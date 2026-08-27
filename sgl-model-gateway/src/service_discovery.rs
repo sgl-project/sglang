@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app_context::AppContext,
-    core::Job,
+    core::{steps::worker::local::find_workers_by_url, Job},
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -817,6 +817,8 @@ async fn reconcile_from_list(
     // removal pass below.
     let mut claimed_urls: HashSet<String> = HashSet::new();
 
+    let dp_aware = app_context.router_config.dp_aware;
+
     // Page through the LIST rather than pulling the whole collection in one
     // response. With no namespace configured this is an Api::all over every
     // pod in the cluster, once per resync per router replica, so an unbounded
@@ -882,6 +884,13 @@ async fn reconcile_from_list(
             if let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) {
                 if pod_info.is_healthy() {
                     claimed_urls.insert(pod_info.worker_url(port));
+                    forget_lost_registration(
+                        &pod_info,
+                        &tracked_pods,
+                        &app_context,
+                        port,
+                        dp_aware,
+                    );
                 }
                 // handle_pod_event dedups via tracked_pods and gates on
                 // is_healthy(), so re-adds are cheap no-ops.
@@ -960,6 +969,71 @@ fn pod_identity(pod: &Pod) -> Option<String> {
         .uid
         .clone()
         .or_else(|| pod.metadata.name.clone())
+}
+
+/// Drop a tracked pod whose worker never reached the registry, so the add path
+/// stops treating it as registered and submits it again.
+///
+/// Membership in `tracked_pods` records that an AddWorker job was SUBMITTED,
+/// not that it succeeded: `handle_pod_event` inserts before submitting and
+/// rolls back only when `submit()` itself fails. A job that fails after that —
+/// a `detect_connection_mode` exhausting `worker_startup_timeout_secs` (30
+/// minutes by default), a failing DP discovery, a workflow that never starts —
+/// only records a failed `JobStatus`, and nothing untracks the pod. Because the
+/// add path short-circuits on tracked pods, the pod then stays absent from the
+/// registry for the life of the process while the reconcile believes it is
+/// registered. That is the same unrecoverable state this reconcile closes on
+/// the delete side; the pass is already paying for a full LIST, so it is the
+/// natural place to close it on the add side too.
+fn forget_lost_registration(
+    pod_info: &PodInfo,
+    tracked_pods: &TrackedPods,
+    app_context: &Arc<AppContext>,
+    port: u16,
+    dp_aware: bool,
+) {
+    // Only pods this loop believes it already registered are candidates; a
+    // pod that is not tracked is about to be added by the caller anyway.
+    match tracked_pods.lock() {
+        Ok(tracker) => {
+            if !tracker.contains_key(pod_info.identity()) {
+                return;
+            }
+        }
+        Err(e) => {
+            error!("SD resync: failed to lock tracked_pods: {}", e);
+            return;
+        }
+    }
+
+    // Reconcile against the registry, not just the shadow set. In dp-aware
+    // mode workers are registered as `<url>@<rank>`, so an exact-URL lookup
+    // never matches one and every dp-aware pod would look unregistered.
+    let worker_url = pod_info.worker_url(port);
+    if !find_workers_by_url(&app_context.worker_registry, &worker_url, dp_aware).is_empty() {
+        return;
+    }
+
+    // An add that is still queued or running has not failed yet. `submit()`
+    // does not dedup by URL, so without this the reconcile would pile up a
+    // fresh AddWorker on every tick for the whole 30-minute startup window.
+    if let Some(job_queue) = app_context.worker_job_queue.get() {
+        if job_queue.has_add_worker_in_flight_for(&worker_url) {
+            return;
+        }
+    }
+
+    match tracked_pods.lock() {
+        Ok(mut tracker) => {
+            if tracker.remove(pod_info.identity()).is_some() {
+                warn!(
+                    "SD resync: pod {} is tracked but no worker is registered at {};                      its registration must have failed after being submitted, re-submitting",
+                    pod_info.name, worker_url
+                );
+            }
+        }
+        Err(e) => error!("SD resync: failed to lock tracked_pods: {}", e),
+    }
 }
 
 /// Tracked pods whose identity is absent from a fresh LIST of the API server.
@@ -2492,6 +2566,127 @@ mod tests {
             Some("AddWorker"),
             "the last job for the shared URL must be the replacement's add, \
              never a removal that would undo it"
+        );
+    }
+
+    // ---- add-side repair: tracked but never registered ----
+
+    #[tokio::test]
+    async fn test_reconcile_resubmits_a_tracked_pod_missing_from_the_registry() {
+        // handle_pod_event inserts into the tracked set before submitting and
+        // rolls back only if submit() itself fails. An AddWorker that fails
+        // afterwards — detect_connection_mode exhausting its 30-minute budget,
+        // a failing DP discovery — leaves the pod tracked with nothing
+        // registered, and the add path then short-circuits on it forever. The
+        // reconcile must notice the registry is empty and submit again.
+        let stuck = identified_pod_info("engine-0", "uid-a", "10.0.0.1");
+        let tracked = tracked_from(std::slice::from_ref(&stuck));
+        let worker_url = stuck.worker_url(8000);
+
+        let live = create_identified_k8s_pod("engine-0", "uid-a", "10.0.0.1", "ns-a");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[live], None))]);
+        let app_context = app_context_with_parked_queue(false).await;
+        assert!(
+            app_context
+                .worker_registry
+                .get_by_url(&worker_url)
+                .is_none(),
+            "precondition: the worker never reached the registry"
+        );
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            Arc::clone(&app_context),
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert_eq!(
+            submitted_job(&app_context, &worker_url).as_deref(),
+            Some("AddWorker"),
+            "a tracked pod with no registered worker must be submitted again"
+        );
+        assert!(
+            tracked_identities(&tracked).contains("uid-a"),
+            "the pod stays tracked once resubmitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_resubmit_a_registered_worker() {
+        // The mirror of the test above: a pod whose worker did reach the
+        // registry must not be resubmitted, or every resync would re-register
+        // every worker.
+        let registered = identified_pod_info("engine-0", "uid-a", "10.0.0.1");
+        let tracked = tracked_from(std::slice::from_ref(&registered));
+        let worker_url = registered.worker_url(8000);
+
+        let live = create_identified_k8s_pod("engine-0", "uid-a", "10.0.0.1", "ns-a");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[live], None))]);
+        let app_context = app_context_with_parked_queue(false).await;
+        app_context.worker_registry.register(Arc::new(
+            crate::core::BasicWorkerBuilder::new(worker_url.clone())
+                .worker_type(crate::core::WorkerType::Regular)
+                .build(),
+        ));
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            Arc::clone(&app_context),
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert_eq!(
+            submitted_job(&app_context, &worker_url),
+            None,
+            "an already-registered worker must not be resubmitted"
+        );
+        assert!(
+            tracked_identities(&tracked).contains("uid-a"),
+            "and it must stay tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_does_not_resubmit_a_dp_aware_worker() {
+        // In dp-aware mode a worker is registered as `<url>@<rank>`, so an
+        // exact-URL lookup never finds one. Reconciling the add side against
+        // the registry with `get_by_url` would therefore read every dp-aware
+        // pod as unregistered and resubmit it on every single resync.
+        let registered = identified_pod_info("engine-0", "uid-a", "10.0.0.1");
+        let tracked = tracked_from(std::slice::from_ref(&registered));
+        let worker_url = registered.worker_url(8000);
+
+        let live = create_identified_k8s_pod("engine-0", "uid-a", "10.0.0.1", "ns-a");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[live], None))]);
+        let app_context = app_context_with_parked_queue(true).await;
+        app_context.worker_registry.register(Arc::new(
+            crate::core::BasicWorkerBuilder::new(format!("{}@0", worker_url))
+                .worker_type(crate::core::WorkerType::Regular)
+                .build(),
+        ));
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            Arc::clone(&app_context),
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        assert_eq!(
+            submitted_job(&app_context, &worker_url),
+            None,
+            "a dp-aware worker registered as <url>@<rank> must count as registered"
         );
     }
 }
