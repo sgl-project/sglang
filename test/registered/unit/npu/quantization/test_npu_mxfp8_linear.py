@@ -22,9 +22,48 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
     process_npu_arch35_mxfp8_linear_weights,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 
 
 class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
+    def test_fp8_config_preserves_ue8m0_scale_format(self):
+        quant_config = Fp8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+                "scale_fmt": "ue8m0",
+            }
+        )
+
+        self.assertEqual(quant_config.scale_fmt, "ue8m0")
+
+    def test_layout_only_ue8m0_conversion_preserves_fp8_weight(self):
+        original_weight = torch.randint(1, 255, (128, 64), dtype=torch.uint8).view(
+            torch.float8_e4m3fn
+        )
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(original_weight.clone(), requires_grad=False),
+            weight_scale_inv=torch.nn.Parameter(
+                torch.tensor([[2**-12]], dtype=torch.float32), requires_grad=False
+            ),
+        )
+
+        process_npu_arch35_mxfp8_linear_weights(layer, [128, 128], scale_fmt="ue8m0")
+
+        self.assertEqual(layer.weight.shape, (64, 128))
+        torch.testing.assert_close(
+            layer.weight.data.T.contiguous().view(torch.uint8), original_weight
+        )
+        self.assertEqual(layer.weight_scale_inv.shape, (1, 128, 2))
+        self.assertTrue(
+            torch.equal(
+                layer.weight_scale_inv.data,
+                torch.full((1, 128, 2), 0x73, dtype=torch.uint8),
+            )
+        )
+        self.assertTrue(layer.weight_scale_inv.format_ue8m0)
+
     def test_requantizes_non_128_block_fp8_weights_for_arch35_mxfp8(self):
         layer = SimpleNamespace(
             weight=torch.nn.Parameter(

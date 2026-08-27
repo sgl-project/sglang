@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch.nn import Module
@@ -13,14 +13,84 @@ _FP8_E4M3FN_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
 def process_npu_arch35_mxfp8_linear_weights(
-    layer: Module, weight_block_size: List[int]
+    layer: Module, weight_block_size: List[int], scale_fmt: Optional[str] = None
 ) -> None:
     """Convert block-FP8 weights to the NPU arch35 MXFP8 layout.
 
-    The checkpoint stores arbitrary FP32 scale factors per quantization block,
-    while arch35 GEMM consumes one UE8M0 scale per 32 K elements. Requantize
-    the dequantized weights so the FP8 values and UE8M0 scales remain consistent.
+    UE8M0 checkpoints already use power-of-two scales, so they only need a
+    layout conversion. Other block-FP8 checkpoints retain the original
+    dequantize/requantize fallback.
     """
+    if scale_fmt == "ue8m0":
+        _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
+        return
+
+    _requantize_npu_arch35_mxfp8_weights(layer, weight_block_size)
+
+
+def _layout_npu_arch35_ue8m0_weights(
+    layer: Module, weight_block_size: List[int]
+) -> None:
+    """Reinterpret UE8M0 block scales and transpose weights without requantizing."""
+    block_n, block_k = weight_block_size
+    group_size = _NPU_ARCH35_MXFP8_BLOCK_SIZE
+    n_dim, k_dim = layer.weight.shape
+    if block_k % group_size != 0:
+        raise ValueError(
+            f"UE8M0 block K size must be divisible by {group_size}, got {block_k}."
+        )
+    if k_dim % (2 * group_size) != 0:
+        raise ValueError(
+            "NPU arch35 MXFP8 linear requires K to be divisible by "
+            f"{2 * group_size}, got {k_dim}."
+        )
+
+    expected_scale_shape = (
+        (n_dim + block_n - 1) // block_n,
+        (k_dim + block_k - 1) // block_k,
+    )
+    checkpoint_scale = layer.weight_scale_inv.data
+    if tuple(checkpoint_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Unexpected UE8M0 scale shape: "
+            f"got {tuple(checkpoint_scale.shape)}, expected {expected_scale_shape}."
+        )
+
+    if checkpoint_scale.dtype == torch.float8_e8m0fnu:
+        scale_u8 = checkpoint_scale.view(torch.uint8)
+    elif checkpoint_scale.dtype == torch.uint8:
+        scale_u8 = checkpoint_scale
+    elif checkpoint_scale.dtype == torch.float32:
+        # SGLang's block scale parameter is currently allocated as FP32. The
+        # loader converts F8_E8M0 values to exact powers of two, so recover the
+        # original exponent byte without materializing the weight in FP32.
+        scale_u8 = ((checkpoint_scale.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+    else:
+        raise TypeError(
+            "UE8M0 checkpoint scales must be float8_e8m0fnu, uint8, or float32, "
+            f"got {checkpoint_scale.dtype}."
+        )
+
+    scale_u8 = scale_u8.repeat_interleave(block_n, dim=0)[:n_dim]
+    scale_u8 = scale_u8.repeat_interleave(block_k // group_size, dim=1)
+    scale_u8 = scale_u8[:, : k_dim // group_size]
+
+    # Keep transpose views: the A5 kernel expects the original row-major
+    # storage scanned in K-major logical order.
+    layer.weight.data = layer.weight.data.transpose(0, 1)
+    layer.weight_scale_inv.data = scale_u8.reshape(
+        n_dim, k_dim // (2 * group_size), 2
+    ).transpose(0, 1)
+    layer.weight_scale_inv.format_ue8m0 = True
+
+    if getattr(layer, "_dsv4_npu_arch35_mxfp8_wo_a", False):
+        batch_npu_arch35_wo_a_weights(layer)
+
+
+def _requantize_npu_arch35_mxfp8_weights(
+    layer: Module, weight_block_size: List[int]
+) -> None:
+    """Fallback conversion for block-FP8 checkpoints with arbitrary scales."""
     weight = block_quant_dequant(
         layer.weight.data,
         layer.weight_scale_inv.data,
