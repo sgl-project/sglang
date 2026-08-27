@@ -747,6 +747,17 @@ class QwenImageCrossAttention(nn.Module):
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
+        if attn_mask is None and encoder_hidden_states_mask is not None:
+            image_mask = torch.ones(
+                (hidden_states.shape[0], img_query.shape[1]),
+                device=encoder_hidden_states_mask.device,
+                dtype=torch.bool,
+            )
+            attn_mask = torch.cat(
+                [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
+                dim=1,
+            )
+
         seg_qkv = None
         # The segmented pre-all-to-all emits Ulysses layout; K/V-gather takes
         # the join_seqs path and exchanges inside the attention instead.
@@ -766,20 +777,15 @@ class QwenImageCrossAttention(nn.Module):
             )
         if seg_qkv is not None:
             joint_query, joint_key, joint_value = seg_qkv
+        elif attn_mask is not None and not sp_text_sharded:
+            # Let the eager attention break point pack directly from the text
+            # and image segments. Materializing three dense joint tensors here
+            # only to gather their valid rows again wastes one launch per Q/K/V.
+            joint_query, joint_key, joint_value = img_query, img_key, img_value
         else:
             joint_query = join_seqs(txt_query, img_query, sp_txt_pad)
             joint_key = join_seqs(txt_key, img_key, sp_txt_pad)
             joint_value = join_seqs(txt_value, img_value, sp_txt_pad)
-        if attn_mask is None and encoder_hidden_states_mask is not None:
-            image_mask = torch.ones(
-                (hidden_states.shape[0], img_query.shape[1]),
-                device=encoder_hidden_states_mask.device,
-                dtype=torch.bool,
-            )
-            attn_mask = torch.cat(
-                [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
-                dim=1,
-            )
 
         # Compute joint attention
         joint_hidden_states = self.attn(
@@ -790,6 +796,15 @@ class QwenImageCrossAttention(nn.Module):
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=0 if sp_text_sharded else seq_len_txt,
             qkv_pre_all_to_all=seg_qkv is not None,
+            q_prefix=(
+                txt_query if attn_mask is not None and not sp_text_sharded else None
+            ),
+            k_prefix=(
+                txt_key if attn_mask is not None and not sp_text_sharded else None
+            ),
+            v_prefix=(
+                txt_value if attn_mask is not None and not sp_text_sharded else None
+            ),
         )
 
         # Reshape back

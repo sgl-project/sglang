@@ -292,6 +292,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Varlen gather of Q/K/V at valid positions.",
     ),
     (
+        "diffusion.varlen_pack_segmented_qkv",
+        KernelBackend.TRITON,
+        "layout.varlen_pack_pad_triton:fused_pack_segmented_qkv",
+        _CUDA,
+        "Varlen gather from a virtual prefix/main Q/K/V sequence.",
+    ),
+    (
         "diffusion.varlen_scatter_to_padded",
         KernelBackend.TRITON,
         "layout.varlen_pack_pad_triton:fused_scatter_to_padded",
@@ -435,6 +442,7 @@ _EXPORTS: dict[str, str] = {
     "usp_merge_heads": "layout.usp_relayout_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",
     "fused_pack_qkv": "layout.varlen_pack_pad_triton",
+    "fused_pack_segmented_qkv": "layout.varlen_pack_pad_triton",
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
