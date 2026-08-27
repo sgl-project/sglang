@@ -1906,7 +1906,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if get_parallel().config.pp_size > 1:
+        if get_parallel().pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

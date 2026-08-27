@@ -186,7 +186,7 @@ class CommonKVManager(BaseKVManager):
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
-        self.pp_size = get_parallel().config.pp_size
+        self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (

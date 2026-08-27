@@ -899,9 +899,12 @@ def latency_test(
     initialize_fp4_gemm_config()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        parallel = get_parallel().config
+        parallel = get_parallel()
         set_gpu_proc_affinity(
-            parallel.pp_size, parallel.tp_size, parallel.nnodes, tp_rank
+            parallel.pp_size,
+            parallel.tp_size,
+            parallel.nnodes,
+            tp_rank,
         )
 
     # Configure the logger
