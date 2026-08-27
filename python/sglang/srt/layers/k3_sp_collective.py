@@ -85,27 +85,18 @@ def _init_state() -> Optional[_State]:
         (logger.warning if explicit else logger.info)(message)
         return None
 
-    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
+    from sglang.kernels.ops.kimi_k3 import comm as k3_comm
+    from sglang.kernels.ops.kimi_k3 import sp_collective
 
-    # Refuse to enable without a checked-in table for this exact device.
-    if (
-        sp_collective.get_dispatch(
-            "reduce_scatter",
-            group.world_size,
-            _HIDDEN_SIZE,
-            1,
-            torch.device("cuda"),
-        )
-        is None
-    ):
+    # Refuse to enable where the strategy boundaries have not been measured.
+    if not sp_collective.supported(group.world_size, torch.device("cuda")):
         (logger.warning if explicit else logger.info)(
             "K3 SP collective has no tuning table for %s; using NCCL.",
             torch.cuda.get_device_name(),
         )
         return None
 
-    sp_collective.register_comm(comm.obj)
-    attn_res.register_comm(comm.obj)
+    k3_comm.register(comm.obj)
     _STATE = _State(group, comm)
     logger.info(
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",
@@ -137,20 +128,20 @@ def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
     state = _init_state()
     if state is None:
         return False
-    from sglang.kernels.ops.kimi_k3 import sp_collective
+    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
 
-    dispatch = sp_collective.get_dispatch(
+    strategy = sp_collective.choose_strategy(
         "reduce_scatter",
         state.group.world_size,
-        _HIDDEN_SIZE,
         num_tokens,
         device,
+        push_fits=_rs_push_fits(state, num_tokens),
     )
-    if dispatch is not None and dispatch.strategy == "pull":
+    if strategy == "pull":
         return True
     if not envs.SGLANG_K3_SP_ATTN_RES.get():
         return False
-    fusion = sp_collective.get_fusion_dispatch(
+    fusion = attn_res.get_fusion_dispatch(
         "reduce_scatter_attn_res",
         state.group.world_size,
         _HIDDEN_SIZE,
@@ -224,18 +215,29 @@ def _resolve_symmetric_o_proj_input(tensor: torch.Tensor) -> tuple[torch.Tensor,
     return output, k3_ar_fusion.find_mc_ptr(output) or 0
 
 
+def _rs_push_fits(state: _State, global_tokens: int) -> bool:
+    """Whether a reduce-scatter shard still fits a push slot."""
+    shard_bytes = -(-global_tokens // state.group.world_size) * _HIDDEN_SIZE * 2
+    return shard_bytes <= state.comm.max_push_size
+
+
 def _eligible(
     state: _State,
     tensor: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
 ) -> bool:
+    """Shape and layout the collectives require.
+
+    A ragged split is fine -- the kernels route on a prefix sum rather than a
+    uniform stride -- but the fused attention-residual path is not, so that
+    check sits with its two callers instead of here.
+    """
     if (
         tensor.dtype != torch.bfloat16
         or not tensor.is_contiguous()
         or tensor.ndim != 2
         or tensor.shape[1] != _HIDDEN_SIZE
         or tensor.shape[0] <= 0
-        or tensor.shape[0] % state.group.world_size != 0
     ):
         return False
     if residual is not None:
@@ -246,8 +248,7 @@ def _eligible(
             or not residual.is_contiguous()
         ):
             return False
-    local_bytes = tensor.numel() * tensor.element_size() // state.group.world_size
-    return local_bytes <= state.comm.max_push_size
+    return True
 
 
 def reduce_scatter_res(
@@ -259,42 +260,30 @@ def reduce_scatter_res(
         return None
     from sglang.kernels.ops.kimi_k3 import sp_collective
 
-    dispatch = sp_collective.get_dispatch(
+    world_size = state.group.world_size
+    strategy = sp_collective.choose_strategy(
         "reduce_scatter",
-        state.group.world_size,
-        tensor.shape[1],
+        world_size,
         tensor.shape[0],
         tensor.device,
+        push_fits=_rs_push_fits(state, tensor.shape[0]),
     )
-    if dispatch is None:
+    if strategy == "nccl":
         return None
     output = torch.empty(
-        (tensor.shape[0] // state.group.world_size, tensor.shape[1]),
+        (sp_collective.local_tokens(world_size, tensor.shape[0]), tensor.shape[1]),
         dtype=tensor.dtype,
         device=tensor.device,
     )
-    if dispatch.strategy == "push":
-        return sp_collective.reduce_scatter_res(
-            state.group.world_size,
-            tensor,
-            output,
-            residual,
-            tuning=dispatch.tuning,
-        )
-    if dispatch.strategy == "pull":
-        tensor, input_mc_ptr = _resolve_symmetric_o_proj_input(tensor)
-        if input_mc_ptr == 0:
-            logger.warning("K3 pull RS input is not symmetric; using NCCL.")
-            return None
-        return sp_collective.reduce_scatter_pull(
-            state.group.world_size,
-            tensor,
-            output,
-            residual,
-            input_mc_ptr=input_mc_ptr,
-            tuning=dispatch.tuning,
-        )
-    raise AssertionError(f"unknown K3 reduce-scatter strategy: {dispatch.strategy}")
+    if strategy == "push":
+        return sp_collective.reduce_scatter_push(world_size, tensor, output, residual)
+    tensor, input_mc_ptr = _resolve_symmetric_o_proj_input(tensor)
+    if input_mc_ptr == 0:
+        logger.warning("K3 pull RS input is not symmetric; using NCCL.")
+        return None
+    return sp_collective.reduce_scatter_pull(
+        world_size, tensor, output, residual, input_mc_ptr=input_mc_ptr
+    )
 
 
 def reduce_scatter_attn_res(
@@ -312,6 +301,8 @@ def reduce_scatter_attn_res(
         state is None
         or not envs.SGLANG_K3_SP_ATTN_RES.get()
         or not _eligible(state, tensor, residual)
+        # The fused kernel indexes by a uniform stride, unlike the plain pair.
+        or tensor.shape[0] % state.group.world_size != 0
     ):
         return None
     local_tokens = tensor.shape[0] // state.group.world_size
@@ -324,9 +315,9 @@ def reduce_scatter_attn_res(
         or ow.shape != (_HIDDEN_SIZE,)
     ):
         return None
-    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
+    from sglang.kernels.ops.kimi_k3 import attn_res
 
-    dispatch = sp_collective.get_fusion_dispatch(
+    dispatch = attn_res.get_fusion_dispatch(
         "reduce_scatter_attn_res",
         state.group.world_size,
         tensor.shape[1],
@@ -365,48 +356,39 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
     state = _init_state()
     if state is None:
         return None
-    global_tokens = tensor.shape[0] * state.group.world_size
+    world_size = state.group.world_size
+    global_tokens = tensor.shape[0] * world_size
     if (
         tensor.dtype != torch.bfloat16
         or not tensor.is_contiguous()
         or tensor.ndim != 2
         or tensor.shape[1] != _HIDDEN_SIZE
         or tensor.shape[0] <= 0
-        or tensor.numel() * tensor.element_size() > state.comm.max_push_size
     ):
         return None
     from sglang.kernels.ops.kimi_k3 import sp_collective
 
-    dispatch = sp_collective.get_dispatch(
+    strategy = sp_collective.choose_strategy(
         "all_gather",
-        state.group.world_size,
-        tensor.shape[1],
+        world_size,
         global_tokens,
         tensor.device,
+        # A gather stages this rank's shard, so a slot holds it directly.
+        push_fits=tensor.numel() * tensor.element_size() <= state.comm.max_push_size,
     )
-    if dispatch is None:
+    if strategy == "nccl":
         return None
-    output_shape = (global_tokens, tensor.shape[1])
-    if dispatch.strategy == "push":
-        output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
-        return sp_collective.all_gather(
-            state.group.world_size,
-            tensor,
-            output,
-            tuning=dispatch.tuning,
+    if strategy == "push":
+        output = torch.empty(
+            (global_tokens, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device
         )
-    if dispatch.strategy == "direct":
-        output = _symm_buffer(
-            state, _ALL_GATHER, global_tokens, tensor.shape[1], tensor.dtype
-        )
-        return sp_collective.all_gather_direct(
-            state.group.world_size,
-            tensor,
-            output,
-            output_mc_ptr=k3_ar_fusion.get_mc_ptr(output),
-            tuning=dispatch.tuning,
-        )
-    raise AssertionError(f"unknown K3 all-gather strategy: {dispatch.strategy}")
+        return sp_collective.all_gather_push(world_size, tensor, output)
+    output = _symm_buffer(
+        state, _ALL_GATHER, global_tokens, tensor.shape[1], tensor.dtype
+    )
+    return sp_collective.all_gather_pull(
+        world_size, tensor, output, output_mc_ptr=k3_ar_fusion.get_mc_ptr(output)
+    )
 
 
 def attn_res_all_gather(
@@ -437,10 +419,10 @@ def attn_res_all_gather(
         or ow.shape != (_HIDDEN_SIZE,)
     ):
         return None
-    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
+    from sglang.kernels.ops.kimi_k3 import attn_res
 
     global_tokens = prefix.shape[0] * state.group.world_size
-    dispatch = sp_collective.get_fusion_dispatch(
+    dispatch = attn_res.get_fusion_dispatch(
         "attn_res_all_gather",
         state.group.world_size,
         prefix.shape[1],

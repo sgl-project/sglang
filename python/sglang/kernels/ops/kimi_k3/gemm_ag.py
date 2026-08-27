@@ -7,7 +7,7 @@ full weight itself), multicast-stores it into the CustomAllReduceV2 push
 workspace (one more user of its double-buffer phase protocol), and a
 Lamport-spin consumer assembles ``out = up_proj(x) + b (+ c)`` — reading
 1/8 of the weight bytes per rank instead of all of them. Needs
-:func:`sglang.kernels.ops.kimi_k3.all_reduce.register_comm` once beforehand
+:func:`sglang.kernels.ops.kimi_k3.comm.register` once beforehand
 (the same registration the push all-reduce uses).
 """
 
@@ -23,7 +23,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.kimi_k3.all_reduce import _COMM_MAP
+from sglang.kernels.ops.kimi_k3 import comm as k3_comm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -62,7 +62,7 @@ def _gemm_ag_op(
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    _jit_module().run(_COMM_MAP[world_size], x, weight, b, c, out)
+    _jit_module().run(k3_comm.get(world_size), x, weight, b, c, out)
 
 
 def gemm_ag_up_proj(

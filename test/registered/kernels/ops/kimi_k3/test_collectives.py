@@ -9,10 +9,14 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication import nvlink_comm
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.kimi_k3 import (
     all_reduce,
     attn_res,
+)
+from sglang.kernels.ops.kimi_k3 import comm as k3_comm
+from sglang.kernels.ops.kimi_k3 import (
     gemm_ag,
     gemm_ar,
     sp_collective,
@@ -30,7 +34,6 @@ _HIDDEN_SIZE = 7168
 _GEMM_AR_K_TOTAL = 12288
 _GEMM_AG_WORLD_SIZE = 8
 _MB = 1024 * 1024
-_SP_TUNING = sp_collective.Tuning(num_blocks=1, block_size=256)
 
 
 def _device():
@@ -71,9 +74,7 @@ def _init_comm():
     )
     if comm.disabled or not comm.has_multicast:
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
-    all_reduce.register_comm(comm.obj)
-    sp_collective.register_comm(comm.obj)
-    attn_res.register_comm(comm.obj)
+    k3_comm.register(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -172,13 +173,7 @@ def test_sequence_parallel_collectives():
         torch.bfloat16
     )
     reduce_output = torch.empty_like(expected_reduce)
-    sp_collective.reduce_scatter_res(
-        world_size,
-        reduce_input,
-        reduce_output,
-        residual,
-        tuning=_SP_TUNING,
-    )
+    sp_collective.reduce_scatter_push(world_size, reduce_input, reduce_output, residual)
 
     gather_input = torch.randn(
         local_tokens,
@@ -199,16 +194,55 @@ def test_sequence_parallel_collectives():
         group=nccl_group,
     )
     gather_output = torch.empty_like(expected_gather)
-    sp_collective.all_gather(
-        world_size,
-        gather_input,
-        gather_output,
-        tuning=_SP_TUNING,
-    )
+    sp_collective.all_gather_push(world_size, gather_input, gather_output)
     torch.cuda.synchronize()
 
     torch.testing.assert_close(reduce_output, expected_reduce, rtol=2e-2, atol=3e-2)
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_sequence_parallel_ragged():
+    """A token count that does not divide by the world size.
+
+    The plain pair routes on a prefix sum, so the shards differ in length by
+    one; only the fused attention-residual path needs a uniform stride.
+    """
+    _require_sm100()
+    comm = _init_comm()
+    rank, world_size = dist.get_rank(), comm.world_size
+    global_tokens = world_size * 3 + 1
+    avg, rem = divmod(global_tokens, world_size)
+    local_tokens = avg + (1 if rank < rem else 0)
+    prefix = avg * rank + min(rank, rem)
+
+    generator = torch.Generator(device="cuda").manual_seed(40 + rank)
+    reduce_input = torch.randn(
+        global_tokens,
+        _HIDDEN_SIZE,
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
+    )
+    expected = reduce_input.float()
+    _, nccl_group = _init_world()
+    dist.all_reduce(expected, group=nccl_group)
+    expected = expected[prefix : prefix + local_tokens].to(torch.bfloat16)
+
+    output = torch.empty_like(expected)
+    sp_collective.reduce_scatter_push(world_size, reduce_input, output)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=3e-2)
+
+    gather_input = output.clone()
+    gathered = torch.empty(
+        global_tokens, _HIDDEN_SIZE, device=_device(), dtype=torch.bfloat16
+    )
+    sp_collective.all_gather_push(world_size, gather_input, gathered)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        gathered[prefix : prefix + local_tokens], output, rtol=0, atol=0
+    )
 
 
 @torch.inference_mode()
@@ -340,7 +374,7 @@ def test_attention_residual_direct_all_gather():
 def _precompile(num_gpus):
     for world_size in num_gpus:
         all_reduce._jit_module(world_size)
-        sp_collective._jit_module(world_size)
+        nvlink_comm._jit_push_module(torch.bfloat16, world_size)
         gemm_ar._jit_module(_GEMM_AR_K_TOTAL // world_size, world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()

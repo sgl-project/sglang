@@ -106,9 +106,9 @@ def _get_state() -> Optional[_State]:
                 "multicast is unavailable; using the regular all-reduce path."
             )
         return None
-    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.kimi_k3 import comm as k3_comm
 
-    mod.register_comm(comm.obj)
+    k3_comm.register(comm.obj)
     logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
     return _State(comm, comm.world_size, group.cpu_group.group_name)
 
@@ -248,13 +248,13 @@ def all_reduce_low_sm(
     x: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
     *,
-    num_blocks: Optional[int] = None,
-    unroll: Optional[int] = None,
+    num_blocks: int = 0,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x) [+ residual]``, pinned to the low-SM NVLS pull.
 
     For side-stream use: push would fan out over many blocks and steal SMs from
-    the GEMMs it overlaps. ``num_blocks`` / ``unroll`` default to the tuned tables.
+    the GEMMs it overlaps. ``num_blocks`` of 0 lets the collective size its own
+    grid; pass one to cap it.
     """
     from sglang.kernels.ops.kimi_k3 import all_reduce as mod
 
@@ -268,7 +268,6 @@ def all_reduce_low_sm(
         residual,
         input_mc_ptr=get_mc_ptr(x),
         num_blocks=num_blocks,
-        unroll=unroll,
     )
 
 
