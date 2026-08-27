@@ -66,6 +66,7 @@ GLM_5_2_W4A8_16P_TWO_NODE_OTHER_ARGS = [
     "deepep",
     "--deepep-mode",
     "auto",
+    "--disable-shared-experts-fusion",
     "--load-balance-method",
     "round_robin",
     "--reasoning-parser",
