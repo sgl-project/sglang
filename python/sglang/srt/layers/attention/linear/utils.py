@@ -69,6 +69,11 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     verify: LinearAttnKernelBackend
 
 
+def flashinfer_gdn_uses_state_pool(capability: tuple[int, int]) -> bool:
+    """Whether FlashInfer GDN uses the pooled bf16 state interface."""
+    return capability[0] >= 10 and capability != (12, 0)
+
+
 def resolve_linear_attn_backends(
     prefill_default: Optional[str] = None,
 ) -> LinearAttnBackends:

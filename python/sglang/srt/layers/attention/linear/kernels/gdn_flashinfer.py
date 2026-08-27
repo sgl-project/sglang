@@ -3,7 +3,12 @@
 Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).
 
 SM90 (Hopper): full support — decode, prefill, MTP.  State dtype: fp32.
-SM100 (Blackwell): full support — decode, prefill, MTP.
+SM100 (Blackwell): full support — decode, prefill, MTP. State dtype: bf16.
+SM110 (Blackwell): keeps the existing pooled bf16 decode/prefill policy;
+target verify is not enabled.
+SM120 (Blackwell workstation): decode and prefill use unpooled fp32 state;
+MTP verify is not supported.
+SM121 and later architectures keep the pooled bf16 state policy.
 
 Requires flashinfer >= 0.6.14.
 """
@@ -18,6 +23,9 @@ import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
+)
+from sglang.srt.layers.attention.linear.utils import (
+    flashinfer_gdn_uses_state_pool,
 )
 from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
@@ -137,7 +145,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     """FlashInfer kernel for GDN with K-last SSM state layout.
 
     SM90 (Hopper): decode uses gather/scatter; prefill and MTP verify supported.
-    SM100 (Blackwell): decode uses gather/scatter; prefill and MTP verify supported.
+    SM100 (Blackwell): pooled bf16 state; prefill and MTP verify supported.
+    SM110 (Blackwell): pooled bf16 state; target verify is not enabled.
+    SM120 (Blackwell workstation): unpooled fp32 state; no MTP verify.
 
     Requires flashinfer >= 0.6.14.
     """
@@ -161,11 +171,14 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._decode_fn is None:
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
-        sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major >= 10
-        self.supports_target_verify = sm_major in (9, 10)
+        self.device_capability = torch.cuda.get_device_capability()
+        self.sm_major = self.device_capability[0]
+        self.is_sm120 = self.device_capability == (12, 0)
+        # Exact SM120 is the workstation exception to the pooled state policy.
+        self.use_state_pool = flashinfer_gdn_uses_state_pool(self.device_capability)
+        self.supports_target_verify = self.sm_major in (9, 10)
 
-        if sm_major == 9 and self._prefill_fn is None:
+        if (self.sm_major == 9 or self.is_sm120) and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
         if self._mtp_fn is None:
             raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
@@ -223,6 +236,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if self.is_sm120 and ssm_states.dtype != torch.float32:
+            raise RuntimeError(
+                "SM120 FlashInfer GDN decode requires unpooled fp32 state. "
+                "Use --mamba-ssm-dtype float32 or "
+                "--linear-attn-decode-backend triton."
+            )
         batch_size = cache_indices.shape[0]
         num_heads = q.shape[2]
         head_k_dim = q.shape[3]
@@ -289,6 +308,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple:
         from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+
+        if self.is_sm120 and ssm_states.dtype != torch.float32:
+            raise RuntimeError(
+                "SM120 FlashInfer GDN prefill requires unpooled fp32 state. "
+                "Use --mamba-ssm-dtype float32 or "
+                "--linear-attn-prefill-backend triton."
+            )
 
         total_seq_len = q.shape[1]
         num_v_heads = v.shape[2]

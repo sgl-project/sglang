@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
     flashinfer_gdn_prefill_default,
 )
+from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
@@ -245,6 +246,73 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
+
+    def test_sm120_flashinfer_uses_unpooled_state_and_disables_verify(self):
+        kernels = (True, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        with (
+            patch.object(
+                gdn_flashinfer, "_get_flashinfer_gdn_kernels", return_value=kernels
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(12, 0)),
+        ):
+            kernel = gdn_flashinfer.FlashInferGDNKernel()
+
+        self.assertFalse(kernel.use_state_pool)
+        self.assertFalse(kernel.supports_target_verify)
+        with self.assertRaisesRegex(RuntimeError, "unpooled fp32 state"):
+            kernel.decode(
+                None,
+                None,
+                None,
+                None,
+                None,
+                A_log=None,
+                dt_bias=None,
+                ssm_states=torch.empty(1, dtype=torch.bfloat16),
+                cache_indices=None,
+                query_start_loc=None,
+            )
+
+    def test_sm110_flashinfer_keeps_upstream_state_and_verify_policy(self):
+        kernels = (True, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        with (
+            patch.object(
+                gdn_flashinfer, "_get_flashinfer_gdn_kernels", return_value=kernels
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(11, 0)),
+        ):
+            kernel = gdn_flashinfer.FlashInferGDNKernel()
+
+        self.assertTrue(kernel.use_state_pool)
+        self.assertFalse(kernel.supports_target_verify)
+
+    def test_flashinfer_state_pool_policy_across_capabilities(self):
+        kernels = (True, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        cases = (
+            ((9, 0), False),
+            ((10, 0), True),
+            ((11, 0), True),
+            ((12, 0), False),
+            ((12, 1), True),
+            ((13, 0), True),
+        )
+        for capability, expected_pool in cases:
+            with self.subTest(capability=capability):
+                with (
+                    patch.object(
+                        gdn_flashinfer,
+                        "_get_flashinfer_gdn_kernels",
+                        return_value=kernels,
+                    ),
+                    patch.object(
+                        torch.cuda,
+                        "get_device_capability",
+                        return_value=capability,
+                    ),
+                ):
+                    kernel = gdn_flashinfer.FlashInferGDNKernel()
+
+                self.assertEqual(kernel.use_state_pool, expected_pool)
 
 
 if __name__ == "__main__":
