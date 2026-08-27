@@ -228,7 +228,7 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 FROM $BASE_IMAGE_ROCM1000 AS rocm1000-base
 
 # Redeclare the global selector inside this stage so each matrix build installs
-# only the device payload for its target image (gfx942 or gfx950).
+# only the device payload for its target image (gfx942, gfx950 or gfx1250).
 ARG GPU_ARCH
 
 # ROCM_TRITON_VERSION rather than TRITON_VERSION: the final stage declares a
