@@ -414,6 +414,7 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup_mode: str | None = None
 
     warmup_resolutions: list[str] = None
+    warmup_num_frames: int | None = None
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
@@ -1162,6 +1163,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"Invalid --warmup-mode {self.warmup_mode!r}; "
                 f"expected one of {WARMUP_MODES}."
             )
+        if self.warmup_num_frames is not None and self.warmup_num_frames <= 0:
+            raise ValueError("--warmup-num-frames must be a positive integer.")
 
         if self.enable_torch_compile and self.warmup_mode is None:
             self.warmup_mode = "server"
@@ -1171,9 +1174,11 @@ class ServerArgs(DisaggServerArgsMixin):
                 "to disable this behavior."
             )
 
-        # Explicit resolutions need a request path unless an existing server
+        # Explicit warmup shapes need a request path unless an existing server
         # default already supplies the synthetic startup request.
-        if self.warmup_resolutions is not None and self.warmup_mode in (None, "off"):
+        if (
+            self.warmup_resolutions is not None or self.warmup_num_frames is not None
+        ) and self.warmup_mode in (None, "off"):
             self.warmup_mode = "request"
 
         # BCG captures every graph during a synthetic warmup forward at startup
@@ -2233,6 +2238,16 @@ class ServerArgs(DisaggServerArgsMixin):
             nargs="+",
             default=ServerArgs.warmup_resolutions,
             help="Specify explicit warmup resolutions. e.g., `--warmup-resolutions 256x256 720x720`",
+        )
+        parser.add_argument(
+            "--warmup-num-frames",
+            type=int,
+            default=ServerArgs.warmup_num_frames,
+            help=(
+                "Override the synthetic video warmup frame count. Use this with "
+                "breakable CUDA graphs when serving a non-default frame count so "
+                "the captured latent shape matches the request."
+            ),
         )
         parser.add_argument(
             "--warmup-steps",

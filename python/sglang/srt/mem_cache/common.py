@@ -130,14 +130,16 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
+            tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
         if available_size < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_tokens - available_size)
+            )
 
 
 def retraction_backup(
