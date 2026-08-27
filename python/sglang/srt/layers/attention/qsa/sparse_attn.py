@@ -96,7 +96,10 @@ def _sparse_gqa_prefill(
     for start in range(0, row_limit, BLOCK_N):
         current = start + offs_n
         token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
-        valid = token >= 0
+        # The upper bound keeps a selected index inside this request's slice
+        # of the packed K/V, so a too-large index cannot read the next
+        # request's keys or run off the end of the buffer for the last one.
+        valid = (token >= 0) & (token < seq_end - seq_start)
         keys = tl.load(
             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -108,15 +111,23 @@ def _sparse_gqa_prefill(
             other=0.0,
         )
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
-        next_max = tl.maximum(max_value, tl.max(scores, 1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        has_values = tl.sum(valid.to(tl.int32), axis=0) > 0
+        block_max = tl.max(scores, axis=1)
+        next_max = tl.where(has_values, tl.maximum(max_value, block_max), max_value)
+        alpha = tl.where(has_values, tl.math.exp2(max_value - next_max), 1.0)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    output = tl.where(
+        normalizer[:, None] > 0,
+        accumulator / normalizer[:, None],
+        0.0,
+    )
     tl.store(
         out
         + query * so_m
@@ -237,7 +248,9 @@ def _sparse_gqa_chunk_prefill(
     for start in range(0, row_limit, BLOCK_N):
         current = start + offs_n
         token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
-        valid = token >= 0
+        # Same bound as the non-chunked kernel: kv_len is this request's
+        # packed K/V length, so an index at or past it is another request's.
+        valid = (token >= 0) & (token < kv_len)
         keys = tl.load(
             k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -249,15 +262,23 @@ def _sparse_gqa_chunk_prefill(
             other=0.0,
         )
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
-        next_max = tl.maximum(max_value, tl.max(scores, 1))
-        alpha = tl.math.exp2(max_value - next_max)
-        probabilities = tl.math.exp2(scores - next_max[:, None])
+        has_values = tl.sum(valid.to(tl.int32), axis=0) > 0
+        block_max = tl.max(scores, axis=1)
+        next_max = tl.where(has_values, tl.maximum(max_value, block_max), max_value)
+        alpha = tl.where(has_values, tl.math.exp2(max_value - next_max), 1.0)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
         accumulator = tl.dot(
             probabilities.to(values.dtype), values, accumulator * alpha[:, None]
         )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
-    output = accumulator / normalizer[:, None]
+    output = tl.where(
+        normalizer[:, None] > 0,
+        accumulator / normalizer[:, None],
+        0.0,
+    )
     tl.store(
         out
         + query * so_m
@@ -374,11 +395,16 @@ def _qsa_sparse_decode(
             other=-1,
         )
         valid = (cols < topk) & (logical >= 0) & (logical < seq_len)
+        # int64: a physical slot times the KV row stride passes 2**31 once the
+        # pool holds more slots than 2**31 / stride, and Triton keeps the whole
+        # offset expression in the width of its operands.
+        request_offset = req.to(tl.int64) * sr_m
+        logical_offset = tl.where(valid, logical, 0).to(tl.int64) * sr_n
         slots = tl.load(
-            req_to_token + req * sr_m + tl.where(valid, logical, 0) * sr_n,
+            req_to_token + request_offset + logical_offset,
             mask=valid,
             other=0,
-        )
+        ).to(tl.int64)
         keys = tl.load(
             k + slots[None, :] * sk_n + kv_head * sk_h + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -501,11 +527,16 @@ def _qsa_sparse_decode_splitk(
             other=-1,
         )
         valid = (cols < topk) & (logical >= 0) & (logical < seq_len)
+        # int64: a physical slot times the KV row stride passes 2**31 once the
+        # pool holds more slots than 2**31 / stride, and Triton keeps the whole
+        # offset expression in the width of its operands.
+        request_offset = req.to(tl.int64) * sr_m
+        logical_offset = tl.where(valid, logical, 0).to(tl.int64) * sr_n
         slots = tl.load(
-            req_to_token + req * sr_m + tl.where(valid, logical, 0) * sr_n,
+            req_to_token + request_offset + logical_offset,
             mask=valid,
             other=0,
-        )
+        ).to(tl.int64)
         keys = tl.load(
             k + slots[None, :] * sk_n + kv_head * sk_h + offs_d[:, None] * sk_d,
             mask=valid[None, :],
@@ -865,18 +896,22 @@ def _compact_kv(
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
     dims = tl.arange(0, BLOCK_D)
     length = tl.load(seq_lens + batch)
-    req = tl.load(req_indices + batch)
-    pack_start = tl.load(cu_k + batch)
+    req = tl.load(req_indices + batch).to(tl.int64)
+    pack_start = tl.load(cu_k + batch).to(tl.int64)
     valid_count = tl.load(cu_k + batch + 1) - pack_start
     positions = tl.load(indices + batch * idx_stride + cols, mask=cols < topk, other=-1)
     valid = (cols < valid_count) & (positions >= 0) & (positions < length)
     slots = tl.load(
-        req_to_token + req * req_stride + tl.where(valid, positions, 0),
+        req_to_token + req * req_stride + tl.where(valid, positions, 0).to(tl.int64),
         mask=valid,
         other=0,
-    )
+    ).to(tl.int64)
     src = slots[:, None] * heads * dim + head * dim + dims[None, :]
-    dst = (pack_start + cols)[:, None] * heads * dim + head * dim + dims[None, :]
+    dst = (
+        (pack_start + cols.to(tl.int64))[:, None] * heads * dim
+        + head * dim
+        + dims[None, :]
+    )
     mask = valid[:, None] & (dims[None, :] < dim)
     tl.store(out_k + dst, tl.load(k + src, mask=mask, other=0.0), mask=mask)
     tl.store(out_v + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
