@@ -215,9 +215,33 @@ class _StreamBoundModule:
 
     def __init__(self, module: Module):
         self._module = module
-        self._bound_entries: dict[str, object] = {}
 
-    def _bind(self, fn):
+    @property
+    def __class__(self):
+        # Transparent proxy: isinstance(m, tvm_ffi.Module) must keep working.
+        return type(self._module)
+
+    def __getitem__(self, key):
+        fn = self._module[key]
+        return self._bind(fn) if callable(fn) else fn
+
+    def __contains__(self, key):
+        return key in self._module
+
+    def __repr__(self):
+        return repr(self._module)
+
+    def __getattr__(self, name: str):
+        fn = getattr(self._module, name)
+        if not callable(fn):
+            return fn
+        bound = self._bind(fn)
+        # Memoize: the instance attribute shadows __getattr__ on later lookups.
+        object.__setattr__(self, name, bound)
+        return bound
+
+    @staticmethod
+    def _bind(fn):
         from tvm_ffi.core import _env_set_current_stream
 
         def bound(*args, _fn=fn, **kwargs):
@@ -226,23 +250,4 @@ class _StreamBoundModule:
             _env_set_current_stream(_DLPACK_DEVICE_TYPE, device_index, stream)
             return _fn(*args, **kwargs)
 
-        return bound
-
-    def __getattr__(self, name: str):
-        fn = getattr(self._module, name)
-        if not callable(fn):
-            return fn
-        bound = self._bind(fn)
-        # Memoize: the instance attribute shadows __getattr__ on later lookups.
-        setattr(self, name, bound)
-        return bound
-
-    def __getitem__(self, name: str):
-        # tvm-ffi also exposes entry points by subscript. Special methods are
-        # looked up on the type, so __getattr__ never sees this lookup; callers
-        # that pre-resolve entries as ``module["name"]`` need binding too.
-        bound = self._bound_entries.get(name)
-        if bound is None:
-            bound = self._bind(self._module[name])
-            self._bound_entries[name] = bound
         return bound
