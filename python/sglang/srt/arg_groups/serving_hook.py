@@ -9,8 +9,11 @@ import socket
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
     resolving_view,
 )
+from sglang.srt.utils.common import configure_media_url_security
+from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -158,3 +161,55 @@ def handle_crash_dump_env(server_args: Any):
                 coredump_dir,
                 e,
             )
+
+
+def handle_media_url_security(server_args: Any):
+    """Normalize and publish the media URL policy before workers start."""
+    cfg = resolving_view(server_args)
+    declare_resolution(
+        server_args,
+        "_handle_media_url_security",
+        allowed_media_domains=configure_media_url_security(
+            cfg.allowed_media_domains,
+            cfg.media_url_max_file_size_mb,
+        ),
+    )
+
+
+def handle_load_balance_method(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
+        raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
+
+    if cfg.load_balance_method == "auto":
+        # Default behavior:
+        # - non-PD: round_robin
+        # - PD prefill: follow_bootstrap_room
+        # - PD decode: round_robin
+        declare_resolution(
+            server_args,
+            "_handle_load_balance_method",
+            load_balance_method=(
+                "follow_bootstrap_room"
+                if cfg.disaggregation_mode == "prefill"
+                else "round_robin"
+            ),
+        )
+        return
+
+
+def handle_grammar_backend(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.grammar_backend is None:
+        declare_resolution(
+            server_args, "_handle_grammar_backend", grammar_backend="xgrammar"
+        )
+
+
+def handle_debug_utils(server_args: Any):
+    cfg = resolving_view(server_args)
+    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+        logger.info("Set soft_watchdog_timeout since in CI")
+        declare_resolution(
+            server_args, "_handle_debug_utils", soft_watchdog_timeout=300
+        )

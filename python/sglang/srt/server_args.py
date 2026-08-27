@@ -91,7 +91,6 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
-    configure_media_url_security,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -121,7 +120,6 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -4252,24 +4250,9 @@ class ServerArgs:
         handle_dcp_validation(self)
 
     def _handle_load_balance_method(self):
-        cfg = resolving_view(self)
-        if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
-            raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
+        from sglang.srt.arg_groups.serving_hook import handle_load_balance_method
 
-        if cfg.load_balance_method == "auto":
-            # Default behavior:
-            # - non-PD: round_robin
-            # - PD prefill: follow_bootstrap_room
-            # - PD decode: round_robin
-            self._declare(
-                "_handle_load_balance_method",
-                load_balance_method=(
-                    "follow_bootstrap_room"
-                    if cfg.disaggregation_mode == "prefill"
-                    else "round_robin"
-                ),
-            )
-            return
+        handle_load_balance_method(self)
 
     def _handle_ssl_validation(self):
         from sglang.srt.arg_groups.serving_hook import handle_ssl_validation
@@ -4282,15 +4265,9 @@ class ServerArgs:
         handle_multimodal(self)
 
     def _handle_media_url_security(self):
-        """Normalize and publish the media URL policy before workers start."""
-        cfg = resolving_view(self)
-        self._declare(
-            "_handle_media_url_security",
-            allowed_media_domains=configure_media_url_security(
-                cfg.allowed_media_domains,
-                cfg.media_url_max_file_size_mb,
-            ),
-        )
+        from sglang.srt.arg_groups.serving_hook import handle_media_url_security
+
+        handle_media_url_security(self)
 
     def _handle_deprecated_args(self):
         cfg = resolving_view(self)
@@ -4632,33 +4609,14 @@ class ServerArgs:
         use_mlx()
 
     def _handle_npu_backends(self):
-        cfg = resolving_view(self)
-        if cfg.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+        from sglang.srt.arg_groups.platform_hook import handle_npu_backends
 
-            set_default_server_args(self)
-
-            current = cfg.cuda_graph_config.prefill.tc_compiler
-            if current is not None and current != "eager":
-                logger.warning(
-                    "At this moment Ascend platform only support prefill graph compilation with "
-                    "cuda_graph_config[prefill].tc_compiler='eager'."
-                )
-                self._declare(
-                    "_handle_npu_backends",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.PREFILL, tc_compiler="eager"
-                    ),
-                )
+        handle_npu_backends(self)
 
     def _handle_mps_backends(self):
-        cfg = resolving_view(self)
-        if cfg.device == "mps":
-            if not use_mlx():
-                self._declare(
-                    "_handle_mps_backends",
-                    disable_overlap_schedule=True,
-                )
+        from sglang.srt.arg_groups.platform_hook import handle_mps_backends
+
+        handle_mps_backends(self)
 
     def _handle_xpu_backends(self):
         cfg = resolving_view(self)
@@ -6215,23 +6173,19 @@ class ServerArgs:
         run_post_process_pass(self, _page_size_default)
 
     def _handle_amd_specifics(self):
-        if is_hip():
-            self._declare("_handle_amd_specifics", triton_attention_num_kv_splits=16)
+        from sglang.srt.arg_groups.platform_hook import handle_amd_specifics
+
+        handle_amd_specifics(self)
 
     def _handle_nccl_pre_warm(self):
-        # pre_warm_nccl is only used with CUDA or HIP hardware or NPU hardware
-        cfg = resolving_view(self)
-        if cfg.pre_warm_nccl and not (is_cuda() or is_hip() or is_npu()):
-            logger.warning(
-                "pre_warm_nccl is only applicable for CUDA or HIP hardware or NPU hardware. "
-                "Ignoring pre_warm_nccl setting on current hardware."
-            )
-            self._declare("_handle_nccl_pre_warm", pre_warm_nccl=False)
+        from sglang.srt.arg_groups.platform_hook import handle_nccl_pre_warm
+
+        handle_nccl_pre_warm(self)
 
     def _handle_grammar_backend(self):
-        cfg = resolving_view(self)
-        if cfg.grammar_backend is None:
-            self._declare("_handle_grammar_backend", grammar_backend="xgrammar")
+        from sglang.srt.arg_groups.serving_hook import handle_grammar_backend
+
+        handle_grammar_backend(self)
 
     def _handle_mamba_backend(self):
         from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -6704,94 +6658,9 @@ class ServerArgs:
         run_post_process_pass(self, _dp_lm_head_validation)
 
     def _handle_moe_kernel_config(self):
-        # The quantization-driven runner resolutions moved to the pipeline
-        # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
-        # the compatibility asserts and fusion writes stay below.
-        cfg = resolving_view(self)
-        from sglang.srt.arg_groups.overrides import (
-            _moe_runner_backend_quant_constraints,
-            _moe_runner_fusion_disable,
-            run_post_process_pass,
-        )
+        from sglang.srt.arg_groups.moe_hook import handle_moe_kernel_config
 
-        run_post_process_pass(self, _moe_runner_backend_quant_constraints)
-
-        view = resolved_view(self)
-        if view.moe_runner_backend == "flashinfer_cutlass":
-            assert view.quantization in [
-                "modelopt_fp4",
-                "modelopt_fp8",
-                "modelopt_mixed",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
-            assert view.ep_size in [
-                1,
-                cfg.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-
-        if view.moe_runner_backend == "flashinfer_cutedsl":
-            # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
-            assert (
-                view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
-                or self.get_model_config().nvfp4_moe_meta is not None
-            ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
-            assert view.ep_size in [
-                1,
-                cfg.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
-            assert view.moe_a2a_backend in [
-                "none",
-                "deepep",
-                "flashinfer",
-            ], (
-                f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
-                f"got '{view.moe_a2a_backend}'."
-            )
-            if view.moe_a2a_backend == "deepep" and (
-                view.quantization == "nvfp4_online"
-                or envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-            ):
-                raise ValueError(
-                    "flashinfer_cutedsl per-token NVFP4 activation requires "
-                    "moe_a2a_backend='none' or 'flashinfer'."
-                )
-
-        if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
-            assert view.quantization in [
-                "modelopt_fp4",
-                "nvfp4_online",
-                "fp8",
-                "mxfp8",
-                "modelopt_fp8",
-                "modelopt_mixed",
-                "compressed-tensors",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
-
-        if view.moe_runner_backend == "flashinfer_trtllm_routed":
-            assert view.quantization in [
-                "fp8",
-                "mxfp8",
-                "modelopt_fp4",
-                "modelopt_mixed",
-                "nvfp4_online",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
-
-        # The runner-driven shared-experts fusion disables moved to the
-        # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
-        # invoked here at the legacy write slots.
-        run_post_process_pass(self, _moe_runner_fusion_disable)
-
-        if resolved_view(self).moe_runner_backend == "cutlass" and resolved_view(
-            self
-        ).quantization in [
-            "fp8",
-            "mxfp8",
-        ]:
-            assert (
-                resolved_view(self).ep_size == 1
-            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+        handle_moe_kernel_config(self)
 
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
@@ -7547,192 +7416,36 @@ class ServerArgs:
         handle_prefill_only_disable_kv_cache(self)
 
     def _handle_hicache_ratio_default(self):
-        """Default the host/device ratio per host memory mode.
+        from sglang.srt.arg_groups.hicache_hook import handle_hicache_ratio_default
 
-        Runs before the dummy-model boundary: direct HostKVCache consumers
-        (unit fixtures, dummy-model launches) must never see a None ratio.
-        buffer_only stages in flight rather than retaining, so it needs only
-        enough to cover the write backlog plus parked prefetches.
-
-        A decode server keeps the ratio unset here: kv_cache_builder resolves
-        it against the retraction-backup backend (1.0 for host_pool, else 2.0).
-        """
-        cfg = resolving_view(self)
-        if cfg.hicache_ratio is None and cfg.disaggregation_mode != "decode":
-            self._declare(
-                "_handle_hicache_ratio_default",
-                hicache_ratio=(
-                    1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
-                ),
-            )
+        handle_hicache_ratio_default(self)
 
     def _handle_hicache(self):
-        """Normalize hicache-related knobs into a valid runtime configuration.
+        from sglang.srt.arg_groups.hicache_hook import handle_hicache
 
-        Resolution order:
-        1) Layout <-> I/O compatibility for direct conflicts.
-        2) Storage <-> layout compatibility (may rewrite layout).
-        """
-        cfg = resolving_view(self)
-        # Skip all normalization when neither hicache nor decode-offload path is active.
-        if not (
-            cfg.enable_hierarchical_cache
-            or cfg.disaggregation_decode_enable_offload_kvcache
-            or (
-                cfg.disaggregation_mode == "decode"
-                and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
-            )
-        ):
-            return
-
-        self._validate_hicache_host_memory_mode()
-
-        # Step 1: Initial layout-io compatibility normalization.
-        self._resolve_layout_io_compatibility()
-
-        # Step 2: Storage-layout normalization without changing io backend.
-        self._resolve_storage_layout_compatibility()
-
-        # Step 3: DCP compatibility for the L2 (device<->host) path.
-        self._resolve_hicache_dcp_compatibility()
+        handle_hicache(self)
 
     def _validate_hicache_host_memory_mode(self):
-        cfg = resolving_view(self)
-        if cfg.hicache_host_memory_mode not in ("cache", "buffer_only"):
-            raise ValueError(
-                "hicache_host_memory_mode must be 'cache' or 'buffer_only', "
-                f"got {cfg.hicache_host_memory_mode!r}"
-            )
+        from sglang.srt.arg_groups.hicache_hook import validate_hicache_host_memory_mode
 
-        # Both modes are defaulted upstream (a decode server resolves the
-        # ratio later, in kv_cache_builder), so this fires only if that
-        # defaulting regresses -- never build an unsized host pool.
-        if (
-            cfg.hicache_size <= 0
-            and cfg.hicache_ratio is None
-            and cfg.disaggregation_mode != "decode"
-        ):
-            raise ValueError(
-                f"--hicache-host-memory-mode {cfg.hicache_host_memory_mode} "
-                "requires a host pool size: pass --hicache-size or "
-                "--hicache-ratio."
-            )
-
-        if cfg.hicache_host_memory_mode == "cache":
-            return
-
-        if cfg.hicache_storage_backend is None:
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only requires a storage backend "
-                "(--hicache-storage-backend): host memory is only a staging buffer "
-                "and all cached data lives in storage."
-            )
-        if cfg.hicache_write_policy == "write_back":
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only does not support "
-                "--hicache-write-policy write_back; use write_through or "
-                "write_through_selective."
-            )
-        if cfg.disaggregation_mode == "decode":
-            raise ValueError(
-                "--hicache-host-memory-mode buffer_only is not supported on "
-                "decode instances: the decode-side prefetch and offload paths "
-                "bypass the buffer-mode pipeline, fetching without its prefix "
-                "context and never consuming its staged holds. Prefill "
-                "instances share the standard scheduler path and are supported."
-            )
+        validate_hicache_host_memory_mode(self)
 
     def _resolve_hicache_dcp_compatibility(self):
-        cfg = resolving_view(self)
-        if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
-            return
-        if cfg.hicache_storage_backend is not None:
-            raise NotImplementedError(
-                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-                "supported yet: under DCP each rank holds a distinct "
-                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-                "backup and the storage keys must become dcp_rank-aware "
-                "first. Run HiCache+DCP with L1/L2 only."
-            )
-        if cfg.speculative_algorithm not in (None, "DSPARK"):
-            raise NotImplementedError(
-                "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-                "decoding; other draft-model host pools have no DCP index "
-                "translation."
-            )
-        if cfg.enable_lmcache:
-            raise NotImplementedError(
-                "--enable-lmcache with --dcp-size > 1 is not supported: "
-                "LMCache has no DCP-aware index translation."
-            )
-        if cfg.enable_hisparse:
-            raise NotImplementedError(
-                "--enable-hisparse with --dcp-size > 1 is not supported: the "
-                "HiSparse host pool is constructed without DCP translation."
-            )
-        if not self.use_mla_backend():
-            raise NotImplementedError(
-                "HiCache with --dcp-size > 1 is only supported for MLA models: "
-                "the index translation lives in MLATokenToKVPoolHost, and the "
-                "MHA host pool has none."
-            )
-        logger.info(
-            "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
-            "logical slot accounting with per-rank physical translation at "
-            "the transfer boundary (dcp_size=%d).",
-            cfg.dcp_size,
-        )
+        from sglang.srt.arg_groups.hicache_hook import resolve_hicache_dcp_compatibility
+
+        resolve_hicache_dcp_compatibility(self)
 
     def _resolve_layout_io_compatibility(self):
-        cfg = resolving_view(self)
-        if (
-            cfg.hicache_mem_layout == "page_first_direct"
-            and cfg.hicache_io_backend == "kernel"
-        ):
-            self._declare(
-                "_resolve_layout_io_compatibility",
-                hicache_io_backend="direct",
-            )
-            logger.warning(
-                "Kernel io backend does not support page first direct layout, switching to direct io backend"
-            )
+        from sglang.srt.arg_groups.hicache_hook import resolve_layout_io_compatibility
 
-        if (
-            cfg.hicache_mem_layout == "page_first"
-            and cfg.hicache_io_backend == "direct"
-        ):
-            self._declare(
-                "_resolve_layout_io_compatibility",
-                hicache_mem_layout="page_first_direct",
-            )
-            logger.warning(
-                "Page first layout is not supported with direct IO backend, switching to page first direct layout"
-            )
+        resolve_layout_io_compatibility(self)
 
     def _resolve_storage_layout_compatibility(self):
-        cfg = resolving_view(self)
-        if (
-            cfg.hicache_storage_backend != "mooncake"
-            or cfg.hicache_mem_layout != "layer_first"
-        ):
-            return
-
-        if cfg.hicache_io_backend == "direct":
-            new_layout = "page_first_direct"
-        elif cfg.hicache_io_backend == "kernel":
-            new_layout = "page_first"
-        else:
-            # Keep current behavior for unknown backends (e.g., kernel_ascend).
-            new_layout = cfg.hicache_mem_layout
-
-        self._declare(
-            "_resolve_storage_layout_compatibility",
-            hicache_mem_layout=new_layout,
+        from sglang.srt.arg_groups.hicache_hook import (
+            resolve_storage_layout_compatibility,
         )
-        logger.warning(
-            f"Mooncake storage backend does not support layer_first layout, "
-            f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
-        )
+
+        resolve_storage_layout_compatibility(self)
 
     def _resolve_hf_gguf_model_path(self):
         """Turn a Hub reference to a .gguf into a local file path."""
@@ -8551,86 +8264,9 @@ class ServerArgs:
         # construction in model_runner_kv_cache_mixin._init_pools.
 
     def _handle_page_major_kv_layout(self):
-        # The unified pool stores state in the page-major envelope-strided layout, so
-        # enabling it implies --enable-page-major-kv-layout — routing it through the
-        # single page-major path + stride-aware Triton asserts (set before the guard).
-        cfg = resolving_view(self)
-        if cfg.enable_unified_memory:
-            self._declare(
-                "_handle_page_major_kv_layout",
-                enable_page_major_kv_layout=True,
-            )
-        if not cfg.enable_page_major_kv_layout:
-            return
-        # Only the Triton attention kernels read the strided 4-D envelope K/V
-        # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
-        # exposes each layer as a DENSE contiguous per-layer view
-        # (build_dense_mla_views), which the paged MLA kernels consume directly,
-        # with their kv_indices / block tables remapped to dense ids. Names below
-        # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
-        # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
-        # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
-        # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
-        # page_table (in-kernel for captured decode, one funnel for eager).
-        # flashmla / cutlass_mla share the create_flashmla block-table path and
-        # can be added the same way once exercised.
-        if cfg.enable_unified_memory and self.use_mla_backend():
-            allowed_full = {
-                "triton",
-                "fa3",
-                "trtllm_mla",
-                "flashinfer",
-                "cutedsl_mla",
-                "tokenspeed_mla",
-            }
-        else:
-            allowed_full = {"triton"}
-        backends = set(self._resolved_attention_backends())
-        backends.discard(None)
-        assert backends <= allowed_full, (
-            "--enable-page-major-kv-layout requires the Triton attention backend "
-            "for the full-attention layers (unified-memory MLA also allows the "
-            f"paged MLA backends); got {sorted(backends)}, allowed "
-            f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
-        )
-        # The Mamba/KDA state is stored in envelope-strided views; only
-        # stride-audited kernels may read it (Stage 4 audit, per slot):
-        # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64); helion (specializes KDA state strides 0-3
-        #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
-        #   gating update is stride-safe) on KDA-hybrid models only.
-        # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
-        #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
-        #   int64 strides), with the same KDA-only caveat.
-        # - mamba (mamba2/short-conv state): triton only.
-        # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
-        # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
-        decode_allowed = {"triton", "flashinfer"}
-        prefill_allowed = {"triton", "flashkda"}
-        if self.use_mla_backend():
-            decode_allowed.update({"cutedsl", "helion"})
-            prefill_allowed.update({"cutedsl", "helion"})
-        resolved_linear_decode = (
-            cfg.linear_attn_decode_backend or cfg.linear_attn_backend
-        )
-        resolved_linear_prefill = (
-            cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
-        )
-        assert resolved_linear_decode in decode_allowed | {None}, (
-            "--enable-page-major-kv-layout: linear-attention DECODE backend must "
-            f"be one of {sorted(decode_allowed)} for the strided conv/SSM state; "
-            f"got {resolved_linear_decode!r}."
-        )
-        assert resolved_linear_prefill in prefill_allowed | {None}, (
-            "--enable-page-major-kv-layout: linear-attention PREFILL backend must "
-            f"be one of {sorted(prefill_allowed)} for the strided conv/SSM state; "
-            f"got {resolved_linear_prefill!r}."
-        )
-        assert cfg.mamba_backend in (None, "triton"), (
-            "--enable-page-major-kv-layout requires the Triton Mamba kernels for "
-            f"the strided conv/SSM state; got {cfg.mamba_backend!r}. Pass "
-            "--mamba-backend triton."
-        )
+        from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
+
+        handle_page_major_kv_layout(self)
 
     def _handle_dllm_inference(self):
         cfg = resolving_view(self)
@@ -8858,10 +8494,9 @@ class ServerArgs:
         handle_crash_dump_env(self)
 
     def _handle_debug_utils(self):
-        cfg = resolving_view(self)
-        if is_in_ci() and cfg.soft_watchdog_timeout is None:
-            logger.info("Set soft_watchdog_timeout since in CI")
-            self._declare("_handle_debug_utils", soft_watchdog_timeout=300)
+        from sglang.srt.arg_groups.serving_hook import handle_debug_utils
+
+        handle_debug_utils(self)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
