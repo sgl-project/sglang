@@ -32,7 +32,7 @@ def is_npu_arch35() -> bool:
 
     import acl
 
-    return acl.rt.get_device_info(0, 601) == (3501, 0)
+    return acl.rt.get_device_info(0, 601) == (3510, 0)
 
 
 class NPUACLFormat(IntEnum):
