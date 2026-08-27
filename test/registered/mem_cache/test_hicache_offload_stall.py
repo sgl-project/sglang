@@ -1,22 +1,19 @@
 """A full host pool stops KV offload permanently, and must say so.
 
 ``write_backup`` returns 0 when the host pool cannot take another page. That is
-normally transient -- ``evict_host`` frees something and the next attempt
-succeeds -- but ``evict_host`` can only free a node that the *device* tier has
+normally transient, but ``evict_host`` can only free a node the *device* tier
 already dropped: ``_update_host_leaf_status`` admits a node to
 ``evictable_host_leaves`` only when ``node.evicted``. So when the device pool is
 larger than the host pool, the host pool fills first, GPU eviction never fires,
-nothing is ever evictable, and offload stops for the life of the process.
+and offload stops for the life of the process.
 
-Measured on the 2-worker KVCR POC (Qwen3-8B, page-size 64, ~19-page prefixes):
-offload froze at 1680 of 1696 host pages and never resumed; halving the host pool
-moved the freeze to 844 pages; making the device pool smaller than the host pool
-removed it entirely, and offload then ran past the host pool size.
+Measured on the 2-worker KVCR POC (Qwen3-8B, page-size 64): offload froze at
+1680 of 1696 host pages; halving the host pool moved the freeze to 844; making
+the device pool smaller removed it entirely.
 
-Nothing errors on this path: L2 write-through and L3 offload just stop, and every
-later request reports an ordinary cache miss. The warning is the fix available
-here -- the reclaim rule itself is HiRadixCache's, but an operator who sees this
-line knows to raise ``--hicache-size``.
+Nothing errors -- L2 write-through and L3 offload just stop and every later
+request reports an ordinary cache miss. The reclaim rule is HiRadixCache's, but
+an operator who sees this line knows to raise ``--hicache-size``.
 
 What turns this red: deleting the ``_log_offload_stalled()`` call from
 ``write_backup``'s ``host_indices is None`` branch, or narrowing the warning so
@@ -42,9 +39,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _StalledCache:
     """The narrowest object ``write_backup`` needs, with a full host pool.
 
-    Built by ``__new__`` rather than a real constructor: ``HiRadixCache.__init__``
-    allocates device memory and starts controller threads, none of which this
-    path touches.
+    Built by ``__new__``: ``HiRadixCache.__init__`` allocates device memory and
+    starts controller threads, none of which this path touches.
     """
 
     @staticmethod
@@ -115,9 +111,8 @@ class OffloadStallWarningTest(unittest.TestCase):
     def test_retry_after_eviction_is_not_reported_as_a_stall(self):
         """Only a *second* failed attempt means nothing was evictable.
 
-        ``write_backup`` retries once after ``evict_host``. A first-attempt
-        failure that the retry rescues is ordinary pressure, not a stall, and
-        warning on it would make the line meaningless.
+        ``write_backup`` retries once after ``evict_host``; a first-attempt failure the
+        retry rescues is ordinary pressure, and warning on it makes the line meaningless.
         """
         cache = _StalledCache.build()
         host_indices = MagicMock()

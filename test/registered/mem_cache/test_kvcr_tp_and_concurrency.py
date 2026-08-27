@@ -1,26 +1,19 @@
-"""KVCRStore under TP>1 colocation and under concurrent in-flight operations.
+"""KVCRStore under TP/DP rank colocation and under concurrent operations.
 
-Everything shipped so far was validated at TP=1 with one request at a time, so
-the two assumptions most likely to be wrong in production are untested:
+Two assumptions the TP=1 single-request validation never exercised:
 
-  1. **Rank colocation (TP, and DP on top of it).** Every ``(dp, attn_cp,
-     attn_tp)`` rank of one engine builds its own KVCRStore in its own process
-     on the same host, holding a different slice of every head. The port this
-     rank *binds* must follow the full coordinate -- a collision is silent,
-     because ``ZmqPeerControlChannel`` binds from the progress thread, so the
-     engine still starts and only peer fetches break. The port it *dials* must
-     follow only the within-DP part, because the router already resolved which
-     DP rank of the source holds the prefix; a wrong dial is worse than silent,
-     since block keys are token hashes carrying no rank identity, so the fetch
-     succeeds and returns another rank's shard.
+  1. **Rank colocation.** Every ``(dp, attn_cp, attn_tp)`` rank builds its own
+     KVCRStore on the same host holding a different head slice. The port it
+     *binds* must follow the full coordinate; the port it *dials* must follow
+     only the within-DP part, since the router already picked the source DP
+     rank. Both failures are silent: block keys are token hashes carrying no
+     rank identity, so a wrong dial succeeds and returns another rank's shard.
 
   2. **Concurrent operations.** ``poll_completed()`` both drains a queue and
      advances state machines, so the source pump and ``_drain_until`` race for
-     every completion. ``_completed_ops`` keeps the loser's result from being
-     dropped; these tests drive that path with several waiters in flight.
+     every completion; ``_completed_ops`` keeps the loser's result.
 
-CPU-only: KVCRStore is built without a mem_pool so ``_build_kvcr`` never runs,
-and the core is a fake.
+CPU-only: no mem_pool, so ``_build_kvcr`` never runs and the core is a fake.
 
     python -m pytest test/registered/mem_cache/test_kvcr_tp_and_concurrency.py -v
 """
@@ -82,9 +75,8 @@ def _storage_config(
 ) -> HiCacheStorageConfig:
     """One scheduler's config.
 
-    ``tp_rank``/``tp_size`` are attention-scoped whenever DP attention is on --
-    ``cache_controller._generate_storage_config`` substitutes ``attn_tp_*`` for
-    them there -- so a DP=2/attn_tp=2 engine is four configs with ``tp_size=2``.
+    ``tp_rank``/``tp_size`` are attention-scoped whenever DP attention is on, so a
+    DP=2/attn_tp=2 engine is four configs with ``tp_size=2``.
     """
     extra_config = {
         "local_dram_bytes": 1 << 20,
@@ -161,8 +153,8 @@ def _hint_extra_info(endpoint: str) -> HiCacheStorageExtraInfo:
 class FakeEntry:
     """One completed block key, shaped like the core's ``OpEntryResult``.
 
-    ``success`` is derived from ``status`` exactly as the core derives it, so
-    DROPPED and FAILED are both falsy and only the status tells them apart.
+    ``success`` is derived from ``status`` as the core derives it, so DROPPED and
+    FAILED are both falsy and only the status tells them apart.
     """
 
     def __init__(self, success: bool = True, status=None) -> None:
@@ -178,9 +170,8 @@ class FakeEntry:
 def _per_op_residue(store: KVCRStore, op_handle: int) -> List[str]:
     """Names of every store container that still keys on ``op_handle``.
 
-    A scan rather than a check of one named field: the guarded property is that
-    no bookkeeping keyed by op handle may outlive the operation, so a rewrite is
-    free to rename or reshape the containers.
+    A scan, not a check of one named field: no bookkeeping keyed by op handle may
+    outlive the operation, however a rewrite reshapes the containers.
     """
     return sorted(
         name
@@ -196,10 +187,8 @@ def _raise_fault(*_args, **_kwargs):
 class _ExplodingKVCR:
     """A core whose every entry point raises.
 
-    Stands in for faults that arrive as an exception rather than as a result: a
-    version skew that moved a method, a NIXL agent in a bad state, an internal
-    assertion. ``FakeKVCR`` cannot model these -- it reports failure through the
-    normal result path, which is exactly the path that does not run.
+    ``FakeKVCR`` reports failure through the normal result path, which is exactly
+    the path an exception skips.
     """
 
     deposit = _raise_fault
@@ -213,8 +202,8 @@ class _ExplodingKVCR:
 class FakeKVCR:
     """Records deliver() calls and reports completions only when told to.
 
-    Nothing completes on its own: a test calls ``finish(op_handle, keys)``, so
-    the interleaving between waiters is chosen by the test, not by timing.
+    Nothing completes on its own, so the interleaving between waiters is chosen by
+    the test rather than by timing.
     """
 
     def __init__(self) -> None:
@@ -231,10 +220,8 @@ class FakeKVCR:
     def deliver_and_finish(self, keys: List[str]) -> int:
         """Complete the op inside the submit call, as a local-tier hit does.
 
-        The local tier moves bytes with a NIXL transfer addressed to our own
-        agent, which the progress thread can retire between the submit returning
-        and the caller's first poll -- microseconds against a 5 ms pump
-        interval. So this is the ordinary case, not a contrived one.
+        The local tier moves bytes over a NIXL loopback, retired between the submit
+        returning and the caller's first poll -- microseconds against a 5 ms pump.
         """
         handle = self.deliver(destinations={})
         self.finish(handle, keys)
@@ -256,27 +243,32 @@ class FakeKVCR:
 class TPColocationTest(unittest.TestCase):
     """Two ranks of one engine, same host, same extra_config."""
 
-    def test_agent_name_is_unique_per_rank(self):
-        rank0 = _store(0, 2)
-        rank1 = _store(1, 2)
+    def test_the_agent_name_separates_every_rank_and_every_restart(self):
+        """Peers key their remote-agent tables by name, so any collision makes
+        one registration overwrite another's. The name must therefore carry the
+        full rank coordinate, and a fresh id so a restarted rank does not reuse
+        a name its peers still have cached.
+        """
+        tp0, tp1 = _store(0, 2), _store(1, 2)
+        dp1 = _store(0, 2, dp_rank=1, dp_size=2)
+        restarted = _store(0, 2)
 
-        self.assertNotEqual(rank0._agent_name, rank1._agent_name)
-        self.assertIn("tp0", rank0._agent_name)
-        self.assertIn("tp1", rank1._agent_name)
-
-    def test_agent_name_is_unique_across_restarts_of_the_same_rank(self):
-        """A restarted rank must not reuse a name a peer may still have cached."""
-        first = _store(0, 2)
-        second = _store(0, 2)
-
-        self.assertNotEqual(first._agent_name, second._agent_name)
+        self.assertIn("tp0", tp0._agent_name)
+        self.assertIn("tp1", tp1._agent_name)
+        names = [
+            tp0._agent_name,
+            tp1._agent_name,
+            dp1._agent_name,
+            restarted._agent_name,
+        ]
+        self.assertEqual(len(set(names)), len(names))
 
     def test_control_port_is_offset_by_tp_rank(self):
         """One configured port must not mean one bound port.
 
-        A collision fails in the background -- the engine comes up, registers,
-        advertises an endpoint, and only peer fetches break. Offsetting by rank
-        is what dynamo already assumes when it publishes one endpoint per rank.
+        A collision fails in the background: the engine comes up and only peer fetches
+        break. This is also the layout dynamo assumes when publishing per-rank
+        endpoints.
         """
         ports = {rank: _store(rank, 4)._control_port() for rank in range(4)}
 
@@ -291,11 +283,10 @@ class TPColocationTest(unittest.TestCase):
         )
 
     def test_ephemeral_control_port_is_not_offset(self):
-        """Port 0 means "ask the OS", and the OS already guarantees distinctness.
+        """Port 0 means "ask the OS", which already guarantees distinctness.
 
-        Offsetting an ephemeral port would land on an arbitrary in-use port.
-        Local-only, because ``KVCRBackendConfig`` refuses port 0 together with
-        ``enable_remote_hint``; colocated ranks still each bind one.
+        Offsetting it would land on an arbitrary in-use port. Local-only, because
+        ``KVCRBackendConfig`` refuses port 0 together with ``enable_remote_hint``.
         """
         rank0 = _store(0, 2, control_port=0, enable_remote_hint=False)
         rank1 = _store(1, 2, control_port=0, enable_remote_hint=False)
@@ -309,16 +300,11 @@ class TPColocationTest(unittest.TestCase):
 class SourceEndpointRankTest(unittest.TestCase):
     """Which source port each rank dials for a hint-driven fetch.
 
-    Regression for a wrong-shard bug seen on real hardware at TP=2: both ranks
-    of the target dialed the single endpoint dynamo advertises, so rank 1 pulled
-    rank 0's KV. It does not fail -- block keys are token hashes with no rank
-    identity, so rank 1 accepts the shard and reports a full cache hit. The only
-    outward symptom was that greedy decoding produced different text than the
-    same prefix computed locally.
-
-    dynamo cannot fix this on its side: it indexes workers by ``(worker_id,
-    dp_rank)`` and has no TP concept, so the endpoint it advertises is
-    necessarily the engine's base. Realigning it is the consumer's job.
+    Regression for a wrong-shard bug at TP=2: both ranks dialed the single endpoint
+    dynamo advertises, so rank 1 accepted rank 0's shard and reported a full hit.
+    The only symptom was generated text differing from the same prefix computed
+    locally. dynamo cannot fix it there -- it indexes by ``(worker_id, dp_rank)``
+    and has no TP concept, so realigning is the consumer's job.
     """
 
     def _dialed(self, tp_rank: int, tp_size: int, endpoint: str) -> str:
@@ -344,8 +330,7 @@ class SourceEndpointRankTest(unittest.TestCase):
     def test_rank_alignment_survives_an_ipv6_source_host(self):
         """The offset applies to the port, not to whatever precedes it.
 
-        A bracketed IPv6 literal contains colons of its own, so splitting on a
-        colon rewrites the address instead of the port.
+        A bracketed IPv6 literal contains colons of its own.
         """
         self.assertEqual(
             self._dialed(1, 2, "tcp://[fd00::1]:25000"), "tcp://[fd00::1]:25001"
@@ -354,8 +339,7 @@ class SourceEndpointRankTest(unittest.TestCase):
     def test_an_unparseable_endpoint_drops_the_hint(self):
         """A rank that cannot align must fetch nothing, not fetch wrongly.
 
-        Returning the endpoint verbatim would put rank 1 back on rank 0's shard
-        -- the exact corruption this alignment exists to prevent.
+        Returning the endpoint verbatim puts rank 1 back on rank 0's shard.
         """
         store = _store(1, 2)
 
@@ -366,19 +350,15 @@ class SourceEndpointRankTest(unittest.TestCase):
 class DPColocationTest(unittest.TestCase):
     """Attention DP: several DP ranks of one engine on one host.
 
-    SGLang runs one scheduler per ``(dp, attn_cp, attn_tp)`` rank, so a DP=2 /
-    attn_tp=2 engine is four processes sharing one ``extra_config``. Offsetting
-    by ``tp_rank`` alone puts DP rank 1 on DP rank 0's ports -- the same silent
-    bind collision ``TPColocationTest`` covers, reached through the other
-    dimension.
+    One scheduler per ``(dp, attn_cp, attn_tp)`` rank, all sharing one
+    ``extra_config``. Offsetting by ``tp_rank`` alone puts DP rank 1 on DP rank 0's
+    ports -- the same silent collision reached through the other dimension.
     """
 
     def test_dp_ranks_occupy_consecutive_port_blocks(self):
         """DP rank r owns ``[base + r*attn_tp_size, +attn_tp_size)``.
 
-        This is the layout dynamo mirrors when it publishes per-DP-rank
-        endpoints, so it is a contract between the two repos: dynamo must stride
-        by ``attn_tp_size``, not by 1.
+        A contract with dynamo, which must stride by ``attn_tp_size``, not by 1.
         """
         ports = {
             (dp_rank, tp_rank): _store(tp_rank, 2, dp_rank, 2)._control_port()
@@ -399,9 +379,8 @@ class DPColocationTest(unittest.TestCase):
     def test_attn_cp_is_part_of_the_rank_coordinate(self):
         """CP shards attention too, so two CP ranks must not share a port.
 
-        With DP=2 / attn_cp=2 / attn_tp=1 the engine is again four schedulers,
-        and a formula that only multiplies ``dp_rank`` by ``tp_size`` would give
-        every DP rank the same two ports.
+        A formula that only multiplies ``dp_rank`` by ``tp_size`` gives every DP rank
+        the same two ports here.
         """
         ports = {
             (dp_rank, cp_rank): _store(
@@ -421,26 +400,12 @@ class DPColocationTest(unittest.TestCase):
             },
         )
 
-    def test_agent_name_distinguishes_dp_ranks(self):
-        """Same TP rank, different DP rank: NIXL still needs two names.
-
-        Peers key their remote-agent tables by name, so a collision here would
-        make one rank's registration overwrite the other's.
-        """
-        rank0 = _store(0, 2, dp_rank=0, dp_size=2)
-        rank1 = _store(0, 2, dp_rank=1, dp_size=2)
-
-        self.assertNotEqual(rank0._agent_name, rank1._agent_name)
-
     def test_the_dialed_source_port_ignores_our_dp_rank(self):
         """The router already picked the source DP rank; we add only our own
         within-DP offset.
 
-        The hint names one specific ``(worker, dp_rank)`` source -- our own DP
-        rank says nothing about which of the source's DP ranks holds the prefix.
-        Adding it would walk into a different DP group's port block, and because
-        block keys carry no rank identity that fetch would succeed and return
-        the wrong shard.
+        Our DP rank says nothing about which of the source's DP ranks holds the prefix.
+        Adding it walks into another DP group's port block, and that fetch succeeds.
         """
         dialed = {
             (dp_rank, tp_rank): _store(tp_rank, 2, dp_rank, 2)
@@ -468,11 +433,9 @@ class UnusableHostPoolTest(unittest.TestCase):
     def test_a_per_layer_pool_refuses_to_start_the_backend(self):
         """A pool with no single kv_buffer tensor cannot be NIXL-registered.
 
-        ``framework_dram`` is the one registration covering the engine's host KV
-        pool, and both directions address it -- even the local-tier copy is a
-        NIXL loopback -- so no direction works unregistered. The old code logged
-        a warning and started anyway, so a DeepSeek-V4-style per-layer pool came
-        up healthy and then named unregistered memory in every transfer.
+        ``framework_dram`` is the one registration both directions address -- even the
+        local-tier copy is a NIXL loopback. Warning and starting anyway let a
+        DeepSeek-V4-style per-layer pool name unregistered memory in every transfer.
         """
         store = _store(0, 1)
         # Probe-able (so the local tier sizes fine) but kv_buffer is a per-layer
@@ -491,11 +454,8 @@ class UnusableHostPoolTest(unittest.TestCase):
     def test_a_failed_page_probe_refuses_to_start_the_backend(self):
         """The local DRAM tier is the backend's only storage, so it is required.
 
-        Leaving it unconfigured is worse than not starting: ``deposit`` then
-        fails each entry individually, which reads downstream as "the cache
-        never hits" -- indistinguishable from a cold server -- while every peer
-        serve silently has nothing to offer, because this backend never hands
-        out framework memory (see ``pin_adapter``).
+        Unconfigured, ``deposit`` fails each entry individually, which reads downstream
+        as a cold server while every peer serve silently has nothing to offer.
         """
         store = _store(0, 1)
         # A registrable kv_buffer, so this gets past the framework_dram gate and
@@ -516,17 +476,14 @@ class UnusableHostPoolTest(unittest.TestCase):
 class SidecarPoolTest(unittest.TestCase):
     """A pool this backend cannot address must never be reported as served.
 
-    A hybrid KV stack (DSA/MiniMax indexer, Mamba, SWA) hands the backend one
-    ``PoolTransfer`` per pool, and the sidecar transfer is *derived*: the
-    controller copies the KV pool's own host indices and hashes into it. This
-    backend resolves host addresses through ``mem_pool_host``, which for a
-    hybrid stack forwards to the anchor (KV) pool -- so a sidecar transfer would
-    be handed KV addresses, move KV bytes into KV pages, report success, and
-    leave the sidecar's host pool untouched. ``True`` for a page it never wrote
-    makes ``_sync_and_clamp_prefetch_result`` skip the clamp, and the model
-    attends over an indexer page holding KV bytes -- wrong output, no error
-    anywhere. Every entry point below has to score the pool a miss on its own; a
-    guard on only some of them still leaves a fail-open path.
+    A hybrid KV stack (DSA/MiniMax indexer, Mamba, SWA) sends one ``PoolTransfer``
+    per pool, the sidecar one derived from the KV pool's indices and hashes. This
+    backend resolves addresses through ``mem_pool_host``, which forwards to the
+    anchor pool -- so a sidecar transfer moves KV bytes into KV pages, reports
+    success, and leaves the sidecar untouched. ``True`` for a page never written
+    makes ``_sync_and_clamp_prefetch_result`` skip the clamp and the model attends
+    over an indexer page holding KV bytes. Every entry point must score the pool a
+    miss on its own; guarding only some leaves a fail-open path.
     """
 
     def _store_with_core(self) -> KVCRStore:
@@ -565,9 +522,8 @@ class SidecarPoolTest(unittest.TestCase):
         self.assertIs(store.registered_pools[PoolName.KV], pool)
 
     def test_a_sidecar_get_is_a_miss_and_never_reaches_the_core(self):
-        """Asserting the deliver never ran is what separates this guard from the
-        ``_fail_closed`` decorator -- an exception inside would also produce
-        all-False, and would not be the same fix.
+        """Asserting the deliver never ran separates this guard from
+        ``_fail_closed``, which would also produce all-False and is not the same fix.
         """
         store = self._store_with_core()
         delivered = []
@@ -584,10 +540,8 @@ class SidecarPoolTest(unittest.TestCase):
         self.assertEqual(delivered, [PoolName.KV])
 
     def test_a_sidecar_set_is_a_miss_and_never_reaches_the_core(self):
-        """The write side fails open one step later than the read side: the
-        sidecar's host page is marked offloaded, HiCache is free to evict it,
-        and the only copy is gone -- the later read cannot recover what was
-        never stored.
+        """The write side fails open one step later: the sidecar's host page is
+        marked offloaded, HiCache evicts it, and the only copy is gone.
         """
         store = self._store_with_core()
         deposited = []
@@ -604,10 +558,9 @@ class SidecarPoolTest(unittest.TestCase):
         self.assertEqual(deposited, [PoolName.KV])
 
     def test_a_sidecar_pool_makes_the_whole_prefix_unavailable(self):
-        """``batch_exists_v2`` returns one ``kv_hit_pages`` for the request and
-        the controller issues gets for that prefix across all pools, so
-        reporting the KV pages this backend really holds would promise sidecar
-        pages it cannot serve -- the same fail-open one call earlier.
+        """``batch_exists_v2`` reports one ``kv_hit_pages`` for the request and the
+        controller issues gets for that prefix across all pools, so reporting the KV
+        pages held would promise sidecar pages this backend cannot serve.
         """
         store = self._store_with_core()
         store._kvcr = SimpleNamespace(
@@ -637,13 +590,12 @@ class SidecarPoolTest(unittest.TestCase):
 class UnaddressableParallelismTest(unittest.TestCase):
     """Rank coordinates a KVCR block key cannot encode must fail at startup.
 
-    A block key is ``sha256(token ids)#<segment>`` and a router hint carries only
-    an endpoint plus page hashes, so nothing on the wire says which slice of the
-    model produced the bytes. ``_rank_port_offset`` separates ``(dp, attn_cp,
-    attn_tp)`` by port instead. Pipeline rank and head splitting have no such
-    separation: two ranks that differ only along one of them derive the same
-    port *and* the same key, so a fetch lands another rank's bytes in pages the
-    model then attends over -- wrong output with nothing logged.
+    A block key is ``sha256(token ids)#<segment>`` and a hint carries an endpoint
+    plus page hashes, so nothing on the wire says which model slice produced the
+    bytes; ``_rank_port_offset`` separates ``(dp, attn_cp, attn_tp)`` by port
+    instead. Pipeline rank and head splitting have no such separation -- same port
+    *and* same key, so the fetch lands another rank's bytes in pages the model
+    attends over.
     """
 
     def _config(self, **overrides) -> HiCacheStorageConfig:
@@ -669,11 +621,9 @@ class UnaddressableParallelismTest(unittest.TestCase):
     def test_tp_lcm_size_alone_is_not_what_gets_rejected(self):
         """Only ``should_split_heads`` means the keys actually differ per rank.
 
-        ``cache_controller`` accepts ``tp_lcm_size`` on every deployment but
-        resolves it to ``should_split_heads=False`` for a rank-replicated model
-        (MLA) or a layout other than ``page_head`` -- there the pages are
-        identical across ranks and the pooled key is correct. Keying the guard
-        on ``tp_lcm_size`` would refuse those deployments.
+        ``cache_controller`` accepts ``tp_lcm_size`` everywhere but resolves it to
+        False for a rank-replicated model (MLA) or a non-``page_head`` layout, where
+        the pooled key is correct. Keying the guard on it would refuse those.
         """
         store = KVCRStore(
             self._config(tp_lcm_size=8, should_split_heads=False), mem_pool=None
@@ -691,12 +641,9 @@ class ConcurrentDrainTest(unittest.TestCase):
         self.store._kvcr = self.core
 
     def test_completion_drained_by_the_pump_still_reaches_its_waiter(self):
-        """The exact case _completed_ops exists for.
-
-        The pump drains the queue on its interval, so a get's completion is
-        routinely observed by a thread that is not waiting on it. If the pump
-        dropped it, the waiter would spin to its deadline and report a miss -- a
-        silent recompute, not an error.
+        """The case ``_completed_ops`` exists for: the pump routinely observes a
+        get's completion, and dropping it makes the waiter spin to its deadline and
+        report a miss.
         """
         self.store._register_waiter(101)
         self.core.finish(101, ["seg-a"])
@@ -747,10 +694,9 @@ class ConcurrentDrainTest(unittest.TestCase):
     def test_a_completion_arriving_after_its_waiter_gave_up_is_dropped(self):
         """A timed-out op's late result must not sit in the stash forever.
 
-        Timing out cancels nothing -- ``kvcr.abort()`` is a no-op stub -- so the
-        op stays in flight and may still report, but its waiter is gone and
-        nothing will ever pop it again. Every entry stashed this way is
-        permanent, and the store lives as long as the scheduler.
+        Timing out cancels nothing -- ``kvcr.abort()`` is a no-op stub -- so the op may
+        still report with no waiter left to pop it, and the store lives as long as the
+        scheduler.
         """
         self.store._drain_until(501, timeout_s=0.05)
         self.core.finish(501, ["seg-a"])
@@ -763,16 +709,10 @@ class ConcurrentDrainTest(unittest.TestCase):
     def test_an_op_that_never_reports_leaves_nothing_behind(self):
         """The timeout path must not assume the op eventually reports.
 
-        Measured against the real core in this backend's exact call shape: a
-        remote pull whose source has gone silent parks in KVCR's
-        WAITING_TERMINAL state, left only on a ``write_done`` notification a
-        dead peer never sends. 6/6 such delivers never reported their op handle
-        at all -- not late, never. So any bookkeeping keyed on the *abandoned*
-        handle and pruned when its late result arrives is pruned by an event
-        that does not happen: one permanent entry per timed-out request.
-
-        What turns this red: reintroducing an abandoned-handle tombstone, or any
-        other per-op record that outlives ``_drain_until`` on the timeout path.
+        Measured against the real core: a remote pull whose source went silent parks in
+        WAITING_TERMINAL awaiting a ``write_done`` a dead peer never sends, and 6/6
+        never reported their handle at all. So bookkeeping keyed on the abandoned
+        handle and pruned on its late result is pruned by an event that never happens.
         """
         for handle in range(601, 606):
             self.store._drain_until(handle, timeout_s=0.01)
@@ -786,17 +726,10 @@ class ConcurrentDrainTest(unittest.TestCase):
     def test_a_pump_cannot_poll_between_a_submit_and_its_registration(self):
         """Registration must precede the submit's completion, not follow it.
 
-        ``_poll_once`` drops completions nobody is waiting on, which makes the
-        window between "core hands back a handle" and "caller registers as its
-        waiter" load-bearing. A local-tier hit retires inside that window, so a
-        pump polling there would drop the completion and the caller would sit
-        out the full ``get_timeout_s`` before reporting a miss on an op that
-        succeeded -- turning the fastest path into the slowest one.
-
-        ``_submit_and_wait`` closes the window by holding ``_poll_lock`` across
-        the submit and the registration, which the first assertion checks. The
-        interleaving is forced rather than raced, so registering after the
-        submit instead fails every run.
+        ``_poll_once`` drops completions nobody waits on, and a local-tier hit retires
+        inside that window, so a pump polling there costs the caller a full
+        ``get_timeout_s`` on an op that succeeded. ``_submit_and_wait`` holds
+        ``_poll_lock`` across both; the interleaving is forced, not raced.
         """
         pumped = threading.Event()
 
@@ -837,12 +770,9 @@ class CloseTest(unittest.TestCase):
     def test_the_core_is_not_closed_under_a_pump_stuck_in_a_poll(self):
         """A pump inside poll_completed() is walking state close() frees.
 
-        ``kvcr.close()`` tears down the progress thread and the local tier, so a
-        pump mid-``poll_completed()`` is reading freed KVCR state -- a
-        use-after-free reachable through NIXL, not a benign late tick. The pump
-        only ever misses its stop flag while inside a poll, so a join that times
-        out is precisely the dangerous case, and the old fire-and-forget
-        ``join(timeout=...)`` closed anyway.
+        ``kvcr.close()`` tears down the progress thread and the local tier, so this is
+        a use-after-free reachable through NIXL. The pump only misses its stop flag
+        while inside a poll, so a join that times out is precisely the dangerous case.
         """
         wedged = threading.Event()
         store, core = self._store_with_pump(wedged.wait)
@@ -878,13 +808,9 @@ class HintRequestIdTest(unittest.TestCase):
     def test_two_gets_sharing_a_prefix_get_different_ids(self):
         """Same-prefix concurrency is the normal case, and it used to collide.
 
-        ``batch_get_v2`` registers the hint under this id and unregisters it in a
-        ``finally``. When the id was derived from the hint's content, two
-        concurrent requests for the *same* prefix produced the same id, so
-        whichever finished first called ``discard_hint`` on the id the other was
-        still fetching against. The loser's remaining segments then find no
-        hint, report MISS, and get recomputed: a silent halving of the hit rate
-        under exactly the load the feature exists for.
+        With the id derived from the hint's content, whichever request finished first
+        called ``discard_hint`` on the id the other was still fetching against; the
+        loser's remaining segments then miss and get recomputed.
         """
         store = _store(0, 1)
         extra_info = _hint_extra_info("tcp://10.0.0.7:25000")
@@ -901,13 +827,9 @@ class HintRequestIdTest(unittest.TestCase):
 class RemoteFailureTest(unittest.TestCase):
     """A remote source that is slow, gone, or lying must degrade to recompute.
 
-    Every one of these is a normal event for a P2P cache: the source is another
-    server that can be restarted, drained, or simply evict the prefix between
-    the router's index and our fetch. The requirement is uniform -- report the
-    pages as not-loaded and return. Raising out of ``batch_get_v2`` would kill
-    the prefetch thread that HiCache never restarts, taking down *local* L3
-    caching for the life of the process; hanging would stall it just as
-    permanently.
+    All three are normal for a P2P cache. Raising out of ``batch_get_v2`` kills the
+    prefetch thread HiCache never restarts, taking down *local* L3 for the life of
+    the process; hanging stalls it just as permanently.
     """
 
     def setUp(self) -> None:
@@ -920,10 +842,8 @@ class RemoteFailureTest(unittest.TestCase):
         return SimpleNamespace(name=PoolName.KV, keys=keys)
 
     def test_a_source_that_never_answers_reports_a_miss_rather_than_hanging(self):
-        """The dead-source case: the router named a peer that has since been
-        killed, so no completion ever arrives. ``kvcr.abort()`` cancels nothing,
-        so the deadline in ``_drain_until`` is the only thing between a dead
-        peer and a permanently wedged prefetch thread.
+        """``kvcr.abort()`` cancels nothing, so ``_drain_until``'s deadline is all
+        that stands between a dead peer and a permanently wedged prefetch thread.
         """
         self.store._kvcr = FakeKVCR()  # finish() is never called
         self.store._host_descriptors = lambda transfer: (
@@ -942,13 +862,9 @@ class RemoteFailureTest(unittest.TestCase):
         self.assertLess(elapsed, self.store._config.get_timeout_s + 5.0)
 
     def test_a_partially_delivered_page_counts_as_not_loaded(self):
-        """A page is all-or-nothing: its segments are not independently usable.
-
-        One host page fans out into ``segments_per_page`` block keys, and
-        attention reads the whole page. Reporting True when only some arrived
-        would tell HiCache the page is cached, and the model would attend over
-        whatever was in the un-filled half -- silent wrong output rather than a
-        slow correct one.
+        """A page is all-or-nothing: attention reads the whole page, so reporting
+        True when only some of its segments arrived makes the model attend over
+        whatever was in the un-filled half.
         """
         self.store._segments_per_page = 2
         core = FakeKVCR()
@@ -971,9 +887,8 @@ class RemoteFailureTest(unittest.TestCase):
         self.assertEqual(results, [False])
 
     def test_an_unparseable_hint_is_ignored_rather_than_raising(self):
-        """The hint crosses a process and a repository boundary, so a schema
-        skew is a deployment reality, not a programming error. The safe reading
-        of a hint we cannot decode is that there is no hint.
+        """The hint crosses a process and a repository boundary, so schema skew is
+        a deployment reality; the safe reading of an undecodable hint is no hint.
         """
         extra_info = HiCacheStorageExtraInfo(
             extra_info={ROUTER_HINT_KEY: {"source_control_endpoint": 17}}
@@ -982,11 +897,8 @@ class RemoteFailureTest(unittest.TestCase):
         self.assertIsNone(self.store._parse_hint(extra_info))
 
     def test_a_hint_covering_nothing_leaves_the_prefix_at_zero(self):
-        """``batch_exists_v2`` is the gate: the controller only issues gets for
-        the prefix reported here, and it allocates host memory for it. Counting
-        a page whose hash the hint does not cover would reserve memory for pages
-        that then miss, released only after a full deliver round trip against a
-        source that never had them.
+        """``batch_exists_v2`` is the gate: the controller allocates host memory
+        for the prefix reported here, released only after a full deliver round trip.
         """
         self.store._kvcr = FakeKVCR()
         self.store._locally_resident = lambda segment_keys: False
@@ -1004,19 +916,14 @@ class RemoteFailureTest(unittest.TestCase):
 class RaisingCoreTest(unittest.TestCase):
     """A core that raises must degrade to a miss, never out of the store.
 
-    ``RemoteFailureTest`` covers a *peer* that fails, which the core reports
-    through its normal result path. This is the other source: the core itself
-    raising. It arrives as an exception rather than a result, so none of the
-    miss-reporting logic runs.
+    ``RemoteFailureTest`` covers a *peer* failing, which the core reports through
+    its normal result path. This is the core itself raising, which skips that path
+    entirely, and nothing above this backend catches it:
+    ``test_hicache_storage_thread_survival.py`` shows each HiCache storage loop
+    ending on the first exception, unsupervised, taking the only
+    ``append_host_mem_release`` and ``ack_backup_queue`` producers with it.
 
-    Nothing above this backend catches it.
-    ``test_hicache_storage_thread_survival.py`` shows what happens then: each
-    HiCache storage loop ends on the first exception, they are unsupervised
-    daemons so nothing restarts them, and they take the only
-    ``append_host_mem_release`` and ``ack_backup_queue`` producers with them.
-
-    What turns these red: removing a ``@_fail_closed`` decorator from any
-    HiCacheStorage entry point.
+    What turns these red: removing a ``@_fail_closed`` decorator.
     """
 
     def setUp(self) -> None:
@@ -1042,11 +949,8 @@ class RaisingCoreTest(unittest.TestCase):
         self.assertEqual(self.store.stats()["faults_batch_get_v2"], 1)
 
     def test_a_raising_query_reports_no_available_prefix(self):
-        """``batch_exists_v2`` gates the whole path, so its miss must be zero.
-
-        Any other answer is worse than a miss: the controller allocates host
-        memory for the prefix reported here and only releases it after a full
-        deliver round trip.
+        """``batch_exists_v2`` gates the whole path, and any answer but zero makes
+        the controller allocate host memory it releases only after a deliver round trip.
         """
         result = self.store.batch_exists_v2(["page-a", "page-b"])
 
@@ -1054,11 +958,9 @@ class RaisingCoreTest(unittest.TestCase):
         self.assertEqual(self.store.stats()["faults_batch_exists_v2"], 1)
 
     def test_the_v1_shapes_survive_it_too(self):
-        """``batch_*_v1`` is what HiRadixCache calls, and it has its own shape.
-
-        v1 returns a flat list and ``batch_exists`` an int, so a guard that only
-        covered v2 would return v2's dict here and the caller would read it as
-        an unexpected type rather than as a miss.
+        """``batch_*_v1`` is what HiRadixCache calls and has its own shape: a flat
+        list, and an int from ``batch_exists``. A v2-only guard returns a dict the
+        caller reads as an unexpected type rather than as a miss.
         """
         self.assertEqual(
             self.store.batch_set_v1(["a", "b"], torch.arange(2)), [False, False]
@@ -1070,9 +972,8 @@ class RaisingCoreTest(unittest.TestCase):
         self.assertFalse(self.store.exists("a"))
 
     def test_a_repeating_fault_is_counted_every_time_but_logged_once(self):
-        """These faults repeat once per prefetch. A traceback per occurrence
-        would be the loudest thing in the log and say nothing new after the
-        first, but dropping the count would hide how bad it is.
+        """These faults repeat once per prefetch: a traceback each would say
+        nothing new after the first, and dropping the count would hide how bad it is.
         """
         with self.assertLogs(kvcr_store.__name__, "WARNING") as logs:
             for _ in range(5):
@@ -1084,10 +985,8 @@ class RaisingCoreTest(unittest.TestCase):
     def test_a_raising_discard_hint_does_not_lose_a_completed_fetch(self):
         """The pages are already in host memory when ``discard_hint`` runs.
 
-        It sits in a ``finally`` after every transfer has completed, so letting
-        it raise would convert a fetch that succeeded into a recompute -- and on
-        the exception path it would replace the original fault with a less
-        informative one.
+        It sits in a ``finally`` after every transfer completed, so letting it raise
+        converts a successful fetch into a recompute.
         """
         core = FakeKVCR()
         core.discard_hint = _raise_fault
@@ -1116,13 +1015,9 @@ class StatsTest(unittest.TestCase):
     """The counters that make a silent remote path diagnosable."""
 
     def test_a_hinted_get_and_an_unhinted_one_are_counted_apart(self):
-        """These two look identical downstream and have opposite causes.
-
-        No hint means the router did not name a source -- an upstream fact. A
-        hint that still loads nothing means the fetch failed, which is ours.
-        Both end as "cache miss" in every metric sglang exports, so without this
-        split the first symptom of a broken remote path is an unattributable
-        throughput regression.
+        """These look identical downstream and have opposite causes: no hint is an
+        upstream fact, a hint that loads nothing is ours. Both end as "cache miss" in
+        every metric sglang exports.
         """
         store = _store(0, 1)
         store._kvcr = SimpleNamespace(submit_hint=lambda *a, **k: None)
@@ -1135,13 +1030,9 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(stats["get_without_hint"], 1)
 
     def test_a_policy_drop_and_a_failure_are_counted_apart(self):
-        """DROPPED and FAILED are both falsy, and mean opposite things.
-
-        ``OpEntryResult.success`` is ``status is SUCCESS``, so a block the policy
-        declined because the tier is full reads identically to a block whose
-        transfer broke. The first is the tier working as configured; the second
-        is a defect. Without this split, tuning a policy until it drops more
-        looks exactly like introducing a fault.
+        """DROPPED and FAILED are both falsy and mean opposite things: a tier
+        working as configured versus a defect. Without the split, tuning a policy until
+        it drops more looks exactly like introducing a fault.
         """
         store = _store(0, 1)
 
@@ -1162,10 +1053,9 @@ class StatsTest(unittest.TestCase):
 class PolicySelectionTest(unittest.TestCase):
     """The local-tier policy is named by config, never left to the core.
 
-    The core's default is not a stable interface: it was FIFO through kvcr
-    ``abb13bf`` and LRU as of ``e3a816e``. An unchanged config therefore re-tunes
-    eviction on a core bump, which silently invalidates any throughput number
-    taken before it.
+    The core's default is not a stable interface -- FIFO through kvcr ``abb13bf``,
+    LRU as of ``e3a816e`` -- so an unchanged config re-tunes eviction on a core
+    bump and silently invalidates any throughput number taken before it.
     """
 
     def test_default_is_explicit_not_inherited(self):
@@ -1175,27 +1065,23 @@ class PolicySelectionTest(unittest.TestCase):
     def test_builtin_names_match_the_core_classes(self):
         """These strings are also vLLM's ``_BUILTIN_POLICIES`` keys.
 
-        Both engines' configs are read by the same people comparing the same
-        arms, so a name has to mean one thing across them; and each maps to a
-        class this repo does not own.
+        Both engines' configs are read by the same people comparing the same arms, and
+        each maps to a class this repo does not own.
         """
         self.assertIs(kvcr_store._resolve_policy("fifo").__class__, FIFOPolicy)
         self.assertIs(kvcr_store._resolve_policy("lru").__class__, LRUPolicy)
 
     def test_an_unknown_bare_name_is_rejected_with_the_valid_ones(self):
-        """A typo must not fall through to the core's default -- silently
-        ignoring it is the whole failure this config exists to prevent, and the
-        misconfiguration is invisible afterwards.
+        """A typo must not fall through to the core's default -- silently ignoring
+        it is the whole failure this config exists to prevent.
         """
         with self.assertRaises(ValueError) as caught:
             kvcr_store._resolve_policy("lfu")
         self.assertIn("lru", str(caught.exception))
 
     def test_a_qualified_path_to_a_non_policy_is_rejected(self):
-        """An external policy is imported by path, so the type is unchecked.
-
-        Handing the core a non-policy object fails later, from inside a
-        placement decision on a prefetch, where it reads as a core bug.
+        """An external policy is imported by path, so the type is unchecked, and a
+        non-policy object fails later from inside a placement decision.
         """
         with self.assertRaises(TypeError):
             kvcr_store._resolve_policy("collections.OrderedDict")
@@ -1205,12 +1091,10 @@ class PolicySelectionTest(unittest.TestCase):
 class SourcePumpFaultToleranceTest(unittest.TestCase):
     """The pump is what makes this worker usable as a P2P source.
 
-    ``_poll_completed`` is what advances a peer's ``start_write`` through pin and
-    transfer, and on an otherwise idle worker the pump is its only caller. A
-    pump that exits on one transient NIXL or ZMQ error retires the worker as a
-    source for the life of the process: nothing restarts the thread, the engine
-    keeps serving inference, and peers see only that this worker never has
-    anything -- indistinguishable from a cold cache.
+    ``_poll_completed`` advances a peer's ``start_write`` through pin and transfer,
+    and on an idle worker the pump is its only caller. A pump that exits on one
+    transient NIXL or ZMQ error retires the worker as a source for the life of the
+    process, while the engine keeps serving and peers see only a cold cache.
     """
 
     def _run_pump(self, store, poll, *, stop_after: float = 0.5) -> None:
@@ -1243,9 +1127,8 @@ class SourcePumpFaultToleranceTest(unittest.TestCase):
     def test_a_persistent_fault_ends_the_pump_and_is_visible(self):
         """The negative branch: retrying forever on a dead core is not a fix.
 
-        Without this, "survive faults" could degrade into an unconditional spin
-        that never reports. The counter is the only trace an operator gets --
-        past this point the worker is silently source-dead.
+        The counter is the only trace an operator gets -- past this point the worker is
+        silently source-dead.
         """
         calls = []
 

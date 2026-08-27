@@ -2,30 +2,24 @@
 
 ``prefetch_thread_func``, ``prefetch_io_aux_func`` and ``backup_thread_func``
 each wrap their body in ``except Empty: continue`` and nothing else, so any
-other exception escapes the loop and ends the thread. They are daemon threads
-with no supervisor, so nothing restarts them: one exception disables L2/L3 for
-the life of the process.
+other exception ends the thread. They are unsupervised daemons, so one exception
+disables L2/L3 for the life of the process.
 
-Worse, it does not merely stop caching -- it leaks the resources those loops
-were responsible for returning:
+It does not merely stop caching -- it leaks what those loops were responsible
+for returning. ``prefetch_io_aux_func`` is the only caller of
+``append_host_mem_release``, so reserved host pages are never freed and
+``prefetch_tokens_occupied`` never falls until the rate limiter blocks every
+future prefetch. ``backup_thread_func`` is the only producer for
+``ack_backup_queue``, which drives ``entry.release_host()``, so every backed-up
+node holds its host reference forever.
 
-- ``prefetch_io_aux_func`` is the only caller of ``append_host_mem_release`` on
-  the prefetch path. Without it the host pages a prefetch reserved are never
-  freed and ``prefetch_tokens_occupied`` never falls, so once the total crosses
-  ``prefetch_capacity_limit`` the rate limiter blocks every future prefetch --
-  the leak ``prefetch_rate_limited`` already warns about.
-- ``backup_thread_func`` is the only producer for ``ack_backup_queue``, which is
-  what drives ``entry.release_host()`` in ``HiRadixCache``'s drain. Without it
-  every backed-up node holds its host reference forever.
-
-None of this raises anywhere visible. The engine keeps serving, every request
+None of it raises anywhere visible: the engine keeps serving, every request
 reports an ordinary cache miss, and the host pool quietly drains. That is what
 obliges every backend -- including KVCR's -- to guard its own surface.
 
 What turns this red: adding a general ``except Exception`` to those loops
 upstream. That would be a fix, and these tests should then be replaced by ones
-asserting the loop survives -- they are not a claim that the current behaviour
-is desirable, only that it is what backends must be written against.
+asserting the loop survives.
 
     python -m pytest test/registered/mem_cache/test_hicache_storage_thread_survival.py -v
 """
@@ -48,9 +42,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _RaisingBackend:
     """A storage backend whose every entry point raises after N calls.
 
-    Modelled on a transient core fault rather than a permanently broken
-    backend: the first ``ok_calls`` succeed, so a test can show the loop was
-    alive and working right up to the exception.
+    A transient core fault rather than a permanently broken backend: the first
+    ``ok_calls`` succeed, so a test can show the loop was alive right up to it.
     """
 
     def __init__(self, ok_calls: int = 0) -> None:
@@ -80,8 +73,8 @@ class _RaisingBackend:
 def _controller(backend) -> HiCacheController:
     """The narrowest controller the three loop functions touch.
 
-    Built with ``__new__``: the real constructor allocates device memory and
-    starts several threads, none of which these loops use.
+    Built with ``__new__``: the real constructor allocates device memory and starts
+    threads none of these loops use.
     """
     cc = HiCacheController.__new__(HiCacheController)
     cc.storage_backend = backend
@@ -123,10 +116,9 @@ def _operation(n_pages: int = 2):
 def _run_until_idle(target, stop_event: threading.Event, settle_s: float = 0.5):
     """Run one loop function in a thread and report whether it survived.
 
-    The loops block on a 1 s queue timeout, so ``settle_s`` has to be shorter
-    than that: a thread that is merely *waiting* is still alive at 0.5 s, while
-    one that took an exception has already exited. Returns the thread so the
-    caller can assert on ``is_alive()``.
+    The loops block on a 1 s queue timeout, so ``settle_s`` must be shorter: a
+    thread merely waiting is still alive at 0.5 s, one that took an exception has
+    already exited.
     """
     thread = threading.Thread(target=target, daemon=True)
     thread.start()
@@ -176,8 +168,8 @@ class PrefetchThreadSurvivalTest(unittest.TestCase):
     def test_a_raising_batch_exists_kills_the_prefetch_thread(self):
         """``_storage_hit_query`` runs unguarded inside ``prefetch_thread_func``.
 
-        The operation is neither put on the hit queue nor revoked, so the
-        scheduler side is left with a prefetch it will never hear about again.
+        The operation is neither put on the hit queue nor revoked, so the scheduler is
+        left with a prefetch it will never hear about again.
         """
         cc = _controller(_RaisingBackend(ok_calls=0))
         cc.prefetch_queue.put(_operation())
@@ -191,10 +183,8 @@ class PrefetchThreadSurvivalTest(unittest.TestCase):
     def test_a_raising_get_kills_the_io_aux_thread_and_leaks_host_pages(self):
         """``prefetch_io_aux_func`` is the only caller that frees reserved pages.
 
-        ``append_host_mem_release`` sits *after* ``_page_transfer`` in the loop
-        body, so an exception from the backend skips it. The reservation those
-        pages represent is what ``prefetch_capacity_limit`` counts against, and
-        nothing else ever gives it back.
+        ``append_host_mem_release`` sits *after* ``_page_transfer``, so an exception
+        skips it, and the reservation is what ``prefetch_capacity_limit`` counts against.
         """
         cc = _controller(_RaisingBackend(ok_calls=0))
         cc.prefetch_buffer.put(_operation())

@@ -2,18 +2,14 @@
 
 A dynamo router hint, parsed by our :class:`RouterHint` and matched by our
 :class:`StrKeyHintAdapter`, must drive the real ``nvidia-kvcr`` core to fetch a
-remote prefix from a peer. Two real ``KVCR`` instances (target + source) are
-wired to in-process fakes for NIXL, the ZMQ control channel, and primary pinning
--- the same seams the core's own unit tests fake -- and assert that:
+remote prefix from a peer. Two real ``KVCR`` instances are wired to in-process
+fakes for NIXL, the ZMQ control channel, and primary pinning -- the same seams
+the core'''s own unit tests fake -- and assert that ``submit_hint`` + ``query``
+reports the covered keys FETCHABLE (our adapter'''s ``matches`` is the gate) and
+that ``deliver`` makes the source issue a real NIXL WRITE of those blocks.
 
-  1. ``target.submit_hint(...)`` + ``target.query(keys)`` reports the
-     hint-covered keys as FETCHABLE (our adapter's ``matches`` is the gate), and
-  2. ``target.deliver(...)`` makes the source issue a real NIXL WRITE of the
-     covered blocks and both sides converge to a SUCCESS op result.
-
-CPU-only: no torch, GPU, or real NIXL. This does not cover the ``KVCRStore``
-host-pool wiring (that needs a real HostKVCache), only the hint -> core contract
-that the store's ``_build_kvcr`` depends on.
+CPU-only. Does not cover the ``KVCRStore`` host-pool wiring (that needs a real
+HostKVCache), only the hint -> core contract ``_build_kvcr`` depends on.
 
     python -m pytest test/registered/mem_cache/test_kvcr_router_hint_e2e.py -v
 """
@@ -86,9 +82,9 @@ def _mem_descriptor(addr: int = 128, size: int = 16) -> MemDescriptor:
 class FakePrimaryPinning:
     """The KVCR-to-framework pin triple over an in-memory descriptor table.
 
-    ``request_pin`` is asynchronous by contract, so this fake answers on the very
-    next poll. ``missing_indices`` marks positions the source does NOT hold,
-    which is how partial-prefix delivery is driven.
+    ``request_pin`` is asynchronous by contract, so this answers on the next poll.
+    ``missing_indices`` marks positions the source does NOT hold, which drives
+    partial-prefix delivery.
     """
 
     def __init__(self, missing_indices: Collection[int] = ()):
@@ -260,8 +256,8 @@ def _poll_until(kvcr, predicate, *, timeout: float = 2):
 def _has_outstanding_operations(kvcr) -> bool:
     """Whether the core still owns an in-flight op.
 
-    Replaces the ``has_pending_work()`` the facade used to expose; the count is
-    now core-internal, and the core's own tests read it the same way.
+    Replaces the ``has_pending_work()`` the facade used to expose; the core'''s own
+    tests read it the same way.
     """
     return kvcr._core._outstanding_operations > 0
 
@@ -451,19 +447,17 @@ class TestKVCRRouterHintE2E(unittest.TestCase):
     def test_evicted_block_is_not_served_out_of_the_deposited_host_page(self):
         """After eviction the source declines rather than reading host memory.
 
-        Regression guard. The backend used to answer ``request_pin`` out of a
-        dict of the ``HostKVCache`` descriptors it had handed to ``deposit``,
-        which outlived KVCR's own residency: once the local tier evicted a key,
-        KVCR fell through to the framework callback and got the *host page*
-        back. Nothing on that path errors -- block keys are token hashes with no
-        content check -- so a peer would decode from whatever HiCache had since
-        refilled that page with.
+        The backend used to answer ``request_pin`` out of a dict of the ``HostKVCache``
+        descriptors it handed to ``deposit``, which outlived KVCR'''s own residency: once
+        the local tier evicted a key, KVCR fell through to the framework callback and
+        got the *host page* back. Nothing on that path errors -- block keys are token
+        hashes with no content check -- so a peer decodes from whatever HiCache had
+        since refilled that page with.
 
-        The eviction is load-bearing: while a key is resident,
-        ``_claim_local_dram_sources`` answers first and both the old and the new
-        adapter serve the same slot address. One slot, two deposits, so k1
-        evicts k0; the correct answer is a single-descriptor write covering k1
-        alone, addressed inside KVCR's slot region.
+        The eviction is load-bearing: while a key is resident ``_claim_local_dram_sources``
+        answers first and both adapters serve the same slot address. One slot, two
+        deposits, so k1 evicts k0; the correct answer is a single-descriptor write
+        covering k1 alone, addressed inside KVCR'''s slot region.
         """
         block_size = 16
         source_slots = ctypes.create_string_buffer(block_size)

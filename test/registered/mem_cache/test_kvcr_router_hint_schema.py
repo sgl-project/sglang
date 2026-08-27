@@ -1,19 +1,18 @@
 """Wire-schema conformance for the KV hint the dynamo router sends.
 
-The dynamo router and SGLang name the same KV block two different ways, and the
-seam between them is unforgiving: a mismatch does not raise, it silently makes
-every hint cover zero pages, so a P2P fetch degrades to a full recompute with no
-error anywhere. These tests pin the conversion.
+The dynamo router and SGLang name the same KV block two different ways, and a
+mismatch does not raise -- it silently makes every hint cover zero pages, so a
+P2P fetch degrades to a full recompute with no error anywhere.
 
-SGLang publishes KV events carrying ``hash_str_to_int64(page_hash)`` -- the
-leading 16 hex chars of the SHA256 digest, reinterpreted as a signed int64. The
-router indexes that as ``ExternalSequenceBlockHash(u64)`` and echoes it back in
-the hint as a bare JSON number, so ``page hash -> event int64 -> u64 -> hint ->
-page key`` must land back on the same 16 hex chars the store compares against.
+SGLang publishes KV events carrying ``hash_str_to_int64(page_hash)``: the
+leading 16 hex chars of the SHA256 digest as a signed int64. The router indexes
+it as ``ExternalSequenceBlockHash(u64)`` and echoes it back as a bare JSON
+number, so ``page hash -> event int64 -> u64 -> hint -> page key`` must land
+back on the same 16 hex chars the store compares against.
 
 The hint travels inside the v0.1 KV-hint envelope (dynamo #13134, SGLang RFC
 #36224) as a ``kv.source_locations@1.0`` action; ``EnvelopeTest`` covers that
-outer layer, everything else covers the payload. Needs no ``kvcr`` wheel.
+outer layer. Needs no ``kvcr`` wheel.
 
     python -m pytest test/registered/mem_cache/test_kvcr_router_hint_schema.py -v
 """
@@ -149,22 +148,11 @@ class ParseTest(unittest.TestCase):
         self.assertTrue(hint.covers(f"{_PAGE_HASH}#3"))
         self.assertFalse(hint.covers(f"{_SMALL_PAGE_HASH}#3"))
 
-    def test_uncovered_page_is_rejected(self):
-        hint = RouterHint.maybe_from_extra_info(
-            _extra_info(
-                {
-                    "source_control_endpoint": "tcp://peer:25000",
-                    "block_hashes": [_PAGE_HASH],
-                }
-            )
-        )
-        self.assertFalse(hint.covers(_SMALL_PAGE_HASH))
-
     def test_bad_hash_truncates_rather_than_shifting(self):
         """Hints are root-aligned, so an unreadable entry ends the prefix.
 
-        Dropping it instead would silently renumber every block after it, and
-        the store would fetch the wrong KV for a position it believes matched.
+        Dropping it instead would renumber every block after it, and the store would
+        fetch the wrong KV for a position it believes matched.
         """
         hint = RouterHint.maybe_from_extra_info(
             _extra_info(
@@ -218,11 +206,9 @@ class EnvelopeTest(unittest.TestCase):
         self.assertTrue(hint.covers(_PAGE_HASH))
 
     def test_an_unimplemented_action_does_not_suppress_ours(self):
-        """Actions are independent: one we ignore must not hide one we implement.
-
-        An envelope is a list, and a router is free to add actions for other
-        consumers. Scanning only the first entry would make our fetch depend on
-        the router's action ordering.
+        """Actions are independent, and a router is free to add ones for other
+        consumers. Scanning only the first entry would make our fetch depend on the
+        router's action ordering.
         """
         envelope = _envelope(self._PAYLOAD)
         envelope["actions"].insert(
@@ -274,12 +260,10 @@ class ExtraInfoKeyAgreementTest(unittest.TestCase):
     def test_the_controller_and_the_backend_name_the_same_key(self):
         """The producer and consumer of the hint hold separate literals.
 
-        ``cache_controller`` writes the hint under its own constant so the
-        generic controller does not import a backend, and the KVCR backend
-        reads it under its own. That layering is deliberate, but it means a
-        rename on one side is invisible to the other: every hint would simply
-        stop being found, no fetch would be issued, and the only symptom is
-        that P2P quietly stops working. Nothing else pins the two together.
+        ``cache_controller`` writes the hint under its own constant so the generic
+        controller does not import a backend, and the KVCR backend reads it under its
+        own. A rename on one side is invisible to the other: every hint stops being
+        found, no fetch is issued, and P2P quietly stops working.
         """
         from sglang.srt.managers.cache_controller import _ROUTER_HINT_EXTRA_INFO_KEY
 
