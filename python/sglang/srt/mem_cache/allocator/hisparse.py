@@ -249,6 +249,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
+    # Free grouping is a batching optimization; this allocator opts out because
+    # `free_hisparse` must return the device-buffer slots before the HiSparse
+    # coordinator observes the mapping again. Both hooks are no-ops so `free`
+    # below can stay unconditional.
     def free_group_begin(self):
         return
 
@@ -258,11 +262,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
-            self.logical_attn_allocator.free(free_index)
-            self.free_hisparse(free_index)
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
+        self.logical_attn_allocator.free(free_index)
+        self.free_hisparse(free_index)
         assert (
             self.logical_attn_allocator.available_size()
             <= self.logical_attn_allocator.size
