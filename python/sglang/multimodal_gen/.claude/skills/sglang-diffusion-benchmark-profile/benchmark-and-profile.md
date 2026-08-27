@@ -161,10 +161,10 @@ Eager/BCG/BCG/Eager at `lossless`, then the same sequence at `high`, while
 holding one GPU set and one isolated checkpoint cache. The high+BCG cells test
 whether the combination is actually supported; do not average them when the
 runtime rejects the combination or the helper detects a late quality-fusion
-mount. The helper also hashes every generated artifact, first requires the two
-Eager rows at each quality to agree, then rejects any BCG row whose hash differs
-from that Eager reference. Cleanup occurs only after all eight runs, including
-on failure or interruption:
+mount. The helper hashes every generated image, video, audio, or 3D mesh
+artifact. It first requires the two Eager rows at each quality to agree, then
+rejects any BCG row whose hash differs from that Eager reference. Cleanup occurs
+only after all eight runs, including on failure or interruption:
 
 ```bash
 MODEL_CACHE_ROOT=/path/to/task-owned/model-caches

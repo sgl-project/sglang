@@ -107,7 +107,8 @@ temporal shape. Treat any remaining temporal or conditioning signature miss as
 Eager fallback, not as a valid BCG measurement.
 
 A zero process exit is not sufficient evidence: every accepted row must also
-contain its requested perf dump and a generated image, video, or audio file.
+contain its requested perf dump and a generated image, video, audio, or 3D mesh
+file.
 The helper gives every cell a unique output name and rejects missing artifacts.
 
 On machines with a read-only Hugging Face cache, combine
