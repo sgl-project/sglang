@@ -105,7 +105,7 @@ do
         export GLOO_SOCKET_IFNAME=enp196s0f0
         export STREAMS_PER_DEVICE=32
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${K3_DEEPEP_DECODE_CAPACITY:-128}
         export HCCL_BUFFSIZE=2000
         export DEEPEP_NORMAL_LONG_SEQ_ROUND=64
         export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
@@ -121,7 +121,7 @@ do
         unset ASCEND_RT_VISIBLE_DEVICES
         unset ASCEND_LAUNCH_BLOCKING
 
-        echo "K3 launch: tp=64 dp=${DP_SIZE} gamma=${DSPARK_BLOCK_SIZE} graph_bs=${GRAPH_BS[*]:-disabled}"
+        echo "K3 launch: tp=64 dp=${DP_SIZE} gamma=${DSPARK_BLOCK_SIZE} graph_bs=${GRAPH_BS[*]:-disabled} deepep_capacity=${SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK} radix_cache=off"
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --dist-init-addr 192.168.25.209:5000 --nnodes 4 --node-rank $i \
@@ -138,6 +138,7 @@ do
             --mem-fraction-static 0.75 \
             --max-mamba-cache-size 180 \
             --chunked-prefill-size 16384 \
+            --disable-radix-cache \
             "${GRAPH_ARGS[@]}" \
             --reasoning-parser kimi_k3 \
             --max-running-requests 64 \
