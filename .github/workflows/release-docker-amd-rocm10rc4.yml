@@ -120,11 +120,6 @@ jobs:
   # gfx1250 is a separate job rather than a third leg of the publish matrix:
   # there is no MI450 runner pool, so nothing below consumes this image, and a
   # gfx1250-only build failure must not gate the gfx942/gfx950 validation chain.
-  #
-  # Two flavors exist: the stock one on AMD's SDK Triton, already published, and
-  # _build_triton on the upstream revision the 7.14 image uses. Only the latter is
-  # in the matrix — rebuilding the stock image would republish it under a new date
-  # tag for no change. Add 'gfx1250-rocm10rc4' back here to refresh it.
   publish-gfx1250:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'push' || github.ref == 'refs/heads/rocm10-gfx1250') && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250')
     runs-on: amd-docker-scale
@@ -132,7 +127,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx1250-rocm10rc4_build_triton']
+        gpu_arch: ['gfx1250-rocm10rc4']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -186,7 +181,6 @@ jobs:
 
           case "${{ matrix.gpu_arch }}" in
             gfx1250-rocm10rc4) rocm_tag="rocm10rc4-mi45x" ;;
-            gfx1250-rocm10rc4_build_triton) rocm_tag="rocm10rc4-mi45x_build_triton" ;;
             *)
               echo "Unsupported gfx arch"
               exit 1
