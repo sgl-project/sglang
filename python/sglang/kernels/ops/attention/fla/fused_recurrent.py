@@ -41,7 +41,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    # Tiled GQA head pairing (i_hv % H), matching Qwen3.5/Qwen3-Next GDN weights.
+    # Interleaved (i_hv // (HV//H)) is only correct when HV == H; for HV = 2H it
+    # misroutes v_head 16 to q_head 8 instead of q_head 0, causing garbage output.
+    i_h = i_hv % H
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
             cu_seqlens + i_n + 1
@@ -211,7 +214,10 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    # Tiled GQA head pairing (i_hv % H), matching Qwen3.5/Qwen3-Next GDN weights.
+    # Interleaved (i_hv // (HV//H)) is only correct when HV == H; for HV = 2H it
+    # misroutes v_head 16 to q_head 8 instead of q_head 0, causing garbage output.
+    i_h = i_hv % H
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -436,7 +442,10 @@ def fused_recurrent_kda_packed_decode_kernel(
     so the state decay is a per-K vector ``exp(g)`` rather than a scalar."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    # Tiled GQA head pairing (i_hv % H), matching Qwen3.5/Qwen3-Next GDN weights.
+    # Interleaved (i_hv // (HV//H)) is only correct when HV == H; for HV = 2H it
+    # misroutes v_head 16 to q_head 8 instead of q_head 0, causing garbage output.
+    i_h = i_hv % H
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
@@ -906,7 +915,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    # Tiled GQA head pairing (i_hv % H), matching Qwen3.5/Qwen3-Next GDN weights.
+    # Interleaved (i_hv // (HV//H)) is only correct when HV == H; for HV = 2H it
+    # misroutes v_head 16 to q_head 8 instead of q_head 0, causing garbage output.
+    i_h = i_hv % H
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
             cu_seqlens + i_n + 1
