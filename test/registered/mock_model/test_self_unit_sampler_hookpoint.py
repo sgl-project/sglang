@@ -2,13 +2,12 @@
 
 Instantiating the registered _OracleSampler factory requires a live distributed (TP) group
 plus a populated global ServerArgs, so the forward-path behavior of _OracleSampler is covered
-by the e2e harness rather than this unit file. Here we assert that registration updates the
-CLI choices and that a second install replaces the factory with one bound to the new oracle.
+by the e2e harness rather than this unit file. Here we assert that registration stores the
+backend and that a second install replaces the factory with one bound to the new oracle.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import unittest
 
@@ -16,11 +15,7 @@ os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
 
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
-from sglang.srt.layers.sampler import (
-    _CUSTOM_SAMPLER_FACTORIES,
-    register_sampler_backend,
-)
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,19 +41,6 @@ class TestInstallOracleSampler(CustomTestCase):
         self.assertIs(hook_b.oracle, oracle_b)
         self.assertIsNot(hook_a, hook_b)
         self.assertIsNot(factory_a, factory_b)
-
-    def test_registered_backend_is_available_to_cli(self) -> None:
-        backend = "test_registered_sampler"
-        register_sampler_backend(backend, lambda: None)
-        self.addCleanup(_CUSTOM_SAMPLER_FACTORIES.pop, backend, None)
-
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        sampling_backend_action = next(
-            action for action in parser._actions if action.dest == "sampling_backend"
-        )
-
-        self.assertIn(backend, sampling_backend_action.choices)
 
 
 if __name__ == "__main__":

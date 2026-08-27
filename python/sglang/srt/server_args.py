@@ -77,7 +77,6 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.sampler_registry import get_registered_sampler_backends
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
@@ -9531,7 +9530,6 @@ class ServerArgs:
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         sampling_backend_choices = {"flashinfer", "pytorch", "ascend"}
-        sampling_backend_choices.update(get_registered_sampler_backends())
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             sampling_backend_choices.add("token_oracle")
         parser.add_argument(
