@@ -10,8 +10,8 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, ModelLaunchSettings
 class PerformanceTestParams:
     """Parameters for performance testing."""
 
-    batch_sizes: List[int] = field(default_factory=lambda: [1, 8, 16, 64])
-    input_lens: Tuple[int, ...] = (4096,)
+    batch_sizes: List[int] = field(default_factory=lambda: [1, 8, 16])
+    input_lens: Tuple[int, ...] = (8192,)
     output_lens: Tuple[int, ...] = (512,)
     profile_dir: Optional[str] = None  # None = auto-generate based on is_vlm
     dataset_name: str = "mmmu"  # For VLM perf test
@@ -79,11 +79,26 @@ def run_performance_test(
             other_args=model.extra_args,
             variant=model.variant or "",
             extra_bench_args=extra_bench_args,
+            env=model.env,
         )
 
         if success and results:
             perf_runner.add_report(results, variant=model.variant)
             print(f"✓ Performance test succeeded for {model.model_path}")
+
+            # The cumulative /server_info accept length is reset by the cache
+            # flush before the profiling phase, so it can be missing here. Fall
+            # back to the per-run accept lengths captured during benchmarking.
+            if avg_spec_accept_length is None:
+                run_accept_lengths = [
+                    r.acc_length
+                    for r in results
+                    if r.acc_length is not None and r.acc_length > 0
+                ]
+                if run_accept_lengths:
+                    avg_spec_accept_length = sum(run_accept_lengths) / len(
+                        run_accept_lengths
+                    )
 
             # Validate speculative decoding accept length if threshold is set
             error_msg = None

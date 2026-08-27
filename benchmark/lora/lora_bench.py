@@ -25,7 +25,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from launch_server import LORA_PATH, NUM_LORAS
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -35,10 +34,12 @@ from sglang.bench_serving import (
     _create_bench_client_session,
     calculate_metrics,
     get_request,
-    get_tokenizer,
-    remove_prefix,
-    sample_random_requests,
 )
+from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.utils import get_tokenizer, remove_prefix
+
+DEFAULT_BASE_MODEL_PATH = "meta-llama/Llama-2-7b-hf"
+DEFAULT_NUM_LORAS = 4
 
 global args
 
@@ -76,7 +77,7 @@ async def async_request_openai_completions(
             payload = {
                 "text": prompt,
                 "sampling_params": {"max_new_tokens": request_func_input.output_len},
-                "lora_path": f"lora{random.randint(0, NUM_LORAS - 1)}",
+                "lora_path": f"lora{random.randint(0, args.num_loras - 1)}",
             }
         headers = {"Authorization": ""}
 
@@ -279,6 +280,9 @@ async def benchmark(
         result = {
             "backend": args.backend,
             "request_rate": request_rate,
+            "base_model_path": args.base_model_path,
+            "base_only": args.base_only,
+            "num_loras": args.num_loras,
             "total_input_tokens": metrics.total_input,
             "total_output_tokens": metrics.total_output,
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
@@ -309,6 +313,11 @@ async def benchmark(
         file.write(json.dumps(result) + "\n")
 
     result = {
+        "backend": args.backend,
+        "request_rate": request_rate,
+        "base_model_path": args.base_model_path,
+        "base_only": args.base_only,
+        "num_loras": args.num_loras,
         "duration": benchmark_duration,
         "completed": metrics.completed,
         "total_input_tokens": metrics.total_input,
@@ -349,6 +358,8 @@ def run_benchmark(args_: argparse.Namespace):
     set_ulimit()
     random.seed(args.seed)
     np.random.seed(args.seed)
+    if not args.base_only and args.num_loras <= 0:
+        raise ValueError("--num-loras must be greater than 0 unless --base-only is set")
 
     # Set url
     if args.port is None:
@@ -371,8 +382,8 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Read dataset
     backend = args.backend
-    model_id = args.model = LORA_PATH["base"]
-    tokenizer_id = args.model
+    model_id = args.base_model_path
+    tokenizer_id = args.base_model_path
 
     tokenizer = get_tokenizer(tokenizer_id)
 
@@ -412,6 +423,21 @@ def set_ulimit(target_soft_limit=65535):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Benchmark the online lora serving throughput.")
+    parser.add_argument(
+        "--base-model-path",
+        type=str,
+        default=DEFAULT_BASE_MODEL_PATH,
+        help="Base model path or Hugging Face model ID.",
+    )
+    parser.add_argument(
+        "--num-loras",
+        type=int,
+        default=DEFAULT_NUM_LORAS,
+        help=(
+            "Number of LoRA adapters used by the benchmark. Must match the "
+            "server launcher."
+        ),
+    )
     parser.add_argument(
         "--backend",
         type=str,

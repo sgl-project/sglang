@@ -28,7 +28,7 @@ class FluxVAEArchConfig(VAEArchConfig):
 
 @dataclass
 class Flux2VAEArchConfig(FluxVAEArchConfig):
-    pass
+    decoder_block_out_channels: tuple[int, ...] | None = None
 
 
 @dataclass

@@ -1,0 +1,30 @@
+name: Retag Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Existing image tag (e.g., v0.4.7-cu129-amd64)"
+        required: true
+      target_tag:
+        description: "New tag to apply (e.g., latest)"
+        required: true
+
+jobs:
+  retag:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-22.04
+    environment: "prod"
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Retag image
+        run: |
+          echo "Retagging lmsysorg/sglang:${{ inputs.source_tag }} -> lmsysorg/sglang:${{ inputs.target_tag }}"
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:${{ inputs.target_tag }} \
+            lmsysorg/sglang:${{ inputs.source_tag }}

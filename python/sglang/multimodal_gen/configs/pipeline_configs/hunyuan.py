@@ -18,6 +18,10 @@ from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
+    TextConditioningOutput,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
 )
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
@@ -46,23 +50,37 @@ def llama_preprocess_text(prompt: str) -> str:
     return prompt_template_video["template"].format(prompt)
 
 
-def llama_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.tensor:
+def llama_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> TextConditioningOutput:
     hidden_state_skip_layer = 2
     assert outputs.hidden_states is not None
     hidden_states: tuple[torch.Tensor, ...] = outputs.hidden_states
-    last_hidden_state: torch.tensor = hidden_states[-(hidden_state_skip_layer + 1)]
+    last_hidden_state: torch.Tensor = hidden_states[-(hidden_state_skip_layer + 1)]
     crop_start = prompt_template_video.get("crop_start", -1)
     last_hidden_state = last_hidden_state[:, crop_start:]
-    return last_hidden_state
+    attention_mask = _text_inputs.attention_mask.to(
+        device=last_hidden_state.device, dtype=torch.bool
+    )
+    if crop_start < 0:
+        attention_mask = attention_mask[:, crop_start:]
+    else:
+        attention_mask = attention_mask[
+            :, crop_start : crop_start + last_hidden_state.shape[1]
+        ]
+    seq_lens = [int(x) for x in attention_mask.to(torch.int64).sum(dim=1).tolist()]
+    return TextConditioningOutput(last_hidden_state, attention_mask, seq_lens)
 
 
-def clip_preprocess_text(prompt: str) -> str:
-    return prompt
-
-
-def clip_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.tensor:
-    pooler_output: torch.tensor = outputs.pooler_output
-    return pooler_output
+def clip_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> TextConditioningOutput:
+    pooler_output: torch.Tensor = outputs.pooler_output
+    batch_size = int(pooler_output.shape[0])
+    prompt_embeds_mask = torch.ones(
+        (batch_size, 1), dtype=torch.bool, device=pooler_output.device
+    )
+    return TextConditioningOutput(pooler_output, prompt_embeds_mask, [1] * batch_size)
 
 
 @dataclass
@@ -84,8 +102,8 @@ class HunyuanConfig(PipelineConfig):
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (LlamaConfig(), CLIPTextConfig())
     )
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (llama_preprocess_text, clip_preprocess_text)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (llama_preprocess_text, None)
     )
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (llama_postprocess_text, clip_postprocess_text))
@@ -102,6 +120,37 @@ class HunyuanConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        if encoder_index == 1:
+            return outputs.pooler_output
+        return None
+
+    def get_pos_prompt_embeds(self, batch):
+        return batch.prompt_embeds[0]
+
+    def get_neg_prompt_embeds(self, batch):
+        return batch.negative_prompt_embeds[0]
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        prompt_attention_mask = batch.prompt_attention_mask[0]
+        return {
+            "encoder_attention_mask": prompt_attention_mask,
+            "encoder_hidden_states_mask": prompt_attention_mask,
+            "pooled_projections": (
+                batch.pooled_embeds[0] if batch.pooled_embeds else None
+            ),
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        negative_attention_mask = batch.negative_attention_mask[0]
+        return {
+            "encoder_attention_mask": negative_attention_mask,
+            "encoder_hidden_states_mask": negative_attention_mask,
+            "pooled_projections": (
+                batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
+            ),
+        }
+
 
 @dataclass
 class FastHunyuanConfig(HunyuanConfig):
@@ -112,3 +161,8 @@ class FastHunyuanConfig(HunyuanConfig):
 
     # No need to re-specify guidance_scale or embedded_cfg_scale as they
     # already have the desired values from HunyuanConfig
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_components=("vae",),
+        )

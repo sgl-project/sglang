@@ -4,8 +4,6 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -28,6 +26,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -190,7 +189,7 @@ class PhiMoE(nn.Module):
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -248,8 +247,8 @@ class PhiMoEAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
+        attn_tp_rank = get_parallel().attn_tp_rank
+        attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
@@ -336,7 +335,7 @@ class PhiMoEDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         self.self_attn = PhiMoEAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -349,7 +348,7 @@ class PhiMoEDecoderLayer(nn.Module):
             layer_id=layer_id,
             attention_bias=config.attention_bias,
             quant_config=quant_config,
-            rope_scaling=config.rope_scaling,
+            rope_scaling=config.rope_parameters,
             prefix=add_prefix("self_attn", prefix),
         )
         self.block_sparse_moe = PhiMoE(

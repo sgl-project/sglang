@@ -1,3 +1,8 @@
+from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+    AscendTPCombineInput,
+    AscendTPDispatcher,
+    AscendTPDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -20,11 +25,27 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
     FlashinferDispatcher,
     FlashinferDispatchOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
     MooncakeDispatchOutput,
     MooncakeEPDispatcher,
+)
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    MoriEPDispatcher,
+    MoriEPLLCombineInput,
+    MoriEPLLDispatchOutput,
+    MoriEPNormalCombineInput,
+    MoriEPNormalDispatchOutput,
+)
+from sglang.srt.layers.moe.token_dispatcher.nixl import (
+    NixlEPCombineInput,
+    NixlEPDispatcher,
+    NixlEPDispatchOutput,
+)
+from sglang.srt.layers.moe.token_dispatcher.pplx import (
+    PplxCombineInput,
+    PplxDispatcher,
+    PplxDispatchOutput,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -46,6 +67,17 @@ __all__ = [
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",
+    "MoriEPNormalDispatchOutput",
+    "MoriEPNormalCombineInput",
+    "MoriEPLLDispatchOutput",
+    "MoriEPLLCombineInput",
+    "MoriEPDispatcher",
+    "NixlEPCombineInput",
+    "NixlEPDispatchOutput",
+    "NixlEPDispatcher",
+    "PplxCombineInput",
+    "PplxDispatchOutput",
+    "PplxDispatcher",
     "StandardDispatcher",
     "StandardDispatchOutput",
     "StandardCombineInput",
@@ -55,5 +87,7 @@ __all__ = [
     "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
-    "NpuFuseEPDispatcher",
+    "AscendTPDispatcher",
+    "AscendTPDispatchOutput",
+    "AscendTPCombineInput",
 ]

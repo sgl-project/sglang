@@ -44,6 +44,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
     flatten_nested_list,
 )
@@ -53,10 +54,13 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import logger
+from sglang.srt.utils import get_device, logger
 
 try:
-    from transformers import LogitsWarper
+    # `LogitsWarper` was removed in transformers v4.48 (merged into
+    # `LogitsProcessor`, same `__call__(input_ids, scores)` contract). Alias it
+    # so the annotations and `_tts_deps` below stay valid.
+    from transformers.generation import LogitsProcessor as LogitsWarper
     from vector_quantize_pytorch import GroupedResidualFSQ
 
     _tts_deps = True
@@ -1513,7 +1517,7 @@ class MiniCPMO(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
         # Get all special token IDs
@@ -1803,6 +1807,10 @@ class MiniCPMO(MiniCPMBaseModel):
         return audio_embs
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
         # list of tensors
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(

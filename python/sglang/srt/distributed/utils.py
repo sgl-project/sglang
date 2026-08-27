@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/utils.py
 
 # Copyright 2023 The vLLM team.
@@ -16,6 +18,36 @@ import torch
 from torch.distributed import TCPStore
 
 logger = logging.getLogger(__name__)
+
+
+def set_global_tcp_store(store: TCPStore) -> None:
+    """Install the shared TCPStore created during distributed initialization;
+    the handle lives on ``ctx.resources``."""
+    from sglang.srt.runtime_context import get_resources
+
+    get_resources().tcp_store = store
+    logger.info("Global TCPStore has been set")
+
+
+def get_global_tcp_store() -> Optional[TCPStore]:
+    """Get the existing global TCPStore.
+
+    This function provides access to the shared TCPStore instance that was
+    created during distributed initialization. All components (like NIXL buffers)
+    should use this same store for coordination.
+
+    Returns:
+        The global TCPStore instance, or None if not initialized yet.
+    """
+    from sglang.srt.runtime_context import get_resources
+
+    store = get_resources().tcp_store
+    if store is None:
+        logger.warning(
+            "Global TCPStore not found. Make sure init_distributed_environment "
+            "was called with a tcp:// init method."
+        )
+    return store
 
 
 def ensure_divisibility(numerator, denominator):

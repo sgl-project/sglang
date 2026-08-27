@@ -1,28 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# Adapted from
-# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/solar.py
 from collections.abc import Iterable
 from typing import Any, List, Optional, Tuple, Union
 
@@ -30,8 +8,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -54,7 +31,32 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+
+# Adapted from
+# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
+# Copyright 2023 The vLLM team.
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/solar.py
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class SolarMLP(nn.Module):
@@ -115,7 +117,7 @@ class SolarAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -194,8 +196,7 @@ class SolarDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
 
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
@@ -362,8 +363,8 @@ class SolarModel(nn.Module):
         return hidden_states
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         for layer_idx, scaling_factor in kv_cache_scales_loader(
             quantization_param_path,
             tp_rank,

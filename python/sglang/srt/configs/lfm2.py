@@ -20,7 +20,12 @@ from transformers import CONFIG_MAPPING
 from transformers import Lfm2Config as HFLfm2Config
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -58,40 +63,38 @@ class Lfm2Config(HFLfm2Config):
         LFM2 uses ShortConv layers with a small fixed-size cache (kernel_size - 1).
         Unlike full Mamba2 models, LFM2 only uses the conv state, not SSM temporal state.
         """
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         conv_layer_ids = self.linear_layer_ids
         if not conv_layer_ids:
             return None
 
         hidden_size = self.hidden_size
-        # conv_L_cache in config is kernel_size (e.g., 3)
         conv_kernel = int(self.conv_L_cache)
-        L_cache = conv_kernel - 1  # actual cache size (e.g., 2 for kernel=3)
 
-        # get_attention_tp_size() requires initialization, default to 1 if not available
+        # get_parallel().attn_tp_size requires initialization, default to 1 if not available
         try:
-            tp_size = get_attention_tp_size()
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 
         # For ShortConv layers, we use a simplified Mamba2StateShape
         # LFM2 doesn't use SSM state (state_size=0), only conv state
+        # We pass num_heads=tp_size so divide(tp_size, tp_size)=1 always works.
+        # Since state_size=0, the temporal state shape has zero elements anyway.
         shape = Mamba2StateShape.create(
             tp_world_size=tp_size,
             intermediate_size=hidden_size,
             n_groups=1,  # ShortConv doesn't use grouping
-            num_heads=1,  # ShortConv is not multi-head
+            num_heads=tp_size,  # Ensures divide works; temporal state is empty anyway
             head_dim=hidden_size,  # Conv operates on full hidden dim
             state_size=0,  # No SSM temporal state for ShortConv
             conv_kernel=conv_kernel,
         )
 
-        # Uses default mamba2_state_dtype() which reads SGLANG_MAMBA_CONV_DTYPE env var
-        # (defaults to bfloat16). Set SGLANG_MAMBA_CONV_DTYPE=float16 for fp16 inference.
         return Mamba2CacheParams(
             shape=shape,
             layers=conv_layer_ids,
+            dtype=mamba2_state_dtype(self),
         )
 
 

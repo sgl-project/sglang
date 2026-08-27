@@ -14,6 +14,7 @@ from fastapi.responses import ORJSONResponse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import Hf3fsMetadataInterface
 
 # --- Configuration ---
@@ -115,7 +116,7 @@ class GlobalMetadataState:
 
     def __init__(self, persistence_path: Optional[str], save_interval: int):
         self.global_lock = threading.RLock()
-        self.ranks: Dict[int, RankMetadata] = {}
+        self.ranks: Dict[str, RankMetadata] = {}
         self.persistence_path = Path(persistence_path) if persistence_path else None
         self.save_interval = save_interval
         self.save_timer: Optional[threading.Timer] = None
@@ -132,13 +133,14 @@ class GlobalMetadataState:
                 persisted_data = json.load(f)
 
             with self.global_lock:
-                for rank_id_str, data in persisted_data.items():
-                    rank_id = int(rank_id_str)
+                for key_str, data in persisted_data.items():
+                    if ":" not in key_str:
+                        key_str = f"{key_str}:kv"  # For backward compatibility
                     num_pages = data["num_pages"]
                     rank_meta = RankMetadata(num_pages)
                     rank_meta.free_pages = data["free_pages"]
                     rank_meta.key_to_index = OrderedDict(data["key_to_index"])
-                    self.ranks[rank_id] = rank_meta
+                    self.ranks[key_str] = rank_meta
                 logging.info(
                     f"Successfully loaded metadata for {len(self.ranks)} ranks."
                 )
@@ -156,9 +158,9 @@ class GlobalMetadataState:
         logging.info("Persisting metadata to disk...")
         with self.global_lock:
             serializable_state = {}
-            for rank_id, rank_meta in self.ranks.items():
+            for key_str, rank_meta in self.ranks.items():
                 with rank_meta.lock:
-                    serializable_state[rank_id] = {
+                    serializable_state[key_str] = {
                         "num_pages": rank_meta.num_pages,
                         "free_pages": rank_meta.free_pages,
                         "key_to_index": list(rank_meta.key_to_index.items()),
@@ -211,14 +213,19 @@ class Hf3fsMetadataServer:
         self.app.post("/{rank}/clear")(self.clear)
         self.app.post("/{rank}/get_page_indices")(self.get_page_indices)
 
-    def get_rank_metadata(self, rank: int) -> RankMetadata:
+    def _rank_key(self, rank: int, namespace: str) -> str:
+        """Generate the composite key for rank+namespace."""
+        return f"{rank}:{namespace}"
+
+    def get_rank_metadata(self, rank: int, namespace: str = "kv") -> RankMetadata:
         """Get rank metadata with proper error handling."""
-        if rank not in self.state.ranks:
+        key = self._rank_key(rank, namespace)
+        if key not in self.state.ranks:
             raise HTTPException(
                 status_code=404,
-                detail=f"Rank {rank} not initialized. Please call /{rank}/initialize first.",
+                detail=f"Rank {rank} namespace '{namespace}' not initialized. Please call /{rank}/initialize first.",
             )
-        return self.state.ranks[rank]
+        return self.state.ranks[key]
 
     async def _read_json(self, request: Request) -> dict:
         """Parse request JSON using orjson if available."""
@@ -233,32 +240,38 @@ class Hf3fsMetadataServer:
         """Initialize a rank with specified number of pages."""
         data = await self._read_json(request)
         num_pages = data["num_pages"]
+        namespace = data.get("namespace", "kv")
+        key = self._rank_key(rank, namespace)
         with self.state.global_lock:
-            if rank in self.state.ranks:
+            if key in self.state.ranks:
                 logging.info(
-                    f"Rank {rank} already exists. Initialization request ignored."
+                    f"Rank {rank} namespace '{namespace}' already exists. Initialization request ignored."
                 )
-                if self.state.ranks[rank].num_pages != num_pages:
+                if self.state.ranks[key].num_pages != num_pages:
                     logging.warning(
-                        f"Rank {rank} initialized with different num_pages. Existing: {self.state.ranks[rank].num_pages}, New: {num_pages}"
+                        f"Rank {rank} namespace '{namespace}' initialized with different num_pages. Existing: {self.state.ranks[key].num_pages}, New: {num_pages}"
                     )
             else:
-                logging.info(f"Initializing new Rank {rank} with {num_pages} pages.")
-                self.state.ranks[rank] = RankMetadata(num_pages)
+                logging.info(
+                    f"Initializing new Rank {rank} namespace '{namespace}' with {num_pages} pages."
+                )
+                self.state.ranks[key] = RankMetadata(num_pages)
         return Response(status_code=204)
 
     async def exists(self, rank: int, request: Request):
         """Check if keys exist in metadata."""
         data = await self._read_json(request)
         keys = data["keys"]
-        metadata = self.get_rank_metadata(rank)
+        namespace = data.get("namespace", "kv")
+        metadata = self.get_rank_metadata(rank, namespace)
         results = metadata.exists_keys(keys)
         return self._json_response({"exists": results})
 
     async def reserve_and_allocate_page_indices(self, rank: int, request: Request):
         """Reserve and allocate page indices for keys."""
         data = await self._read_json(request)
-        metadata = self.get_rank_metadata(rank)
+        namespace = data.get("namespace", "kv")
+        metadata = self.get_rank_metadata(rank, namespace)
         keys = data["keys"]
         results = metadata.reserve_and_allocate_page_indices(keys)
         return self._json_response({"indices": results})
@@ -266,7 +279,8 @@ class Hf3fsMetadataServer:
     async def confirm_write(self, rank: int, request: Request):
         """Confirm write operations and release pages."""
         data = await self._read_json(request)
-        metadata = self.get_rank_metadata(rank)
+        namespace = data.get("namespace", "kv")
+        metadata = self.get_rank_metadata(rank, namespace)
         success_written_keys = data.get("written_keys_to_confirm", [])
         released_pages = data.get("pages_to_release", [])
 
@@ -277,20 +291,24 @@ class Hf3fsMetadataServer:
     async def delete_keys(self, rank: int, request: Request):
         """Delete keys from metadata."""
         data = await self._read_json(request)
-        metadata = self.get_rank_metadata(rank)
+        namespace = data.get("namespace", "kv")
+        metadata = self.get_rank_metadata(rank, namespace)
         count = metadata.delete_keys(data["keys"])
         return Response(status_code=204)
 
-    async def clear(self, rank: int):
+    async def clear(self, rank: int, request: Request):
         """Clear all metadata for a rank."""
-        metadata = self.get_rank_metadata(rank)
+        data = await self._read_json(request)
+        namespace = data.get("namespace", "kv")
+        metadata = self.get_rank_metadata(rank, namespace)
         metadata.clear_all()
         return Response(status_code=204)
 
     async def get_page_indices(self, rank: int, request: Request):
         """Get page indices for keys."""
         data = await self._read_json(request)
-        metadata = self.get_rank_metadata(rank)
+        namespace = data.get("namespace", "kv")
+        metadata = self.get_rank_metadata(rank, namespace)
         keys = data["keys"]
         results = metadata.get_page_indices(keys)
         return self._json_response({"indices": results})
@@ -349,14 +367,19 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
             logging.error(f"Failed to POST to {endpoint} after retries: {e}")
             raise RuntimeError(f"Failed to connect to metadata server: {e}") from e
 
-    def initialize(self, rank: int, num_pages: int) -> None:
-        self._post(f"{rank}/initialize", {"num_pages": num_pages})
+    def initialize(
+        self, rank: int, num_pages: int, namespace: PoolName = PoolName.KV
+    ) -> None:
+        self._post(
+            f"{rank}/initialize", {"num_pages": num_pages, "namespace": str(namespace)}
+        )
 
     def reserve_and_allocate_page_indices(
-        self, rank: int, keys: List[Tuple[str, str]]
+        self, rank: int, keys: List[Tuple[str, str]], namespace: PoolName = PoolName.KV
     ) -> List[Tuple[bool, int]]:
         response = self._post(
-            f"{rank}/reserve_and_allocate_page_indices", {"keys": keys}
+            f"{rank}/reserve_and_allocate_page_indices",
+            {"keys": keys, "namespace": str(namespace)},
         )
         return [tuple(item) for item in response.get("indices")]
 
@@ -365,69 +388,107 @@ class Hf3fsGlobalMetadataClient(Hf3fsMetadataInterface):
         rank: int,
         written_keys_to_confirm: List[Tuple[str, int]],
         pages_to_release: List[int],
+        namespace: PoolName = PoolName.KV,
     ) -> None:
         self._post(
             f"{rank}/confirm_write",
             {
                 "written_keys_to_confirm": written_keys_to_confirm,
                 "pages_to_release": pages_to_release,
+                "namespace": str(namespace),
             },
         )
 
-    def delete_keys(self, rank: int, keys: List[str]) -> None:
-        self._post(f"{rank}/delete_keys", {"keys": keys})
+    def delete_keys(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> None:
+        self._post(f"{rank}/delete_keys", {"keys": keys, "namespace": str(namespace)})
 
-    def exists(self, rank: int, keys: List[str]) -> List[bool]:
-        response = self._post(f"{rank}/exists", {"keys": keys})
+    def exists(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> List[bool]:
+        response = self._post(
+            f"{rank}/exists", {"keys": keys, "namespace": str(namespace)}
+        )
         return response.get("exists", [])
 
-    def clear(self, rank: int) -> None:
-        self._post(f"{rank}/clear", {})
+    def clear(self, rank: int, namespace: PoolName = PoolName.KV) -> None:
+        self._post(f"{rank}/clear", {"namespace": str(namespace)})
 
-    def get_page_indices(self, rank: int, keys: List[str]) -> List[Optional[int]]:
-        response = self._post(f"{rank}/get_page_indices", {"keys": keys})
+    def get_page_indices(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> List[Optional[int]]:
+        response = self._post(
+            f"{rank}/get_page_indices", {"keys": keys, "namespace": str(namespace)}
+        )
         return response.get("indices")
 
 
 class Hf3fsLocalMetadataClient(Hf3fsMetadataInterface):
-    """Local metadata client that directly operates on single RankMetadata in memory without metadata server."""
+    """Local metadata client that directly operates on RankMetadata in memory without metadata server."""
 
     def __init__(self):
-        self.rank_metadata = None
+        self._metadata: Dict[str, RankMetadata] = {}  # key: "rank:namespace"
 
-    def initialize(self, rank: int, num_pages: int) -> None:
-        self.rank_metadata = RankMetadata(num_pages)
+    def _ns_key(self, rank: int, namespace: PoolName) -> str:
+        return f"{rank}:{namespace}"
+
+    def _get_metadata(self, rank: int, namespace) -> RankMetadata:
+        key = self._ns_key(rank, namespace)
+        if key not in self._metadata:
+            raise RuntimeError(
+                f"Namespace '{namespace}' for rank {rank} not initialized"
+            )
+        return self._metadata[key]
+
+    def initialize(
+        self, rank: int, num_pages: int, namespace: PoolName = PoolName.KV
+    ) -> None:
+        key = self._ns_key(rank, namespace)
+        if key not in self._metadata:
+            self._metadata[key] = RankMetadata(num_pages)
 
     def reserve_and_allocate_page_indices(
-        self, rank: int, keys: List[Tuple[str, str]]
+        self, rank: int, keys: List[Tuple[str, str]], namespace: PoolName = PoolName.KV
     ) -> List[Tuple[bool, int]]:
         """Reserve and allocate page indices for keys."""
-        return self.rank_metadata.reserve_and_allocate_page_indices(keys)
+        return self._get_metadata(rank, namespace).reserve_and_allocate_page_indices(
+            keys
+        )
 
     def confirm_write(
         self,
         rank: int,
         written_keys_to_confirm: List[Tuple[str, int]],
         pages_to_release: List[int],
+        namespace: PoolName = PoolName.KV,
     ) -> None:
         """Confirm write operations."""
-        self.rank_metadata.confirm_write(written_keys_to_confirm, pages_to_release)
+        self._get_metadata(rank, namespace).confirm_write(
+            written_keys_to_confirm, pages_to_release
+        )
 
-    def delete_keys(self, rank: int, keys: List[str]) -> None:
+    def delete_keys(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> None:
         """Delete keys."""
-        self.rank_metadata.delete_keys(keys)
+        self._get_metadata(rank, namespace).delete_keys(keys)
 
-    def exists(self, rank: int, keys: List[str]) -> List[bool]:
+    def exists(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> List[bool]:
         """Check if keys exist."""
-        return self.rank_metadata.exists_keys(keys)
+        return self._get_metadata(rank, namespace).exists_keys(keys)
 
-    def clear(self, rank: int) -> None:
+    def clear(self, rank: int, namespace: PoolName = PoolName.KV) -> None:
         """Clear all metadata for rank."""
-        self.rank_metadata.clear_all()
+        self._get_metadata(rank, namespace).clear_all()
 
-    def get_page_indices(self, rank: int, keys: List[str]) -> List[Optional[int]]:
+    def get_page_indices(
+        self, rank: int, keys: List[str], namespace: PoolName = PoolName.KV
+    ) -> List[Optional[int]]:
         """Get page indices for keys."""
-        return self.rank_metadata.get_page_indices(keys)
+        return self._get_metadata(rank, namespace).get_page_indices(keys)
 
 
 def run_metadata_server(

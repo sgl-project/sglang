@@ -76,6 +76,12 @@ class EncoderConfig(ModelConfig):
     quant_config: QuantizationConfig | None = None
     lora_config: Any | None = None
 
+    # Parallel folding: during the encoding stage the whole DiT replica is idle,
+    # so TP-shard the encoder across those otherwise-unused GPUs instead of
+    # running it on a single rank. None = replicated, else the group to fold
+    # over ("sp"|"ulysses"|"ring"|"world"); resolved by finalize_encoder_folding.
+    parallel_folding_mode: str | None = None
+
 
 @dataclass
 class TextEncoderConfig(EncoderConfig):

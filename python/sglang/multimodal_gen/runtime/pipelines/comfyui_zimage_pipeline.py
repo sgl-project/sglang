@@ -15,10 +15,12 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
-    set_default_dtype,
     shard_model,
 )
-from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    set_default_torch_dtype,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -36,7 +38,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -141,7 +144,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         head_dim = dim // num_heads
         q_size = dim
         k_size = head_dim * num_kv_heads
-        v_size = head_dim * num_kv_heads
 
         for name, tensor in weight_iterator:
             # Match qkv weights in layers, noise_refiner, or context_refiner
@@ -266,7 +268,9 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         safetensors_list = [self.model_path]
         logger.info("Loading weights from: %s", safetensors_list)
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         hf_config = {}
 
@@ -288,6 +292,8 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             # Create model first (same as maybe_load_fsdp_model)
             from sglang.multimodal_gen.runtime.platforms import current_platform
 
+            # precision-constraint: FSDP mixed precision currently uses bf16
+            # parameters and fp32 reduction regardless of model load dtype.
             mp_policy = MixedPrecisionPolicy(
                 torch.bfloat16, torch.float32, None, cast_forward_inputs=False
             )
@@ -299,7 +305,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 mp_policy=mp_policy,
             )
 
-            with set_default_dtype(default_dtype), torch.device("meta"):
+            with set_default_torch_dtype(default_dtype), torch.device("meta"):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             # Check if we should use FSDP
@@ -309,7 +315,6 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
             if use_fsdp:
-                world_size = server_args.hsdp_replicate_dim * server_args.hsdp_shard_dim
                 device_mesh = init_device_mesh(
                     current_platform.device_type,
                     mesh_shape=(
@@ -324,7 +329,9 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
-                    fsdp_shard_conditions=model._fsdp_shard_conditions,
+                    fsdp_shard_conditions=getattr(
+                        model, "_fsdp_shard_conditions", None
+                    ),
                     pin_cpu_memory=server_args.pin_cpu_memory,
                 )
 
@@ -379,24 +386,19 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             "ComfyUIZImagePipeline.create_pipeline_stages() called - creating latent_preparation_stage and denoising_stage"
         )
 
-        # Add ComfyUILatentPreparationStage to handle latents properly for SP
-        # This stage includes device mismatch fix for ComfyUI pipelines in multi-GPU scenarios
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=ComfyUILatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
+        self.add_stages(
+            [
+                ComfyUILatentPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
+                ),
+                DenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                ),
+            ]
         )
 
-        # Add DenoisingStage for the actual denoising process
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
         logger.info(
             f"ComfyUIZImagePipeline stages created: {list(self._stage_name_mapping.keys())}"
         )

@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,11 @@ class Gemma3MLP(nn.Module):
         return x
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
 class Gemma3Attention(nn.Module):
     def __init__(
         self,
@@ -141,27 +149,72 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.is_sliding = (
-            config.text_config.layer_types[layer_id] == "sliding_attention"
-        )
+        layer_types = getattr(config.text_config, "layer_types", None)
+        if layer_types:
+            self.layer_type = layer_types[layer_id]
+            self.is_sliding = self.layer_type == "sliding_attention"
+        else:
+            # official Gemma3 uses sliding_window_pattern when layer_types is absent
+            sliding_window_pattern = getattr(
+                config.text_config, "sliding_window_pattern", None
+            )
+            self.is_sliding = (
+                bool((layer_id + 1) % sliding_window_pattern)
+                if sliding_window_pattern
+                else False
+            )
+            self.layer_type = "sliding_attention" if self.is_sliding else None
+
+        rope_parameters = getattr(config.text_config, "rope_parameters", None) or {}
+        layer_rope_params = {}
+        if self.layer_type is not None and isinstance(rope_parameters, dict):
+            layer_rope_params = dict(rope_parameters.get(self.layer_type) or {})
 
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention.
-            self.rope_theta = config.text_config.rope_local_base_freq
-            rope_scaling = None  # Default
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_local_base_freq",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 10_000.0,
+                        )("local", 10_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or None
             # sliding window
             self.sliding_window = get_attention_sliding_window_size(config.text_config)
             # (left, right) = (window, 0) effectively for causal
             self.window_size = (self.sliding_window, 0)
         else:
             # Global attention.
-            self.rope_theta = config.text_config.rope_theta
-            rope_scaling = config.text_config.rope_scaling
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_theta",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 1_000_000.0,
+                        )("global", 1_000_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or getattr(
+                config.text_config, "rope_scaling", None
+            )
             self.sliding_window = None
             self.window_size = (-1, -1)
 
-        self.rotary_emb = get_rope(
+        self.rotary_pos_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.text_config.max_position_embeddings,
@@ -189,6 +242,25 @@ class Gemma3Attention(nn.Module):
             dim=self.head_dim, eps=config.text_config.rms_norm_eps
         )
 
+    def _apply_rotary_pos_emb(self, positions, q, k):
+        positions_flat = positions.flatten().to(
+            device=self.rotary_pos_emb.cos_sin_cache.device, dtype=torch.long
+        )
+        cos_sin = self.rotary_pos_emb.cos_sin_cache.index_select(0, positions_flat)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # match HF Gemma3: expand half-dim freqs to full head dim before rotate_half
+        cos = torch.cat((cos, cos), dim=-1).to(device=q.device, dtype=q.dtype)
+        sin = torch.cat((sin, sin), dim=-1).to(device=q.device, dtype=q.dtype)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        num_tokens = positions_flat.shape[0]
+
+        q = q.reshape(num_tokens, -1, self.head_dim)
+        k = k.reshape(num_tokens, -1, self.head_dim)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+        return q, k
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -208,17 +280,19 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
 
         # Apply RoPE
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary_pos_emb(positions, q, k)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
         # TODO(FlamingoPg): Support LocalAttention
         query = q.transpose(1, 2)
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        attn_mask = torch.zeros(
+        attn_mask = torch.ones(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=torch.float32,
+            dtype=torch.bool,
         )
         causal = torch.triu(
             torch.ones(
@@ -226,30 +300,39 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, float("-inf"))
+        attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
-            dist = idx[None, :] - idx[:, None]
+            dist = idx[:, None] - idx[None, :]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, float("-inf"))
+            attn_mask = attn_mask.masked_fill(too_far, False)
 
-        key_pad = ~attention_mask.to(torch.bool)
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask.masked_fill(
-            key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-            float("-inf"),
-        )
+        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
-        attn_kwargs = {
-            "attn_mask": attn_mask,
-            "dropout_p": 0.0,
-            "is_causal": False,
-            "scale": self.scaling,
-        }
         if query.shape[1] != key.shape[1]:
-            attn_kwargs["enable_gqa"] = True
+            num_key_value_groups = query.shape[1] // key.shape[1]
+            key = key[:, :, None, :, :].expand(
+                batch_size, key.shape[1], num_key_value_groups, seq_len, self.head_dim
+            )
+            value = value[:, :, None, :, :].expand(
+                batch_size,
+                value.shape[1],
+                num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
+            key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+            value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2)
 
@@ -446,6 +529,9 @@ class SiglipAttention(nn.Module):
         tp_size = get_tp_world_size()
         self.head_dim = hidden_size // num_heads
         self.num_heads_per_partition = num_heads // tp_size
+        # Cache the per-rank projection width so forward() does not re-read the
+        # global TP size (which is not patched to the folding group at run time).
+        self.embed_dim_per_partition = self.num_heads_per_partition * self.head_dim
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -476,7 +562,7 @@ class SiglipAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.hidden_size // get_tp_world_size()] * 3, dim=-1)
+        q, k, v = qkv.split([self.embed_dim_per_partition] * 3, dim=-1)
 
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
@@ -486,7 +572,7 @@ class SiglipAttention(nn.Module):
         attn_output = self.attn(q, k, v)
 
         attn_output = attn_output.reshape(
-            batch_size, seq_len, self.hidden_size // get_tp_world_size()
+            batch_size, seq_len, self.embed_dim_per_partition
         )
 
         output, _ = self.out_proj(attn_output)
@@ -696,7 +782,9 @@ class Gemma3TextModel(nn.Module):
                     layer_id=i,
                     config=config,
                     quant_config=self.quant_config,
-                    prefix=f"{config.text_config.prefix}.layers.{i}",
+                    prefix=add_prefix(
+                        f"layers.{i}", getattr(config.text_config, "prefix", "")
+                    ),
                 )
                 for i in range(config.text_config.num_hidden_layers)
             ]
@@ -707,7 +795,8 @@ class Gemma3TextModel(nn.Module):
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids) * self.embed_scale
+        out = self.embed_tokens(input_ids)
+        return out * torch.tensor(self.embed_scale, device=out.device, dtype=out.dtype)
 
     def forward(
         self,
@@ -735,7 +824,6 @@ class Gemma3TextModel(nn.Module):
             position_ids = torch.arange(
                 0, hidden_states.shape[1], device=hidden_states.device
             ).unsqueeze(0)
-        position_ids = position_ids + 1
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
 
@@ -852,7 +940,20 @@ class Gemma3TextModel(nn.Module):
         return loaded_params
 
 
-class Gemma3ForConditionalGeneration(nn.Module):
+class Gemma3ForConditionalGeneration(nn.Module, LayerwiseOffloadableModuleMixin):
+    # transformers 5.6.0 flattened SiglipVisionModel, dropping the
+    # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
+    # HF source keys back into our nested namespace when transferring weights.
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["language_model.layers"]
+
+    param_names_mapping = {
+        r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
+    }
+    reverse_param_names_mapping = {
+        r"^(vision_tower\.)vision_model\.(embeddings|encoder|post_layernorm|head)\.": r"\1\2.",
+    }
+
     def __init__(
         self,
         config: Gemma3Config,

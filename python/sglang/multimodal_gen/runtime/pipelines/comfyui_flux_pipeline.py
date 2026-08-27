@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -613,7 +613,9 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
 
         safetensors_list = [self.model_path]
         logger.info("Loading weights from: %s", safetensors_list)
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         hf_config = {}
 
@@ -666,24 +668,19 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
             "ComfyUIFluxPipeline.create_pipeline_stages() called - creating latent_preparation_stage and denoising_stage"
         )
 
-        # Add ComfyUILatentPreparationStage to handle latents properly for SP
-        # This stage includes device mismatch fix for ComfyUI pipelines in multi-GPU scenarios
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=ComfyUILatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
+        self.add_stages(
+            [
+                ComfyUILatentPreparationStage(
+                    scheduler=self.get_module("scheduler"),
+                    transformer=self.get_module("transformer"),
+                ),
+                DenoisingStage(
+                    transformer=self.get_module("transformer"),
+                    scheduler=self.get_module("scheduler"),
+                ),
+            ]
         )
 
-        # Add DenoisingStage for the actual denoising process
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DenoisingStage(
-                transformer=self.get_module("transformer"),
-                scheduler=self.get_module("scheduler"),
-            ),
-        )
         logger.info(
             f"ComfyUIFluxPipeline stages created: {list(self._stage_name_mapping.keys())}"
         )

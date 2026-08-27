@@ -6,6 +6,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -253,7 +257,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         return cos, sin
 
     def get_kv_cache_and_cache_idx(self, forward_batch):
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(self.layer_id)
+        k_cache, v_cache = get_token_to_kv_pool().get_kv_buffer(self.layer_id)
         slot_mapping = forward_batch.out_cache_loc.to(dtype=torch.int32)
         return k_cache, v_cache, slot_mapping
 
@@ -266,7 +270,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
     ):
         bsz, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
         self.dtype = hidden_states.dtype
-        self.cos, self.sin = self.get_sin_cos(positions)
+        if self.layer_id == 0:
+            self.cos, self.sin = self.get_sin_cos(positions)
+            self.rotary_emb.cos_cached, self.rotary_emb.sin_cache = self.cos, self.sin
+        else:
+            self.cos, self.sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cache
+
         self.kvCache, self.kvCacheRope, self.slotmapping = (
             self.get_kv_cache_and_cache_idx(forward_batch)
         )
@@ -309,15 +318,15 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         cache_mode = "PA_NZ" if is_fia_nz() else "PA_BNSD"
         self.kvCache = self.kvCache.view(
             -1,
-            forward_batch.attn_backend.page_size,
+            get_attn_backend().page_size,
             1,
-            forward_batch.attn_backend.kv_lora_rank,
+            get_attn_backend().kv_lora_rank,
         )
         self.kvCacheRope = self.kvCacheRope.view(
             -1,
-            forward_batch.attn_backend.page_size,
+            get_attn_backend().page_size,
             1,
-            forward_batch.attn_backend.qk_rope_head_dim,
+            get_attn_backend().qk_rope_head_dim,
         )
         k_rope, k_nope, _, _ = torch.ops.npu.npu_kv_rmsnorm_rope_cache(
             latent_cache,
@@ -340,7 +349,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.has_preprocess_weights = True
             self.dtype = hidden_states.dtype
 
-        cos, sin = self.get_sin_cos(positions)
+        if self.layer_id == 0:
+            cos, sin = self.get_sin_cos(positions)
+            self.rotary_emb.cos_cached, self.rotary_emb.sin_cache = cos, sin
+        else:
+            cos, sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cache
+
         k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
 
         q_nope_out = torch.empty(
@@ -459,8 +473,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         # assert self.quant_config and self.quant_config.get_name() == "modelslim"
         # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
-            hasattr(self.qkv_a_proj.quant_method, "quant_config")
-            and self.qkv_a_proj.quant_method.quant_config.get_name() == "modelslim"
+            hasattr(self.qkv_a_proj.quant_method, "quantization_config")
+            and self.qkv_a_proj.quant_method.quantization_config.get_name()
+            == "modelslim"
         )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = hasattr(self.quant_config, "ignore") and any(

@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-""" Ernie4.5 MTP model compatible with baidu/ERNIE-4.5-*-PT weights. """
+"""Ernie4.5 MTP model compatible with baidu/ERNIE-4.5-*-PT weights."""
 
 from typing import Iterable, Optional, Tuple
 

@@ -11,10 +11,14 @@ import psutil
 import torch
 
 from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
     CpuArchEnum,
     Platform,
     PlatformEnum,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class CpuPlatform(Platform):
@@ -22,6 +26,14 @@ class CpuPlatform(Platform):
     device_name = "CPU"
     device_type = "cpu"
     dispatch_key = "CPU"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("cpu")
+
+    @classmethod
+    def get_torch_distributed_backend_str(cls) -> str:
+        return "gloo"
 
     @classmethod
     def get_cpu_architecture(cls) -> CpuArchEnum:
@@ -62,7 +74,7 @@ class CpuPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -84,5 +96,28 @@ class CpuPlatform(Platform):
         return free_memory / (1 << 30)
 
     @classmethod
+    def get_attn_backend_cls_str(
+        cls,
+        selected_backend: AttentionBackendEnum | None,
+        head_size: int,
+        dtype: torch.dtype,
+    ) -> str:
+        if selected_backend not in (None, AttentionBackendEnum.TORCH_SDPA):
+            logger.warning(
+                "%s is not supported on CPU; falling back to Torch SDPA.",
+                selected_backend,
+            )
+
+        logger.info("Using Torch SDPA backend for CPU.")
+        return (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        )
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator.CpuCommunicator"
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """Whether to enable DIT layerwise offload by default on the current platform."""
+        return False

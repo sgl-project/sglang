@@ -18,13 +18,13 @@ SGLang Diffusion now includes an integrated WebUI. Simply add the `--webui` para
 ### Launch Text-to-Image Service
 
 ```bash
-sglang serve black-forest-labs/FLUX.1-dev --num-gpus 1 --webui --webui-port 2333
+sglang serve --model-path black-forest-labs/FLUX.1-dev --num-gpus 1 --webui --webui-port 2333
 ```
 
 ### Launch Text-to-Video Service
 
 ```bash
-sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --webui --webui-port 2333
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --webui --webui-port 2333
 ```
 
 ### Launch Image-to-Image Service
@@ -34,7 +34,7 @@ sglang serve --model-path Qwen/Qwen-Image-Edit-2511 --num-gpus 1 --webui --webui
 
 ### Launch Image-to-Video Service
 ```bash
-sglang serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --num-gpus 1 --webui --webui-port 2333
+sglang serve --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers --num-gpus 1 --webui --webui-port 2333
 ```
 
 ## Port Forwarding

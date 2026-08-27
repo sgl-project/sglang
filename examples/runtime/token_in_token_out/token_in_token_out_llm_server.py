@@ -25,7 +25,7 @@ def main():
     server_process, port = launch_server_cmd(
         f"python -m sglang.launch_server --model-path {MODEL_PATH} --skip-tokenizer-init --host 0.0.0.0"
     )
-    wait_for_server(f"http://localhost:{port}")
+    wait_for_server(f"http://localhost:{port}", process=server_process)
 
     # Sample prompts.
     prompts = [

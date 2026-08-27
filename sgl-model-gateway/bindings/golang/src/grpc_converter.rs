@@ -14,7 +14,7 @@ use smg::tokenizer::stream::DecodeStream;
 use smg::tool_parser::ToolParser;
 use smg::protocols::common::{Tool, ToolChoice, ToolChoiceValue, ToolCallDelta, FunctionCallDelta, Usage, StringOrArray};
 use smg::tokenizer::stop::StopSequenceDecoder;
-use smg::grpc_client::sglang_proto as proto;
+use smg_grpc_client::sglang_proto as proto;
 
 use super::error::{SglErrorCode, set_error_message, clear_error_message};
 use super::tokenizer::TokenizerHandle;
@@ -390,7 +390,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
     created: u64,
     system_fingerprint: Option<&str>,
 ) -> Result<Option<smg::protocols::chat::ChatCompletionStreamResponse>, String> {
-    use smg::grpc_client::sglang_proto::generate_response::Response::*;
+    use smg_grpc_client::sglang_proto::generate_response::Response::*;
     use smg::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
 
     match proto_response.response {

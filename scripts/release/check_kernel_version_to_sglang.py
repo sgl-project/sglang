@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Check if sgl-kernel version from sgl-kernel/pyproject.toml matches the versions
-used in SGLang files (python/pyproject.toml, engine.py, and Dockerfile).
+Check whether SGLang's kernel dependencies match the AOT source pyproject.
+
+The dependent versions are read from python/pyproject.toml, engine.py, and
+Dockerfile.
 Sets GitHub Actions output variables to indicate if sync is needed.
 """
 
@@ -17,8 +19,8 @@ except ImportError:
 
 
 def get_kernel_version_from_source() -> str:
-    """Extract version from sgl-kernel/pyproject.toml (line 11)"""
-    pyproject_path = Path("sgl-kernel/pyproject.toml")
+    """Extract the version from the AOT source pyproject."""
+    pyproject_path = Path("python/sglang/kernels/aot/pyproject.toml")
 
     if not pyproject_path.exists():
         print(f"Error: {pyproject_path} not found")
@@ -29,14 +31,16 @@ def get_kernel_version_from_source() -> str:
 
     version = data.get("project", {}).get("version")
     if not version:
-        print("Error: Could not find version in sgl-kernel/pyproject.toml")
+        print(
+            "Error: Could not find version in python/sglang/kernels/aot/pyproject.toml"
+        )
         sys.exit(1)
 
     return version
 
 
 def get_kernel_version_from_python_pyproject() -> str:
-    """Extract sgl-kernel version from python/pyproject.toml"""
+    """Extract sglang-kernel version from python/pyproject.toml"""
     pyproject_path = Path("python/pyproject.toml")
 
     if not pyproject_path.exists():
@@ -45,17 +49,17 @@ def get_kernel_version_from_python_pyproject() -> str:
 
     content = pyproject_path.read_text()
 
-    # Match "sgl-kernel==x.x.x"
-    match = re.search(r'"sgl-kernel==([^"]+)"', content)
+    # Match "sglang-kernel==x.x.x"
+    match = re.search(r'"sglang-kernel==([^"]+)"', content)
     if not match:
-        print("Error: Could not find sgl-kernel version in python/pyproject.toml")
+        print("Error: Could not find sglang-kernel version in python/pyproject.toml")
         sys.exit(1)
 
     return match.group(1)
 
 
 def get_kernel_version_from_engine() -> str:
-    """Extract sgl-kernel version from python/sglang/srt/entrypoints/engine.py"""
+    """Extract sglang-kernel version from python/sglang/srt/entrypoints/engine.py"""
     engine_path = Path("python/sglang/srt/entrypoints/engine.py")
 
     if not engine_path.exists():
@@ -64,13 +68,13 @@ def get_kernel_version_from_engine() -> str:
 
     content = engine_path.read_text()
 
-    # Find the assert_pkg_version call for sgl-kernel
-    # Look for the pattern: assert_pkg_version("sgl-kernel", "version", ...)
+    # Find the assert_pkg_version call for sglang-kernel
+    # Look for the pattern: assert_pkg_version("sglang-kernel", "version", ...)
     match = re.search(
-        r'assert_pkg_version\s*\(\s*"sgl-kernel"\s*,\s*"([^"]+)"', content
+        r'assert_pkg_version\s*\(\s*"sglang-kernel"\s*,\s*"([^"]+)"', content
     )
     if not match:
-        print("Error: Could not find sgl-kernel version in engine.py")
+        print("Error: Could not find sglang-kernel version in engine.py")
         sys.exit(1)
 
     return match.group(1)
@@ -101,9 +105,13 @@ def main():
     engine_version = get_kernel_version_from_engine()
     dockerfile_version = get_kernel_version_from_dockerfile()
 
-    print(f"Kernel version in sgl-kernel/pyproject.toml: {kernel_version}")
-    print(f"Kernel version in python/pyproject.toml: {pyproject_version}")
-    print(f"Kernel version in engine.py: {engine_version}")
+    print(
+        f"Kernel version in python/sglang/kernels/aot/pyproject.toml: {kernel_version}"
+    )
+    print(
+        f"SGLang kernel dependency version in python/pyproject.toml: {pyproject_version}"
+    )
+    print(f"SGLang kernel dependency version in engine.py: {engine_version}")
     print(f"Kernel version in Dockerfile: {dockerfile_version}")
 
     # Check if any version differs from the source

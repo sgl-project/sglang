@@ -1,19 +1,21 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any, Dict, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPU_W4A4DynamicLinearMethod,
 )
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
+from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 from sglang.srt.utils import set_weight_attrs
 
 
-class ModelSlimW4A4Int4(ModelSlimScheme):
+class ModelSlimW4A4Int4(ModelSlimLinearScheme):
 
     def __init__(
         self,
@@ -28,6 +30,8 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
     def get_weight(
         input_size: int, output_size: int, params_dtype: torch.dtype
     ) -> Dict[str, Any]:
+        if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+            output_size = output_size // 2
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.int8)}
         return params_dict
 
@@ -53,15 +57,25 @@ class ModelSlimW4A4Int4(ModelSlimScheme):
     ) -> None:
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
-
+        if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+            weight_output_size_per_partition = output_size_per_partition // 2
+        else:
+            weight_output_size_per_partition = output_size_per_partition
         weight_dict = {
             "weight": torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=torch.int8
+                weight_output_size_per_partition,
+                input_size_per_partition,
+                dtype=torch.int8,
             )
         }
         for weight_name, weight_param in weight_dict.items():
             param = torch.nn.Parameter(weight_param, requires_grad=False)
-            set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
+            if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+                set_weight_attrs(
+                    param, {"input_dim": 1, "output_dim": 0, "pack_factor": 2}
+                )
+            else:
+                set_weight_attrs(param, {"input_dim": 1, "output_dim": 0})
             layer.register_parameter(weight_name, param)
             set_weight_attrs(param, extra_weight_attrs)
 

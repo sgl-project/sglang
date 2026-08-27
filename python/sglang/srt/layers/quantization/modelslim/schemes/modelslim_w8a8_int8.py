@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Dict, List, Optional
 
 import torch
@@ -14,10 +15,10 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
+from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 
-class ModelSlimW8A8Int8(ModelSlimScheme):
+class ModelSlimW8A8Int8(ModelSlimLinearScheme):
 
     def __init__(
         self,

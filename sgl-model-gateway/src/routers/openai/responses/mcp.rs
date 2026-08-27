@@ -13,11 +13,11 @@ use std::{io, sync::Arc};
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
+use smg_mcp as mcp;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
-    mcp,
     protocols::{
         event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
         responses::{generate_id, ResponseInput, ResponsesRequest},

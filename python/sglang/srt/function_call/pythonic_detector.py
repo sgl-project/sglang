@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import safe_ast_parse
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class PythonicDetector(BaseFormatDetector):
         normal_text = normal_text_before + normal_text_after
 
         try:
-            module = ast.parse(tool_call_text)
+            module = safe_ast_parse(tool_call_text)
             parsed = getattr(module.body[0], "value", None)
             if not (
                 isinstance(parsed, ast.List)

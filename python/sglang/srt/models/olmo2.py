@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +17,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/olmo2.py
 """Inference-only OLMo2 model compatible with HuggingFace weights."""
+
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -23,8 +26,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
@@ -43,9 +44,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 _is_cuda = is_cuda()
@@ -60,7 +62,7 @@ def get_attention_sliding_window_size(config):
 class Olmo2Attention(nn.Module):
     """
     This is the attention block where the output is computed as
-    ``Attention(LN(x))`` in ``MLP(LN(x + Attention(LN(x))))``
+    Attention(LN(x)) in MLP(LN(x + Attention(LN(x))))
     (plus another skip connection).
     """
 
@@ -75,7 +77,7 @@ class Olmo2Attention(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
 
         assert self.hidden_size % self.total_num_heads == 0
@@ -98,7 +100,7 @@ class Olmo2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters["rope_theta"]
 
         # Attention input projection. Projects x -> (q, k, v)
         self.qkv_proj = QKVParallelLinear(
@@ -110,7 +112,7 @@ class Olmo2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank = get_parallel().tp_rank
         self.alt_stream = alt_stream
 
         self.k_norm = RMSNorm(
@@ -213,7 +215,7 @@ class Olmo2Attention(nn.Module):
 class Olmo2MLP(nn.Module):
     """
     This is the MLP block where the output is computed as
-    ``MLP(x)`` in ``LN(MLP(x + LN(Attention(x))))``
+    MLP(x) in LN(MLP(x + LN(Attention(x))))
     (plus another skip connection).
     """
 
@@ -262,7 +264,7 @@ class Olmo2MLP(nn.Module):
 class Olmo2DecoderLayer(nn.Module):
     """
     This is a typical transformer block where the output is
-    computed as ``MLP(LN(x + Attention(LN(x))))``
+    computed as MLP(LN(x + Attention(LN(x))))
     (plus another skip connection).
     """
 
@@ -330,7 +332,7 @@ class Olmo2Model(nn.Module):
         super().__init__()
         self.config = config
         if alt_stream is None and _is_cuda:
-            alt_stream = torch.cuda.Stream()
+            alt_stream = get_stream("alt")
         self.alt_stream = alt_stream
 
         self.embed_tokens = VocabParallelEmbedding(

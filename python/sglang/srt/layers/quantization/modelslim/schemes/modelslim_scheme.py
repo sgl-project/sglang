@@ -1,18 +1,21 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from abc import ABC, abstractmethod
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from abc import abstractmethod
 from typing import Optional
 
 import torch
 
-__all__ = ["ModelSlimScheme"]
+from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
+
+__all__ = ["ModelSlimLinearScheme", "ModelSlimMoEScheme"]
 
 
-class ModelSlimScheme(ABC):
+class ModelSlimLinearScheme(BaseLinearScheme):
     """
     Abstract class used to describe the weight creation and forward pass
-    of different quantization schemes supported by CompressedTensors.
+    of different quantization schemes supported by ModelSlim.
     """
 
     @abstractmethod
@@ -20,6 +23,14 @@ class ModelSlimScheme(ABC):
         """
         Weight creation for the particular scheme. Inputs to this function
 
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """
+        Called after weight loading is complete for any cleanup that
+        needs to occur.
         """
         raise NotImplementedError
 
@@ -35,6 +46,21 @@ class ModelSlimScheme(ABC):
             other parameters relevant to the particular scheme.
         :param x: input to the layer
         :param bias: bias parameter
+
+        """
+        raise NotImplementedError
+
+
+class ModelSlimMoEScheme(BaseMoEScheme):
+    """
+    Abstract class used to describe the weight creation and forward pass
+    of different quantization schemes supported by ModelSlim.
+    """
+
+    @abstractmethod
+    def create_weights(self, *args, **kwargs):
+        """
+        Weight creation for the particular scheme. Inputs to this function
 
         """
         raise NotImplementedError

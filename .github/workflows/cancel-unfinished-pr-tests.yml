@@ -7,7 +7,17 @@ on:
         description: 'Space-separated list of workflow filenames to cancel'
         required: true
         type: string
-        default: 'pr-test.yml'
+        default: 'pr-test.yml pr-test-extra.yml'
+      include_high_priority:
+        description: 'Also cancel runs from high-priority PRs'
+        required: false
+        type: boolean
+        default: false
+      include_rerun_test:
+        description: 'Also cancel /rerun-test dispatched runs (rerun-test.yml)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: write   # Needed to cancel runs
@@ -21,33 +31,113 @@ jobs:
       - name: Install GitHub CLI
         run: sudo apt-get install -y gh jq
 
-      - name: Cancel unfinished PR-associated runs (skip high-priority PRs)
+      - name: Cancel unfinished PR-associated runs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          WORKFLOWS: ${{ github.event.inputs.workflows || 'pr-test.yml' }}
+          WORKFLOWS: ${{ github.event.inputs.workflows }}
+          INCLUDE_HIGH_PRIORITY: ${{ github.event.inputs.include_high_priority }}
+          INCLUDE_RERUN_TEST: ${{ github.event.inputs.include_rerun_test }}
         shell: bash
         run: |
           set -euo pipefail
 
           # Read the space-separated string from the input into a bash array
           read -r -a WORKFLOW_FILES <<< "${WORKFLOWS}"
+          if [ "$INCLUDE_RERUN_TEST" = "true" ]; then
+            WORKFLOW_FILES+=("rerun-test.yml")
+          fi
 
-          echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${WORKFLOWS}"
+          echo "Targeting ${#WORKFLOW_FILES[@]} workflow(s): ${WORKFLOW_FILES[*]}"
+          echo "include_high_priority=$INCLUDE_HIGH_PRIORITY, include_rerun_test=$INCLUDE_RERUN_TEST"
           echo ""
+
+          # Decide whether to cancel run_id given a PR-lookup endpoint.
+          #   $1 = run_id
+          #   $2 = gh api path returning a list of PR objects (head=... or commits/<sha>/pulls)
+          #   $3 = short label for log messages
+          maybe_cancel_for_pr() {
+            local run_id="$1"
+            local pr_query="$2"
+            local pr_label="$3"
+
+            local pr_info
+            pr_info=$(gh api -H "Accept: application/vnd.github+json" "$pr_query" \
+              --jq '.[0] | {number, state, merged_at}' 2>/dev/null || true)
+
+            if [ -z "$pr_info" ] || [ "$pr_info" = "null" ]; then
+              echo "  ⚠️  No PR found ($pr_label), skipping"
+              return
+            fi
+
+            local pr_number pr_state
+            pr_number=$(echo "$pr_info" | jq -r '.number // empty')
+            pr_state=$(echo "$pr_info" | jq -r '.state // empty')
+
+            if [ -z "$pr_number" ]; then
+              echo "  ⚠️  PR lookup returned empty number, skipping"
+              return
+            fi
+
+            local pr_url="https://github.com/$REPO/pull/$pr_number"
+            echo "  PR: $pr_url ($pr_state)"
+
+            # Closed PR (merged or not): always cancel, skip label checks.
+            if [ "$pr_state" = "closed" ]; then
+              echo "  🚫 Cancelling (PR closed)..."
+              gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
+              return
+            fi
+
+            # Open PR: apply label-based skip rules.
+            local labels
+            labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
+              | jq -r '.labels[].name' 2>/dev/null || true)
+
+            if echo "$labels" | grep -Fxq "bypass-maintenance"; then
+              echo "  🛑 Skipping (bypass-maintenance label, never cancelled)"
+              return
+            fi
+
+            if echo "$labels" | grep -Fxq "high priority"; then
+              if [ "$INCLUDE_HIGH_PRIORITY" != "true" ]; then
+                echo "  🛑 Skipping (high priority label)"
+                return
+              fi
+              echo "  ⚠️  High priority PR, but include_high_priority is enabled"
+            fi
+
+            echo "  🚫 Cancelling..."
+            gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
+          }
+          export -f maybe_cancel_for_pr
 
           for workflow_file in "${WORKFLOW_FILES[@]}"; do
             echo "========================================="
             echo "Workflow: $workflow_file"
             echo "========================================="
 
-            # Get all unfinished runs
-            all_runs=$(gh run list \
-              --repo "$REPO" \
-              --workflow "$workflow_file" \
-              --json databaseId,status,event,url,createdAt \
-              --limit 1000 \
-            | jq -c '.[] | select(.status=="queued" or .status=="waiting" or .status=="in_progress")')
+            # Get all unfinished runs.
+            # Use server-side --status filter: without it, `gh run list --limit 1000`
+            # only sees the most recent 1000 runs by createdAt, which on busy workflows
+            # like pr-test.yml is < 3 days. Old stuck runs would be missed.
+            all_runs=""
+            for status in queued in_progress waiting; do
+              batch=$(gh run list \
+                --repo "$REPO" \
+                --workflow "$workflow_file" \
+                --status "$status" \
+                --json databaseId,status,event,url,createdAt,displayTitle \
+                --limit 1000 \
+              | jq -c '.[]')
+              if [ -n "$batch" ]; then
+                if [ -n "$all_runs" ]; then
+                  all_runs="$all_runs"$'\n'"$batch"
+                else
+                  all_runs="$batch"
+                fi
+              fi
+            done
 
             if [ -z "$all_runs" ]; then
               echo "✅ No unfinished runs found"
@@ -58,15 +148,16 @@ jobs:
             # Count runs by event type
             total_runs=$(echo "$all_runs" | wc -l)
             pr_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event=="pull_request")] | length')
-            other_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event!="pull_request")] | length')
+            dispatch_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event=="workflow_dispatch")] | length')
+            other_runs=$(echo "$all_runs" | jq -s '[.[] | select(.event!="pull_request" and .event!="workflow_dispatch")] | length')
 
-            echo "📊 Summary: $total_runs unfinished runs ($pr_runs PR-related, $other_runs other)"
+            echo "📊 Summary: $total_runs unfinished ($pr_runs pull_request, $dispatch_runs workflow_dispatch, $other_runs other)"
             echo ""
 
-            # Process non-PR runs first
+            # Other runs: list only, do not cancel.
             if [ "$other_runs" -gt 0 ]; then
-              echo "--- Non-PR Runs ---"
-              echo "$all_runs" | jq -c 'select(.event!="pull_request")' | while read -r run; do
+              echo "--- Other Runs (listed only, not cancelled) ---"
+              echo "$all_runs" | jq -c 'select(.event!="pull_request" and .event!="workflow_dispatch")' | while read -r run; do
                 run_url=$(echo "$run" | jq -r '.url')
                 run_event=$(echo "$run" | jq -r '.event')
                 run_status=$(echo "$run" | jq -r '.status')
@@ -75,9 +166,9 @@ jobs:
               echo ""
             fi
 
-            # Process PR runs
+            # PR runs: resolve PR via head=owner:branch.
             if [ "$pr_runs" -gt 0 ]; then
-              echo "--- PR Runs (checking for cancellation) ---"
+              echo "--- PR Runs (resolving via head=owner:branch) ---"
               echo "$all_runs" | jq -c 'select(.event=="pull_request")' | while read -r run; do
                 run_id=$(echo "$run" | jq -r '.databaseId')
                 run_url=$(echo "$run" | jq -r '.url')
@@ -86,54 +177,56 @@ jobs:
                 echo ""
                 echo "Run ($run_status): $run_url"
 
-                # Fetch full run details to get head repository and branch info
                 run_details=$(gh api -H "Accept: application/vnd.github+json" \
                   "repos/$REPO/actions/runs/$run_id" 2>/dev/null || true)
-
                 if [ -z "$run_details" ]; then
                   echo "  ⚠️  Could not fetch run details, skipping"
                   continue
                 fi
 
-                # Get head owner and branch (works for both fork and non-fork PRs)
                 head_owner=$(echo "$run_details" | jq -r '.head_repository.owner.login // empty')
                 head_branch=$(echo "$run_details" | jq -r '.head_branch // empty')
-
                 if [ -z "$head_owner" ] || [ -z "$head_branch" ]; then
                   echo "  ⚠️  Missing head info, skipping"
                   continue
                 fi
 
                 echo "  Branch: ${head_owner}:${head_branch}"
-
-                # Find PR by searching with head=owner:branch
-                pr_number=$(gh api -H "Accept: application/vnd.github+json" \
-                  "repos/$REPO/pulls?state=open&head=${head_owner}:${head_branch}" \
-                  --jq '.[0].number // empty' 2>/dev/null || true)
-
-                if [ -z "$pr_number" ]; then
-                  echo "  ⚠️  No open PR found, skipping"
-                  continue
-                fi
-
-                pr_url="https://github.com/$REPO/pull/$pr_number"
-                echo "  PR: $pr_url"
-
-                # Check for high priority label
-                labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
-                  | jq -r '.labels[].name' 2>/dev/null || true)
-
-                if echo "$labels" | grep -Fxq "high priority"; then
-                  echo "  🛑 Skipping (high priority label)"
-                  continue
-                fi
-
-                echo "  🚫 Cancelling..."
-                gh run cancel "$run_id" --repo "$REPO" || echo "  ⚠️  Cancellation failed"
+                maybe_cancel_for_pr "$run_id" \
+                  "repos/$REPO/pulls?state=all&head=${head_owner}:${head_branch}" \
+                  "head=${head_owner}:${head_branch}"
               done
+              echo ""
             fi
 
-            echo ""
+            # workflow_dispatch runs (e.g. /rerun-test): resolve PR via pr_head_sha
+            # parsed from run-name (`[rerun-test] <cmd> <sha>`).
+            if [ "$dispatch_runs" -gt 0 ]; then
+              echo "--- Dispatch Runs (resolving via pr_head_sha in display_title) ---"
+              echo "$all_runs" | jq -c 'select(.event=="workflow_dispatch")' | while read -r run; do
+                run_id=$(echo "$run" | jq -r '.databaseId')
+                run_url=$(echo "$run" | jq -r '.url')
+                run_status=$(echo "$run" | jq -r '.status')
+                display_title=$(echo "$run" | jq -r '.displayTitle // empty')
+
+                echo ""
+                echo "Run ($run_status): $run_url"
+                echo "  Title: $display_title"
+
+                # Last whitespace-delimited token if it is a 40-hex SHA.
+                last_token=$(echo "$display_title" | awk '{print $NF}')
+                if ! [[ "$last_token" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "  ⚠️  No pr_head_sha in title, skipping"
+                  continue
+                fi
+
+                echo "  pr_head_sha: $last_token"
+                maybe_cancel_for_pr "$run_id" \
+                  "repos/$REPO/commits/$last_token/pulls" \
+                  "sha=$last_token"
+              done
+              echo ""
+            fi
           done
 
           echo "========================================="

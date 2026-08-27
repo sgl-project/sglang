@@ -12,12 +12,14 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        first_done_first_out_mode: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        self.first_done_first_out_mode = first_done_first_out_mode
 
     @staticmethod
     def from_server_args(
@@ -31,14 +33,19 @@ class DllmConfig:
             model_path=server_args.model_path,
             model_revision=server_args.revision,
         )
+        DLLM_PARAMS = {
+            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
+            "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+        }
 
-        if model_config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
-            block_size = 32
-            mask_id = 156895
+        arch = model_config.hf_config.architectures[0]
+        if arch in DLLM_PARAMS:
+            params = DLLM_PARAMS[arch]
+            block_size = params["block_size"]
+            mask_id = params["mask_id"]
         else:
-            raise RuntimeError(
-                f"Unknown diffusion LLM: {model_config.hf_config.architectures[0]}"
-            )
+            raise RuntimeError(f"Unknown diffusion LLM: {arch}")
 
         max_running_requests = (
             1
@@ -67,4 +74,5 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            first_done_first_out_mode=server_args.dllm_fdfo,
         )

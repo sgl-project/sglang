@@ -3,17 +3,17 @@ use std::{
     time::Duration,
 };
 
+use data_connector::{
+    create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
+    StorageFactoryConfig,
+};
 use reqwest::Client;
+use smg_mcp::McpManager;
 use tracing::debug;
 
 use crate::{
     config::RouterConfig,
     core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
-    data_connector::{
-        create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
-        StorageFactoryConfig,
-    },
-    mcp::McpManager,
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -329,12 +329,12 @@ impl AppContextBuilder {
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
         let mut client_builder = Client::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(50)))
-            .pool_max_idle_per_host(500)
+            .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)))
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
             .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)));
+            .tcp_keepalive(Some(Duration::from_secs(config.tcp_keepalive_secs)));
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -490,7 +490,7 @@ impl AppContextBuilder {
         // Always create with empty config and defaults
         debug!("Initializing MCP manager with empty config and default settings (5 min TTL, 100 max connections)");
 
-        let empty_config = crate::mcp::McpConfig {
+        let empty_config = smg_mcp::McpConfig {
             servers: Vec::new(),
             pool: Default::default(),
             proxy: None,

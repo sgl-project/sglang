@@ -15,7 +15,7 @@ from setproctitle import setproctitle
 from sglang_router.launch_router import RouterArgs, launch_router
 
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_port_available
+from sglang.srt.utils.network import is_port_available
 
 
 def setup_logger():

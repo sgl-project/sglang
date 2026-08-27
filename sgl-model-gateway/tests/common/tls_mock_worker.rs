@@ -101,7 +101,7 @@ impl TlsMockWorker {
         let app = Router::new()
             .route("/health", get(health_handler))
             .route("/health_generate", get(health_generate_handler))
-            .route("/get_server_info", get(server_info_handler))
+            .route("/server_info", get(server_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .with_state(config);

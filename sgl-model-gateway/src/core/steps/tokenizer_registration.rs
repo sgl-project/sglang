@@ -12,6 +12,10 @@ use std::{sync::Arc, time::Duration};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
+use wfaas::{
+    BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
+    WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
+};
 
 use super::workflow_data::TokenizerWorkflowData;
 use crate::{
@@ -22,10 +26,6 @@ use crate::{
         factory,
         registry::LoadOutcome,
         traits::Tokenizer,
-    },
-    workflow::{
-        BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId,
-        StepResult, WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
     },
 };
 

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Callable, Optional
 
@@ -7,6 +8,7 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -14,14 +16,15 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_block_scale_ue8m0_for_deepgemm,
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -42,7 +45,7 @@ strategy_to_parameter_type = {
 }
 
 
-class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
+class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
     def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
         self.weight_quant = weight_quant
         self.strategy = self.weight_quant.strategy
@@ -187,15 +190,31 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
-            weight = layer.weight
-            weight_scale = layer.weight_scale
-
             if is_fp8_fnuz():
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=weight_scale
+                    weight=layer.weight, weight_scale=layer.weight_scale
                 )
-            layer.weight = Parameter(weight.data, requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
+                layer.weight = Parameter(weight.data, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
+                layer.weight_scale.format_ue8m0 = False
+            else:
+                layer.weight.requires_grad_(False)
+                layer.weight_scale.requires_grad_(False)
+
+            # On Blackwell, block-FP8 dispatches to DeepGEMM, which needs the
+            # weight scales UE8M0-packed to match its UE8M0 activation scales.
+            use_deepgemm_runner = (
+                self.w8a8_block_fp8_linear
+                is deepgemm_w8a8_block_fp8_linear_with_fallback
+            )
+            requant_block_scale_ue8m0_for_deepgemm(
+                layer.weight,
+                layer.weight_scale,
+                self.weight_block_size,
+                use_deepgemm_runner=use_deepgemm_runner,
+                output_dtype=getattr(layer, "orig_dtype", None),
+                weight_shape=layer.weight.shape,
+            )
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
