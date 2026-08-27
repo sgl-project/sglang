@@ -8,6 +8,7 @@ sys.modules["libtpu"] = None
 import mmap
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -24,6 +25,20 @@ class TestMmapAllocator(unittest.TestCase):
         self.assertEqual(tensor.dtype, dtype)
         # Verify it has mapped memory address
         self.assertGreater(tensor.data_ptr(), 0)
+
+    @patch(
+        "sglang.srt.mem_cache.storage.mmap.mmap_allocator._alloc_hugepage",
+        side_effect=OSError(12, "Cannot allocate memory"),
+    )
+    def test_alloc_mmap_strict_hugepage_failure_is_fatal(self, _mock_alloc):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            envs.SGLANG_HUGEPAGE_STRICT.override(True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot be honored"):
+                alloc_mmap((2, 2), torch.float32)
 
     def test_alloc_shm(self):
         dims = (10, 1024)

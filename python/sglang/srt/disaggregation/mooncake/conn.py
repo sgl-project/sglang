@@ -1678,6 +1678,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     "supported by PD DCP relayout"
                                 )
                             chunked_dst_kv_indice = req.dst_kv_indices
+                            chunked_dst_device_kv_indice = None
                         else:
                             chunked_dst_kv_indice = req.dst_kv_indices[
                                 kv_chunk.index_slice
@@ -2481,31 +2482,30 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
 
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info["is_dummy"]
+            payload = [
+                str(self.bootstrap_room).encode("ascii"),
+                self.kv_mgr.local_ip.encode("ascii"),
+                str(self.kv_mgr.rank_port).encode("ascii"),
+                self.session_id.encode("ascii"),
+                kv_indices.tobytes() if not is_dummy else b"",
+                str(aux_index).encode("ascii") if not is_dummy else b"",
+                (
+                    pack_int_lists(state_indices, "i")
+                    if not is_dummy and state_indices
+                    else b""
+                ),
+                str(self.required_dst_info_num).encode("ascii"),
+                str(decode_prefix_len or 0).encode("ascii"),
+                (
+                    np.asarray(device_kv_indices, dtype=np.int32).tobytes()
+                    if not is_dummy and device_kv_indices is not None
+                    else b""
+                ),
+            ]
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(
-                        [
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            kv_indices.tobytes() if not is_dummy else b"",
-                            str(aux_index).encode("ascii") if not is_dummy else b"",
-                            (
-                                pack_int_lists(state_indices, "i")
-                                if not is_dummy and state_indices
-                                else b""
-                            ),
-                            str(self.required_dst_info_num).encode("ascii"),
-                            str(decode_prefix_len or 0).encode("ascii"),
-                            (
-                                np.asarray(device_kv_indices, dtype=np.int32).tobytes()
-                                if not is_dummy and device_kv_indices is not None
-                                else b""
-                            ),
-                        ]
-                    )
+                    sock.send_multipart(payload)
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(

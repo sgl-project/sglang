@@ -707,6 +707,9 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # Fail allocation instead of silently falling back to 4KiB pages when an
+    # explicitly requested hugepage mapping cannot be created.
+    SGLANG_HUGEPAGE_STRICT = EnvBool(False)
 
     # ===================================================================
     # KV-transfer staging and Mooncake transport
@@ -748,6 +751,13 @@ class Envs:
     # ===================================================================
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
     SGLANG_MORI_SEND_AUX_RDMA = EnvBool(False)
+    # Maximum byte length of one CPU RDMA registration. Keep it 2MiB-aligned
+    # so the same chunks can be individually cudaHostRegister'd on hugetlb
+    # storage and registered with MoRI without subrange peer-memory mappings.
+    SGLANG_MORI_HOST_REGISTRATION_CHUNK_BYTES = EnvInt(256 * (1 << 20))
+    # Spread independent DP/TP scheduler processes over the configured RDMA
+    # device list instead of concentrating every host MR on the first HCA.
+    SGLANG_MORI_RANK_LOCAL_IB_DEVICE = EnvBool(False)
     # Number of RDMA Queue Pairs (QPs) used per transfer operation. Higher
     # values can increase parallelism and bandwidth utilization.
     SGLANG_MORI_QP_PER_TRANSFER = EnvInt(4)
