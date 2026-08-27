@@ -5656,7 +5656,7 @@ class TestGetSchemaProperties(unittest.TestCase):
                 {"type": "object", "properties": {"kind": {"const": "other"}}},
             ],
         }
-        # first branch wins on duplicate keys, matching oneOf preference order
+        # duplicate keys resolve to the first branch that declares them
         self.assertEqual(
             get_schema_properties(schema),
             {"kind": {"const": "acme"}, "payload": {"type": "object"}},
@@ -5813,6 +5813,14 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
         detector = Glm4MoeDetector()
         name, arguments = self._stream_arguments(
             detector, self.glm4_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm4_streaming_object_argument_closes_outer_brace(self):
+        detector = Glm4MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm4_text, self.flat_tools
         )
         self.assertEqual(name, "acme")
         self.assertEqual(json.loads(arguments), self.expected)

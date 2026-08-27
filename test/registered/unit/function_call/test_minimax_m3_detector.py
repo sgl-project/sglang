@@ -535,5 +535,63 @@ def _parse_segments_text(text, tools):
     ], result.normal_text
 
 
+class TestMinimaxM3TopLevelOneOf(CustomTestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "acme"},
+                                    "payload": {
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                        "required": ["value"],
+                                    },
+                                },
+                                "required": ["kind", "payload"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"kind": {"const": "other"}},
+                                "required": ["kind"],
+                            },
+                        ],
+                    },
+                ),
+            ),
+        ]
+        self.segments = (
+            "<tool_call>",
+            '<invoke name="acme">',
+            "<kind>acme",
+            "</kind>",
+            "<payload>",
+            "<value>hello",
+            "</value>",
+            "</payload>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        self.expected = {"kind": "acme", "payload": {"value": "hello"}}
+
+    def test_detect_and_parse(self):
+        calls, _ = _parse_segments(self.segments, self.tools)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"], self.expected)
+
+    def test_streaming(self):
+        calls = _stream_segments(self.segments, self.tools)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"], self.expected)
+
+
 if __name__ == "__main__":
     unittest.main()

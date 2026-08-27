@@ -83,7 +83,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
                 if isinstance(params, dict):
                     properties = get_schema_properties(params)
-                    if properties:
+                    if properties or "properties" in params:
                         return properties
                     return params
                 else:
