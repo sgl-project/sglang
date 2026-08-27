@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Final, List, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Final, List, NamedTuple
 
 import torch
-from tvm_ffi import Module
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -13,7 +12,12 @@ from sglang.kernels.jit.utils import (
 )
 
 if TYPE_CHECKING:
+    from tvm_ffi import Module
+
     from sglang.kernels.ops.communication.all_reduce import Communicator
+
+
+SUPPORTED_OPS: Final = ["all_reduce", "all_gather", "reduce_scatter"]
 
 
 class Partition(NamedTuple):
@@ -32,7 +36,33 @@ def get_token_partion(num_tokens: int, comm: Communicator) -> Partition:
     )
 
 
-SUPPORTED_OPS: Final = ["all_reduce", "all_gather", "reduce_scatter"]
+class CopyEngineFlags(NamedTuple):
+    flags: torch.Tensor  # [2 * world_size,] on symm-mem
+    flags_ptr: int
+    flags_mc_ptr: int
+
+
+def make_ce_flags(
+    group,
+    world_size: int,
+    *,
+    flags: torch.Tensor | None = None,
+) -> CopyEngineFlags:
+    """Allocate the flag array the copy-engine barrier waits on."""
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    if flags is None:
+        flags = _SymmetricMemory.empty_strided_p2p(
+            (2 * world_size,),
+            [1],
+            torch.int32,
+            torch.device("cuda", torch.cuda.current_device()),
+            group.group_name,
+        )
+        flags.zero_()
+    mc_ptr = get_multicast_ptr(flags)
+    torch.cuda.synchronize()
+    return CopyEngineFlags(flags, flags.data_ptr(), mc_ptr)
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
@@ -64,37 +94,17 @@ def _jit_misc_module() -> Module:
     )
 
 
-# Two arrays of `world_size` words, plus their multicast alias. The copy-engine
-# barrier signals through the alias and waits on the local copy, so these have to
-# live in symmetric memory. One set per communicator, allocated on first use.
-_CE_FLAGS: Dict[int, Tuple[torch.Tensor, int, int]] = {}
-
-
-def make_ce_flags(group, world_size: int) -> Tuple[torch.Tensor, int, int]:
-    """Allocate the flag array the copy-engine barrier waits on."""
-    from torch._C._distributed_c10d import _SymmetricMemory
-
-    flags = _SymmetricMemory.empty_strided_p2p(
-        (2 * world_size,),
-        [1],
-        torch.int32,
-        torch.device("cuda", torch.cuda.current_device()),
-        group.group_name,
-    )
-    flags.zero_()
-    mc_ptr = get_multicast_ptr(flags)
-    torch.cuda.synchronize()
-    return flags, flags.data_ptr(), mc_ptr
-
-
 @cache_once
-def _jit_pull_module(dtype: torch.dtype) -> Module:
+def _jit_pull_module(dtype: torch.dtype, num_unroll: int) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "nvl_comm_pull",
         *args,
+        f"unroll{num_unroll}",
         cuda_files=["distributed/nvlink_comm.cuh"],
-        cuda_wrappers=[(n, f"NVLinkComm<{args}>::{n}_pull") for n in SUPPORTED_OPS],
+        cuda_wrappers=[
+            (n, f"NVLinkComm<{args}>::{n}_pull<{num_unroll}>") for n in SUPPORTED_OPS
+        ],
     )
 
 
@@ -103,8 +113,8 @@ def _jit_push_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         "nvl_comm_push",
-        str(world_size),
         *args,
+        f"world{world_size}",
         cuda_files=["distributed/nvlink_comm.cuh"],
         cuda_wrappers=[
             (n, f"NVLinkComm<{args}>::{n}_push<{world_size}>") for n in SUPPORTED_OPS
@@ -112,31 +122,59 @@ def _jit_push_module(dtype: torch.dtype, world_size: int) -> Module:
     )
 
 
-def all_reduce_push(comm: Communicator, input: torch.Tensor, output: torch.Tensor):
-    _jit_push_module(input.dtype, comm.world_size).all_reduce(comm, input, output)
+# `residual` on any of these is folded into the reduction rather than costing a
+# separate pass. It may be shaped like this rank's shard or like the whole
+# tensor; in the latter case this rank's slice is taken, so a ragged split needs
+# no view on the caller's side.
+def all_reduce_push(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> None:
+    _jit_push_module(input.dtype, comm.world_size).all_reduce(
+        comm, input, output, residual
+    )
 
 
-def all_gather_push(comm: Communicator, input: torch.Tensor, output: torch.Tensor):
-    _jit_push_module(input.dtype, comm.world_size).all_gather(comm, input, output)
+def all_gather_push(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> None:
+    _jit_push_module(input.dtype, comm.world_size).all_gather(
+        comm, input, output, residual
+    )
 
 
-def reduce_scatter_push(comm: Communicator, input: torch.Tensor, output: torch.Tensor):
-    _jit_push_module(input.dtype, comm.world_size).reduce_scatter(comm, input, output)
+def reduce_scatter_push(
+    comm: Communicator,
+    input: torch.Tensor,
+    output: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> None:
+    _jit_push_module(input.dtype, comm.world_size).reduce_scatter(
+        comm, input, output, residual
+    )
 
 
 def all_reduce_pull(
     comm: Communicator,
     input: torch.Tensor,
     output: torch.Tensor,
+    residual: torch.Tensor | None = None,
     *,
     in_mc_ptr: int = 0,
     out_mc_ptr: int = 0,
+    num_unroll=4,
     num_blocks_hint: int = 0,
 ) -> None:
-    _jit_pull_module(input.dtype).all_reduce(
+    _jit_pull_module(input.dtype, num_unroll).all_reduce(
         comm,
         input,
         output,
+        residual,
         in_mc_ptr or get_multicast_ptr(input),
         out_mc_ptr or get_multicast_ptr(output),
         num_blocks_hint,
@@ -147,14 +185,17 @@ def all_gather_pull(
     comm: Communicator,
     input: torch.Tensor,
     output: torch.Tensor,
+    residual: torch.Tensor | None = None,
     *,
     out_mc_ptr: int = 0,
-    num_blocks_hint: int = 32,
+    num_unroll=4,
+    num_blocks_hint: int = 0,
 ) -> None:
-    _jit_pull_module(input.dtype).all_gather(
+    _jit_pull_module(input.dtype, num_unroll).all_gather(
         comm,
         input,
         output,
+        residual,
         out_mc_ptr or get_multicast_ptr(output),
         num_blocks_hint,
     )
@@ -164,20 +205,23 @@ def reduce_scatter_pull(
     comm: Communicator,
     input: torch.Tensor,
     output: torch.Tensor,
+    residual: torch.Tensor | None = None,
     *,
     in_mc_ptr: int = 0,
+    num_unroll=4,
     num_blocks_hint: int = 0,
 ) -> None:
-    _jit_pull_module(input.dtype).reduce_scatter(
+    _jit_pull_module(input.dtype, num_unroll).reduce_scatter(
         comm,
         input,
         output,
+        residual,
         in_mc_ptr or get_multicast_ptr(input),
         num_blocks_hint,
     )
 
 
-def all_gather_copy_engine(
+def all_gather_copy_engine_multicast(
     comm: Communicator,
     input: torch.Tensor,
     output: torch.Tensor,
@@ -197,9 +241,9 @@ def all_gather_copy_engine_unicast(
     input: torch.Tensor,
     output: torch.Tensor,
     *,
-    group=None,
     peer_out_ptrs: List[int] | None = None,
     stream: int | None = None,
+    ce_flags: CopyEngineFlags,
 ) -> None:
     """All-gather that launches no kernel at all.
 
@@ -212,10 +256,6 @@ def all_gather_copy_engine_unicast(
     """
     from torch._C._distributed_c10d import _SymmetricMemory
 
-    flags = _CE_FLAGS.get(id(comm))
-    if flags is None:
-        assert group is not None, "pass `group` on the first call to allocate the flags"
-        flags = _CE_FLAGS[id(comm)] = make_ce_flags(group, comm.world_size)
     if peer_out_ptrs is None:
         base = _SymmetricMemory.rendezvous(output).buffer_ptrs
         # `output` may be a view into the middle of the allocation, and the peer
@@ -225,7 +265,7 @@ def all_gather_copy_engine_unicast(
     if stream is None:
         stream = torch.cuda.current_stream().cuda_stream
     _jit_misc_module().all_gather_copy_engine_unicast(
-        comm, input, output, peer_out_ptrs, flags[1], flags[2], stream
+        comm, input, output, peer_out_ptrs, *ce_flags[1:], stream
     )
 
 

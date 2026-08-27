@@ -1,32 +1,3 @@
-"""Latency of the NVLink push/pull collectives against NCCL and custom AR v2.
-
-Scratch benchmark -- not registered, not wired into CI.
-
-    python benchmark/bench_nvlink_comm/bench_nvlink_comm.py
-    python benchmark/bench_nvlink_comm/bench_nvlink_comm.py --num-gpu 4
-
-Shapes, with W = world size and H = hidden:
-
-    all_reduce      in [T, H]      out [T, H]
-    all_gather      in [T, H]      out [T * W, H]
-    reduce_scatter  in [T * W, H]  out [T, H]
-
-The push family stages through the plane's own slots, so it is capped by the
-push workspace and drops out of the larger rows. The pull family runs on the
-caller's symmetric buffers and has no such ceiling, which is why the sweep runs
-well past what push can serve.
-
-On the extra copy: custom AR v2 stages a plain tensor through its workspace and
-copies the result back, while the pull path needs its buffers to be symmetric in
-the first place. `nvlink-pull` times the kernel on buffers that already are, and
-`nvlink-pull+copy` adds the copy in and out, which is the honest comparison
-against `v2` when the caller's data lives in ordinary memory.
-
-NCCL symmetric memory goes through `pynccl_comm`, not `dist`: the window is
-registered against that communicator, so a `dist` collective would silently take
-the ordinary path. The communicator also starts disabled, hence `change_state`.
-"""
-
 from __future__ import annotations
 
 import atexit
@@ -54,8 +25,6 @@ PROVIDERS = [
     "v2",
     "nvlink-push",
     "nvlink-pull",
-    "copy-engine",
-    "copy-engine-unicast",
 ]
 OPS = nvl.SUPPORTED_OPS
 
@@ -164,10 +133,11 @@ def _shapes(op: str, tokens: int, world_size: int) -> Tuple[Tuple[int, int], ...
     return (tokens, HIDDEN), (tokens, HIDDEN)
 
 
+@marker.parametrize("residual", [False, True])
 @marker.parametrize("op", OPS)
 @marker.parametrize("tokens", [2**n for n in range(15)])
 @marker.benchmark("provider", PROVIDERS)
-def benchmark(op: str, tokens: int, provider: str):
+def benchmark(op: str, tokens: int, residual: bool, provider: str):
     cpu_group, gpu_group, pynccl_coord, device = _init_groups()
     world_size = dist.get_world_size(cpu_group)
     nvlink, v2 = _init_comms()
@@ -178,8 +148,6 @@ def benchmark(op: str, tokens: int, provider: str):
 
     if provider == "v2" and op != "all_reduce":
         marker.skip("v2 is an all-reduce baseline only")
-    if provider.startswith("copy-engine") and op != "all_gather":
-        marker.skip("the copy-engine paths only implement all_gather")
     if provider.startswith("nvlink-push"):
         # Only the gather spans the plane; all-reduce and the scatter each put a
         # sender's whole contribution into a single slot.
@@ -193,27 +161,39 @@ def benchmark(op: str, tokens: int, provider: str):
     sym_out = _symm(out_shape, cpu_group)
     sym_in.normal_()
 
-    if provider == "copy-engine":
-        # The copy engine moves the payload and the collective launches only its
-        # two barriers, so this cell runs the all-gather with zero SM occupancy.
-        fn = lambda: nvl.all_gather_copy_engine(nvlink.obj, sym_in, sym_out)
+    # The nvlink kernels fold the residual into the reduction; every other
+    # provider has to pay for a separate pass, which is what this row compares.
+    # The gather's residual lands on this rank's shard before it is broadcast,
+    # so it is the input that gets the extra pass there, not the output.
+    res = None
+    if residual:
+        res_shape = in_shape if op == "all_gather" else out_shape
+        res = torch.randn(res_shape, dtype=DTYPE, device=device)
 
-    elif provider == "copy-engine-unicast":
-        # Same shape, but the payload rides the unicast links: one peer copy per
-        # rank instead of a single write to the multicast alias.
-        nvl.all_gather_copy_engine_unicast(nvlink.obj, sym_in, sym_out, group=cpu_group)
-        fn = lambda: nvl.all_gather_copy_engine_unicast(nvlink.obj, sym_in, sym_out)
+    def unfused(collective, target):
+        """The collective plus the separate residual pass it cannot absorb."""
+        if res is None:
+            return collective
+        if op == "all_gather":
+            return lambda: (target.add_(res), collective())
+        return lambda: (collective(), target.add_(res))
 
-    elif provider == "nccl":
+    if provider == "nccl":
         plain_in = torch.randn(in_shape, dtype=DTYPE, device=device)
         plain_out = torch.empty(out_shape, dtype=DTYPE, device=device)
         if op == "all_reduce":
-            fn = lambda: dist.all_reduce(plain_in, group=gpu_group)
+            fn = unfused(lambda: dist.all_reduce(plain_in, group=gpu_group), plain_in)
         elif op == "all_gather":
-            fn = lambda: dist.all_gather_single(plain_out, plain_in, group=gpu_group)
+            fn = unfused(
+                lambda: dist.all_gather_single(plain_out, plain_in, group=gpu_group),
+                plain_in,
+            )
         else:
-            fn = lambda: dist.reduce_scatter_single(
-                plain_out, plain_in, group=gpu_group
+            fn = unfused(
+                lambda: dist.reduce_scatter_single(
+                    plain_out, plain_in, group=gpu_group
+                ),
+                plain_out,
             )
     elif provider == "nccl-symm":
         pool_in = _nccl_pool_tensor(in_shape, pynccl_coord)
@@ -226,14 +206,14 @@ def benchmark(op: str, tokens: int, provider: str):
         # All three run in place on registered buffers, so this stays a
         # zero-copy baseline, matching nvlink-pull.
         if op == "all_reduce":
-            fn = lambda: comm.all_reduce(pool_in)
+            fn = unfused(lambda: comm.all_reduce(pool_in), pool_in)
         elif op == "all_gather":
-            fn = lambda: comm.all_gather(pool_out, pool_in)
+            fn = unfused(lambda: comm.all_gather(pool_out, pool_in), pool_in)
         else:
-            fn = lambda: comm.reduce_scatter(pool_out, pool_in)
+            fn = unfused(lambda: comm.reduce_scatter(pool_out, pool_in), pool_out)
     elif provider == "v2":
         plain_in = torch.randn(in_shape, dtype=DTYPE, device=device)
-        fn = lambda: v2.custom_all_reduce(plain_in)
+        fn = unfused(lambda: v2.custom_all_reduce(plain_in), plain_in)
     else:
         op_fn = {
             ("all_reduce", "push"): nvl.all_reduce_push,
@@ -243,7 +223,7 @@ def benchmark(op: str, tokens: int, provider: str):
             ("all_gather", "pull"): nvl.all_gather_pull,
             ("reduce_scatter", "pull"): nvl.reduce_scatter_pull,
         }[(op, "push" if provider.startswith("nvlink-push") else "pull")]
-        fn = lambda: op_fn(nvlink.obj, sym_in, sym_out)
+        fn = lambda: op_fn(nvlink.obj, sym_in, sym_out, res)
 
     # Bandwidth-equivalent bytes a ring collective moves per rank.
     payload = max(in_bytes, out_bytes)
