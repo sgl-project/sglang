@@ -5,6 +5,9 @@ so XPU and Ascend nightly runs render the same Markdown table in
 `$GITHUB_STEP_SUMMARY`.
 """
 
+import json
+
+from sglang.srt.environ import envs
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 HEADER = """
@@ -48,3 +51,34 @@ def write_results_to_github_step_summary(results: dict):
             f"| {accuracy_threshold} | {status} |\n"
         )
     write_github_step_summary(summary)
+    _append_metric_records(results)
+
+
+def _append_metric_records(results: dict) -> None:
+    """Append one JSON record per model to `SGLANG_TEST_METRICS_FILE`, if set.
+
+    Consumed by the nightly XPU dashboard step in xpu-ci-job-monitor.yml to
+    render per-model ref/actual/status/duration tables. Errors are swallowed
+    so a broken write never turns a passing test red.
+    """
+    path = envs.SGLANG_TEST_METRICS_FILE.get()
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            for model, metrics in results.items():
+                record = {
+                    "model": model,
+                    "accuracy": metrics.get("accuracy"),
+                    "accuracy_threshold": metrics.get("accuracy_threshold"),
+                    "output_throughput": metrics.get("output_throughput"),
+                    "output_throughput_threshold": metrics.get(
+                        "output_throughput_threshold"
+                    ),
+                    "latency": metrics.get("latency"),
+                    "error": metrics.get("error", ""),
+                    "status": "pass" if not metrics.get("error") else "fail",
+                }
+                f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
