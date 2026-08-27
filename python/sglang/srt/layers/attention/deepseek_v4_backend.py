@@ -1771,12 +1771,19 @@ class DeepseekV4AttnBackend(
                 and cp_strategy is not None
                 and cp_strategy.name == "interleave"
             )
+            force_kvcache_prefill = self.dsv4_prefill_backend == "flashmla_kvcache"
+            force_sparse_prefill = self.dsv4_prefill_backend in (
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+            )
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
                 and cp_sparse_supported
+                and not force_kvcache_prefill
                 and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    force_sparse_prefill
+                    or q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
             ):
@@ -1911,12 +1918,21 @@ class DeepseekV4AttnBackend(
                 swa_window=SWA_WINDOW,
             )
             device = seq_lens.device
-            swa_first_pos = torch.tensor(
-                first_positions_cpu, dtype=torch.int32, device=device
+            # A direct ``torch.tensor(..., device=device)`` for each list uses
+            # pageable host memory and synchronizes the current CUDA stream.
+            # Pack both tiny arrays into one pinned allocation so their H2D
+            # transfer is a single asynchronous operation ordered before the
+            # cache-build kernels on the same stream.
+            swa_ranges_cpu = torch.tensor(
+                [first_positions_cpu, gather_lens_cpu],
+                dtype=torch.int32,
+                pin_memory=device.type == "cuda",
             )
-            swa_gather_lens = torch.tensor(
-                gather_lens_cpu, dtype=torch.int32, device=device
+            swa_ranges = swa_ranges_cpu.to(
+                device=device,
+                non_blocking=device.type == "cuda",
             )
+            swa_first_pos, swa_gather_lens = swa_ranges.unbind(0)
             total_swa = sum(gather_lens_cpu)
             selected_seq_lens_cpu = [seq_lens_cpu[i] for i in local_request_indices_cpu]
             max_seq_len = max(selected_seq_lens_cpu)
@@ -1956,9 +1972,8 @@ class DeepseekV4AttnBackend(
         if output.shape[0] == physical_rows:
             return output
         assert output.shape[0] < physical_rows
-        padded = output.new_zeros((physical_rows, *output.shape[1:]))
-        padded[: output.shape[0]] = output
-        return padded
+        padding = output.new_zeros((physical_rows - output.shape[0], *output.shape[1:]))
+        return torch.cat((output, padding), dim=0)
 
     def _forward_prefill_sparse(
         self,
