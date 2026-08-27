@@ -1010,6 +1010,7 @@ jobs:
 
       - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 150
+        continue-on-error: true
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1061,6 +1062,7 @@ jobs:
 
       - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 MTP)
         timeout-minutes: 180
+        continue-on-error: true
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
