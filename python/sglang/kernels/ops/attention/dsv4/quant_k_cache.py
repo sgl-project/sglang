@@ -69,6 +69,143 @@ def _quant_k_cache_fused_kernel(
         tl.store(scale_k_nope_uint8_ptr + out_scale_offset, scale_uint8)
 
 
+@triton.jit
+def _quant_k_cache_aiter_2buff_kernel(
+    k_bf16_ptr,
+    nope_scale_fp8_ptr,
+    nope_scale_uint8_ptr,
+    k_rope_bf16_ptr,
+    k_bf16_stride_0,
+    nope_scale_stride_0,
+    k_rope_bf16_stride_0,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    SCALE_OFFSET: tl.constexpr,
+    PAD_OFFSET: tl.constexpr,
+    PAD_SIZE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Quantize K directly into AITER MLA's 512-byte two-buffer layout."""
+    # int64 for the same reason _quant_k_cache_fused_kernel needs it: token_id
+    # multiplies a 512/576-element row stride, which overflows int32 past ~3.7M
+    # rows, well inside the pool sizes long-context serving allocates.
+    token_id = tl.program_id(0).to(tl.int64)
+    tile_id = tl.program_id(1)
+
+    if tile_id == NUM_TILES:
+        offsets = tl.arange(0, TILE_SIZE)
+
+        rope_data = tl.load(
+            k_bf16_ptr + token_id * k_bf16_stride_0 + DIM_NOPE + offsets,
+            mask=offsets < DIM_ROPE,
+            other=0.0,
+        )
+        tl.store(
+            k_rope_bf16_ptr + token_id * k_rope_bf16_stride_0 + offsets,
+            rope_data,
+            mask=offsets < DIM_ROPE,
+        )
+
+        # The AITER reader reserves bytes [462:512]. Initialize them in this
+        # same launch instead of allocating the output with torch.zeros().
+        tl.store(
+            nope_scale_uint8_ptr
+            + token_id * nope_scale_stride_0
+            + PAD_OFFSET
+            + offsets,
+            0,
+            mask=offsets < PAD_SIZE,
+        )
+    else:
+        tile_range = tl.arange(0, TILE_SIZE)
+        in_offsets = token_id * k_bf16_stride_0 + tile_id * TILE_SIZE + tile_range
+        x_fp32 = tl.load(k_bf16_ptr + in_offsets).to(tl.float32)
+
+        abs_x = tl.abs(x_fp32)
+        max_abs = tl.max(abs_x)
+        max_abs_clamped = tl.maximum(max_abs, EPS)
+        scale = max_abs_clamped / FP8_MAX
+        ceil_log2 = tl.math.ceil(tl.log2(scale))
+        scale_pow2_fp32 = tl.exp2(ceil_log2)
+        scale_inv = 1.0 / scale_pow2_fp32
+        x_scaled = x_fp32 * scale_inv
+        x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX).to(
+            nope_scale_fp8_ptr.dtype.element_ty
+        )
+
+        tl.store(
+            nope_scale_fp8_ptr
+            + token_id * nope_scale_stride_0
+            + tile_id * TILE_SIZE
+            + tile_range,
+            x_fp8,
+        )
+
+        # AITER expects every e8m0 exponent byte twice:
+        # [s0, s0, s1, s1, ..., s6, s6].
+        scale_uint8 = (ceil_log2.to(tl.int32) + 127).to(tl.uint8)
+        scale_offset = token_id * nope_scale_stride_0 + SCALE_OFFSET + 2 * tile_id
+        tl.store(nope_scale_uint8_ptr + scale_offset, scale_uint8)
+        tl.store(nope_scale_uint8_ptr + scale_offset + 1, scale_uint8)
+
+
+def quant_to_aiter_2buff_triton(
+    k_bf16: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return AITER MLA's packed FP8 nope/scale buffer and BF16 rope buffer.
+
+    The first output is ``[num_tokens, 512]`` bytes laid out as
+    ``[448 fp8 nope | 14 duplicated e8m0 scale bytes | 50 zero pad bytes]``.
+    The kernel writes the complete layout directly, avoiding four subsequent
+    PyTorch fill/copy launches.
+    """
+    assert k_bf16.dtype == torch.bfloat16
+    num_tokens, hidden_dim = k_bf16.shape
+    assert hidden_dim == 512
+
+    dim_nope = 448
+    dim_rope = 64
+    tile_size = 64
+    num_tiles = dim_nope // tile_size
+    scale_offset = dim_nope
+    pad_offset = scale_offset + 2 * num_tiles
+
+    k_bf16 = k_bf16.contiguous()
+    nope_scale_fp8 = torch.empty(
+        (num_tokens, hidden_dim), dtype=fp8_dtype, device=k_bf16.device
+    )
+    k_rope_bf16 = torch.empty(
+        (num_tokens, dim_rope), dtype=torch.bfloat16, device=k_bf16.device
+    )
+
+    fp8_dtype_info = torch.finfo(fp8_dtype)
+    grid = (num_tokens, num_tiles + 1)
+    _quant_k_cache_aiter_2buff_kernel[grid](
+        k_bf16,
+        nope_scale_fp8,
+        nope_scale_fp8.view(torch.uint8),
+        k_rope_bf16,
+        k_bf16.stride(0),
+        nope_scale_fp8.stride(0),
+        k_rope_bf16.stride(0),
+        DIM_NOPE=dim_nope,
+        DIM_ROPE=dim_rope,
+        TILE_SIZE=tile_size,
+        NUM_TILES=num_tiles,
+        SCALE_OFFSET=scale_offset,
+        PAD_OFFSET=pad_offset,
+        PAD_SIZE=hidden_dim - pad_offset,
+        FP8_MIN=fp8_dtype_info.min,
+        FP8_MAX=fp8_dtype_info.max,
+        EPS=1e-8,
+    )
+    return nope_scale_fp8, k_rope_bf16
+
+
 def quant_to_nope_fp8_rope_bf16_pack_triton(
     k_bf16: torch.Tensor,
 ) -> NopeFp8RopeBf16Pack:
