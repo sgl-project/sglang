@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
     resolved_view,
     resolving_view,
 )
@@ -266,3 +267,83 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "cuda-graph capture only; disable piecewise prefill capture "
             "(e.g. --cuda-graph-backend-prefill=disabled)."
         )
+
+
+def handle_page_major_kv_layout(server_args: Any):
+    # The unified pool stores state in the page-major envelope-strided layout, so
+    # enabling it implies --enable-page-major-kv-layout — routing it through the
+    # single page-major path + stride-aware Triton asserts (set before the guard).
+    cfg = resolving_view(server_args)
+    if cfg.enable_unified_memory:
+        declare_resolution(
+            server_args,
+            "_handle_page_major_kv_layout",
+            enable_page_major_kv_layout=True,
+        )
+    if not cfg.enable_page_major_kv_layout:
+        return
+    # Only the Triton attention kernels read the strided 4-D envelope K/V
+    # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
+    # exposes each layer as a DENSE contiguous per-layer view
+    # (build_dense_mla_views), which the paged MLA kernels consume directly,
+    # with their kv_indices / block tables remapped to dense ids. Names below
+    # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
+    # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
+    # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
+    # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
+    # page_table (in-kernel for captured decode, one funnel for eager).
+    # flashmla / cutlass_mla share the create_flashmla block-table path and
+    # can be added the same way once exercised.
+    if cfg.enable_unified_memory and server_args.use_mla_backend():
+        allowed_full = {
+            "triton",
+            "fa3",
+            "trtllm_mla",
+            "flashinfer",
+            "cutedsl_mla",
+            "tokenspeed_mla",
+        }
+    else:
+        allowed_full = {"triton"}
+    backends = set(server_args._resolved_attention_backends())
+    backends.discard(None)
+    assert backends <= allowed_full, (
+        "--enable-page-major-kv-layout requires the Triton attention backend "
+        "for the full-attention layers (unified-memory MLA also allows the "
+        f"paged MLA backends); got {sorted(backends)}, allowed "
+        f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
+    )
+    # The Mamba/KDA state is stored in envelope-strided views; only
+    # stride-audited kernels may read it (Stage 4 audit, per slot):
+    # - decode: triton; flashinfer (recurrent_kda compiles the state slot
+    #   stride as a free int64); helion (specializes KDA state strides 0-3
+    #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
+    #   gating update is stride-safe) on KDA-hybrid models only.
+    # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
+    #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
+    #   int64 strides), with the same KDA-only caveat.
+    # - mamba (mamba2/short-conv state): triton only.
+    # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
+    # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
+    decode_allowed = {"triton", "flashinfer"}
+    prefill_allowed = {"triton", "flashkda"}
+    if server_args.use_mla_backend():
+        decode_allowed.update({"cutedsl", "helion"})
+        prefill_allowed.update({"cutedsl", "helion"})
+    resolved_linear_decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
+    resolved_linear_prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+    assert resolved_linear_decode in decode_allowed | {None}, (
+        "--enable-page-major-kv-layout: linear-attention DECODE backend must "
+        f"be one of {sorted(decode_allowed)} for the strided conv/SSM state; "
+        f"got {resolved_linear_decode!r}."
+    )
+    assert resolved_linear_prefill in prefill_allowed | {None}, (
+        "--enable-page-major-kv-layout: linear-attention PREFILL backend must "
+        f"be one of {sorted(prefill_allowed)} for the strided conv/SSM state; "
+        f"got {resolved_linear_prefill!r}."
+    )
+    assert cfg.mamba_backend in (None, "triton"), (
+        "--enable-page-major-kv-layout requires the Triton Mamba kernels for "
+        f"the strided conv/SSM state; got {cfg.mamba_backend!r}. Pass "
+        "--mamba-backend triton."
+    )
