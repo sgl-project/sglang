@@ -40,7 +40,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_device,
     get_exec,
     get_parallel,
@@ -249,7 +248,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = configured_pp_size()
+            pp_size = get_parallel().config.pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
