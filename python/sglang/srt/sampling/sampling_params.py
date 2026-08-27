@@ -225,11 +225,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
+                # Generated text may use a longer, non-canonical tokenization
+                # than encoding the stop string in isolation.
+                stop_str_max_len = max(stop_str_max_len, len(stop_str.encode("utf-8")))
                 if tokenizer is not None:
                     stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
                     stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
-                else:
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
 
         # Process stop regex strings
