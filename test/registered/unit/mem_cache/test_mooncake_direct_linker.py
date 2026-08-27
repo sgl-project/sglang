@@ -12,7 +12,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -33,8 +35,6 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-    DevicePoolEntry,
-    DevicePoolGroup,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache

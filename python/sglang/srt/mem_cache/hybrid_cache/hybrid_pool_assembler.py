@@ -29,10 +29,6 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-    DevicePoolEntry,
-    DevicePoolGroup,
-)
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -135,146 +131,6 @@ def _resolve_deepseek_v4_layer_mappings(
         c4_state={layer: index for index, layer in enumerate(c4)},
         c4_state_global_layers=c4_state_global_layers,
     )
-
-
-def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
-    views = []
-    for layer in global_layers:
-        pool = state_pools[layer]
-        state = pool.kv_score_buffer.kv_score
-        ring = int(pool.ring_size)
-        usable = state.shape[0] // ring * ring
-        views.append(
-            state.view(torch.uint8)
-            .reshape(state.shape[0], -1)[:usable]
-            .reshape(usable // ring, -1)
-        )
-    return views
-
-
-def _build_deepseek_v4_device_pool_group(
-    kvcache: Any,
-    page_size: int,
-    mappings: _DeepSeekV4LayerMappings,
-) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
-
-    if getattr(kvcache, "_unified_kv", False) or isinstance(
-        kvcache.c4_kv_pool, HiSparseC4DevicePool
-    ):
-        raise ValueError(
-            "The direct external linker does not support unified-KV or HiSparse."
-        )
-    if kvcache.swa_page_size != page_size:
-        raise ValueError(
-            "DeepSeek V4 SWA page size must match the tree page size: "
-            f"{kvcache.swa_page_size} != {page_size}."
-        )
-
-    entries = [
-        DevicePoolEntry(
-            name=PoolName.SWA,
-            indices_from_pool=PoolName.SWA,
-            device_pool=kvcache.swa_kv_pool,
-            components=[kvcache.swa_kv_pool.kv_buffer],
-            layer_mapping=mappings.swa,
-            page_size=page_size,
-            rows_are_pages=True,
-        )
-    ]
-
-    def add(name, source, pool, buffers, layer_mapping):
-        if layer_mapping:
-            entries.append(
-                DevicePoolEntry(
-                    name=name,
-                    indices_from_pool=source,
-                    device_pool=pool,
-                    components=[buffers],
-                    layer_mapping=layer_mapping,
-                    page_size=page_size,
-                    rows_are_pages=True,
-                )
-            )
-
-    add(
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.KV,
-        kvcache.c4_kv_pool,
-        kvcache.c4_kv_pool.kv_buffer,
-        mappings.c4,
-    )
-    add(
-        PoolName.DEEPSEEK_V4_C4_INDEXER,
-        PoolName.KV,
-        kvcache.c4_indexer_kv_pool,
-        kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-        mappings.c4,
-    )
-    add(
-        PoolName.DEEPSEEK_V4_C128,
-        PoolName.KV,
-        kvcache.c128_kv_pool,
-        kvcache.c128_kv_pool.kv_buffer,
-        mappings.c128,
-    )
-    add(
-        PoolName.DEEPSEEK_V4_C4_STATE,
-        PoolName.SWA,
-        kvcache.compress_state_pools,
-        _deepseek_v4_state_views(
-            kvcache.compress_state_pools,
-            mappings.c4_state_global_layers,
-        ),
-        mappings.c4_state,
-    )
-    add(
-        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-        PoolName.SWA,
-        kvcache.indexer_compress_state_pools,
-        _deepseek_v4_state_views(
-            kvcache.indexer_compress_state_pools,
-            mappings.c4_state_global_layers,
-        ),
-        mappings.c4_state,
-    )
-    return DevicePoolGroup(
-        entries,
-        mappings.transfer_layer_num,
-        page_size,
-        rank_replicated=True,
-    )
-
-
-def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
-    if kvcache.page_size != page_size:
-        raise ValueError(
-            "DSA KV page size must match the tree page size: "
-            f"{kvcache.page_size} != {page_size}."
-        )
-    num_layers = kvcache.layer_num
-    identity = {layer: layer for layer in range(num_layers)}
-    entries = [
-        DevicePoolEntry(
-            name=PoolName.KV,
-            indices_from_pool=PoolName.KV,
-            device_pool=kvcache,
-            components=[kvcache.kv_buffer],
-            layer_mapping=identity,
-            page_size=page_size,
-            rows_are_pages=False,
-        ),
-        DevicePoolEntry(
-            name=PoolName.INDEXER,
-            indices_from_pool=PoolName.KV,
-            device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
-            page_size=page_size,
-            rows_are_pages=True,
-        ),
-    ]
-    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
 def build_kv_host_pool(
@@ -1397,11 +1253,11 @@ class _DeepSeekV4Strategy(StackStrategy):
         }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
-        return _build_deepseek_v4_device_pool_group(
-            kvcache,
-            page_size,
-            _resolve_deepseek_v4_layer_mappings(kvcache),
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_deepseek_v4_device_pool_group,
         )
+
+        return _build_deepseek_v4_device_pool_group(kvcache, page_size)
 
     def build(
         self,
@@ -1672,6 +1528,10 @@ class _DsaStrategy(StackStrategy):
         }
 
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_dsa_device_pool_group,
+        )
+
         return _build_dsa_device_pool_group(kvcache, page_size)
 
     def build(
@@ -1879,21 +1739,6 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
     raise AssertionError(
         f"No matching HiCache strategy for kvcache={type(kvcache).__name__}, "
         f"components={sorted(c.name for c in components)}"
-    )
-
-
-def resolve_hybrid_device_pool_group(
-    *,
-    kvcache: Any,
-    page_size: int,
-    params: CacheInitParams,
-    components: set[ComponentType],
-):
-    """Materialize a direct-linker pool group through the assembler registry."""
-    return _select_strategy(kvcache, components).build_direct_linker_pool_group(
-        kvcache=kvcache,
-        params=params,
-        page_size=page_size,
     )
 
 

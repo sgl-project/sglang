@@ -14,7 +14,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
@@ -27,8 +29,6 @@ from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-    DevicePoolEntry,
-    DevicePoolGroup,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
