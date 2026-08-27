@@ -36,6 +36,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def __init__(self, eagle_worker: EagleDraftWorker):
         self._init_arch_map()
         super().__init__(eagle_worker)
+        self.replay_graph_needs_seq_lens_cpu = (
+            self._is_replay_graph_needs_seq_lens_cpu()
+        )
 
     def _init_arch_map(self):
         self.attr_name: Dict[str, str] = {
@@ -55,6 +58,10 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
+
+    def _is_replay_graph_needs_seq_lens_cpu(self):
+        hf_config = self.model_runner.model_config.hf_config
+        return not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config))
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         can_run_graph = super().can_run_graph(forward_batch)
@@ -77,18 +84,17 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         decision = torch.tensor(
             int(can_run_graph and seed_ready),
             dtype=torch.int32,
-            device=self.device,
+            device="cpu",
         )
         torch.distributed.all_reduce(
             decision,
             op=torch.distributed.ReduceOp.MIN,
-            group=self.model_runner.tp_group.device_group,
+            group=self.model_runner.tp_group.cpu_group,
         )
         return bool(decision.item())
 
     def _replay_graph(self, shape_key, forward_batch):
-        hf_config = self.model_runner.model_config.hf_config
-        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+        if self.replay_graph_needs_seq_lens_cpu:
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (
