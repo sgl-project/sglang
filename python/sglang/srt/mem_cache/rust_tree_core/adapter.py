@@ -200,7 +200,9 @@ def _insert_step_from_binding(step) -> InsertStepResult:
         # A stepped insert delivers all actions through steps, never the result.
         assert not step.result.cache_actions
         result = InsertResult(
-            prefix_len=step.result.prefix_len, mamba_exist=step.result.mamba_exist
+            prefix_len=step.result.prefix_len,
+            mamba_exist=step.result.mamba_exist,
+            host_insert_dropped=step.result.host_insert_dropped,
         )
     return InsertStepResult(
         actions=_cache_actions_from_tagged(step.actions), result=result
@@ -680,6 +682,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             prefix_len=result.prefix_len,
             total_len=result.total_len,
             inserted_host_node=result.inserted_host_node,
+            host_insert_dropped=result.host_insert_dropped,
             mamba_exist=result.mamba_exist,
             cache_actions=_cache_actions_from_tagged(result.cache_actions),
         )

@@ -555,6 +555,7 @@ pub struct InsertResultBinding {
     prefix_len: usize,
     total_len: usize,
     inserted_host_node: Option<NodeId>,
+    host_insert_dropped: bool,
     mamba_exist: bool,
     cache_actions: Py<PyList>,
 }
@@ -591,6 +592,7 @@ impl InsertResultBinding {
             prefix_len: result.prefix_len,
             total_len: result.total_len,
             inserted_host_node: result.inserted_host_node,
+            host_insert_dropped: result.host_insert_dropped,
             mamba_exist: result.mamba_exist,
             cache_actions: cache_actions_to_py(py, result.cache_actions)?,
         })

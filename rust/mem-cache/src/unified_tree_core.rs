@@ -126,6 +126,8 @@ pub struct InsertResult {
     pub mamba_exist: bool,
     /// The deepest host-backed node an insert_host attached or matched.
     pub inserted_host_node: Option<NodeId>,
+    /// Whether write-through rejected a host suffix below an unbacked parent.
+    pub host_insert_dropped: bool,
     /// Actions for the controller to apply.
     pub cache_actions: Vec<CacheAction>,
 }
@@ -1205,6 +1207,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     prefix_len: 0,
                     total_len: 0,
                     inserted_host_node: None,
+                    host_insert_dropped: false,
                     mamba_exist: true,
                     cache_actions: Vec::new(),
                 }),
@@ -1446,6 +1449,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             prefix_len: state.total_prefix_length,
             total_len: 0,
             inserted_host_node: None,
+            host_insert_dropped: false,
             mamba_exist: false,
             cache_actions: Vec::new(),
         };
@@ -2552,6 +2556,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 prefix_len: 0,
                 total_len: 0,
                 inserted_host_node: None,
+                host_insert_dropped: false,
                 mamba_exist: true,
                 cache_actions: Vec::new(),
             };
@@ -2588,6 +2593,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             prefix_len: matched_length,
             total_len,
             inserted_host_node: None,
+            host_insert_dropped: false,
             mamba_exist: false,
             cache_actions,
         };
@@ -2596,6 +2602,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if !node.is_root() && node.has_host_value(FULL) {
                 result.inserted_host_node = Some(self.arena.node(node_id).id);
             }
+            return result;
+        }
+
+        // Under write-through, a host-only suffix below a device-only parent
+        // would violate the invariant that a backed-up child has a backed-up
+        // parent. Keep any split actions produced by the walk, but do not
+        // materialize the suffix.
+        let parent = self.arena.node(node_id);
+        if !self.is_write_back && !parent.is_root() && !parent.backuped() {
+            result.host_insert_dropped = true;
             return result;
         }
 

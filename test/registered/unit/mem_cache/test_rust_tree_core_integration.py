@@ -450,6 +450,21 @@ def test_insert_host_extends_the_backuped_path():
     assert match.host_hit_length == 2
 
 
+def test_insert_host_reports_a_dropped_write_through_suffix():
+    core = _tree_core()
+    _insert(core, [1], [10])
+    parent = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+
+    result = core.insert_host(
+        parent, _key([2]), torch.tensor([100], dtype=torch.int64), ["h0"]
+    )
+
+    assert result.prefix_len == 0
+    assert result.total_len == 1
+    assert result.inserted_host_node is None
+    assert result.host_insert_dropped
+
+
 def test_host_lock_refs_round_trip():
     core = _tree_core()
     core.set_hicache_enabled()

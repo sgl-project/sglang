@@ -2873,6 +2873,7 @@ fn insert_host_attaches_a_host_only_leaf_under_the_root() {
     );
     assert_eq!(result.prefix_len, 0);
     assert_eq!(result.total_len, 2);
+    assert!(!result.host_insert_dropped);
     let new_node = result.inserted_host_node.unwrap();
     let node = tc.arena.node(tc.arena.resolve(new_node));
     assert!(node.evicted() && node.backuped());
@@ -2892,8 +2893,9 @@ fn insert_host_attaches_a_host_only_leaf_under_the_root() {
 }
 
 #[test]
-fn insert_host_walks_the_match_and_attaches_only_the_suffix() {
+fn insert_host_allows_a_suffix_under_an_unbacked_write_back_parent() {
     let mut tc = core();
+    tc.is_write_back = true;
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     let root = tc.arena.root();
     let result = tc.insert_host(
@@ -2908,6 +2910,7 @@ fn insert_host_walks_the_match_and_attaches_only_the_suffix() {
     );
     assert_eq!(result.prefix_len, 2);
     assert_eq!(result.total_len, 4);
+    assert!(!result.host_insert_dropped);
     let new_node = tc
         .arena
         .node(tc.arena.resolve(result.inserted_host_node.unwrap()));
@@ -2920,6 +2923,58 @@ fn insert_host_walks_the_match_and_attaches_only_the_suffix() {
         new_node.hash_value,
         Some(vec!["h2".to_string(), "h3".to_string()])
     );
+}
+
+#[test]
+fn insert_host_drops_a_suffix_under_an_unbacked_write_through_parent() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let root = tc.arena.root();
+    let nodes_before = tc.arena.len();
+    let result = tc.insert_host(
+        tc.arena.node(root).id,
+        /* extra_key = */ None,
+        vec![1, 2, 3, 4],
+        Tensor::from_slice(&[100i64, 101, 102, 103]),
+        vec!["h0", "h1", "h2", "h3"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+    );
+
+    assert_eq!(result.prefix_len, 2);
+    assert_eq!(result.total_len, 4);
+    assert_eq!(result.inserted_host_node, None);
+    assert!(result.host_insert_dropped);
+    assert!(result.cache_actions.is_empty());
+    assert_eq!(tc.arena.len(), nodes_before);
+}
+
+#[test]
+fn insert_host_drop_preserves_split_actions_and_lengths() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2, 3]))
+        .best_match_node_id;
+    tc.mark_write_through_pending(leaf);
+    let root = tc.arena.root();
+    let result = tc.insert_host(
+        tc.arena.node(root).id,
+        /* extra_key = */ None,
+        vec![1, 9],
+        Tensor::from_slice(&[100i64, 101]),
+        vec!["h0".to_string(), "h1".to_string()],
+    );
+
+    assert_eq!(result.prefix_len, 1);
+    assert_eq!(result.total_len, 2);
+    assert_eq!(result.inserted_host_node, None);
+    assert!(result.host_insert_dropped);
+    assert!(matches!(
+        result.cache_actions.as_slice(),
+        [CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id, .. }] if *ack_id == leaf
+    ));
 }
 
 #[test]
@@ -3018,6 +3073,7 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
     );
     assert_eq!(result.prefix_len, 2);
     assert_eq!(result.inserted_host_node, None);
+    assert!(!result.host_insert_dropped);
     // Once backuped, the same insert reports the node.
     tc.arena.set_host_value(
         tc.arena.resolve(leaf),
@@ -3032,6 +3088,7 @@ fn insert_host_full_match_reports_only_a_backuped_node() {
         vec!["h0".to_string(), "h1".to_string()],
     );
     assert_eq!(result.inserted_host_node, Some(leaf));
+    assert!(!result.host_insert_dropped);
 }
 
 #[test]
@@ -3069,6 +3126,7 @@ fn insert_host_empty_key_is_a_noop() {
     assert_eq!(result.prefix_len, 0);
     assert!(result.mamba_exist);
     assert_eq!(result.inserted_host_node, None);
+    assert!(!result.host_insert_dropped);
     assert_eq!(tc.arena.len(), 1);
 }
 
@@ -6796,20 +6854,20 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
     let top = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
-    let root = tc.arena.root();
+    tc.insert(&insert_params(
+        &vec![1, 2, 3, 4, 5, 6, 7, 8],
+        &[20, 21, 22, 23, 24, 25, 26, 27],
+    ));
     let h_leaf = tc
-        .insert_host(
-            tc.arena.node(root).id,
-            /* extra_key = */ None,
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
-            Tensor::from_slice(&[100i64, 101, 102, 103, 104, 105, 106, 107]),
-            vec!["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        )
-        .inserted_host_node
-        .unwrap();
+        .match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7, 8]))
+        .best_match_node_id;
+    let h_leaf_idx = tc.arena.resolve(h_leaf);
+    tc.commit_backup(
+        h_leaf,
+        Tensor::from_slice(&[104i64, 105, 106, 107]),
+        HashMap::new(),
+    );
+    demote_node(&mut tc, h_leaf_idx);
     let step = tc.begin_insert(&insert_params(
         &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
@@ -6881,22 +6939,24 @@ fn one_insert_walk_fires_two_crossings_around_a_backuped_middle() {
     let top = tc
         .match_prefix(&match_params(&vec![1, 2, 3, 4]))
         .best_match_node_id;
-    // A storage prefetch host-inserts a backuped middle below the unbacked top.
-    let root = tc.arena.root();
+    // Build a backed-up, device-evicted middle below the unbacked top. A
+    // write-through host refill below an unbacked parent is now rejected.
+    tc.insert(&insert_params(
+        &vec![1, 2, 3, 4, 5, 6, 7, 8],
+        &[20, 21, 22, 23, 24, 25, 26, 27],
+    ));
     let middle = tc
-        .insert_host(
-            tc.arena.node(root).id,
-            /* extra_key = */ None,
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
-            Tensor::from_slice(&[100i64, 101, 102, 103, 104, 105, 106, 107]),
-            vec!["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        )
-        .inserted_host_node
-        .unwrap();
-    // The device insert unevicts the middle and adds the unbacked deep leaf.
+        .match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7, 8]))
+        .best_match_node_id;
+    let middle_idx = tc.arena.resolve(middle);
+    tc.commit_backup(
+        middle,
+        Tensor::from_slice(&[104i64, 105, 106, 107]),
+        HashMap::new(),
+    );
+    demote_node(&mut tc, middle_idx);
+
+    // The device insert restores the middle and adds the unbacked deep leaf.
     tc.insert(&insert_params(
         &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
