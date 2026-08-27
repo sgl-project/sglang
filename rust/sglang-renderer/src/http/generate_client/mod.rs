@@ -8,9 +8,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DynamoTokenizer, FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
-    GenerationOutputExtras, GenerationStream, MatchedStop, PreparedGenerateRequest, TextTokenizer,
-    TokenIds, TokenIdsRequest,
+    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
+    GenerationOutputExtras, GenerationStream, MatchedStop, PreparedGenerateRequest, TokenIds,
+    TokenIdsRequest,
 };
 
 #[derive(Clone)]
@@ -18,8 +18,6 @@ pub struct HttpGenerateClient {
     client: reqwest::Client,
     generate_url: Arc<str>,
     tokenizer: dynamo_tokenizers::Tokenizer,
-    stop_tokenizer: Arc<DynamoTokenizer>,
-    auto_specials: Arc<[i32]>,
 }
 
 /// Renderer-to-engine framing options stay private to this HTTP transport and
@@ -45,25 +43,17 @@ impl HttpGenerateClient {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| format!("building engine HTTP client failed: {error}"))?;
-        let stop_tokenizer = Arc::new(DynamoTokenizer::new(tokenizer.clone()));
-        let auto_specials = stop_tokenizer.auto_specials().into();
         Ok(Self {
             client,
             generate_url,
             tokenizer,
-            stop_tokenizer,
-            auto_specials,
         })
     }
     pub async fn generate(
         &self,
         mut request: TokenIdsRequest,
     ) -> Result<GenerationStream, FrontendError> {
-        translate_text_stops(
-            &mut request,
-            self.stop_tokenizer.as_ref(),
-            &self.auto_specials,
-        )?;
+        let mut stop_matcher = take_text_stops(&mut request)?;
 
         let prompt_ids = request
             .input_ids
@@ -135,8 +125,12 @@ impl HttpGenerateClient {
                         yield Err(error);
                         return;
                     }
-                    output.text = match decode_ids(&mut decoder, &output.token_ids) {
-                        Ok(text) => text,
+                    let matched_stop = match decode_output(
+                        &mut decoder,
+                        &mut output,
+                        stop_matcher.as_mut(),
+                    ) {
+                        Ok(matched_stop) => matched_stop,
                         Err(error) => {
                             yield Err(error);
                             return;
@@ -144,6 +138,13 @@ impl HttpGenerateClient {
                     };
                     if decode_logprob_text {
                         fill_logprob_text(&logprob_tokenizer, output.extras.as_deref_mut());
+                    }
+                    if let Some(matched_stop) = matched_stop {
+                        output.finish_reason = Some(GenerationFinishReason::Stop(Some(
+                            MatchedStop::Text(matched_stop),
+                        )));
+                        yield Ok(GenerationEvent::Done(output));
+                        return;
                     }
                     terminal = output.finish_reason.is_some();
                     if terminal {
@@ -175,11 +176,9 @@ impl HttpGenerateClient {
     }
 }
 
-fn translate_text_stops(
+fn take_text_stops(
     request: &mut TokenIdsRequest,
-    tokenizer: &dyn TextTokenizer,
-    auto_specials: &[i32],
-) -> Result<(), FrontendError> {
+) -> Result<Option<StopStringMatcher>, FrontendError> {
     let params = &mut request.options.sampling_params;
     if params.min_new_tokens > 0 {
         return Err(invalid(
@@ -192,48 +191,189 @@ fn translate_text_stops(
         ));
     }
 
-    let mut stop_token_ids = params.stop_token_ids.take().unwrap_or_default();
-    for stop in std::mem::take(&mut params.stop_strs) {
-        let mut ids = tokenizer
-            .encode(&stop)
-            .map_err(|error| invalid(format!("tokenizing stop {stop:?} failed: {error}")))?;
-        if ids.starts_with(auto_specials) {
-            ids.drain(..auto_specials.len());
-        }
-        if ids.len() != 1 {
-            return Err(invalid(format!(
-                "stop {stop:?} tokenizes to {} tokens; the token-only engine supports only single-token text stops",
-                ids.len()
-            )));
-        }
-        stop_token_ids.push(i64::from(ids[0]));
-    }
-    stop_token_ids.sort_unstable();
-    stop_token_ids.dedup();
-    params.stop_token_ids = (!stop_token_ids.is_empty()).then_some(stop_token_ids);
+    let matcher =
+        StopStringMatcher::new(std::mem::take(&mut params.stop_strs), params.no_stop_trim);
     params.stop = None;
     params.stop_regex = None;
     params.stop_regex_strs.clear();
     params.stop_str_max_len = 0;
     params.stop_regex_max_len = 0;
-    Ok(())
+    Ok(matcher)
 }
 
-fn decode_ids(
+struct StopStringMatcher {
+    stops: Vec<String>,
+    pending: String,
+    include_stop: bool,
+}
+
+struct StopMatch {
+    text: String,
+    matched: Option<String>,
+}
+
+impl StopStringMatcher {
+    fn new(stops: Vec<String>, include_stop: bool) -> Option<Self> {
+        let stops = stops
+            .into_iter()
+            .filter(|stop| !stop.is_empty())
+            .collect::<Vec<_>>();
+        (!stops.is_empty()).then_some(Self {
+            stops,
+            pending: String::new(),
+            include_stop,
+        })
+    }
+
+    fn push(&mut self, text: &str) -> StopMatch {
+        self.pending.push_str(text);
+        if let Some((position, stop)) = self.stops.iter().find_map(|stop| {
+            self.pending
+                .find(stop)
+                .map(|position| (position, stop.clone()))
+        }) {
+            let end = if self.include_stop {
+                position + stop.len()
+            } else {
+                position
+            };
+            let text = self.pending[..end].to_owned();
+            self.pending.clear();
+            return StopMatch {
+                text,
+                matched: Some(stop),
+            };
+        }
+
+        let held_start = self
+            .pending
+            .char_indices()
+            .map(|(start, _)| start)
+            .chain(std::iter::once(self.pending.len()))
+            .find(|&start| {
+                self.stops
+                    .iter()
+                    .any(|stop| stop.starts_with(&self.pending[start..]))
+            })
+            .unwrap_or(self.pending.len());
+        let held = self.pending.split_off(held_start);
+        let text = std::mem::replace(&mut self.pending, held);
+        StopMatch {
+            text,
+            matched: None,
+        }
+    }
+
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn decode_output(
     decoder: &mut dynamo_tokenizers::DecodeStream,
-    token_ids: &[i32],
-) -> Result<String, FrontendError> {
+    output: &mut GenerationOutput,
+    mut stop_matcher: Option<&mut StopStringMatcher>,
+) -> Result<Option<String>, FrontendError> {
     let mut text = String::new();
-    for &id in token_ids {
+    for index in 0..output.token_ids.len() {
+        let id = output.token_ids[index];
         let id = u32::try_from(id).map_err(|_| internal("engine returned a negative token ID"))?;
         if let Some(delta) = decoder
             .step(id)
             .map_err(|error| internal(format!("detokenizing engine output failed: {error}")))?
         {
-            text.push_str(&delta);
+            if let Some(matcher) = stop_matcher.as_deref_mut() {
+                let matched = matcher.push(&delta);
+                text.push_str(&matched.text);
+                if let Some(stop) = matched.matched {
+                    truncate_output(output, index + 1)?;
+                    output.text = text;
+                    return Ok(Some(stop));
+                }
+            } else {
+                text.push_str(&delta);
+            }
         }
     }
-    Ok(text)
+    if output.finish_reason.is_some()
+        && let Some(matcher) = stop_matcher
+    {
+        text.push_str(&matcher.flush());
+    }
+    output.text = text;
+    Ok(None)
+}
+
+fn truncate_output(output: &mut GenerationOutput, kept_tokens: usize) -> Result<(), FrontendError> {
+    output.token_ids.truncate(kept_tokens);
+    output.completion_tokens = u64::try_from(kept_tokens).unwrap_or(u64::MAX);
+    let Some(extras) = output.extras.as_deref_mut() else {
+        return Ok(());
+    };
+    truncate_optional(&mut extras.output_logprobs, kept_tokens, "output logprobs")?;
+    truncate_optional(
+        &mut extras.output_logprob_token_ids,
+        kept_tokens,
+        "output logprob token IDs",
+    )?;
+    truncate_optional(
+        &mut extras.output_logprob_text,
+        kept_tokens,
+        "output logprob text",
+    )?;
+    if extras.output_top_logprob_lengths.is_empty() {
+        return Ok(());
+    }
+    if extras.output_top_logprob_lengths.len() < kept_tokens {
+        return Err(internal(format!(
+            "engine returned {} top-logprob positions for {kept_tokens} retained tokens",
+            extras.output_top_logprob_lengths.len()
+        )));
+    }
+    let alternatives =
+        extras.output_top_logprob_lengths[..kept_tokens]
+            .iter()
+            .try_fold(0usize, |total, &length| -> Result<usize, FrontendError> {
+                total
+                    .checked_add(usize::try_from(length).map_err(|_| {
+                        internal("engine top-logprob count exceeds addressable memory")
+                    })?)
+                    .ok_or_else(|| internal("engine top-logprob count overflowed"))
+            })?;
+    extras.output_top_logprob_lengths.truncate(kept_tokens);
+    truncate_optional(
+        &mut extras.output_top_logprobs,
+        alternatives,
+        "output top logprobs",
+    )?;
+    truncate_optional(
+        &mut extras.output_top_logprob_token_ids,
+        alternatives,
+        "output top-logprob token IDs",
+    )?;
+    truncate_optional(
+        &mut extras.output_top_logprob_text,
+        alternatives,
+        "output top-logprob text",
+    )
+}
+
+fn truncate_optional<T>(
+    values: &mut Vec<T>,
+    length: usize,
+    description: &str,
+) -> Result<(), FrontendError> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    if values.len() < length {
+        return Err(internal(format!(
+            "engine returned {} {description} values for {length} retained tokens",
+            values.len()
+        )));
+    }
+    values.truncate(length);
+    Ok(())
 }
 
 fn fill_logprob_text(
@@ -621,22 +761,6 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
 
-    struct StopTokenizer;
-
-    impl TextTokenizer for StopTokenizer {
-        fn encode(&self, text: &str) -> Result<TokenIds, crate::RendererError> {
-            Ok(match text {
-                "<eos>" => vec![0, 9],
-                "many" => vec![0, 4, 5],
-                _ => vec![0, 7],
-            })
-        }
-
-        fn auto_specials(&self) -> Vec<i32> {
-            vec![0]
-        }
-    }
-
     fn request(stop: Vec<&str>) -> TokenIdsRequest {
         TokenIdsRequest {
             rid: "r".into(),
@@ -652,9 +776,12 @@ mod tests {
     }
 
     #[test]
-    fn single_token_stops_become_engine_token_stops() {
+    fn text_stops_stay_in_the_frontend_and_token_stops_reach_the_engine() {
         let mut request = request(vec!["<eos>"]);
-        translate_text_stops(&mut request, &StopTokenizer, &[0]).unwrap();
+        request.options.sampling_params.stop_token_ids = Some(vec![9]);
+        let matcher = take_text_stops(&mut request).unwrap();
+
+        assert!(matcher.is_some());
         assert_eq!(
             request.options.sampling_params.stop_token_ids,
             Some(vec![9])
@@ -663,11 +790,86 @@ mod tests {
     }
 
     #[test]
-    fn multi_token_stops_are_rejected_before_submission() {
-        let mut request = request(vec!["many"]);
-        let error = translate_text_stops(&mut request, &StopTokenizer, &[0]).unwrap_err();
-        assert_eq!(error.status_code, 400);
-        assert!(error.message.contains("tokenizes to 2 tokens"));
+    fn decoded_stop_matcher_handles_cross_frame_matches_and_order() {
+        let mut matcher = StopStringMatcher::new(vec!["END".into(), "ND".into()], false).unwrap();
+
+        let first = matcher.push("value E");
+        assert_eq!(first.text, "value ");
+        assert!(first.matched.is_none());
+
+        let second = matcher.push("ND trailing");
+        assert_eq!(second.text, "");
+        assert_eq!(second.matched.as_deref(), Some("END"));
+    }
+
+    #[test]
+    fn no_stop_trim_includes_the_matched_text() {
+        let mut matcher = StopStringMatcher::new(vec!["END".into()], true).unwrap();
+        let matched = matcher.push("value END trailing");
+
+        assert_eq!(matched.text, "value END");
+        assert_eq!(matched.matched.as_deref(), Some("END"));
+    }
+
+    #[test]
+    fn local_stop_truncates_token_aligned_logprobs() {
+        let mut output = GenerationOutput {
+            token_ids: vec![7, 8, 9],
+            completion_tokens: 3,
+            extras: Some(Box::new(GenerationOutputExtras {
+                output_logprobs: vec![-0.1, -0.2, -0.3],
+                output_logprob_token_ids: vec![7, 8, 9],
+                output_top_logprobs: vec![-0.1, -1.0, -0.2, -0.3],
+                output_top_logprob_token_ids: vec![7, 6, 8, 9],
+                output_top_logprob_lengths: vec![2, 1, 1],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        truncate_output(&mut output, 2).unwrap();
+
+        assert_eq!(output.token_ids, [7, 8]);
+        assert_eq!(output.completion_tokens, 2);
+        let extras = output.extras.unwrap();
+        assert_eq!(extras.output_logprobs, [-0.1, -0.2]);
+        assert_eq!(extras.output_logprob_token_ids, [7, 8]);
+        assert_eq!(extras.output_top_logprobs, [-0.1, -1.0, -0.2]);
+        assert_eq!(extras.output_top_logprob_token_ids, [7, 6, 8]);
+        assert_eq!(extras.output_top_logprob_lengths, [2, 1]);
+    }
+
+    #[test]
+    fn text_stops_are_matched_on_contextual_decoder_output() {
+        let tokenizer = tiny_tokenizer();
+        let token_ids = tokenizer
+            .encode("hello")
+            .unwrap()
+            .token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect::<Vec<_>>();
+        let mut expected_decoder = tokenizer.decode_stream(&[65], true);
+        let mut decoded = String::new();
+        for &id in &token_ids {
+            if let Some(delta) = expected_decoder.step(id as u32).unwrap() {
+                decoded.push_str(&delta);
+            }
+        }
+        assert!(!decoded.is_empty());
+
+        let mut decoder = tokenizer.decode_stream(&[65], true);
+        let mut output = GenerationOutput {
+            token_ids,
+            completion_tokens: 1,
+            ..Default::default()
+        };
+        let mut matcher = StopStringMatcher::new(vec![decoded.clone()], false).unwrap();
+
+        let matched = decode_output(&mut decoder, &mut output, Some(&mut matcher)).unwrap();
+
+        assert_eq!(matched.as_deref(), Some(decoded.as_str()));
+        assert!(output.text.is_empty());
     }
 
     #[test]
@@ -816,7 +1018,7 @@ mod tests {
         dynamo_tokenizers::Tokenizer::from_file_with_options(
             path.to_str().unwrap(),
             dynamo_tokenizers::TokenizerOptions {
-                add_special_tokens: true,
+                add_special_tokens: false,
             },
         )
         .unwrap()
@@ -825,9 +1027,13 @@ mod tests {
     #[tokio::test]
     async fn backend_posts_token_ids_and_decodes_the_engine_stream() {
         let tokenizer = tiny_tokenizer();
-        let output_ids = DynamoTokenizer::new(tokenizer.clone())
+        let output_ids = tokenizer
             .encode("hello")
-            .unwrap();
+            .unwrap()
+            .token_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect::<Vec<_>>();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

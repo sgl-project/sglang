@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use dynamo_renderer::RenderedPrompt;
 use serde::{Deserialize, Serialize};
 
 use crate::{SamplingParams, TokenIds};
@@ -23,6 +24,7 @@ pub struct GenerationOptions {
 /// One text-generation prompt before tokenizer-dependent preparation.
 pub enum TextPrompt {
     Text(String),
+    Rendered(RenderedPrompt),
     TokenIds(TokenIds),
 }
 
@@ -34,7 +36,7 @@ pub enum TextPrompt {
 pub struct TextRequest {
     pub rid: String,
     pub prompt: TextPrompt,
-    pub skip_special_tokens: bool,
+    pub add_special_tokens: bool,
     pub options: GenerationOptions,
 }
 
@@ -42,13 +44,13 @@ impl TextRequest {
     pub fn text(
         rid: impl Into<String>,
         text: impl Into<String>,
-        skip_special_tokens: bool,
+        add_special_tokens: bool,
         options: GenerationOptions,
     ) -> Self {
         Self {
             rid: rid.into(),
             prompt: TextPrompt::Text(text.into()),
-            skip_special_tokens,
+            add_special_tokens,
             options,
         }
     }
@@ -56,13 +58,27 @@ impl TextRequest {
     pub fn token_ids(
         rid: impl Into<String>,
         input_ids: TokenIds,
-        skip_special_tokens: bool,
+        add_special_tokens: bool,
         options: GenerationOptions,
     ) -> Self {
         Self {
             rid: rid.into(),
             prompt: TextPrompt::TokenIds(input_ids),
-            skip_special_tokens,
+            add_special_tokens,
+            options,
+        }
+    }
+
+    pub fn rendered(
+        rid: impl Into<String>,
+        prompt: RenderedPrompt,
+        add_special_tokens: bool,
+        options: GenerationOptions,
+    ) -> Self {
+        Self {
+            rid: rid.into(),
+            prompt: TextPrompt::Rendered(prompt),
+            add_special_tokens,
             options,
         }
     }

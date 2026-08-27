@@ -9,11 +9,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
+use dynamo_protocols::types::CreateCompletionRequest;
 
 use crate::RendererService;
 
-use super::error::{openai_error, renderer_status};
+use super::{
+    ExtendedChatCompletionRequest,
+    error::{openai_error, renderer_status},
+};
 
 #[derive(Clone)]
 struct RenderState {
@@ -34,14 +37,19 @@ async fn health() -> StatusCode {
 
 async fn render_chat(
     State(state): State<RenderState>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ExtendedChatCompletionRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let extended = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let ExtendedChatCompletionRequest {
+        request,
+        chat_template_kwargs,
+        continue_final_message,
+    } = extended;
     if request.n.is_some_and(|n| n > 1) {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -50,7 +58,16 @@ async fn render_chat(
         );
     }
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    match state.renderer.prepare_chat(request, &response_id).await {
+    match state
+        .renderer
+        .prepare_chat_with_template_args(
+            request,
+            &response_id,
+            chat_template_kwargs,
+            continue_final_message,
+        )
+        .await
+    {
         Ok(mut prepared_requests) => Json(
             prepared_requests
                 .pop()
@@ -109,6 +126,9 @@ mod tests {
                     rid: request.rid,
                     input_ids: match request.prompt {
                         TextPrompt::Text(text) => text.split_whitespace().map(|_| 7).collect(),
+                        TextPrompt::Rendered(prompt) => {
+                            prompt.as_str().split_whitespace().map(|_| 7).collect()
+                        }
                         TextPrompt::TokenIds(_) => {
                             panic!("token-ID prompts bypass the tokenizer backend")
                         }

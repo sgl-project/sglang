@@ -8,11 +8,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use dynamo_protocols::types::CreateChatCompletionRequest;
+use dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ReasoningEffort,
+};
 use futures::future::try_join_all;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::RendererService;
+use crate::{ChatRequest, RendererService};
 
 use super::error::{error_payload, renderer_status};
 
@@ -25,73 +29,141 @@ pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
 
 async fn tokenize(
     State(renderer): State<Arc<RendererService>>,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
     let object = body
-        .as_object_mut()
+        .as_object()
         .ok_or_else(|| bad_request("request body must be a JSON object"))?;
-    let prompt = object.get("prompt").filter(|v| !v.is_null()).cloned();
-    let messages = object.get("messages").filter(|v| !v.is_null()).cloned();
-    if prompt.is_some() == messages.is_some() {
-        return Err(bad_request(
-            "Exactly one of 'prompt' or 'messages' must be provided.",
-        ));
+    let has_prompt = object.get("prompt").is_some_and(|value| !value.is_null());
+    let has_messages = object.get("messages").is_some_and(|value| !value.is_null());
+    if has_prompt == has_messages {
+        return Err(exactly_one_input());
     }
-
-    let (tokens, count) = if let Some(prompt) = prompt {
-        let add_special_tokens = object
-            .get("add_special_tokens")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        match prompt {
-            Value::String(text) => {
-                let tokens = renderer
-                    .tokenize_prompt(text, add_special_tokens)
+    let request = serde_json::from_value::<TokenizeRequest>(body)
+        .map_err(|error| bad_request(error.to_string()))?;
+    let (tokens, count) = match request {
+        TokenizeRequest::Prompt(request) => {
+            if request.messages.is_some() {
+                return Err(exactly_one_input());
+            }
+            let add_special_tokens = request.add_special_tokens;
+            let prompt = request.prompt;
+            match prompt {
+                TokenizePrompt::One(text) => {
+                    let tokens = renderer
+                        .tokenize_prompt(text, add_special_tokens)
+                        .await
+                        .map_err(renderer_error)?;
+                    (json!(tokens), json!(tokens.len()))
+                }
+                TokenizePrompt::Many(texts) => {
+                    let tokens = try_join_all(
+                        texts
+                            .into_iter()
+                            .map(|text| renderer.tokenize_prompt(text, add_special_tokens)),
+                    )
                     .await
                     .map_err(renderer_error)?;
-                (json!(tokens), json!(tokens.len()))
+                    let count = tokens.iter().map(Vec::len).collect::<Vec<_>>();
+                    (json!(tokens), json!(count))
+                }
             }
-            Value::Array(values) => {
-                let texts = values
-                    .into_iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(str::to_owned)
-                            .ok_or_else(|| bad_request("prompt must contain only strings"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let tokens = try_join_all(
-                    texts
-                        .into_iter()
-                        .map(|text| renderer.tokenize_prompt(text, add_special_tokens)),
-                )
+        }
+        TokenizeRequest::Chat(request) => {
+            if request.prompt.is_some() {
+                return Err(exactly_one_input());
+            }
+            let request = request
+                .into_chat(&renderer.config().served_model_name)
+                .map_err(renderer_error)?;
+            let tokens = renderer
+                .tokenize_chat(request)
                 .await
                 .map_err(renderer_error)?;
-                let count = tokens.iter().map(Vec::len).collect::<Vec<_>>();
-                (json!(tokens), json!(count))
-            }
-            _ => return Err(bad_request("prompt must be a string or list of strings")),
+            (json!(tokens), json!(tokens.len()))
         }
-    } else {
-        object.remove("prompt");
-        object.remove("add_special_tokens");
-        object
-            .entry("model")
-            .or_insert_with(|| json!(renderer.config().served_model_name));
-        let request: CreateChatCompletionRequest =
-            serde_json::from_value(body).map_err(|error| bad_request(error.to_string()))?;
-        let tokens = renderer
-            .tokenize_chat(request)
-            .await
-            .map_err(renderer_error)?;
-        (json!(tokens), json!(tokens.len()))
     };
     Ok(Json(json!({
         "tokens": tokens,
         "count": count,
         "max_model_len": renderer.config().limits.context_len,
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TokenizeRequest {
+    Prompt(TokenizePromptRequest),
+    Chat(TokenizeChatRequest),
+}
+
+#[derive(Deserialize)]
+struct TokenizePromptRequest {
+    prompt: TokenizePrompt,
+    #[serde(default)]
+    messages: Option<Value>,
+    #[serde(default = "default_true")]
+    add_special_tokens: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TokenizePrompt {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct TokenizeChatRequest {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<ChatCompletionRequestMessage>,
+    #[serde(default)]
+    prompt: Option<Value>,
+    #[serde(default)]
+    tools: Option<Vec<ChatCompletionTool>>,
+    #[serde(default)]
+    tool_choice: Option<ChatCompletionToolChoiceOption>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    continue_final_message: bool,
+    #[serde(default)]
+    chat_template_kwargs: Option<std::collections::HashMap<String, Value>>,
+}
+
+impl TokenizeChatRequest {
+    fn into_chat(self, served_model: &str) -> Result<ChatRequest, crate::RendererError> {
+        let model = self.model.unwrap_or_else(|| served_model.to_owned());
+        if model != served_model {
+            return Err(format!("The model `{model}` does not exist").into());
+        }
+        Ok(ChatRequest {
+            rid: "tokenize".into(),
+            model,
+            messages: self.messages,
+            tools: self.tools,
+            tool_choice: self.tool_choice,
+            response_format: None,
+            reasoning_effort: self.reasoning_effort,
+            continue_final_message: self.continue_final_message,
+            chat_template_args: self.chat_template_kwargs,
+            sampling_params: Default::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
+            parallel_tool_calls: true,
+        })
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn exactly_one_input() -> Response {
+    bad_request("Exactly one of 'prompt' or 'messages' must be provided.")
 }
 
 fn renderer_error(error: crate::RendererError) -> Response {
@@ -121,14 +193,13 @@ mod tests {
     struct PrefixTokenizer;
 
     impl TextTokenizer for PrefixTokenizer {
-        fn encode(&self, text: &str) -> Result<Vec<i32>, RendererError> {
-            Ok(std::iter::once(1)
+        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+            Ok(add_special_tokens
+                .then_some(1)
+                .into_iter()
                 .chain(text.split_whitespace().map(|_| 7))
+                .chain(add_special_tokens.then_some(2))
                 .collect())
-        }
-
-        fn auto_specials(&self) -> Vec<i32> {
-            vec![1]
         }
     }
 
@@ -191,7 +262,7 @@ mod tests {
         assert_eq!(body["count"], json!([2, 0]));
 
         let (_, body) = post(json!({"prompt": "one"})).await;
-        assert_eq!(body["tokens"], json!([1, 7]));
+        assert_eq!(body["tokens"], json!([1, 7, 2]));
     }
 
     #[tokio::test]
@@ -208,9 +279,64 @@ mod tests {
                 .is_some_and(|tokens| !tokens.is_empty())
         );
         assert_ne!(body["tokens"][0], json!(1));
+        assert_ne!(
+            body["tokens"][body["tokens"].as_array().unwrap().len() - 1],
+            json!(2)
+        );
         assert_eq!(
             body["count"],
             json!(body["tokens"].as_array().unwrap().len())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_tokenization_continues_the_final_assistant_message() {
+        let (_, regular) = post(json!({
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "partial answer"}
+            ]
+        }))
+        .await;
+        let (status, continued) = post(json!({
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "partial answer"}
+            ],
+            "continue_final_message": true,
+            "chat_template_kwargs": {
+                "continue_final_message": false,
+                "add_generation_prompt": true
+            }
+        }))
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(continued["count"].as_u64().unwrap() < regular["count"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn chat_tokenization_lowers_tokenize_specific_options() {
+        let request: TokenizeChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "assistant", "content": "partial"}],
+            "reasoning_effort": "high",
+            "continue_final_message": true,
+            "chat_template_kwargs": {"marker": true}
+        }))
+        .unwrap();
+
+        let chat = request.into_chat("model").unwrap();
+
+        assert!(chat.continue_final_message);
+        assert_eq!(
+            chat.chat_template_args
+                .as_ref()
+                .and_then(|args| args.get("marker")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            serde_json::to_value(chat.reasoning_effort).unwrap(),
+            json!("high")
         );
     }
 }

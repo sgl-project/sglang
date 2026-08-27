@@ -42,7 +42,8 @@ pub use service::{OpenAIRequestLowerer, RendererService, TokenizationBackend};
 pub use template::ChatFormatter;
 pub use tokenizer::{
     DynamoTokenizer, NoTokenizer, PooledTokenizer, TextTokenizer, check_completion_token_budget,
-    check_total_tokens, load_tokenizer, prepare_direct_request, resolve_model_file,
-    tokenize_text_prompt, tokenize_text_request, validate_completion_fields, validate_text_request,
+    check_total_tokens, load_tokenizer, prepare_direct_request, resolve_chat_template_file,
+    resolve_model_file, resolve_tokenizer_file, tokenize_text_prompt, tokenize_text_request,
+    validate_completion_fields, validate_text_request,
 };
 pub use types::{OneOrMany, OneOrManyItem, TokenIds};

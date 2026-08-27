@@ -29,15 +29,26 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
     if config.renderer.skip_tokenizer_init {
         return Err("standalone rendering requires a tokenizer".into());
     }
-    let tokenizer = load_tokenizer(
+    let tokenizer_without_specials = load_tokenizer(
         (!config.renderer.tokenizer_path.is_empty())
             .then_some(config.renderer.tokenizer_path.as_str()),
         config.renderer.revision.as_deref(),
         false,
+        false,
     )?
     .ok_or_else(|| "standalone rendering requires a tokenizer".to_owned())?;
-    let encode_tokenizer: Arc<dyn TextTokenizer> =
-        Arc::new(DynamoTokenizer::new(tokenizer.clone()));
+    let tokenizer_with_specials = load_tokenizer(
+        (!config.renderer.tokenizer_path.is_empty())
+            .then_some(config.renderer.tokenizer_path.as_str()),
+        config.renderer.revision.as_deref(),
+        false,
+        true,
+    )?
+    .ok_or_else(|| "standalone rendering requires a tokenizer".to_owned())?;
+    let encode_tokenizer: Arc<dyn TextTokenizer> = Arc::new(DynamoTokenizer::new(
+        tokenizer_without_specials.clone(),
+        tokenizer_with_specials,
+    ));
     let tokenizer_backend = Arc::new(PooledTokenizer::new(
         encode_tokenizer,
         config.tokenizer_workers,
@@ -47,7 +58,7 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
         OpenAIRequestLowerer::new(config.renderer),
         tokenizer_backend,
     ));
-    let generate_client = HttpGenerateClient::new(config.engine_url, tokenizer)?;
+    let generate_client = HttpGenerateClient::new(config.engine_url, tokenizer_without_specials)?;
     let listener = tokio::net::TcpListener::bind(config.http_addr)
         .await
         .map_err(|error| format!("binding renderer on {} failed: {error}", config.http_addr))?;

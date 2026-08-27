@@ -8,10 +8,12 @@ use dynamo_parsers::{
     ToolChoice as DynamoToolChoice, ToolDefinition, TriggeredTagsConfig,
 };
 use dynamo_protocols::types::{
-    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ReasoningEffort, ResponseFormat,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ReasoningEffort, ResponseFormat,
 };
-use dynamo_renderer::{OAIChatLikeRequest, TextInput, may_be_fix_tool_schema};
+use dynamo_renderer::{
+    OAIChatLikeRequest, RenderedPrompt, RenderedSegment, TextInput, may_be_fix_tool_schema,
+};
 use minijinja::Value;
 
 use crate::{
@@ -33,6 +35,7 @@ pub struct ChatRequest {
     pub tool_choice: Option<ChatCompletionToolChoiceOption>,
     pub response_format: Option<ResponseFormat>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub continue_final_message: bool,
     pub chat_template_args: Option<HashMap<String, serde_json::Value>>,
     pub sampling_params: SamplingParams,
     pub choice_count: usize,
@@ -76,7 +79,7 @@ impl OAIChatLikeRequest for ChatRequest {
     }
 
     fn should_add_generation_prompt(&self) -> bool {
-        true
+        !self.continue_final_message
     }
 
     fn chat_template_args(&self) -> Option<&HashMap<String, serde_json::Value>> {
@@ -97,6 +100,7 @@ pub struct LoweredChat {
 /// Applies structured chat semantics before the shared text generation path.
 pub struct ChatPreprocessor {
     formatter: Option<ChatFormatter>,
+    formatter_error: Option<String>,
     tool_call_parser: Option<String>,
     reasoning_parser: Option<String>,
 }
@@ -105,9 +109,15 @@ impl ChatPreprocessor {
     pub(crate) fn new(config: &RendererConfig, formatter: Option<ChatFormatter>) -> Self {
         Self {
             formatter,
+            formatter_error: None,
             tool_call_parser: config.tool_call_parser.clone(),
             reasoning_parser: config.reasoning_parser.clone(),
         }
+    }
+
+    pub(crate) fn with_formatter_error(mut self, error: Option<String>) -> Self {
+        self.formatter_error = error;
+        self
     }
 
     pub fn preprocess(&self, mut request: ChatRequest) -> Result<LoweredChat, RendererError> {
@@ -133,10 +143,10 @@ impl ChatPreprocessor {
 
         let mut text_requests = Vec::with_capacity(request.choice_count);
         for index in 0..request.choice_count {
-            text_requests.push(TextRequest::text(
+            text_requests.push(TextRequest::rendered(
                 format!("{}-{index}", request.rid),
                 prompt.clone(),
-                true,
+                false,
                 GenerationOptions {
                     sampling_params: request.sampling_params.clone(),
                     stream: request.stream,
@@ -169,10 +179,10 @@ impl ChatPreprocessor {
         validate_chat(&request)?;
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
         let prompt = self.render(&request)?;
-        Ok(TextRequest::text(
+        Ok(TextRequest::rendered(
             request.rid,
             prompt,
-            true,
+            false,
             GenerationOptions {
                 sampling_params: request.sampling_params,
                 ..Default::default()
@@ -180,15 +190,96 @@ impl ChatPreprocessor {
         ))
     }
 
-    fn render(&self, request: &ChatRequest) -> Result<String, RendererError> {
-        let formatter = self
-            .formatter
-            .as_ref()
-            .ok_or_else(|| RendererError::from("this model has no usable chat template"))?;
-        formatter
-            .render(request)
-            .map_err(|error| format!("chat template render failed: {error}").into())
+    fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt, RendererError> {
+        let formatter = self.formatter.as_ref().ok_or_else(|| {
+            RendererError::from(
+                self.formatter_error
+                    .clone()
+                    .unwrap_or_else(|| "this model has no usable chat template".to_owned()),
+            )
+        })?;
+        let mut request = request.clone();
+        let final_message = prepare_continuation(&mut request);
+        let template_args = request.chat_template_args.get_or_insert_with(HashMap::new);
+        template_args.insert(
+            "add_generation_prompt".into(),
+            (!request.continue_final_message).into(),
+        );
+        template_args.insert(
+            "continue_final_message".into(),
+            request.continue_final_message.into(),
+        );
+        let prompt = formatter
+            .render_prompt(&request)
+            .map_err(|error| format!("chat template render failed: {error}"))?;
+        match final_message {
+            Some(final_message) => truncate_continuation(prompt, &final_message),
+            None => Ok(prompt),
+        }
     }
+}
+
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+fn prepare_continuation(request: &mut ChatRequest) -> Option<String> {
+    if !request.continue_final_message {
+        return None;
+    }
+    let Some(ChatCompletionRequestMessage::Assistant(message)) = request.messages.last_mut() else {
+        request.continue_final_message = false;
+        return None;
+    };
+    let Some(ChatCompletionRequestAssistantMessageContent::Text(text)) = message.content.as_mut()
+    else {
+        request.continue_final_message = false;
+        return None;
+    };
+    let original = text.clone();
+    text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+    Some(original)
+}
+
+fn truncate_continuation(
+    prompt: RenderedPrompt,
+    final_message: &str,
+) -> Result<RenderedPrompt, RendererError> {
+    let text = prompt.as_str();
+    let tag_location = text
+        .rfind(CONTINUE_FINAL_MESSAGE_TAG.trim_end())
+        .filter(|_| text.contains(final_message.trim()))
+        .ok_or_else(|| {
+            RendererError::from(
+                "continue_final_message is set but the final message does not appear in the rendered prompt",
+            )
+        })?;
+    let truncate_at = if text[tag_location..].starts_with(CONTINUE_FINAL_MESSAGE_TAG) {
+        tag_location
+    } else {
+        text[..tag_location].trim_end().len()
+    };
+    Ok(truncate_rendered_prompt(&prompt, truncate_at))
+}
+
+fn truncate_rendered_prompt(prompt: &RenderedPrompt, truncate_at: usize) -> RenderedPrompt {
+    let Some(segments) = prompt.segments() else {
+        return RenderedPrompt::text(prompt.as_str()[..truncate_at].to_owned());
+    };
+    let mut remaining = truncate_at;
+    let mut truncated = Vec::new();
+    for segment in segments {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(segment.text.len());
+        if take != 0 {
+            truncated.push(RenderedSegment::new(
+                segment.text[..take].to_owned(),
+                segment.allow_special,
+            ));
+        }
+        remaining -= take;
+    }
+    RenderedPrompt::segmented(truncated)
 }
 
 fn validate_chat(request: &ChatRequest) -> Result<(), RendererError> {
@@ -198,7 +289,25 @@ fn validate_chat(request: &ChatRequest) -> Result<(), RendererError> {
     if request.choice_count == 0 {
         return Err("choice_count must be at least 1".into());
     }
+    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
+        return Err("image, audio, video, and file message content is not supported".into());
+    }
     Ok(())
+}
+
+fn contains_media(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(contains_media),
+        serde_json::Value::Object(object) => {
+            object.keys().any(|key| {
+                matches!(
+                    key.as_str(),
+                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
+                )
+            }) || object.values().any(contains_media)
+        }
+        _ => false,
+    }
 }
 
 fn merge_template_stops(sampling: &mut SamplingParams, formatter: Option<&ChatFormatter>) {

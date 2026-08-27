@@ -16,6 +16,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_renderer::{
     ChatTemplate, ContextMixins, OAIChatLikeRequest, PromptContextMixin, PromptFormatter,
+    RenderedPrompt,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -62,17 +63,27 @@ pub enum ChatFormatter {
 
 impl ChatFormatter {
     /// Render the request's messages to a single prompt string.
+    #[cfg(test)]
     pub(super) fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {
+        self.render_prompt(request).map(RenderedPrompt::into_text)
+    }
+
+    /// Render the request while preserving tokenizer trust boundaries required
+    /// by native formatters such as Kimi K3.
+    pub(super) fn render_prompt(
+        &self,
+        request: &dyn OAIChatLikeRequest,
+    ) -> Result<RenderedPrompt, TemplateError> {
         match self {
             ChatFormatter::HuggingFace(formatter) => {
                 let PromptFormatter::OAI(formatter) = formatter;
                 formatter
-                    .render(request)
+                    .render_prompt(request)
                     .map_err(|error| TemplateError::Renderer {
                         message: error.to_string(),
                     })
             }
-            ChatFormatter::Legacy(formatter) => formatter.render(request),
+            ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
     }
 
@@ -128,7 +139,7 @@ impl Default for LegacySpec {
 
 /// Native port of Python `generate_chat_conv` + `Conversation.get_prompt()`:
 /// fold system messages into the system prompt, keep user/assistant messages in
-/// order, always append the assistant opening, then render per `sep_style`.
+/// order, optionally append the assistant opening, then render per `sep_style`.
 #[derive(Clone)]
 pub struct LegacyFormatter {
     pub(super) spec: LegacySpec,
@@ -193,8 +204,9 @@ impl LegacyFormatter {
                 }
             }
         }
-        // Python's `generate_chat_conv` appends the assistant opening.
-        messages.push((self.spec.roles.1.clone(), String::new()));
+        if request.should_add_generation_prompt() {
+            messages.push((self.spec.roles.1.clone(), String::new()));
+        }
         self.render_prompt(&system_message, &messages)
     }
 
@@ -818,7 +830,10 @@ pub(crate) fn load_chat_formatter(
 
     // HF-style JSON files may carry chat_template directly. Legacy SGLang
     // files carry Conversation fields and are translated below.
-    if let Some(chat_template) = template.get("chat_template") {
+    if template.is_string() {
+        set_chat_template(&mut config, template)?;
+        formatter_from_config(&config)
+    } else if let Some(chat_template) = template.get("chat_template") {
         set_chat_template(&mut config, chat_template.clone())?;
         formatter_from_config(&config)
     } else {

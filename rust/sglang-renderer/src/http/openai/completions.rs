@@ -95,6 +95,7 @@ async fn completions(
             } else {
                 match &text_request.prompt {
                     TextPrompt::Text(text) => text.clone(),
+                    TextPrompt::Rendered(prompt) => prompt.as_str().to_owned(),
                     TextPrompt::TokenIds(input_ids) => {
                         match state.generate_client.detokenize(input_ids.clone()) {
                             Ok(echo) => echo,

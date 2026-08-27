@@ -22,7 +22,7 @@ use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta, ChatCompletionTokenLogprob,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
     ServiceTier as ChatServiceTier, TopLogprobs,
 };
@@ -30,7 +30,7 @@ use futures::StreamExt;
 
 use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
-    OpenAIHttpFrontend,
+    ExtendedChatCompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
     submission::{collect_output, merge_indexed, submit_inputs},
 };
@@ -50,14 +50,19 @@ struct ChatStreamWireContext {
 
 async fn chat_completions(
     State(state): State<Arc<OpenAIHttpFrontend>>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ExtendedChatCompletionRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let extended = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let ExtendedChatCompletionRequest {
+        request,
+        chat_template_kwargs,
+        continue_final_message,
+    } = extended;
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let stream = request.stream.unwrap_or(false);
     let model = request.model.clone();
@@ -71,7 +76,12 @@ async fn chat_completions(
             .config()
             .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let chat = match state.renderer.lower_openai_chat(request, &response_id) {
+    let chat = match state.renderer.lower_openai_chat_with_template_args(
+        request,
+        &response_id,
+        chat_template_kwargs,
+        continue_final_message,
+    ) {
         Ok(chat) => chat,
         Err(error) => {
             let status = renderer_status(&error);

@@ -13,21 +13,6 @@ use crate::{
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
-fn contains_media(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
-            object.keys().any(|key| {
-                matches!(
-                    key.as_str(),
-                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
-                )
-            }) || object.values().any(contains_media)
-        }
-        _ => false,
-    }
-}
-
 /// Lower the OpenAI Chat wire type into the structured internal chat request.
 /// Chat template rendering and tool constraints deliberately happen later in
 /// `ChatPreprocessor`, where non-HTTP protocol adapters can reuse them.
@@ -35,6 +20,16 @@ pub(crate) fn lower_chat_request(
     config: &RendererConfig,
     request: CreateChatCompletionRequest,
     response_id: &str,
+) -> Result<ChatRequest, RendererError> {
+    lower_chat_request_with_template_args(config, request, response_id, None, false)
+}
+
+pub(crate) fn lower_chat_request_with_template_args(
+    config: &RendererConfig,
+    request: CreateChatCompletionRequest,
+    response_id: &str,
+    chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+    continue_final_message: bool,
 ) -> Result<ChatRequest, RendererError> {
     validate_chat_request(config, &request)?;
     let sampling_params = chat_sampling_params(
@@ -49,7 +44,8 @@ pub(crate) fn lower_chat_request(
         tool_choice: request.tool_choice,
         response_format: request.response_format,
         reasoning_effort: request.reasoning_effort,
-        chat_template_args: None,
+        continue_final_message,
+        chat_template_args,
         sampling_params,
         choice_count: request.n.unwrap_or(1) as usize,
         stream: request.stream.unwrap_or(false),
@@ -65,9 +61,6 @@ fn validate_chat_request(
 ) -> Result<(), RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
-    }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return Err("image, audio, video, and file message content is not supported".into());
     }
     if request.n == Some(0) {
         return Err("n must be at least 1".into());
@@ -246,7 +239,7 @@ pub(crate) fn lower_completion_request(
             };
             let rid = format!("{response_id}-{index}");
             requests.push(match &prompt {
-                PromptSpec::Text(text) => TextRequest::text(rid, text.clone(), false, options),
+                PromptSpec::Text(text) => TextRequest::text(rid, text.clone(), true, options),
                 PromptSpec::TokenIds(input_ids) => {
                     TextRequest::token_ids(rid, input_ids.clone(), false, options)
                 }
