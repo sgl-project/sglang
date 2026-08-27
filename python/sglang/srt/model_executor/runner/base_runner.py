@@ -46,7 +46,12 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_flags,
+    get_parallel,
+)
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
@@ -211,10 +216,10 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().config.tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
-        self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.dp_size = get_parallel().config.dp_size
+        self.pp_size = get_parallel().config.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
@@ -265,7 +270,7 @@ class BaseRunner(ABC):
         with custom_all_reduce.register_graph_buffers).
         """
         mr = self.model_runner
-        if mr.server_args.flashinfer_allreduce_fusion_backend is None:
+        if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
@@ -284,7 +289,7 @@ class BaseRunner(ABC):
         """
         if (
             not get_parallel().dcp_enabled
-            or get_parallel().dcp_comm_backend != "fi_a2a"
+            or get_parallel().config.dcp_comm_backend != "fi_a2a"
         ):
             return
 
@@ -343,10 +348,10 @@ class BaseRunner(ABC):
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
-            dp_size=get_parallel().dp_size,
-            pp_size=mr.server_args.pp_size,
+            dp_size=get_parallel().config.dp_size,
+            pp_size=get_parallel().config.pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
-            require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
             encoder_len_fill_value=(
                 getattr(mr.model_config.hf_config, "max_source_positions", 0)
@@ -410,7 +415,7 @@ class BaseRunner(ABC):
         # TARGET_VERIFY dummy forward would trip the linear-attn backend's
         # pool-type assert. Warm up in plain DECODE instead.
         _is_pd_prefill_target = (
-            mr.server_args.disaggregation_mode == "prefill" and not mr.is_draft_worker
+            get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
         if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
             if mr.is_draft_worker:
@@ -420,10 +425,12 @@ class BaseRunner(ABC):
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
-            assert (
-                capture_forward_mode == ForwardMode.EXTEND
-                and not mr.spec_algorithm.is_speculative()
-            ), "extend_num_tokens_per_req requires a non-speculative EXTEND dummy"
+            assert capture_forward_mode == ForwardMode.EXTEND and (
+                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
+            ), (
+                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
+                "target EXTEND dummy"
+            )
             num_tokens_per_req = extend_num_tokens_per_req
 
         num_tokens = batch_size * num_tokens_per_req
@@ -514,7 +521,7 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if mr.server_args.pp_size > 1:
+        if get_parallel().config.pp_size > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
@@ -528,13 +535,13 @@ class BaseRunner(ABC):
             )
 
         # TP-gather requirements for global token metadata.
-        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
-        require_attn_tp_gather_ = require_attn_tp_gather(mr.server_args)
-        if require_gathered_buffer(mr.server_args):
+        require_mlp_tp_gather_ = require_mlp_tp_gather()
+        require_attn_tp_gather_ = require_attn_tp_gather()
+        if require_gathered_buffer():
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            global_num_tokens_cpu = [num_tokens] * get_parallel().dp_size
+            global_num_tokens_cpu = [num_tokens] * get_parallel().config.dp_size
         elif require_attn_tp_gather_:
             global_num_tokens_cpu = [num_tokens]
         else:
@@ -574,7 +581,7 @@ class BaseRunner(ABC):
             )
 
         # Optional LoRA metadata.
-        if mr.server_args.enable_lora:
+        if mr.lora_manager is not None:
             lora_ids = [None] * batch_size
         else:
             lora_ids = None
@@ -638,7 +645,7 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                mr.server_args.pp_size > 1
+                get_parallel().config.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(

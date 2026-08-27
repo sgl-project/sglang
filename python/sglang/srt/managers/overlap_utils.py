@@ -8,20 +8,22 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_spec,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
-    server_args: ServerArgs,
     attn_backends: Sequence[AttentionBackend],
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
@@ -34,10 +36,10 @@ def decide_needs_cpu_seq_lens(
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         # FIXME: support TBO without seq lens cpu value
         return True
-    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if algo.is_ngram():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
@@ -49,14 +51,14 @@ def decide_needs_cpu_seq_lens(
     )
 
 
-def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
+def decide_needs_confidence_relay() -> bool:
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
     )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+    algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
     if not algo.is_dspark():
         return False
     return read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
@@ -523,14 +525,8 @@ class FutureMap:
             self.confidence_relay.scatter(indices, confidence)
         # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
         if self.spec_algo.is_some():
-            device_module = torch.get_device_module(self.device)
             if self.publish_ready is None:
-                self.publish_ready = device_module.Event()
-            else:
-                # Chain the records: event fire implies every prior publish is
-                # visible, so an off-forward-stream publish (PD-decode prebuilt
-                # seeding) cannot drop the in-flight forward's fence.
-                device_module.current_stream().wait_event(self.publish_ready)
+                self.publish_ready = torch.get_device_module(self.device).Event()
             self.publish_ready.record()
             self._publish_fresh = True
         if publish_confidence:

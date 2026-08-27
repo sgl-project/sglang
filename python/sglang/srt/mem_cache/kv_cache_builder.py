@@ -32,6 +32,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -46,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
 
@@ -65,7 +67,6 @@ def maybe_register_hicache_draft(
     tree_cache,
     draft_plan: HiCacheDraftPlan,
     server_args: ServerArgs,
-    page_size: int,
 ) -> None:
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
@@ -75,13 +76,7 @@ def maybe_register_hicache_draft(
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     if not isinstance(tree_cache, UnifiedRadixCache):
-        _register_legacy_hicache_draft(
-            tree_cache=tree_cache,
-            draft_pool=draft_plan.device_pools[0],
-            server_args=server_args,
-            page_size=page_size,
-        )
-        return
+        raise NotImplementedError("HiCache draft pools require UnifiedRadixCache.")
 
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         build_hicache_draft_sidecars,
@@ -92,57 +87,26 @@ def maybe_register_hicache_draft(
         tree_cache=tree_cache,
         server_args=server_args,
     )
-    tree_cache.register_hicache_draft_pools(specs, entries)
-
-
-def _register_legacy_hicache_draft(
-    *,
-    tree_cache,
-    draft_pool,
-    server_args: ServerArgs,
-    page_size: int,
-) -> None:
-    from sglang.srt.mem_cache.memory_pool import (
-        MHATokenToKVPool,
-        MLATokenToKVPool,
-    )
-    from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
-    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-
-    pool = draft_pool
-    if pool.layer_num == 0:
-        return
-
-    # Create host pool for draft with the same slot count as the target host pool,
-    # so that host indices stay 1-to-1 between target and draft KV caches.
-    primary_host_pool = tree_cache.cache_controller.mem_pool_host
-    host_pool_kwargs = dict(
-        host_to_device_ratio=primary_host_pool.logical_size / pool.size,
-        host_size=0,
-        page_size=page_size,
-        layout=server_args.hicache_mem_layout,
-        allocator_type=server_args.hicache_storage_backend,
-        pool_label="draft",
-    )
-    if isinstance(pool, MHATokenToKVPool):
-        draft_host_pool = get_mha_host_pool_cls(pool)(pool, **host_pool_kwargs)
-    elif isinstance(pool, MLATokenToKVPool):
-        draft_host_pool = MLATokenToKVPoolHost(pool, **host_pool_kwargs)
-    else:
-        logger.warning(
-            "Draft pool type %s is not supported by the legacy HiCache path; "
-            "skipping draft KV registration.",
-            type(pool).__name__,
-        )
-        return
-
-    tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
+    for spec, entry in zip(specs, entries, strict=True):
+        tree_cache.register_sidecar_pool(spec, entry)
 
 
 # Host slots a backup-only retraction pool gets, as a fraction of the device
 # pool. Sized well under 1.0 because a retraction burst touches a fraction of
 # the device tokens; overflow aborts the request rather than pre-reserving.
 BACKUP_ONLY_HICACHE_RATIO = 0.2
+
+
+def uses_ssm_state(model_config) -> bool:
+    """Whether the model keeps recurrent/conv state alongside its attention KV."""
+    spec = linear_attn_model_spec(model_config)
+    return (
+        hybrid_gdn_config(model_config) is not None
+        or mamba2_config(model_config) is not None
+        or (spec.uses_mamba_radix_cache if spec is not None else False)
+        or kimi_linear_config(model_config) is not None
+        or hybrid_lightning_config(model_config) is not None
+    )
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -164,8 +128,13 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
-            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+        # Host-pool retraction transfers full and sliding-window components
+        # only, so a model with recurrent state stays on cpu_tensor.
+        supports_host_pool = not uses_ssm_state(
+            tp_worker.model_runner.model_config
+        ) and (
+            isinstance(kv_cache, MHATokenToKVPool)
+            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -175,6 +144,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
+            # Large ROCm retraction restores can fault the GPU process. Keep
+            # host_pool opt-in on HIP until the retraction path is safe at scale.
+            and not is_hip()
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
@@ -227,15 +199,7 @@ def build_kv_cache(
 
     # Hybrid memory pool
     is_hybrid_swa = tp_worker.is_hybrid_swa
-    _spec = linear_attn_model_spec(tp_worker.model_runner.model_config)
-    _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
-    is_hybrid_ssm = (
-        hybrid_gdn_config(tp_worker.model_runner.model_config) is not None
-        or mamba2_config(tp_worker.model_runner.model_config) is not None
-        or _registry_needs_mamba
-        or kimi_linear_config(tp_worker.model_runner.model_config) is not None
-        or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
-    )
+    is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
@@ -259,18 +223,38 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache is unsupported with hybrid SWA/SSM models —
-    # these use specialized memory pools incompatible with the
-    # prefix-match-and-lock allocation path.
+    # Decode-side radix cache supports SWA only through the unified tree, whose
+    # component pools preserve the full-attention prefix while transferring the
+    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
+    # incompatible with the prefix-match-and-lock allocation path.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with sliding window attention (SWA) models"
-            )
+            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models requires the unified radix "
+                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
+                )
+            if enable_hierarchical_cache:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache with sliding "
+                    "window attention (SWA) models currently supports only "
+                    "device-resident cache and is incompatible with "
+                    "--enable-hierarchical-cache."
+                )
+            if getattr(model_config, "is_deepseek_v4_arch", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "DeepSeek-V4 (DSA) compressed KV (c4/c128/indexer) yet."
+                )
+            if getattr(model_config, "is_hybrid_swa_compress", False):
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache does not support "
+                    "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
+                )
         if is_hybrid_ssm:
             raise ValueError(
                 "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -295,7 +279,9 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
+            attn_tp_cpu_group
+            if get_parallel().config.enable_dp_attention
+            else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
@@ -339,7 +325,6 @@ def build_kv_cache(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
             server_args=server_args,
-            page_size=page_size,
         )
 
     if retraction_backup == "host_pool":

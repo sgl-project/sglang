@@ -12,14 +12,20 @@ export const benchmarks = [
   // H200 + BF16 (TP4)
   // ====================================================================
   {
-    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", spec: "nextn", nodes: "single" },
     sglang_version: "PR #33561 @ c5071ded",
     accuracy: { gsm8k_pct: 96.59 },
   },
   {
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.36 },
+    notes: "Full GSM8K stop rate 99.62%; accept length ~4.5-5.1.",
+  },
+  {
     // Rejected by the full GSM8K gate at request 1319: a no-EOS runaway generated
     // >33k tokens. Recipe stays `verified: false` in ling-3.0-flash.jsx.
-    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" },
     accuracy: { gsm8k_pct: null },
     notes: "Full GSM8K gate did not complete: one request ran away without emitting EOS (>33k generated tokens).",
   },
@@ -28,17 +34,35 @@ export const benchmarks = [
   // H200 + FP8 (TP4 + EP4)
   // ====================================================================
   {
-    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", spec: "nextn", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 95.83 },
   },
   {
-    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 96.51 },
   },
   {
-    match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.13 },
+    notes: "Full GSM8K stop rate 99.55%; accept length ~3.3-4.4.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "int4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.36 },
+    notes: "Full GSM8K stop rate 99.62%; accept length ~4.6-4.9.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 76a3e673",
+    accuracy: { gsm8k_pct: 96.29 },
+    notes: "Full GSM8K stop rate 99.85%; accept length ~3.8-5.9.",
+  },
+  {
+    match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e1a24a18",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -50,7 +74,7 @@ export const benchmarks = [
     notes: "Full GSM8K stop rate 100%; default decode CUDA Graph captured 32 shapes through batch 218.",
   },
   {
-    match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e1a24a18",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -66,7 +90,7 @@ export const benchmarks = [
   // H200 + HiCache (Mooncake tiered cache)
   // ====================================================================
   {
-    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "hicache", nodes: "single" },
+    match: { hw: "h200", variant: "default", quant: "bf16", strategy: "hicache", spec: "nextn", nodes: "single" },
     sglang_version: "PR #33561 @ 51bcd89c",
     accuracy: { gsm8k_pct: 96.44 },
   },
@@ -75,12 +99,30 @@ export const benchmarks = [
   // B200 + BF16 (TP4)
   // ====================================================================
   {
-    match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-    sglang_version: "PR #33561 @ c5071ded",
-    accuracy: { gsm8k_pct: 96.44 },
+    match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", spec: "nextn", nodes: "single" },
+    sglang_version: "PR #33561 @ 0e5e40d8f (dev-Ling-3.0-flash image)",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 171.57, tpot_ms: 2.34, tokens_per_sec_per_gpu: 886 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 248.30, tpot_ms: 5.29, tokens_per_sec_per_gpu: 5936 },
+    ],
+    accuracy: { gsm8k_pct: 96.66 },
   },
   {
-    match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "b200", variant: "default", quant: "bf16", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    sglang_version: "PR #33561 @ 0e5e40d8f (dev-Ling-3.0-flash image)",
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 156.44, tpot_ms: 0.78, tokens_per_sec_per_gpu: 1902 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 247.27, tpot_ms: 2.87, tokens_per_sec_per_gpu: 8025 },
+    ],
+    accuracy: { gsm8k_pct: 96.59 },
+    notes: "Average accept length 6.22 (200q GSM8K window); deterministic 20-request stop rate 100%.",
+  },
+  {
+    match: { hw: "b200", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ c5071ded",
     accuracy: { gsm8k_pct: 96.51 },
   },
@@ -89,17 +131,17 @@ export const benchmarks = [
   // B200 + FP8 (TP4 + EP4)
   // ====================================================================
   {
-    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", spec: "nextn", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 96.59 },
   },
   {
-    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e57e030b",
     accuracy: { gsm8k_pct: 97.04 },
   },
   {
-    match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e1a24a18",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -111,7 +153,7 @@ export const benchmarks = [
     notes: "Full GSM8K stop rate 99.70%; default decode CUDA Graph captured 40 shapes through batch 305.",
   },
   {
-    match: { hw: "b200", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+    match: { hw: "b200", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ e1a24a18",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -129,14 +171,14 @@ export const benchmarks = [
   // TODO: both cells are `verified: true` (gated on the final head) but the GSM8K
   // percentages were not recorded in the PR body or in the verifying commits —
   // fill from the run logs.
-  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "low-latency", spec: "nextn", nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "high-throughput", spec: "off", nodes: "single" } },
 
   // ====================================================================
   // GB300 + FP8 (TP4 + EP4)
   // ====================================================================
   // TODO: both cells are `verified: true` on the final head; the 96.66% / 96.44%
   // pair in the PR body predates the TP+EP change — fill with the re-measured values.
-  { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", spec: "nextn", nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", spec: "off", nodes: "single" } },
 ];

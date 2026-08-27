@@ -368,8 +368,12 @@ class AnthropicServing:
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
-        ) -> Optional[str]:
-            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+        ) -> tuple[Optional[str], Optional[str]]:
+            """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
+
+            At most one is set: encoders that frame the reasoning channel take
+            it as ``reasoning_content``, everything else gets it re-wrapped and
+            spliced into content.
 
             ``redacted_thinking`` carries encrypted bytes that no local
             parser can interpret, so we raise rather than silently drop it.
@@ -387,11 +391,15 @@ class AnthropicServing:
                 if block.type == "thinking" and block.thinking
             ]
             if not thinking_parts:
-                return None
+                return None, None
+
+            reasoning_text = "\n".join(thinking_parts)
+            if self.openai_serving_chat.supports_native_reasoning_history():
+                return reasoning_text, None
 
             try:
-                return self.openai_serving_chat.wrap_reasoning_history(
-                    "\n".join(thinking_parts)
+                return None, self.openai_serving_chat.wrap_reasoning_history(
+                    reasoning_text
                 )
             except ValueError as e:
                 logger.warning(
@@ -399,7 +407,7 @@ class AnthropicServing:
                     len(thinking_parts),
                     e,
                 )
-                return None
+                return None, None
 
         system_parts: list[str] = []
         if anthropic_request.system:
@@ -454,7 +462,11 @@ class AnthropicServing:
             tool_calls: list[dict] = []
 
             if msg.role == "assistant":
-                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                reasoning_content, reasoning_history = (
+                    _convert_assistant_thinking_blocks(msg.content)
+                )
+                if reasoning_content is not None:
+                    openai_msg["reasoning_content"] = reasoning_content
                 if reasoning_history is not None:
                     content_parts.append({"type": "text", "text": reasoning_history})
 

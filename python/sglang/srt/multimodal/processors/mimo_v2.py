@@ -1021,7 +1021,7 @@ class MiMoProcessor:
                     "num_video_tokens": num_media_tokens_per_grid,
                     "segment_audio_token_len": segment_audio_token_len,
                     "segment_audio": segment_audio,
-                    # Used by encode_server to trim audio_encoder output.
+                    # Used by encoder.server to trim audio_encoder output.
                     "audio_start_token_idx": audio_start_token_idx,
                 }
             )
