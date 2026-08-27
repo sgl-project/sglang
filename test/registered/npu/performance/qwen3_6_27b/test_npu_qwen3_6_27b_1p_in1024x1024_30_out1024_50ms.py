@@ -9,6 +9,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-2-npu-a3")
+register_npu_ci(est_time=3600, suite="nightly-perf-2-npu-a3", nightly=True)
 
 QWEN3_6_27B_1024_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -22,7 +23,8 @@ QWEN3_6_27B_1024_ENVS = {
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "150",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "300",
+    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
     "ASCEND_USE_FIA": "1",
 }
 

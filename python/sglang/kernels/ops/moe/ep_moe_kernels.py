@@ -241,7 +241,7 @@ def pre_reorder_triton_kernel_for_cutlass_moe(
         for idx in range(topk):
             expert_id = tl.load(token_topk_ids_ptr + idx)
             if expert_id != num_local_experts:
-                dst_idx = tl.load(token_src2dst_ptr + idx)
+                dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
                 tl.store(dst_ptr_offs + dst_idx * hidden_size, out_data, mask=mask)
 
 
@@ -1944,6 +1944,7 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     k,
     K_SCALE_BLOCK_SIZE: tl.constexpr,
     K_BLOCK_SIZE: tl.constexpr,
+    HAS_K_TAIL: tl.constexpr,
 ):
     pid_k, pid_m, pid_e = (
         tl.program_id(axis=0),
@@ -1959,6 +1960,11 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
         return
     output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
     k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    # k only has to be a multiple of the 128-wide scale group (e.g. 3584), so the
+    # last k block can be partial.  Specialize on it: hidden sizes that fill
+    # every block keep the unmasked loads, and their codegen is unchanged.
+    if HAS_K_TAIL:
+        k_mask = k_offsets < k
     scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
 
     x_ptrs = x_ptr + pid_e * m * k + k_offsets
@@ -1966,10 +1972,22 @@ def _fp8_per_token_quant_to_per_tensor_quant_kernel(
     x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
 
     for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
-        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
-        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
+        if HAS_K_TAIL:
+            hidden = tl.load(x_ptrs + tok_idx * k, mask=k_mask, other=0.0)
+            x_scale = tl.load(
+                x_scale_ptrs + tok_idx * x_scale_stride1, mask=k_mask, other=0.0
+            )
+        else:
+            hidden = tl.load(x_ptrs + tok_idx * k)
+            x_scale = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1)
+        hidden = hidden.to(tl.float32)
+        scale_fp32 = x_scale.to(tl.float32)
         hidden = hidden * scale_fp32 * output_scale_val_inv
-        tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
+        quantized = hidden.to(output_ptr.dtype.element_ty)
+        if HAS_K_TAIL:
+            tl.store(output_ptrs + tok_idx * k, quantized, mask=k_mask)
+        else:
+            tl.store(output_ptrs + tok_idx * k, quantized)
 
 
 def fp8_per_token_to_per_tensor_quant_triton(
@@ -1986,8 +2004,7 @@ def fp8_per_token_to_per_tensor_quant_triton(
     assert output_scale.numel() == 1
 
     K_BLOCK_SIZE = 1024
-    assert x.size(2) % K_BLOCK_SIZE == 0
-    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    grid = (triton.cdiv(x.size(2), K_BLOCK_SIZE), 32, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
         x,
         x_scale,
@@ -1999,26 +2016,17 @@ def fp8_per_token_to_per_tensor_quant_triton(
         x.size(2),
         K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
         K_BLOCK_SIZE=K_BLOCK_SIZE,
+        HAS_K_TAIL=x.size(2) % K_BLOCK_SIZE != 0,
         num_warps=8,
     )
 
 
-def moe_permute(
+def _moe_permute_rows(
     inputs: torch.Tensor,
     topk_ids: torch.Tensor,
-    num_experts: int,
-    use_int64_offset: bool = False,
-    is_ep: bool = False,
+    src2dst: torch.Tensor,
     outputs: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare
-
-    expert_offsets, src2dst = moe_permute_prepare(
-        topk_ids=topk_ids,
-        num_experts=num_experts,
-        use_int64_offset=use_int64_offset,
-        is_ep=is_ep,
-    )
+) -> torch.Tensor:
     output_shape = (topk_ids.nelement(), inputs.size(-1))
     if outputs is None:
         outputs = torch.empty(output_shape, dtype=inputs.dtype, device=inputs.device)
@@ -2038,7 +2046,54 @@ def moe_permute(
         BLOCK_SIZE=512,
     )
 
+    return outputs
+
+
+def moe_permute(
+    inputs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare
+
+    expert_offsets, src2dst = moe_permute_prepare(
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+    )
+    outputs = _moe_permute_rows(inputs, topk_ids, src2dst, outputs)
+
     return outputs, src2dst, expert_offsets
+
+
+def moe_permute_with_scale(
+    inputs: torch.Tensor,
+    input_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    use_int64_offset: bool = False,
+    is_ep: bool = False,
+    outputs: torch.Tensor | None = None,
+    scale_outputs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if inputs.size(0) != input_scale.size(0):
+        raise ValueError("inputs and input_scale must have the same number of rows")
+
+    outputs, src2dst, expert_offsets = moe_permute(
+        inputs=inputs,
+        topk_ids=topk_ids,
+        num_experts=num_experts,
+        use_int64_offset=use_int64_offset,
+        is_ep=is_ep,
+        outputs=outputs,
+    )
+    scale_outputs = _moe_permute_rows(input_scale, topk_ids, src2dst, scale_outputs)
+
+    return outputs, scale_outputs, src2dst, expert_offsets
 
 
 def moe_unpermute(

@@ -4,23 +4,23 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    get_diffusers_component_config,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
 
-class BridgeLoader(ComponentLoader):
+class BridgeLoader(PlainStateDictComponentLoader):
     """Loader for MOVA dual tower bridge with FSDP support."""
 
     pipeline_bridge_config_attr: str = "bridge_config"
@@ -31,7 +31,7 @@ class BridgeLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = self.load_component_config(component_model_path, component_name)
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:
@@ -74,12 +74,17 @@ class BridgeLoader(ComponentLoader):
             default_dtype,
         )
 
-        component_cpu_offload = server_args.should_cpu_offload_component(component_name)
+        use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
+        )
 
         # Use the FSDP loader when FSDP is requested or shard rules are declared.
         fsdp_shard_conditions = getattr(model_cls, "_fsdp_shard_conditions", None)
-        if server_args.use_fsdp_inference or (
-            server_args.hsdp_shard_dim is not None and fsdp_shard_conditions
+        if use_fsdp or (
+            server_args.residency_mode(component_name) == RESIDENT
+            and server_args.hsdp_shard_dim is not None
+            and fsdp_shard_conditions
         ):
             local_torch_device = get_local_torch_device()
             # Load with FSDP support
@@ -90,9 +95,9 @@ class BridgeLoader(ComponentLoader):
                 device=local_torch_device,
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
                 hsdp_shard_dim=server_args.hsdp_shard_dim,
-                cpu_offload=component_cpu_offload,
+                component_starts_on_cpu=component_starts_on_cpu,
                 pin_cpu_memory=server_args.pin_cpu_memory,
-                fsdp_inference=server_args.use_fsdp_inference,
+                fsdp_inference=use_fsdp,
                 param_dtype=default_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
@@ -106,7 +111,7 @@ class BridgeLoader(ComponentLoader):
             model = model_cls.from_pretrained(
                 component_model_path, torch_dtype=default_dtype
             )
-            target_device = self.target_device(component_cpu_offload)
+            target_device = self.target_device(component_starts_on_cpu)
             model = model.to(device=target_device, dtype=default_dtype)
 
         total_params = sum(p.numel() for p in model.parameters())

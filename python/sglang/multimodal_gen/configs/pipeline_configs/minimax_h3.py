@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -82,6 +85,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             speed_mode_enable_torch_compile_by_default=False,
+            # 61.73 GB of DiT weights. Every card that is not part of a
+            # 4xH200 set has to stream them, so the DiT has to be eligible for
+            # automatic layerwise offload -- the default here is an empty tuple,
+            # which makes the gate in _should_auto_enable_dit_layerwise_offload
+            # always false and leaves the DiT resident until it fails to load.
+            dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
             auto_enable_cfg_parallel=False,
@@ -110,6 +119,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             else type(current_platform).__name__
         )
         model_variant = str(server_args.model_variant or "fl2va").lower()
+        resolved_quant_config = self.text_encoder_configs[0].quant_config
+        text_encoder_quantization = (
+            resolved_quant_config.get_name()
+            if resolved_quant_config is not None
+            else None
+        )
         actual = {
             "attention_backend": attention_backend,
             "backend": self._server_arg_value(server_args.backend),
@@ -123,6 +138,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
             "quantization": server_args.quantization,
+            "transformer_weights_path": server_args.transformer_weights_path,
+            "text_encoder_quantization": text_encoder_quantization,
             "regional_compile": server_args.regional_compile,
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
@@ -144,6 +161,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "num_gpus": 4,
             "performance_mode": "speed",
             "quantization": None,
+            "transformer_weights_path": None,
+            "text_encoder_quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
             "sp_degree": 4,
@@ -178,6 +197,29 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        if current_platform.is_mps():
+            required_components = (
+                "transformer",
+                "text_encoder",
+                "video_vae",
+                "audio_vae",
+            )
+            missing_components = [
+                component
+                for component in required_components
+                if server_args.residency_mode(component) != LAYERWISE_OFFLOAD
+            ]
+            if missing_components:
+                raise ValueError(
+                    "MiniMax-H3 on MPS requires synchronous layerwise offload for "
+                    f"{missing_components}; pass --layerwise-offload-components "
+                    "transformer text_encoder video_vae audio_vae"
+                )
+            if server_args.enable_torch_compile:
+                raise ValueError(
+                    "MiniMax-H3 MPS execution does not support torch.compile; "
+                    "pass --enable-torch-compile false"
+                )
         component_backends = server_args.component_attention_backends or {}
         attention_backend = component_backends.get(
             "transformer", self._server_arg_value(server_args.attention_backend)

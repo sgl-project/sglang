@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -126,6 +128,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
+    weight_block_size: Optional[List[int]] = None
+
     def __init__(self):
         super().__init__()
         # mapping is updated by models as they initialize
@@ -185,17 +189,22 @@ class QuantizationConfig(ABC):
         if hf_quant_config is None:
             return None
 
+        # If the user explicitly requested an online requantization (e.g.
+        # quark_mxfp4 on top of an NVFP4 checkpoint), do not override it back
+        # to the source format.
+        from sglang.srt.configs.model_config import REQUANTIZATION_METHODS
+
+        if user_quant == "nvfp4_online" or user_quant in REQUANTIZATION_METHODS:
+            return None
+
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
-            if quant_algo == "MXFP8":
-                return "mxfp8"
-            elif quant_algo == "FP8":
-                return "modelopt_fp8"
-            elif "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
+            canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
+            if canonical_method is not None:
+                return canonical_method
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.

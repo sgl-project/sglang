@@ -10,8 +10,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
     GlmImageAR,
+    GlmImageDecodingStage,
+    center_crop_glm_image_output,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
@@ -232,6 +235,9 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
                 stage.forward(batch, self._server_args())
 
                 self.assertEqual((batch.width, batch.height), expected)
+                self.assertEqual(
+                    (batch.requested_width, batch.requested_height), requested
+                )
                 stage.generate_prior_tokens.assert_called_once_with(
                     prompt="A simple product sketch",
                     image=None,
@@ -270,8 +276,76 @@ class TestGlmImageARSrtBackend(unittest.TestCase):
 
         call_kwargs = stage.generate_prior_tokens.call_args.kwargs
         self.assertEqual((batch.width, batch.height), (1280, 736))
+        self.assertEqual((batch.requested_width, batch.requested_height), (1280, 720))
         self.assertEqual(call_kwargs["image"][0].size, (1280, 736))
         self.assertEqual((call_kwargs["width"], call_kwargs["height"]), (1280, 736))
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.get_local_torch_device",
+        return_value=torch.device("cpu"),
+    )
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.glm_image.load_image",
+        return_value=Image.new("RGB", (1280, 720)),
+    )
+    def test_forward_preserves_implicit_edit_image_size(
+        self, _mock_load_image, _mock_device
+    ):
+        stage = GlmImageAR(processor=_FakeProcessor(), vision_language_encoder=None)
+        stage.generate_prior_tokens = MagicMock(
+            return_value=(torch.zeros((1, 1), dtype=torch.long), None, None)
+        )
+        sampling = GlmImageSamplingParams(
+            prompt="Edit this image",
+            image_path="input.png",
+        )
+        sampling.seed = None
+        batch = Req(sampling_params=sampling)
+
+        stage.forward(batch, self._server_args())
+
+        self.assertEqual((batch.width, batch.height), (1280, 736))
+        self.assertEqual((batch.requested_width, batch.requested_height), (1280, 720))
+        call_kwargs = stage.generate_prior_tokens.call_args.kwargs
+        self.assertEqual(call_kwargs["image"][0].size, (1280, 736))
+        self.assertEqual((call_kwargs["width"], call_kwargs["height"]), (1280, 736))
+
+    def test_center_crop_restores_requested_size(self):
+        frames = torch.arange(1024 * 1024).reshape(1, 1, 1024, 1024)
+
+        cropped = center_crop_glm_image_output(frames, 1000, 999)
+
+        self.assertEqual(tuple(cropped.shape), (1, 1, 999, 1000))
+        self.assertEqual(cropped[0, 0, 0, 0], frames[0, 0, 12, 12])
+        self.assertEqual(cropped[0, 0, -1, -1], frames[0, 0, 1010, 1011])
+        self.assertTrue(cropped.is_contiguous())
+
+    @patch.object(DecodingStage, "forward")
+    def test_decoding_stage_crops_outputs_and_trajectory(self, mock_decode):
+        frames = torch.zeros((2, 3, 736, 1280))
+        trajectory = [
+            torch.zeros((2, 3, 1, 736, 1280)),
+            torch.ones((2, 3, 1, 736, 1280)),
+        ]
+        mock_decode.return_value = OutputBatch(
+            output=frames,
+            trajectory_decoded=trajectory,
+        )
+        stage = GlmImageDecodingStage(vae=None)
+        sampling = GlmImageSamplingParams(width=1280, height=736)
+        sampling.requested_width = 1280
+        sampling.requested_height = 720
+        batch = Req(sampling_params=sampling)
+
+        output_batch = stage.forward(batch, self._server_args())
+
+        self.assertEqual(tuple(output_batch.output.shape), (2, 3, 720, 1280))
+        self.assertEqual(len(output_batch.trajectory_decoded), 2)
+        for decoded in output_batch.trajectory_decoded:
+            self.assertEqual(tuple(decoded.shape), (2, 3, 1, 720, 1280))
+        mock_decode.assert_called_once_with(batch, self._server_args())
 
     @patch(
         "sglang.multimodal_gen.runtime.pipelines_core.stages."

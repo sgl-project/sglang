@@ -114,6 +114,25 @@ class DSATopKBackend(Enum):
         ):
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
 
+        # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
+        # kernel through its ragged entry point: no page table (the columns are
+        # already flattened-KV positions), no plan (prefill has enough rows that
+        # the cluster path never applies), just a per-row window and an additive
+        # output transform. `batch_idx_list` is not None only on the prefill-CP
+        # path, whose `topk_indices_offset` is built from cu_seqlens_q rather
+        # than the KV bases -- leave that one on the legacy kernel.
+        if (
+            self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.RAGGED
+            and topk_indices_offset is not None
+            and batch_idx_list is None
+            and 0 < topk <= 2048
+            and lengths.shape[0] == logits.shape[0] == topk_indices_offset.shape[0]
+        ):
+            return _topk_transform_v2_ragged(
+                logits, lengths, topk, topk_indices_offset, row_starts
+            )
+
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
         # dispatched to v2 above.
@@ -158,27 +177,7 @@ class DSATopKBackend(Enum):
             import flashinfer
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                if row_starts is not None:
-                    # Packed PAGED extend uses batch-global score offsets with
-                    # request-local page tables. FlashInfer applies row_starts
-                    # to both, so reuse the SGL transform.
-                    from sgl_kernel import fast_topk_transform_fused
-
-                    page_table_size_1 = (
-                        attn_metadata.page_table_1[batch_idx_list]
-                        if batch_idx_list is not None
-                        else attn_metadata.page_table_1
-                    )
-                    return fast_topk_transform_fused(
-                        score=logits,
-                        lengths=lengths,
-                        page_table_size_1=page_table_size_1,
-                        cu_seqlens_q=cu_seqlens_q_topk,
-                        topk=topk,
-                        row_starts=row_starts,
-                    )
-
-                row_to_batch, local_row_starts = _build_flashinfer_paged_args(
+                row_to_batch, page_table_row_starts = _build_flashinfer_paged_args(
                     attn_metadata=attn_metadata,
                     row_starts=row_starts,
                     cu_seqlens_q_topk=cu_seqlens_q_topk,
@@ -195,7 +194,8 @@ class DSATopKBackend(Enum):
                     deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
                     tie_break=_flashinfer_tie_break_value(),
                     dsa_graph_safe=True,
-                    row_starts=local_row_starts,
+                    row_starts=row_starts,
+                    page_table_row_starts=page_table_row_starts,
                 )
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
@@ -308,8 +308,6 @@ def _topk_transform_v2_paged(
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
-    assert page_table.dtype == torch.int32
-    lengths_i32 = lengths.to(torch.int32)
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or
@@ -321,8 +319,39 @@ def _topk_transform_v2_paged(
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
 
     page_size = attn_metadata.page_size
-    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_512_v2(logits, lengths, page_table, out, page_size, plan)
+    return out
+
+
+def _topk_transform_v2_ragged(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_indices_offset: torch.Tensor,
+    row_starts: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fused ragged top-k via the DeepSeek-V4 v2 JIT kernel.
+
+    ``logits`` is written in place: the kernel reads from a 16-byte-aligned base
+    and masks the <= 3 columns that pulls in ahead of the window. Those columns
+    belong to a preceding request of the same row, and the score buffer is dead
+    after the top-k (see ``DSAIndexer._get_topk_ragged``).
+
+    Preconditions match the paged helper: fp32 scores with unit row stride and a
+    16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
+    construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
+    """
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+
+    out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+    topk_transform_ragged_v2(
+        logits,
+        lengths,
+        out_offsets=topk_indices_offset,
+        out_indices=out,
+        row_starts=row_starts,
+    )
     return out
 
 
@@ -373,13 +402,13 @@ def _build_flashinfer_paged_args(
             "PAGED topk_transform with row_starts requires cu_seqlens_q metadata."
         )
 
-    local_row_starts = row_starts
-    if local_row_starts is not None and row_to_batch is not None:
-        local_row_starts = (
-            local_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
+    page_table_row_starts = row_starts
+    if page_table_row_starts is not None and row_to_batch is not None:
+        page_table_row_starts = (
+            page_table_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
         )
 
-    return row_to_batch, local_row_starts
+    return row_to_batch, page_table_row_starts
 
 
 def _flashinfer_tie_break_value() -> int:

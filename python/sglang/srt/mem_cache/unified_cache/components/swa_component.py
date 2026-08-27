@@ -71,6 +71,9 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        self.full_window_pages = (
+            self.sliding_window_size + params.page_size - 1
+        ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -755,6 +758,7 @@ class SWAComponent(TreeComponent):
                 page_size=self.cache.page_size,
                 req_to_token_pool=self.cache.req_to_token_pool,
                 token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+                retain_floor=self.cache.swa_retain_floor(req),
             )
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
@@ -769,16 +773,32 @@ class SWAComponent(TreeComponent):
         # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
-        sw_pages = (
-            self.cache.sliding_window_size + self.cache.page_size - 1
-        ) // self.cache.page_size
-        if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
+        sw_pages = self.full_window_pages
+        if sw_pages == 0:
             return PreparePrefetchResult()
-        num_tokens = sw_pages * self.cache.page_size
-        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
-        if host_indices is None:
-            self.cache.evict_host(num_tokens, ComponentType.SWA)
-            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        prefetch_pages = prefetch_tokens // self.cache.page_size
+        if prefetch_pages >= sw_pages:
+            num_pages = sw_pages
+        elif prefetch_pages <= 0:
+            return PreparePrefetchResult()
+        elif (
+            self.tree_core.is_root(node_id)
+            or self.cache.host_memory_mode == "buffer_only"
+        ):
+            # Sub-window fetch: at root the sequence IS its window; mid-tree
+            # (buffer mode) the window head is the device prefix's own ring
+            # state, so only the suffix needs fetching.
+            num_pages = prefetch_pages
+        else:
+            # Cache-mode graft: a mid-tree window head is not
+            # device-guaranteed, require a full window.
+            return PreparePrefetchResult()
+        num_tokens = num_pages * self.cache.page_size
+        host_indices = self.cache.host_pool_group.alloc(
+            num_tokens,
+            pool=PoolName.SWA,
+            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
+        )
         if host_indices is None:
             return PreparePrefetchResult(alloc_failed=True)
         return PreparePrefetchResult(host_indices=host_indices)
@@ -868,12 +888,14 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.PREFETCH:
             assert host_indices is not None
-            sw_pages = host_indices.numel() // self.tree_core.page_size
+            # Keys are unknowable at build time; placeholders carry the
+            # count, _sync_trailing_keys fills the real trailing hashes.
+            num_pages = host_indices.numel() // self.tree_core.page_size
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     host_indices=host_indices,
-                    keys=["__placeholder__"] * sw_pages,
+                    keys=["__placeholder__"] * num_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             ]
@@ -996,6 +1018,13 @@ class SWAComponent(TreeComponent):
             and insert_result.inserted_host_node is not None
             else None
         )
+        if anchor is not self.tree_core.root_node:
+            # Cache-mode graft commit only (buffer fills never reach here):
+            # a hit-shrunk window mid-tree is missing its head — drop it.
+            # Root anchors are complete windows of their own.
+            if window_require_pages < self.full_window_pages:
+                self._release_swa_host(host_indices, cache_actions)
+                return
         if (
             target is None
             or window_require_pages == 0
@@ -1093,7 +1122,7 @@ class SWAComponent(TreeComponent):
         if self._swa_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._swa_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.SWA)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         alloc = self.cache.token_to_kv_pool_allocator
@@ -1120,7 +1149,7 @@ class SWAComponent(TreeComponent):
             # freeing only the incoming full, then store the swa on the node.
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
-            alloc.full_to_swa_index_mapping[action.incoming_full.to(torch.int64)] = 0
+            alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.full_attn_allocator.free(action.incoming_full)
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value

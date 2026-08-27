@@ -31,11 +31,13 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -61,7 +63,6 @@ from sglang.srt.utils.common import (
     is_xpu,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.tensor_bridge import use_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -166,9 +167,12 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
-    """Accumulated declared values: declarations never mutate
-    ``server_args``, so mid-resolution readers overlay them from the
-    declaration stash (last writer wins, like the gate)."""
+    """What the declarations say so far, last writer wins.
+
+    Passes declare without touching the fields until
+    ``materialize_declarations``, so a mid-resolution reader needs this to see
+    them; handlers and hooks write as they declare, and for those the overlay
+    repeats what the field already holds."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -218,6 +222,44 @@ def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
         object.__setattr__(server_args, "_internal_write", False)
 
 
+def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
+    """Record a resolution write in the declaration stash, and apply it now.
+
+    The stash is what the projection reads, so a resolver that only assigns
+    the field leaves that write invisible to it. The immediate write keeps the
+    resolver's successors seeing the value where they read the field directly.
+
+    What it does change is which writer wins. A declaration is appended and
+    replayed last, so a resolver that declares a field a *deferred* writer (a
+    post-process pass, a registry entry) also decides now beats it, where its
+    bare assignment used to be overwritten by that writer's declaration. A
+    resolver that gates on such a field has to read the resolving view rather
+    than the raw field, or it decides from a value that is already stale.
+
+    For resolvers inside ``__post_init__``: the handlers on ``ServerArgs``
+    (through ``self._declare``) and the ``arg_groups`` hooks and hardware
+    defaults they call. Resolution that has to wait for the launcher stage
+    goes through ``declare_late_resolution`` instead.
+
+    Names arrive as keyword arguments, which accept anything; a misspelled one
+    would otherwise become a new attribute that nothing ever reads, so it is
+    rejected here. This is not the model-override whitelist: that one limits
+    which fields a *registry entry* may reach, while a resolver writing the
+    field it owns is the pipeline resolving by construction.
+    """
+    if dataclasses.is_dataclass(type(server_args)):
+        unknown = sorted(set(fields) - field_names(type(server_args)))
+        if unknown:
+            raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
+    for name, value in fields.items():
+        setattr(server_args, name, value)
+
+
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
     """Resolve fields on a config that is **not published yet**.
 
@@ -250,7 +292,59 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
         log = []
         object.__setattr__(server_args, "_runtime_mutations", log)
     log.append((source, dict(fields)))
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
     _apply_fields(server_args, fields)
+
+
+def declare_direct_writes(
+    server_args: Any, source: str, resolve: Callable[[Any], Any]
+) -> Any:
+    """Run a resolver that writes the fields directly, and declare what it moved.
+
+    Returns whatever the resolver returned, so a provider with a return value
+    can go through the same capture.
+
+    Out-of-tree platform plugins are handed the record and set fields on it.
+    Their implementations live outside this tree, so they cannot be converted
+    by editing the resolver; and the raw snapshot is taken before the pipeline
+    starts, so a plugin's default is neither declared nor raw.
+
+    Rebinding is what the diff sees, and rebinding is all it needs to see: a
+    plugin that mutates a value in place reaches the projection anyway, because
+    the raw snapshot and the stash entries hold the same object it mutated.
+
+    A stand-in record (tests drive the hooks with a plain namespace) has no
+    fields to diff and no projection to feed, so the resolver runs uncaptured.
+    """
+    if not dataclasses.is_dataclass(server_args):
+        return resolve(server_args)
+    before = {
+        field.name: getattr(server_args, field.name)
+        for field in dataclasses.fields(server_args)
+    }
+    already = len(getattr(server_args, "_resolved_overrides", None) or ())
+    result = resolve(server_args)
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    # A resolver reached this way can also declare properly -- the in-tree
+    # implementations of these hooks do. Those fields are already explained, and
+    # recording them again would attribute them to the wrapper and bury an
+    # actual direct write among the echoes.
+    declared = {name for _source, fields in stash[already:] for name in fields}
+    changed = {
+        name: getattr(server_args, name)
+        for name, previous in before.items()
+        if name not in declared and getattr(server_args, name) is not previous
+    }
+    if changed:
+        stash.append((source, changed))
+    return result
 
 
 def materialize_declarations(server_args: Any) -> None:
@@ -263,6 +357,27 @@ def materialize_declarations(server_args: Any) -> None:
         for field, value in declared.items():
             setattr(server_args, field, value)
     server_args._declarations_materialized = True
+
+
+def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
+    """What resolution decided for ``field``: the declaration if there is one,
+    otherwise what the caller supplied.
+
+    This is what the config projection reads. Reading the field instead would
+    work only for as long as declarations materialize onto the record -- and
+    the point of declaring is that they will not, so the projection must not
+    depend on it. A config that never ran the pipeline (a mock, a partial
+    fixture) carries no raw snapshot; its fields are all it has.
+    """
+    for _source, declared in reversed(
+        getattr(server_args, "_resolved_overrides", None) or ()
+    ):
+        if field in declared:
+            return declared[field]
+    raw = getattr(server_args, "_raw_input", None)
+    if raw is not None and field in raw:
+        return raw[field]
+    return getattr(server_args, field, default)
 
 
 def resolved_view(server_args: Any) -> ResolvedView:
@@ -288,6 +403,42 @@ def attention_backends_of(cfg: Any) -> tuple:
         else cfg.attention_backend
     )
     return prefill, decode
+
+
+def modelexpress_transport_of(cfg: Any) -> str:
+    """The modelexpress transport a config-shaped object asks for.
+
+    ``modelexpress_config`` is a JSON string (or an already-parsed dict) rather
+    than a leaf of its own; this is the shared parse for the transfer-engine
+    gate (`remote_instance_transfer_engine_of`) and any future bag reader.
+    ``ServerArgs.modelexpress_transport`` keeps its own instance-cached parse
+    (`_parsed_modelexpress_config`) -- same rule, cached seed-side."""
+    raw = cfg.modelexpress_config
+    if raw is None:
+        parsed = {}
+    elif isinstance(raw, str):
+        parsed = json.loads(raw)
+    else:
+        parsed = raw
+    return parsed.get("transport", "nixl")
+
+
+def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    ``load_format`` overrides the config's: a draft runner loading under
+    ``--speculative-draft-load-format`` needs its own transfer engine. Every
+    input is a ``model`` leaf, so this serves both the pre-publish member and
+    the post-publish accessor."""
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        return True
+    if (load_format or cfg.load_format) != "remote_instance":
+        return False
+    backend = cfg.remote_instance_weight_loader_backend
+    return backend == "transfer_engine" or (
+        backend == "modelexpress"
+        and modelexpress_transport_of(cfg) == "transfer_engine"
+    )
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
@@ -537,17 +688,17 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
-    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # FlashInfer 0.6.17+ ships the required SiTU kernels and is a pinned
-    # project dependency.
+    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103.
+    # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
+    # back to BF16 weight materialization during model loading.
     if server_args.moe_runner_backend != "auto":
         return {}
-    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+    if not (is_sm100_supported() and get_device_sm() in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
     logger.info(
-        "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+        "Kimi-K3 on SM100/SM103/SM107: moe_runner_backend=flashinfer_mxfp4 "
         "(FlashInfer SiTU kernels)."
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
@@ -562,6 +713,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     "GlmMoeDsaForCausalLM",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
+    "Dots3NoteForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
@@ -572,6 +724,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     overrides: Dict[str, Any] = {}
+
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
         if server_args.is_attention_backend_not_set():
@@ -1064,6 +1217,57 @@ def _moss_vl_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+@_register_for("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM")
+def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
+    if server_args.enable_dp_attention:
+        raise ValueError("MiniCPM does not support DP attention")
+    has_sparse_attention = getattr(hf_config, "has_minicpm_sparse_attention", False)
+    has_hybrid_attention = has_sparse_attention or getattr(
+        hf_config, "has_lightning_layers", False
+    )
+    overrides: Dict[str, Any] = {}
+    if has_hybrid_attention:
+        if server_args.enable_hierarchical_cache:
+            raise ValueError("MiniCPM SALA does not support hierarchical cache")
+        overrides["disable_radix_cache"] = True
+    if envs.SGLANG_MINICPM_FORCE_DENSE.get():
+        dense_backends = {
+            "minicpm_flashattn": ("fa4" if is_blackwell_supported() else "fa3"),
+            "minicpm_flashinfer": "flashinfer",
+        }
+        # Literal keys keep the written-field set statically derivable; a loop
+        # variable hides it from the census in test_chain_read_ratchet.py.
+        dense_attention = dense_backends.get(server_args.attention_backend)
+        if dense_attention is not None:
+            overrides["attention_backend"] = dense_attention
+        dense_prefill = dense_backends.get(server_args.prefill_attention_backend)
+        if dense_prefill is not None:
+            overrides["prefill_attention_backend"] = dense_prefill
+        dense_decode = dense_backends.get(server_args.decode_attention_backend)
+        if dense_decode is not None:
+            overrides["decode_attention_backend"] = dense_decode
+    elif has_sparse_attention:
+        uses_sparse_backend = server_args.is_attention_backend_not_set() or any(
+            backend in ("minicpm_flashattn", "minicpm_flashinfer")
+            for backend in (
+                server_args.attention_backend,
+                server_args.prefill_attention_backend,
+                server_args.decode_attention_backend,
+            )
+        )
+        if uses_sparse_backend and server_args.disaggregation_mode != "null":
+            raise ValueError(
+                "MiniCPM sparse attention does not support PD disaggregation"
+            )
+        if server_args.is_attention_backend_not_set():
+            overrides["attention_backend"] = (
+                "minicpm_flashinfer"
+                if is_blackwell_supported()
+                else "minicpm_flashattn"
+            )
+    return overrides
+
+
 @_register_for("MiniCPMV4_6ForConditionalGeneration")
 def _minicpm_v4_6_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_sm100_supported() and server_args.attention_backend is None:
@@ -1127,16 +1331,27 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["swa_full_tokens_ratio"] = 0.1
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
-    # nvidia/DeepSeek-V4-Pro-NVFP4 uses flashinfer_trtllm_routed MoE runner backend.
-    if (
-        server_args.moe_runner_backend == "auto"
-        and server_args.get_model_config().nvfp4_moe_meta is not None
-    ):
-        overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
-        logger.info(
-            "Use flashinfer_trtllm_routed as MoE runner backend for "
-            f"{model_arch} hybrid FP8+NVFP4 checkpoint."
-        )
+    if server_args.moe_runner_backend == "auto":
+        model_config = server_args.get_model_config()
+        # nvidia/DeepSeek-V4-Pro-NVFP4 uses the routed TRT-LLM runner.
+        if model_config.nvfp4_moe_meta is not None:
+            overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
+            logger.info(
+                "Use flashinfer_trtllm_routed as MoE runner backend for "
+                f"{model_arch} hybrid FP8+NVFP4 checkpoint."
+            )
+        elif (
+            server_args.device == "cuda"
+            and not is_hip()
+            and server_args.moe_a2a_backend == "none"
+            and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            and model_config.is_fp4_experts
+            and (is_sm90_supported() or is_sm100_supported() or is_sm120_supported())
+        ):
+            overrides["moe_runner_backend"] = "flashinfer_mxfp4"
+            logger.info(
+                "Use flashinfer_mxfp4 as MoE runner backend for " f"{model_arch}."
+            )
     return overrides
 
 
@@ -1267,8 +1482,32 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    if is_sm100_supported() and server_args.attention_backend is None:
-        overrides["attention_backend"] = "flashinfer"
+    if is_blackwell_supported() and server_args.is_attention_backend_not_set():
+        if server_args.speculative_algorithm is not None:
+            speculative_algorithm = server_args.speculative_algorithm.upper()
+            if is_sm100_supported() and server_args.speculative_eagle_topk in (
+                None,
+                1,
+            ):
+                overrides["attention_backend"] = "trtllm_mha"
+                if server_args.page_size is None:
+                    overrides["page_size"] = 64
+                if server_args.mamba_radix_cache_strategy == "auto":
+                    overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+            else:
+                overrides["attention_backend"] = "triton"
+                if (
+                    server_args.speculative_draft_attention_backend is None
+                    and speculative_algorithm in ("EAGLE", "NEXTN", "DFLASH", "DSPARK")
+                ):
+                    overrides["speculative_draft_attention_backend"] = "flashinfer"
+        elif is_sm100_supported():
+            overrides["attention_backend"] = "trtllm_mha"
     return overrides
 
 
@@ -1465,6 +1704,10 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "InternS2PreviewForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        # Text-only entries of the same hybrid stack (models/qwen3_5_text.py);
+        # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -1485,6 +1728,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "KimiLinearForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        # Text-only entries of the same hybrid stack (models/qwen3_5_text.py);
+        # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLM",
         "Qwen3NextForCausalLM",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
@@ -1721,6 +1968,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "GlmMoeDsaForCausalLM",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
+        "Dots3NoteForCausalLM",
     }
 )
 
@@ -1881,20 +2129,6 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     ], f"{kv_cache_dtype} is not supported for {model_arch}"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
-    return {}
-
-
-@register_post_process
-def _deepseek_v4_sm120_moe(view: Any) -> dict:
-    """Default DeepSeek V4 MXFP4 experts to FlashInfer CUTLASS on SM120."""
-    hf_config = view.get_model_config().hf_config
-    if hf_config.architectures[0] != "DeepseekV4ForCausalLM":
-        return {}
-    if is_sm120_supported() and view.moe_runner_backend == "auto":
-        logger.info(
-            "Use flashinfer_mxfp4 as MoE runner backend on SM120 for DeepseekV4"
-        )
-        return {"moe_runner_backend": "flashinfer_mxfp4"}
     return {}
 
 
@@ -2368,13 +2602,53 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _tp_lm_head_all_to_all_default(view: Any) -> dict:
+    """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
+
+    Prefill-only and colocated nodes keep the feature disabled by default: the
+    LM-head weight layout is fixed at load time, so enabling the TP path would
+    also move their long prefills away from the communication-free DP LM head.
+    An explicit CLI value always wins.
+    """
+    if view.enable_tp_lm_head_all_to_all is not None:
+        return {}
+
+    enable = (
+        view.disaggregation_mode == "decode"
+        and view.enable_dp_attention
+        and view.dp_size > 1
+        and view.tp_size == view.dp_size
+        and view.attn_cp_size == 1
+        and not view.enable_dp_lm_head
+    )
+    return {"enable_tp_lm_head_all_to_all": enable}
+
+
+@register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
     """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head. Reads the mid-resolution values through the view."""
+    dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
+    values through the view."""
     if view.enable_dp_lm_head:
         assert (
             view.enable_dp_attention
         ), "Please enable dp attention when setting enable_dp_lm_head. "
+    if view.enable_tp_lm_head_all_to_all:
+        assert view.enable_dp_attention, (
+            "Please enable dp attention when setting " "enable_tp_lm_head_all_to_all."
+        )
+        assert not view.enable_dp_lm_head, (
+            "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
+            "incompatible with --enable-dp-lm-head."
+        )
+        assert view.tp_size == view.dp_size, (
+            "--enable-tp-lm-head-all-to-all currently requires tp_size == "
+            f"dp_size, got tp_size={view.tp_size}, dp_size={view.dp_size}."
+        )
+        assert view.attn_cp_size == 1, (
+            "--enable-tp-lm-head-all-to-all currently requires "
+            f"attn_cp_size == 1, got {view.attn_cp_size}."
+        )
     return {}
 
 
@@ -2396,11 +2670,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
+            "flashinfer_cutedsl",
         ]:
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
@@ -2484,20 +2759,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
     return {}
 
 
-def _cutlass_moe_env_override(view: Any) -> dict:
-
-    if envs.SGLANG_CUTLASS_MOE.get():
-        logger.warning(
-            "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
-        )
-        assert view.quantization in [
-            "fp8",
-            "mxfp8",
-        ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
-        return {"moe_runner_backend": "cutlass"}
-    return {}
-
-
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
@@ -2523,12 +2784,6 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
-    if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":
-        moe_a2a_backend = "megamoe"
-        logger.info(
-            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-            "auto-configuring --moe-a2a-backend megamoe."
-        )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
     return {}

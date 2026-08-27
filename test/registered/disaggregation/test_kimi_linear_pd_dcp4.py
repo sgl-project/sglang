@@ -306,6 +306,8 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             str(PHYSICAL_PAGE_SIZE),
             "--chunked-prefill-size",
             str(CHUNKED_PREFILL_SIZE),
+            "--cuda-graph-backend-prefill",
+            "disabled",
             "--mem-fraction-static",
             "0.80",
         ]

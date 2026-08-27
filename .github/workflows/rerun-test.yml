@@ -72,8 +72,9 @@ env:
   # every run, so a rerun holding the write token could become everyone's next
   # comparison baseline. Without the repo var it fails fast instead.
 
+# Every job below sets its own `permissions`, which replaces rather than merges
+# with a workflow-level block -- so keep the floor here minimal and grant per job.
 permissions:
-  actions: write
   contents: read
   issues: read
 
@@ -93,6 +94,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
 
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
@@ -188,6 +192,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
 
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
@@ -262,6 +269,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+          # This checkout can hold a fork's code that the steps below execute;
+          # without this the job token stays in .git/config, readable by it.
+          persist-credentials: false
 
       - name: Mark runner picked up
         if: inputs.reply_comment_id != '' && inputs.reply_marker != ''

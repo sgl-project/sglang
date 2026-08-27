@@ -5,9 +5,9 @@ description: "Run ERNIE-Image with built-in prompt enhancement or a separate SGL
 
 ## Quick Start
 
-By default, the PE model is loaded by the diffusion model server, which may not provide optimal performance. For higher performance, the PE model can be deployed as a separate SGLang server. This document uses `baidu/ERNIE-Image` as an example.
+By default, the diffusion server loads the PE model in-process with SGLang's native Ministral3 implementation. Deploy the PE model as a separate SGLang server when it needs independent resources or scaling. This document uses `baidu/ERNIE-Image` as an example.
 
-Run the model with the built-in Transformers PE implementation (default):
+Run the model with the built-in native PE implementation (default):
 
 ```bash
 # Terminal 1: launch server
@@ -52,6 +52,18 @@ curl -X POST http://${HOST}:${PORT}/v1/images/generations \
     "use_pe": true
   }'
 ```
+
+For a memory-constrained in-process deployment, the native PE decoder supports
+layerwise offload:
+
+```bash
+sglang serve --model-path baidu/ERNIE-Image \
+  --layerwise-offload-components pe \
+  --port ${PORT}
+```
+
+This option streams PE decoder layers from CPU and can increase prompt-enhancement
+latency. It does not apply when `--pe-server-url` selects an external PE server.
 
 ## Support matrix
 

@@ -34,7 +34,11 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_flags,
+    get_spec,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
@@ -109,7 +113,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
         self.attn_dp_size = model_runner.ps.attn_dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = configured_pp_size()
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -124,7 +128,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if speculative_num_steps is None
             else speculative_num_steps
         )
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        self.topk = get_spec().speculative_eagle_topk
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
 
         # Patch_model in parent's capture() needs an attn_backend reference.
@@ -147,9 +151,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
         # Static capture width.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_decode", server_args=model_runner.server_args
-        )
+        self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
@@ -622,10 +624,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         raw_seq_lens_sum = forward_batch.seq_lens_sum
 
         if bs != raw_bs:
+            raw_out_cache_loc = forward_batch.out_cache_loc
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            # Match out_cache_loc to the padded graph batch for metadata replay.
+            forward_batch.out_cache_loc = buffers.out_cache_loc[
+                : num_tokens * self.speculative_num_steps
+            ]
             if raw_seq_lens_sum is not None:
                 forward_batch.seq_lens_sum = (
                     raw_seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
@@ -676,5 +683,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
             forward_batch.seq_lens_sum = raw_seq_lens_sum
+            forward_batch.out_cache_loc = raw_out_cache_loc
 
         return out
