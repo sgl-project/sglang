@@ -25,7 +25,7 @@ from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
 
 
 class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
-    def test_requantizes_non_128_block_fp8_weights_for_a5_mxfp8(self):
+    def test_requantizes_non_128_block_fp8_weights_for_arch35_mxfp8(self):
         layer = SimpleNamespace(
             weight=torch.nn.Parameter(
                 torch.ones(64, 128, dtype=torch.float8_e4m3fn), requires_grad=False

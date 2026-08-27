@@ -25,6 +25,25 @@ from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     npu_apply_without_routing_weights_w4a4_mxfp,
     w4a8_mxfp_gmm,
 )
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+
+class TestFP4MethodGate(unittest.TestCase):
+    def test_pre_arch35_keeps_fp8_moe_method(self):
+        config = Fp8Config(is_fp4_experts=True)
+        layer = FusedMoE.__new__(FusedMoE)
+
+        with (
+            patch("sglang.srt.layers.quantization.fp8.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.quantization.fp8.is_npu_arch35",
+                return_value=False,
+            ),
+        ):
+            method = config.get_quant_method(layer, "model.layers.0.experts")
+
+        self.assertIsInstance(method, Fp8MoEMethod)
 
 
 class TestApplySwiGLULimitNpu(unittest.TestCase):

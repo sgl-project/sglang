@@ -9,7 +9,7 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 
-class TestNPUArch35Capability(unittest.TestCase):
+class TestArch35Capability(unittest.TestCase):
     def tearDown(self):
         is_npu_arch35.cache_clear()
 
