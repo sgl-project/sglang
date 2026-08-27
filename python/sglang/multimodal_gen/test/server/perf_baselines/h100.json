@@ -104,7 +104,7 @@
             "expected_avg_denoise_ms": 247.95,
             "expected_median_denoise_ms": 249.01,
             "load_peak_vram_mb": 41840.0,
-            "runtime_peak_vram_mb": 46938.0,
+            "runtime_peak_vram_mb": 58554.0,
             "estimated_full_test_time_s": 133.1
         },
         "qwen_image_t2i_2_gpus": {
@@ -317,7 +317,7 @@
                 "ImageVAEEncodingStage": 0.01
             },
             "denoise_step_ms": {
-                "0": 65.28,
+                "0": 1082.71,
                 "1": 129.11,
                 "2": 440.87,
                 "3": 457.02,
@@ -778,7 +778,7 @@
             "expected_avg_denoise_ms": 51.13,
             "expected_median_denoise_ms": 54.3,
             "load_peak_vram_mb": 13120.0,
-            "runtime_peak_vram_mb": 17602.0,
+            "runtime_peak_vram_mb": 24262.0,
             "estimated_full_test_time_s": 75.0
         },
         "qwen_image_edit_ti2i": {
@@ -847,7 +847,7 @@
             "expected_avg_denoise_ms": 633.05,
             "expected_median_denoise_ms": 636.16,
             "load_peak_vram_mb": 43244.0,
-            "runtime_peak_vram_mb": 48250.0,
+            "runtime_peak_vram_mb": 59796.0,
             "estimated_full_test_time_s": 153.6
         },
         "joyai_image_edit_ti2i": {
@@ -1499,7 +1499,7 @@
             },
             "denoise_step_ms": {
                 "0": 286.89,
-                "1": 167.02,
+                "1": 828.85,
                 "2": 1010.47,
                 "3": 1009.41,
                 "4": 1011.33,
@@ -1708,7 +1708,7 @@
             "expected_avg_denoise_ms": 1923.51,
             "expected_median_denoise_ms": 1933.7,
             "load_peak_vram_mb": 35350.0,
-            "runtime_peak_vram_mb": 51230.0,
+            "runtime_peak_vram_mb": 58158.0,
             "estimated_full_test_time_s": 248.9
         },
         "wan2_2_t2v_a14b_2gpu": {
@@ -2044,7 +2044,7 @@
                 "DecodingStage": 7.37
             },
             "denoise_step_ms": {
-                "0": 66.76,
+                "0": 1195.42,
                 "1": 66.48,
                 "2": 189.28,
                 "3": 226.37,
@@ -2336,7 +2336,7 @@
                 "ImageVAEEncodingStage": 0.01
             },
             "denoise_step_ms": {
-                "0": 66.32,
+                "0": 1110.98,
                 "1": 341.96,
                 "2": 419.84,
                 "3": 460.86,
@@ -2796,7 +2796,7 @@
             "expected_avg_denoise_ms": 802.06,
             "expected_median_denoise_ms": 747.62,
             "load_peak_vram_mb": 56048.0,
-            "runtime_peak_vram_mb": 59804.0,
+            "runtime_peak_vram_mb": 66586.0,
             "estimated_full_test_time_s": 363.2
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
