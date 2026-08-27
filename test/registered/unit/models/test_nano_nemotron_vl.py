@@ -37,6 +37,18 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertEqual(model.get_embed_and_head(), (embed, head))
         self.assertIs(model.lm_head, head)
 
+    def test_delegates_dflash_capture_to_language_model(self):
+        model = object.__new__(NemotronH_Omni_Reasoning_V3)
+        nn.Module.__init__(model)
+        captured_layer_ids = []
+        model.language_model = SimpleNamespace(
+            set_dflash_layers_to_capture=captured_layer_ids.extend
+        )
+
+        model.set_dflash_layers_to_capture([1, 22, 43, 64, 85])
+
+        self.assertEqual(captured_layer_ids, [1, 22, 43, 64, 85])
+
     def test_vision_final_layernorm_is_loaded_and_applied(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)

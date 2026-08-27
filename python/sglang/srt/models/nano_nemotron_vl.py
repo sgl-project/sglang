@@ -232,6 +232,9 @@ class NemotronH_Nano_VL_V2(EVS):
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
+
     def extract_feature(self, pixel_values):
         micro_batch_size = 128
         n = pixel_values.shape[0]
