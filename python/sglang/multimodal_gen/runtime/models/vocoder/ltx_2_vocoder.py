@@ -721,8 +721,8 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         if hasattr(self, "bwe_generator"):
             input_dtype = hidden_states.dtype
-            # Keep CUDA/XPU behavior on autocast; CPU uses _module_in_fp32 to
-            # materialize module weights in fp32 during the forward region.
+            # Keep CUDA/XPU behavior on autocast; CPU uses _module_in_fp32 (https://github.com/Lightricks/LTX-2/blob/400fd31054597515f47125691032c04b1c3ee24e/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py#L585-L609)
+            # to materialize module weights in fp32 during the forward region.
             autocast_ctx = (
                 torch.autocast(
                     device_type=hidden_states.device.type, dtype=torch.float32
