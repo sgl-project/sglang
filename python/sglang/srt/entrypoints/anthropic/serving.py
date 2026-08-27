@@ -621,17 +621,14 @@ class AnthropicServing:
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
-        # ``task_budget`` is a soft hint forwarded as a custom param so the
-        # model can see it without it becoming a hard cap (``max_tokens``
-        # is still the hard cap).
+        # ``reasoning_effort`` knob, which accepts every tier the Anthropic
+        # Literal allows. ``task_budget`` is a soft hint forwarded as a
+        # custom param so the model can see it without it becoming a hard
+        # cap (``max_tokens`` is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
             if oc.effort is not None:
-                chat_request.reasoning_effort = (
-                    "max" if oc.effort == "xhigh" else oc.effort
-                )
+                chat_request.reasoning_effort = oc.effort
             if oc.task_budget is not None:
                 # Custom params are silently ignored by backends that
                 # don't recognise them; logging it makes the propagation
@@ -768,6 +765,15 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            # Template rejections (e.g. an effort tier the template does not
+            # accept) arrive as ValueError; the OpenAI path returns 400 for
+            # these, so mirror it instead of reporting a server fault.
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=_scrub_error_message(str(e), 400),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -813,6 +819,15 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            # Template rejections (e.g. an effort tier the template does not
+            # accept) arrive as ValueError; the OpenAI path returns 400 for
+            # these, so mirror it instead of reporting a server fault.
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=_scrub_error_message(str(e), 400),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
