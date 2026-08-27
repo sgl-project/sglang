@@ -29,6 +29,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.runtime_context import (
+    derive_attention_widths,
     get_device,
     get_exec,
     get_flags,
@@ -63,8 +64,6 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
-    # Elastic scaling moves this width away from what the launch derived, so
-    # the stamp moves with it.
     get_parallel().stamp_derived_widths(attn_dp_size=new_dp_size)
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
@@ -327,8 +326,17 @@ def is_dp_max_padding() -> bool:
 def compute_dp_attention_world_info(
     enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
 ):
-    attn_dp_size = dp_size if enable_dp_attention else 1
-    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
+    """This rank's place in the attention topology, plus the widths it sits in.
+
+    The widths come from `derive_attention_widths`; what this adds is the two
+    ranks, which are per-process and so are not part of the stamped set.
+    """
+    attn_dp_size, attn_tp_size = derive_attention_widths(
+        tp_size=tp_size,
+        attn_cp_size=attn_cp_size,
+        dp_size=dp_size,
+        enable_dp_attention=enable_dp_attention,
+    )
     attn_tp_rank = tp_rank % attn_tp_size
 
     if not enable_dp_attention:
@@ -359,12 +367,9 @@ def initialize_dp_attention(
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ATTN_DP_SIZE = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
-    # The attention-DP width is the one derived size that dist init settles
-    # here rather than in `initialize_model_parallel`, so it is stamped here.
     get_parallel().stamp_derived_widths(attn_dp_size=_ATTN_DP_SIZE)
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:

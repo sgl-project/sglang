@@ -131,6 +131,19 @@ _PARALLEL_FIELDS = frozenset(
 )
 
 
+def derive_attention_widths(
+    *, tp_size: int, attn_cp_size: int, dp_size: int, enable_dp_attention: bool
+) -> tuple:
+    """(attn_dp_size, attn_tp_size) from the leaves.
+
+    Split out because the rank computation in
+    `dp_attention.compute_dp_attention_world_info` needs the same two numbers
+    and must not carry a second copy of the arithmetic.
+    """
+    attn_dp_size = dp_size if enable_dp_attention else 1
+    return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
+
+
 def derive_parallel_widths(
     *,
     tp_size: int,
@@ -153,7 +166,15 @@ def derive_parallel_widths(
     """
     return {
         "attn_dp_size": attn_dp_size,
-        "attn_tp_size": tp_size // attn_dp_size // attn_cp_size,
+        # `attn_dp_size` is already the effective width (1 when DP attention is
+        # off), so the flag is spent here; a caller passing the raw `dp_size`
+        # leaf with the attention disabled would get tp/dp/cp instead of tp/1/cp.
+        "attn_tp_size": derive_attention_widths(
+            tp_size=tp_size,
+            attn_cp_size=attn_cp_size,
+            dp_size=attn_dp_size,
+            enable_dp_attention=True,
+        )[1],
         "moe_ep_size": moe_ep_size,
         "moe_tp_size": tp_size // moe_ep_size // moe_dp_size,
         "dcp_enabled": dcp_enabled,
@@ -1588,7 +1609,9 @@ def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
-    Wrapper subsystems (``parallel``) hold no state and are unaffected.
+    ``parallel`` holds the stamped derived widths, which go with the lifecycle
+    that stamped them: `_derived_width` prefers the stamp over the live group,
+    so leaving one behind lets the next test read the previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
@@ -1596,6 +1619,7 @@ def reset_context() -> None:
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
+    _CONTEXT.parallel.clear_derived_widths()
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()

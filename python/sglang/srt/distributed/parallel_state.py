@@ -2506,10 +2506,8 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    # The widths no flag sets are arithmetic on the ones that do, and that
-    # arithmetic lives in the runtime context. The groups below are built at
-    # exactly these numbers, and the same dict is stamped at the end so a
-    # reader never has to ask a coordinator for its own width.
+    # The groups below are built at these numbers, and the same dict is stamped
+    # once they exist.
     derived_widths = derive_parallel_widths(
         tp_size=tensor_model_parallel_size,
         attn_cp_size=attn_cp_size,
