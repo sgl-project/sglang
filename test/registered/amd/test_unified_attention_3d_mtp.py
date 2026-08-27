@@ -15,7 +15,7 @@ if _RUNNABLE:
         from aiter.ops.triton.attention.unified_attention import unified_attention
         from aiter.ops.triton.utils.types import e4m3_dtype
 
-        from sglang.kernels.ops.attention.aiter_unified_attention_mtp import (
+        from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
             qwen35_mtp_unified_attention,
         )
     except Exception:

@@ -61,7 +61,7 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
-    from sglang.kernels.ops.attention.aiter_unified_attention_mtp import (
+    from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         qwen35_mtp_unified_attention,
     )
 except ImportError:
