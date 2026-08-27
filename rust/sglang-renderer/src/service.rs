@@ -1,8 +1,8 @@
-//! Transport-independent renderer orchestration.
+//! Reusable SGLang request preprocessing.
 
 use std::sync::Arc;
 
-use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
+use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest, Prompt};
 use dynamo_renderer::{kimi_k3_formatter_for, native_formatter_for};
 use futures::future::{BoxFuture, try_join_all};
 
@@ -10,14 +10,17 @@ use futures::future::{BoxFuture, try_join_all};
 use crate::GenerateRequestMetadata;
 #[cfg(any(feature = "http", test))]
 use crate::protocol::openai::lower_chat_request_with_template_args;
-use crate::protocol::openai::{lower_chat_request, lower_completion_request};
+use crate::protocol::openai::{
+    lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
+};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{
     check_total_tokens, resolve_chat_template_file, resolve_model_file, validate_text_request,
+    validate_token_ids_request,
 };
 use crate::{
-    ChatFormatter, ChatPreprocessor, ChatRequest, LoweredChat, PreparedGenerateRequest,
-    RendererConfig, RendererError, TextPrompt, TextRequest, TokenIdsRequest,
+    ChatFormatter, ChatPreprocessor, ChatRequest, GenerateRequest, LoweredChat, RendererConfig,
+    RendererError, TextRequest, TokenIdsRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one model-facing text
@@ -30,36 +33,42 @@ pub trait TokenizationBackend: Send + Sync {
     ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>>;
 }
 
-/// Engine-free OpenAI protocol lowering shared by inference and rendering.
-///
-/// This type deliberately has no preprocessing backend. Full inference
-/// lowers protocol semantics here, then submits text or token-ID inputs to its
-/// existing request FSM.
-pub struct OpenAIRequestLowerer {
+/// Internal OpenAI wire lowering before model-specific preprocessing.
+struct OpenAIRequestLowerer {
     config: RendererConfig,
 }
 
-/// Standalone request preparation: shared OpenAI processing plus host-provided
-/// CPU work.
-///
-/// This service returns prepared generation requests. Chat response processors
-/// created during lowering are discarded by this preparation-only path.
+/// Shared preprocessing used by inference and render-only frontends.
 pub struct RendererService {
     lowerer: OpenAIRequestLowerer,
     chat_preprocessor: ChatPreprocessor,
     backend: Arc<dyn TokenizationBackend>,
 }
 
+#[cfg(any(feature = "http", test))]
+pub(crate) struct ChatLoweringOptions {
+    pub chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub continue_final_message: bool,
+    pub sampling_overrides: crate::SamplingParamsOverrides,
+    pub metadata: GenerateRequestMetadata,
+}
+
+#[cfg(any(feature = "http", test))]
+pub(crate) struct ChatGenerateRequests {
+    pub requests: Vec<GenerateRequest>,
+    pub response_processor: crate::ChatResponseProcessor,
+}
+
 impl OpenAIRequestLowerer {
-    pub fn new(config: RendererConfig) -> Self {
+    fn new(config: RendererConfig) -> Self {
         Self { config }
     }
 
-    pub fn config(&self) -> &RendererConfig {
+    fn config(&self) -> &RendererConfig {
         &self.config
     }
 
-    pub fn lower_chat(
+    fn lower_chat(
         &self,
         request: CreateChatCompletionRequest,
         response_id: &str,
@@ -84,17 +93,26 @@ impl OpenAIRequestLowerer {
         )
     }
 
-    pub fn lower_completions(
+    fn lower_text_completions(
         &self,
         request: CreateCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<TextRequest>, RendererError> {
-        lower_completion_request(&self.config, &request, response_id)
+        lower_text_completion_request(&self.config, &request, response_id)
+    }
+
+    fn lower_token_ids_completions(
+        &self,
+        request: CreateCompletionRequest,
+        response_id: &str,
+    ) -> Result<Vec<TokenIdsRequest>, RendererError> {
+        lower_token_ids_completion_request(&self.config, &request, response_id)
     }
 }
 
 impl RendererService {
-    pub fn new(lowerer: OpenAIRequestLowerer, backend: Arc<dyn TokenizationBackend>) -> Self {
+    pub fn new(config: RendererConfig, backend: Arc<dyn TokenizationBackend>) -> Self {
+        let lowerer = OpenAIRequestLowerer::new(config);
         let (formatter, formatter_error) = load_chat_support(lowerer.config());
         let chat_preprocessor = ChatPreprocessor::new(lowerer.config(), formatter)
             .with_formatter_error(formatter_error);
@@ -109,10 +127,28 @@ impl RendererService {
         &self,
         request: CreateChatCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
         let chat = self.lowerer.lower_chat(request, response_id)?;
         let lowered = self.chat_preprocessor.preprocess(chat)?;
-        self.prepare_many(lowered.text_requests).await
+        self.prepare_text_many(lowered.text_requests).await
+    }
+
+    #[cfg(any(feature = "http", test))]
+    pub(crate) fn lower_chat_with_options(
+        &self,
+        request: CreateChatCompletionRequest,
+        response_id: &str,
+        options: ChatLoweringOptions,
+    ) -> Result<LoweredChat, RendererError> {
+        let mut chat = self.lowerer.lower_chat_with_template_args(
+            request,
+            response_id,
+            options.chat_template_args,
+            options.continue_final_message,
+        )?;
+        options.sampling_overrides.apply(&mut chat.sampling_params);
+        chat.metadata = options.metadata;
+        self.chat_preprocessor.preprocess(chat)
     }
 
     #[cfg(any(feature = "http", test))]
@@ -120,79 +156,48 @@ impl RendererService {
         &self,
         request: CreateChatCompletionRequest,
         response_id: &str,
-        chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
-        continue_final_message: bool,
-        sampling_overrides: crate::SamplingParamsOverrides,
-        metadata: GenerateRequestMetadata,
-    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let mut chat = self.lowerer.lower_chat_with_template_args(
-            request,
-            response_id,
-            chat_template_args,
-            continue_final_message,
-        )?;
-        sampling_overrides.apply(&mut chat.sampling_params);
-        chat.metadata = metadata;
-        let lowered = self.chat_preprocessor.preprocess(chat)?;
-        self.prepare_many(lowered.text_requests).await
+        options: ChatLoweringOptions,
+    ) -> Result<ChatGenerateRequests, RendererError> {
+        let lowered = self.lower_chat_with_options(request, response_id, options)?;
+        Ok(ChatGenerateRequests {
+            requests: self.prepare_text_many(lowered.text_requests).await?,
+            response_processor: lowered.response_processor,
+        })
     }
 
     pub fn config(&self) -> &RendererConfig {
         self.lowerer.config()
     }
 
-    /// Convert the OpenAI wire request into the shared structured chat type.
-    pub fn lower_openai_chat(
-        &self,
-        request: CreateChatCompletionRequest,
-        response_id: &str,
-    ) -> Result<ChatRequest, RendererError> {
-        self.lowerer.lower_chat(request, response_id)
-    }
-
     #[cfg(any(feature = "http", test))]
-    pub(crate) fn lower_openai_chat_with_template_args(
-        &self,
-        request: CreateChatCompletionRequest,
-        response_id: &str,
-        chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
-        continue_final_message: bool,
-        sampling_overrides: crate::SamplingParamsOverrides,
-        metadata: GenerateRequestMetadata,
-    ) -> Result<ChatRequest, RendererError> {
-        let mut chat = self.lowerer.lower_chat_with_template_args(
-            request,
-            response_id,
-            chat_template_args,
-            continue_final_message,
-        )?;
-        sampling_overrides.apply(&mut chat.sampling_params);
-        chat.metadata = metadata;
-        Ok(chat)
-    }
-
-    /// Apply chat templates, tools, and parser setup, then lower to text.
-    pub fn preprocess_chat(&self, request: ChatRequest) -> Result<LoweredChat, RendererError> {
-        self.chat_preprocessor.preprocess(request)
-    }
-
-    pub fn lower_completions(
-        &self,
-        request: CreateCompletionRequest,
-        response_id: &str,
-    ) -> Result<Vec<TextRequest>, RendererError> {
-        self.lowerer.lower_completions(request, response_id)
-    }
-
-    #[cfg(any(feature = "http", test))]
-    pub(crate) fn lower_completions_with_metadata(
+    pub(crate) fn lower_text_completions_with_metadata(
         &self,
         request: CreateCompletionRequest,
         response_id: &str,
         sampling_overrides: crate::SamplingParamsOverrides,
         metadata: GenerateRequestMetadata,
     ) -> Result<Vec<TextRequest>, RendererError> {
-        let mut requests = self.lowerer.lower_completions(request, response_id)?;
+        let mut requests = self.lowerer.lower_text_completions(request, response_id)?;
+        for request in &mut requests {
+            sampling_overrides
+                .clone()
+                .apply(&mut request.options.sampling_params);
+            request.metadata = metadata.clone();
+        }
+        Ok(requests)
+    }
+
+    #[cfg(any(feature = "http", test))]
+    pub(crate) fn lower_token_ids_completions_with_metadata(
+        &self,
+        request: CreateCompletionRequest,
+        response_id: &str,
+        sampling_overrides: crate::SamplingParamsOverrides,
+        metadata: GenerateRequestMetadata,
+    ) -> Result<Vec<TokenIdsRequest>, RendererError> {
+        let mut requests = self
+            .lowerer
+            .lower_token_ids_completions(request, response_id)?;
         for request in &mut requests {
             sampling_overrides
                 .clone()
@@ -205,8 +210,15 @@ impl RendererService {
     pub async fn prepare_text_request(
         &self,
         request: TextRequest,
-    ) -> Result<TokenIdsRequest, RendererError> {
-        self.prepare_one(request).await
+    ) -> Result<GenerateRequest, RendererError> {
+        self.prepare_text(request).await.map(Into::into)
+    }
+
+    pub async fn prepare_token_ids_request(
+        &self,
+        request: TokenIdsRequest,
+    ) -> Result<GenerateRequest, RendererError> {
+        self.prepare_token_ids(request).map(Into::into)
     }
 
     pub async fn tokenize_prompt(
@@ -218,7 +230,7 @@ impl RendererService {
         Ok(self.backend.tokenize(request).await?.input_ids)
     }
 
-    pub async fn tokenize_chat(
+    pub(crate) async fn tokenize_chat(
         &self,
         request: ChatRequest,
     ) -> Result<crate::TokenIds, RendererError> {
@@ -230,45 +242,90 @@ impl RendererService {
         &self,
         request: CreateCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let requests = self.lowerer.lower_completions(request, response_id)?;
-        self.prepare_many(requests).await
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        match &request.prompt {
+            Prompt::String(_) | Prompt::StringArray(_) => {
+                let requests = self.lowerer.lower_text_completions(request, response_id)?;
+                self.prepare_text_many(requests).await
+            }
+            Prompt::IntegerArray(_) | Prompt::ArrayOfIntegerArray(_) => {
+                let requests = self
+                    .lowerer
+                    .lower_token_ids_completions(request, response_id)?;
+                self.prepare_token_ids_many(requests)
+            }
+        }
     }
 
     #[cfg(any(feature = "http", test))]
-    pub(crate) async fn prepare_completions_with_metadata(
+    pub(crate) async fn prepare_text_completions_with_metadata(
         &self,
         request: CreateCompletionRequest,
         response_id: &str,
         sampling_overrides: crate::SamplingParamsOverrides,
         metadata: GenerateRequestMetadata,
-    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let requests = self.lower_completions_with_metadata(
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        let requests = self.lower_text_completions_with_metadata(
             request,
             response_id,
             sampling_overrides,
             metadata,
         )?;
-        self.prepare_many(requests).await
+        self.prepare_text_many(requests).await
     }
 
-    async fn prepare_many(
+    #[cfg(any(feature = "http", test))]
+    pub(crate) async fn prepare_token_ids_completions_with_metadata(
+        &self,
+        request: CreateCompletionRequest,
+        response_id: &str,
+        sampling_overrides: crate::SamplingParamsOverrides,
+        metadata: GenerateRequestMetadata,
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        let requests = self.lower_token_ids_completions_with_metadata(
+            request,
+            response_id,
+            sampling_overrides,
+            metadata,
+        )?;
+        self.prepare_token_ids_many(requests)
+    }
+
+    async fn prepare_text_many(
         &self,
         requests: Vec<TextRequest>,
-    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let requests = try_join_all(
-            requests
-                .into_iter()
-                .map(|request| self.prepare_one(request)),
-        )
-        .await?;
-        Ok(requests
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        Ok(self
+            .prepare_text_inputs(requests)
+            .await?
             .into_iter()
-            .map(PreparedGenerateRequest::from)
+            .map(GenerateRequest::from)
             .collect())
     }
 
-    async fn prepare_one(
+    async fn prepare_text_inputs(
+        &self,
+        requests: Vec<TextRequest>,
+    ) -> Result<Vec<TokenIdsRequest>, RendererError> {
+        try_join_all(
+            requests
+                .into_iter()
+                .map(|request| self.prepare_text(request)),
+        )
+        .await
+    }
+
+    fn prepare_token_ids_many(
+        &self,
+        requests: Vec<TokenIdsRequest>,
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        requests
+            .into_iter()
+            .map(|request| self.prepare_token_ids(request).map(GenerateRequest::from))
+            .collect()
+    }
+
+    async fn prepare_text(
         &self,
         mut request: TextRequest,
     ) -> Result<TokenIdsRequest, RendererError> {
@@ -277,15 +334,20 @@ impl RendererService {
             self.lowerer.config.skip_tokenizer_init,
             self.lowerer.config.vocab_size,
         )?;
-        let mut request = match request.prompt {
-            TextPrompt::Text(_) | TextPrompt::Rendered(_) => self.backend.tokenize(request).await?,
-            TextPrompt::TokenIds(input_ids) => TokenIdsRequest {
-                rid: request.rid,
-                input_ids,
-                options: request.options,
-                metadata: request.metadata,
-            },
-        };
+        let mut request = self.backend.tokenize(request).await?;
+        check_total_tokens(&mut request, &self.lowerer.config.limits)?;
+        Ok(request)
+    }
+
+    fn prepare_token_ids(
+        &self,
+        mut request: TokenIdsRequest,
+    ) -> Result<TokenIdsRequest, RendererError> {
+        validate_token_ids_request(&request, &self.lowerer.config.limits)?;
+        request.options.sampling_params.normalize(
+            self.lowerer.config.skip_tokenizer_init,
+            self.lowerer.config.vocab_size,
+        )?;
         check_total_tokens(&mut request, &self.lowerer.config.limits)?;
         Ok(request)
     }
@@ -400,7 +462,7 @@ mod tests {
 
     #[test]
     fn chat_lowering_carries_rendered_prompt_and_template_stops() {
-        let lowerer = OpenAIRequestLowerer::new(RendererConfig {
+        let config = RendererConfig {
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
             revision: None,
@@ -420,7 +482,7 @@ mod tests {
                 allow_auto_truncate: false,
                 enable_return_hidden_states: false,
             },
-        });
+        };
         let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
@@ -428,33 +490,25 @@ mod tests {
         }))
         .unwrap();
 
-        let service = RendererService::new(lowerer, Arc::new(UnexpectedTokenizer));
+        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
         let chat = service
-            .lower_openai_chat_with_template_args(
+            .lower_chat_with_options(
                 request,
                 "chatcmpl-test",
-                Some(std::collections::HashMap::from([(
-                    "enable_thinking".to_owned(),
-                    serde_json::Value::Bool(false),
-                )])),
-                false,
-                crate::SamplingParamsOverrides::default(),
-                GenerateRequestMetadata::default(),
+                ChatLoweringOptions {
+                    chat_template_args: Some(std::collections::HashMap::from([(
+                        "enable_thinking".to_owned(),
+                        serde_json::Value::Bool(false),
+                    )])),
+                    continue_final_message: false,
+                    sampling_overrides: crate::SamplingParamsOverrides::default(),
+                    metadata: GenerateRequestMetadata::default(),
+                },
             )
             .unwrap();
-        assert_eq!(
-            chat.chat_template_args
-                .as_ref()
-                .and_then(|args| args.get("enable_thinking")),
-            Some(&serde_json::Value::Bool(false))
-        );
-        let lowered = service.preprocess_chat(chat).unwrap();
-        let text_request = &lowered.text_requests[0];
+        let text_request = &chat.text_requests[0];
 
-        assert!(matches!(
-            &text_request.prompt,
-            TextPrompt::Rendered(prompt) if prompt.as_str().contains("<|im_start|>user")
-        ));
+        assert!(text_request.prompt.as_str().contains("<|im_start|>user"));
         assert!(matches!(
             text_request.options.sampling_params.stop.as_ref(),
             Some(OneOrMany::Many(stops))
@@ -507,8 +561,8 @@ mod tests {
     }
 
     #[test]
-    fn token_id_completion_bypasses_tokenization_and_is_still_prepared() {
-        let lowerer = OpenAIRequestLowerer::new(RendererConfig {
+    fn token_id_completion_bypasses_tokenization_and_builds_generate_request() {
+        let config = RendererConfig {
             served_model_name: "model".into(),
             tokenizer_path: String::new(),
             revision: None,
@@ -528,8 +582,8 @@ mod tests {
                 allow_auto_truncate: true,
                 enable_return_hidden_states: false,
             },
-        });
-        let service = RendererService::new(lowerer, Arc::new(UnexpectedTokenizer));
+        };
+        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
         let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
             "prompt": [11, 12, 13],
@@ -537,10 +591,10 @@ mod tests {
         }))
         .unwrap();
 
-        let prepared =
+        let requests =
             futures::executor::block_on(service.prepare_completions(request, "cmpl-test")).unwrap();
 
-        assert_eq!(prepared[0].input_ids, vec![11, 12, 13]);
-        assert_eq!(prepared[0].sampling_params.max_new_tokens, Some(2));
+        assert_eq!(requests[0].input_ids, vec![11, 12, 13]);
+        assert_eq!(requests[0].sampling_params.max_new_tokens, Some(2));
     }
 }

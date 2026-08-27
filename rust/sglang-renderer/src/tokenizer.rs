@@ -1,8 +1,8 @@
 //! Tokenizer primitives shared by renderer hosts.
 
 use crate::{
-    RendererError as Error, RendererLimits, SamplingParams, TextPrompt, TextRequest, TokenIds,
-    TokenIdsRequest, TokenizationBackend,
+    RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
+    TokenizationBackend,
 };
 use futures::{channel::oneshot, future::BoxFuture};
 use std::path::{Path, PathBuf};
@@ -359,17 +359,6 @@ impl TextTokenizer for DynamoTokenizer {
     }
 }
 
-/// Tokenize one text prompt and resolve tokenizer-dependent stop sizing.
-pub fn tokenize_text_prompt(
-    text: &str,
-    add_special_tokens: bool,
-    sampling_params: &mut SamplingParams,
-    tokenizer: &dyn TextTokenizer,
-) -> Result<TokenIds, Error> {
-    resolve_stop_token_window(sampling_params, tokenizer);
-    tokenizer.encode(text, add_special_tokens)
-}
-
 fn resolve_stop_token_window(sampling_params: &mut SamplingParams, tokenizer: &dyn TextTokenizer) {
     // Size the scheduler's stop-match window in TOKENS, as Python's
     // `normalize(tokenizer)` does.
@@ -404,17 +393,9 @@ pub fn tokenize_text_request(
         metadata,
     } = request;
     resolve_stop_token_window(&mut options.sampling_params, tokenizer);
-    let input_ids = match prompt {
-        TextPrompt::Text(text) => tokenizer.encode(&text, add_special_tokens)?,
-        TextPrompt::Rendered(prompt) => match prompt.encode_segments() {
-            Some(segments) => tokenizer.encode_segments(&segments, add_special_tokens)?,
-            None => tokenizer.encode(prompt.as_str(), add_special_tokens)?,
-        },
-        TextPrompt::TokenIds(_) => {
-            return Err(Error::Validation(
-                "token-ID prompt must bypass the tokenizer backend".into(),
-            ));
-        }
+    let input_ids = match prompt.encode_segments() {
+        Some(segments) => tokenizer.encode_segments(&segments, add_special_tokens)?,
+        None => tokenizer.encode(prompt.as_str(), add_special_tokens)?,
     };
     Ok(TokenIdsRequest {
         rid,
@@ -424,78 +405,48 @@ pub fn tokenize_text_request(
     })
 }
 
-/// Run the engine-free validation, normalization, tokenization and context checks.
-pub fn prepare_direct_request(
-    mut request: TextRequest,
-    tokenizer: &dyn TextTokenizer,
-    limits: &RendererLimits,
-) -> Result<TokenIdsRequest, Error> {
-    validate_text_request(&request, limits)?;
-    request
-        .options
-        .sampling_params
-        .normalize(limits.skip_tokenizer_init, limits.vocab_size)?;
-    let mut request = match request.prompt {
-        TextPrompt::Text(text) => tokenize_text_request(
-            TextRequest {
-                prompt: TextPrompt::Text(text),
-                ..request
-            },
-            tokenizer,
-        )?,
-        TextPrompt::Rendered(prompt) => tokenize_text_request(
-            TextRequest {
-                prompt: TextPrompt::Rendered(prompt),
-                ..request
-            },
-            tokenizer,
-        )?,
-        TextPrompt::TokenIds(input_ids) => TokenIdsRequest {
-            rid: request.rid,
-            input_ids,
-            options: request.options,
-            metadata: request.metadata,
-        },
-    };
-    check_total_tokens(&mut request, limits)?;
-    Ok(request)
-}
-
 /// Validate fields that must be safe before tokenization or engine submission.
 pub fn validate_text_request(request: &TextRequest, limits: &RendererLimits) -> Result<(), Error> {
-    if request.rid.len() > 128 {
-        return Err(Error::Validation(format!(
-            "rid is {} bytes, over the 128-byte limit",
-            request.rid.len()
-        )));
+    validate_request_id(&request.rid)?;
+    if request.prompt.as_str().is_empty() {
+        return Err(Error::Validation("prompt cannot be empty".into()));
     }
-    let input_ids = match &request.prompt {
-        TextPrompt::Text(text) => {
-            if text.is_empty() {
-                return Err(Error::Validation("prompt cannot be empty".into()));
-            }
-            None
-        }
-        TextPrompt::Rendered(prompt) => {
-            if prompt.as_str().is_empty() {
-                return Err(Error::Validation("prompt cannot be empty".into()));
-            }
-            None
-        }
-        TextPrompt::TokenIds(input_ids) => {
-            if input_ids.is_empty() {
-                return Err(Error::Validation("input_ids cannot be empty".into()));
-            }
-            Some(input_ids.as_slice())
-        }
-    };
     let options = &request.options;
     validate_completion_fields(
-        input_ids,
+        None,
         options.token_ids_logprob.as_deref(),
         options.return_hidden_states,
         limits,
     )
+}
+
+/// Validate an already-tokenized request without passing it through the text
+/// tokenizer path.
+pub fn validate_token_ids_request(
+    request: &TokenIdsRequest,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
+    validate_request_id(&request.rid)?;
+    if request.input_ids.is_empty() {
+        return Err(Error::Validation("input_ids cannot be empty".into()));
+    }
+    let options = &request.options;
+    validate_completion_fields(
+        Some(&request.input_ids),
+        options.token_ids_logprob.as_deref(),
+        options.return_hidden_states,
+        limits,
+    )
+}
+
+fn validate_request_id(rid: &str) -> Result<(), Error> {
+    if rid.len() > 128 {
+        return Err(Error::Validation(format!(
+            "rid is {} bytes, over the 128-byte limit",
+            rid.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Validate the common completion fields before tokenization or engine
@@ -544,11 +495,11 @@ pub fn check_total_tokens(
     let mut input_ids = Some(std::mem::take(&mut request.input_ids));
     let result =
         check_completion_token_budget(&mut input_ids, &mut request.options.sampling_params, limits);
-    request.input_ids = input_ids.expect("prepared token-ID request retains input_ids");
+    request.input_ids = input_ids.expect("validated token-ID request retains input_ids");
     result
 }
 
-/// Enforce the context limit over the common prepared completion fields.
+/// Enforce the context limit over the common token-only completion fields.
 pub fn check_completion_token_budget(
     input_ids: &mut Option<TokenIds>,
     sampling_params: &mut SamplingParams,

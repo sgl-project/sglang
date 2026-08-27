@@ -1,4 +1,4 @@
-//! OpenAI HTTP frontends built on the engine-neutral renderer contracts.
+//! Optional standalone HTTP frontend built on the reusable renderer service.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -97,6 +97,8 @@ pub(crate) struct ChatCompletionRequest {
     pub sampling_overrides: SamplingParamsOverrides,
     #[serde(flatten)]
     pub extensions: RequestExtensions,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, Value>,
 }
 
 /// SGLang's legacy-completions HTTP contract.
@@ -142,6 +144,8 @@ pub(crate) struct CompletionRequest {
     pub sampling_overrides: SamplingParamsOverrides,
     #[serde(flatten)]
     pub extensions: RequestExtensions,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, Value>,
 }
 
 pub(crate) struct ChatRequestParts {
@@ -155,6 +159,7 @@ pub(crate) struct ChatRequestParts {
 impl ChatCompletionRequest {
     #[allow(deprecated)]
     pub fn into_parts(self) -> Result<ChatRequestParts, String> {
+        reject_unsupported_fields(&self.unsupported_fields)?;
         let modalities = self
             .modalities
             .map(serde_json::from_value)
@@ -206,12 +211,16 @@ impl ChatCompletionRequest {
 impl CompletionRequest {
     pub fn into_parts(
         self,
-    ) -> (
-        DynamoCompletionRequest,
-        SamplingParamsOverrides,
-        RequestExtensions,
-    ) {
+    ) -> Result<
         (
+            DynamoCompletionRequest,
+            SamplingParamsOverrides,
+            RequestExtensions,
+        ),
+        String,
+    > {
+        reject_unsupported_fields(&self.unsupported_fields)?;
+        Ok((
             DynamoCompletionRequest {
                 model: self.model,
                 prompt: self.prompt,
@@ -235,8 +244,21 @@ impl CompletionRequest {
             },
             self.sampling_overrides,
             self.extensions,
-        )
+        ))
     }
+}
+
+fn reject_unsupported_fields(fields: &HashMap<String, Value>) -> Result<(), String> {
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let mut names = fields.keys().cloned().collect::<Vec<_>>();
+    names.sort_unstable();
+    Err(format!(
+        "unsupported request field{}: {}",
+        if names.len() == 1 { "" } else { "s" },
+        names.join(", ")
+    ))
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -315,18 +337,21 @@ impl RequestExtensions {
     }
 }
 
-pub use generate_client::HttpGenerateClient;
+pub(crate) use generate_client::HttpGenerateClient;
 pub use runtime::{RendererRuntimeConfig, serve};
 #[cfg(test)]
 mod test_utils;
 
-pub struct OpenAIHttpFrontend {
+pub(crate) struct OpenAIHttpFrontend {
     pub(crate) renderer: Arc<crate::RendererService>,
     pub(crate) generate_client: HttpGenerateClient,
 }
 
 impl OpenAIHttpFrontend {
-    pub fn new(renderer: Arc<crate::RendererService>, generate_client: HttpGenerateClient) -> Self {
+    pub(crate) fn new(
+        renderer: Arc<crate::RendererService>,
+        generate_client: HttpGenerateClient,
+    ) -> Self {
         Self {
             renderer,
             generate_client,
@@ -334,7 +359,7 @@ impl OpenAIHttpFrontend {
     }
 }
 
-pub fn inference_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
+pub(crate) fn inference_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
     Router::new()
         .merge(openai::routes())
@@ -342,18 +367,32 @@ pub fn inference_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
         .merge(tokenize::routes(renderer))
 }
 
-pub fn render_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
-    render::routes(renderer.clone()).merge(tokenize::routes(renderer))
-}
-
-pub fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
+pub(crate) fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
     inference_routes(frontend).merge(render::routes(renderer))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ChatCompletionRequest;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Json, Router,
+        body::{Body, to_bytes},
+        extract::State,
+        http::{Request, StatusCode},
+        response::sse::{Event, Sse},
+        routing::post,
+    };
+    use futures::future::BoxFuture;
+    use tower::ServiceExt;
+
+    use super::{ChatCompletionRequest, HttpGenerateClient, OpenAIHttpFrontend, standalone_routes};
+    use crate::{
+        RendererConfig, RendererError, RendererLimits, RendererService, SamplingDefaults,
+        TextRequest, TokenIdsRequest, TokenizationBackend,
+    };
 
     #[test]
     fn chat_request_preserves_template_controls() {
@@ -387,5 +426,192 @@ mod tests {
         assert_eq!(parts.sampling_overrides.min_tokens, Some(3));
         assert_eq!(parts.sampling_overrides.ignore_eos, Some(true));
         assert_eq!(parts.sampling_overrides.skip_special_tokens, Some(false));
+    }
+
+    #[test]
+    fn unsupported_sglang_fields_are_rejected_instead_of_ignored() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "input_ids": [1, 2, 3],
+            "task": "domain"
+        }))
+        .unwrap();
+
+        let error = match request.into_parts() {
+            Err(error) => error,
+            Ok(_) => panic!("unsupported fields must be rejected"),
+        };
+
+        assert_eq!(error, "unsupported request fields: input_ids, task");
+    }
+
+    struct WordTokenizer;
+
+    impl TokenizationBackend for WordTokenizer {
+        fn tokenize(
+            &self,
+            request: TextRequest,
+        ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>> {
+            Box::pin(async move {
+                Ok(TokenIdsRequest {
+                    rid: request.rid,
+                    input_ids: request
+                        .prompt
+                        .as_str()
+                        .split_whitespace()
+                        .map(|_| 7)
+                        .collect(),
+                    options: request.options,
+                    metadata: request.metadata,
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct EngineState {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn generate(
+        State(state): State<EngineState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        state.requests.lock().unwrap().push(body);
+        let frame = serde_json::json!({
+            "output_ids": [104],
+            "meta_info": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "finish_reason": {"type": "stop", "matched": null}
+            }
+        })
+        .to_string();
+        Sse::new(futures::stream::iter([
+            Ok(Event::default().data(frame)),
+            Ok(Event::default().data("[DONE]")),
+        ]))
+    }
+
+    fn renderer_config() -> RendererConfig {
+        RendererConfig {
+            served_model_name: "model".into(),
+            tokenizer_path: ".".into(),
+            revision: None,
+            model_path: String::new(),
+            chat_template: Some("chatml".into()),
+            tool_call_parser: None,
+            reasoning_parser: None,
+            stream_response_default_include_usage: false,
+            skip_tokenizer_init: false,
+            vocab_size: 128,
+            default_sampling_params: SamplingDefaults::default(),
+            limits: RendererLimits {
+                skip_tokenizer_init: false,
+                vocab_size: 128,
+                context_len: 128,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: false,
+                enable_return_hidden_states: false,
+            },
+        }
+    }
+
+    fn tiny_tokenizer() -> dynamo_tokenizers::Tokenizer {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../experimental/sgl-router/tests/fixtures/tiny_tokenizer.json");
+        dynamo_tokenizers::Tokenizer::from_file_with_options(
+            path.to_str().unwrap(),
+            dynamo_tokenizers::TokenizerOptions {
+                add_special_tokens: false,
+            },
+        )
+        .unwrap()
+    }
+
+    async fn post_request(
+        app: Router<()>,
+        uri: &str,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inference_and_render_share_chat_preparation() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let engine = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/generate", post(generate))
+                    .with_state(EngineState {
+                        requests: captured.clone(),
+                    }),
+            )
+            .into_future(),
+        );
+        let renderer = Arc::new(RendererService::new(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+        ));
+        let client =
+            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
+        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let body = serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello world"}],
+            "rid": "chatcmpl-parity",
+            "max_tokens": 8,
+            "temperature": 0.4,
+            "top_k": 17,
+            "min_p": 0.2,
+            "min_tokens": 3,
+            "stop_regex": "END[0-9]",
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "chat_template_kwargs": {"enable_thinking": false},
+            "cache_salt": "tenant-a",
+            "extra_key": "interactive",
+            "priority": 7,
+            "bootstrap_host": "prefill",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 42,
+            "routed_dp_rank": 2,
+            "disagg_prefill_dp_rank": 1
+        });
+
+        let render_response = post_request(app.clone(), "/v1/chat/completions/render", &body).await;
+        assert_eq!(render_response.status(), StatusCode::OK);
+        let mut rendered: serde_json::Value = serde_json::from_slice(
+            &to_bytes(render_response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let inference_response = post_request(app, "/v1/chat/completions", &body).await;
+        assert_eq!(inference_response.status(), StatusCode::OK);
+        let engine_request = captured.lock().unwrap().pop().unwrap();
+        engine.abort();
+        assert!(engine_request.get("text").is_none());
+
+        rendered["stream"] = serde_json::Value::Bool(true);
+        rendered["return_text_in_logprobs"] = serde_json::Value::Bool(false);
+        rendered["sampling_params"]["stop"] = serde_json::json!([]);
+        rendered["incremental_streaming_output"] = serde_json::Value::Bool(true);
+        assert_eq!(engine_request, rendered);
     }
 }

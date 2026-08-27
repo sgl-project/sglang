@@ -187,8 +187,8 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        OpenAIRequestLowerer, PooledTokenizer, RendererConfig, RendererError, RendererLimits,
-        SamplingDefaults, TextTokenizer,
+        PooledTokenizer, RendererConfig, RendererError, RendererLimits, SamplingDefaults,
+        TextTokenizer,
     };
 
     struct PrefixTokenizer;
@@ -227,7 +227,7 @@ mod tests {
             },
         };
         routes(Arc::new(RendererService::new(
-            OpenAIRequestLowerer::new(config),
+            config,
             Arc::new(PooledTokenizer::new(Arc::new(PrefixTokenizer), 2, 2)),
         )))
     }

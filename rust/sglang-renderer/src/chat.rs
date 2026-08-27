@@ -1,4 +1,4 @@
-//! Protocol-neutral structured chat preprocessing.
+//! Internal OpenAI chat preprocessing.
 
 use std::collections::HashMap;
 
@@ -21,11 +21,11 @@ use crate::{
     RendererConfig, RendererError, SamplingParams, TextRequest,
 };
 
-/// Structured chat request shared by protocol adapters.
+/// Internal normalized OpenAI chat state.
 ///
-/// HTTP, gRPC, Messages, and Responses adapters lower into this type. It stays
-/// structured until [`ChatPreprocessor`] applies the model chat template and
-/// lowers it to the same [`TextRequest`] consumed by text completions.
+/// Message and tool values remain Dynamo OpenAI protocol types until
+/// [`ChatPreprocessor`] applies the model chat template and lowers the request
+/// to the same [`TextRequest`] consumed by text completions.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub rid: String,

@@ -3,12 +3,8 @@
 //! `__post_init__` → `normalize` → `verify` pipeline (run in that order, as
 //! `TokenizerManager._create_tokenized_object` does).
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt;
-
-use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
-use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{error::RendererError as Error, regex::RegexPattern, types::OneOrMany};
 
@@ -267,47 +263,6 @@ impl SamplingParamsOverrides {
         if let Some(value) = self.custom_params {
             params.custom_params = Some(value);
         }
-    }
-}
-
-/// The `/generate` body's `sampling_params`: one object (broadcast to every
-/// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
-///
-/// Hand-written `Deserialize` rather than `#[serde(untagged)]`: untagged buffers
-/// the input and, on failure, reports only "data did not match any variant" —
-/// losing the field-level message ("unknown field `temperature`, expected one of
-/// …") that makes a typo actionable. Object-vs-list is unambiguous here, so a
-/// single `deserialize_any` dispatch keeps the inner error verbatim.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SamplingParamsInput {
-    /// Boxed: `SamplingParams` is ~440 bytes, so an inline variant would make
-    /// every `GenerateBody` that big regardless of which form arrived.
-    One(Box<SamplingParams>),
-    Many(Vec<SamplingParams>),
-}
-
-impl<'de> Deserialize<'de> for SamplingParamsInput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct InputVisitor;
-
-        impl<'de> Visitor<'de> for InputVisitor {
-            type Value = SamplingParamsInput;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a sampling_params object, or a list of them (one per prompt)")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                SamplingParams::deserialize(MapAccessDeserializer::new(map))
-                    .map(|p| SamplingParamsInput::One(Box::new(p)))
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(SamplingParamsInput::Many)
-            }
-        }
-
-        deserializer.deserialize_any(InputVisitor)
     }
 }
 

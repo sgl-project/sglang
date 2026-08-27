@@ -1,6 +1,6 @@
 [package]
 name = "sglang-renderer"
-description = "Engine-free request rendering for SGLang"
+description = "Reusable SGLang request preprocessing with an optional OpenAI frontend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

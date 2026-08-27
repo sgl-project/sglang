@@ -152,10 +152,6 @@ impl ChatResponseProcessor {
         }
     }
 
-    pub fn choice_count(&self) -> usize {
-        self.choices.len()
-    }
-
     /// Interpret one completed generation using the same parser selection that
     /// affected request lowering.
     pub async fn process_unary(&mut self, text: String, token_ids: &[i32]) -> ParsedChatChoice {

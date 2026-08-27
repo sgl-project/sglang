@@ -8,11 +8,11 @@ use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
     CompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
-    submission::{collect_output, merge_indexed, submit_inputs},
+    submission::{collect_output, merge_indexed, submit_text_inputs, submit_token_ids_inputs},
 };
 use crate::{
     GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
-    GenerationStream, MatchedStop, TextPrompt,
+    GenerationStream, MatchedStop,
 };
 use axum::{
     Json, Router,
@@ -24,7 +24,9 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_protocols::types::{Choice, CompletionFinishReason, CreateCompletionResponse, Logprobs};
+use dynamo_protocols::types::{
+    Choice, CompletionFinishReason, CreateCompletionResponse, Logprobs, Prompt,
+};
 use futures::StreamExt;
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
@@ -36,6 +38,22 @@ pub(crate) struct SubmittedChoice {
     pub(crate) prompt_index: usize,
     pub(crate) echo: String,
     pub(crate) events: GenerationStream,
+}
+
+fn attach_streams(
+    metadata: Vec<(usize, usize, String)>,
+    streams: Vec<GenerationStream>,
+) -> Vec<SubmittedChoice> {
+    metadata
+        .into_iter()
+        .zip(streams)
+        .map(|((index, prompt_index, echo), events)| SubmittedChoice {
+            index,
+            prompt_index,
+            echo,
+            events,
+        })
+        .collect()
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
@@ -58,7 +76,10 @@ async fn completions(
     if let Err(error) = extended.extensions.validate() {
         return openai_error(StatusCode::BAD_REQUEST, error, false);
     }
-    let (request, sampling_overrides, extensions) = extended.into_parts();
+    let (request, sampling_overrides, extensions) = match extended.into_parts() {
+        Ok(parts) => parts,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+    };
     let response_id = extensions
         .rid
         .clone()
@@ -80,65 +101,82 @@ async fn completions(
         .as_ref()
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
-    let metadata = extensions.metadata(model.clone());
-    let text_requests = match state.renderer.lower_completions_with_metadata(
-        request,
-        &response_id,
-        sampling_overrides,
-        metadata,
-    ) {
-        Ok(requests) => requests,
-        Err(error) => {
-            let status = renderer_status(&error);
-            return openai_error(status, error.to_string(), false);
-        }
-    };
+    let request_metadata = extensions.metadata(model.clone());
     let created = unix_seconds_u32();
-    let mut metadata = Vec::with_capacity(text_requests.len());
-    let mut prompt_echo = String::new();
-
-    for (index, text_request) in text_requests.iter().enumerate() {
-        let prompt_index = index / n;
-        let sample_index = index % n;
-        if sample_index == 0 {
-            prompt_echo = if !echo {
-                String::new()
-            } else {
-                match &text_request.prompt {
-                    TextPrompt::Text(text) => text.clone(),
-                    TextPrompt::Rendered(prompt) => prompt.as_str().to_owned(),
-                    TextPrompt::TokenIds(input_ids) => {
-                        match state.generate_client.detokenize(input_ids.clone()) {
-                            Ok(echo) => echo,
-                            Err(error) => {
-                                return openai_error(
-                                    StatusCode::from_u16(error.status_code)
-                                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                                    error.message,
-                                    false,
-                                );
-                            }
+    let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
+    let submitted = if text_prompt {
+        let text_requests = match state.renderer.lower_text_completions_with_metadata(
+            request,
+            &response_id,
+            sampling_overrides,
+            request_metadata,
+        ) {
+            Ok(requests) => requests,
+            Err(error) => {
+                let status = renderer_status(&error);
+                return openai_error(status, error.to_string(), false);
+            }
+        };
+        let metadata = text_requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                let prompt_index = index / n;
+                let prompt_echo = if echo {
+                    request.prompt.as_str().to_owned()
+                } else {
+                    String::new()
+                };
+                (index, prompt_index, prompt_echo)
+            })
+            .collect();
+        let streams = match submit_text_inputs(&state, text_requests, stream).await {
+            Ok(streams) => streams,
+            Err(response) => return response,
+        };
+        attach_streams(metadata, streams)
+    } else {
+        let token_requests = match state.renderer.lower_token_ids_completions_with_metadata(
+            request,
+            &response_id,
+            sampling_overrides,
+            request_metadata,
+        ) {
+            Ok(requests) => requests,
+            Err(error) => {
+                let status = renderer_status(&error);
+                return openai_error(status, error.to_string(), false);
+            }
+        };
+        let mut metadata = Vec::with_capacity(token_requests.len());
+        let mut prompt_echo = String::new();
+        for (index, request) in token_requests.iter().enumerate() {
+            let prompt_index = index / n;
+            if index % n == 0 {
+                prompt_echo = if echo {
+                    match state.generate_client.detokenize(request.input_ids.clone()) {
+                        Ok(echo) => echo,
+                        Err(error) => {
+                            return openai_error(
+                                StatusCode::from_u16(error.status_code)
+                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                                error.message,
+                                false,
+                            );
                         }
                     }
-                }
-            };
+                } else {
+                    String::new()
+                };
+            }
+            metadata.push((index, prompt_index, prompt_echo.clone()));
         }
-        metadata.push((index, prompt_index, prompt_echo.clone()));
-    }
-    let streams = match submit_inputs(&state, text_requests, stream).await {
-        Ok(streams) => streams,
-        Err(response) => return response,
+        let streams = match submit_token_ids_inputs(&state, token_requests, stream).await {
+            Ok(streams) => streams,
+            Err(response) => return response,
+        };
+        attach_streams(metadata, streams)
     };
-    let submitted = metadata
-        .into_iter()
-        .zip(streams)
-        .map(|((index, prompt_index, echo), events)| SubmittedChoice {
-            index,
-            prompt_index,
-            echo,
-            events,
-        })
-        .collect();
 
     if stream {
         let s = completion_event_stream(
@@ -520,7 +558,7 @@ mod tests {
     };
     use crate::GenerationOutputExtras;
     use crate::http::test_utils::{chunk, submitted};
-    use crate::protocol::openai::{PromptSpec, completion_prompt_specs};
+    use crate::protocol::openai::token_ids_completion_prompts;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
@@ -558,8 +596,8 @@ mod tests {
 
     #[test]
     fn token_prompt_is_normalized_without_echo_state() {
-        let specs = completion_prompt_specs(&Prompt::IntegerArray(vec![1, 2])).unwrap();
-        assert_eq!(specs, [PromptSpec::TokenIds(vec![1, 2])]);
+        let prompts = token_ids_completion_prompts(&Prompt::IntegerArray(vec![1, 2])).unwrap();
+        assert_eq!(prompts, [vec![1, 2]]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Standalone HTTP transport for prepared generation requests.
+//! Standalone HTTP transport for token-only generation requests.
 
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use dynamo_protocols::types::Prompt;
 
 use super::{
     ChatCompletionRequest, CompletionRequest,
@@ -75,17 +76,19 @@ async fn render_chat(
         .prepare_chat_with_template_args(
             request,
             &response_id,
-            chat_template_kwargs,
-            continue_final_message,
-            sampling_overrides,
-            metadata,
+            crate::service::ChatLoweringOptions {
+                chat_template_args: chat_template_kwargs,
+                continue_final_message,
+                sampling_overrides,
+                metadata,
+            },
         )
         .await
     {
-        Ok(mut prepared_requests) => Json(
-            prepared_requests
+        Ok(mut chat) => Json(
+            chat.requests
                 .pop()
-                .expect("prepared chat request contains one choice"),
+                .expect("chat generation contains one request"),
         )
         .into_response(),
         Err(error) => openai_error(renderer_status(&error), error.to_string(), false),
@@ -105,19 +108,40 @@ async fn render_completions(
     if let Err(error) = extended.extensions.validate() {
         return openai_error(StatusCode::BAD_REQUEST, error, false);
     }
-    let (request, sampling_overrides, extensions) = extended.into_parts();
+    let (request, sampling_overrides, extensions) = match extended.into_parts() {
+        Ok(parts) => parts,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+    };
     let model = request.model.clone();
     let response_id = extensions
         .rid
         .clone()
         .unwrap_or_else(|| format!("cmpl-{}", uuid::Uuid::new_v4().simple()));
     let metadata = extensions.metadata(model);
-    match state
-        .renderer
-        .prepare_completions_with_metadata(request, &response_id, sampling_overrides, metadata)
-        .await
-    {
-        Ok(prepared_requests) => Json(prepared_requests).into_response(),
+    let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
+    let requests = if text_prompt {
+        state
+            .renderer
+            .prepare_text_completions_with_metadata(
+                request,
+                &response_id,
+                sampling_overrides,
+                metadata,
+            )
+            .await
+    } else {
+        state
+            .renderer
+            .prepare_token_ids_completions_with_metadata(
+                request,
+                &response_id,
+                sampling_overrides,
+                metadata,
+            )
+            .await
+    };
+    match requests {
+        Ok(requests) => Json(requests).into_response(),
         Err(error) => openai_error(renderer_status(&error), error.to_string(), false),
     }
 }
@@ -133,8 +157,8 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        OpenAIRequestLowerer, RendererConfig, RendererError, RendererLimits, SamplingDefaults,
-        TextPrompt, TextRequest, TokenIdsRequest, TokenizationBackend,
+        RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextRequest,
+        TokenIdsRequest, TokenizationBackend,
     };
 
     struct WordTokenizer;
@@ -147,15 +171,12 @@ mod tests {
             Box::pin(async move {
                 Ok(TokenIdsRequest {
                     rid: request.rid,
-                    input_ids: match request.prompt {
-                        TextPrompt::Text(text) => text.split_whitespace().map(|_| 7).collect(),
-                        TextPrompt::Rendered(prompt) => {
-                            prompt.as_str().split_whitespace().map(|_| 7).collect()
-                        }
-                        TextPrompt::TokenIds(_) => {
-                            panic!("token-ID prompts bypass the tokenizer backend")
-                        }
-                    },
+                    input_ids: request
+                        .prompt
+                        .as_str()
+                        .split_whitespace()
+                        .map(|_| 7)
+                        .collect(),
                     options: request.options,
                     metadata: request.metadata,
                 })
@@ -164,7 +185,7 @@ mod tests {
     }
 
     fn app() -> Router<()> {
-        let lowerer = OpenAIRequestLowerer::new(RendererConfig {
+        let config = RendererConfig {
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
             revision: None,
@@ -184,15 +205,15 @@ mod tests {
                 allow_auto_truncate: false,
                 enable_return_hidden_states: false,
             },
-        });
+        };
         routes(Arc::new(RendererService::new(
-            lowerer,
+            config,
             Arc::new(WordTokenizer),
         )))
     }
 
     #[tokio::test]
-    async fn completion_render_returns_prepared_token_inputs() {
+    async fn completion_render_returns_token_only_generate_requests() {
         let response = app()
             .oneshot(
                 Request::builder()
@@ -230,6 +251,8 @@ mod tests {
                 .unwrap();
         assert_eq!(body[0]["input_ids"], serde_json::json!([7, 7]));
         assert_eq!(body[1]["input_ids"], serde_json::json!([7]));
+        assert!(body[0].get("text").is_none());
+        assert!(body[1].get("text").is_none());
         assert_eq!(body[0]["sampling_params"]["top_k"], 17);
         assert_eq!(body[0]["sampling_params"]["min_p"], 0.2);
         assert_eq!(body[0]["sampling_params"]["min_new_tokens"], 3);

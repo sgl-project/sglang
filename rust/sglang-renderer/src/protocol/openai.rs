@@ -8,14 +8,14 @@ use dynamo_protocols::types::{
 
 use crate::{
     ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
-    RendererError, SamplingDefaults, SamplingParams, TextRequest, TokenIds,
+    RendererError, SamplingDefaults, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
 /// Lower the OpenAI Chat wire type into the structured internal chat request.
 /// Chat template rendering and tool constraints deliberately happen later in
-/// `ChatPreprocessor`, where non-HTTP protocol adapters can reuse them.
+/// `ChatPreprocessor`, where inference and render-only entry points share them.
 pub(crate) fn lower_chat_request(
     config: &RendererConfig,
     request: CreateChatCompletionRequest,
@@ -183,18 +183,64 @@ pub fn chat_sampling_params(
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum PromptSpec {
-    Text(String),
-    TokenIds(TokenIds),
-}
-/// Validate and process one OpenAI completion request into the ordered
-/// model-facing requests consumed by inference or standalone rendering.
-pub(crate) fn lower_completion_request(
+/// Lower a textual OpenAI completion into text-only internal requests.
+pub(crate) fn lower_text_completion_request(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,
 ) -> Result<Vec<TextRequest>, RendererError> {
+    let prompts = text_completion_prompts(&request.prompt)?;
+    let (sampling, n, choice_count, metadata) =
+        completion_lowering_context(config, request, prompts.len())?;
+    let mut requests = Vec::with_capacity(choice_count);
+    for (prompt_index, prompt) in prompts.into_iter().enumerate() {
+        for sample_index in 0..n {
+            let index = prompt_index * n + sample_index;
+            requests.push(
+                TextRequest::text(
+                    format!("{response_id}-{index}"),
+                    prompt.clone(),
+                    true,
+                    completion_generation_options(request, sampling.clone()),
+                )
+                .with_metadata(metadata.clone()),
+            );
+        }
+    }
+    Ok(requests)
+}
+
+/// Lower a pre-tokenized OpenAI completion directly into token-ID requests.
+pub(crate) fn lower_token_ids_completion_request(
+    config: &RendererConfig,
+    request: &CreateCompletionRequest,
+    response_id: &str,
+) -> Result<Vec<TokenIdsRequest>, RendererError> {
+    let prompts = token_ids_completion_prompts(&request.prompt)?;
+    let (sampling, n, choice_count, metadata) =
+        completion_lowering_context(config, request, prompts.len())?;
+    let mut requests = Vec::with_capacity(choice_count);
+    for (prompt_index, input_ids) in prompts.into_iter().enumerate() {
+        for sample_index in 0..n {
+            let index = prompt_index * n + sample_index;
+            requests.push(
+                TokenIdsRequest::new(
+                    format!("{response_id}-{index}"),
+                    input_ids.clone(),
+                    completion_generation_options(request, sampling.clone()),
+                )
+                .with_metadata(metadata.clone()),
+            );
+        }
+    }
+    Ok(requests)
+}
+
+fn completion_lowering_context(
+    config: &RendererConfig,
+    request: &CreateCompletionRequest,
+    prompt_count: usize,
+) -> Result<(SamplingParams, usize, usize, GenerateRequestMetadata), RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -213,77 +259,80 @@ pub(crate) fn lower_completion_request(
     if request.n == Some(0) {
         return Err("n must be at least 1".into());
     }
-    let prompt_specs = completion_prompt_specs(&request.prompt)?;
     let sampling = completion_sampling_params(request)?;
     let n = request.n.unwrap_or(1) as usize;
-    let choice_count = prompt_specs
-        .len()
+    let choice_count = prompt_count
         .checked_mul(n)
         .filter(|&count| count <= MAX_OPENAI_CHOICES)
         .ok_or_else(|| {
             format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}")
         })?;
-    let metadata = GenerateRequestMetadata {
-        model: Some(request.model.clone()),
-        ..Default::default()
-    };
-
-    let mut requests = Vec::with_capacity(choice_count);
-    for (prompt_index, prompt) in prompt_specs.into_iter().enumerate() {
-        for sample_index in 0..n {
-            let index = prompt_index * n + sample_index;
-            let options = GenerationOptions {
-                sampling_params: sampling.clone(),
-                stream: request.stream.unwrap_or(false),
-                return_logprob: request.logprobs.is_some(),
-                logprob_start_len: if request.echo.unwrap_or(false) && request.logprobs.is_some() {
-                    0
-                } else {
-                    -1
-                },
-                top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
-                return_text_in_logprobs: request.logprobs.map(|_| true),
-                ..Default::default()
-            };
-            let rid = format!("{response_id}-{index}");
-            requests.push(
-                match &prompt {
-                    PromptSpec::Text(text) => TextRequest::text(rid, text.clone(), true, options),
-                    PromptSpec::TokenIds(input_ids) => {
-                        TextRequest::token_ids(rid, input_ids.clone(), false, options)
-                    }
-                }
-                .with_metadata(metadata.clone()),
-            );
-        }
-    }
-    Ok(requests)
+    Ok((
+        sampling,
+        n,
+        choice_count,
+        GenerateRequestMetadata {
+            model: Some(request.model.clone()),
+            ..Default::default()
+        },
+    ))
 }
-pub fn completion_prompt_specs(prompt: &Prompt) -> Result<Vec<PromptSpec>, String> {
+
+fn completion_generation_options(
+    request: &CreateCompletionRequest,
+    sampling_params: SamplingParams,
+) -> GenerationOptions {
+    GenerationOptions {
+        sampling_params,
+        stream: request.stream.unwrap_or(false),
+        return_logprob: request.logprobs.is_some(),
+        logprob_start_len: if request.echo.unwrap_or(false) && request.logprobs.is_some() {
+            0
+        } else {
+            -1
+        },
+        top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
+        return_text_in_logprobs: request.logprobs.map(|_| true),
+        ..Default::default()
+    }
+}
+
+pub fn text_completion_prompts(prompt: &Prompt) -> Result<Vec<String>, String> {
     match prompt {
         Prompt::String(text) => {
             if text.is_empty() {
                 return Err("Prompt cannot be empty".into());
             }
-            Ok(vec![PromptSpec::Text(text.clone())])
+            Ok(vec![text.clone()])
         }
         Prompt::StringArray(texts) => {
             if texts.is_empty() || texts.iter().any(String::is_empty) {
                 return Err("Prompt cannot be empty".into());
             }
-            Ok(texts.iter().cloned().map(PromptSpec::Text).collect())
+            Ok(texts.clone())
         }
-        Prompt::IntegerArray(ids) => Ok(vec![token_prompt_spec(ids)?]),
-        Prompt::ArrayOfIntegerArray(prompts) => {
-            if prompts.is_empty() {
-                return Err("Prompt cannot be empty".into());
-            }
-            prompts.iter().map(|ids| token_prompt_spec(ids)).collect()
+        Prompt::IntegerArray(_) | Prompt::ArrayOfIntegerArray(_) => {
+            Err("text completion lowerer requires a text prompt".into())
         }
     }
 }
 
-pub fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
+pub fn token_ids_completion_prompts(prompt: &Prompt) -> Result<Vec<TokenIds>, String> {
+    match prompt {
+        Prompt::IntegerArray(ids) => Ok(vec![token_prompt_ids(ids)?]),
+        Prompt::ArrayOfIntegerArray(prompts) => {
+            if prompts.is_empty() {
+                return Err("Prompt cannot be empty".into());
+            }
+            prompts.iter().map(|ids| token_prompt_ids(ids)).collect()
+        }
+        Prompt::String(_) | Prompt::StringArray(_) => {
+            Err("token-ID completion lowerer requires a token-ID prompt".into())
+        }
+    }
+}
+
+fn token_prompt_ids(ids: &[u32]) -> Result<TokenIds, String> {
     if ids.is_empty() {
         return Err("Prompt cannot be empty".into());
     }
@@ -291,7 +340,7 @@ pub fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
         .iter()
         .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(PromptSpec::TokenIds(input_ids))
+    Ok(input_ids)
 }
 
 pub fn completion_sampling_params(

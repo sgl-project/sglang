@@ -8,9 +8,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
-    GenerationOutputExtras, GenerationStream, MatchedStop, PreparedGenerateRequest, TokenIds,
-    TokenIdsRequest,
+    FrontendError, GenerateRequest, GenerationEvent, GenerationFinishReason, GenerationOutput,
+    GenerationOutputExtras, GenerationStream, MatchedStop, TokenIds,
 };
 
 #[derive(Clone)]
@@ -21,11 +20,11 @@ pub struct HttpGenerateClient {
 }
 
 /// Renderer-to-engine framing options stay private to this HTTP transport and
-/// do not become part of the standalone prepared-request contract.
+/// do not become part of the model server's `/generate` contract.
 #[derive(Serialize)]
 struct EngineGenerateBody<'a> {
     #[serde(flatten)]
-    request: &'a PreparedGenerateRequest,
+    request: &'a GenerateRequest,
     incremental_streaming_output: bool,
 }
 
@@ -51,7 +50,7 @@ impl HttpGenerateClient {
     }
     pub async fn generate(
         &self,
-        mut request: TokenIdsRequest,
+        mut request: GenerateRequest,
     ) -> Result<GenerationStream, FrontendError> {
         let mut stop_matcher = take_text_stops(&mut request)?;
 
@@ -61,21 +60,20 @@ impl HttpGenerateClient {
             .map(|&id| u32::try_from(id))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| invalid("input_ids must be non-negative"))?;
-        let skip_special_tokens = request.options.sampling_params.skip_special_tokens;
-        let decode_logprob_text = request.options.return_text_in_logprobs.unwrap_or(false);
-        let mut wire = PreparedGenerateRequest::from(request);
+        let skip_special_tokens = request.sampling_params.skip_special_tokens;
+        let decode_logprob_text = request.return_text_in_logprobs.unwrap_or(false);
         // The renderer needs token deltas even for a unary OpenAI request. It
         // collects them locally and dropping this response stream propagates
         // client cancellation to `/generate`.
-        wire.stream = true;
+        request.stream = true;
         // The token-only engine cannot fill text columns. Decode them below.
-        wire.return_text_in_logprobs = Some(false);
+        request.return_text_in_logprobs = Some(false);
 
         let response = self
             .client
             .post(self.generate_url.as_ref())
             .json(&EngineGenerateBody {
-                request: &wire,
+                request: &request,
                 incremental_streaming_output: true,
             })
             .send()
@@ -177,13 +175,10 @@ impl HttpGenerateClient {
 }
 
 fn take_text_stops(
-    request: &mut TokenIdsRequest,
+    request: &mut GenerateRequest,
 ) -> Result<Option<StopStringMatcher>, FrontendError> {
-    let params = &mut request.options.sampling_params;
-    let matcher =
-        StopStringMatcher::new(std::mem::take(&mut params.stop_strs), params.no_stop_trim);
-    params.stop = None;
-    params.stop_str_max_len = 0;
+    let params = &mut request.sampling_params;
+    let matcher = StopStringMatcher::new(std::mem::take(&mut params.stop), params.no_stop_trim);
     Ok(matcher)
 }
 
@@ -742,7 +737,7 @@ fn internal(message: impl Into<String>) -> FrontendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GenerationOptions, SamplingParams};
+    use crate::{GenerationOptions, SamplingParams, TokenIdsRequest};
     use axum::{
         Json, Router,
         extract::State,
@@ -752,7 +747,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::Mutex;
 
-    fn request(stop: Vec<&str>) -> TokenIdsRequest {
+    fn request(stop: Vec<&str>) -> GenerateRequest {
         TokenIdsRequest {
             rid: "r".into(),
             input_ids: vec![1],
@@ -765,37 +760,30 @@ mod tests {
             },
             metadata: Default::default(),
         }
+        .into()
     }
 
     #[test]
     fn text_stops_stay_in_the_frontend_and_token_stops_reach_the_engine() {
         let mut request = request(vec!["<eos>"]);
-        request.options.sampling_params.stop_token_ids = Some(vec![9]);
+        request.sampling_params.stop_token_ids = Some(vec![9]);
         let matcher = take_text_stops(&mut request).unwrap();
 
         assert!(matcher.is_some());
-        assert_eq!(
-            request.options.sampling_params.stop_token_ids,
-            Some(vec![9])
-        );
-        assert!(request.options.sampling_params.stop_strs.is_empty());
+        assert_eq!(request.sampling_params.stop_token_ids, Some(vec![9]));
+        assert!(request.sampling_params.stop.is_empty());
     }
 
     #[test]
     fn regex_stops_and_min_tokens_reach_the_engine() {
         let mut request = request(vec!["END"]);
-        request.options.sampling_params.stop_regex_strs = vec!["[0-9]{3}".into()];
-        request.options.sampling_params.stop_regex_max_len = 3;
-        request.options.sampling_params.min_new_tokens = 4;
+        request.sampling_params.stop_regex = vec!["[0-9]{3}".into()];
+        request.sampling_params.min_new_tokens = 4;
 
         take_text_stops(&mut request).unwrap();
 
-        assert_eq!(
-            request.options.sampling_params.stop_regex_strs,
-            ["[0-9]{3}"]
-        );
-        assert_eq!(request.options.sampling_params.stop_regex_max_len, 3);
-        assert_eq!(request.options.sampling_params.min_new_tokens, 4);
+        assert_eq!(request.sampling_params.stop_regex, ["[0-9]{3}"]);
+        assert_eq!(request.sampling_params.min_new_tokens, 4);
     }
 
     #[test]
@@ -1081,7 +1069,7 @@ mod tests {
             },
             metadata: Default::default(),
         };
-        let mut events = client.generate(request).await.unwrap();
+        let mut events = client.generate(request.into()).await.unwrap();
         let output = match events.next().await.unwrap().unwrap() {
             GenerationEvent::Done(output) => output,
             GenerationEvent::Frame(_) => panic!("mock engine returned a terminal frame"),
@@ -1120,12 +1108,15 @@ mod tests {
         let client =
             HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
         let mut events = client
-            .generate(TokenIdsRequest {
-                rid: "incremental".into(),
-                input_ids: vec![65],
-                options: GenerationOptions::default(),
-                metadata: Default::default(),
-            })
+            .generate(
+                TokenIdsRequest {
+                    rid: "incremental".into(),
+                    input_ids: vec![65],
+                    options: GenerationOptions::default(),
+                    metadata: Default::default(),
+                }
+                .into(),
+            )
             .await
             .unwrap();
 
@@ -1196,7 +1187,7 @@ mod tests {
             options: GenerationOptions::default(),
             metadata: Default::default(),
         };
-        let mut events = client.generate(request).await.unwrap();
+        let mut events = client.generate(request.into()).await.unwrap();
         assert!(events.next().await.is_some());
         drop(events);
         tokio::time::timeout(Duration::from_secs(2), notice_rx)

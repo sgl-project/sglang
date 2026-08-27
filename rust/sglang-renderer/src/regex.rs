@@ -255,39 +255,33 @@ fn cache_bound(pattern: &str, max_len: usize) {
     c.insert(pattern.into(), max_len);
 }
 
-/// A `stop_regex` that has been admitted, together with the bound derived while
-/// admitting it.
+/// The bound derived from an admitted `stop_regex`.
 ///
 /// Holding one is the proof: it cannot be built without passing [`validate`], and
-/// its [`max_len`](Self::max_len) came from *that* pattern's own AST. So no caller
-/// can pair one pattern's bound with another's, and there is no second route to a
-/// bound that could drift from the validated one.
-pub struct RegexPattern<'a> {
-    pattern: &'a str,
+/// its [`max_len`](Self::max_len) came from the admitted pattern's own AST. There
+/// is no second route to a bound that could drift from the validated pattern.
+pub struct RegexPattern {
     max_len: usize,
 }
 
-/// `TryFrom`, not `FromStr`: `FromStr::from_str` takes a `&str` whose lifetime the
-/// trait never names, so it cannot be tied to `Self` — a borrowing type can never
-/// implement it. `TryFrom<&'a str>` carries the lifetime, so it can.
-impl<'a> TryFrom<&'a str> for RegexPattern<'a> {
+impl TryFrom<&str> for RegexPattern {
     type Error = Error;
 
-    fn try_from(pattern: &'a str) -> Result<Self, Self::Error> {
+    fn try_from(pattern: &str) -> Result<Self, Self::Error> {
         Self::build(pattern)
     }
 }
 
-impl<'a> RegexPattern<'a> {
+impl RegexPattern {
     /// Admit `pattern` and derive its bound in a single AST walk.
     ///
     /// `Err` for anything CPython's `re` cannot compile, or cannot match cheaply
     /// enough to run on every decode step — see [`validate`].
-    fn build(pattern: &'a str) -> Result<Self, Error> {
+    fn build(pattern: &str) -> Result<Self, Error> {
         // Same pattern text ⇒ same verdict and same bound, so a repeat costs a hash
         // lookup instead of a parse + translate. See [`ADMISSION_CACHE`].
         if let Some(max_len) = cached_bound(pattern) {
-            return Ok(Self { pattern, max_len });
+            return Ok(Self { max_len });
         }
         let ast = validate(pattern)?;
         // Translate the AST `validate` already produced instead of re-parsing. The full
@@ -306,13 +300,7 @@ impl<'a> RegexPattern<'a> {
             })?;
         let max_len = hir_max_len(&hir);
         cache_bound(pattern, max_len);
-        Ok(Self { pattern, max_len })
-    }
-
-    /// The admitted pattern. See the field note on why this is kept.
-    #[allow(dead_code)]
-    pub fn pattern(&self) -> &str {
-        self.pattern
+        Ok(Self { max_len })
     }
 
     pub fn max_len(&self) -> usize {
@@ -658,9 +646,8 @@ mod tests {
     }
 
     #[test]
-    fn admitted_pattern_carries_its_own_text_and_bound() {
+    fn admitted_pattern_carries_its_bound() {
         let p = RegexPattern::try_from(r"\d{6}").expect("valid");
-        assert_eq!(p.pattern(), r"\d{6}");
         assert_eq!(p.max_len(), 6);
     }
 

@@ -48,5 +48,3 @@ impl RendererError {
         }
     }
 }
-
-pub type Result<T> = std::result::Result<T, RendererError>;

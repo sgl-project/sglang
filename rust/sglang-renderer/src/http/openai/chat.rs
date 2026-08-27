@@ -32,7 +32,7 @@ use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
     ChatCompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
-    submission::{collect_output, merge_indexed, submit_inputs},
+    submission::{collect_output, merge_indexed, submit_generate_requests},
 };
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
@@ -88,31 +88,29 @@ async fn chat_completions(
             .config()
             .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let chat = match state.renderer.lower_openai_chat_with_template_args(
-        request,
-        &response_id,
-        chat_template_kwargs,
-        continue_final_message,
-        sampling_overrides,
-        extensions.metadata(model.clone()),
-    ) {
+    let chat = match state
+        .renderer
+        .prepare_chat_with_template_args(
+            request,
+            &response_id,
+            crate::service::ChatLoweringOptions {
+                chat_template_args: chat_template_kwargs,
+                continue_final_message,
+                sampling_overrides,
+                metadata: extensions.metadata(model.clone()),
+            },
+        )
+        .await
+    {
         Ok(chat) => chat,
         Err(error) => {
             let status = renderer_status(&error);
             return openai_error(status, error.to_string(), false);
         }
     };
-    let lowered = match state.renderer.preprocess_chat(chat) {
-        Ok(lowered) => lowered,
-        Err(error) => {
-            let status = renderer_status(&error);
-            return openai_error(status, error.to_string(), false);
-        }
-    };
-    let text_requests = lowered.text_requests;
-    let response_processor = lowered.response_processor;
+    let response_processor = chat.response_processor;
     let created = unix_seconds_u32();
-    let streams = match submit_inputs(&state, text_requests, stream).await {
+    let streams = match submit_generate_requests(&state, chat.requests, stream).await {
         Ok(streams) => streams,
         Err(response) => return response,
     };
@@ -492,13 +490,15 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::http::test_utils::{chat_submitted, chunk};
     use crate::protocol::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
-    use crate::template::load_chat_formatter;
     use crate::{
-        ChatPreprocessor, GenerationOutputExtras, OpenAIRequestLowerer, RendererConfig,
-        RendererLimits, SamplingDefaults as ModelSamplingDefaults,
+        GenerateRequestMetadata, GenerationOutputExtras, NoTokenizer, RendererConfig,
+        RendererLimits, RendererService, SamplingDefaults as ModelSamplingDefaults,
+        SamplingParamsOverrides,
     };
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
@@ -543,12 +543,19 @@ mod tests {
             "n": choices
         }))
         .unwrap();
-        let formatter = load_chat_formatter(None, None, Some("chatml")).unwrap();
-        let preprocessor = ChatPreprocessor::new(&config, Some(formatter));
-        let chat = OpenAIRequestLowerer::new(config)
-            .lower_chat(request, "chatcmpl-test")
-            .unwrap();
-        preprocessor.preprocess(chat).unwrap().response_processor
+        RendererService::new(config, Arc::new(NoTokenizer))
+            .lower_chat_with_options(
+                request,
+                "chatcmpl-test",
+                crate::service::ChatLoweringOptions {
+                    chat_template_args: None,
+                    continue_final_message: false,
+                    sampling_overrides: SamplingParamsOverrides::default(),
+                    metadata: GenerateRequestMetadata::default(),
+                },
+            )
+            .unwrap()
+            .response_processor
     }
 
     fn wire_context(include_usage: bool) -> ChatStreamWireContext {

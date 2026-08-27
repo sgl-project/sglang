@@ -1,49 +1,47 @@
-//! Engine-free OpenAI request rendering for SGLang.
+//! Reusable request preprocessing for SGLang.
 //!
-//! This crate owns OpenAI protocol lowering, chat templating, tokenization,
-//! response interpretation, and the prepared token-in contract. Its optional
-//! HTTP frontend sends prepared token requests to SGLang's `/generate`
-//! endpoint, so the crate has no PyO3, scheduler, or GPU runtime dependency.
+//! The core lowers OpenAI requests, renders chat templates, tokenizes prompts,
+//! and produces the token-in contract consumed by SGLang. The optional `http`
+//! feature adds a standalone OpenAI frontend backed by SGLang's `/generate`
+//! endpoint.
 
-pub mod chat;
-pub mod config;
-pub mod error;
-pub mod generation;
+mod chat;
+mod config;
+mod error;
+mod generation;
 #[cfg(feature = "http")]
-pub mod http;
-pub mod output;
-pub mod protocol;
-pub mod request;
-pub mod sampling;
-pub mod service;
-pub mod template;
-pub mod tokenizer;
-pub mod types;
+mod http;
+mod output;
+mod protocol;
+mod request;
+mod sampling;
+mod service;
+mod template;
+mod tokenizer;
+mod types;
 
 mod regex;
 
-pub use chat::{ChatPreprocessor, ChatRequest, LoweredChat};
+pub(crate) use chat::{ChatPreprocessor, ChatRequest, LoweredChat};
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
-pub use generation::{
+pub(crate) use generation::{
     FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
     GenerationOutputExtras, GenerationStream, MatchedStop,
 };
-pub use output::{
+#[cfg(feature = "http")]
+pub use http::{RendererRuntimeConfig, serve};
+pub(crate) use output::{
     ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
-    ChatResponseProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatChoice,
+    ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
 };
 pub use request::{
-    GenerateRequestMetadata, GenerationOptions, PreparedGenerateRequest, PreparedSamplingParams,
-    TextPrompt, TextRequest, TokenIdsRequest,
+    GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
+    TextRequest, TokenIdsRequest,
 };
-pub use sampling::{SamplingParams, SamplingParamsOverrides};
-pub use service::{OpenAIRequestLowerer, RendererService, TokenizationBackend};
-pub use template::ChatFormatter;
-pub use tokenizer::{
-    DynamoTokenizer, NoTokenizer, PooledTokenizer, TextTokenizer, check_completion_token_budget,
-    check_total_tokens, load_tokenizer, prepare_direct_request, resolve_chat_template_file,
-    resolve_model_file, resolve_tokenizer_file, tokenize_text_prompt, tokenize_text_request,
-    validate_completion_fields, validate_text_request,
-};
+pub use sampling::SamplingParams;
+pub(crate) use sampling::SamplingParamsOverrides;
+pub use service::{RendererService, TokenizationBackend};
+pub(crate) use template::ChatFormatter;
+pub use tokenizer::{DynamoTokenizer, NoTokenizer, PooledTokenizer, TextTokenizer, load_tokenizer};
 pub use types::{OneOrMany, OneOrManyItem, TokenIds};

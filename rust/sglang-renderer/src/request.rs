@@ -45,21 +45,13 @@ pub struct GenerationOptions {
 }
 
 #[derive(Debug, Clone)]
-/// One text-generation prompt before tokenizer-dependent preparation.
-pub enum TextPrompt {
-    Text(String),
-    Rendered(RenderedPrompt),
-    TokenIds(TokenIds),
-}
-
-#[derive(Debug, Clone)]
-/// Internal text-generation request shared by every protocol frontend.
+/// Internal text-only generation request before tokenization.
 ///
-/// Chat preprocessing renders structured messages into `Text`; Completions
-/// and gRPC may also supply already-tokenized prompts through `TokenIds`.
+/// Protocol adapters lower textual completions into this type. Structured chat
+/// reaches it only after [`crate::ChatPreprocessor`] renders the messages.
 pub struct TextRequest {
     pub rid: String,
-    pub prompt: TextPrompt,
+    pub prompt: RenderedPrompt,
     pub add_special_tokens: bool,
     pub options: GenerationOptions,
     pub metadata: GenerateRequestMetadata,
@@ -74,22 +66,7 @@ impl TextRequest {
     ) -> Self {
         Self {
             rid: rid.into(),
-            prompt: TextPrompt::Text(text.into()),
-            add_special_tokens,
-            options,
-            metadata: GenerateRequestMetadata::default(),
-        }
-    }
-
-    pub fn token_ids(
-        rid: impl Into<String>,
-        input_ids: TokenIds,
-        add_special_tokens: bool,
-        options: GenerationOptions,
-    ) -> Self {
-        Self {
-            rid: rid.into(),
-            prompt: TextPrompt::TokenIds(input_ids),
+            prompt: RenderedPrompt::text(text.into()),
             add_special_tokens,
             options,
             metadata: GenerateRequestMetadata::default(),
@@ -104,7 +81,7 @@ impl TextRequest {
     ) -> Self {
         Self {
             rid: rid.into(),
-            prompt: TextPrompt::Rendered(prompt),
+            prompt,
             add_special_tokens,
             options,
             metadata: GenerateRequestMetadata::default(),
@@ -126,14 +103,30 @@ pub struct TokenIdsRequest {
     pub metadata: GenerateRequestMetadata,
 }
 
-/// Text token-in request accepted by SGLang's `/generate` endpoint.
+impl TokenIdsRequest {
+    pub fn new(rid: impl Into<String>, input_ids: TokenIds, options: GenerationOptions) -> Self {
+        Self {
+            rid: rid.into(),
+            input_ids,
+            options,
+            metadata: GenerateRequestMetadata::default(),
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: GenerateRequestMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
+/// Token-only request sent to the model server's `/generate` endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PreparedGenerateRequest {
+pub struct GenerateRequest {
     pub rid: String,
     #[serde(flatten)]
     pub metadata: GenerateRequestMetadata,
     pub input_ids: TokenIds,
-    pub sampling_params: PreparedSamplingParams,
+    pub sampling_params: GenerateSamplingParams,
     pub stream: bool,
     pub return_logprob: bool,
     pub logprob_start_len: i64,
@@ -145,7 +138,7 @@ pub struct PreparedGenerateRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl From<TokenIdsRequest> for PreparedGenerateRequest {
+impl From<TokenIdsRequest> for GenerateRequest {
     fn from(request: TokenIdsRequest) -> Self {
         let options = request.options;
         Self {
@@ -165,7 +158,7 @@ impl From<TokenIdsRequest> for PreparedGenerateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PreparedSamplingParams {
+pub struct GenerateSamplingParams {
     pub max_new_tokens: Option<i64>,
     pub stop: Vec<String>,
     pub stop_token_ids: Option<Vec<i64>>,
@@ -193,7 +186,7 @@ pub struct PreparedSamplingParams {
     pub custom_params: Option<serde_json::Value>,
 }
 
-impl From<SamplingParams> for PreparedSamplingParams {
+impl From<SamplingParams> for GenerateSamplingParams {
     fn from(params: SamplingParams) -> Self {
         Self {
             max_new_tokens: params.max_new_tokens,

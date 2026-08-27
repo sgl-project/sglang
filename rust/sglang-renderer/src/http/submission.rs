@@ -1,7 +1,10 @@
 use axum::{http::StatusCode, response::Response};
 use futures::{StreamExt, stream::BoxStream};
 
-use crate::{FrontendError, GenerationEvent, GenerationOutput, GenerationStream, TextRequest};
+use crate::{
+    FrontendError, GenerateRequest, GenerationEvent, GenerationOutput, GenerationStream,
+    TextRequest, TokenIdsRequest,
+};
 
 use super::{OpenAIHttpFrontend, error::openai_error};
 
@@ -9,14 +12,14 @@ use super::{OpenAIHttpFrontend, error::openai_error};
 ///
 /// All streams are established before either endpoint starts collecting them,
 /// preserving concurrent engine execution without introducing a backend trait.
-pub(super) async fn submit_inputs(
+pub(super) async fn submit_text_inputs(
     frontend: &OpenAIHttpFrontend,
     inputs: Vec<TextRequest>,
     stream_response: bool,
 ) -> Result<Vec<GenerationStream>, Response> {
     let mut streams = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let prepared = frontend
+        let generate_request = frontend
             .renderer
             .prepare_text_request(input)
             .await
@@ -29,7 +32,69 @@ pub(super) async fn submit_inputs(
             })?;
         let events = frontend
             .generate_client
-            .generate(prepared)
+            .generate(generate_request)
+            .await
+            .map_err(|error| {
+                openai_error(
+                    StatusCode::from_u16(error.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    error.message,
+                    stream_response,
+                )
+            })?;
+        streams.push(events);
+    }
+    Ok(streams)
+}
+
+/// Validate and submit requests that were already tokenized by the protocol
+/// adapter. They never enter the text tokenizer path.
+pub(super) async fn submit_token_ids_inputs(
+    frontend: &OpenAIHttpFrontend,
+    inputs: Vec<TokenIdsRequest>,
+    stream_response: bool,
+) -> Result<Vec<GenerationStream>, Response> {
+    let mut streams = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let generate_request = frontend
+            .renderer
+            .prepare_token_ids_request(input)
+            .await
+            .map_err(|error| {
+                openai_error(
+                    super::error::renderer_status(&error),
+                    error.to_string(),
+                    false,
+                )
+            })?;
+        let events = frontend
+            .generate_client
+            .generate(generate_request)
+            .await
+            .map_err(|error| {
+                openai_error(
+                    StatusCode::from_u16(error.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    error.message,
+                    stream_response,
+                )
+            })?;
+        streams.push(events);
+    }
+    Ok(streams)
+}
+
+/// Submit token-only requests produced by the shared chat pipeline.
+pub(super) async fn submit_generate_requests(
+    frontend: &OpenAIHttpFrontend,
+    inputs: Vec<GenerateRequest>,
+    stream_response: bool,
+) -> Result<Vec<GenerationStream>, Response> {
+    let mut streams = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let events = frontend
+            .generate_client
+            .generate(input)
             .await
             .map_err(|error| {
                 openai_error(

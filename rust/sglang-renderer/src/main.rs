@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use sglang_renderer::http::{RendererRuntimeConfig, serve};
+use sglang_renderer::{RendererRuntimeConfig, serve};
 
 fn main() {
     let config_path = parse_config_path().unwrap_or_else(|error| exit(error));
