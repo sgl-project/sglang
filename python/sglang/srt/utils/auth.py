@@ -100,10 +100,10 @@ def decide_request_auth(
     if path.startswith("/health") or path.startswith("/metrics"):
         return AuthDecision(allowed=True)
 
-    def _check_bearer_token(
+    def _check_single_bearer_token(
         authorization_header: Optional[str], expected_token: str
     ) -> bool:
-        """Check bearer token with constant-time comparison."""
+        """Check bearer token against exactly one key (no comma splitting)."""
         if not authorization_header:
             return False
         parts = authorization_header.split(" ", 1)
@@ -111,12 +111,40 @@ def decide_request_auth(
             return False
         return secrets.compare_digest(parts[1], expected_token)
 
+    def _check_bearer_token(
+        authorization_header: Optional[str], expected_token: str
+    ) -> bool:
+        """Check bearer token with constant-time comparison.
+
+        `--api-key` accepts a comma-separated list; a bearer token matching any
+        entry (or the full raw string, so keys containing literal commas and
+        internal clients that send the configured value verbatim keep working)
+        is accepted. `--admin-api-key` stays a single key.
+        """
+        if not authorization_header:
+            return False
+        parts = authorization_header.split(" ", 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return False
+        token = parts[1]
+        candidates = [expected_token]
+        if "," in expected_token:
+            candidates.extend(
+                k for k in (p.strip() for p in expected_token.split(",")) if k
+            )
+        # No early exit: identical work for every candidate.
+        matched = False
+        for candidate in candidates:
+            if secrets.compare_digest(token, candidate):
+                matched = True
+        return matched
+
     # Force-auth endpoints: only admin_api_key can unlock them; if admin_api_key is unset,
     # reject them unconditionally (explicitly "not allowed").
     if auth_level == AuthLevel.ADMIN_FORCE:
         if not admin_api_key:
             return AuthDecision(allowed=False, error_status_code=403)
-        if not _check_bearer_token(authorization_header, admin_api_key):
+        if not _check_single_bearer_token(authorization_header, admin_api_key):
             return AuthDecision(allowed=False)
         return AuthDecision(allowed=True)
 
@@ -128,7 +156,7 @@ def decide_request_auth(
     if auth_level == AuthLevel.ADMIN_OPTIONAL:
         if admin_api_key:
             return AuthDecision(
-                allowed=_check_bearer_token(authorization_header, admin_api_key)
+                allowed=_check_single_bearer_token(authorization_header, admin_api_key)
             )
         elif api_key:
             return AuthDecision(

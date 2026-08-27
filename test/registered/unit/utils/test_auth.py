@@ -292,6 +292,90 @@ class TestDecideRequestAuth(CustomTestCase):
         )
         self.assertFalse(decision.allowed)
 
+    # ==================== Multi-Key (comma-separated --api-key) ====================
+
+    def test_normal_multi_key_each_accepted(self):
+        for key in ("key-one", "key-two", "key-three"):
+            decision = decide_request_auth(
+                method="POST",
+                path="/v1/chat/completions",
+                authorization_header=f"Bearer {key}",
+                api_key="key-one,key-two,key-three",
+                admin_api_key=None,
+                auth_level=AuthLevel.NORMAL,
+            )
+            self.assertTrue(decision.allowed, key)
+
+    def test_normal_multi_key_raw_string_accepted(self):
+        # Internal clients (e.g. warmup) send the configured value verbatim;
+        # a legacy key containing a literal comma also keeps working.
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer key-one,key-two",
+            api_key="key-one,key-two",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_normal_multi_key_wrong_rejected(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer key-four",
+            api_key="key-one,key-two,key-three",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_normal_multi_key_whitespace_tolerated(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer key-two",
+            api_key="key-one, key-two",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_normal_multi_key_empty_segment_not_a_key(self):
+        # "key-one," must not admit an empty bearer token
+        decision = decide_request_auth(
+            method="POST",
+            path="/v1/chat/completions",
+            authorization_header="Bearer ",
+            api_key="key-one,",
+            admin_api_key=None,
+            auth_level=AuthLevel.NORMAL,
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_admin_key_never_split(self):
+        # admin_api_key stays a single key even if it contains commas
+        decision = decide_request_auth(
+            method="POST",
+            path="/some_admin_endpoint",
+            authorization_header="Bearer admin-one",
+            api_key=None,
+            admin_api_key="admin-one,admin-two",
+            auth_level=AuthLevel.ADMIN_FORCE,
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_admin_optional_multi_api_key(self):
+        decision = decide_request_auth(
+            method="POST",
+            path="/some_endpoint",
+            authorization_header="Bearer key-two",
+            api_key="key-one,key-two",
+            admin_api_key=None,
+            auth_level=AuthLevel.ADMIN_OPTIONAL,
+        )
+        self.assertTrue(decision.allowed)
+
     def test_bearer_case_insensitive(self):
         decision = decide_request_auth(
             method="POST",
