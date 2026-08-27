@@ -1,6 +1,6 @@
 //! Tokenizer primitives shared by renderer hosts.
 
-use crate::{RendererError as Error, RendererRequest, TokenIds};
+use crate::{RendererError as Error, RendererLimits, RendererRequest, TokenIds};
 use std::path::Path;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -163,5 +163,104 @@ pub fn tokenize_generate_request(
     } else {
         ids
     });
+    Ok(())
+}
+
+/// Run the engine-free validation, normalization, tokenization and context checks.
+pub fn prepare_direct_request(
+    mut request: RendererRequest,
+    tokenizer: &dyn TextTokenizer,
+    auto_specials: &[i32],
+    limits: &RendererLimits,
+) -> Result<RendererRequest, Error> {
+    validate_request(&request, limits)?;
+    request
+        .sampling_params
+        .normalize(limits.skip_tokenizer_init, limits.vocab_size)?;
+    if !request.already_tokenized() {
+        tokenize_generate_request(&mut request, tokenizer, auto_specials)?;
+    }
+    check_total_tokens(&mut request, limits)?;
+    Ok(request)
+}
+
+/// Validate fields that must be safe before tokenization or engine submission.
+pub fn validate_request(request: &RendererRequest, limits: &RendererLimits) -> Result<(), Error> {
+    if request.rid.len() > 128 {
+        return Err(Error::Validation(format!(
+            "rid is {} bytes, over the 128-byte limit",
+            request.rid.len()
+        )));
+    }
+    if limits.skip_tokenizer_init && !request.already_tokenized() {
+        return Err(Error::Validation(
+            "skip_tokenizer_init is set: request must provide input_ids".into(),
+        ));
+    }
+    for &id in request.input_ids.iter().flatten() {
+        if id < 0 || id as u64 >= limits.vocab_size {
+            return Err(Error::Validation(format!(
+                "input_ids contains out-of-vocabulary token id {id}; valid range is [0, {})",
+                limits.vocab_size
+            )));
+        }
+    }
+    for &id in request.token_ids_logprob.iter().flatten() {
+        if id < 0 || id as u64 >= limits.vocab_size {
+            return Err(Error::Validation(format!(
+                "token_ids_logprob contains out-of-vocabulary token id {id}; valid range is [0, {})",
+                limits.vocab_size
+            )));
+        }
+    }
+    if request.return_hidden_states && !limits.enable_return_hidden_states {
+        return Err(Error::Validation(
+            "The server is not configured to return the hidden states. Please set `--enable-return-hidden-states` to enable this feature."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Enforce the model context limit after tokenization.
+pub fn check_total_tokens(
+    request: &mut RendererRequest,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
+    let max_req_len = limits.context_len;
+    let input_len =
+        request.input_ids.as_ref().map_or(0, Vec::len) as u64 + limits.num_reserved_tokens;
+    if input_len >= max_req_len {
+        if !limits.allow_auto_truncate {
+            return Err(Error::Validation(format!(
+                "The input ({input_len} tokens) is longer than the model's context length ({max_req_len} tokens)."
+            )));
+        }
+        if let Some(ids) = &mut request.input_ids {
+            ids.truncate(max_req_len as usize);
+        }
+    }
+    let input_len =
+        request.input_ids.as_ref().map_or(0, Vec::len) as u64 + limits.num_reserved_tokens;
+    let Some(max_new_tokens) = request.sampling_params.max_new_tokens else {
+        return Ok(());
+    };
+    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
+    if total <= max_req_len {
+        return Ok(());
+    }
+    if !limits.allow_auto_truncate {
+        return Err(Error::Validation(format!(
+            "Requested token count exceeds the model's maximum context length of {max_req_len} tokens. You requested a total of {total} tokens: {input_len} tokens from the input messages and {max_new_tokens} tokens for the completion. Please reduce the number of tokens in the input messages or the completion to fit within the limit."
+        )));
+    }
+    let clamped = max_req_len.saturating_sub(input_len) as i64;
+    if request.sampling_params.min_new_tokens > clamped {
+        return Err(Error::Validation(format!(
+            "min_new_tokens must be in [0, max_new_tokens({clamped})], got {}",
+            request.sampling_params.min_new_tokens
+        )));
+    }
+    request.sampling_params.max_new_tokens = Some(clamped);
     Ok(())
 }

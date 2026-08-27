@@ -6,8 +6,11 @@
 
 pub mod config;
 pub mod error;
+pub mod openai;
 pub mod request;
 pub mod sampling;
+pub mod service;
+pub mod template;
 pub mod tokenizer;
 pub mod types;
 
@@ -17,5 +20,10 @@ pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, RendererRequest};
 pub use sampling::SamplingParams;
-pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer, resolve_model_file};
+pub use service::{ChatResponsePlan, PreparedChat, PreprocessBackend, RendererService};
+pub use template::ChatFormatter;
+pub use tokenizer::{
+    DynamoTokenizer, TextTokenizer, check_total_tokens, load_tokenizer, prepare_direct_request,
+    resolve_model_file, validate_request,
+};
 pub use types::{OneOrMany, OneOrManyItem, TokenIds};

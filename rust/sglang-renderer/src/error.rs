@@ -12,6 +12,8 @@ pub enum RendererErrorKind {
 
 #[derive(Debug, Clone, Error)]
 pub enum RendererError {
+    #[error("{0}")]
+    Request(String),
     #[error("validation failed: {0}")]
     Validation(String),
     #[error("tokenize failed: {0}")]
@@ -24,10 +26,22 @@ pub enum RendererError {
     Internal(String),
 }
 
+impl From<String> for RendererError {
+    fn from(message: String) -> Self {
+        Self::Request(message)
+    }
+}
+
+impl From<&str> for RendererError {
+    fn from(message: &str) -> Self {
+        Self::Request(message.to_owned())
+    }
+}
+
 impl RendererError {
     pub fn kind(&self) -> RendererErrorKind {
         match self {
-            Self::Validation(_) => RendererErrorKind::InvalidRequest,
+            Self::Request(_) | Self::Validation(_) => RendererErrorKind::InvalidRequest,
             Self::Tokenize(_) => RendererErrorKind::Tokenize,
             Self::Unavailable => RendererErrorKind::Unavailable,
             Self::WorkerDropped | Self::Internal(_) => RendererErrorKind::Internal,
