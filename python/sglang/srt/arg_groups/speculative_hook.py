@@ -181,6 +181,67 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args,
         )
 
+    _check_draft_prefetch(server_args)
+
+
+def _check_draft_prefetch(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.environ import envs
+
+    # Read every field through the overlay, never the raw record: during
+    # __post_init__ the resolution pipeline stashes its decisions without
+    # writing the fields, so raw reads would miss this hook's own earlier
+    # decisions (alias/auto-params/adaptive) and model overrides
+    # (multi-layer EAGLE).
+    cfg = resolved_view(server_args)
+
+    if not cfg.enable_draft_prefetch:
+        return
+    if cfg.speculative_num_steps is None or cfg.speculative_num_steps <= 1:
+        raise ValueError(
+            "--enable-draft-prefetch requires --speculative-num-steps > 1, got "
+            f"{cfg.speculative_num_steps}."
+        )
+    # NEXTN is absent on purpose: _resolve_speculative_algorithm_alias
+    # (earlier in this hook) promotes NEXTN to EAGLE before this check runs,
+    # so the resolved algorithm is never "NEXTN" here.
+    if cfg.speculative_algorithm not in ("EAGLE3", "EAGLE"):
+        raise ValueError(
+            "--enable-draft-prefetch only supports EAGLE/EAGLE3 "
+            f"speculative algorithms, got {cfg.speculative_algorithm}."
+        )
+    if cfg.enable_multi_layer_eagle:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with multi-layer EAGLE "
+            "(--enable-multi-layer-eagle, also auto-enabled for some models): "
+            "MultiLayerEagleWorkerV2 does not implement draft prefetch."
+        )
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            "--enable-draft-prefetch requires "
+            "--speculative-eagle-topk == 1: the pre-concatenated "
+            "candidate chain assumes a single chain, got "
+            f"{cfg.speculative_eagle_topk}."
+        )
+    if cfg.speculative_adaptive:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with "
+            "--speculative-adaptive: adaptive runtime changes "
+            "speculative_num_steps, which the pre-run draft cannot "
+            "follow."
+        )
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "--enable-draft-prefetch is incompatible with "
+            "--speculative-use-rejection-sampling: the draft-prefetch "
+            "verify input does not carry draft_probs."
+        )
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        logger.warning(
+            "SGLANG_ENABLE_OVERLAP_PLAN_STREAM is enabled; combining it with "
+            "--enable-draft-prefetch may cause decode stage to go down."
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)

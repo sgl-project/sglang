@@ -2357,7 +2357,12 @@ class ServerArgs:
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
         NS("spec"),
     ] = None
-
+    enable_draft_prefetch: A[
+        bool,
+        "pre-run the next round's draft after draft_extend (EAGLE family, "
+        "topk=1, num_steps > 1 only).",
+        NS("spec"),
+    ] = False
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
     decoupled_spec_bind_endpoint: A[
