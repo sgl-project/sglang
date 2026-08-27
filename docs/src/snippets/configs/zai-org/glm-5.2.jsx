@@ -246,7 +246,16 @@ sgl-eval run aime25 \\
     },
 
     // ----- Card 6: "Hierarchical KV Cache" -----
+    // amdIo pins the ROCm host-transfer pair. Without it the AMD chips inherit
+    // the server defaults (--hicache-io-backend kernel, --hicache-mem-layout
+    // page_first) and, with no L3 backend selected, the overlay emits no
+    // layout/io flags at all — which is exactly the L2-only DRAM-offload shape
+    // the MI355X MXFP4 agentic recipe runs. page_first_direct + direct keeps
+    // ROCm on the plain host-copy path instead of the AOT transfer kernels, and
+    // matches the AMD pair already pinned on DeepSeek-V4 and Qwen3.5. Sizing
+    // stays on the engine default (ratio 2) pending an MI355X measurement.
     hicache: {
+      amdIo: { memLayout: "page_first_direct", ioBackend: "direct" },
       backends: [
         { id: null,       label: "Auto" },
         { id: "file",     label: "File" },
