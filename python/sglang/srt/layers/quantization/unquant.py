@@ -600,7 +600,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
-
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
@@ -633,6 +632,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and moe_runner_config.gemm1_alpha is None
             and moe_runner_config.gemm1_clamp_limit is None
             and moe_runner_config.swiglu_limit is None
+            and not moe_runner_config.apply_router_weight_on_input
             # The LoRA MoE hooks read and write the full-width pre-activation
             # buffer in halves layout; both assumptions break here.
             and not get_lora().enable_lora
