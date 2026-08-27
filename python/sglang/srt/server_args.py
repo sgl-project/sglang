@@ -11,7 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The arguments of the server."""
+"""Server argument declarations, resolution, and CLI registration.
+
+Keep this file in the following top-level order:
+
+1. Imports and the module logger.
+2. Public extension-point choice lists, with each legacy ``add_*`` alias
+   immediately below the choice list it extends.
+3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
+   aliases. A choice list used by only one field belongs inline in that field.
+4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
+   registration and small query helpers. New resolution steps are appended at
+   the end of ``_run_resolution_pipeline``, immediately before resolution is
+   marked complete, unless an earlier dependency is documented explicitly.
+5. Module-level ``ServerArgs`` construction/runtime shims.
+6. Networking constants and ``PortArgs``.
+
+Model- or vendor-specific utilities belong in ``sglang.srt.arg_groups`` (or
+their owning subsystem), not before ``ServerArgs`` in this module.
+"""
 
 from __future__ import annotations
 
@@ -110,10 +128,14 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-# Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+# --------------------------------------------------------------------------
+# Extension points: out-of-tree platforms and plugins extend these lists
+# before ServerArgs is constructed. Each list owns its adder on the line
+# below it. A list with no adder is not an extension point -- inline it into
+# the field's Arg(choices=...) instead of hoisting it here.
+# --------------------------------------------------------------------------
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+# --- Model loading and quantization ---
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -186,6 +208,8 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 add_quantization_method_choices = QUANTIZATION_CHOICES.extend
+
+# --- Attention backends ---
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -267,6 +291,8 @@ add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )
 
+# --- Transport ---
+
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
@@ -277,15 +303,14 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 ]
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
 
+# --- Sampling and grammar ---
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 add_grammar_backend_choices = GRAMMAR_BACKEND_CHOICES.extend
 
-# Placeholder token inserted between items in Multi-Item Scoring sequences:
-# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
-# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
-# attention mask compat and logprob column indexing. Will be removed once the
-# attention backend supports position-only MIS.
-MIS_DELIMITER_TOKEN_ID = 9999
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+
+# --- MoE and GEMM runners ---
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -308,15 +333,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.extend
-
-# These architectures take the A2A MoE path and skip post-expert all-reduce.
-_DEEPEP_V2_VALIDATED_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV3ForCausalLM",
-        "DeepseekV4ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    }
-)
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
@@ -349,17 +365,17 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 ]
 add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.extend
 
+# --- Cache and scheduling policy ---
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.extend
+
+# --- Reinforcement learning ---
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.extend
 
-# Speculative algorithms whose verify forward presents a uniform per-request
-# token width, which is what the LoRA segment layout assumes.
-_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
-
-DEFAULT_LORA_EVICTION_POLICY = "lru"
+# --- Linear attention ---
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
@@ -372,6 +388,12 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend
+
+# --------------------------------------------------------------------------
+# Add new extension points at the end of the matching group above. A new
+# choice list is inlined into its field by default; hoisting one here makes
+# it public API for out-of-tree code and is a deliberate decision.
+# --------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -1491,9 +1513,7 @@ class ServerArgs:
             nargs="*",
         ),
         NS("observability"),
-    ] = dataclasses.field(
-        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
-    )
+    ] = dataclasses.field(default_factory=list)
     crash_dump_folder: A[
         Optional[str],
         "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
@@ -7434,10 +7454,17 @@ class ServerArgs:
         )
 
         architecture = architectures[0] if architectures else None
-        if architecture not in _DEEPEP_V2_VALIDATED_ARCHITECTURES:
+        # These architectures take the A2A MoE path and skip post-expert
+        # all-reduce.
+        validated_architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "Qwen3MoeForCausalLM",
+        )
+        if architecture not in validated_architectures:
             raise ValueError(
                 f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-                f"architectures are {sorted(_DEEPEP_V2_VALIDATED_ARCHITECTURES)}. "
+                f"architectures are {sorted(validated_architectures)}. "
                 "Other model workflows may require an all-reduce after A2A "
                 "combine. Use --moe-a2a-backend deepep."
             )
@@ -10459,7 +10486,10 @@ class ServerArgs:
         if cfg.speculative_algorithm in ["NGRAM", None]:
             return
 
-        if cfg.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
+        # These algorithms present a uniform per-request token width during
+        # verify, which is what the LoRA segment layout assumes.
+        lora_spec_algorithms = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+        if cfg.speculative_algorithm not in lora_spec_algorithms:
             promoted = (
                 " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
                 "promoted to FROZEN_KV_MTP, which does not support LoRA)"
@@ -10785,6 +10815,11 @@ class ServerArgs:
         return cfg.expert_balancedness_report_mode in ("prometheus", "both")
 
 
+# --------------------------------------------------------------------------
+# Module-level ServerArgs helpers and runtime shims.
+# --------------------------------------------------------------------------
+
+
 def resolve_encoder_transfer_backend(
     backend: str, model_arch: str, tp_size: int
 ) -> str:
@@ -10923,6 +10958,11 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     )
 
     return ServerArgs.from_cli_args(raw_args)
+
+
+# --------------------------------------------------------------------------
+# Networking constants and PortArgs.
+# --------------------------------------------------------------------------
 
 
 ZMQ_TCP_PORT_DELTA = 233
