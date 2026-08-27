@@ -399,7 +399,7 @@ class Fp8Config(QuantizationConfig):
                 ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 return fp8_method
 
-            if self.is_fp4_experts and is_npu() and is_npu_arch35():
+            if self.is_fp4_experts and is_npu_arch35():
                 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
                     NPUW4A4Fp4MoEMethod,
                 )
