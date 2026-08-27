@@ -112,7 +112,7 @@ class PrefillDelayer:
             f"mixed_slot_guard={self._mixed_slot_guard}"
         )
         self.dp_size = dp_size
-        self.enable_dp_attention = get_parallel().enable_dp_attention
+        self.enable_dp_attention = get_parallel().config.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
