@@ -2916,34 +2916,13 @@ def format_plan_summary(
 
 
 def format_applied_changes(*, plan: AutoResidencyPlan) -> str:
-    """Describe the applied residency changes as equivalent server args.
-
-    Users can pin the printed ``--component-residency`` flags to freeze this
-    placement, or disable the adjustment entirely with the kill switch.
-    """
+    """Describe runtime transitions without claiming startup equivalence."""
     changes = "; ".join(
         _format_residency_change(candidate) for candidate in plan.changes
     )
-    component_args = []
-    has_auto_only_change = False
-    for candidate in plan.changes:
-        target_mode = candidate.target_mode()
-        if target_mode in (COMPONENT_OFFLOAD, RESIDENT):
-            component_args.append(f"{candidate.component_name}={target_mode}")
-        else:
-            has_auto_only_change = True
-    equivalent = (
-        "--component-residency " + " ".join(component_args)
-        if component_args
-        else "none"
-    )
-    if has_auto_only_change:
-        equivalent += " (partial layer/HostPin placement remains auto-only)"
     return (
-        f"Auto residency: adjusted {changes}. "
-        f"Equivalent server args: {equivalent}. "
-        f"Pin these flags to make this placement explicit, or set "
-        f"SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1 to disable auto adjustment."
+        f"Auto residency: adjusted {changes}. Startup flags may use a different "
+        f"load path; disable with SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1."
     )
 
 

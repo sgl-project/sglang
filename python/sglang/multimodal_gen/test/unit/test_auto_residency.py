@@ -3626,7 +3626,7 @@ class TestCandidateRanking:
 
 
 class TestAppliedChangesLog:
-    def test_reports_equivalent_server_args_and_kill_switch(self):
+    def test_reports_runtime_transition_and_kill_switch(self):
         plan = _plan_for(
             [
                 _candidate("text_encoder", mode=LAYERWISE_OFFLOAD, weight_gib=7),
@@ -3636,7 +3636,8 @@ class TestAppliedChangesLog:
         message = format_applied_changes(plan=plan)
         assert "text_encoder: layerwise-offload -> resident" in message
         assert "vae: component-offload -> resident" in message
-        assert "--component-residency text_encoder=resident vae=resident" in message
+        assert "Startup flags may use a different load path" in message
+        assert "--component-residency" not in message
         assert "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1" in message
 
 
