@@ -38,6 +38,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -189,6 +190,15 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
+    elif a2a_backend.is_deepep_v2():
+        return DeepEPv2Dispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -223,6 +233,34 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
             "(FP8 blockwise or per-tensor MoE), but this layer selected "
             f"{type(quant_method).__name__}. Remove --moe-runner-backend "
             "hpc_ops for this model."
+        )
+
+
+def _validate_deepep_v2_quant_method(quant_method) -> None:
+    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    config = (
+        quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
+    )
+    reason = None
+    if not isinstance(quant_method, Fp8MoEMethod):
+        reason = f"selected {type(quant_method).__name__}"
+    elif quant_method.use_mxfp8:
+        reason = "selected MXFP8 weights"
+    elif quant_method.is_fp4_expert:
+        reason = "selected FP4 experts"
+    elif list(quant_method.weight_block_size or []) != [128, 128]:
+        reason = f"has weight_block_size={quant_method.weight_block_size}"
+    elif config.activation_scheme != "dynamic":
+        reason = f"has activation_scheme={config.activation_scheme!r}"
+
+    if reason is not None:
+        raise ValueError(
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
+            f"experts with dynamic activation scaling, but this layer {reason}. "
+            "Use a compatible checkpoint or --moe-a2a-backend deepep."
         )
 
 
@@ -407,6 +445,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        _validate_deepep_v2_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
