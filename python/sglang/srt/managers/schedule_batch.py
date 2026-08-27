@@ -2830,6 +2830,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_cpu = merged_seq_lens_cpu
+        if not self.spec_algorithm.is_none():
+            # Spec keeps decode seq_lens at the committed base (bonus token
+            # pending); this step commits it, so tail rows need the decode
+            # path's +1 or attention drops the token's own row (qo len
+            # seq_lens - prefix_lens hits 0 and the kv span excludes self).
+            bumped = self.seq_lens.clone()
+            bumped[-running_bs:] += 1
+            self.seq_lens = bumped
 
         # For overlap scheduler, the output_ids has one step delay
         delta = 0 if self.enable_overlap else -1

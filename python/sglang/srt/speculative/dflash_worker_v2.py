@@ -1675,13 +1675,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            if batch.forward_mode.is_mixed() and batch.decoding_reqs:
-                # Each decode-tail request committed its pending bonus token
-                # this step, so its next-iter length advances by one.
-                new_seq_lens = batch.seq_lens.clone()
-                new_seq_lens[-len(batch.decoding_reqs) :] += 1
-            else:
-                new_seq_lens = batch.seq_lens
+            # Mixed decode tails already carry the +1 from mix_with_running.
+            new_seq_lens = batch.seq_lens
             batch_output.new_seq_lens = new_seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
