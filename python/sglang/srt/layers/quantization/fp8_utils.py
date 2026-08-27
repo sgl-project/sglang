@@ -7,6 +7,10 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.gemm.skinny_ptpc_gemv import (
+    skinny_ptpc_gemv,
+    skinny_ptpc_gemv_supported,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -2187,6 +2191,13 @@ def apply_fp8_ptpc_linear(
         q_input, x_scale = input
         q_input = q_input.view(-1, q_input.shape[-1])
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
+        if skinny_ptpc_gemv_supported(
+            q_input.shape[0], weight.shape[0], q_input.shape[1]
+        ):
+            output = skinny_ptpc_gemv(q_input, weight, x_scale, weight_scale)
+            if bias is not None:
+                output = output + bias
+            return output.view(*output_shape)
         output = aiter.gemm_a8w8_bpreshuffle(
             q_input, weight, x_scale, weight_scale, None, torch.bfloat16
         )
