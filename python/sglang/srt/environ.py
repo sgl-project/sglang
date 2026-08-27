@@ -500,6 +500,7 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
@@ -1042,6 +1043,10 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Per-rank buffer capacity, not a model token limit.
+    SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
+    SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
@@ -1144,6 +1149,11 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
+    # into a small CUDA graph, collapsing its host dispatch cost to one launch.
+    # Experimental; auto-falls back to eager if the backend's prep is not capturable.
+    SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1539,6 +1549,20 @@ class Envs:
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+
+    # ===================================================================
+    # Weight Cache Daemon
+    # ===================================================================
+    # Paths the daemon and the engine ranks it serves must agree on. Both are
+    # format templates and must keep the {global_rank} placeholder: each rank
+    # talks to the daemon on its own GPU, so a rank-independent path would point
+    # every rank at one daemon and map another rank's shard.
+    SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE = EnvStr(
+        "/tmp/sglang_weight_cache_rank{global_rank}.sock"
+    )
+    SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
+        "/tmp/sglang_weight_cache_rank{global_rank}.ready"
+    )
 
 
 envs = Envs()

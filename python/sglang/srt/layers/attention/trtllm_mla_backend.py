@@ -195,6 +195,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        pass
+
     def __init__(
         self,
         model_runner: ModelRunner,
