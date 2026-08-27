@@ -405,9 +405,8 @@ class DSV4Metadata:
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
 
-    # Built at the runner's prefill WAR boundary for the fast path; otherwise
-    # populated lazily by ``_forward_prefill_sparse``. Reused across every
-    # layer in the chunk and reset when graph metadata is refreshed.
+    # Built at the runner's prefill WAR boundary when the fast path is on,
+    # otherwise lazily by ``_forward_prefill_sparse``.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
     prefill_shared_reads_snapshotted: bool = False
 
@@ -1364,11 +1363,9 @@ class DeepseekV4AttnBackend(
     def prepare_prefill_shared_read_snapshot(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> None:
-        # DFLASH/DSPARK have no later prefill draft-extend reader. Sparse
-        # prefill otherwise reads req_to_token/full_to_swa lazily in its first
-        # layer, so snapshot those mappings after the runner has resolved the
-        # actual query geometry. CP-v2 uses a rank-local query layout that this
-        # global snapshot does not represent.
+        # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
+        # first layer. DFLASH/DSPARK have no later prefill draft-extend reader;
+        # CP-v2 shards the query layout that this global snapshot assumes.
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata):
             metadata.prefill_shared_reads_snapshotted = False
@@ -1390,6 +1387,8 @@ class DeepseekV4AttnBackend(
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, num_qo_tokens=num_qo_tokens
             )
+        # Marked for dense prefill too: that path reads only core_attn_metadata,
+        # which init_forward_metadata already snapshotted.
         metadata.prefill_shared_reads_snapshotted = True
 
     def _build_sparse_prefill_chunk_cache(
