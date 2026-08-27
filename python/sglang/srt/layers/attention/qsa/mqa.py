@@ -1,8 +1,7 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer.
+"""Weight-free MQA operators for the simple QSA indexer.
 
-The CUDA kernels are reduced versions of the previously validated Qwen MQA
-kernels: the per-head weight input and all unrelated feature branches are
-removed. Torch implementations are kept as the only fallback and reference.
+Triton is the production SM120 backend. TileLang remains the SM100 path, and
+torch is an explicit diagnostic backend and the numerical reference.
 """
 
 import logging
@@ -12,7 +11,12 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.attention.qsa.mqa import (
+    triton_qsa_mqa_decode,
+    triton_qsa_mqa_prefill,
+)
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm120_supported, is_sm121
 
 logger = logging.getLogger(__name__)
 
@@ -32,40 +36,40 @@ except ImportError:
     HAS_TILELANG = False
 
 
-_TILELANG_BACKEND_VALUES = {"auto", "tilelang", "torch"}
-_tilelang_backend_available: Optional[bool] = None
+_MQA_BACKEND_VALUES = {"auto", "tilelang", "triton", "torch"}
+_tilelang_backend_ready = False
 _tilelang_backend_lock = threading.Lock()
 _torch_backend_logged = False
 
 
-def _configured_tilelang_backend() -> str:
+def _configured_mqa_backend() -> str:
     backend = envs.SGLANG_QSA_MQA_BACKEND.get().strip().lower()
-    if backend not in _TILELANG_BACKEND_VALUES:
+    if backend not in _MQA_BACKEND_VALUES:
         raise ValueError(
-            "SGLANG_QSA_MQA_BACKEND must be one of auto, tilelang, or torch; "
+            "SGLANG_QSA_MQA_BACKEND must be one of auto, tilelang, triton, or torch; "
             f"got {backend!r}"
         )
     return backend
 
 
-def _disable_tilelang_qsa(exc: BaseException) -> None:
-    global _tilelang_backend_available
-    if _tilelang_backend_available is not False:
-        logger.warning(
-            "TileLang QSA MQA failed; falling back to the torch implementation "
-            "for the rest of this process: %s",
-            exc,
-        )
-    _tilelang_backend_available = False
+def _resolve_mqa_backend(*, is_cuda: bool) -> str:
+    backend = _configured_mqa_backend()
+    if backend != "auto":
+        return backend
+    if not is_cuda:
+        return "torch"
+    # GB10 (sm_121) shares the capability major but is unvalidated for the new
+    # Triton default; it keeps the TileLang/torch fallback unless opted in.
+    if is_sm120_supported() and not is_sm121():
+        return "triton"
+    return "tilelang" if HAS_TILELANG else "torch"
 
 
 def _run_tilelang_or_torch(q: torch.Tensor, tilelang_call, torch_call):
-    """Run one compile probe and permanently fall back after any failure."""
+    """Run the selected non-Triton backend without masking launch failures."""
 
-    global _tilelang_backend_available, _torch_backend_logged
-    backend = _configured_tilelang_backend()
-    if not q.is_cuda:
-        return torch_call()
+    global _tilelang_backend_ready, _torch_backend_logged
+    backend = _resolve_mqa_backend(is_cuda=q.is_cuda)
     if backend == "torch":
         if not _torch_backend_logged:
             logger.info(
@@ -74,31 +78,17 @@ def _run_tilelang_or_torch(q: torch.Tensor, tilelang_call, torch_call):
             )
             _torch_backend_logged = True
         return torch_call()
-    if not HAS_TILELANG or _tilelang_backend_available is False:
-        return torch_call()
-
-    if _tilelang_backend_available is None:
-        # Serialize the first lazy JIT invocation. This is both the capability
-        # probe and protection against two graph-capture workers racing the
-        # same TileLang compilation.
+    if backend != "tilelang":
+        raise RuntimeError(f"unexpected non-Triton QSA MQA backend {backend!r}")
+    if not HAS_TILELANG:
+        raise RuntimeError("TileLang QSA MQA was requested but TileLang is unavailable")
+    if not _tilelang_backend_ready:
         with _tilelang_backend_lock:
-            if _tilelang_backend_available is None:
-                try:
-                    result = tilelang_call()
-                except Exception as exc:
-                    _disable_tilelang_qsa(exc)
-                    return torch_call()
-                _tilelang_backend_available = True
-                logger.info("TileLang QSA MQA compile probe succeeded")
+            if not _tilelang_backend_ready:
+                result = tilelang_call()
+                _tilelang_backend_ready = True
                 return result
-
-    try:
-        return tilelang_call()
-    except Exception as exc:
-        # New shapes may trigger additional lazy specializations, so a later
-        # compile can still fail after the initial probe.
-        _disable_tilelang_qsa(exc)
-        return torch_call()
+    return tilelang_call()
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -333,9 +323,7 @@ if HAS_TILELANG:
                                         0,
                                         :,
                                     ],
-                                    k_shared[
-                                        sp * page_size : (sp + 1) * page_size, :
-                                    ],
+                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
                                 )
                         T.gemm(
                             k_shared,
@@ -382,9 +370,7 @@ def tilelang_qsa_mqa_prefill(
     # Allocate the padded output once. Appending even a few padding rows with
     # torch.cat would allocate and copy the entire [rows, keys] FP32 matrix,
     # temporarily doubling the dominant prefill buffer for long contexts.
-    logits = torch.zeros(
-        (padded_rows, keys), dtype=torch.float32, device=q.device
-    )
+    logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
     q_padded = q.to(torch.bfloat16).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
@@ -468,11 +454,12 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    backend = _resolve_mqa_backend(is_cuda=q.is_cuda)
+    if backend == "triton":
+        return triton_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return _run_tilelang_or_torch(
         q,
-        lambda: tilelang_qsa_mqa_prefill(
-            q, k, row_starts, row_ends, score_scale
-        ),
+        lambda: tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale),
         lambda: torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale),
     )
 
@@ -485,6 +472,11 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    backend = _resolve_mqa_backend(is_cuda=q.is_cuda)
+    if backend == "triton":
+        return triton_qsa_mqa_decode(
+            q, k_cache, page_table, context_lens, max_model_len, score_scale
+        )
     return _run_tilelang_or_torch(
         q,
         lambda: tilelang_qsa_mqa_decode(
@@ -504,4 +496,6 @@ __all__ = [
     "tilelang_qsa_mqa_prefill",
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
+    "triton_qsa_mqa_decode",
+    "triton_qsa_mqa_prefill",
 ]

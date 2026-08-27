@@ -300,8 +300,8 @@ class Envs:
     # Select the QSA sparse decode backend. Auto uses Triton on SM120 and the
     # flash-attention fallback on other architectures.
     SGLANG_QSA_DECODE_BACKEND = EnvStr("auto")
-    # Select the QSA MQA scoring backend. Auto follows the architecture default
-    # and retains the process-wide fallback after a TileLang compile failure.
+    # Select the QSA MQA scoring backend. Auto follows the architecture default;
+    # failures from the selected backend are reported to the caller.
     SGLANG_QSA_MQA_BACKEND = EnvStr("auto")
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)

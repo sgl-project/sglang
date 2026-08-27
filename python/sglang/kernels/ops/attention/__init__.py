@@ -7,7 +7,21 @@ KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+
+_SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
+
+for _fn in ("triton_qsa_mqa_decode", "triton_qsa_mqa_prefill"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn.removeprefix('triton_')}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.qsa.mqa:{_fn}",
+            capabilities=_SM120,
+            description="Qwen sparse-attention MQA scoring for SM120.",
+        )
+    )
+del _fn
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [
