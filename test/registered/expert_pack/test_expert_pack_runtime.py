@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,11 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
-ROOT = Path(__file__).resolve().parents[3]
-TOOLS = ROOT / "tools" / "expert_pack"
-sys.path.insert(0, str(TOOLS))
-
-from format import (  # noqa: E402
+from sglang.srt.model_loader.expert_pack.format import (  # noqa: E402
     ENTRY_STRUCT,
     FLAG_IDENTITY_PAYLOAD,
     FLAG_TRIPLET_OBJECTS,
