@@ -8,6 +8,9 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     matches_lora_target,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _NamedModel:
