@@ -1925,11 +1925,11 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
             prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
         )
         with (
-            patch("sglang.srt.server_args.is_hip", return_value=False),
-            patch("sglang.srt.server_args.is_npu", return_value=False),
-            patch("sglang.srt.server_args.is_cpu", return_value=False),
-            patch("sglang.srt.server_args.is_mps", return_value=False),
-            patch("sglang.srt.server_args.is_xpu", return_value=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_hip", return_value=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_npu", return_value=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_cpu", return_value=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_mps", return_value=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_xpu", return_value=False),
         ):
             args._disable_tc_piecewise_cudagraph_if_incompatible()
 

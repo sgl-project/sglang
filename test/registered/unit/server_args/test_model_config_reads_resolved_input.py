@@ -283,6 +283,21 @@ def _hook_declarations(dispatch, source_module):
     return out
 
 
+def _hook_functions():
+    """Module-level resolution functions under `arg_groups/`.
+
+    A handler that moved out of the record leaves a slot behind that imports
+    one of these and calls it. Without following that hop the scan stops at
+    the slot and silently loses everything the handler does.
+    """
+    functions = {}
+    for path in sorted((_SRT / "arg_groups").glob("*.py")):
+        for node in _parsed(path).body:
+            if isinstance(node, ast.FunctionDef):
+                functions.setdefault(node.name, node)
+    return functions
+
+
 def _pipeline():
     """(ordered steps, {step: methods it reaches}) for the resolution dispatch."""
     tree = _parsed(_SRT / "server_args.py")
@@ -294,6 +309,8 @@ def _pipeline():
     methods = {
         node.name: node for node in record.body if isinstance(node, ast.FunctionDef)
     }
+    hooks = _hook_functions()
+    methods.update({name: node for name, node in hooks.items() if name not in methods})
     dispatch = methods["_run_resolution_pipeline"]
     steps = [
         name
@@ -313,14 +330,17 @@ def _pipeline():
             return seen
         seen.add(name)
         for node in ast.walk(methods[name]):
+            if not isinstance(node, ast.Call):
+                continue
             if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "self"
                 and node.func.attr in methods
             ):
                 reaches(node.func.attr, seen)
+            elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+                reaches(node.func.id, seen)
         return seen
 
     step_lines = {}
