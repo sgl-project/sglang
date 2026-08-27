@@ -516,8 +516,8 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
-    # Restated rather than inherited: the SWA parent's group hooks drive
-    # swa_free_group, which this pure-SWA variant does not have.
+    # Not inherited: the SWA parent's hooks drive swa_free_group,
+    # which this pure-SWA variant does not have.
     def free_group_begin(self):
         self.free_group = []
 

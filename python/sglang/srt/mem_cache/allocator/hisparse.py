@@ -245,8 +245,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.free_group = None
 
-    # No deferred frees here: free() has to clear the full-to-hisparse mapping
-    # in step with the logical release, so the group hooks are no-ops.
+    # No deferred frees: free() must clear the full-to-hisparse mapping at once.
     def free_group_begin(self):
         return
 
