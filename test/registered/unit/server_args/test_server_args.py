@@ -1,5 +1,5 @@
+import argparse
 import dataclasses
-import importlib
 import json
 import os
 import socket
@@ -2067,54 +2067,61 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
 
-    The choice set is built once at server_args.py import time, so each subtest
-    reloads the module with the env var set to the desired value.
+    The choice set is finalized when CLI arguments are registered, so each
+    parser must reflect the environment at construction time.
     """
 
-    def _reload_server_args_with_env(self, *, enabled: bool):
-        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
-        try:
-            return importlib.reload(server_args_module)
-        finally:
-            if previous is None:
-                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
-            else:
-                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
-
     def test_token_oracle_rejected_when_env_disabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=False)
-        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "0"}):
+            with self.assertRaises(SystemExit):
+                server_args_module.prepare_server_args(
+                    [
+                        "--model-path",
+                        DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                        "--sampling-backend",
+                        "token_oracle",
+                    ]
+                )
 
-        with self.assertRaises(SystemExit):
-            reloaded.prepare_server_args(
+    def test_token_oracle_accepted_when_env_enabled(self):
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1"}):
+            parsed = server_args_module.prepare_server_args(
                 [
                     "--model-path",
                     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                     "--sampling-backend",
                     "token_oracle",
+                    # Explicit device so ServerArgs.__post_init__ does not call
+                    # get_device() (fails on CPU-only CI runners) and does not run
+                    # _handle_cpu_backends (which would override sampling_backend
+                    # to "pytorch", masking what we want to verify).
+                    "--device",
+                    "cuda",
                 ]
             )
-
-    def test_token_oracle_accepted_when_env_enabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=True)
-        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
-
-        parsed = reloaded.prepare_server_args(
-            [
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-                "--sampling-backend",
-                "token_oracle",
-                # Explicit device so ServerArgs.__post_init__ does not call
-                # get_device() (fails on CPU-only CI runners) and does not run
-                # _handle_cpu_backends (which would override sampling_backend
-                # to "pytorch", masking what we want to verify).
-                "--device",
-                "cuda",
-            ]
-        )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+    def test_gate_is_recomputed_for_each_parser(self):
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1"}):
+            enabled_parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(enabled_parser)
+
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "0"}):
+            disabled_parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(disabled_parser)
+
+        enabled_action = next(
+            action
+            for action in enabled_parser._actions
+            if action.dest == "sampling_backend"
+        )
+        disabled_action = next(
+            action
+            for action in disabled_parser._actions
+            if action.dest == "sampling_backend"
+        )
+        self.assertIn("token_oracle", enabled_action.choices)
+        self.assertNotIn("token_oracle", disabled_action.choices)
 
 
 class TestDeepEPv2Args(CustomTestCase):

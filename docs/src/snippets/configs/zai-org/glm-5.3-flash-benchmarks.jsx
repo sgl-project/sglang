@@ -134,14 +134,62 @@ export const benchmarks = [
     notes:
       "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) at rc2 (f13cb6f6a7), same protocol as the BF16 rows: 1,189.96 / 2,476.87 / 3,972.52 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.3–5.5% above BF16 + TileLang across the curve, and the FP8 pool holds 13.5M tokens per rank vs 7.5M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 99.92% stop rate (one truncated run of 1,319). With HiCache L1+L2 (32 GB host tier) the same protocol measured 1,187.13 / 2,464.89 / 3,941.37 tok/s — a 0.2-0.8% overhead; the random dataset has no prefix reuse, so L2 benefit was not exercised.",
   },
-  { match: { hw: "h100", strategy: "low-latency" } },
-  { match: { hw: "h100", strategy: "high-throughput" } },
-  { match: { hw: "h200", strategy: "low-latency" } },
-  { match: { hw: "h200", strategy: "high-throughput" } },
-  { match: { hw: "b200", strategy: "low-latency" } },
-  { match: { hw: "b200", strategy: "high-throughput" } },
-  { match: { hw: "b300", strategy: "low-latency" } },
-  { match: { hw: "b300", strategy: "high-throughput" } },
+  {
+    match: { hw: "h100", strategy: "low-latency" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 97.27 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27%. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "h100", strategy: "high-throughput" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 97.50 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.50% for the recommended selection; 97.27-97.50% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "h200", strategy: "low-latency" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 97.04 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.04%. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "h200", strategy: "high-throughput" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 97.35 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.35% for the recommended selection; 97.19-97.57% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "b200", strategy: "low-latency" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 97.27 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x B200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27% for the recommended selection; 97.12-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "b200", strategy: "high-throughput" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 97.27 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x B200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27% for the recommended selection; 96.97-97.35% across all 8 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "b300", strategy: "low-latency" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 96.82 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x B300 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 96.82% for the recommended selection; 96.82-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
+  {
+    match: { hw: "b300", strategy: "high-throughput" },
+    sglang_version: "f040cc72e6",
+    accuracy: { gsm8k_pct: 96.97 },
+    notes:
+      "Full GSM8K (all 1,319 problems) on 8x B300 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 96.97% for the recommended selection; 96.97-97.04% across all 8 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+  },
   { match: { hw: "gb200", strategy: "low-latency" } },
   { match: { hw: "gb200", strategy: "high-throughput" } },
   {
