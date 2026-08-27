@@ -33,8 +33,10 @@ class SchedulerDllmMixin:
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
-        if self.enable_priority_preemption:
-            running_batch.batch_is_full = False
+        # `batch_is_full` is a per-round signal here: dLLM requests never enter
+        # `running_batch`, and a stale value would block re-admitting the
+        # request whose KV a retraction just freed.
+        running_batch.batch_is_full = False
 
         # Early exit if batch is full or no requests available
         if self._should_skip_prefill(running_batch=running_batch):
@@ -52,13 +54,12 @@ class SchedulerDllmMixin:
         # builds its own adder so the per-round DLLM budget stays phase-aware,
         # and a phase that cannot allocate falls through to the next one instead
         # of ending the round.
-        batch_was_full = running_batch.batch_is_full
         adder = None
         forward_mode = None
         for is_prefill in self._dllm_phase_order():
-            # A failed probe must not leave `batch_is_full` set for the next
-            # phase or the next round.
-            running_batch.batch_is_full = batch_was_full
+            # A failed probe must not leave `batch_is_full` set for the phase
+            # attempted after it.
+            running_batch.batch_is_full = False
             candidate = self._create_dllm_prefill_adder(
                 running_bs, running_batch=running_batch, is_prefill=is_prefill
             )

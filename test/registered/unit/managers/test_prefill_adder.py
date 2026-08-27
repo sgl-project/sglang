@@ -577,6 +577,118 @@ class TestPrefillAdder(CustomTestCase):
                     [True, False],
                 )
 
+    def _make_stale_flag_req(self, rid, phase):
+        req = SimpleNamespace(rid=rid, dllm_phase=phase, is_retracted=False)
+        req.init_next_round_input = lambda *a, **kw: None
+        req.is_dllm_prefill = lambda r=req: r.dllm_phase in (
+            DllmReqPhase.STAGING_PREFILL,
+            DllmReqPhase.INCOMING_PREFILL,
+        )
+        return req
+
+    def test_dllm_round_start_clears_stale_batch_full(self):
+        # In dLLM mode the flag is only ever written and read inside one
+        # get_new_batch_dllm() call, so a value seen at round start is stale.
+        manager = MagicMock()
+        manager.get_prefill_requests.return_value = []
+        manager.get_decode_requests.return_value = []
+        manager.waiting_queue = []
+        manager.is_empty.return_value = False
+        running_batch = SimpleNamespace(
+            batch_is_full=True, reqs=[], is_empty=lambda: True
+        )
+        scheduler = SimpleNamespace(
+            enable_priority_preemption=False,
+            policy=MagicMock(),
+            waiting_queue=[],
+            dllm_manager=manager,
+            tree_cache=MagicMock(),
+            get_num_allocatable_reqs=lambda bs: 8,
+            _fetch_waiting_reqs=lambda: None,
+            _retract_dllm_req=MagicMock(),
+            _abort_dllm_req_exact=MagicMock(),
+        )
+        scheduler._should_skip_prefill = (
+            lambda *, running_batch: SchedulerDllmMixin._should_skip_prefill(
+                scheduler, running_batch=running_batch
+            )
+        )
+        scheduler._dllm_phase_order = lambda: SchedulerDllmMixin._dllm_phase_order(
+            scheduler
+        )
+        scheduler._retract_or_abort_dllm_req = (
+            lambda rb: SchedulerDllmMixin._retract_or_abort_dllm_req(scheduler, rb)
+        )
+
+        SchedulerDllmMixin.get_new_batch_dllm(scheduler, running_batch)
+
+        self.assertFalse(running_batch.batch_is_full)
+
+    def test_dllm_recovers_next_round_after_retraction_frees_kv(self):
+        # A blocked staging prefill plus a blocked incoming decode. The decode
+        # phase is attempted last and marks the batch full, so before the fix
+        # that flag survived the round and sent every incoming request -- the
+        # retraction victim included -- straight to the preempt-or-break path,
+        # with no clear path left because no batch ever ran again.
+        staging = self._make_stale_flag_req("staging", DllmReqPhase.STAGING_PREFILL)
+        incoming = self._make_stale_flag_req("incoming", DllmReqPhase.INCOMING_DECODE)
+        manager = DllmManager(SimpleNamespace(max_running_requests=4, block_size=32))
+        manager.waiting_queue = [staging, incoming]
+        running_batch = SimpleNamespace(
+            batch_is_full=False, reqs=[], is_empty=lambda: True
+        )
+        kv_exhausted = {"value": True}
+
+        def make_adder(running_bs, *, running_batch, is_prefill):
+            adder = SimpleNamespace(can_run_list=[], preempt_list=[])
+            adder.add_dllm_staging_req = lambda req: AddReqResult.NO_TOKEN
+
+            def add_one_req(req, **kwargs):
+                if kv_exhausted["value"]:
+                    return AddReqResult.NO_TOKEN
+                adder.can_run_list.append(req)
+                return AddReqResult.CONTINUE
+
+            adder.add_one_req = add_one_req
+            return adder
+
+        def retract(req):
+            req.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+            req.is_retracted = True
+            kv_exhausted["value"] = False
+
+        scheduler = SchedulerDllmMixin()
+        scheduler.enable_priority_preemption = False
+        scheduler.policy = MagicMock()
+        scheduler.waiting_queue = []
+        scheduler.dllm_manager = manager
+        scheduler.server_args = MagicMock()
+        scheduler.tree_cache = MagicMock()
+        scheduler.get_num_allocatable_reqs = lambda bs: 8
+        scheduler._should_skip_prefill = lambda *, running_batch: False
+        scheduler._fetch_waiting_reqs = lambda: None
+        scheduler._create_dllm_prefill_adder = make_adder
+        scheduler._retract_dllm_req = retract
+        scheduler._abort_dllm_req_exact = MagicMock()
+        scheduler._update_state_for_batch = MagicMock()
+        scheduler._create_dllm_batch = lambda reqs, mode, **kw: SimpleNamespace(
+            reqs=list(reqs), forward_mode=mode
+        )
+
+        with patch("sglang.srt.dllm.mixin.scheduler.set_time_batch"):
+            first = scheduler.get_new_batch_dllm(running_batch)
+            self.assertIsNone(first)
+            self.assertTrue(staging.is_retracted)
+            self.assertFalse(kv_exhausted["value"])
+
+            # No batch ran, so get_next_batch_to_run's reset never fires. The
+            # freed KV must still be usable on the very next round.
+            second = scheduler.get_new_batch_dllm(running_batch)
+
+        self.assertIsNotNone(second)
+        self.assertIn(staging, second.reqs)
+        scheduler._abort_dllm_req_exact.assert_not_called()
+
     def _make_no_progress_scheduler(self, waiting_queue, *, running_batch_empty=True):
         manager = MagicMock()
         manager.waiting_queue = waiting_queue
