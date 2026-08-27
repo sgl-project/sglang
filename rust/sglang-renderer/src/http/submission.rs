@@ -2,8 +2,8 @@ use axum::{http::StatusCode, response::Response};
 use futures::{StreamExt, stream::BoxStream};
 
 use crate::{
-    FrontendError, GenerateRequest, GenerationEvent, GenerationOutput, GenerationStream,
-    TextRequest, TokenIdsRequest,
+    CompletionRequest, FrontendError, GenerateRequest, GenerationEvent, GenerationOutput,
+    GenerationStream, TokenIdsRequest,
 };
 
 use super::{OpenAIHttpFrontend, error::openai_error};
@@ -12,24 +12,25 @@ use super::{OpenAIHttpFrontend, error::openai_error};
 ///
 /// All streams are established before either endpoint starts collecting them,
 /// preserving concurrent engine execution without introducing a backend trait.
-pub(super) async fn submit_text_inputs(
+pub(super) async fn submit_completion_inputs(
     frontend: &OpenAIHttpFrontend,
-    inputs: Vec<TextRequest>,
+    inputs: Vec<CompletionRequest>,
     stream_response: bool,
 ) -> Result<Vec<GenerationStream>, Response> {
     let mut streams = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let generate_request = frontend
-            .renderer
-            .prepare_text_request(input)
-            .await
-            .map_err(|error| {
-                openai_error(
-                    super::error::renderer_status(&error),
-                    error.to_string(),
-                    false,
-                )
-            })?;
+        let generate_request =
+            frontend
+                .renderer
+                .prepare_completion(input)
+                .await
+                .map_err(|error| {
+                    openai_error(
+                        super::error::renderer_status(&error),
+                        error.to_string(),
+                        false,
+                    )
+                })?;
         let events = frontend
             .generate_client
             .generate(generate_request)

@@ -8,8 +8,11 @@ use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
     CompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
-    submission::{collect_output, merge_indexed, submit_text_inputs, submit_token_ids_inputs},
+    submission::{
+        collect_output, merge_indexed, submit_completion_inputs, submit_token_ids_inputs,
+    },
 };
+use crate::protocol::openai::{lower_text_completion_request, lower_token_ids_completion_request};
 use crate::{
     GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
     GenerationStream, MatchedStop,
@@ -105,42 +108,43 @@ async fn completions(
     let created = unix_seconds_u32();
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let submitted = if text_prompt {
-        let text_requests = match state.renderer.lower_text_completions_with_metadata(
-            request,
-            &response_id,
-            sampling_overrides,
-            request_metadata,
-        ) {
-            Ok(requests) => requests,
-            Err(error) => {
-                let status = renderer_status(&error);
-                return openai_error(status, error.to_string(), false);
-            }
-        };
-        let metadata = text_requests
+        let mut completion_requests =
+            match lower_text_completion_request(state.renderer.config(), &request, &response_id) {
+                Ok(requests) => requests,
+                Err(error) => {
+                    let status = renderer_status(&error);
+                    return openai_error(status, error.to_string(), false);
+                }
+            };
+        for completion in &mut completion_requests {
+            sampling_overrides
+                .clone()
+                .apply(&mut completion.options.sampling_params);
+            completion.metadata = request_metadata.clone();
+        }
+        let metadata = completion_requests
             .iter()
             .enumerate()
             .map(|(index, request)| {
                 let prompt_index = index / n;
                 let prompt_echo = if echo {
-                    request.prompt.as_str().to_owned()
+                    request.prompt.clone()
                 } else {
                     String::new()
                 };
                 (index, prompt_index, prompt_echo)
             })
             .collect();
-        let streams = match submit_text_inputs(&state, text_requests, stream).await {
+        let streams = match submit_completion_inputs(&state, completion_requests, stream).await {
             Ok(streams) => streams,
             Err(response) => return response,
         };
         attach_streams(metadata, streams)
     } else {
-        let token_requests = match state.renderer.lower_token_ids_completions_with_metadata(
-            request,
+        let mut token_requests = match lower_token_ids_completion_request(
+            state.renderer.config(),
+            &request,
             &response_id,
-            sampling_overrides,
-            request_metadata,
         ) {
             Ok(requests) => requests,
             Err(error) => {
@@ -148,6 +152,12 @@ async fn completions(
                 return openai_error(status, error.to_string(), false);
             }
         };
+        for token_request in &mut token_requests {
+            sampling_overrides
+                .clone()
+                .apply(&mut token_request.options.sampling_params);
+            token_request.metadata = request_metadata.clone();
+        }
         let mut metadata = Vec::with_capacity(token_requests.len());
         let mut prompt_echo = String::new();
         for (index, request) in token_requests.iter().enumerate() {

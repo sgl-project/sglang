@@ -3,6 +3,10 @@
 use std::sync::Arc;
 
 use crate::RendererService;
+use crate::protocol::openai::{
+    lower_chat_request_with_template_args, lower_text_completion_request,
+    lower_token_ids_completion_request,
+};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -71,20 +75,21 @@ async fn render_chat(
         .clone()
         .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
     let metadata = extensions.metadata(model);
-    match state
-        .renderer
-        .prepare_chat_with_template_args(
-            request,
-            &response_id,
-            crate::service::ChatLoweringOptions {
-                chat_template_args: chat_template_kwargs,
-                continue_final_message,
-                sampling_overrides,
-                metadata,
-            },
-        )
-        .await
-    {
+    let mut chat_request = match lower_chat_request_with_template_args(
+        state.renderer.config(),
+        request,
+        &response_id,
+        chat_template_kwargs,
+        continue_final_message,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return openai_error(renderer_status(&error), error.to_string(), false);
+        }
+    };
+    sampling_overrides.apply(&mut chat_request.sampling_params);
+    chat_request.metadata = metadata;
+    match state.renderer.prepare_chat(chat_request).await {
         Ok(mut chat) => Json(
             chat.requests
                 .pop()
@@ -120,25 +125,38 @@ async fn render_completions(
     let metadata = extensions.metadata(model);
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let requests = if text_prompt {
-        state
-            .renderer
-            .prepare_text_completions_with_metadata(
-                request,
-                &response_id,
-                sampling_overrides,
-                metadata,
-            )
-            .await
+        let mut requests =
+            match lower_text_completion_request(state.renderer.config(), &request, &response_id) {
+                Ok(requests) => requests,
+                Err(error) => {
+                    return openai_error(renderer_status(&error), error.to_string(), false);
+                }
+            };
+        for request in &mut requests {
+            sampling_overrides
+                .clone()
+                .apply(&mut request.options.sampling_params);
+            request.metadata = metadata.clone();
+        }
+        state.renderer.prepare_completions(requests).await
     } else {
-        state
-            .renderer
-            .prepare_token_ids_completions_with_metadata(
-                request,
-                &response_id,
-                sampling_overrides,
-                metadata,
-            )
-            .await
+        let mut requests = match lower_token_ids_completion_request(
+            state.renderer.config(),
+            &request,
+            &response_id,
+        ) {
+            Ok(requests) => requests,
+            Err(error) => {
+                return openai_error(renderer_status(&error), error.to_string(), false);
+            }
+        };
+        for request in &mut requests {
+            sampling_overrides
+                .clone()
+                .apply(&mut request.options.sampling_params);
+            request.metadata = metadata.clone();
+        }
+        state.renderer.prepare_token_ids_requests(requests)
     };
     match requests {
         Ok(requests) => Json(requests).into_response(),
@@ -224,6 +242,7 @@ mod tests {
                         serde_json::json!({
                             "model": "model",
                             "prompt": ["one two", "three"],
+                            "n": 2,
                             "max_tokens": 5,
                             "top_k": 17,
                             "min_p": 0.2,
@@ -250,9 +269,15 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(body[0]["input_ids"], serde_json::json!([7, 7]));
-        assert_eq!(body[1]["input_ids"], serde_json::json!([7]));
-        assert!(body[0].get("text").is_none());
-        assert!(body[1].get("text").is_none());
+        assert_eq!(body[1]["input_ids"], serde_json::json!([7, 7]));
+        assert_eq!(body[2]["input_ids"], serde_json::json!([7]));
+        assert_eq!(body[3]["input_ids"], serde_json::json!([7]));
+        assert!(
+            body.as_array()
+                .unwrap()
+                .iter()
+                .all(|request| request.get("text").is_none())
+        );
         assert_eq!(body[0]["sampling_params"]["top_k"], 17);
         assert_eq!(body[0]["sampling_params"]["min_p"], 0.2);
         assert_eq!(body[0]["sampling_params"]["min_new_tokens"], 3);
@@ -270,7 +295,10 @@ mod tests {
         assert_eq!(body[0]["bootstrap_room"], 42);
         assert_eq!(body[0]["routed_dp_rank"], 2);
         assert_eq!(body[0]["disagg_prefill_dp_rank"], 1);
-        assert_eq!(body[1]["cache_salt"], "tenant-a");
+        assert_eq!(body[1]["rid"], "request-id-1");
+        assert_eq!(body[2]["rid"], "request-id-2");
+        assert_eq!(body[3]["rid"], "request-id-3");
+        assert_eq!(body[3]["cache_salt"], "tenant-a");
     }
 
     #[tokio::test]

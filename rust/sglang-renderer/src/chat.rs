@@ -1,4 +1,5 @@
-//! Internal OpenAI chat preprocessing.
+//! Transport-neutral chat preprocessing over a canonical OpenAI-compatible
+//! message vocabulary.
 
 use std::collections::HashMap;
 
@@ -16,14 +17,13 @@ use dynamo_renderer::{
 };
 use minijinja::Value;
 
-#[cfg(any(feature = "http", test))]
 use crate::ChatResponseProcessor;
 use crate::{
     ChatFormatter, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
     RendererError, SamplingParams, TextRequest,
 };
 
-/// Internal normalized OpenAI chat state.
+/// Renderer-owned normalized chat state.
 ///
 /// Message and tool values remain Dynamo OpenAI protocol types until
 /// [`ChatPreprocessor`] applies the model chat template and lowers the request
@@ -93,7 +93,6 @@ impl OAIChatLikeRequest for ChatRequest {
 /// Chat-to-text result plus the state needed to interpret generated output.
 pub struct LoweredChat {
     pub text_requests: Vec<TextRequest>,
-    #[cfg(any(feature = "http", test))]
     pub response_processor: ChatResponseProcessor,
 }
 
@@ -102,7 +101,6 @@ pub struct ChatPreprocessor {
     formatter: Option<ChatFormatter>,
     formatter_error: Option<String>,
     tool_call_parser: Option<String>,
-    #[cfg(any(feature = "http", test))]
     reasoning_parser: Option<String>,
 }
 
@@ -112,7 +110,6 @@ impl ChatPreprocessor {
             formatter,
             formatter_error: None,
             tool_call_parser: config.tool_call_parser.clone(),
-            #[cfg(any(feature = "http", test))]
             reasoning_parser: config.reasoning_parser.clone(),
         }
     }
@@ -141,7 +138,6 @@ impl ChatPreprocessor {
             Some(request.parallel_tool_calls),
         )?;
         let prompt = self.render(&request)?;
-        #[cfg(any(feature = "http", test))]
         let uses_tool_call_structural_tag = request.sampling_params.structural_tag.is_some();
 
         let mut text_requests = Vec::with_capacity(request.choice_count);
@@ -165,7 +161,6 @@ impl ChatPreprocessor {
             );
         }
 
-        #[cfg(any(feature = "http", test))]
         let response_processor = ChatResponseProcessor::new(
             parser,
             self.reasoning_parser.clone(),
@@ -177,13 +172,11 @@ impl ChatPreprocessor {
         );
         Ok(LoweredChat {
             text_requests,
-            #[cfg(any(feature = "http", test))]
             response_processor,
         })
     }
 
     /// Render chat for tokenization without creating generation/output state.
-    #[cfg(any(feature = "http", test))]
     pub fn lower_to_text(&self, mut request: ChatRequest) -> Result<TextRequest, RendererError> {
         validate_chat(&request)?;
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());

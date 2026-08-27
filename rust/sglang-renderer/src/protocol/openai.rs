@@ -7,23 +7,15 @@ use dynamo_protocols::types::{
 };
 
 use crate::{
-    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
-    RendererError, SamplingDefaults, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
+    ChatRequest, CompletionRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    RendererConfig, RendererError, SamplingDefaults, SamplingParams, TokenIds, TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
 /// Lower the OpenAI Chat wire type into the structured internal chat request.
 /// Chat template rendering and tool constraints deliberately happen later in
-/// `ChatPreprocessor`, where inference and render-only entry points share them.
-pub(crate) fn lower_chat_request(
-    config: &RendererConfig,
-    request: CreateChatCompletionRequest,
-    response_id: &str,
-) -> Result<ChatRequest, RendererError> {
-    lower_chat_request_with_template_args(config, request, response_id, None, false)
-}
-
+/// `ChatPreprocessor`, where every transport shares them.
 pub(crate) fn lower_chat_request_with_template_args(
     config: &RendererConfig,
     request: CreateChatCompletionRequest,
@@ -188,7 +180,7 @@ pub(crate) fn lower_text_completion_request(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,
-) -> Result<Vec<TextRequest>, RendererError> {
+) -> Result<Vec<CompletionRequest>, RendererError> {
     let prompts = text_completion_prompts(&request.prompt)?;
     let (sampling, n, choice_count, metadata) =
         completion_lowering_context(config, request, prompts.len())?;
@@ -197,10 +189,9 @@ pub(crate) fn lower_text_completion_request(
         for sample_index in 0..n {
             let index = prompt_index * n + sample_index;
             requests.push(
-                TextRequest::text(
+                CompletionRequest::new(
                     format!("{response_id}-{index}"),
                     prompt.clone(),
-                    true,
                     completion_generation_options(request, sampling.clone()),
                 )
                 .with_metadata(metadata.clone()),

@@ -34,6 +34,7 @@ use crate::http::{
     error::{error_payload, openai_error, renderer_status},
     submission::{collect_output, merge_indexed, submit_generate_requests},
 };
+use crate::protocol::openai::lower_chat_request_with_template_args;
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -88,20 +89,22 @@ async fn chat_completions(
             .config()
             .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let chat = match state
-        .renderer
-        .prepare_chat_with_template_args(
-            request,
-            &response_id,
-            crate::service::ChatLoweringOptions {
-                chat_template_args: chat_template_kwargs,
-                continue_final_message,
-                sampling_overrides,
-                metadata: extensions.metadata(model.clone()),
-            },
-        )
-        .await
-    {
+    let mut chat_request = match lower_chat_request_with_template_args(
+        state.renderer.config(),
+        request,
+        &response_id,
+        chat_template_kwargs,
+        continue_final_message,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            let status = renderer_status(&error);
+            return openai_error(status, error.to_string(), false);
+        }
+    };
+    sampling_overrides.apply(&mut chat_request.sampling_params);
+    chat_request.metadata = extensions.metadata(model.clone());
+    let chat = match state.renderer.prepare_chat(chat_request).await {
         Ok(chat) => chat,
         Err(error) => {
             let status = renderer_status(&error);
@@ -494,11 +497,13 @@ mod tests {
 
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::http::test_utils::{chat_submitted, chunk};
-    use crate::protocol::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
+    use crate::protocol::openai::{
+        ChatSamplingDefaults as SamplingDefaults, chat_sampling_params,
+        lower_chat_request_with_template_args,
+    };
     use crate::{
-        GenerateRequestMetadata, GenerationOutputExtras, NoTokenizer, RendererConfig,
-        RendererLimits, RendererService, SamplingDefaults as ModelSamplingDefaults,
-        SamplingParamsOverrides,
+        GenerationOutputExtras, NoTokenizer, RendererConfig, RendererLimits, RendererService,
+        SamplingDefaults as ModelSamplingDefaults,
     };
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
@@ -543,17 +548,11 @@ mod tests {
             "n": choices
         }))
         .unwrap();
+        let chat =
+            lower_chat_request_with_template_args(&config, request, "chatcmpl-test", None, false)
+                .unwrap();
         RendererService::new(config, Arc::new(NoTokenizer))
-            .lower_chat_with_options(
-                request,
-                "chatcmpl-test",
-                crate::service::ChatLoweringOptions {
-                    chat_template_args: None,
-                    continue_final_message: false,
-                    sampling_overrides: SamplingParamsOverrides::default(),
-                    metadata: GenerateRequestMetadata::default(),
-                },
-            )
+            .preprocess_chat(chat)
             .unwrap()
             .response_processor
     }
