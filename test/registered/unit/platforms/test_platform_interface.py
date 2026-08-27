@@ -351,6 +351,9 @@ class TestNpuDeviceMixin(CustomTestCase):
             mock_npu.get_device_properties.assert_called_once_with(1)
             self.assertEqual(base.get_current_memory_usage(), 5 * 10**8)
             mock_npu.max_memory_allocated.assert_called_once_with(None)
+            device = torch.device("npu", 0)
+            base.get_current_memory_usage(device)
+            mock_npu.max_memory_allocated.assert_called_with(device)
             self.assertEqual(base.get_available_memory(2), (10**9, 2 * 10**9))
             mock_npu.mem_get_info.assert_called_once_with(2)
 
@@ -383,6 +386,7 @@ class TestNpuDeviceMixin(CustomTestCase):
         self.assertTrue(base.is_pin_memory_available(device="npu"))
         self.assertTrue(base.is_pin_memory_available(device=torch.device("npu", 0)))
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
+        self.assertFalse(base.is_pin_memory_available(device=torch.device("cpu")))
 
     def test_default_seed_everything_seeds_npu(self):
         mock_npu = MagicMock()
@@ -398,11 +402,27 @@ class TestNpuDeviceMixin(CustomTestCase):
         mock_torch_seed.assert_called_once_with(123)
         mock_npu.manual_seed_all.assert_called_once_with(123)
 
+    def test_seed_everything_none_seed_is_noop(self):
+        mock_npu = MagicMock()
+        with (
+            patch.object(torch, "npu", mock_npu, create=True),
+            patch("torch.manual_seed") as mock_torch_seed,
+            patch("sglang.srt.platforms.device_mixin.np.random.seed") as mock_np_seed,
+            patch("sglang.srt.platforms.device_mixin.random.seed") as mock_random_seed,
+        ):
+            NpuSRTPlatform.seed_everything(None)
+        mock_random_seed.assert_not_called()
+        mock_np_seed.assert_not_called()
+        mock_torch_seed.assert_not_called()
+        mock_npu.manual_seed_all.assert_not_called()
+
     def test_npu_srt_platform_identity(self):
         base = NpuSRTPlatform()
         self.assertTrue(base.is_npu())
         self.assertFalse(base.is_cuda())
         self.assertFalse(base.is_cuda_alike())
+        self.assertEqual(base.device_name, "npu")
+        self.assertEqual(base.device_type, "npu")
 
     def test_get_default_attention_backend_is_ascend(self):
         self.assertEqual(NpuSRTPlatform().get_default_attention_backend(), "ascend")
