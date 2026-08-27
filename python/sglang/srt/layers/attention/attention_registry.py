@@ -114,6 +114,15 @@ def create_aiter_backend(runner):
     return AiterAttnBackend(runner)
 
 
+@register_attention_backend("moonmath_mla")
+def create_moonmath_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("moonmath_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.moonmath_mla_backend import MoonmathMLABackend
+
+    return MoonmathMLABackend(runner)
+
+
 @register_attention_backend("wave")
 def create_wave_backend(runner):
     from sglang.srt.layers.attention.wave_backend import WaveAttnBackend

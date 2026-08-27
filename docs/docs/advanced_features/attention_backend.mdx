@@ -299,6 +299,15 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Moonmath MLA (ROCm)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ (aiter)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ (aiter)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
   </tbody>
 </table>
 
@@ -692,6 +701,31 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend wave
+```
+
+- Moonmath MLA (AMD ROCm, MI300X)
+  - Requires `moonmath-attention` from [github.com/moonmath-ai/amd-kernels](https://github.com/moonmath-ai/amd-kernels), and `--kv-cache-dtype fp8_e4m3`
+  - Serves absorbed MLA with A16W8 (bf16 Q / fp8 KV) at H≤16: decode, plus the speculative verify pass through a multi-query draft window of 4..8 tokens, which aiter's asm MLA has no kernel for. Set `SGLANG_MOONMATH_MLA_MULTIQ_VERIFY=0` to force verify back to aiter.
+  - Prefill falls back to aiter, with Q zero-padded to aiter's 16-head minimum at head counts it cannot serve (Kimi-K3 has 12 per rank at TP8).
+```bash Command
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --attention-backend moonmath_mla \
+  --kv-cache-dtype fp8_e4m3 \
+  --trust-remote-code
+```
+  With speculative decoding, the draft window must land in 4..8 for the verify pass to take the multi-query kernel; a DSpark block size of 7 gives a window of 8. Kimi-K3 additionally needs `SGLANG_USE_AITER=1` for the gfx942 MXFP4 MoE route.
+```bash Command
+SGLANG_USE_AITER=1 python3 -m sglang.launch_server \
+  --tp 8 \
+  --model moonshotai/Kimi-K3 \
+  --attention-backend moonmath_mla \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path RadixArk/Kimi-K3-DSpark \
+  --speculative-dspark-block-size 7 \
+  --trust-remote-code
 ```
 
 - FlexAttention
