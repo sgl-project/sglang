@@ -1647,7 +1647,7 @@
                 "TextEncodingStage": 327.33,
                 "DecodingStage": 1357.99,
                 "TimestepPreparationStage": 1.32,
-                "ImageEncodingStage": 22.1,
+                "ImageEncodingStage": 451.16,
                 "LatentPreparationStage": 0.1,
                 "DenoisingStage": 96179.65,
                 "ImageVAEEncodingStage": 910.6
