@@ -16,26 +16,17 @@ SGLang supports this checkpoint through the native `multimodal_gen` runtime. The
 
 ## 2. SGLang-diffusion Installation
 
-Install SGLang with the diffusion extra before running the native generation pipeline:
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
 
-```bash Command
-cd /path/to/sglang
-pip install uv
-uv pip install -e "python[diffusion]" --prerelease=allow
-```
-
-For general environment setup, see the [SGLang Diffusion installation guide](../../../docs/sglang-diffusion/installation).
+Please refer to the [official SGLang-diffusion installation guide](../../../docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
 ### 3.1 Offline Image Generation
 
-Run `sglang generate` from the SGLang repository root. If you are using an editable source checkout, set `PYTHONPATH` so the command resolves to the local `python/` package:
+SenseNova-U1.5-8B-MoT is a text-to-image model. You can run a single offline generation job with `sglang generate`:
 
 ```bash Command
-cd /workspace/sglang
-export PYTHONPATH=/workspace/sglang/python
-
 sglang generate \
   --model-path sensenova/SenseNova-U1.5-8B-MoT \
   --prompt "A cinematic mountain lake at sunrise, realistic photography." \
@@ -47,34 +38,80 @@ sglang generate \
   --output-file-path output_sensenova_u15.png
 ```
 
-For a local checkpoint, pass the local model directory:
+### 3.2 Recommended Resolutions
 
-```bash Command
-sglang generate \
-  --model-path /workspace/models/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT \
-  --prompt "A clean technology poster with structured layout and clear typography." \
-  --width 2304 \
-  --height 4096 \
-  --num-outputs-per-prompt 1 \
-  --guidance-scale 4.0 \
-  --num-inference-steps 50 \
-  --seed 42 \
-  --output-file-path output_sensenova_u15_4k.png
-```
+SenseNova-U1 was trained around the 2K-pixel resolution tier. Although the pipeline supports arbitrary `--width` and `--height` values, generation quality may degrade for untrained size combinations.
 
-### 3.2 Resolution Requirements
-
-SenseNova-U1.5-8B-MoT requires both `--width` and `--height` to be divisible by `32`. The pipeline validates this before generation so unsupported sizes fail with a clear error instead of a model-internal reshape error.
-
-Common aligned resolutions:
+Recommended resolution tiers:
 
 | Aspect ratio | Resolution |
 | --- | --- |
 | 1:1 | `2048 x 2048` |
-| 9:16 | `2016 x 3584` |
+| 16:9 / 9:16 | `2720 x 1536` / `1536 x 2720` |
+| 3:2 / 2:3 | `2496 x 1664` / `1664 x 2496` |
+| 4:3 / 3:4 | `2368 x 1760` / `1760 x 2368` |
+| 2:1 / 1:2 | `2880 x 1440` / `1440 x 2880` |
+| 3:1 / 1:3 | `3456 x 1152` / `1152 x 3456` |
 | 9:16 4K | `2304 x 4096` |
-| 16:9 | `4096 x 2304` |
 
-Do not use `2160 x 3840` for 9:16 generation with this model: the aspect ratio is correct, but `2160` is not divisible by `32`.
+## 4. API Usage
 
-High-resolution poster generation can be memory intensive. If `2304 x 4096` does not fit on your GPU, try `2016 x 3584` first and then upscale offline.
+For complete API documentation, please refer to the [official API usage guide](../../../docs/sglang-diffusion/api/openai_api).
+
+### 4.1 Generate an Image
+
+```python Example
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.generate(
+    model="sensenova/SenseNova-U1.5-8B-MoT",
+    prompt="A clean technology poster with structured layout and clear typography.",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(response.data[0].b64_json)
+with open("output_sensenova_u15.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+## 5. Benchmark
+
+Test Environment:
+
+- Hardware: RTX40 series
+- Model: sensenova/SenseNova-U1.5-8B-MoT
+- Docker Image: TBD
+- SGLang diffusion version: TBD
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Generate an image
+
+**Server Command**:
+
+```shell Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000
+```
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+  --dataset vbench \
+  --task text-to-image \
+  --num-prompts 1 \
+  --max-concurrency 1 \
+  --port 30000
+```
+
+**Result**:
+
+```text Output
+TBD
+```
