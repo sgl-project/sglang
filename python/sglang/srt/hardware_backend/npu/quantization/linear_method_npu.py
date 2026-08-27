@@ -10,7 +10,6 @@ from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
     npu_dynamic_quantize_weight,
     npu_format_online_dense_scale,
     npu_format_online_dense_weight,
-    npu_quantize_w4a4_dense_weight,
 )
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
@@ -117,14 +116,9 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
         loader.register_source(weight)
 
     def _quantize_loaded_weight(self, layer: torch.nn.Module) -> None:
-        if self.spec.mode == "w4a4_int4":
-            quantized_weight, weight_scale = npu_quantize_w4a4_dense_weight(
-                layer.weight.data
-            )
-        else:
-            quantized_weight, weight_scale = npu_dynamic_quantize_weight(
-                layer.weight.data, self.spec
-            )
+        quantized_weight, weight_scale = npu_dynamic_quantize_weight(
+            layer.weight.data, self.spec
+        )
         copy_or_rebind_param(
             layer,
             "weight",
@@ -168,20 +162,6 @@ class NPUOnlineW8A8Int8LinearMethod(_NPUOnlineIntegerLinearMethod):
     quant_mode = "w8a8_int8"
 
 
-class NPUOnlineW4A4Int4LinearMethod(_NPUOnlineIntegerLinearMethod):
-    """Online W4A4 INT4 method for unquantized dense NPU linear layers."""
-
-    quant_mode = "w4a4_int4"
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return _apply_w4a4_dynamic_linear(layer=layer, x=x, bias=bias)
-
-
 _W8A8_LINEAR_PROJECTIONS = frozenset(
     {
         "q_proj",
@@ -195,7 +175,6 @@ _W8A8_LINEAR_PROJECTIONS = frozenset(
         "down_proj",
     }
 )
-_W4A4_LINEAR_PROJECTIONS = frozenset({"gate_proj", "up_proj", "gate_up_proj"})
 
 
 def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]:
@@ -206,8 +185,8 @@ def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]
     projection = prefix.rsplit(".", 1)[-1]
     if projection not in _W8A8_LINEAR_PROJECTIONS:
         return None
-    if spec.mode == "w4a4_int4" and projection in _W4A4_LINEAR_PROJECTIONS:
-        return NPUOnlineW4A4Int4LinearMethod()
+    # w4a4_int4 is mixed precision: dense projections stay W8A8 while MoE
+    # w13 uses W4A4 and w2 uses W8A8.
     return NPUOnlineW8A8Int8LinearMethod()
 
 

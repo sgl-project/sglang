@@ -713,8 +713,7 @@ class ServerArgs:
         Arg(
             help=(
                 "The online quantization method. Ascend integer online "
-                "quantization supports full-precision FP16 checkpoints; use "
-                "--dtype float16."
+                "quantization supports full-precision FP16 and BF16 checkpoints."
             ),
             choices=ONLINE_QUANTIZATION_CHOICES,
             resolvable=True,

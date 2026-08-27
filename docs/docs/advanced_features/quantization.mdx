@@ -824,6 +824,13 @@ For more detailed examples of quantization of models, as well as information abo
 
 ## Online Quantization
 
+On Ascend, `--online-quantization w8a8_int8` converts supported attention and
+MLP projections from a full-precision FP16/BF16 checkpoint to W8A8 at load time.
+`--online-quantization w4a4_int4` is a mixed dense/MoE mode: dense projections,
+including `gate_up_proj` and `down_proj`, use W8A8; routed MoE `w13` uses W4A4
+and `w2` uses W8A8. Embeddings, language-model heads, and MoE routers remain in
+their original precision. FP16 and BF16 checkpoints are supported.
+
 To enable online quantization, you can simply specify `--quantization` in the command line. For example, you can launch the server with the following command to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`:
 
 ```bash Command

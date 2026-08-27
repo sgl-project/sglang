@@ -58,11 +58,10 @@ def get_npu_online_moe_integer_quant_spec(
 
 
 def validate_npu_online_source_dtype(params_dtype: torch.dtype) -> None:
-    if params_dtype != torch.float16:
+    if params_dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
-            "Ascend online integer quantization currently requires --dtype "
-            "float16; the dynamic-scale matmul contract does not support "
-            "non-FP16 output."
+            "Ascend online integer quantization requires an FP16 or BF16 "
+            f"checkpoint dtype, got {params_dtype}."
         )
 
 
@@ -110,30 +109,6 @@ def _convert_packed_int4_weight(weight: torch.Tensor) -> torch.Tensor:
     return converted.reshape(*weight.shape[:-2], input_size, output_size // 8)
 
 
-def npu_quantize_w4a4_dense_weight(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply ModelSlim-compatible symmetric per-channel INT4 quantization."""
-    if weight.dim() != 2:
-        raise ValueError(
-            "Ascend W4A4 dense weights must be two-dimensional, got "
-            f"shape {tuple(weight.shape)}."
-        )
-
-    scale = weight.abs().amax(dim=-1) / 7.0
-    # ModelSlim clamps with FP32 epsilon cast to the source dtype. Using the
-    # much larger FP16 machine epsilon changes small-channel scales.
-    eps = torch.tensor(
-        torch.finfo(torch.float32).eps, dtype=weight.dtype, device=weight.device
-    )
-    scale = scale.clamp_min(eps)
-    quantized = torch.round(weight / scale.unsqueeze(-1))
-    quantized = quantized.clamp_(-8, 7).to(torch.int32)
-    # aclnnQuantMatmulV5 requires dense A4W4 x2Scale to be FP32 on the target
-    # CANN/torch_npu runtime.
-    return quantized, scale.to(torch.float32)
-
-
 def npu_format_online_weight(
     weight: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
 ) -> torch.Tensor:
@@ -149,20 +124,6 @@ def npu_format_online_weight(
 def npu_format_online_dense_weight(
     weight: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
 ) -> torch.Tensor:
-    if spec.mode == "w4a4_int4":
-        if weight.dtype != torch.int32:
-            raise TypeError(
-                "Ascend W4A4 dense quantization must produce torch.int32, got "
-                f"{weight.dtype}."
-            )
-        if weight.shape[-2] % 8:
-            raise ValueError(
-                "Ascend W4A4 dense output size must be divisible by 8, got "
-                f"{weight.shape[-2]}."
-            )
-        # Match SGLang's working offline ModelSlim path exactly.
-        weight = weight.transpose(-2, -1).contiguous()
-        return torch.ops.npu.npu_convert_weight_to_int4pack(weight)
     return npu_format_online_weight(weight, spec)
 
 
