@@ -335,7 +335,7 @@ def npu_w8a8_block_fp8_linear(
         original_dtype = torch.bfloat16
 
     orig_shape = input.shape
-    input_2d = input.reshape(-1, orig_shape[-1]).contiguous()
+    input_2d = input.view(-1, orig_shape[-1]).contiguous()
 
     x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
         input_2d, dst_type=torch.float8_e4m3fn

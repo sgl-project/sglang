@@ -3641,7 +3641,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if _should_dequant_fp8_wo_a(self.quant_config):
+        if not (_FP8_WO_A_GEMM or _use_npu_a5_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
