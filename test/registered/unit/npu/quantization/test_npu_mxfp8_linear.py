@@ -64,20 +64,11 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         )
         self.assertTrue(layer.weight_scale_inv.format_ue8m0)
 
-    def test_requantizes_non_128_block_fp8_weights_for_arch35_mxfp8(self):
-        layer = SimpleNamespace(
-            weight=torch.nn.Parameter(
-                torch.ones(64, 128, dtype=torch.float8_e4m3fn), requires_grad=False
-            ),
-            weight_scale_inv=torch.nn.Parameter(
-                torch.ones(1, 1, dtype=torch.float32), requires_grad=False
-            ),
-        )
-        process_npu_arch35_mxfp8_linear_weights(layer, [64, 128])
-
-        self.assertEqual(layer.weight.data.shape, (128, 64))
-        self.assertEqual(layer.weight_scale_inv.data.shape, (2, 64, 2))
-        self.assertTrue(layer.weight_scale_inv.format_ue8m0)
+    def test_rejects_non_ue8m0_scale_format(self):
+        with self.assertRaisesRegex(ValueError, "scale_fmt='ue8m0'"):
+            process_npu_arch35_mxfp8_linear_weights(
+                SimpleNamespace(), [128, 128], scale_fmt="float32"
+            )
 
     def test_rejects_non_fp8_weight(self):
         with self.assertRaisesRegex(ValueError, "expects float8_e4m3fn weights"):
