@@ -945,7 +945,8 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
     {
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
-        "DeepseekV4ForCausalLM",
+        # DeepseekV4 is absent on purpose: under EP + NextN its workspace
+        # creation barriers against the cuda-graph capture loop's own barrier.
         "GptOssForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm4MoeForCausalLM",
