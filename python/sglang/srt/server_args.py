@@ -426,6 +426,11 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
+LINEAR_ATTN_DECODE_BACKEND_CHOICES = [
+    *LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+    "hip",
+]
+
 
 # Allow external code to add more choices
 def add_load_format_choices(choices):
@@ -490,6 +495,7 @@ def add_rl_on_policy_target_choices(choices):
 
 def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+    LINEAR_ATTN_DECODE_BACKEND_CHOICES.extend(choices)
 
 
 @dataclasses.dataclass
@@ -2720,7 +2726,7 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only; the HIP backend is GDN decode-only and must be selected with --linear-attn-decode-backend.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -2728,15 +2734,15 @@ class ServerArgs:
     linear_attn_decode_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend. HIP is currently limited to non-speculative Qwen3.5 GDN on ROCm gfx95; unsupported GDN scopes fall back to Triton.",
+            choices=LINEAR_ATTN_DECODE_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
     ] = None
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer. HIP is not a prefill backend.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
