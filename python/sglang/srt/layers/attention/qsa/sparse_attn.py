@@ -1,4 +1,9 @@
-"""Validated sparse GQA operators migrated from the QSA reference branch."""
+"""Validated sparse GQA operators migrated from the QSA reference branch.
+
+``qsa_sparse_decode_triton`` is the package-independent decode path: it maps
+logical QSA selections through ``req_to_token`` and reads the paged KV pool
+directly, avoiding both the packed scratch copy and a flash-attn dependency.
+"""
 
 from typing import Optional
 
@@ -310,6 +315,209 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
 
 
 @triton.jit
+def _qsa_sparse_decode(
+    q,
+    k,
+    v,
+    out,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    scale,
+    topk,
+    sq_m: tl.constexpr,
+    sq_h: tl.constexpr,
+    sq_d: tl.constexpr,
+    sk_n: tl.constexpr,
+    sk_h: tl.constexpr,
+    sk_d: tl.constexpr,
+    sv_n: tl.constexpr,
+    sv_h: tl.constexpr,
+    sv_d: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
+    sr_m: tl.constexpr,
+    sr_n: tl.constexpr,
+    si_m: tl.constexpr,
+    si_n: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    req = tl.load(req_indices + row)
+    seq_len = tl.load(seq_lens + row)
+
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_values = tl.load(
+        q
+        + row * sq_m
+        + (kv_head * GROUP_SIZE + offs_h[:, None]) * sq_h
+        + offs_d[None, :] * sq_d,
+        mask=(offs_h < GROUP_SIZE)[:, None],
+        other=0.0,
+    )
+    max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    normalizer = tl.zeros([BLOCK_M], tl.float32)
+    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+    for start in range(0, topk, BLOCK_N):
+        cols = start + offs_n
+        logical = tl.load(
+            indices + row * si_m + cols * si_n,
+            mask=cols < topk,
+            other=-1,
+        )
+        valid = (cols < topk) & (logical >= 0) & (logical < seq_len)
+        slots = tl.load(
+            req_to_token + req * sr_m + tl.where(valid, logical, 0) * sr_n,
+            mask=valid,
+            other=0,
+        )
+        keys = tl.load(
+            k
+            + slots[None, :] * sk_n
+            + kv_head * sk_h
+            + offs_d[:, None] * sk_d,
+            mask=valid[None, :],
+            other=0.0,
+        )
+        values = tl.load(
+            v
+            + slots[:, None] * sv_n
+            + kv_head * sv_h
+            + offs_d[None, :] * sv_d,
+            mask=valid[:, None],
+            other=0.0,
+        )
+        scores = tl.where(
+            valid[None, :],
+            tl.dot(q_values, keys) * scale * 1.4426950408889634,
+            -float("inf"),
+        )
+        has_values = tl.sum(valid.to(tl.int32), axis=0) > 0
+        block_max = tl.max(scores, axis=1)
+        next_max = tl.where(has_values, tl.maximum(max_value, block_max), max_value)
+        alpha = tl.where(has_values, tl.math.exp2(max_value - next_max), 1.0)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype),
+            values,
+            accumulator * alpha[:, None],
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+        max_value = next_max
+
+    output = tl.where(
+        normalizer[:, None] > 0,
+        accumulator / normalizer[:, None],
+        0.0,
+    )
+    tl.store(
+        out
+        + row * so_m
+        + (kv_head * GROUP_SIZE + offs_h[:, None]) * so_h
+        + offs_d[None, :] * so_d,
+        output,
+        mask=(offs_h < GROUP_SIZE)[:, None],
+    )
+
+
+def qsa_sparse_decode_triton(
+    q,
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    indices,
+    seq_lens,
+    scale,
+):
+    """Sparse GQA decode over logical token indices and the live paged KV pool.
+
+    All rows, including CUDA-graph padding rows, are launched uniformly. A row
+    with no valid selected token returns zero without dereferencing the request
+    table or KV cache through an invalid logical index.
+    """
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("q, k and v must be rank-3 tensors")
+    if q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("QSA Triton decode requires BF16 Q/K/V tensors")
+    if not q.is_cuda or not k.is_cuda or not v.is_cuda:
+        raise ValueError("QSA Triton decode requires CUDA Q/K/V tensors")
+    rows, num_q_heads, head_dim = q.shape
+    if head_dim not in (128, 256):
+        raise ValueError(
+            f"QSA Triton decode supports head_dim 128 or 256, got {head_dim}"
+        )
+    if k.shape != v.shape or k.shape[2] != head_dim:
+        raise ValueError("QSA Triton decode requires matching K/V cache shapes")
+    num_kv_heads = k.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("QSA query heads must be divisible by KV heads")
+    if indices.ndim != 2 or indices.shape[0] != rows:
+        raise ValueError("QSA decode indices must be [query_rows, topk]")
+    if req_to_token.ndim != 2:
+        raise ValueError("QSA req_to_token must be rank 2")
+    if req_indices.numel() != rows or seq_lens.numel() != rows:
+        raise ValueError(
+            "QSA request indices and sequence lengths must match query rows"
+        )
+    if not all(
+        tensor.is_cuda
+        for tensor in (req_to_token, req_indices, indices, seq_lens)
+    ):
+        raise ValueError("QSA decode metadata must be CUDA tensors")
+
+    group_size = num_q_heads // num_kv_heads
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n = 64
+    out = torch.empty_like(q)
+    _qsa_sparse_decode[(rows, num_kv_heads)](
+        q,
+        k,
+        v,
+        out,
+        req_to_token,
+        req_indices,
+        indices,
+        seq_lens,
+        scale,
+        indices.shape[1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        req_to_token.stride(0),
+        req_to_token.stride(1),
+        indices.stride(0),
+        indices.stride(1),
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_warps=8,
+        num_stages=2,
+    )
+    return out
+
+
+@triton.jit
 def _fa2_valid_counts(
     seq_lens,
     indices,
@@ -448,6 +656,7 @@ def qwen_sparse_kv_extraction_compact_triton(
 
 
 __all__ = [
+    "qsa_sparse_decode_triton",
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
