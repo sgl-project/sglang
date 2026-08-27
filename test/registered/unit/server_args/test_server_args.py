@@ -1598,6 +1598,25 @@ class TestDecoupledSpecArgs(CustomTestCase):
 
 
 class TestAdaptiveSpecArgs(CustomTestCase):
+    def test_multi_layer_eagle_rejects_non_mtp_llama_before_autofill(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE"
+        args.enable_multi_layer_eagle = True
+        args.device = "cuda"
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--enable-multi-layer-eagle requires a model with embedded MTP "
+            "draft layers; it is not supported for LlamaForCausalLM",
+        ):
+            handle_speculative_decoding(args)
+
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(

@@ -707,6 +707,23 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]
+    multi_layer_eagle_archs = {
+        "InklingForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "Step3p5ForCausalLM",
+        "Step3p7ForConditionalGeneration",
+    }
+    if (
+        resolved_view(server_args).enable_multi_layer_eagle
+        and model_arch not in multi_layer_eagle_archs
+    ):
+        raise ValueError(
+            "--enable-multi-layer-eagle requires a model with embedded MTP "
+            "draft layers; it is not supported for "
+            f"{model_arch}."
+        )
+
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
