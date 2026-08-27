@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups import pd_disaggregation_hook
+from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.entrypoints.sidecar import (
@@ -223,7 +223,7 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
             model_path="dummy", mm_enable_dp_encoder=True, tp_size=1
         )
 
-        with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
+        with self.assertLogs(parallel_hook.logger, level="WARNING") as logs:
             server_args._handle_data_parallelism()
 
         self.assertIn("TP=1", logs.output[0])
@@ -234,7 +234,7 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
             model_path="dummy", mm_enable_dp_encoder=True, tp_size=4
         )
 
-        with self.assertLogs(server_args_module.logger, level="INFO") as logs:
+        with self.assertLogs(parallel_hook.logger, level="INFO") as logs:
             server_args._handle_data_parallelism()
 
         self.assertIn("TP=4", logs.output[0])

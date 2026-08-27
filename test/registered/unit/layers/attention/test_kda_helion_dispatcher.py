@@ -159,8 +159,11 @@ class TestHelionKDADispatcher(unittest.TestCase):
 
     def test_replayssm_accepts_helion_and_rejects_other_backends(self):
         with (
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=False),
-            patch("sglang.srt.server_args.is_cuda", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
+                return_value=False,
+            ),
+            patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
         ):
             helion_args = ServerArgs(
                 model_path="dummy",
@@ -184,8 +187,11 @@ class TestHelionKDADispatcher(unittest.TestCase):
             mamba_ssm_dtype="bfloat16",
         )
         with (
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=True),
-            patch("sglang.srt.server_args.is_cuda", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
         ):
             args._handle_linear_attn_backend()
 
