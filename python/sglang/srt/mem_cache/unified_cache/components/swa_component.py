@@ -80,6 +80,11 @@ class SWAComponent(TreeComponent):
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.swa_is_index_addressed = getattr(kvcache, "swa_is_index_addressed", True)
+        # Set by a future request-relative restore path only after that path is
+        # fully wired for this cache instance.
+        self.swa_restore_wired = False
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -108,6 +113,14 @@ class SWAComponent(TreeComponent):
                 dirty.append(cur)
             cur = cur.parent
         return dirty
+
+    @property
+    def reused_swa_is_trustworthy(self) -> bool:
+        return self.swa_is_index_addressed or self.swa_restore_wired
+
+    @property
+    def participates_in_linker(self) -> bool:
+        return self.swa_is_index_addressed
 
     def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
         return bool(self._dirty_backup_window(node))
@@ -305,11 +318,10 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         state = {"len": float("inf")}
 
-        # unified_kv never caches the SWA ring (per-request, not content-stable),
-        # so SWA bookkeeping must not gate the match here.
-        swa_device_only_hicache = (
-            not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
-        )
+        # A request-relative SWA ring is not represented by tree component
+        # values. Let FULL drive the match while the scheduler re-prefills the
+        # untrusted tail (or a future restore path makes it trustworthy).
+        reused_swa_is_untrustworthy = not self.reused_swa_is_trustworthy
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -317,7 +329,7 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if swa_device_only_hicache and (node.backuped or not node.evicted):
+                if reused_swa_is_untrustworthy and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)
@@ -1016,8 +1028,8 @@ class SWAComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
-        # unified_kv keeps SWA as a device-only ring.
-        if not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache:
+        # A request-relative SWA ring has no page-indexed HiCache pool.
+        if not self.swa_is_index_addressed:
             return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:

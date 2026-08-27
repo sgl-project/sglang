@@ -3070,21 +3070,17 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._sliding_window_size
 
     def swa_reprefill_tail_tokens(self) -> int:
-        """
-        Only unified_kv + HiCache needs this: SWA lives in a per-request ring
-        (state_slot/pos), not content-stable and never offloaded to host, so a
-        reused prefix's trailing sliding window would read another request's
-        stale ring slots. Re-prefilling that window rewrites this request's ring
-        (what plain radix reuse does via its SWA match gate). 0 for every other
-        layout.
+        """Return the SWA tail held out of cross-request prefix reuse.
+
+        Unified-KV stores SWA in a request-relative ring, so another request
+        cannot trust those ring slots unless an explicit restore path has
+        populated them. Re-prefilling one window is the existing mitigation,
+        but is not bit-exact; see sglang#34562.
         """
         swa = self.components.get(ComponentType.SWA)
-        unified_compress_only_hicache = (
-            self.cache_controller is not None
-            and swa is not None
-            and not self.tree_core.has_swa_host_pool
-        )
-        return swa.sliding_window_size if unified_compress_only_hicache else 0
+        if swa is None or swa.reused_swa_is_trustworthy:
+            return 0
+        return swa.sliding_window_size
 
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:

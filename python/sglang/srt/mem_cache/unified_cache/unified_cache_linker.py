@@ -19,9 +19,11 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -35,6 +37,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -44,8 +47,83 @@ from sglang.srt.mem_cache.utils import get_hash_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+        DevicePoolGroup,
+    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+
+DIRECT_LINKER_CACHE_SCHEMA_VERSION = 1
+
+
+def with_direct_linker_cache_layout_tag(
+    extra_config: dict | None,
+    *,
+    kvcache: Any,
+    pool_group: DevicePoolGroup,
+    pp_rank: int,
+    pp_size: int,
+) -> dict:
+    """Return storage config namespaced by the direct-linker byte layout.
+
+    DeepSeek-V4's paged and unified KV layouts use the same logical pool names
+    for incompatible bytes.  Keep the user's tag as the outer namespace, then
+    append a deterministic schema tag before either storage backend constructs
+    its key prefix. This intentionally makes pre-schema DSV4 entries cold-miss
+    after an upgrade instead of risking a cross-layout hit.
+    """
+    config = dict(extra_config or {})
+
+    # Check the resolved names first so generic linker paths do not import the
+    # model-specific pool module. The subsequent isinstance also covers
+    # platform subclasses without relying on duck typing or class-name strings.
+    dsv4_pools = {
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+    }
+    if not dsv4_pools.intersection(pool_group.entry_map):
+        return config
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4TokenToKVPool,
+    )
+
+    if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+        return config
+
+    indexer_pool = kvcache.c4_indexer_kv_pool
+    if not hasattr(indexer_pool, "use_fp4_indexer"):
+        raise ValueError("DeepSeek-V4 indexer pool does not expose its wire format.")
+
+    layout = "unified-bf16" if kvcache._unified_kv else "paged"
+    indexer = "fp4" if indexer_pool.use_fp4_indexer else "int8"
+    pp_size = int(pp_size)
+    if pp_size <= 0 or not 0 <= int(pp_rank) < pp_size:
+        raise ValueError(
+            "Invalid DeepSeek-V4 PP layout for external-cache namespace: "
+            f"pp_rank={pp_rank}, pp_size={pp_size}."
+        )
+
+    # Do not recompute layer ranges here: the model partitions over
+    # num_hidden_layers, compression_ratios also counts the NextN/MTP layer.
+    partition = os.getenv("SGLANG_PP_LAYER_PARTITION")
+    partition = "auto" if partition is None else partition.replace(",", ".")
+
+    layout_tag = (
+        f"ucdl-dsv4-v{DIRECT_LINKER_CACHE_SCHEMA_VERSION}"
+        f"-layout-{layout}-indexer-{indexer}"
+        f"-pp{pp_size}-layers-{partition}"
+    )
+    user_tag = config.get("extra_backend_tag")
+    config["extra_backend_tag"] = (
+        layout_tag if user_tag is None else f"{user_tag}__{layout_tag}"
+    )
+    return config
+
+
+logger = logging.getLogger(__name__)
 
 
 class UnifiedCacheLinker(ABC):
@@ -141,6 +219,11 @@ class UnifiedCacheLinkerWrapper:
     ):
         self.cache = cache
         self.cache_linker = cache_linker
+        self._components = tuple(
+            component
+            for component in cache._components_tuple
+            if component.participates_in_linker
+        )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
@@ -150,6 +233,14 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
+        swa = cache.components.get(ComponentType.SWA)
+        if swa is not None and not swa.participates_in_linker:
+            logger.warning(
+                "Direct external linker with request-relative SWA uses the "
+                "approximate re-prefill path; restored outputs are not "
+                "guaranteed bit-exact with a cold run "
+                "(https://github.com/sgl-project/sglang/issues/34562)."
+            )
 
     @property
     def layer_done_counter(self) -> object:
@@ -172,7 +263,7 @@ class UnifiedCacheLinkerWrapper:
             return result
 
         lookup_transfers = []
-        for component in cache._components_tuple:
+        for component in self._components:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
@@ -270,7 +361,7 @@ class UnifiedCacheLinkerWrapper:
 
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
-        for component in cache._components_tuple:
+        for component in self._components:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
@@ -292,6 +383,21 @@ class UnifiedCacheLinkerWrapper:
             component_transfers,
             prefix_len,
         )
+
+        # Components omitted from the linker do not run their PREPARE hook.
+        # Keep a non-restorable SWA range as tombstones instead of rebuilding
+        # it from an uninitialized FULL-to-SWA mapping during cache.insert().
+        swa = cache.components.get(ComponentType.SWA)
+        if swa is not None and swa not in self._components:
+            if req.kv is None:
+                from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+                req.kv = ReqKvInfo(
+                    kv_allocated_len=prefix_len,
+                    swa_evicted_seqlen=prefix_len,
+                )
+            else:
+                req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, prefix_len)
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
@@ -468,7 +574,7 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         node = cache.resolve_node_handle(node_id)
         transfers = []
-        for component in cache._components_tuple:
+        for component in self._components:
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.OFFLOAD, node, None
             )

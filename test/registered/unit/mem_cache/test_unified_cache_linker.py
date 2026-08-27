@@ -85,6 +85,8 @@ class _MappingRecorder:
 
 def _cache_for_wrapper(**kwargs):
     defaults = {
+        "_components_tuple": (),
+        "components": {},
         "tree_core": SimpleNamespace(enable_external_cache_linker=False),
         "write_through_threshold": 256,
         "pp_size": 1,
@@ -101,6 +103,8 @@ def test_cache_linker_attachment_is_backend_independent():
         write_through_threshold=256,
     )
     cache.linker = None
+    cache._components_tuple = ()
+    cache.components = {}
     linker = _FakeLinker()
 
     cache.init_cache_linker(linker)
@@ -128,6 +132,8 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
 def test_async_offload_pins_node_until_completion():
     class _Component:
+        participates_in_linker = True
+
         def build_external_linker_transfer(self, phase, node, keys):
             assert phase == LinkerTransferPhase.OFFLOAD
             return PoolTransfer(name=PoolName.KV, keys=["page"])
@@ -225,6 +231,8 @@ def test_release_request_cancels_queued_load():
 
 def test_failed_offload_rolls_back_split_fragments():
     class _Component:
+        participates_in_linker = True
+
         def build_external_linker_transfer(self, phase, node, keys):
             return PoolTransfer(name=PoolName.KV, keys=["page"])
 
@@ -300,6 +308,8 @@ def test_split_action_retargets_pending_external_offload():
 
 def test_reset_quiesces_backend_before_releasing_pending_locks():
     class _Component:
+        participates_in_linker = True
+
         def build_external_linker_transfer(self, phase, node, keys):
             return PoolTransfer(name=PoolName.KV, keys=["page"])
 

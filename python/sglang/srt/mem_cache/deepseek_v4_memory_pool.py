@@ -709,6 +709,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
 
+    @property
+    def swa_is_index_addressed(self) -> bool:
+        """Whether SWA slots have content-stable allocator indices.
+
+        The unified-KV layout stores SWA in a request-relative ring, so its
+        contents cannot be restored through the page-indexed linker entry used
+        by the paged layout.
+        """
+        return not self._unified_kv
+
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
