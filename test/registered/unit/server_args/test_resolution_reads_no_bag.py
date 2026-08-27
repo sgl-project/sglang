@@ -205,9 +205,29 @@ def _functions_in(path):
     }
 
 
+def _locally_shadowed_accessors(path):
+    """Accessor names this file imports from somewhere that is not the context.
+
+    `get_device` is both the `device` bag accessor and the hardware probe in
+    `utils.common`. Matching the bare name would report the probe as a bag read,
+    so a name imported from elsewhere in this file is not the accessor.
+    """
+    shadowed = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.endswith("runtime_context"):
+                continue
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name in _BAG_ACCESSORS:
+                    shadowed.add(name)
+    return shadowed
+
+
 def _reaches_a_bag(path, entry):
     """Does `entry` in `path` reach a bag accessor, following calls in-module?"""
     functions = _functions_in(path)
+    shadowed = _locally_shadowed_accessors(path)
     seen = set()
 
     def walk(name):
@@ -225,7 +245,7 @@ def _reaches_a_bag(path, entry):
                 continue
             if not isinstance(node.func, ast.Name):
                 continue
-            if node.func.id in _BAG_ACCESSORS:
+            if node.func.id in _BAG_ACCESSORS and node.func.id not in shadowed:
                 return node.lineno
             found = walk(node.func.id)
             if found is not None:
