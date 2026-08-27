@@ -319,8 +319,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        # This call owns the SWA slot the full index maps to right now:
-        # a cache action later in the same group may re-point it (see free_swa).
+        # Resolve the SWA side before deferring the full side: a cache action
+        # later in this group can re-point free_index at a different SWA slot.
         self.free_swa(free_index)
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
@@ -366,9 +366,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if not self.is_not_in_free_group:
             # Resolve ownership now. A cache action later in this group may
-            # install a new mapping for the same full index. Unmapped entries
-            # are dropped in free_group_end: the mask is data-dependent, so
-            # filtering per call would synchronize.
+            # install a new mapping for the same full index. Queued unfiltered:
+            # the mask is data-dependent, so free_group_end drops the unmapped
+            # zeros once instead of synchronizing on every call.
             self.swa_free_group.append(swa_indices)
             return
 
@@ -379,9 +379,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_free_group = []
 
     def free_group_end(self):
-        # Both sides were resolved at enqueue time, so the flush only returns
-        # physical slots; routing the batch back through free() would re-read a
-        # mapping that no longer describes it.
+        # Must not route the batch back through free() the way the base
+        # implementation does: both sides were resolved at enqueue time, and
+        # the mapping no longer describes these full indices.
         self.is_not_in_free_group = True
         if self.free_group:
             free_group = self.free_group
