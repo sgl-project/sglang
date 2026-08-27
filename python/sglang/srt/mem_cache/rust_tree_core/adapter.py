@@ -431,7 +431,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         binding_result = self._binding.evict_device_next_node(
             int(component_type), _tracker_to_binding(tracker)
         )
-        result = EvictDeviceNextNodeResult(node_id=binding_result.node_id)
+        result = EvictDeviceNextNodeResult(
+            node_id=binding_result.node_id,
+            made_progress=binding_result.made_progress,
+        )
         return _fill_evict_result(binding_result, result)
 
     def evict_device_leaf(

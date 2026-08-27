@@ -666,12 +666,13 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
         .collect()
 }
 
-/// Next-eviction-node step result: the node to evict (None when the walk
-/// is done), this step's per-component evicted counts, and this step's
-/// newly freed tensors.
+/// Next-eviction-node step result: the node to evict, whether the walk made
+/// progress, this step's per-component evicted counts, and this step's newly
+/// freed tensors.
 #[pyclass(get_all)]
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
+    made_progress: bool,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
@@ -1043,9 +1044,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
-    /// The next device leaf to evict, or None when the walk is done; the
-    /// passed running tracker gates the budget, and the result carries this
-    /// step's deltas.
+    /// Advance one component eviction step. A missing node with
+    /// `made_progress` set means an internal tombstone completed the step;
+    /// otherwise a missing node means the walk is exhausted.
     fn evict_device_next_node(
         &self,
         py: Python<'_>,
@@ -1056,8 +1057,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let baseline = tracker_from_py(tracker)?;
         let (node_id, result) =
             py.allow_threads(move || self.core().evict_device_next_node(ct, &baseline));
+        let made_progress = node_id.is_some() || !result.tracker.is_empty();
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
+            made_progress,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,

@@ -262,7 +262,10 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// Begin this component's device-eviction walk (build its cursor/heap).
     fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize);
 
-    /// Return the next device-leaf node for the driver to evict, or None.
+    /// Advance one eviction step and return a device leaf, if selected.
+    ///
+    /// Implementations must return after one allocator-relevant internal
+    /// mutation so the caller can drain pending frees before continuing.
     fn evict_device_next_node(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,

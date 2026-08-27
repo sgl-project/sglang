@@ -647,6 +647,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
     }
 
+    /// Advance one device-eviction step and return a leaf, if selected.
+    ///
+    /// An internal tombstone is one complete step so the caller can apply its
+    /// pending frees and recheck allocator capacity before the next mutation.
     fn evict_device_next_node(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
@@ -701,6 +705,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 Some(tracker),
             );
             tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
+            break None;
         };
         tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
         next

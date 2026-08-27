@@ -595,7 +595,7 @@ fn evict_component_all_frees_both_tiers_without_the_host_lru() {
 }
 
 #[test]
-fn device_walk_tombstones_internal_nodes_and_returns_the_leaf() {
+fn device_walk_advances_one_allocator_mutation_per_call() {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.insert(&insert_params_mamba(&vec![1], &[10], Some(7)));
     tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(8)));
@@ -607,15 +607,21 @@ fn device_walk_tombstones_internal_nodes_and_returns_the_leaf() {
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.evict_device_start(MAMBA, /* request_cnt = */ 2);
-    let (next, step) = tc.evict_device_next_node(MAMBA, &tracker);
+    let (first, step) = tc.evict_device_next_node(MAMBA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
-    // The internal node a tombstoned inline; the device leaf b is handed out.
-    assert_eq!(next, Some(b));
+    // The internal node is a complete step so its free can be reused before
+    // the walk hands out another victim.
+    assert_eq!(first, None);
     assert!(!tc.arena.node(tc.arena.resolve(a)).has_device_value(MAMBA));
     assert!(tc.arena.node(tc.arena.resolve(b)).has_device_value(MAMBA));
     assert!(tc.arena.has_device_value(tc.arena.resolve(a), FULL));
     assert_eq!(tracker[&MAMBA], 1);
     assert!(!tc.device_lru_list(MAMBA).in_list(Some(tc.arena.resolve(a))));
+
+    let (second, step) = tc.evict_device_next_node(MAMBA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    assert_eq!(second, Some(b));
+    assert_eq!(tracker[&MAMBA], 1);
     tc.evict_device_end(MAMBA);
 }
 

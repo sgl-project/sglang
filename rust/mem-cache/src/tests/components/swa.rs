@@ -2599,27 +2599,40 @@ fn swa_tracker() -> HashMap<ComponentType, usize> {
 }
 
 #[test]
-fn evict_walk_tombstones_internal_nodes_and_returns_the_leaf() {
+fn evict_walk_advances_one_allocator_mutation_per_call() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     let [a, b, c] = swa_evict_chain(&mut tc);
     let mut tracker = swa_tracker();
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.evict_device_start(SWA, /* request_cnt = */ 100);
-    let (next, step) = tc.evict_device_next_node(SWA, &tracker);
+    let (first, step) = tc.evict_device_next_node(SWA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
-    // The LRU-first internal nodes a and b are tombstoned inline (their
-    // frees are the FULL slices); the D-leaf c is handed to the driver.
-    assert_eq!(next, Some(tc.arena.node(c).id));
+    // Each internal tombstone is its own step so the allocator can observe
+    // and reuse the freed slice before the walk mutates another node.
+    assert_eq!(first, None);
     assert!(!tc.arena.has_device_value(a, SWA));
+    assert!(tc.arena.has_device_value(b, SWA));
+    assert!(tc.arena.has_device_value(c, SWA));
+    assert_eq!(tracker[&SWA], 1);
+    assert_eq!(device_frees[&SWA].len(), 1);
+    assert!(device_frees[&SWA][0].equal(&Tensor::from_slice(&[10i64])));
+
+    let (second, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    assert_eq!(second, None);
     assert!(!tc.arena.has_device_value(b, SWA));
     assert!(tc.arena.has_device_value(c, SWA));
     assert!(tc.arena.has_device_value(a, FULL));
     assert!(tc.arena.has_device_value(b, FULL));
     assert_eq!(tracker[&SWA], 2);
     assert_eq!(device_frees[&SWA].len(), 2);
-    assert!(device_frees[&SWA][0].equal(&Tensor::from_slice(&[10i64])));
     assert!(device_frees[&SWA][1].equal(&Tensor::from_slice(&[11i64])));
+
+    let (third, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    assert_eq!(third, Some(tc.arena.node(c).id));
+    assert_eq!(tracker[&SWA], 2);
     tc.evict_device_end(SWA);
 }
 
@@ -2645,14 +2658,14 @@ fn evict_walk_stops_at_the_token_budget() {
 #[test]
 fn evict_walk_step_tracker_carries_only_the_deltas_over_the_baseline() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
-    let [_a, _b, c] = swa_evict_chain(&mut tc);
+    let [_a, _b, _c] = swa_evict_chain(&mut tc);
     // A non-zero baseline stands in for prior steps' evictions.
     let baseline = HashMap::from([(FULL, 0), (SWA, 3)]);
     tc.evict_device_start(SWA, /* request_cnt = */ 100);
     let (next, step) = tc.evict_device_next_node(SWA, &baseline);
-    assert_eq!(next, Some(tc.arena.node(c).id));
-    // a and b tombstone inline: the step reports 2, not the 5-token total.
-    assert_eq!(step.tracker[&SWA], 2);
+    assert_eq!(next, None);
+    // One internal node tombstones: the step reports 1, not the running total.
+    assert_eq!(step.tracker[&SWA], 1);
     tc.evict_device_end(SWA);
 }
 
@@ -2667,10 +2680,14 @@ fn evict_walk_skips_locked_nodes() {
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.evict_device_start(SWA, /* request_cnt = */ 100);
-    let (next, step) = tc.evict_device_next_node(SWA, &tracker);
+    let (first, step) = tc.evict_device_next_node(SWA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
-    // a and b tombstone inline; the locked c is invisible to the cursor.
-    assert_eq!(next, None);
+    assert_eq!(first, None);
+    assert_eq!(tracker[&SWA], 1);
+    let (second, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    // a and b tombstone in separate steps; the locked c is invisible.
+    assert_eq!(second, None);
     assert!(tc.arena.has_device_value(c, SWA));
     assert_eq!(tracker[&SWA], 2);
     let _ = (a, b);
@@ -2689,8 +2706,8 @@ fn evict_walk_revalidates_a_delisted_cursor() {
     let mut host_frees = HashMap::new();
     let (next, step) = tc.evict_device_next_node(SWA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
-    // The walk resets to the list's LRU end (b) and reaches the leaf.
-    assert_eq!(next, Some(tc.arena.node(c).id));
+    // The walk resets to the list's LRU end (b) and performs one tombstone.
+    assert_eq!(next, None);
     assert!(tc.arena.has_device_value(a, SWA));
     assert!(!tc.arena.has_device_value(b, SWA));
     tc.evict_device_end(SWA);
@@ -2706,12 +2723,18 @@ fn evict_walk_second_call_resumes_past_the_returned_leaf() {
     tc.evict_device_start(SWA, /* request_cnt = */ 100);
     let (first, step) = tc.evict_device_next_node(SWA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
-    assert_eq!(first, Some(tc.arena.node(c).id));
-    // The driver has not delisted c yet: the pre-advanced cursor must not
-    // hand the same leaf out again.
+    assert_eq!(first, None);
     let (second, step) = tc.evict_device_next_node(SWA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     assert_eq!(second, None);
+    let (third, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    assert_eq!(third, Some(tc.arena.node(c).id));
+    // The driver has not delisted c yet: the pre-advanced cursor must not
+    // hand the same leaf out again.
+    let (fourth, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    assert_eq!(fourth, None);
     tc.evict_device_end(SWA);
     let _ = (a, b);
 }
@@ -2727,13 +2750,16 @@ fn evict_walk_start_skips_a_locked_lru_end() {
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.evict_device_start(SWA, /* request_cnt = */ 100);
-    let (next, step) = tc.evict_device_next_node(SWA, &tracker);
+    let (first, step) = tc.evict_device_next_node(SWA, &tracker);
     accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
     // The locked LRU-end a is invisible; the walk starts at b.
-    assert_eq!(next, Some(tc.arena.node(c).id));
+    assert_eq!(first, None);
     assert!(tc.arena.has_device_value(a, SWA));
     assert!(!tc.arena.has_device_value(b, SWA));
     assert_eq!(tracker[&SWA], 1);
+    let (second, step) = tc.evict_device_next_node(SWA, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    assert_eq!(second, Some(tc.arena.node(c).id));
     tc.evict_device_end(SWA);
 }
 

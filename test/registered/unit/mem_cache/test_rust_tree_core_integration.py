@@ -956,7 +956,11 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
     device_frees: dict = {}
     host_frees: dict = {}
     core.evict_device_start(ComponentType.MAMBA, 2)
-    # The internal node tombstones inline; the leaf comes back to the driver.
+    step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
+    assert step.node_id is None
+    assert step.made_progress
+    _accumulate_step(step, tracker, device_frees, host_frees)
+
     step = core.evict_device_next_node(ComponentType.MAMBA, tracker)
     leaf = step.node_id
     _accumulate_step(step, tracker, device_frees, host_frees)

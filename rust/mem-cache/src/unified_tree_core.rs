@@ -1762,9 +1762,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .evict_device_start(self, request_cnt);
     }
 
-    /// Return the next device leaf to evict for a component, or None when
-    /// done. The walk's budget gate reads running totals from *baseline*;
-    /// the result carries only this step's deltas.
+    /// Advance one component eviction step and report whether it progressed.
     pub fn evict_device_next_node(
         &mut self,
         component_type: ComponentType,
