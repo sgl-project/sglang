@@ -47,6 +47,27 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
+class _DraftFp8LMHeadMethod:
+    """Rank-local W8A8 projection for the speculative draft head."""
+
+    def apply(self, layer, hidden_states, bias=None):
+        from sgl_kernel import fp8_scaled_mm
+
+        from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+
+        hidden_states_fp8, hidden_states_scale = scaled_fp8_quant(
+            hidden_states, use_per_token_if_dynamic=True
+        )
+        return fp8_scaled_mm(
+            hidden_states_fp8,
+            layer.draft_fp8_weight,
+            hidden_states_scale.reshape(-1),
+            layer.draft_fp8_weight_scale,
+            hidden_states.dtype,
+            bias,
+        )
+
+
 def _mtp_quant_config(quant_config):
     """The quantization the MTP module itself is built with.
 
@@ -109,6 +130,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.config = config
         self.tp_size = get_parallel().tp_size
+        self.use_fp8_lm_head = envs.SGLANG_EAGLE_DRAFT_FP8_LM_HEAD.get()
+        if self.use_fp8_lm_head and config.tie_word_embeddings:
+            raise ValueError(
+                "SGLANG_EAGLE_DRAFT_FP8_LM_HEAD requires untied embeddings"
+            )
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
@@ -160,11 +186,28 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        if self.use_fp8_lm_head:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                per_token_group_quant_fp8,
+            )
+
+            fp8_weight, fp8_weight_scale = per_token_group_quant_fp8(
+                head, head.shape[-1]
+            )
+            self.lm_head.register_buffer(
+                "draft_fp8_weight", fp8_weight.T, persistent=False
+            )
+            self.lm_head.register_buffer(
+                "draft_fp8_weight_scale",
+                fp8_weight_scale.reshape(-1).contiguous(),
+                persistent=False,
+            )
+            self.lm_head.quant_method = _DraftFp8LMHeadMethod()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head):
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings or self.use_fp8_lm_head:
             return
 
         self.lm_head = target_lm_head
