@@ -143,7 +143,6 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
     .ok_or_else(|| "standalone rendering requires a tokenizer".to_owned())?;
     let text_tokenizer: Arc<dyn tokenizer::TextTokenizer> =
         Arc::new(tokenizer::DynamoTokenizer::new(tokenizer));
-    let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
     let listener = bind_tcp_listener(cfg.rust_server_args.http_addr).map_err(|error| {
         format!(
             "binding render listener on {} failed: {error}",
@@ -157,14 +156,7 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
         None,
         cfg.server_args.tokenizer_worker_num,
         &mut threads,
-        |_| {
-            tokenizer::TokenizerWorker::new(
-                render_rx.clone(),
-                None,
-                text_tokenizer.clone(),
-                limits.clone(),
-            )
-        },
+        |_| tokenizer::TokenizerWorker::new(render_rx.clone(), None, text_tokenizer.clone()),
     );
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let handle = std::thread::Builder::new()
@@ -300,7 +292,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     tokenizer_rx.clone(),
                     Some(tok_manager_tx.clone()),
                     tokenizer.clone(),
-                    tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
                 )
             },
         );

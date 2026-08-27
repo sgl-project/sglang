@@ -25,10 +25,11 @@ pub use output::{
 };
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, TextCompletionRequest};
 pub use sampling::SamplingParams;
-pub use service::{LoweredChat, PreprocessBackend, RendererService, RequestLowerer};
+pub use service::{LoweredChat, RendererService, RequestLowerer, TokenizationBackend};
 pub use template::ChatFormatter;
 pub use tokenizer::{
-    DynamoTokenizer, TextTokenizer, check_total_tokens, load_tokenizer, prepare_direct_request,
-    resolve_model_file, validate_request,
+    DynamoTokenizer, TextTokenizer, check_completion_token_budget, check_total_tokens,
+    load_tokenizer, prepare_direct_request, resolve_model_file, tokenize_text_completion,
+    validate_completion_fields, validate_request,
 };
 pub use types::{OneOrMany, OneOrManyItem, TokenIds};

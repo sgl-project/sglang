@@ -2,57 +2,14 @@
 
 use std::sync::Arc;
 
-use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::request::RequestKind;
 use crate::renderer::PreprocessJob;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::to_scheduler::Limits;
 use crate::tokenizer_manager::wiring::TmEvent;
-use crate::utils::{error::Error, fsm::Event};
+use crate::utils::fsm::Event;
 
+use sglang_renderer::tokenize_text_completion;
 pub use sglang_renderer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
-use sglang_renderer::{RendererLimits, prepare_direct_request};
-
-/// Remove one leading run of auto-added specials — exactly what an
-/// `add_special_tokens=false` encode would have produced, without a second
-/// tokenizer instance (the post-processor always prepends the same prefix, so
-/// a template-rendered copy of those tokens is preserved).
-fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
-    if ids.starts_with(auto_specials) {
-        ids.drain(..auto_specials.len());
-    }
-    ids
-}
-
-/// Apply the text-tokenization stage to one generate request. Both the normal
-/// tokenizer worker and the standalone renderer call this function so stop
-/// sizing and special-token handling cannot drift between the two paths.
-pub(crate) fn tokenize_generate_request(
-    request: &mut GenerateRequest,
-    tokenizer: &dyn TextTokenizer,
-    auto_specials: &[i32],
-) -> Result<(), Error> {
-    // Size the scheduler's stop-match window in TOKENS, as Python's
-    // `normalize(tokenizer)` does.
-    if let Some(stop_tokens) = request
-        .sampling_params
-        .stop_strs
-        .iter()
-        // A stop that won't encode falls back to its byte length rather
-        // than failing the request: still an over-estimate, never an
-        // under-estimate, so the scheduler cannot miss that stop.
-        .map(|stop| tokenizer.encode(stop).map_or(stop.len(), |ids| ids.len()))
-        .max()
-    {
-        request.sampling_params.stop_str_max_len = stop_tokens;
-    }
-    let ids = tokenizer.encode(request.text.as_deref().unwrap_or(""))?;
-    request.input_ids = Some(if request.skip_special_tokens {
-        strip_auto_specials(ids, auto_specials)
-    } else {
-        ids
-    });
-    Ok(())
-}
 
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
@@ -66,7 +23,6 @@ pub struct TokenizerWorker {
     tm: Option<flume::Sender<TmEvent>>,
     tokenizer: Arc<dyn TextTokenizer>,
     auto_specials: Vec<i32>,
-    renderer_limits: RendererLimits,
 }
 
 impl TokenizerWorker {
@@ -74,23 +30,13 @@ impl TokenizerWorker {
         rx: flume::Receiver<PreprocessJob>,
         tm: Option<flume::Sender<TmEvent>>,
         tokenizer: Arc<dyn TextTokenizer>,
-        limits: Limits,
     ) -> Self {
         let auto_specials = tokenizer.auto_specials();
-        let renderer_limits = RendererLimits {
-            skip_tokenizer_init: limits.skip_tokenizer_init,
-            vocab_size: limits.vocab_size,
-            context_len: limits.context_len,
-            num_reserved_tokens: limits.num_reserved_tokens,
-            allow_auto_truncate: limits.allow_auto_truncate,
-            enable_return_hidden_states: limits.enable_return_hidden_states,
-        };
         Self {
             rx,
             tm,
             tokenizer,
             auto_specials,
-            renderer_limits,
         }
     }
 }
@@ -108,13 +54,16 @@ impl Runnable for TokenizerWorker {
                             tracing::error!("tokenizer pool received a non-generate request");
                             continue;
                         };
-                        match tokenize_generate_request(
-                            g,
+                        match tokenize_text_completion(
+                            g.text.as_deref(),
+                            &mut g.input_ids,
+                            g.skip_special_tokens,
+                            &mut g.sampling_params,
                             self.tokenizer.as_ref(),
                             &self.auto_specials,
                         ) {
                             Ok(()) => Event::TokenizeDone,
-                            Err(err) => Event::Error(err),
+                            Err(err) => Event::Error(err.into()),
                         }
                     };
                     let _ = req.state.apply(event);
@@ -128,14 +77,18 @@ impl Runnable for TokenizerWorker {
                     }
                 }
                 PreprocessJob::Render(job) => {
-                    let result = prepare_direct_request(
-                        job.request,
+                    let crate::renderer::RenderJob { mut request, reply } = *job;
+                    let result = tokenize_text_completion(
+                        request.text.as_deref(),
+                        &mut request.input_ids,
+                        request.skip_special_tokens,
+                        &mut request.sampling_params,
                         self.tokenizer.as_ref(),
                         &self.auto_specials,
-                        &self.renderer_limits,
-                    );
+                    )
+                    .map(|()| request);
                     // The HTTP request may have been cancelled while preparing.
-                    let _ = job.reply.send(result);
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -145,7 +98,6 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::config::ServerArgs;
     use crate::message::request::{GenerateRequest, Request, RequestKind};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
@@ -196,13 +148,7 @@ mod tests {
             .expect("send");
         drop(req_tx); // closes the loop after one request
 
-        TokenizerWorker::new(
-            req_rx,
-            Some(tm_tx),
-            Arc::new(WordTokenizer),
-            Limits::from(&ServerArgs::default()),
-        )
-        .run();
+        TokenizerWorker::new(req_rx, Some(tm_tx), Arc::new(WordTokenizer)).run();
 
         let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
             panic!("expected Tokenized");
@@ -214,17 +160,6 @@ mod tests {
             g.sampling_params.stop_str_max_len, 3,
             "must be the max TOKEN count (3), not the byte count (8)"
         );
-    }
-
-    /// The strip reproduces `add_special_tokens=false`: one leading run of
-    /// auto-added specials is removed, a template-rendered copy is kept, and
-    /// tokenizers with no auto specials (empty probe) are untouched.
-    #[test]
-    fn strip_auto_specials_matches_add_special_tokens_false() {
-        assert_eq!(strip_auto_specials(vec![0, 0, 1, 2], &[0]), vec![0, 1, 2]);
-        assert_eq!(strip_auto_specials(vec![1, 2], &[0]), vec![1, 2]);
-        assert_eq!(strip_auto_specials(vec![1, 2], &[]), vec![1, 2]);
-        assert_eq!(strip_auto_specials(vec![0], &[0, 9]), vec![0]);
     }
 
     /// Word tokens plus a prepended BOS marker (id 0) — like an HF tokenizer
@@ -261,13 +196,7 @@ mod tests {
                 }))
                 .expect("send");
             drop(req_tx);
-            TokenizerWorker::new(
-                req_rx,
-                Some(tm_tx),
-                Arc::new(MarkedTokenizer),
-                Limits::from(&ServerArgs::default()),
-            )
-            .run();
+            TokenizerWorker::new(req_rx, Some(tm_tx), Arc::new(MarkedTokenizer)).run();
             let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
                 panic!("expected Tokenized");
             };

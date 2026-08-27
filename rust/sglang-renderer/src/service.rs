@@ -12,9 +12,11 @@ use crate::{
     ChatFormatter, ChatOutputProcessor, RendererConfig, RendererError, TextCompletionRequest,
 };
 
-/// Host-provided CPU execution for one lowered renderer request.
-pub trait PreprocessBackend: Send + Sync {
-    fn prepare(
+/// Host-provided tokenizer-dependent CPU execution for one lowered text
+/// completion. Validation, sampling normalization, and context checks remain
+/// owned by `RendererService`.
+pub trait TokenizationBackend: Send + Sync {
+    fn tokenize(
         &self,
         request: TextCompletionRequest,
     ) -> BoxFuture<'static, Result<TextCompletionRequest, RendererError>>;
@@ -33,7 +35,7 @@ pub struct RequestLowerer {
 /// Standalone request preparation: shared lowering plus host-provided CPU work.
 pub struct RendererService {
     lowerer: RequestLowerer,
-    backend: Arc<dyn PreprocessBackend>,
+    backend: Arc<dyn TokenizationBackend>,
 }
 
 /// Lowered generation requests plus their request-scoped output processor.
@@ -97,7 +99,7 @@ impl RequestLowerer {
 }
 
 impl RendererService {
-    pub fn new(lowerer: RequestLowerer, backend: Arc<dyn PreprocessBackend>) -> Self {
+    pub fn new(lowerer: RequestLowerer, backend: Arc<dyn TokenizationBackend>) -> Self {
         Self { lowerer, backend }
     }
 
@@ -136,15 +138,16 @@ impl RendererService {
         &self,
         mut request: TextCompletionRequest,
     ) -> Result<TextCompletionRequest, RendererError> {
-        if self.lowerer.config.skip_tokenizer_init {
-            validate_request(&request, &self.lowerer.config.limits)?;
-            request
-                .sampling_params
-                .normalize(true, self.lowerer.config.vocab_size)?;
-            check_total_tokens(&mut request, &self.lowerer.config.limits)?;
-            return Ok(request);
+        validate_request(&request, &self.lowerer.config.limits)?;
+        request.sampling_params.normalize(
+            self.lowerer.config.skip_tokenizer_init,
+            self.lowerer.config.vocab_size,
+        )?;
+        if !request.already_tokenized() {
+            request = self.backend.tokenize(request).await?;
         }
-        self.backend.prepare(request).await
+        check_total_tokens(&mut request, &self.lowerer.config.limits)?;
+        Ok(request)
     }
 }
 

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
+use sglang_renderer::{RendererLimits, check_completion_token_budget, validate_completion_fields};
 
 use crate::message::config::ServerArgs;
 use crate::message::detok::DetokMsg;
@@ -83,6 +84,19 @@ impl From<&ServerArgs> for Limits {
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,
+        }
+    }
+}
+
+impl From<&Limits> for RendererLimits {
+    fn from(limits: &Limits) -> Self {
+        Self {
+            skip_tokenizer_init: limits.skip_tokenizer_init,
+            vocab_size: limits.vocab_size,
+            context_len: limits.context_len,
+            num_reserved_tokens: limits.num_reserved_tokens,
+            allow_auto_truncate: limits.allow_auto_truncate,
+            enable_return_hidden_states: limits.enable_return_hidden_states,
         }
     }
 }
@@ -592,60 +606,21 @@ fn validate_rid(rid: &Rid) -> Result<(), Error> {
     Ok(())
 }
 
-/// Validate the generate-specific fields checked when normal ingress receives
-/// a request. The standalone renderer calls the same function before it runs
-/// normalization and tokenization.
+/// Validate server identity plus the common completion fields checked when
+/// normal ingress receives a request.
 pub(crate) fn validate_generate_request(
     rid: &Rid,
     request: &GenerateRequest,
     limits: &Limits,
 ) -> Result<(), Error> {
     validate_rid(rid)?;
-    let vocab_size = limits.vocab_size;
-    if limits.skip_tokenizer_init && !request.already_tokenized() {
-        // `Validation` (400), not `Tokenize` (500): the client sent a request this
-        // server cannot serve, which is their error to fix — Python 400s it too.
-        return Err(Error::Validation(
-            "skip_tokenizer_init is set: request must provide input_ids".into(),
-        ));
-    }
-
-    // Client-supplied token ids must be in-vocabulary: an out-of-range id
-    // reaches the embedding lookup and kills the scheduler process, so 400
-    // here instead — mirroring the Python `TokenizerManager` validation.
-    if let Some(ids) = &request.input_ids {
-        for &id in ids {
-            if id < 0 || id as u64 >= vocab_size {
-                return Err(Error::Validation(format!(
-                    "input_ids contains out-of-vocabulary token id {id}; \
-                     valid range is [0, {vocab_size})"
-                )));
-            }
-        }
-    }
-    if let Some(ids) = &request.token_ids_logprob {
-        for &id in ids {
-            if id < 0 || id as u64 >= vocab_size {
-                return Err(Error::Validation(format!(
-                    "token_ids_logprob contains out-of-vocabulary token id \
-                     {id}; valid range is [0, {vocab_size})"
-                )));
-            }
-        }
-    }
-
-    // The scheduler only computes hidden states when launched for it, so without
-    // this the request would 200 with `meta_info.hidden_states` silently absent
-    // (Python `TokenizerManager._validate_one_request`).
-    if request.return_hidden_states && !limits.enable_return_hidden_states {
-        return Err(Error::Validation(
-            "The server is not configured to return the hidden states. \
-             Please set `--enable-return-hidden-states` to enable this feature."
-                .into(),
-        ));
-    }
-
-    Ok(())
+    validate_completion_fields(
+        request.input_ids.as_deref(),
+        request.token_ids_logprob.as_deref(),
+        request.return_hidden_states,
+        &RendererLimits::from(limits),
+    )
+    .map_err(Into::into)
 }
 
 /// The context-window checks that need the tokenized length, mirroring Python
@@ -657,59 +632,12 @@ pub(crate) fn validate_generate_request(
 /// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
 /// opted into that.
 pub(crate) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
-    let max_req_len = limits.context_len;
-    // Python counts the reserved slots as part of the input, so a request can be
-    // rejected for them even when the prompt alone fits.
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    // Input length first, and unconditionally: `max_new_tokens: null` means "no
-    // cap", which must not disable this. Python's comparison is `>=` — a prompt
-    // that exactly fills the window leaves no room to generate.
-    if input_len >= max_req_len {
-        if !limits.allow_auto_truncate {
-            return Err(Error::Validation(format!(
-                "The input ({input_len} tokens) is longer than the model's context \
-                 length ({max_req_len} tokens)."
-            )));
-        }
-        if let Some(ids) = &mut g.input_ids {
-            ids.truncate(max_req_len as usize);
-        }
-    }
-    let input_len =
-        g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
-
-    let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
-        return Ok(()); // no cap requested → nothing to add to the input length
-    };
-    let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
-    if total <= max_req_len {
-        return Ok(());
-    }
-    if !limits.allow_auto_truncate {
-        return Err(Error::Validation(format!(
-            "Requested token count exceeds the model's maximum context length of \
-             {max_req_len} tokens. You requested a total of {total} tokens: {input_len} \
-             tokens from the input messages and {max_new_tokens} tokens for the \
-             completion. Please reduce the number of tokens in the input messages or \
-             the completion to fit within the limit."
-        )));
-    }
-    let clamped = max_req_len.saturating_sub(input_len) as i64;
-    // Re-check what the clamp can break. `verify` already ran (in Normalizing), so
-    // lowering `max_new_tokens` here can leave `min_new_tokens > max_new_tokens` —
-    // and `is_normalized: true` stops the scheduler from re-verifying, so nothing
-    // downstream would catch it. Python validates before it verifies; we can't
-    // reorder the FSM, so we re-assert the one invariant the clamp can violate.
-    if g.sampling_params.min_new_tokens > clamped {
-        return Err(Error::Validation(format!(
-            "min_new_tokens must be in [0, max_new_tokens({clamped})], got {}",
-            g.sampling_params.min_new_tokens
-        )));
-    }
-    g.sampling_params.max_new_tokens = Some(clamped);
-    Ok(())
+    check_completion_token_budget(
+        &mut g.input_ids,
+        &mut g.sampling_params,
+        &RendererLimits::from(limits),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

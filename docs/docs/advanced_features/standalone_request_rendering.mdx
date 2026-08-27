@@ -77,8 +77,8 @@ initial standalone renderer.
 HTTP is the implemented wire format. Its response is a dedicated,
 JSON-serializable `PreparedGenerateRequest` matching the current text fields
 accepted by the public `/generate` endpoint. It is a prototype transport DTO,
-separate from the mutable in-process `RendererRequest`, the server's internal
-`GenerateRequest`, and the scheduler-facing MessagePack
+separate from the mutable in-process `TextCompletionRequest`, the server's
+internal `GenerateRequest`, and the scheduler-facing MessagePack
 `TokenizedGenerateReqInput`. Scheduler types are not a public renderer wire
 contract.
 

@@ -128,7 +128,6 @@ mod tests {
     use crate::message::types::TokenIds;
     use crate::renderer::{PreprocessJob, new_renderer_service};
     use crate::runtime::Runnable;
-    use crate::tokenizer_manager::to_scheduler::Limits;
     use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
 
     struct WordTokenizer;
@@ -173,17 +172,11 @@ mod tests {
             },
             ..Default::default()
         });
-        let limits = Limits::from(&*server_args);
         let tokenizer: Arc<dyn TextTokenizer> = Arc::new(WordTokenizer);
         let (jobs, worker_jobs) = flume::bounded::<PreprocessJob>(8);
         let workers = (0..server_args.tokenizer_worker_num)
             .map(|worker_index| {
-                let worker = TokenizerWorker::new(
-                    worker_jobs.clone(),
-                    None,
-                    tokenizer.clone(),
-                    limits.clone(),
-                );
+                let worker = TokenizerWorker::new(worker_jobs.clone(), None, tokenizer.clone());
                 std::thread::Builder::new()
                     .name(format!("test-renderer-{worker_index}"))
                     .spawn(move || worker.run())
@@ -236,6 +229,31 @@ mod tests {
                 crate::message::types::OneOrMany::Many(stops) if stops.len() == 1
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn completion_render_preserves_pretokenized_prompt() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions/render")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "model",
+                    "prompt": [11, 12, 13],
+                    "max_tokens": 5
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = test_app().request(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        let rendered = body.as_array().expect("completion render is an array");
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0]["input_ids"], serde_json::json!([11, 12, 13]));
     }
 
     #[tokio::test]

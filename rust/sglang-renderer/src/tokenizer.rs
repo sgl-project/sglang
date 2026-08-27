@@ -1,6 +1,8 @@
 //! Tokenizer primitives shared by renderer hosts.
 
-use crate::{RendererError as Error, RendererLimits, TextCompletionRequest, TokenIds};
+use crate::{
+    RendererError as Error, RendererLimits, SamplingParams, TextCompletionRequest, TokenIds,
+};
 use std::path::Path;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -135,18 +137,20 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
     ids
 }
 
-/// Apply the text-tokenization stage to one generate request. Both the normal
-/// tokenizer worker and the standalone renderer call this function so stop
-/// sizing and special-token handling cannot drift between the two paths.
-pub fn tokenize_generate_request(
-    request: &mut TextCompletionRequest,
+/// Apply the tokenizer-dependent stage to the common fields of one text
+/// completion. Full inference and standalone rendering both call this exact
+/// operation, even though they retain different enclosing request types.
+pub fn tokenize_text_completion(
+    text: Option<&str>,
+    input_ids: &mut Option<TokenIds>,
+    skip_special_tokens: bool,
+    sampling_params: &mut SamplingParams,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
 ) -> Result<(), Error> {
     // Size the scheduler's stop-match window in TOKENS, as Python's
     // `normalize(tokenizer)` does.
-    if let Some(stop_tokens) = request
-        .sampling_params
+    if let Some(stop_tokens) = sampling_params
         .stop_strs
         .iter()
         // A stop that won't encode falls back to its byte length rather
@@ -155,10 +159,10 @@ pub fn tokenize_generate_request(
         .map(|stop| tokenizer.encode(stop).map_or(stop.len(), |ids| ids.len()))
         .max()
     {
-        request.sampling_params.stop_str_max_len = stop_tokens;
+        sampling_params.stop_str_max_len = stop_tokens;
     }
-    let ids = tokenizer.encode(request.text.as_deref().unwrap_or(""))?;
-    request.input_ids = Some(if request.skip_special_tokens {
+    let ids = tokenizer.encode(text.unwrap_or(""))?;
+    *input_ids = Some(if skip_special_tokens {
         strip_auto_specials(ids, auto_specials)
     } else {
         ids
@@ -178,7 +182,14 @@ pub fn prepare_direct_request(
         .sampling_params
         .normalize(limits.skip_tokenizer_init, limits.vocab_size)?;
     if !request.already_tokenized() {
-        tokenize_generate_request(&mut request, tokenizer, auto_specials)?;
+        tokenize_text_completion(
+            request.text.as_deref(),
+            &mut request.input_ids,
+            request.skip_special_tokens,
+            &mut request.sampling_params,
+            tokenizer,
+            auto_specials,
+        )?;
     }
     check_total_tokens(&mut request, limits)?;
     Ok(request)
@@ -195,12 +206,28 @@ pub fn validate_request(
             request.rid.len()
         )));
     }
-    if limits.skip_tokenizer_init && !request.already_tokenized() {
+    validate_completion_fields(
+        request.input_ids.as_deref(),
+        request.token_ids_logprob.as_deref(),
+        request.return_hidden_states,
+        limits,
+    )
+}
+
+/// Validate the common completion fields before tokenization or engine
+/// submission. Request identity remains an enclosing host concern.
+pub fn validate_completion_fields(
+    input_ids: Option<&[i32]>,
+    token_ids_logprob: Option<&[i32]>,
+    return_hidden_states: bool,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
+    if limits.skip_tokenizer_init && !input_ids.is_some_and(|ids| !ids.is_empty()) {
         return Err(Error::Validation(
             "skip_tokenizer_init is set: request must provide input_ids".into(),
         ));
     }
-    for &id in request.input_ids.iter().flatten() {
+    for &id in input_ids.iter().flat_map(|ids| ids.iter()) {
         if id < 0 || id as u64 >= limits.vocab_size {
             return Err(Error::Validation(format!(
                 "input_ids contains out-of-vocabulary token id {id}; valid range is [0, {})",
@@ -208,7 +235,7 @@ pub fn validate_request(
             )));
         }
     }
-    for &id in request.token_ids_logprob.iter().flatten() {
+    for &id in token_ids_logprob.iter().flat_map(|ids| ids.iter()) {
         if id < 0 || id as u64 >= limits.vocab_size {
             return Err(Error::Validation(format!(
                 "token_ids_logprob contains out-of-vocabulary token id {id}; valid range is [0, {})",
@@ -216,7 +243,7 @@ pub fn validate_request(
             )));
         }
     }
-    if request.return_hidden_states && !limits.enable_return_hidden_states {
+    if return_hidden_states && !limits.enable_return_hidden_states {
         return Err(Error::Validation(
             "The server is not configured to return the hidden states. Please set `--enable-return-hidden-states` to enable this feature."
                 .into(),
@@ -230,22 +257,29 @@ pub fn check_total_tokens(
     request: &mut TextCompletionRequest,
     limits: &RendererLimits,
 ) -> Result<(), Error> {
+    check_completion_token_budget(&mut request.input_ids, &mut request.sampling_params, limits)
+}
+
+/// Enforce the context limit over the common prepared completion fields.
+pub fn check_completion_token_budget(
+    input_ids: &mut Option<TokenIds>,
+    sampling_params: &mut SamplingParams,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
     let max_req_len = limits.context_len;
-    let input_len =
-        request.input_ids.as_ref().map_or(0, Vec::len) as u64 + limits.num_reserved_tokens;
+    let input_len = input_ids.as_ref().map_or(0, Vec::len) as u64 + limits.num_reserved_tokens;
     if input_len >= max_req_len {
         if !limits.allow_auto_truncate {
             return Err(Error::Validation(format!(
                 "The input ({input_len} tokens) is longer than the model's context length ({max_req_len} tokens)."
             )));
         }
-        if let Some(ids) = &mut request.input_ids {
+        if let Some(ids) = input_ids {
             ids.truncate(max_req_len as usize);
         }
     }
-    let input_len =
-        request.input_ids.as_ref().map_or(0, Vec::len) as u64 + limits.num_reserved_tokens;
-    let Some(max_new_tokens) = request.sampling_params.max_new_tokens else {
+    let input_len = input_ids.as_ref().map_or(0, Vec::len) as u64 + limits.num_reserved_tokens;
+    let Some(max_new_tokens) = sampling_params.max_new_tokens else {
         return Ok(());
     };
     let total = input_len.saturating_add(max_new_tokens.max(0) as u64);
@@ -258,12 +292,12 @@ pub fn check_total_tokens(
         )));
     }
     let clamped = max_req_len.saturating_sub(input_len) as i64;
-    if request.sampling_params.min_new_tokens > clamped {
+    if sampling_params.min_new_tokens > clamped {
         return Err(Error::Validation(format!(
             "min_new_tokens must be in [0, max_new_tokens({clamped})], got {}",
-            request.sampling_params.min_new_tokens
+            sampling_params.min_new_tokens
         )));
     }
-    request.sampling_params.max_new_tokens = Some(clamped);
+    sampling_params.max_new_tokens = Some(clamped);
     Ok(())
 }

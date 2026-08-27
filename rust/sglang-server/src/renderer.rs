@@ -13,7 +13,7 @@ pub(crate) use sglang_renderer::{
     PreparedGenerateRequest, RendererConfig, RendererError as RenderServiceError, RendererService,
     RequestLowerer, TextCompletionRequest,
 };
-use sglang_renderer::{PreprocessBackend, RendererLimits, SamplingDefaults};
+use sglang_renderer::{RendererLimits, SamplingDefaults, TokenizationBackend};
 
 /// Shared tokenizer-pool work. Engine requests retain their FSM, while renderer
 /// requests use the crate-owned request and error contracts.
@@ -27,12 +27,12 @@ pub(crate) struct RenderJob {
     pub(crate) reply: oneshot::Sender<Result<TextCompletionRequest, RenderServiceError>>,
 }
 
-struct ServerPreprocessBackend {
+struct ServerTokenizationBackend {
     jobs: flume::Sender<PreprocessJob>,
 }
 
-impl PreprocessBackend for ServerPreprocessBackend {
-    fn prepare(
+impl TokenizationBackend for ServerTokenizationBackend {
+    fn tokenize(
         &self,
         request: TextCompletionRequest,
     ) -> BoxFuture<'static, Result<TextCompletionRequest, RenderServiceError>> {
@@ -59,7 +59,7 @@ pub(crate) fn new_renderer_service(
 ) -> RendererService {
     RendererService::new(
         new_request_lowerer(&server_args),
-        Arc::new(ServerPreprocessBackend { jobs }),
+        Arc::new(ServerTokenizationBackend { jobs }),
     )
 }
 
@@ -126,7 +126,13 @@ impl From<TextCompletionRequest> for GenerateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sglang_renderer::SamplingParams;
+    use sglang_renderer::{
+        SamplingParams, TextTokenizer, prepare_direct_request, tokenize_text_completion,
+    };
+
+    use crate::tokenizer_manager::to_scheduler::{
+        Limits, check_total_tokens, validate_generate_request,
+    };
 
     #[test]
     fn engine_conversion_preserves_renderer_fields() {
@@ -163,5 +169,65 @@ mod tests {
         assert_eq!(engine.token_ids_logprob, Some(vec![5, 6]));
         assert!(engine.return_hidden_states);
         assert_eq!(engine.return_text_in_logprobs, Some(true));
+    }
+
+    struct WordTokenizer;
+
+    impl TextTokenizer for WordTokenizer {
+        fn encode(&self, text: &str) -> Result<Vec<i32>, sglang_renderer::RendererError> {
+            Ok(text.split_whitespace().map(|_| 7).collect())
+        }
+    }
+
+    #[test]
+    fn standalone_and_inference_stages_prepare_identical_completions() {
+        let limits = Limits {
+            skip_tokenizer_init: false,
+            vocab_size: 128,
+            context_len: 5,
+            num_reserved_tokens: 0,
+            allow_auto_truncate: true,
+            enable_return_hidden_states: false,
+        };
+        let request = TextCompletionRequest {
+            rid: "completion-1".into(),
+            text: Some("one two three".into()),
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(4),
+                stop: Some(crate::message::types::OneOrMany::One("two words".into())),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let standalone = prepare_direct_request(
+            request.clone(),
+            &WordTokenizer,
+            &[],
+            &RendererLimits::from(&limits),
+        )
+        .unwrap();
+
+        let mut inference = GenerateRequest::from(request);
+        validate_generate_request(&inference.rid, &inference, &limits).unwrap();
+        inference
+            .sampling_params
+            .normalize(limits.skip_tokenizer_init, limits.vocab_size)
+            .unwrap();
+        tokenize_text_completion(
+            inference.text.as_deref(),
+            &mut inference.input_ids,
+            inference.skip_special_tokens,
+            &mut inference.sampling_params,
+            &WordTokenizer,
+            &[],
+        )
+        .unwrap();
+        check_total_tokens(&mut inference, &limits).unwrap();
+
+        assert_eq!(inference.input_ids, standalone.input_ids);
+        assert_eq!(inference.sampling_params, standalone.sampling_params);
+        assert_eq!(inference.sampling_params.stop_str_max_len, 2);
+        assert_eq!(inference.sampling_params.max_new_tokens, Some(2));
     }
 }
