@@ -71,6 +71,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             initializer=self._device_module.set_device,
             initargs=(self._device_id,),
         )
+        self._defer_update_wait = get_bool_env_var(
+            "SGLANG_NPU_DEFER_GRAPH_UPDATE_WAIT"
+        )
+        self._pending_update = None
 
     @contextmanager
     def capture_session(self, stream):
@@ -147,8 +151,15 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        self._finish_pending_update()
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
+
+    def _finish_pending_update(self) -> None:
+        if self._pending_update is None:
+            return
+        pending, self._pending_update = self._pending_update, None
+        pending.result()
 
     def replay_with_input_update(
         self,
@@ -174,14 +185,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = self._graphs[shape_key]
 
+        self._finish_pending_update()
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
         graph.replay()
-        update_future.result()
+        if self._defer_update_wait:
+            self._pending_update = update_future
+        else:
+            update_future.result()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        self._finish_pending_update()
         self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()

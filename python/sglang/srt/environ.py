@@ -896,6 +896,8 @@ class Envs:
     SGLANG_NPU_FUSED_KDA_RAGGED_IO = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)
     SGLANG_NPU_REUSE_KDA_VERIFY_METADATA = EnvBool(False)
+    # Reap NPUGraph.update at the next replay so graph-tail work can hide it.
+    SGLANG_NPU_DEFER_GRAPH_UPDATE_WAIT = EnvBool(False)
     SGLANG_NPU_QUANT_SHARED_AG = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
