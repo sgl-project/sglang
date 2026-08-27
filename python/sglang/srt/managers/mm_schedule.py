@@ -554,7 +554,7 @@ def _encode_encoder_window_requests(
     data_embedding_func: DataEmbeddingFunc,
     requests: List[PerImageRequestInfo],
     device: torch.device,
-) -> Dict[int, torch.Tensor]:
+) -> Dict[Tuple[Optional[int], int], torch.Tensor]:
     """Encode opt-in audio windows without changing the default MM path."""
     unique_items = _collect_encoder_window_items(requests)
     hash_to_embedding = {}
@@ -565,7 +565,7 @@ def _encode_encoder_window_requests(
         if cached is not None:
             embedding = cached.embedding.reshape(-1, cached.embedding.shape[-1])
             if embedding.shape[0] == info.token_count:
-                hash_to_embedding[item_hash] = embedding
+                hash_to_embedding[(item_hash, info.token_count)] = embedding
                 _acknowledge_deferred_cuda_ipc_cache_hits([info.item])
                 continue
             embedding_cache.free(item_hash, None)
@@ -611,30 +611,9 @@ def _encode_encoder_window_requests(
                 if clone_cached_splits:
                     embedding = embedding.clone()
                 embedding_cache.set(item_hash, EmbeddingResult(embedding=embedding))
-            hash_to_embedding[item_hash] = embedding
+            hash_to_embedding[(item_hash, token_count)] = embedding
 
     return hash_to_embedding
-
-
-def _assemble_encoder_window_chunk(
-    request: PerImageRequestInfo,
-    hash_to_embedding: Dict[int, torch.Tensor],
-) -> Optional[torch.Tensor]:
-    if not request.overlapping:
-        return None
-
-    chunk_start = request.extend_prefix_len
-    chunk_end = chunk_start + request.extend_seq_len
-    chunks = []
-    for _index, item, start, end in request.overlapping:
-        overlap_start = max(start, chunk_start)
-        overlap_end = min(end, chunk_end - 1)
-        chunks.append(
-            hash_to_embedding[item.hash][
-                overlap_start - start : overlap_end - start + 1
-            ]
-        )
-    return torch.cat(chunks, dim=0)
 
 
 def _get_chunked_encoder_window_embedding(
@@ -643,7 +622,12 @@ def _get_chunked_encoder_window_embedding(
     device: torch.device,
 ) -> Optional[torch.Tensor]:
     embeddings = _encode_encoder_window_requests(data_embedding_func, [request], device)
-    return _assemble_encoder_window_chunk(request, embeddings)
+    return _assemble_per_image_chunk(
+        request.overlapping,
+        embeddings,
+        request.extend_prefix_len,
+        request.extend_seq_len,
+    )
 
 
 def _assemble_per_image_chunk(
@@ -785,7 +769,12 @@ def _get_chunked_prefill_embedding(
             data_embedding_func, encoder_window_requests, device
         )
         for req_info in encoder_window_requests:
-            chunk = _assemble_encoder_window_chunk(req_info, window_embeddings)
+            chunk = _assemble_per_image_chunk(
+                req_info.overlapping,
+                window_embeddings,
+                req_info.extend_prefix_len,
+                req_info.extend_seq_len,
+            )
             if chunk is not None:
                 all_chunks.append((req_info.req_idx, chunk))
 

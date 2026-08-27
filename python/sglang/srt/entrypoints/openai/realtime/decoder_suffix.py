@@ -68,7 +68,7 @@ class DecoderSuffixState(msgspec.Struct):
             # Pending text is provisional and the final decode supersedes it;
             # keeping both turns a boundary rewrite into duplicated output.
             return DecoderSuffixUpdate(
-                delta=decoded_suffix or previous_suffix,
+                delta=decoded_suffix,
                 pending_suffix="",
             )
         if not decoded_suffix:

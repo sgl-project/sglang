@@ -487,6 +487,11 @@ class TestRealtimeASR(CustomTestCase):
         )
         self.assertEqual(update.delta, "I agree with that")
 
+        update = DecoderSuffixState("hello", "provisional").reconcile(
+            "", is_last=True, holdback_words=1
+        )
+        self.assertEqual((update.delta, update.pending_suffix), ("", ""))
+
     def test_decoder_prefix_helpers_preserve_word_boundaries(self):
         state = DecoderSuffixState(emitted_text="")
         for prefix, decoded, expected in (

@@ -382,7 +382,7 @@ def test_encoder_batch_key_separates_incompatible_items():
     )
 
     assert encoder_calls == [[(3,)], [(4,)]]
-    assert set(embeddings) == {item.hash for item in items}
+    assert set(embeddings) == {(item.hash, _num_tokens(item)) for item in items}
 
 
 def test_same_window_hash_requires_matching_token_counts():
@@ -418,7 +418,7 @@ def test_same_hash_aggregates_cacheability(cacheable_first):
     embeddings = mm_schedule._encode_encoder_window_requests(encoder, requests, _CPU)
 
     assert encoder_calls == [1]
-    assert set(embeddings) == {5500}
+    assert set(embeddings) == {(5500, 1)}
     assert mm_schedule.embedding_cache.has(5500)
 
 
@@ -434,7 +434,7 @@ def test_window_item_reencodes_wrong_length_cache_hit():
         _encoder_tensor, [_request([item])], _CPU
     )
 
-    assert embeddings[item.hash].shape == (2, HIDDEN)
+    assert embeddings[(item.hash, 2)].shape == (2, HIDDEN)
     assert mm_schedule.embedding_cache.get_single(item.hash).embedding.shape == (
         2,
         HIDDEN,
@@ -452,6 +452,7 @@ def test_wrong_length_encoder_output_is_rejected():
         mm_schedule._encode_encoder_window_requests(
             bad_encoder, [_request([item])], _CPU
         )
+
 
 if __name__ == "__main__":
     import sys
