@@ -10,8 +10,8 @@ use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, Request};
 
 pub(crate) use sglang_renderer::{
-    PreparedGenerateRequest, RendererConfig, RendererError as RenderServiceError, RendererRequest,
-    RendererService, RequestLowerer,
+    PreparedGenerateRequest, RendererConfig, RendererError as RenderServiceError, RendererService,
+    RequestLowerer, TextCompletionRequest,
 };
 use sglang_renderer::{PreprocessBackend, RendererLimits, SamplingDefaults};
 
@@ -23,8 +23,8 @@ pub(crate) enum PreprocessJob {
 }
 
 pub(crate) struct RenderJob {
-    pub(crate) request: RendererRequest,
-    pub(crate) reply: oneshot::Sender<Result<RendererRequest, RenderServiceError>>,
+    pub(crate) request: TextCompletionRequest,
+    pub(crate) reply: oneshot::Sender<Result<TextCompletionRequest, RenderServiceError>>,
 }
 
 struct ServerPreprocessBackend {
@@ -34,8 +34,8 @@ struct ServerPreprocessBackend {
 impl PreprocessBackend for ServerPreprocessBackend {
     fn prepare(
         &self,
-        request: RendererRequest,
-    ) -> BoxFuture<'static, Result<RendererRequest, RenderServiceError>> {
+        request: TextCompletionRequest,
+    ) -> BoxFuture<'static, Result<TextCompletionRequest, RenderServiceError>> {
         let jobs = self.jobs.clone();
         Box::pin(async move {
             let (reply, result) = oneshot::channel();
@@ -103,8 +103,8 @@ pub(crate) fn render_http_status(error: &RenderServiceError) -> u16 {
     }
 }
 
-impl From<RendererRequest> for GenerateRequest {
-    fn from(request: RendererRequest) -> Self {
+impl From<TextCompletionRequest> for GenerateRequest {
+    fn from(request: TextCompletionRequest) -> Self {
         Self {
             rid: Rid::from_client(&request.rid),
             text: request.text,
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn engine_conversion_preserves_renderer_fields() {
-        let rendered = RendererRequest {
+        let rendered = TextCompletionRequest {
             rid: "client-rid".into(),
             text: Some("prompt".into()),
             input_ids: Some(vec![1, 2, 3]),

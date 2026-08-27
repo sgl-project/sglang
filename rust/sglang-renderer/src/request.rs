@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use crate::{SamplingParams, TokenIds};
 
 #[derive(Debug, Clone, Default)]
-pub struct RendererRequest {
+/// Model-facing text completion after protocol-specific lowering and before
+/// tokenizer-dependent preparation.
+///
+/// Chat and legacy Completions both converge on this type. Chat-specific
+/// response interpretation is retained separately by `ChatOutputProcessor`.
+pub struct TextCompletionRequest {
     pub rid: String,
     pub text: Option<String>,
     pub input_ids: Option<TokenIds>,
@@ -22,7 +27,7 @@ pub struct RendererRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl RendererRequest {
+impl TextCompletionRequest {
     pub fn already_tokenized(&self) -> bool {
         self.input_ids.as_ref().is_some_and(|ids| !ids.is_empty())
     }
@@ -49,8 +54,8 @@ pub struct PreparedGenerateRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl From<RendererRequest> for PreparedGenerateRequest {
-    fn from(mut request: RendererRequest) -> Self {
+impl From<TextCompletionRequest> for PreparedGenerateRequest {
+    fn from(mut request: TextCompletionRequest) -> Self {
         Self {
             rid: request.rid,
             input_ids: request

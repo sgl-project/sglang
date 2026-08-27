@@ -1,6 +1,6 @@
 //! Tokenizer primitives shared by renderer hosts.
 
-use crate::{RendererError as Error, RendererLimits, RendererRequest, TokenIds};
+use crate::{RendererError as Error, RendererLimits, TextCompletionRequest, TokenIds};
 use std::path::Path;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -139,7 +139,7 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
 /// tokenizer worker and the standalone renderer call this function so stop
 /// sizing and special-token handling cannot drift between the two paths.
 pub fn tokenize_generate_request(
-    request: &mut RendererRequest,
+    request: &mut TextCompletionRequest,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
 ) -> Result<(), Error> {
@@ -168,11 +168,11 @@ pub fn tokenize_generate_request(
 
 /// Run the engine-free validation, normalization, tokenization and context checks.
 pub fn prepare_direct_request(
-    mut request: RendererRequest,
+    mut request: TextCompletionRequest,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
     limits: &RendererLimits,
-) -> Result<RendererRequest, Error> {
+) -> Result<TextCompletionRequest, Error> {
     validate_request(&request, limits)?;
     request
         .sampling_params
@@ -185,7 +185,10 @@ pub fn prepare_direct_request(
 }
 
 /// Validate fields that must be safe before tokenization or engine submission.
-pub fn validate_request(request: &RendererRequest, limits: &RendererLimits) -> Result<(), Error> {
+pub fn validate_request(
+    request: &TextCompletionRequest,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
     if request.rid.len() > 128 {
         return Err(Error::Validation(format!(
             "rid is {} bytes, over the 128-byte limit",
@@ -224,7 +227,7 @@ pub fn validate_request(request: &RendererRequest, limits: &RendererLimits) -> R
 
 /// Enforce the model context limit after tokenization.
 pub fn check_total_tokens(
-    request: &mut RendererRequest,
+    request: &mut TextCompletionRequest,
     limits: &RendererLimits,
 ) -> Result<(), Error> {
     let max_req_len = limits.context_len;

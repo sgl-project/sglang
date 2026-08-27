@@ -8,14 +8,16 @@ use futures::future::{BoxFuture, try_join_all};
 use crate::openai::{lower_chat_requests, lower_completion_requests};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_request};
-use crate::{ChatFormatter, ChatOutputProcessor, RendererConfig, RendererError, RendererRequest};
+use crate::{
+    ChatFormatter, ChatOutputProcessor, RendererConfig, RendererError, TextCompletionRequest,
+};
 
 /// Host-provided CPU execution for one lowered renderer request.
 pub trait PreprocessBackend: Send + Sync {
     fn prepare(
         &self,
-        request: RendererRequest,
-    ) -> BoxFuture<'static, Result<RendererRequest, RendererError>>;
+        request: TextCompletionRequest,
+    ) -> BoxFuture<'static, Result<TextCompletionRequest, RendererError>>;
 }
 
 /// Engine-free OpenAI request lowering shared by inference and rendering.
@@ -37,7 +39,7 @@ pub struct RendererService {
 /// Lowered generation requests plus their request-scoped output processor.
 /// `requests` are tokenized only when returned by `prepare_chat`.
 pub struct LoweredChat {
-    pub requests: Vec<RendererRequest>,
+    pub requests: Vec<TextCompletionRequest>,
     pub output: ChatOutputProcessor,
 }
 
@@ -89,7 +91,7 @@ impl RequestLowerer {
         &self,
         request: &CreateCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<RendererRequest>, RendererError> {
+    ) -> Result<Vec<TextCompletionRequest>, RendererError> {
         lower_completion_requests(&self.config, request, response_id)
     }
 }
@@ -113,15 +115,15 @@ impl RendererService {
         &self,
         request: &CreateCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<RendererRequest>, RendererError> {
+    ) -> Result<Vec<TextCompletionRequest>, RendererError> {
         let requests = self.lowerer.lower_completions(request, response_id)?;
         self.prepare_many(requests).await
     }
 
     async fn prepare_many(
         &self,
-        requests: Vec<RendererRequest>,
-    ) -> Result<Vec<RendererRequest>, RendererError> {
+        requests: Vec<TextCompletionRequest>,
+    ) -> Result<Vec<TextCompletionRequest>, RendererError> {
         try_join_all(
             requests
                 .into_iter()
@@ -132,8 +134,8 @@ impl RendererService {
 
     async fn prepare_one(
         &self,
-        mut request: RendererRequest,
-    ) -> Result<RendererRequest, RendererError> {
+        mut request: TextCompletionRequest,
+    ) -> Result<TextCompletionRequest, RendererError> {
         if self.lowerer.config.skip_tokenizer_init {
             validate_request(&request, &self.lowerer.config.limits)?;
             request

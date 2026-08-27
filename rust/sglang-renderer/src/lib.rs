@@ -23,7 +23,7 @@ pub use output::{
     ChatEvent, ChatFinishReason, ChatOutputError, ChatOutputInput, ChatOutputItem,
     ChatOutputProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatOutput,
 };
-pub use request::{PreparedGenerateRequest, PreparedSamplingParams, RendererRequest};
+pub use request::{PreparedGenerateRequest, PreparedSamplingParams, TextCompletionRequest};
 pub use sampling::SamplingParams;
 pub use service::{LoweredChat, PreprocessBackend, RendererService, RequestLowerer};
 pub use template::ChatFormatter;
