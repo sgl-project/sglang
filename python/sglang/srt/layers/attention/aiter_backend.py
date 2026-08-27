@@ -60,6 +60,10 @@ try:
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
+
+    from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
+        unified_attention_3d_mtp_func,
+    )
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -2290,6 +2294,51 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
+                    # Shape gate, not a model gate: the kernel is tuned for a 16:1
+                    # GQA ratio (block_m=32 -> block_q=2 packs two draft tokens per
+                    # tile), and head_dim 256 is the only validated size. The kv-head
+                    # count itself is free (kv_head_idx = program_id(1)), but K and V
+                    # must share it -- the kernel has a single kv-head grid dim.
+                    # Qwen3.5-397B-A17B at TP1/TP2 is the only config known to
+                    # match today; any model with the same shapes qualifies.
+                    # TODO(yichiche): relax the head_dim gate once other sizes are
+                    # measured -- the wrapper passes HEAD_SIZE_PADDED unpadded, so
+                    # only powers of 2 work (128/256 OK, 192 is not).
+                    num_queries_per_kv = layer.tp_q_head_num // layer.tp_k_head_num
+                    use_unified_attention_3d_mtp = (
+                        is_gfx95_supported()
+                        and 1 < self.forward_metadata.max_q_len <= 4
+                        and max_kv_len > 512
+                        and num_queries_per_kv == 16
+                        and layer.tp_k_head_num == layer.tp_v_head_num
+                        and layer.qk_head_dim == 256
+                        and layer.v_head_dim == 256
+                        and self.page_size == 16
+                        and q_unified.dtype == torch.bfloat16
+                        and k_unified.dtype == fp8_dtype
+                        and window_size == (-1, -1)
+                        and not layer.logit_cap
+                        and sinks is None
+                    )
+                    if use_unified_attention_3d_mtp:
+                        unified_attention_3d_mtp_func(
+                            q=q_unified,
+                            k=k_unified,
+                            v=v_unified,
+                            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            cu_seqlens_q=self.forward_metadata.qo_indptr,
+                            seqused_k=(
+                                forward_batch.seq_lens + self.forward_metadata.max_q_len
+                            ),
+                            max_seqlen_q=self.forward_metadata.max_q_len,
+                            max_seqlen_k=max_kv_len,
+                            softmax_scale=layer.scaling,
+                            block_table=page_table,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                        )
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                     # GQA-packing fix: do NOT expand the single KV head to
                     # tp_q_head_num. Passing K/V with the true kv-head count (exactly
                     # like forward_decode) lets unified_attention derive
