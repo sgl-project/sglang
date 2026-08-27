@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    LAYERWISE_OFFLOAD,
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
@@ -61,10 +60,10 @@ def choose_initial_resident_components(
     """Choose resident startup components without removing runtime options.
 
     This is a load-feasibility seed, not a second serving-placement planner.
-    Native DiTs using the coarse residency mechanism can still be demoted to
-    component offload by warmup calibration. Auxiliary modules, layerwise
-    components, unknown weights, and explicit choices retain their configured
-    loading semantics.
+    Native DiTs can still be demoted by warmup calibration. Auxiliary modules,
+    unknown weights, pipeline exclusions, and explicit choices retain their
+    configured loading semantics. A model-default layerwise placement remains
+    eligible because avoiding that initialization is the point of this seed.
     """
     reserve_bytes = max(
         MIN_INITIAL_RESIDENCY_RESERVE_BYTES,
@@ -95,10 +94,6 @@ def choose_initial_resident_components(
             or item.component_name in excluded_components
             or not is_dit_component_name(item.component_name)
             or server_args.residency_mode(item.component_name) == RESIDENT
-            or (
-                server_args.configured_residency_mode(item.component_name)
-                == LAYERWISE_OFFLOAD
-            )
             or server_args.explicit_residency_mode(item.component_name) is not None
         ):
             continue

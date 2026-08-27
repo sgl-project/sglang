@@ -114,7 +114,7 @@ def test_initial_seed_does_not_override_explicit_or_auxiliary_components():
     assert selected == set()
 
 
-def test_initial_seed_keeps_layerwise_dit_on_its_configured_load_path():
+def test_initial_seed_can_bypass_model_default_layerwise_initialization():
     args = _Args(modes={"transformer": LAYERWISE_OFFLOAD})
 
     selected = choose_initial_resident_components(
@@ -124,7 +124,7 @@ def test_initial_seed_keeps_layerwise_dit_on_its_configured_load_path():
         denoising_steps=8,
     )
 
-    assert selected == set()
+    assert selected == {"transformer"}
 
 
 def test_initial_seed_honors_pipeline_load_placement_exclusions():
