@@ -6,30 +6,29 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.linear import set_weight_attrs
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 
 from .awq_scheme import AWQMoESchemeBase
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
     from sglang.srt.layers.quantization.awq.awq import AWQConfig, AWQMarlinConfig
 
 __all__ = ["AWQMoEScheme", "AWQAscendMoEScheme"]
 
 
 class AWQMoEScheme(AWQMoESchemeBase):
-    def __init__(self, quant_config: "AWQMarlinConfig"):
+    def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
         if self.quant_config.weight_bits != 4:
             raise ValueError("AWQMoEScheme only supports 4bit now.")
         self.kernel = self._init_kernel(quant_config)
 
-    def _init_kernel(self, quant_config: "AWQMarlinConfig"):
+    def _init_kernel(self, quant_config: AWQMarlinConfig):
         from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
             AWQMoEKernel,
         )
@@ -137,13 +136,13 @@ class AWQMoEScheme(AWQMoESchemeBase):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ):
         return self.kernel.apply(layer, dispatch_output)
 
 
 class AWQAscendMoEScheme(AWQMoEScheme):
-    def _init_kernel(self, quant_config: "AWQConfig"):
+    def _init_kernel(self, quant_config: AWQConfig):
         from sglang.srt.hardware_backend.npu.quantization.awq_kernels import (
             AWQAscendMoEKernel,
         )
@@ -151,6 +150,43 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         return AWQAscendMoEKernel(quant_config)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self,
+        layer: torch.nn.Module,
+        moe_runner_config: MoeRunnerConfig,
+        **extra_weight_attrs,
     ):
+        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+            NPUWNA16Int4MoEMethod,
+        )
+
         self.moe_runner_config = moe_runner_config
+        layer.w13_kernel = NPUWNA16Int4MoEMethod()
+        layer.w2_kernel = NPUWNA16Int4MoEMethod()
+        moe_runner_config.layer = layer
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        self.runner = MoeRunner(backend, moe_runner_config)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.ascend import (
+            AscendQuantInfo,
+        )
+
+        quant_info = AscendQuantInfo(
+            w13_weight=layer.w13_qweight,
+            w2_weight=layer.w2_qweight,
+            w13_weight_scale=layer.w13_scales,
+            w2_weight_scale=layer.w2_scales,
+            w13_weight_offset=layer.w13_qzeros,
+            w2_weight_offset=layer.w2_qzeros,
+            w13_weight_bias=getattr(layer, "w13_weight_bias", None),
+            w2_weight_bias=getattr(layer, "w2_weight_bias", None),
+            w13_scale_bias=getattr(layer, "w13_scale_bias", None),
+            w2_scale_bias=getattr(layer, "w2_scale_bias", None),
+        )
+        return self.runner.run(dispatch_output, quant_info)

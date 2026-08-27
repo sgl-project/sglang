@@ -21,6 +21,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
@@ -134,6 +136,12 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
+    def format_is_ascend_tp(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[AscendTPDispatchOutput]:
+        return dispatch_output.format.is_ascend_tp()
+
+    @staticmethod
     def format_is_deepep_normal(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPNormalDispatchOutput]:
@@ -164,9 +172,13 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    ASCEND_TP = "ascend_tp"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
+
+    def is_ascend_tp(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_TP
 
     def is_deepep_normal(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_NORMAL
@@ -205,6 +217,12 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
+    def format_is_ascend_tp(
+        combine_input: CombineInput,
+    ) -> TypeGuard[AscendTPCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_TP
+
+    @staticmethod
     def format_is_deepep_normal(
         combine_input: CombineInput,
     ) -> TypeGuard[DeepEPNormalCombineInput]:
@@ -237,6 +255,7 @@ class CombineInputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    ASCEND_TP = "ascend_tp"
 
 
 @runtime_checkable

@@ -40,7 +40,7 @@ class Stream:
         return True
 
     # context-manager protocol (``with stream:``)
-    def __enter__(self) -> "Stream":
+    def __enter__(self) -> Stream:
         return self
 
     def __exit__(self, *args: Any) -> None:
@@ -75,7 +75,7 @@ class StreamContext:
     def __init__(self, stream: Any = None) -> None:
         pass
 
-    def __enter__(self) -> "StreamContext":
+    def __enter__(self) -> StreamContext:
         return self
 
     def __exit__(self, *args: Any) -> None:

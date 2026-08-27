@@ -5,6 +5,10 @@ on:
         description: "Whether the PR must have the run-ci label"
         type: boolean
         default: true
+      require-run-ci-extra:
+        description: "Whether the PR must also have the run-ci-extra label (in addition to run-ci)"
+        type: boolean
+        default: false
       cool-down-minutes:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
@@ -19,7 +23,7 @@ jobs:
       - name: Fetch latest PR info
         if: github.event_name == 'pull_request'
         id: pr
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -41,6 +45,7 @@ jobs:
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: ${{ inputs.require-run-ci }}"
+          echo "Require run-ci-extra: ${{ inputs.require-run-ci-extra }}"
           echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
@@ -59,9 +64,22 @@ jobs:
             exit 1
           fi
 
+      # Live-fetch label gate for pr-test-extra.yml. Workflow-level `if`
+      # checks would read the frozen event payload, which doesn't update on
+      # rerun — so /tag-and-rerun-ci extra (slash handler adds the label
+      # then reruns) could never un-skip. A runtime step using gh-api-fetched
+      # labels lets reruns pick up the new label set.
+      - name: Require run-ci-extra label (optional)
+        if: github.event_name == 'pull_request' && inputs.require-run-ci-extra == true
+        run: |
+          if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci-extra') }}" == "false" ]]; then
+            echo "Missing required label 'run-ci-extra'. Add the label (e.g. via /tag-and-rerun-ci extra) to opt this PR into the extra test workflow."
+            exit 1
+          fi
+
       - name: Enforce rate limit for low-permission actors (optional)
         if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |

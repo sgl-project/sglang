@@ -6,7 +6,12 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+register_cuda_ci(
+    est_time=7200,
+    suite="nightly-4-gpu-gb300-kimi-k25",
+    nightly=True,
+    disabled="not needed",
+)
 
 MODEL_PATH = "moonshotai/Kimi-K2.5"
 
@@ -21,7 +26,7 @@ COMMON_ARGS = [
 
 
 class TestKimiK25(unittest.TestCase):
-    """Kimi-K2.5 (native INT4) on GB300 (4x B200 NVL4, tp=4).
+    """Kimi-K2.5 (native INT4) on GB300 (4x GB300 NVL4, tp=4).
 
     No EAGLE/MTP support for Kimi-K2.5 — only TP and TP+DP+DPA variants.
     """

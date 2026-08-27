@@ -62,7 +62,7 @@ class TestGB300ProBalanced(DSV4ProAime25TestBase):
         "2",
         "--mem-fraction-static",
         "0.9",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "128",
         "--max-running-requests",
         "256",
@@ -85,7 +85,7 @@ class TestGB300ProMaxThroughput(DSV4ProAime25TestBase):
         "deepep",
         "--mem-fraction-static",
         "0.9",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "128",
         "--max-running-requests",
         "256",
@@ -103,14 +103,14 @@ class TestGB300ProCP(DSV4ProAime25TestBase):
         "4",
         "--moe-a2a-backend",
         "deepep",
-        "--enable-nsa-prefill-context-parallel",
-        "--nsa-prefill-cp-mode",
+        "--enable-dsa-prefill-context-parallel",
+        "--dsa-prefill-cp-mode",
         "round-robin-split",
         "--chunked-prefill-size",
         "16384",
         "--mem-fraction-static",
         "0.88",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "256",
         "--max-running-requests",
         "256",
@@ -118,7 +118,6 @@ class TestGB300ProCP(DSV4ProAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
     }
 

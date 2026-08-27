@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=147, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=147, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 import gc
@@ -96,9 +96,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         engine.shutdown()
 
     def test_update_weights_from_tensor_load_format_custom(self):
-        custom_loader_name = (
-            "sglang.srt.model_executor.model_runner._model_load_weights_direct"
-        )
+        custom_loader_name = "sglang.srt.model_executor.model_runner_components.weight_updater._model_load_weights_direct"
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             custom_weight_loader=[custom_loader_name],

@@ -34,7 +34,7 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
-    for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
+    for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
         # Skip the wheel if mismatches the passed in cuda_version
         if not check_wheel_cuda_version(path.name, cuda_version):
             continue
@@ -53,7 +53,7 @@ def _update_non_cuda_wheel_index(backend, version):
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
-    for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
+    for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
         # Skip the wheel if not for this backend
         if re.search(f"{backend}", path.name) is None:
             continue

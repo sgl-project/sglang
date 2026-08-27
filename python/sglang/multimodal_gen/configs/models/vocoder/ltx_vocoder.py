@@ -14,7 +14,7 @@ class LTXVocoderArchConfig(VocoderArchConfig):
     in_channels: int = 128
     hidden_channels: int = 1024
     out_channels: int = 2
-    upsample_kernel_sizes: List[int] = field(default_factory=lambda: [3, 7, 11])
+    upsample_kernel_sizes: List[int] = field(default_factory=lambda: [16, 15, 8, 4, 4])
     upsample_factors: List[int] = field(default_factory=lambda: [6, 5, 2, 2, 2])
     resnet_kernel_sizes: List[int] = field(default_factory=lambda: [3, 7, 11])
     resnet_dilations: List[List[int]] = field(

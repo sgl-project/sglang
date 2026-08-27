@@ -78,10 +78,6 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
-    # Use the SP Group of the transformer as the TP Group of T5.
-    parallel_folding: bool = False
-    # "sp" or "ulysses" or "ring"
-    parallel_folding_mode: str = "sp"
 
     @staticmethod
     def add_cli_args(

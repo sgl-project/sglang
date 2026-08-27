@@ -562,6 +562,8 @@ def globally_suppress_loggers():
         "urllib3",
         "httpx",
         "httpcore",
+        "diffusers.quantizers.torchao.torchao_quantizer",
+        "transformers.processing_utils",
         "flash_attn.cute.cache_utils",
     ]
 

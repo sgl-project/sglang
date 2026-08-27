@@ -1,37 +1,22 @@
 # Adapted from trtllm.
 
-import threading
-from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 import torch
 
-
-class do_multi_stream_local(threading.local):
-
-    def __init__(self):
-        self.do_multi_stream = False
-
-
-_local = do_multi_stream_local()
+from sglang.srt.runtime_context import get_forward
 
 
 def set_do_multi_stream(enable: bool):
-    _local.do_multi_stream = enable
+    get_forward().set("multi_stream", enable)
 
 
 def do_multi_stream() -> bool:
-    return _local.do_multi_stream
+    return get_forward().multi_stream
 
 
-@contextmanager
 def with_multi_stream(enable: bool):
-    prev_do_multi_stream = _local.do_multi_stream
-    set_do_multi_stream(enable)
-    try:
-        yield
-    finally:
-        set_do_multi_stream(prev_do_multi_stream)
+    return get_forward().scoped(multi_stream=enable)
 
 
 def maybe_execute_in_parallel(

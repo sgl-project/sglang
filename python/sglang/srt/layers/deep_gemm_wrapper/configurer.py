@@ -3,9 +3,9 @@ import logging
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_device_sm,
-    is_blackwell_supported,
     is_cuda,
     is_musa,
+    is_sm100_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,15 +19,14 @@ def _compute_enable_deep_gemm():
     if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
         return False
     # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
-    if sm_version // 10 == 12:
+    if sm_version == 120:
         return False
     if not (_is_cuda or _is_musa):
         return False
 
     try:
         import deep_gemm  # noqa: F401
-    except (ImportError, AssertionError):
-        # AssertionError: deep_gemm init may fail on unsupported architectures
+    except ImportError:
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()
@@ -35,6 +34,6 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)

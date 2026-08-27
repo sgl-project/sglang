@@ -67,11 +67,13 @@ def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
     """Get valid token ids from the tokenizer vocabulary."""
-    return [
+    # Canonical order: vocab dict iteration order varies across tokenizers
+    # versions, which would break --seed reproducibility.
+    return sorted(
         token_id
         for token_id in tokenizer.get_vocab().values()
         if isinstance(token_id, int)
-    ]
+    )
 
 
 def gen_prompt(tokenizer, token_num):
@@ -81,10 +83,21 @@ def gen_prompt(tokenizer, token_num):
     return tokenizer.decode(selected_tokens)
 
 
+@lru_cache(maxsize=1)
+def get_available_multimodal_text_tokens(tokenizer, image_pad_id):
+    """Get valid token ids for synthetic multimodal text prompts."""
+    excluded_token_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    if image_pad_id is not None:
+        excluded_token_ids.add(image_pad_id)
+    return [
+        token_id
+        for token_id in get_available_tokens(tokenizer)
+        if token_id not in excluded_token_ids
+    ]
+
+
 def gen_mm_prompt(tokenizer, image_pad_id, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
-    if image_pad_id:
-        all_available_tokens.remove(image_pad_id)
+    all_available_tokens = get_available_multimodal_text_tokens(tokenizer, image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)

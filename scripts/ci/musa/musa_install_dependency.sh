@@ -24,6 +24,25 @@ done
 PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ${PIP_INSTALL} --upgrade pip setuptools torchada --user
 
+echo "Checking stale torchada extension locks..."
+active_torchada_builds="$(
+    pgrep -af '(^|[[:space:]/])(mcc|ninja)([[:space:]]|$)|torchada_cpp_ops' 2>/dev/null \
+        | awk -v self="$$" '$1 != self'
+)" || true
+if [ -n "$active_torchada_builds" ]; then
+    echo "$active_torchada_builds"
+    echo "::error::Active torchada extension build detected; refusing to remove lock files"
+    exit 1
+fi
+torch_extensions_dir="${HOME}/.cache/torch_extensions"
+if [ -d "$torch_extensions_dir" ]; then
+    find "$torch_extensions_dir" \
+        -path '*/torchada_cpp_ops/lock' \
+        -type f \
+        -print \
+        -delete
+fi
+
 WHL_DIR="/sglang-checkout/whl"
 if [ -d "$WHL_DIR" ] && compgen -G "${WHL_DIR}"/*.whl > /dev/null; then
     echo "Uninstall old packages based on wheel METADATA..."
@@ -54,9 +73,18 @@ else
     find "$REPO_ROOT" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 
     rm -f "${REPO_ROOT}/python/pyproject.toml" && mv "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
+
+    # setuptools-rust builds the sglang-mm extension (sglang.srt.multimodal._core)
+    # declared in pyproject_other.toml, so a Rust toolchain must be present like
+    # on the CUDA/AMD CI paths. Idempotent; installs per-user under $HOME/.cargo.
+    # Export PATH here because the pip install below runs in this same shell
+    # (install_rustup.sh's own export/GITHUB_PATH only reach subsequent steps).
+    bash "${REPO_ROOT}/scripts/ci/utils/install_rustup.sh"
+    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+
     cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[dev_musa]" --user
 
-    cd "${REPO_ROOT}/sgl-kernel"
+    cd "${REPO_ROOT}/python/sglang/kernels/aot"
     rm -f pyproject.toml && mv pyproject_musa.toml pyproject.toml && MTGPU_TARGET=mp_31 python3 setup_musa.py install --user
     echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 fi

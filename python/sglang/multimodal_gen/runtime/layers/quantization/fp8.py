@@ -7,6 +7,10 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    per_token_group_quant_fp8,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -24,16 +28,13 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import (
     cpu_has_amx_support,
     get_bool_env_var,
     use_intel_amx_backend,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-    per_token_group_quant_fp8,
-)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
@@ -63,9 +64,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = current_platform.is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _use_aiter or _use_hip_int4:
+if USE_AITER or _use_hip_int4:
     pass
 
 
@@ -75,7 +75,11 @@ logger = logging.getLogger(__name__)
 
 
 class Fp8Config(QuantizationConfig):
-    """Config class for FP8."""
+    """Config class for FP8.
+
+    No-arg ``Fp8Config()`` selects online (post-load) weight quantization:
+    ``is_checkpoint_fp8_serialized=False`` with ``activation_scheme="dynamic"``.
+    """
 
     def __init__(
         self,
@@ -83,6 +87,7 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -91,10 +96,11 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.packed_modules_mapping = packed_modules_mapping or {}
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -147,7 +153,11 @@ class Fp8Config(QuantizationConfig):
         from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         return None

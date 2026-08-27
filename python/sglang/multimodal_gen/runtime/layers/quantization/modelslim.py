@@ -139,7 +139,16 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP8Scheme()
-        raise NotImplementedError("No modelslim compatible scheme was found.")
+        elif quant_type in ("W4A4_MXFP4", "W4A4_MXFP4_DUALSCALE"):
+            from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
+                ModelSlimMXFP4Scheme,
+            )
+
+            return ModelSlimMXFP4Scheme()
+        raise NotImplementedError(
+            f"No modelslim compatible scheme was found for layer '{layer_name}'. "
+            f"quant_description['{layer_name}.weight'] = '{quant_type}'"
+        )
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None

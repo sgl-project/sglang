@@ -137,13 +137,6 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
                 )
 
 
-def _set_padded_attr(model_config, attr_name, value):
-    if hasattr(model_config, attr_name):
-        update_config(model_config, attr_name, value)
-    update_config(model_config.hf_config, attr_name, value)
-    update_config(model_config.hf_text_config, attr_name, value)
-
-
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
     attr_value = intermediate_padding_size
     if (
@@ -162,15 +155,23 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     if attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
+        origin_value = attr_value
+        origin_name = "original_" + attr_name
         attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
         if hasattr(model_config, "hf_config"):
             update_config(model_config.hf_config, attr_name, attr_value)
+            update_config(model_config.hf_config, origin_name, origin_value)
             if hasattr(model_config, "hf_text_config"):
                 update_config(model_config.hf_text_config, attr_name, attr_value)
+                update_config(model_config.hf_text_config, origin_name, origin_value)
             if hasattr(model_config.hf_config, "text_config"):
                 update_config(model_config.hf_config.text_config, attr_name, attr_value)
+                update_config(
+                    model_config.hf_config.text_config, origin_name, origin_value
+                )
         else:
             update_config(model_config, attr_name, attr_value)
+            update_config(model_config, origin_name, origin_value)
 
     return model_config
 
@@ -195,44 +196,22 @@ def adjust_config_with_unaligned_cpu_tp(
     # Support the case where the num_attention_heads is not divisible by the TP size.
     weight_block_size = may_get_weight_block_size(model_config, load_config)
 
-    _set_padded_attr(
-        model_config, "original_num_attention_heads", model_config.num_attention_heads
-    )
-    _set_padded_attr(
-        model_config,
-        "original_total_num_kv_heads",
-        model_config.get_total_num_kv_heads(),
-    )
+    for config in [model_config.hf_config, model_config.hf_text_config]:
+        update_config(
+            config,
+            "original_num_attention_heads",
+            model_config.num_attention_heads,
+        )
+        update_config(
+            config,
+            "original_total_num_kv_heads",
+            model_config.get_total_num_kv_heads(),
+        )
 
-    total_kv_heads = model_config.get_total_num_kv_heads()
-    # MQA models (num_kv_heads == 1) replicate the single KV head across TP ranks,
-    # so kv-head padding is not applicable — only attention-head padding is.
-    is_mqa = total_kv_heads == 1
-
-    # Grouped-MQA models (e.g. DeepSeek-V4) carry an additional `o_groups` dim
-    # that must also divide tp_size; the heads-per-group ratio must remain
-    # integer, so pad `o_groups` and `num_attention_heads` together.
-    o_groups = getattr(model_config.hf_config, "o_groups", None)
     if (
-        is_mqa
-        and isinstance(o_groups, int)
-        and o_groups > 0
-        and model_config.num_attention_heads % o_groups == 0
-        and (o_groups % tp_size != 0 or model_config.num_attention_heads % tp_size != 0)
+        model_config.num_attention_heads % tp_size != 0
+        or model_config.get_total_num_kv_heads() % tp_size != 0
     ):
-        _set_padded_attr(model_config, "original_o_groups", o_groups)
-
-        heads_per_group = model_config.num_attention_heads // o_groups
-        new_o_groups = ((o_groups + tp_size - 1) // tp_size) * tp_size
-        new_num_attention_heads = heads_per_group * new_o_groups
-
-        _set_padded_attr(model_config, "o_groups", new_o_groups)
-        _set_padded_attr(model_config, "num_attention_heads", new_num_attention_heads)
-
-    needs_attn_pad = model_config.num_attention_heads % tp_size != 0
-    needs_kv_pad = not is_mqa and total_kv_heads % tp_size != 0
-
-    if needs_attn_pad or needs_kv_pad:
 
         if hasattr(model_config.hf_config, "qk_nope_head_dim") and hasattr(
             model_config.hf_config, "qk_rope_head_dim"
@@ -244,6 +223,10 @@ def adjust_config_with_unaligned_cpu_tp(
                 + model_config.hf_config.qk_rope_head_dim,
             )
 
+        query_heads_per_kv = (
+            model_config.num_attention_heads // model_config.get_total_num_kv_heads()
+        )
+        total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
         head_dim = resolve_head_dim(
@@ -251,21 +234,16 @@ def adjust_config_with_unaligned_cpu_tp(
         )
 
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
+        num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
-        if is_mqa:
-            # Plain MQA path; grouped-MQA models (with `o_groups`) were already
-            # aligned by the pre-pad above, so they won't reach here.
-            # Keep num_key_value_heads == 1 (replicated). Pad attention heads only.
-            num_attention_heads = pad_vocab_size(
-                model_config.num_attention_heads, pad_size
-            )
-        else:
-            query_heads_per_kv = model_config.num_attention_heads // total_kv_heads
-            num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
-            _set_padded_attr(model_config, "num_key_value_heads", num_key_value_heads)
-            num_attention_heads = num_key_value_heads * query_heads_per_kv
-
-        _set_padded_attr(model_config, "num_attention_heads", num_attention_heads)
+        num_attention_heads = num_key_value_heads * query_heads_per_kv
+        for config in [
+            model_config,
+            model_config.hf_config,
+            model_config.hf_text_config,
+        ]:
+            update_config(config, "num_key_value_heads", num_key_value_heads)
+            update_config(config, "num_attention_heads", num_attention_heads)
 
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
     if hasattr(model_config.hf_config, "text_config"):
@@ -274,6 +252,11 @@ def adjust_config_with_unaligned_cpu_tp(
         )
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
+    if model_config.quantization == "mxfp4":
+        # For mxfp4 quantization, 2 mxfp4 values are packed to 1 uint8,
+        # so we need to double the intermediate padding size to ensure
+        # the padded intermediate size is divisible by 2 for proper packing.
+        intermediate_padding_size *= 2
     for moe_intermediate_attr in [
         "moe_intermediate_size",
         "intermediate_size",
@@ -291,10 +274,18 @@ def adjust_config_with_unaligned_cpu_tp(
             "siglip_vision_model",
             "num_attention_heads",
         ],
+        [model_config.hf_config, "vision_config", "qwen2_5_vl", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_vl_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_vl", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
+        [model_config.hf_config, "vision_config", "mllama", "attention_heads"],
+        [
+            model_config.hf_config,
+            "vision_config",
+            "llama4_vision_model",
+            "num_attention_heads",
+        ],
     ]
     if hasattr(model_config.hf_config, "thinker_config"):
         multimodal_config.append(
@@ -315,11 +306,12 @@ def adjust_config_with_unaligned_cpu_tp(
         )
 
     for m_config, config_name, model_type, num_head_str in multimodal_config:
-        if (
-            hasattr(m_config, config_name)
-            and getattr(m_config, config_name).model_type == model_type
+        if hasattr(m_config, config_name) and (
+            m_config.model_type == model_type
+            or getattr(m_config, config_name).model_type == model_type
         ):
             num_heads = getattr(getattr(m_config, config_name), num_head_str)
+
             update_config(
                 getattr(m_config, config_name), "original_" + num_head_str, num_heads
             )
@@ -345,5 +337,19 @@ def adjust_config_with_unaligned_cpu_tp(
                     intermediate_padding_size,
                 ),
             )
+
+            # Pad projector_input_dim for Llama4 vision if needed
+            if model_type == "llama4_vision_model":
+                proj_inp_dim = getattr(m_config, config_name).projector_input_dim
+                if proj_inp_dim % tp_size != 0:
+                    from sglang.srt.layers.vocab_parallel_embedding import (
+                        pad_vocab_size,
+                    )
+
+                    update_config(
+                        getattr(m_config, config_name),
+                        "projector_input_dim",
+                        pad_vocab_size(proj_inp_dim, tp_size),
+                    )
 
     return model_config

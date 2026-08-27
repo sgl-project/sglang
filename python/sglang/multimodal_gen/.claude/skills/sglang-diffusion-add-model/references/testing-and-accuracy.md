@@ -7,9 +7,10 @@ produce a non-noise image or video.
 
 - Add concrete GPU integration cases in `python/sglang/multimodal_gen/test/server/gpu_cases.py`.
 - Keep reusable dataclasses, constants, thresholds, and testcase factory helpers in `python/sglang/multimodal_gen/test/server/testcase_configs.py`.
-- Add the case id to `python/sglang/multimodal_gen/test/server/accuracy_testcase_configs.py`
-  only when it should be part of component-accuracy coverage. Adding a GPU case
-  alone does not enroll it there.
+- Set `DiffusionTestCase.run_component_accuracy_check=False` only when the case
+  should not enter component-accuracy coverage. Eligible cases default to
+  `True`; `python/sglang/multimodal_gen/test/single_test_file/component_accuracy/testcase_configs.py`
+  enrolls them automatically.
 - Let `python/sglang/multimodal_gen/test/run_suite.py` own suite selection, runtime-based partitioning, and standalone test files. Do not hard-code CI shard lists elsewhere.
 - If a new standalone test file is added to a suite, update `STANDALONE_FILE_EST_TIMES` after the first measured CI/runtime value is known.
 
@@ -23,38 +24,62 @@ PYTHONPATH=python python3 python/sglang/multimodal_gen/test/run_suite.py --suite
 
 ## Component Accuracy When Adding A GPU Case
 
-If you add a new entry to `ONE_GPU_CASES`, `TWO_GPU_CASES`, or a B200-specific
-case group in `gpu_cases.py`, treat component accuracy as part of the
-model-adding workflow. Do not assume the new testcase will automatically fit or
-enter the existing component-accuracy harness.
+If you add a new entry to `ONE_GPU_CASES` or `TWO_GPU_CASES`, treat component
+accuracy as part of the model-adding workflow. Cases with
+`run_component_accuracy_check=True` are selected automatically. The selector
+deduplicates each component by source model, component override, and GPU
+topology; later equivalent cases receive an automatic duplicate skip reason.
+B200-only groups are not currently inputs to the component-accuracy selector;
+add or identify a representative regular GPU case when that coverage is
+required.
+
+Larger-topology smoke cases need the same explicit decision even when they are
+not enrolled in component accuracy. MiniMax-H3's current
+`MINIMAX_H3_FOUR_GPU_H100_CASES` is the reference: it exercises a real FL2VA
+request with TP2 + Ulysses2, but deliberately disables component accuracy and
+pipeline consistency because its native joint video/audio components do not
+have a directly comparable Diffusers pipeline contract. Pair this GPU smoke
+case with focused unit tests for request admission, packed-sequence layout,
+denoise scheduling, media handling, and VAE parallel-mode rejection.
 
 The component-accuracy harness compares SGLang components against Diffusers/HF
 reference components. This is stricter than pipeline-level inference. New GPU
 cases commonly fail here for one of three reasons:
 
-1. The model family needs explicit hook wiring in `python/sglang/multimodal_gen/test/server/accuracy_hooks.py`.
+1. The model family needs explicit hook wiring in `python/sglang/multimodal_gen/test/single_test_file/component_accuracy/hooks.py`.
    - Add hook logic only when the harness cannot call the raw component correctly without it.
    - Valid reasons include missing required forward arguments, required autocast/runtime context, or family-specific input preparation for the same component contract.
    - Do not change the compared output mode or add harness-side behavior that changes the component contract just to make the test pass.
 
 2. The component is already covered by another testcase with the same source component and topology.
    - Do not add redundant component-accuracy coverage.
-   - Add a skip entry in `python/sglang/multimodal_gen/test/server/accuracy_config.py` with a concrete reason such as `Representative VAE accuracy is already covered by ... for the same source component and topology`.
+   - Let `_select_accuracy_cases` in
+     `python/sglang/multimodal_gen/test/single_test_file/component_accuracy/testcase_configs.py`
+     deduplicate the component automatically. Do not add a manual skip for a
+     duplicate that the selector can identify.
    - This is the preferred path for variant-only cases such as LoRA, Cache-DiT, upscaling, or other cases that reuse the same underlying component weights and topology.
 
 3. The HF/Diffusers reference component cannot be loaded or compared faithfully in the harness.
-   - Add a skip entry in `accuracy_config.py` with the exact technical failure.
+   - Add a skip entry in
+     `python/sglang/multimodal_gen/test/single_test_file/component_accuracy/config.py`
+     with the exact technical failure.
    - Good reasons include missing/unsupported HF component layout, incomplete checkpoints, unsupported raw component contract, or proven divergence after matched weight transfer and matching output shape.
    - Keep the skip reason concrete and technical. Do not write vague reasons like "component accuracy flaky" or "needs investigation."
 
 When adding a new GPU case, make this decision explicitly:
 
-- if the case should have component-accuracy coverage, add its case id to
-  `accuracy_testcase_configs.py`
-- if the family needs minimal harness wiring, add the smallest possible change in `accuracy_hooks.py`
-- if the case is only a variant of an already covered source component and topology, add a skip in `accuracy_config.py`
-- if the HF/Diffusers reference component cannot be compared faithfully, add a skip in `accuracy_config.py`
-- if the case is intentionally GPU-smoke-only, leave it out of `accuracy_testcase_configs.py` and keep that choice explicit in the PR notes
+- if the case should have component-accuracy coverage, leave
+  `run_component_accuracy_check=True`
+- if the family needs minimal harness wiring, add the smallest possible change
+  in
+  `python/sglang/multimodal_gen/test/single_test_file/component_accuracy/hooks.py`
+- if the case is only a variant of an already covered source component and
+  topology, rely on automatic per-component deduplication
+- if the HF/Diffusers reference component cannot be compared faithfully, add a
+  concrete skip in
+  `python/sglang/multimodal_gen/test/single_test_file/component_accuracy/config.py`
+- if the case is intentionally GPU-smoke-only, set
+  `run_component_accuracy_check=False` and explain the choice in the PR notes
 
 Do not add a new GPU case and wait for CI to discover missing component-accuracy
 wiring.
@@ -71,6 +96,10 @@ Tests should cover:
 - single-GPU inference producing non-noise output
 - multi-GPU inference if TP/SP is supported
 - relevant unit tests for new math, parsing, scheduling, or loader behavior
+- every generated modality and delivery contract. For a joint model such as
+  MiniMax-H3, validate the MP4 video stream, synchronized audio stream, frame
+  rate/sample rate, and multi-output grouping; a visually valid frame sequence
+  alone is not sufficient
 
 For performance data:
 

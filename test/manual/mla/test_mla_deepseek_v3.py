@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,14 +12,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
-)
-
-# DeepSeek-V3 MLA tests with torch compile, FA3, and MTP speculative decoding
-register_cuda_ci(est_time=543, suite="stage-b-test-1-gpu-large")
-register_amd_ci(
-    est_time=221,
-    suite="stage-b-test-1-gpu-small-amd",
-    disabled="see https://github.com/sgl-project/sglang/issues/12574",
 )
 
 
@@ -31,7 +22,9 @@ class TestMLADeepseekV3(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(
+                ["--enable-torch-compile", "--cuda-graph-max-bs-decode", "2"]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -68,7 +61,7 @@ class TestMLADeepseekV3DisableFusedFunc(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code", "--chunked-prefill-size", "256"]
         if is_cuda():
-            other_args.extend(["--cuda-graph-max-bs", "2"])
+            other_args.extend(["--cuda-graph-max-bs-decode", "2"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -116,7 +109,7 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
                     "fa3",
                     "--mem-fraction-static",
                     "0.8",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "2",
                 ]
             )
@@ -154,7 +147,7 @@ class TestDeepseekV3MTP(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
             "--disable-radix",
             "--enable-torch-compile",

@@ -115,6 +115,7 @@ class HttpServerEngineAdapter(EngineBase):
         lora_path=None,
         custom_logit_processor=None,
         priority=None,
+        session_id=None,
     ):
         payload = {
             "text": prompt,
@@ -128,6 +129,7 @@ class HttpServerEngineAdapter(EngineBase):
             "lora_path": lora_path,
             "custom_logit_processor": custom_logit_processor,
             "priority": priority,
+            "session_id": session_id,
         }
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}

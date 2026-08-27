@@ -74,7 +74,11 @@ class ModelOptFp8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+    def from_config(
+        cls,
+        config: Dict[str, Any],
+        ignore_remap: Optional[Dict[str, str]] = None,
+    ) -> ModelOptFp8Config:
         quant_algo = config.get("quant_algo")
         if quant_algo is None:
             raise ValueError(
@@ -85,6 +89,8 @@ class ModelOptFp8Config(QuantizationConfig):
                 f"ModelOptFp8Config only supports FP8, got quant_algo={quant_algo!r}."
             )
         ignore = config.get("ignore", [])
+        if ignore_remap and ignore:
+            ignore = [ignore_remap.get(pattern, pattern) for pattern in ignore]
         return cls(is_checkpoint_fp8_serialized=True, ignore=ignore)
 
     def _is_layer_ignored(self, prefix: str) -> bool:
@@ -122,7 +128,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt static per-tensor FP8 quantization.
 
     Uses ``torch._scaled_mm`` (or CUTLASS FP8 GEMM when available) for
-    the FP8 matrix multiply — the same kernels used by the LLM runtime.
+    the FP8 matrix multiply - the same kernels used by the LLM runtime.
     """
 
     def __init__(self, quant_config: ModelOptFp8Config):
@@ -177,8 +183,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         max_w_scale = layer.weight_scale.max()
 
         # Transpose weight to [in, out] column-major layout for
-        # apply_fp8_linear / CUTLASS fp8_scaled_mm.  Do NOT call
-        # .contiguous() — the kernel requires column-major stride.
+        # apply_fp8_linear / CUTLASS fp8_scaled_mm. Do not call .contiguous();
+        # the kernel requires column-major stride.
         layer.weight = torch.nn.Parameter(layer.weight.data.t(), requires_grad=False)
 
         if self.cutlass_fp8_supported:

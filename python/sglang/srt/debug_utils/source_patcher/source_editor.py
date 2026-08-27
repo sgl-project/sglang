@@ -67,8 +67,9 @@ def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
     ]
 
     if len(found_indices) == 0:
-        preview: str = "\n".join(match_lines)
-        raise PatchApplicationError(f"match text not found in source:\n{preview}")
+        raise PatchApplicationError(
+            _not_found_diagnostic(stripped_source, stripped_match)
+        )
     if len(found_indices) > 1:
         preview = "\n".join(match_lines)
         raise PatchApplicationError(
@@ -76,6 +77,41 @@ def _find_match(*, source_lines: list[str], match_lines: list[str]) -> int:
         )
 
     return found_indices[0]
+
+
+def _not_found_diagnostic(stripped_source: list[str], stripped_match: list[str]) -> str:
+    preview = "\n".join(stripped_match)
+    lines = [
+        f"match text not found in source:\n{preview}",
+        "",
+        f"source_len={len(stripped_source)} lines",
+    ]
+
+    if not stripped_match:
+        return "\n".join(lines)
+    first_match_line = stripped_match[0]
+    hits = [i for i, line in enumerate(stripped_source) if line == first_match_line]
+    if not hits:
+        lines.append(
+            f"first match line {first_match_line!r} does NOT appear anywhere in source"
+        )
+        return "\n".join(lines)
+
+    lines.append(
+        f"first match line {first_match_line!r} appears {len(hits)} time(s); showing up to 8 windows with context:"
+    )
+    for i in hits[:8]:
+        lo = max(0, i - 2)
+        hi = min(len(stripped_source), i + len(stripped_match) + 2)
+        block: list[str] = []
+        for j in range(lo, hi):
+            marker = (
+                ">" if lo + (j - lo) >= i and (j - i) < len(stripped_match) else " "
+            )
+            block.append(f"{marker} {j:4d}: {stripped_source[j]}")
+        lines.append("--")
+        lines.extend(block)
+    return "\n".join(lines)
 
 
 def _realign_replacement(

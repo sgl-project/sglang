@@ -22,7 +22,7 @@ import requests
 
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.bench_one_batch_server import run_benchmark as run_one_batch_benchmark
-from sglang.bench_serving import run_benchmark as run_serving_benchmark
+from sglang.benchmark.serving import run_benchmark as run_serving_benchmark
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -40,10 +40,7 @@ HONGLOUMENG_PATH = os.environ.get(
 )
 
 DSV4_PRO_BASE_ENV = {
-    "SGLANG_ENABLE_SPEC_V2": "1",
-    "SGLANG_OPT_USE_TOPK_V2": "1",
     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
-    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
 }
 
 DSV4_PRO_SERVER_ARGS = [

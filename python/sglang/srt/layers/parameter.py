@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
 import logging
@@ -588,8 +590,8 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor, marlin_tile_size
 ):
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     if marlin_tile_size is not None:
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,

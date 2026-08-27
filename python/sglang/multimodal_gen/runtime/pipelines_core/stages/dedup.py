@@ -30,12 +30,13 @@ class StageDedupMixin:
     deduplicated_output_fields: ClassVar[tuple[str, ...]] = ()
     deduplicated_tensor_tree_output_fields: ClassVar[tuple[str, ...]] = ()
     deduplicated_deepcopy_output_fields: ClassVar[tuple[str, ...]] = ()
+    deduplicated_extra_output_keys: ClassVar[tuple[str, ...]] = ()
     deduplicated_extra_tensor_tree_output_keys: ClassVar[tuple[str, ...]] = ()
 
     def run_grouped_requests(
         self,
-        batches: list["Req"],
-        server_args: "ServerArgs",
+        batches: list[Req],
+        server_args: ServerArgs,
     ) -> list[Any]:
         """Run this stage for a group of independent requests.
 
@@ -60,10 +61,11 @@ class StageDedupMixin:
             cls.deduplicated_output_fields
             or cls.deduplicated_tensor_tree_output_fields
             or cls.deduplicated_deepcopy_output_fields
+            or cls.deduplicated_extra_output_keys
             or cls.deduplicated_extra_tensor_tree_output_keys
         )
 
-    def build_dedup_fingerprint(self, batch: "Req", server_args: "ServerArgs") -> Any:
+    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs) -> Any:
         """Return this stage's semantic input fingerprint for grouped dedup.
 
         A fingerprint is the stage-local set of input values that fully
@@ -79,10 +81,10 @@ class StageDedupMixin:
 
     def run_deduplicated_group(
         self,
-        batches: list["Req"],
-        server_args: "ServerArgs",
+        batches: list[Req],
+        server_args: ServerArgs,
         copy_outputs=None,
-    ) -> list["Req"]:
+    ) -> list[Req]:
         """Run full-stage-equivalent requests once and fan out stage outputs."""
         if copy_outputs is None:
             copy_outputs = self.copy_deduplicated_outputs
@@ -102,15 +104,15 @@ class StageDedupMixin:
 
         return [result for result in results if result is not None]
 
-    def copy_deduplicated_outputs(self, src: "Req", dst: "Req") -> None:
+    def copy_deduplicated_outputs(self, src: Req, dst: Req) -> None:
         """Copy declared stage outputs from a computed request to a duplicate.
 
         ``deduplicated_output_fields`` uses shallow container copies and shares
         tensor references, which is the low-overhead path for read-only outputs
         such as embeddings. Tensor-tree fields recursively clone tensors.
         Deepcopy fields are for mutable request-local runtime objects, such as
-        scheduler instances. Extra keys clone selected ``Req.extra`` entries
-        without replacing the destination extra dict.
+        scheduler instances. Extra output keys follow the same shallow-copy
+        contract, while extra tensor-tree keys recursively clone tensors.
         """
         for field in self.deduplicated_output_fields:
             setattr(dst, field, self.copy_stage_output(getattr(src, field)))
@@ -118,6 +120,9 @@ class StageDedupMixin:
             setattr(dst, field, self.clone_tensor_tree(getattr(src, field)))
         for field in self.deduplicated_deepcopy_output_fields:
             setattr(dst, field, deepcopy(getattr(src, field)))
+        for key in self.deduplicated_extra_output_keys:
+            if key in src.extra:
+                dst.extra[key] = self.copy_stage_output(src.extra[key])
         for key in self.deduplicated_extra_tensor_tree_output_keys:
             if key in src.extra:
                 dst.extra[key] = self.clone_tensor_tree(src.extra[key])
@@ -175,11 +180,11 @@ class StageDedupMixin:
 
     @staticmethod
     def _group_requests_by_fingerprint(
-        batches: list["Req"],
+        batches: list[Req],
         fingerprint_fn,
-    ) -> list[tuple[Any, list[tuple[int, "Req"]]]]:
+    ) -> list[tuple[Any, list[tuple[int, Req]]]]:
         """Group requests by a stage-local fingerprint while preserving order."""
-        groups: dict[Any, list[tuple[int, "Req"]]] = {}
+        groups: dict[Any, list[tuple[int, Req]]] = {}
         for index, batch in enumerate(batches):
             fingerprint = fingerprint_fn(batch)
             groups.setdefault(fingerprint, []).append((index, batch))
