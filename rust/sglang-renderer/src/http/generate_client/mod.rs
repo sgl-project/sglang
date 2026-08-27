@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_stream::stream;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     DynamoTokenizer, FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
@@ -20,6 +20,15 @@ pub struct HttpGenerateClient {
     tokenizer: dynamo_tokenizers::Tokenizer,
     stop_tokenizer: Arc<DynamoTokenizer>,
     auto_specials: Arc<[i32]>,
+}
+
+/// Renderer-to-engine framing options stay private to this HTTP transport and
+/// do not become part of the standalone prepared-request contract.
+#[derive(Serialize)]
+struct EngineGenerateBody<'a> {
+    #[serde(flatten)]
+    request: &'a PreparedGenerateRequest,
+    incremental_streaming_output: bool,
 }
 
 impl HttpGenerateClient {
@@ -75,7 +84,10 @@ impl HttpGenerateClient {
         let response = self
             .client
             .post(self.generate_url.as_ref())
-            .json(&wire)
+            .json(&EngineGenerateBody {
+                request: &wire,
+                incremental_streaming_output: true,
+            })
             .send()
             .await
             .map_err(|error| unavailable(format!("engine request failed: {error}")))?;
@@ -777,6 +789,27 @@ mod tests {
         ]))
     }
 
+    async fn incremental_generate() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let frame = |completion_tokens, finish_reason: serde_json::Value| {
+            Event::default().data(
+                serde_json::json!({
+                    "output_ids": [104],
+                    "meta_info": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": completion_tokens,
+                        "finish_reason": finish_reason,
+                    }
+                })
+                .to_string(),
+            )
+        };
+        Sse::new(futures::stream::iter([
+            Ok(frame(1, serde_json::Value::Null)),
+            Ok(frame(2, serde_json::json!({"type": "length", "length": 2}))),
+            Ok(Event::default().data("[DONE]")),
+        ]))
+    }
+
     fn tiny_tokenizer() -> dynamo_tokenizers::Tokenizer {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../experimental/sgl-router/tests/fixtures/tiny_tokenizer.json");
@@ -840,7 +873,48 @@ mod tests {
         assert_eq!(request["rid"], "client-request");
         assert_eq!(request["input_ids"], serde_json::json!([65]));
         assert_eq!(request["stream"], true);
+        assert_eq!(request["incremental_streaming_output"], true);
         assert_eq!(request["return_text_in_logprobs"], false);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn incremental_engine_frames_are_forwarded_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route("/generate", post(incremental_generate)),
+            )
+            .into_future(),
+        );
+
+        let client =
+            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
+        let mut events = client
+            .generate(TokenIdsRequest {
+                rid: "incremental".into(),
+                input_ids: vec![65],
+                options: GenerationOptions::default(),
+            })
+            .await
+            .unwrap();
+
+        let first = events.next().await.unwrap().unwrap();
+        let GenerationEvent::Frame(first) = first else {
+            panic!("first engine delta must be non-terminal");
+        };
+        assert_eq!(first.token_ids, [104]);
+        assert_eq!(first.completion_tokens, 1);
+
+        let second = events.next().await.unwrap().unwrap();
+        let GenerationEvent::Done(second) = second else {
+            panic!("second engine delta must be terminal");
+        };
+        assert_eq!(second.token_ids, [104]);
+        assert_eq!(second.completion_tokens, 1);
+        assert!(events.next().await.is_none());
         server.abort();
     }
 

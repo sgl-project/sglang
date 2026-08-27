@@ -205,6 +205,9 @@ async fn generate(
         }
     };
     let stream = body.stream;
+    let incremental = body
+        .incremental_streaming_output
+        .unwrap_or(state.server_args.incremental_streaming_output);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form → the response is a JSON array.
     let (mut payloads, is_batch) = match body.into_requests() {
@@ -231,9 +234,9 @@ async fn generate(
             .into_iter()
             .next()
             .expect("into_requests yields >=1 payload");
-        generate_single(&state, payload, stream, timing).await
+        generate_single(&state, payload, stream, incremental, timing).await
     } else {
-        generate_batch(&state, payloads, stream, timing).await
+        generate_batch(&state, payloads, stream, incremental, timing).await
     }
 }
 
@@ -246,6 +249,7 @@ async fn generate_single(
     state: &AppState,
     req: GenerateRequest,
     stream: bool,
+    incremental: bool,
     timing: RequestTiming,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
@@ -259,9 +263,6 @@ async fn generate_single(
     // finishes (axum drops the handler/SSE stream). Disarmed on a natural terminal.
     // `rid_str` is the response `meta_info.id`, reused for every frame.
     let mut guard = AbortGuard::new(state.senders.clone(), rid_str.clone());
-    // Cumulative frames (SGLang default) vs per-step deltas.
-    let incremental = state.server_args.incremental_streaming_output;
-
     if stream {
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
@@ -342,6 +343,7 @@ async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
+    incremental: bool,
     timing: RequestTiming,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
@@ -363,7 +365,6 @@ async fn generate_batch(
         // Multiplex the N streams (mirrors the Python `_handle_batch_request` path);
         // `guard` moves into the stream so a disconnect aborts what's unfinished.
         use futures::StreamExt;
-        let incremental = state.server_args.incremental_streaming_output;
         let s = generation_event_stream(receivers, guard, incremental, true)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()

@@ -63,6 +63,11 @@ pub struct GenerateBody {
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
+    /// Override the server-wide streaming frame format for this response.
+    /// `None` preserves the configured default; one value applies to the whole
+    /// response, including every item in a batch.
+    #[serde(default)]
+    pub incremental_streaming_output: Option<bool>,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
     #[serde(default)]
@@ -844,6 +849,24 @@ mod tests {
         assert!(!is_batch);
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn incremental_streaming_output_is_a_scalar_override() {
+        let unset = serde_json::from_str::<GenerateBody>(r#"{"text": "hi"}"#).unwrap();
+        assert_eq!(unset.incremental_streaming_output, None);
+
+        let enabled = serde_json::from_str::<GenerateBody>(
+            r#"{"text": ["a", "b"], "incremental_streaming_output": true}"#,
+        )
+        .unwrap();
+        assert_eq!(enabled.incremental_streaming_output, Some(true));
+
+        let disabled = serde_json::from_str::<GenerateBody>(
+            r#"{"text": "hi", "incremental_streaming_output": false}"#,
+        )
+        .unwrap();
+        assert_eq!(disabled.incremental_streaming_output, Some(false));
     }
 
     /// List `text` → batch (even length 1); each prompt becomes its own payload.
