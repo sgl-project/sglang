@@ -112,6 +112,17 @@ constexpr int kWaveSize = 64;
 constexpr int kWaveSize = 32;
 #endif
 
+// CUDA removed the unsynchronised warp shuffles, so the two scans below have to
+// spell the operation differently per platform. Both call sites are reached by
+// every thread of the block, hence the full mask.
+__device__ __forceinline__ int shfl_down_wave(int value, int delta) {
+#ifdef USE_ROCM
+  return __shfl_down(value, delta, kWaveSize);
+#else
+  return __shfl_down_sync(0xffffffffu, value, delta, kWaveSize);
+#endif
+}
+
 // Inclusive suffix sum over h[0..kCoarseBins), with h[kCoarseBins] == 0.
 //
 // Unlike the 256-bin scan below this one has more bins than the block has
@@ -137,7 +148,7 @@ __device__ __forceinline__ void suffix_scan_coarse(int* h, int tx) {
   int suf = total;
 #pragma unroll
   for (int d = 1; d < kWaveSize; d <<= 1) {
-    const int y = __shfl_down(suf, d);
+    const int y = shfl_down_wave(suf, d);
     if (lane + d < kWaveSize) suf += y;
   }
   if (lane == 0) s_wave_total[wave] = suf;
@@ -245,7 +256,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       int suf = total;
 #pragma unroll
       for (int d = 1; d < kWaveSize; d <<= 1) {
-        const int y = __shfl_down(suf, d);
+        const int y = shfl_down_wave(suf, d);
         if (tx + d < kWaveSize) suf += y;
       }
       const int excl = suf - total;  // sum of every bin owned by a later lane
