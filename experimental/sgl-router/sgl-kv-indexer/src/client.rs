@@ -9,16 +9,16 @@
 //! a different signal.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
+use rand::Rng;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tonic::transport::{Channel, Endpoint};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::MatchExternalKvPrefixRequest;
 use crate::service::MAX_GRPC_DECODING_MESSAGE_SIZE;
-use crate::status::{IndexerStatusRegistry, DEFAULT_STATUS_FRESHNESS};
 
 /// Default per-query deadline. Indexer failures are request failures, so this
 /// absorbs normal cross-host jitter without stalling a request indefinitely.
@@ -159,7 +159,7 @@ pub trait PrefixIndex: Send + Sync {
 
 /// tonic-backed [`PrefixIndex`] with a lazily-established connection.
 pub struct GrpcPrefixIndex {
-    registry: Arc<IndexerStatusRegistry>,
+    endpoints: Vec<String>,
     channels: Mutex<HashMap<String, Channel>>,
     deadline: Duration,
     prefix_query_semaphore: Semaphore,
@@ -191,18 +191,25 @@ impl GrpcPrefixIndex {
             parse_endpoint(endpoint)?;
         }
         Ok(Self {
-            registry: Arc::new(IndexerStatusRegistry::new(
-                endpoints,
-                DEFAULT_STATUS_FRESHNESS,
-            )),
+            endpoints,
             channels: Mutex::new(HashMap::new()),
             deadline: config.query_deadline,
             prefix_query_semaphore: Semaphore::new(config.max_inflight),
         })
     }
 
-    pub fn status_registry(&self) -> Arc<IndexerStatusRegistry> {
-        Arc::clone(&self.registry)
+    fn endpoint_order(&self, start: usize) -> Vec<String> {
+        self.endpoints
+            .iter()
+            .cycle()
+            .skip(start % self.endpoints.len())
+            .take(self.endpoints.len())
+            .cloned()
+            .collect()
+    }
+
+    fn random_start<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        rng.gen_range(0..self.endpoints.len())
     }
 
     fn try_acquire_prefix_query(&self) -> Result<SemaphorePermit<'_>, PrefixIndexError> {
@@ -299,14 +306,12 @@ impl PrefixIndex for GrpcPrefixIndex {
 
         let _permit = self.try_acquire_prefix_query()?;
 
-        let candidates = self.registry.candidates();
-        if candidates.is_empty() {
-            return Err(PrefixIndexError::Unreachable);
-        }
+        let start = self.random_start(&mut rand::thread_rng());
+        let endpoints = self.endpoint_order(start);
         let mut last_error = PrefixIndexError::Unreachable;
-        for candidate in candidates {
+        for endpoint in endpoints {
             match self
-                .query_one(&candidate.endpoint, &hashes, &eligible_worker_addresses)
+                .query_one(&endpoint, &hashes, &eligible_worker_addresses)
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
@@ -317,10 +322,9 @@ impl PrefixIndex for GrpcPrefixIndex {
                     | PrefixIndexError::PartialCoverage),
                 ) => {
                     tracing::warn!(
-                        indexer_id = %candidate.indexer_id,
-                        endpoint = %candidate.endpoint,
+                        %endpoint,
                         %error,
-                        "KV Indexer query failed; trying next READY replica"
+                        "KV Indexer query failed; trying another replica"
                     );
                     last_error = error;
                 }
@@ -378,6 +382,9 @@ fn classify(code: tonic::Code) -> PrefixIndexError {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::HashSet;
+    use std::sync::Arc;
 
     use super::*;
 
@@ -468,6 +475,35 @@ mod tests {
         assert!(GrpcPrefixIndex::new(PrefixIndexConfig::new("10.0.0.1:50051")).is_err());
     }
 
+    #[test]
+    fn endpoint_order_starts_at_selected_replica_and_wraps() {
+        let index = GrpcPrefixIndex::new(PrefixIndexConfig::new(
+            "http://i1:50051,http://i2:50051,http://i3:50051",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            index.endpoint_order(1),
+            vec![
+                "http://i2:50051".to_string(),
+                "http://i3:50051".to_string(),
+                "http://i1:50051".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn random_start_can_select_every_configured_replica() {
+        let index = GrpcPrefixIndex::new(PrefixIndexConfig::new(
+            "http://i1:50051,http://i2:50051,http://i3:50051",
+        ))
+        .unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let starts: HashSet<_> = (0..64).map(|_| index.random_start(&mut rng)).collect();
+
+        assert_eq!(starts, HashSet::from([0, 1, 2]));
+    }
+
     #[tokio::test]
     async fn local_admission_rejects_without_queueing() {
         let index = GrpcPrefixIndex::new(PrefixIndexConfig {
@@ -488,14 +524,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fleet_query_fails_over_to_next_ready_indexer() {
+    async fn fleet_query_fails_over_across_randomized_static_endpoints() {
         use crate::pb::{
             ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType,
         };
-        use crate::{
-            server_builder, InMemoryKvIndexerBackend, IndexerStatusReport, KvIndexerBackend,
-            KvIndexerService,
-        };
+        use crate::{server_builder, InMemoryKvIndexerBackend, KvIndexerBackend, KvIndexerService};
 
         let backend = Arc::new(InMemoryKvIndexerBackend::new());
         backend
@@ -543,45 +576,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let index = GrpcPrefixIndex::new(PrefixIndexConfig {
-            endpoint: "http://127.0.0.1:1".into(),
+            endpoint: format!("http://{partial_addr},http://127.0.0.1:1,http://{addr}"),
             query_deadline: Duration::from_millis(50),
             max_inflight: 4,
         })
         .unwrap();
-        let registry = index.status_registry();
-        registry
-            .record(IndexerStatusReport {
-                indexer_id: "partial".into(),
-                endpoint: format!("http://{partial_addr}"),
-                ready: true,
-                normalized_load: 0.1,
-                ready_workers: 1,
-                total_workers: 1,
-                streams: Vec::new(),
-            })
-            .unwrap();
-        registry
-            .record(IndexerStatusReport {
-                indexer_id: "dead".into(),
-                endpoint: "http://127.0.0.1:1".into(),
-                ready: true,
-                normalized_load: 0.0,
-                ready_workers: 1,
-                total_workers: 1,
-                streams: Vec::new(),
-            })
-            .unwrap();
-        registry
-            .record(IndexerStatusReport {
-                indexer_id: "healthy".into(),
-                endpoint: format!("http://{addr}"),
-                ready: true,
-                normalized_load: 0.5,
-                ready_workers: 1,
-                total_workers: 1,
-                streams: Vec::new(),
-            })
-            .unwrap();
 
         let outcome = index
             .match_prefix_for_workers(vec![7], vec!["http://worker".into()])

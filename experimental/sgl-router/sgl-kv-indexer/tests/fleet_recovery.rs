@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local fleet integration: 2 Workers, 1 Router client, 2 Indexers, failover,
-//! restart recovery, scale-out, and scale-in eligibility.
+//! Local fleet integration: 2 Workers, 1 Router client, and 2 statically
+//! configured Indexers selected in random order with failover and restart.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -13,8 +13,8 @@ use sgl_kv_indexer::pb::{
     TierType,
 };
 use sgl_kv_indexer::{
-    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, IndexerStatusReport,
-    KvIndexerService, PrefixIndex, PrefixIndexConfig, PrefixOutcome,
+    server_builder, GrpcPrefixIndex, InMemoryKvIndexerBackend, KvIndexerService, PrefixIndex,
+    PrefixIndexConfig, PrefixOutcome,
 };
 
 fn free_addr() -> SocketAddr {
@@ -82,18 +82,6 @@ async fn configure_replica(endpoint: &str, suffix: &str) {
     }
 }
 
-fn report(id: &str, endpoint: &str, load: f64, ready: bool) -> IndexerStatusReport {
-    IndexerStatusReport {
-        indexer_id: id.into(),
-        endpoint: endpoint.into(),
-        ready,
-        normalized_load: load,
-        ready_workers: if ready { 2 } else { 0 },
-        total_workers: 2,
-        streams: Vec::new(),
-    }
-}
-
 fn selected_worker(outcome: PrefixOutcome) -> String {
     match outcome {
         PrefixOutcome::Matched { matches, .. } => matches[0].address.clone(),
@@ -102,7 +90,7 @@ fn selected_worker(outcome: PrefixOutcome) -> String {
 }
 
 #[tokio::test]
-async fn two_indexer_fleet_scales_fails_over_and_recovers_after_restart() {
+async fn two_indexer_fleet_randomizes_fails_over_and_recovers_after_restart() {
     let addr1 = free_addr();
     let addr2 = free_addr();
     let endpoint1 = format!("http://{addr1}");
@@ -113,68 +101,39 @@ async fn two_indexer_fleet_scales_fails_over_and_recovers_after_restart() {
     configure_replica(&endpoint2, "i2").await;
 
     let router = GrpcPrefixIndex::new(PrefixIndexConfig {
-        endpoint: endpoint1.clone(),
+        endpoint: format!("{endpoint1},{endpoint2}"),
         query_deadline: Duration::from_millis(100),
         max_inflight: 8,
     })
     .unwrap();
-    let registry = router.status_registry();
 
-    // Start with one reported replica; this is the fleet's scale-out baseline.
-    registry
-        .record(report("i1", &endpoint1, 0.4, true))
-        .unwrap();
-    assert_eq!(
-        selected_worker(router.match_prefix(vec![1, 2]).await.unwrap()),
-        "http://w1-i1"
-    );
+    // Either configured replica may be selected first.
+    let selected = selected_worker(router.match_prefix(vec![1, 2]).await.unwrap());
+    assert!(matches!(selected.as_str(), "http://w1-i1" | "http://w1-i2"));
 
-    // A lower-load second replica reports READY and immediately receives work.
-    registry
-        .record(report("i2", &endpoint2, 0.1, true))
-        .unwrap();
-    assert_eq!(
-        selected_worker(router.match_prefix(vec![1, 2]).await.unwrap()),
-        "http://w1-i2"
-    );
-
-    // Failure of the selected replica falls through to the next READY member.
+    // Failure of whichever replica is selected first falls through to i1.
     server2.abort();
-    registry
-        .record(report("i2", "http://127.0.0.1:1", 0.0, true))
-        .unwrap();
-    assert_eq!(
-        selected_worker(router.match_prefix(vec![1, 2]).await.unwrap()),
-        "http://w1-i1"
-    );
+    let _ = server2.await;
+    for _ in 0..8 {
+        assert_eq!(
+            selected_worker(router.match_prefix(vec![1, 2]).await.unwrap()),
+            "http://w1-i1"
+        );
+    }
 
-    // Restart loses in-memory state; reconfiguration + snapshot replacement
-    // restores it before the status report makes the replica eligible again.
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let restarted_addr = free_addr();
-    let restarted_endpoint = format!("http://{restarted_addr}");
-    server2 = start_indexer(restarted_addr);
-    configure_replica(&restarted_endpoint, "i2-restarted").await;
-    registry
-        .record(report("i2", &restarted_endpoint, 0.0, true))
-        .unwrap();
+    // A restarted static endpoint becomes usable again after snapshot recovery.
+    server2 = start_indexer(addr2);
+    configure_replica(&endpoint2, "i2-restarted").await;
+    let restarted_router = GrpcPrefixIndex::new(PrefixIndexConfig {
+        endpoint: endpoint2,
+        query_deadline: Duration::from_millis(100),
+        max_inflight: 8,
+    })
+    .unwrap();
     assert_eq!(
-        selected_worker(router.match_prefix(vec![1, 2]).await.unwrap()),
+        selected_worker(restarted_router.match_prefix(vec![1, 2]).await.unwrap()),
         "http://w1-i2-restarted"
     );
-
-    // Scale-in makes i2 ineligible without affecting i1.
-    registry
-        .record(report("i2", &restarted_endpoint, 0.0, false))
-        .unwrap();
-    registry
-        .record(report("i1", &endpoint1, 0.4, true))
-        .unwrap();
-    assert_eq!(
-        selected_worker(router.match_prefix(vec![1, 2]).await.unwrap()),
-        "http://w1-i1"
-    );
-
     server1.abort();
     server2.abort();
 }

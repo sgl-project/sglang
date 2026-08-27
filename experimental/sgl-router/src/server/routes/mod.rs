@@ -4,7 +4,6 @@
 pub mod cache;
 pub mod chat;
 pub mod health;
-pub mod indexer_status;
 pub mod metrics;
 pub mod models;
 pub mod tokenize;

@@ -21,7 +21,7 @@ use crate::pb::{
     ReplaceExternalKvSnapshotRequest, ReplaceExternalKvSnapshotResponse, StreamId, TierType,
     WorkerCacheSpec,
 };
-use crate::status::IndexerStatusHandle;
+use tokio::sync::Semaphore;
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
 /// no caller can make it allocate work proportional to an unbounded field. The
@@ -267,7 +267,7 @@ impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
 #[derive(Debug)]
 pub struct KvIndexerService<B> {
     backend: B,
-    status: std::sync::Arc<IndexerStatusHandle>,
+    prefix_query_semaphore: Semaphore,
 }
 
 impl<B> KvIndexerService<B>
@@ -279,12 +279,11 @@ where
     }
 
     pub fn with_prefix_query_max_inflight(backend: B, max_inflight: usize) -> Self {
-        let status = std::sync::Arc::new(IndexerStatusHandle::new(max_inflight));
-        Self::with_status(backend, status)
-    }
-
-    pub fn with_status(backend: B, status: std::sync::Arc<IndexerStatusHandle>) -> Self {
-        Self { backend, status }
+        assert!(max_inflight > 0, "prefix query capacity must be positive");
+        Self {
+            backend,
+            prefix_query_semaphore: Semaphore::new(max_inflight),
+        }
     }
 
     /// Wraps the service in its generated server with the decoding limit a
@@ -448,7 +447,7 @@ where
         validate_hashes(&request.hashes)?;
         validate_eligible_streams(&request)?;
         // Caps concurrent prefix queries; excess is rejected, never queued.
-        let _permit = self.status.try_acquire_query().map_err(|_| {
+        let _permit = self.prefix_query_semaphore.try_acquire().map_err(|_| {
             if let Some(rejected_total) = OVERLOAD_LOG.record() {
                 tracing::warn!(
                     rejected_total,

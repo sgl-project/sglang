@@ -98,7 +98,6 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
-    let mut indexer_status_registry = None;
     let prefix_provider: Option<Arc<dyn sgl_router::prefix_provider::PrefixMatchProvider>> = cfg
         .model
         .cache_aware
@@ -110,12 +109,12 @@ async fn main() -> Result<()> {
                 query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
                 max_inflight: indexer.query_max_inflight,
             };
-            let provider = Arc::new(
-                sgl_router::prefix_provider::DefaultPrefixMatchProvider::new(config)
-                    .context("configure KV Indexer client")?,
-            );
-            indexer_status_registry = Some(provider.status_registry());
-            Ok::<Arc<dyn sgl_router::prefix_provider::PrefixMatchProvider>, anyhow::Error>(provider)
+            Ok::<Arc<dyn sgl_router::prefix_provider::PrefixMatchProvider>, anyhow::Error>(
+                Arc::new(
+                    sgl_router::prefix_provider::DefaultPrefixMatchProvider::new(config)
+                        .context("configure KV Indexer client")?,
+                ),
+            )
         })
         .transpose()?;
 
@@ -212,7 +211,6 @@ async fn main() -> Result<()> {
         active_load,
     );
     app_ctx.prefix_provider = prefix_provider;
-    app_ctx.indexer_status_registry = indexer_status_registry;
     app_ctx.block_size_oracle = block_size_oracle;
     app_ctx.worker_loads = worker_loads;
     let ctx = Arc::new(app_ctx);

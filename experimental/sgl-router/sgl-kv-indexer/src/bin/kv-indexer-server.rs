@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::{env, io};
 
 use sgl_kv_indexer::{
-    server_builder, shutdown_signal, spawn_status_reporter, stamp_arrival,
-    InMemoryKvIndexerBackend, IndexerStatusHandle, KvIndexerBackend, KvIndexerService,
-    StatusReporterConfig, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    server_builder, shutdown_signal, stamp_arrival, InMemoryKvIndexerBackend, KvIndexerBackend,
+    KvIndexerService, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
 };
 use tonic::service::interceptor::InterceptedService;
 use tracing::info;
@@ -27,26 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "[::1]:50051".to_string())
         .parse::<SocketAddr>()?;
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
-    let status = Arc::new(IndexerStatusHandle::new(prefix_query_max_inflight));
-    let status_reporter_config = StatusReporterConfig::from_env()
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
-    if status_reporter_config.is_some() {
-        // A fleet member is not eligible until its paired Bridge configures and
-        // restores the expected Worker set.
-        status.set_ready(false);
-    }
-
-    let backend: Arc<dyn KvIndexerBackend> =
-        Arc::new(InMemoryKvIndexerBackend::with_status(Arc::clone(&status)));
+    let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
     // The interceptor timestamps each request before its own task is queued,
     // which is what lets the query path shed work whose deadline expired.
     let service = InterceptedService::new(
-        KvIndexerService::with_status(backend, Arc::clone(&status)).into_server(),
+        KvIndexerService::with_prefix_query_max_inflight(backend, prefix_query_max_inflight)
+            .into_server(),
         stamp_arrival,
     );
-
-    let _status_reporter =
-        status_reporter_config.map(|config| spawn_status_reporter(Arc::clone(&status), config));
 
     info!(
         %addr,

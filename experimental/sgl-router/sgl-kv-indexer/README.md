@@ -7,14 +7,13 @@ moving KV data itself.
 
 Each Indexer uses a process-local in-memory index with no external storage
 dependency. The state is soft, but a paired Bridge rebuilds it from every
-Worker's Snapshot + Live Events before that replica reports READY.
+Worker's Snapshot + Live Events before its coverage becomes complete.
 
 ## Architecture
 
 ```text
 Worker fleet ── Snapshot + ZMQ Live ──> Bridge i ── gRPC ──> Indexer i
-Router fleet <──── 100 ms status ───── Indexer fleet
-Router ───────── MatchPrefix ─────────> one fresh READY Indexer
+Router ───── randomized MatchPrefix ──> statically configured Indexer fleet
 Router ───────── GET /v1/loads ───────> Worker fleet
 ```
 
@@ -22,8 +21,8 @@ Router ───────── GET /v1/loads ───────> Worker f
 - One `kv-indexer-bridge` is paired 1:1 with one `kv-indexer-server`; that
   Bridge follows every configured worker/rank stream.
 - Multiple Indexer replicas independently hold the complete placement view.
-- Every Indexer reports readiness, coverage, and normalized query saturation to
-  every Router at a 100 ms default interval.
+- Routers randomly select a configured Indexer for each query and fail over
+  through the remaining static endpoints without exchanging load or status.
 - Placement, worker metadata, reverse holdings, and hit counters live in that
   server process behind a single read/write lock.
 
@@ -35,10 +34,10 @@ leader, consensus, persistence, or state sharing between replicas.
 
 ## Operational contract
 
-Run any number of `Bridge + Indexer` pairs. Routers select the lowest-load fresh
-READY Indexer report, retry another READY member on timeout, unreachability,
-overload, or partial coverage, and fall back to load-only Worker routing when
-none is usable.
+Run any number of `Bridge + Indexer` pairs. Configure their endpoints on each
+Router. Every query starts at a randomly selected replica; timeout,
+unreachability, overload, or partial coverage moves to another configured
+replica. Routing falls back to Worker load when none is usable.
 
 Fleet mode requires snapshot-capable Workers. The Bridge subscribes to Live
 Events before requesting a snapshot, stages Snapshot v2 in bounded gRPC chunks,
@@ -86,14 +85,10 @@ This produces:
 Component-aware routing requires an SGLang engine build that supports
 `component_types`. Start each command in its own terminal.
 
-1. Start each Indexer server. Status reporting is enabled when Router URLs are
-configured:
+1. Start each Indexer server:
 
 ```bash
 KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
-KV_INDEXER_ID=indexer-1 \
-KV_INDEXER_ADVERTISE_ENDPOINT=http://127.0.0.1:50051 \
-KV_INDEXER_ROUTER_URLS=http://127.0.0.1:3001 \
   cargo run --release --bin kv-indexer-server
 ```
 
@@ -101,9 +96,6 @@ KV_INDEXER_ROUTER_URLS=http://127.0.0.1:3001 \
 `KV_INDEXER_PREFIX_QUERY_MAX_INFLIGHT` sets the maximum number of prefix
 queries executing concurrently and defaults to `32`. Requests above the limit
 are rejected immediately with gRPC `RESOURCE_EXHAUSTED`.
-`KV_INDEXER_STATUS_INTERVAL_MS` defaults to `100`; Router reports expire after
-500 ms. The normalized load is current prefix-query saturation divided by the
-configured in-flight capacity.
 
 2. Start one Bridge paired with this Indexer. Fleet mode configures all Worker
 streams in one JSON array:
@@ -149,13 +141,14 @@ sgl-router \
   --tokenizer-path <huggingface-repo-or-tokenizer> \
   --worker-urls http://127.0.0.1:30000 \
   --policy cache_aware_zmq \
-  --kv-indexer-endpoint http://127.0.0.1:50051 \
+  --kv-indexer-endpoint http://127.0.0.1:50051,http://127.0.0.1:50052 \
   --kv-indexer-query-timeout-ms 100 \
   --kv-indexer-query-max-inflight 32
 ```
 
-For multiple Indexer replicas, repeat steps 1–2 with unique Indexer ports/IDs;
-each Bridge uses the same Worker list and its paired Indexer endpoint.
+For multiple Indexer replicas, repeat steps 1–2 with unique Indexer ports. Each
+Bridge uses the same Worker list and its paired Indexer endpoint; the Router's
+comma-separated endpoint list contains every replica.
 
 ## API
 

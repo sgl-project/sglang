@@ -8,7 +8,7 @@
 //! with another server, and lost when the process exits.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tonic::Status;
 
@@ -26,7 +26,6 @@ use crate::pb::{
     TierHashes, WorkerCacheSpec,
 };
 use crate::service::{prefix_limit, WorkerPrefixScanner};
-use crate::status::{IndexerStatusHandle, IndexerStreamStatus};
 use crate::stream::StreamKey;
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
 
@@ -101,7 +100,6 @@ struct CoverageSelection {
 #[derive(Debug)]
 pub struct InMemoryKvIndexerBackend {
     state: RwLock<State>,
-    status: Option<Arc<IndexerStatusHandle>>,
     instance_epoch: String,
 }
 
@@ -109,7 +107,6 @@ impl Default for InMemoryKvIndexerBackend {
     fn default() -> Self {
         Self {
             state: RwLock::new(State::default()),
-            status: None,
             instance_epoch: uuid::Uuid::new_v4().to_string(),
         }
     }
@@ -118,41 +115,6 @@ impl Default for InMemoryKvIndexerBackend {
 impl InMemoryKvIndexerBackend {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_status(status: Arc<IndexerStatusHandle>) -> Self {
-        Self {
-            state: RwLock::new(State::default()),
-            status: Some(status),
-            instance_epoch: uuid::Uuid::new_v4().to_string(),
-        }
-    }
-
-    fn refresh_status(&self, state: &State) {
-        if let Some(status) = &self.status {
-            let mut streams: Vec<_> = state
-                .workers
-                .iter()
-                .map(|(stream, worker)| IndexerStreamStatus {
-                    namespace: stream.namespace.clone(),
-                    worker_id: stream.worker_id.clone(),
-                    dp_rank: stream.dp_rank,
-                    worker_address: worker.address.clone(),
-                    ready: worker.ready,
-                    worker_epoch: worker.epoch.clone().unwrap_or_default(),
-                    watermark: worker.last_seq.unwrap_or_default(),
-                    worker_generation: worker.worker_generation.clone(),
-                })
-                .collect();
-            streams.sort_by(|left, right| {
-                (&left.namespace, &left.worker_id, left.dp_rank).cmp(&(
-                    &right.namespace,
-                    &right.worker_id,
-                    right.dp_rank,
-                ))
-            });
-            status.set_stream_coverage(streams);
-        }
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, State>, Status> {
@@ -213,7 +175,6 @@ impl InMemoryKvIndexerBackend {
                     worker.epoch = None;
                     worker.last_seq = None;
                 }
-                self.refresh_status(&state);
                 return Err(Status::failed_precondition(format!(
                     "event sequence gap: expected {}, got {seq}",
                     last.saturating_add(1)
@@ -302,7 +263,6 @@ impl InMemoryKvIndexerBackend {
                 worker.last_seq = Some(seq);
             }
         }
-        self.refresh_status(&state);
         Ok(ApplyExternalKvBatchResponse {
             applied_seq: seq,
             duplicate: false,
@@ -361,7 +321,6 @@ impl InMemoryKvIndexerBackend {
                 worker.page_size = expected.page_size;
             }
         }
-        self.refresh_status(&state);
         Ok(coverage_response(&state, &self.instance_epoch))
     }
 
@@ -418,7 +377,6 @@ impl InMemoryKvIndexerBackend {
         if !req.worker_generation.is_empty() {
             worker.worker_generation = req.worker_generation;
         }
-        self.refresh_status(&state);
         Ok(ReplaceExternalKvSnapshotResponse {
             applied_seq: req.applied_seq,
         })
@@ -444,7 +402,6 @@ impl InMemoryKvIndexerBackend {
             // before Begin and still fences mismatches.
             worker.worker_generation.clear();
         }
-        self.refresh_status(&state);
         let coverage = coverage_response(&state, &self.instance_epoch);
         Ok(InvalidateWorkerResponse {
             total_workers: coverage.total_workers,
@@ -585,7 +542,6 @@ impl InMemoryKvIndexerBackend {
         worker.hash_schema_version = staging.metadata.hash_schema_version;
         worker.page_size = staging.metadata.page_size;
         worker.is_bigram = staging.metadata.is_bigram;
-        self.refresh_status(&state);
         Ok(CommitExternalKvSnapshotResponse {
             applied_seq: staging.applied_seq,
         })
@@ -1190,45 +1146,51 @@ mod tests {
 
     #[tokio::test]
     async fn configured_workers_become_ready_only_after_atomic_snapshots() {
-        let status = Arc::new(IndexerStatusHandle::new(4));
-        let backend = InMemoryKvIndexerBackend::with_status(Arc::clone(&status));
+        let backend = InMemoryKvIndexerBackend::new();
         backend
             .configure_expected_workers(ConfigureExpectedWorkersRequest {
                 workers: vec![expected("w1", "http://w1"), expected("w2", "http://w2")],
             })
             .await
             .unwrap();
-        assert!(!status.report("i".into(), "http://i".into()).ready);
+        let query = || MatchExternalKvPrefixRequest {
+            hashes: vec![1, 2],
+            max_blocks: 0,
+            eligible_worker_addresses: vec!["http://w1".into(), "http://w2".into()],
+            eligible_streams: Vec::new(),
+        };
+        assert!(
+            !backend
+                .match_external_kv_prefix(query())
+                .await
+                .unwrap()
+                .complete_coverage
+        );
 
         backend
             .replace_external_kv_snapshot(snapshot("w1", "http://w1", "e1", 2, &[1, 2]))
             .await
             .unwrap();
-        assert!(!status.report("i".into(), "http://i".into()).ready);
+        assert!(
+            !backend
+                .match_external_kv_prefix(query())
+                .await
+                .unwrap()
+                .complete_coverage
+        );
         backend
             .replace_external_kv_snapshot(snapshot("w2", "http://w2", "e2", 4, &[1]))
             .await
             .unwrap();
-        let report = status.report("i".into(), "http://i".into());
-        assert!(report.ready);
-        assert_eq!((report.ready_workers, report.total_workers), (2, 2));
 
-        let matched = backend
-            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
-                hashes: vec![1, 2],
-                max_blocks: 0,
-                eligible_worker_addresses: Vec::new(),
-                eligible_streams: Vec::new(),
-            })
-            .await
-            .unwrap();
+        let matched = backend.match_external_kv_prefix(query()).await.unwrap();
+        assert!(matched.complete_coverage);
         assert_eq!(matched.best_prefix_blocks, 2);
     }
 
     #[tokio::test]
     async fn fenced_apply_deduplicates_and_gap_invalidates_worker() {
-        let status = Arc::new(IndexerStatusHandle::new(4));
-        let backend = InMemoryKvIndexerBackend::with_status(Arc::clone(&status));
+        let backend = InMemoryKvIndexerBackend::new();
         backend
             .configure_expected_workers(ConfigureExpectedWorkersRequest {
                 workers: vec![expected("w", "http://w")],
@@ -1274,8 +1236,16 @@ mod tests {
             backend.apply(gap).unwrap_err().code(),
             tonic::Code::FailedPrecondition
         );
-        assert!(!status.report("i".into(), "http://i".into()).ready);
         assert!(backend.read_state().unwrap().blocks.is_empty());
+        let response = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![1],
+                eligible_worker_addresses: vec!["http://w".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!response.complete_coverage);
     }
 
     #[tokio::test]
