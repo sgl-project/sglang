@@ -577,7 +577,7 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
             server_args._handle_mamba_backend()
 
-    @patch("sglang.srt.server_args.is_cuda", return_value=False)
+    @patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=False)
     def test_rejects_non_cuda(self, _mock_is_cuda):
         server_args = ServerArgs(
             model_path="dummy",
@@ -588,8 +588,8 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
             server_args._handle_mamba_backend()
 
-    @patch("sglang.srt.server_args.is_cuda", return_value=True)
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=True)
+    @patch("sglang.srt.arg_groups.mamba_hook.is_sm100_supported", return_value=False)
     def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
         server_args = ServerArgs(
             model_path="dummy",
