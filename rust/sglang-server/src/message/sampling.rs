@@ -130,6 +130,10 @@ pub struct SamplingParams {
         deserialize_with = "i64_one::deserialize"
     )]
     pub n: i64,
+    /// `beam_width > 1` makes it a beam search request. Mirrored for the
+    /// positional wire layout even though the rust path rejects it below.
+    #[serde(default)]
+    pub beam_width: Option<i64>,
     #[serde(default)]
     pub json_schema: Option<String>,
     #[serde(default)]
@@ -256,6 +260,7 @@ impl Default for SamplingParams {
             repetition_penalty: f64_one::default(),
             min_new_tokens: i64_zero::default(),
             n: i64_one::default(),
+            beam_width: None,
             json_schema: None,
             regex: None,
             ebnf: None,
@@ -481,6 +486,20 @@ impl SamplingParams {
                 self.n
             )));
         }
+        if let Some(beam_width) = self.beam_width {
+            if beam_width < 1 {
+                return Err(bad(format!(
+                    "beam_width must be at least 1, got {beam_width}."
+                )));
+            }
+            // Also not a Python restriction: beam search returns its candidates
+            // in `meta_info.beam_results`, which from_scheduler does not carry.
+            if beam_width > 1 {
+                return Err(bad(format!(
+                    "beam_width must be 1 (beam search is not supported), got {beam_width}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -617,7 +636,7 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The 30 wire slots, in Python's declaration order.
+    /// The 31 wire slots, in Python's declaration order.
     ///
     /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
     /// the header carries an ARRAY and every field is identified by POSITION. Two
@@ -642,6 +661,7 @@ mod tests {
         "repetition_penalty",
         "min_new_tokens",
         "n",
+        "beam_width",
         "json_schema",
         "regex",
         "ebnf",
@@ -682,6 +702,7 @@ mod tests {
             repetition_penalty: 0.19,
             min_new_tokens: 20,
             n: 1,
+            beam_width: Some(21),
             json_schema: Some("22".into()),
             regex: Some("23".into()),
             ebnf: Some("24".into()),
@@ -717,6 +738,7 @@ mod tests {
         assert_eq!(arr[at("frequency_penalty")].as_f64(), Some(0.17));
         assert_eq!(arr[at("presence_penalty")].as_f64(), Some(0.18));
         assert_eq!(arr[at("repetition_penalty")].as_f64(), Some(0.19));
+        assert_eq!(arr[at("beam_width")].as_i64(), Some(21));
         assert_eq!(arr[at("json_schema")].as_str(), Some("22"));
         assert_eq!(arr[at("regex")].as_str(), Some("23"));
         assert_eq!(arr[at("ebnf")].as_str(), Some("24"));
@@ -752,6 +774,8 @@ mod tests {
             (r#"{"max_new_tokens": -1}"#, "max_new_tokens"),
             (r#"{"regex": "a", "ebnf": "b"}"#, "Only one of"),
             (r#"{"n": 2}"#, "n must be 1"),
+            (r#"{"beam_width": 2}"#, "beam_width must be 1"),
+            (r#"{"beam_width": 0}"#, "beam_width must be at least 1"),
         ] {
             let err = norm_err(json).to_string();
             assert!(
