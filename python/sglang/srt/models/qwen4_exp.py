@@ -47,12 +47,16 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _is_stream_capturing,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -813,6 +817,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
+        # The tensor is a bare view over an mmap this object owns; keep the
+        # mapping reachable from the parameter itself so that a holder of the
+        # weight cannot outlive the memory it points at.
+        cpu_weight.pinned_host_mapping = self._pinned_buffer
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
@@ -950,6 +958,7 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_stream = (
             torch.cuda.Stream() if config.ple_offload_embedding else None
         )
+        self._graph_prefetch_buffer = None
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
@@ -1086,26 +1095,82 @@ class Qwen4ExpPLELayer(nn.Module):
             self.ple_embedding.forward_idle(forward_batch)
 
     def _allocate_prefetch_buffer(
-        self, lookup_tokens: int, lookup_ids: torch.Tensor
+        self, lookup_tokens: int, device: torch.device
     ) -> torch.Tensor:
         offloaded_embedding = self.ple_embedding.ngram_embedding
         return offloaded_embedding.allocate_output(
-            (lookup_tokens, self.ple_embed_dim), lookup_ids.device
+            (lookup_tokens, self.ple_embed_dim), device
+        )
+
+    def prepare_cuda_graph_prefetch_buffer(
+        self, lookup_tokens: int, device: torch.device
+    ) -> None:
+        """Allocate the shared graph output before any capture begins."""
+        if (
+            not is_sm120_supported()
+            or is_sm121()
+            or self._prefetch_stream is None
+            or lookup_tokens <= 0
+        ):
+            return
+        buffer = self._graph_prefetch_buffer
+        if buffer is not None:
+            if buffer.shape[0] < lookup_tokens:
+                raise RuntimeError(
+                    "PLE graph prefetch buffer is already referenced by captured "
+                    f"graphs ({buffer.shape[0]} tokens < {lookup_tokens})"
+                )
+            return
+        self._graph_prefetch_buffer = self._allocate_prefetch_buffer(
+            lookup_tokens, device
+        )
+
+    @staticmethod
+    def _is_capturing() -> bool:
+        """Whether this call is being recorded into a CUDA graph.
+
+        ``get_is_capture_mode`` is a runner-set flag and not every graph runner
+        in the tree sets it (the non-breakable prefill runner and the vision
+        runners capture without it). Missing a capture here is not a slow path
+        but a use-after-free: the shared eager buffer's address gets baked into
+        the graph, and the next eager forward that needs more tokens replaces
+        that buffer, leaving the graph writing into a freed block. Ask the
+        driver as well.
+        """
+        if get_is_capture_mode():
+            return True
+        return torch.cuda.is_available() and _is_stream_capturing(
+            torch.cuda.current_stream()
         )
 
     def _get_prefetch_buffer(
         self, lookup_tokens: int, lookup_ids: torch.Tensor
     ) -> torch.Tensor:
-        if get_is_capture_mode():
-            buffer = self._graph_prefetch_buffers.get(lookup_tokens)
-            if buffer is None:
-                buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
-                self._graph_prefetch_buffers[lookup_tokens] = buffer
-            return buffer
+        if self._is_capturing():
+            if (
+                not is_sm120_supported()
+                or is_sm121()
+                or self._graph_prefetch_buffer is None
+            ):
+                buffer = self._graph_prefetch_buffers.get(lookup_tokens)
+                if buffer is None:
+                    buffer = self._allocate_prefetch_buffer(
+                        lookup_tokens, lookup_ids.device
+                    )
+                    self._graph_prefetch_buffers[lookup_tokens] = buffer
+                return buffer
+            buffer = self._graph_prefetch_buffer
+            if buffer.shape[0] < lookup_tokens:
+                raise RuntimeError(
+                    "PLE graph prefetch buffer was not preallocated for this "
+                    f"capture ({buffer.shape[0]} tokens available, "
+                    f"{lookup_tokens} needed)"
+                )
+            return buffer[:lookup_tokens]
 
         buffer = self._eager_prefetch_buffer
         if buffer is None or buffer.shape[0] < lookup_tokens:
-            buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids)
+            buffer = self._allocate_prefetch_buffer(lookup_tokens, lookup_ids.device)
             self._eager_prefetch_buffer = buffer
         return buffer[:lookup_tokens]
 
@@ -1143,6 +1208,13 @@ class Qwen4ExpPLELayer(nn.Module):
         stream = self._prefetch_stream
         stream.wait_stream(torch.cuda.current_stream())
         lookup_ids.record_stream(stream)
+        if not self._is_capturing():
+            # The eager buffer is written by the side stream but allocated and
+            # freed on the current one, so the allocator would otherwise hand
+            # its block straight back when a larger buffer replaces it. Graph
+            # buffers are excluded: they are held for the life of the process
+            # and record_stream is not defined for graph-pool blocks.
+            prefetched.record_stream(stream)
         with torch.cuda.stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
@@ -1680,10 +1752,41 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     def prewarm_cuda_graphs(
         self, model_runner, *, capture_decode_cuda_graph: bool
     ) -> None:
-        # These local JIT paths were added for SM120. SM100 uses its existing
-        # CuTe/FlashInfer routes and does not instantiate these modules.
-        if not is_sm120_supported():
+        if not is_sm120_supported() or is_sm121():
             return
+        graph_config = model_runner.server_args.cuda_graph_config
+        max_tokens = 0
+        if graph_config.prefill.backend != Backend.DISABLED:
+            max_tokens = max(
+                max_tokens,
+                max(graph_config.prefill.bs or (graph_config.prefill.max_bs or 0,)),
+            )
+        if (
+            capture_decode_cuda_graph
+            and graph_config.decode.backend != Backend.DISABLED
+        ):
+            decode_width = model_runner.decode_num_tokens_per_req(
+                num_draft_tokens=model_runner.server_args.speculative_num_draft_tokens
+            )
+            max_tokens = max(
+                max_tokens,
+                max(graph_config.decode.bs or (graph_config.decode.max_bs or 0,))
+                * decode_width,
+            )
+
+        for module in self.modules():
+            if not isinstance(module, Qwen4ExpPLELayer):
+                continue
+            lookup_tokens = max_tokens
+            if module.ple_embedding.gather_dp_tokens:
+                # Graph runners pad every DP rank to the captured local token
+                # count before setting global_dp_buffer_len. The sum therefore
+                # cannot exceed the local capture size times attention DP.
+                lookup_tokens *= get_attention_dp_size()
+            module.prepare_cuda_graph_prefetch_buffer(
+                lookup_tokens, torch.device(model_runner.device)
+            )
+
         tic = time.perf_counter()
         self._prewarm_cuda_graph_jit_kernels(
             self,

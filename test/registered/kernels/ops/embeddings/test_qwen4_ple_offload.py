@@ -189,7 +189,8 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
             _make_source_embedding(embedding_dim=layer.ple_embed_dim)
         )
     )
-    layer._graph_prefetch_buffers = {}
+    layer._prefetch_stream = object()
+    layer._graph_prefetch_buffer = None
     layer._eager_prefetch_buffer = None
     lookup_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
 
@@ -204,13 +205,14 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     assert eager_grown_small.data_ptr() == eager_grown.data_ptr()
     assert layer._eager_prefetch_buffer.shape == (12, layer.ple_embed_dim)
 
+    layer.prepare_cuda_graph_prefetch_buffer(5, lookup_ids.device)
     monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: True)
     graph_three = layer._get_prefetch_buffer(3, lookup_ids)
     graph_five = layer._get_prefetch_buffer(5, lookup_ids)
     graph_three_reused = layer._get_prefetch_buffer(3, lookup_ids)
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
-    assert graph_five.data_ptr() != graph_three.data_ptr()
-    assert set(layer._graph_prefetch_buffers) == {3, 5}
+    assert graph_five.data_ptr() == graph_three.data_ptr()
+    assert layer._graph_prefetch_buffer.shape == (5, layer.ple_embed_dim)
 
 
 if __name__ == "__main__":
