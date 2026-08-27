@@ -576,7 +576,9 @@ class QwenImageCrossAttention(nn.Module):
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
-            self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
+            self.use_fused_added_qkv = quant_config is None or isinstance(
+                quant_config, NunchakuConfig
+            )
             if self.use_fused_added_qkv:
                 self.to_added_qkv = MergedColumnParallelLinear(
                     added_kv_proj_dim,
