@@ -10829,7 +10829,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
-        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+        from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
         # Extract boolean actions from the parser to handle them correctly
         config_merger = ConfigArgumentMerger(parser)
