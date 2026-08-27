@@ -2089,10 +2089,10 @@ def apply_residency_changes(
     """Apply complete target states transactionally on this rank.
 
     Component-offload targets move back to CPU immediately; resident targets
-    are materialized on their next use by ``ResidentStrategy``. Layerwise
-    targets may change resident counts and HostPin placement or disable the
-    streaming hooks entirely. Because targets can move in either direction,
-    a later calibration round can replace an earlier placement.
+    materialize on the local device before validation. Layerwise targets may
+    change resident counts and HostPin placement or disable the streaming
+    hooks entirely. Because targets can move in either direction, a later
+    calibration round can replace an earlier placement.
 
     Raises on failure after undoing the changes already applied, so a
     caller observing an exception knows this rank is back on the original
@@ -2313,6 +2313,11 @@ def apply_residency_changes(
                 continue
             if target_mode == RESIDENT:
                 server_args.set_auto_residency_mode(candidate.component_name, RESIDENT)
+                if not is_fsdp_managed_module(module):
+                    module.to(
+                        current_platform.get_local_torch_device(),
+                        non_blocking=True,
+                    )
             elif target_mode == COMPONENT_OFFLOAD:
                 server_args.set_auto_residency_mode(
                     candidate.component_name, COMPONENT_OFFLOAD

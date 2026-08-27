@@ -57,6 +57,11 @@ SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
 SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES = 25
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
+# Two-step schedulers can have one compile-heavy step and one lower-order
+# boundary step, leaving no representative steady-state timing sample. Auto
+# residency extrapolates this timing to the default request, so collect four
+# steps while retaining the shorter warmup for every non-planning path.
+AUTO_RESIDENCY_TIMING_STEPS = 4
 
 
 def get_model_sampling_defaults(server_args: ServerArgs) -> SamplingParams:
@@ -572,6 +577,11 @@ def build_warmup_reqs(
         and server_based_warmup
         and auto_residency_args_skip_reason(server_args) is None
     )
+    if collect_auto_residency_metrics and sampling_defaults.num_inference_steps:
+        warmup_steps = min(
+            int(sampling_defaults.num_inference_steps),
+            max(warmup_steps, AUTO_RESIDENCY_TIMING_STEPS),
+        )
     if auto_residency_warmup_shape is not None:
         width, height, warmup_num_frames = auto_residency_warmup_shape
         resolutions[0] = (width, height)
