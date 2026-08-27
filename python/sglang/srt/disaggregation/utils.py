@@ -1238,6 +1238,24 @@ def setup_state_kv_args(
                 c128_item_lens,
             )
 
+        # On A5 (CYCLE cache_mode) the compressor addresses the C4 state ring
+        # by req_pool_idx, so PD transfer must use req_pool_idx as the index
+        # (not SWA page indices).  Register as a separate state component.
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if is_npu_arch35():
+            c4_ptrs, c4_lens, c4_item_lens = (
+                token_to_kv_pool.get_c4_state_buf_infos()
+            )
+            if c4_ptrs:
+                append_state_component(
+                    kv_args,
+                    AscendStateType.DSV4_C4_STATE,
+                    c4_ptrs,
+                    c4_lens,
+                    c4_item_lens,
+                )
+
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while

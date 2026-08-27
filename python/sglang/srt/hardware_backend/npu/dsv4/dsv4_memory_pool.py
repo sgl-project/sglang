@@ -412,8 +412,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        SWA KV, C4 attention state and C4 indexer state retain separate buffers
-        but share the same SWA page/state index.
+        On pre-A5 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
+        indexer state retain separate buffers but share the same SWA page/state
+        index.  On A5 (CYCLE cache_mode) the compressor addresses the C4 state
+        ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
+        here and registered separately via :meth:`get_c4_state_buf_infos`.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -423,6 +426,33 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             data_ptrs.append(buf.data_ptr())
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
+
+        if not _is_npu_arch35():
+            for pools in (
+                self.compress_state_pools,
+                self.indexer_compress_state_pools,
+            ):
+                for pool in pools:
+                    if pool is None or pool.ratio != 4:
+                        continue
+                    state = pool.kv_score_buffer.kv_score
+                    data_ptrs.append(state.data_ptr())
+                    data_lens.append(state.nbytes)
+                    item_lens.append(state[0].nbytes * pool.ring_size)
+
+        return data_ptrs, data_lens, item_lens
+
+    def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """C4 compress state ring (attention + indexer).
+
+        On A5 (CYCLE cache_mode) the compressor derives the ring bank from
+        ``req_pool_idx``; PD transfer must therefore index this buffer by
+        ``req_pool_idx`` (one ``ring_size``-row bank per request), not by SWA
+        page.
+        """
+        data_ptrs: List[int] = []
+        data_lens: List[int] = []
+        item_lens: List[int] = []
 
         for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
             for pool in pools:
