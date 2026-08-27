@@ -16,7 +16,7 @@ from .utils import (
 if current_platform.is_npu():
     import torch_npu
 
-    from sglang.kernels.ops.diffusion.triton.npu_fallback import (
+    from sglang.kernels.ops.diffusion.common.fallback_npu import (
         NPU_ROTARY_MUL_MAX_HEAD_SIZE,
         NPU_ROTARY_MUL_MAX_NUM_HEADS,
     )
