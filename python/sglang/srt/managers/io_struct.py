@@ -1790,6 +1790,11 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
+    # Prefixes of checkpoint weight names to update. Enables a partial in-place
+    # update of only the matching tensors; model_path may then be a delta
+    # checkpoint holding just the changed tensors (pass [""] to select all of
+    # them). The engine keeps its original model path.
+    weight_name_prefixes: Optional[List[str]] = None
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):

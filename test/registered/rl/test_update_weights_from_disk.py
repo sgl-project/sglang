@@ -77,6 +77,43 @@ class TestEngineUpdateWeightsFromDisk(CustomTestCase):
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])
 
+    def test_partial_update_weights(self):
+        """Partial update patches only the selected tensors and keeps the
+        engine's model identity."""
+        origin_response = self.run_decode()
+
+        # Patch a strict subset of layers from the base (non-Instruct) model.
+        new_model_path = self.model.replace("-Instruct", "")
+        success, message = self.engine.update_weights_from_disk(
+            new_model_path,
+            weight_name_prefixes=["model.layers.0.", "model.layers.1."],
+        )[:2]
+        self.assertTrue(success, message)
+        self.assertIn("partially update", message)
+
+        updated_response = self.run_decode()
+        self.assertNotEqual(origin_response[:32], updated_response[:32])
+
+        # Restore the same subset from the original checkpoint.
+        success, message = self.engine.update_weights_from_disk(
+            self.model,
+            weight_name_prefixes=["model.layers.0.", "model.layers.1."],
+        )[:2]
+        self.assertTrue(success, message)
+        reverted_response = self.run_decode()
+        self.assertEqual(origin_response[:32], reverted_response[:32])
+
+    def test_partial_update_weights_no_match(self):
+        """A prefix matching nothing fails without mutating the model."""
+        origin_response = self.run_decode()
+        success, message = self.engine.update_weights_from_disk(
+            self.model,
+            weight_name_prefixes=["nonexistent_prefix."],
+        )[:2]
+        self.assertFalse(success)
+        self.assertIn("No checkpoint weights matched", message)
+        self.assertEqual(origin_response[:32], self.run_decode()[:32])
+
 
 ###############################################################################
 # HTTP Server Mode Tests (Single-configuration)
