@@ -35,6 +35,7 @@ class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
     ps: ParallelState
     server_args: ServerArgs
+    worker_generation: str
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
@@ -214,6 +215,7 @@ class SchedulerLoadInquirer:
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
+            worker_generation=self.worker_generation,
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_waiting_uncached_tokens=self.get_num_waiting_uncached_tokens(),

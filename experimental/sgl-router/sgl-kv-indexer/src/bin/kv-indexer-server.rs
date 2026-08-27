@@ -26,7 +26,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| "[::1]:50051".to_string())
         .parse::<SocketAddr>()?;
     let prefix_query_max_inflight = prefix_query_max_inflight_from_env()?;
-
     let backend: Arc<dyn KvIndexerBackend> = Arc::new(InMemoryKvIndexerBackend::new());
     // The interceptor timestamps each request before its own task is queued,
     // which is what lets the query path shed work whose deadline expired.
@@ -40,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         %addr,
         prefix_query_max_inflight,
         max_concurrent_streams = MAX_CONCURRENT_STREAMS,
-        "starting single-server in-memory SGLang KV Indexer"
+        "starting in-memory SGLang KV Indexer"
     );
     server_builder()
         .add_service(service)

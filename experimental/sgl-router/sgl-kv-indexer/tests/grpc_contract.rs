@@ -139,6 +139,7 @@ async fn prefix_limit_rejects_over_real_grpc_without_blocking_writes() {
     let request = || MatchExternalKvPrefixRequest {
         hashes: vec![-1],
         max_blocks: 0,
+        ..Default::default()
     };
 
     let mut first_client = client.clone();
@@ -303,6 +304,10 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         seq: 1,
         worker_address: String::new(),
         cache_spec: None,
+        worker_epoch: String::new(),
+        enforce_sequence: false,
+        stream_id: None,
+        worker_generation: String::new(),
         actions: vec![ExternalKvAction {
             r#type: 999,
             tier: hbm(),
@@ -335,6 +340,7 @@ async fn match_prefix_over_grpc() {
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes: vec![a, b, d],
             max_blocks: 0,
+            ..Default::default()
         })
         .await
         .expect("prefix ok")
@@ -374,6 +380,7 @@ async fn prefix_query_scans_more_than_one_apply_chunk_over_grpc() {
         .match_external_kv_prefix(MatchExternalKvPrefixRequest {
             hashes,
             max_blocks: 0,
+            ..Default::default()
         })
         .await
         .expect("prefix request larger than one apply chunk")
@@ -406,6 +413,7 @@ async fn packed_signed_hash_query_can_exceed_tonics_default_receive_limit() {
     let request = MatchExternalKvPrefixRequest {
         hashes,
         max_blocks: 0,
+        ..Default::default()
     };
     assert!(request.encoded_len() > TONIC_DEFAULT_RECEIVE_LIMIT);
     assert!(request.encoded_len() < MAX_GRPC_DECODING_MESSAGE_SIZE);
@@ -427,6 +435,7 @@ async fn query_past_the_configured_limit_is_refused_as_out_of_range() {
     let request = MatchExternalKvPrefixRequest {
         hashes: (0..hash_count).map(|value| value as i64).collect(),
         max_blocks: 0,
+        ..Default::default()
     };
     assert!(request.encoded_len() > MAX_GRPC_DECODING_MESSAGE_SIZE);
 
@@ -489,10 +498,11 @@ async fn start_recording_deadlines(
 async fn router_client_publishes_its_deadline_on_the_wire() {
     let (index, seen) = start_recording_deadlines(Duration::from_millis(250)).await;
 
-    index
+    let error = index
         .match_prefix(vec![1, 2, 3])
         .await
-        .expect("query reaches the indexer");
+        .expect_err("empty Indexer has partial coverage");
+    assert_eq!(error, sgl_kv_indexer::PrefixIndexError::PartialCoverage);
 
     let seen = seen.lock().expect("deadline recorder").clone();
     assert_eq!(

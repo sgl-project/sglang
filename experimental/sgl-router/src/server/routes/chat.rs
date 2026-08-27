@@ -17,7 +17,6 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
-use sgl_kv_indexer::PrefixIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -170,7 +169,7 @@ pub async fn chat_completions(
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
     let external_prefix = match (
-        ctx.prefix_index.as_ref(),
+        ctx.prefix_provider.as_ref(),
         request_tokens.as_ref(),
         ctx.block_size_oracle.get(),
     ) {
@@ -184,8 +183,22 @@ pub async fn chat_completions(
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+                resolve_prefix_query(
+                    index
+                        .match_prefix_for_workers(
+                            hashes,
+                            workers.iter().map(|worker| worker.url.clone()).collect(),
+                        )
+                        .await,
+                    &model_str,
+                )?
             };
+            tracing::debug!(
+                provider = index.provider_name(),
+                query_blocks,
+                ?outcome,
+                "external prefix signal resolved"
+            );
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
@@ -212,7 +225,8 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
-        .with_external_prefix(external_prefix.as_ref());
+        .with_external_prefix(external_prefix.as_ref())
+        .with_worker_loads(Some(&ctx.worker_loads));
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -663,7 +677,8 @@ fn resolve_prefix_query(
         Err(
             error @ (PrefixIndexError::Overloaded
             | PrefixIndexError::Timeout
-            | PrefixIndexError::Unreachable),
+            | PrefixIndexError::Unreachable
+            | PrefixIndexError::PartialCoverage),
         ) => {
             tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
             Ok(sgl_kv_indexer::PrefixOutcome::Empty)
@@ -987,6 +1002,7 @@ mod tests {
             sgl_kv_indexer::PrefixIndexError::Overloaded,
             sgl_kv_indexer::PrefixIndexError::Timeout,
             sgl_kv_indexer::PrefixIndexError::Unreachable,
+            sgl_kv_indexer::PrefixIndexError::PartialCoverage,
             sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
         ] {
             assert_eq!(

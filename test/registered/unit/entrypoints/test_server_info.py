@@ -49,6 +49,7 @@ def _stub_tokenizer_manager(
     tokenizer_manager.server_args = server_args
     tokenizer_manager.model_path = server_args.model_path
     tokenizer_manager.served_model_name = server_args.served_model_name
+    tokenizer_manager.instance_id = "test-generation"
     tokenizer_manager.startup_time = None
     tokenizer_manager.get_internal_state = get_internal_state
     return tokenizer_manager
@@ -119,17 +120,18 @@ class TestServerInfoKvEventsField(CustomTestCase):
         info = _call_server_info_with(args)
 
         self.assertIn("kv_events", info)
-        self.assertEqual(
-            info["kv_events"],
-            {
-                "publisher": "zmq",
-                "endpoint_host": "*",
-                "endpoint_port_base": 5557,
-                "topic": "kv",
-                "block_size": 64,
-                "dp_size": 2,
-            },
-        )
+        descriptor = info["kv_events"]
+        self.assertEqual(descriptor["publisher"], "zmq")
+        self.assertEqual(descriptor["endpoint_host"], "*")
+        self.assertEqual(descriptor["endpoint_port_base"], 5557)
+        self.assertEqual(descriptor["topic"], "kv")
+        self.assertEqual(descriptor["block_size"], 64)
+        self.assertEqual(descriptor["dp_size"], 2)
+        self.assertEqual(descriptor["namespace"], "dummy")
+        self.assertEqual(descriptor["model"], "dummy")
+        self.assertEqual(descriptor["worker_generation"], "test-generation")
+        self.assertEqual(descriptor["hash_schema_version"], 1)
+        self.assertFalse(descriptor["is_bigram"])
 
     def test_kv_events_descriptor_carries_specific_host_and_topic(self):
         args = ServerArgs(
@@ -149,6 +151,54 @@ class TestServerInfoKvEventsField(CustomTestCase):
         self.assertEqual(info["kv_events"]["topic"], "kv")
         self.assertEqual(info["kv_events"]["block_size"], 128)
         self.assertEqual(info["kv_events"]["dp_size"], 1)
+
+    def test_kv_events_descriptor_advertises_optional_snapshot_endpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"snapshot_endpoint": "tcp://*:5757"}'
+            ),
+            page_size=64,
+            dp_size=2,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["snapshot_endpoint_host"], "*")
+        self.assertEqual(info["kv_events"]["snapshot_endpoint_port_base"], 5757)
+        self.assertEqual(info["kv_events"]["snapshot_protocol_version"], 2)
+
+    def test_kv_events_descriptor_advertises_optional_replay_endpoint(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"replay_endpoint": "tcp://*:5657"}'
+            ),
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["kv_events"]["replay_endpoint_host"], "*")
+        self.assertEqual(info["kv_events"]["replay_endpoint_port_base"], 5657)
+        self.assertEqual(info["kv_events"]["replay_protocol_version"], 2)
+
+    def test_invalid_snapshot_endpoint_does_not_hide_live_publisher(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config=(
+                '{"publisher": "zmq", "endpoint": "tcp://*:5557", '
+                '"snapshot_endpoint": "inproc://snapshot"}'
+            ),
+            page_size=64,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertIsNotNone(info["kv_events"])
+        self.assertNotIn("snapshot_endpoint_host", info["kv_events"])
 
     # ----- disabled / unconfigured -------------------------------------
 

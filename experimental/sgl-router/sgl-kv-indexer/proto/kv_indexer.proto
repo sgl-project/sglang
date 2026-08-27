@@ -13,6 +13,15 @@ enum TierType {
   TIER_SSD = 3;
 }
 
+// One independently recoverable KV event stream. A Worker may expose several
+// DP ranks; namespace prevents unrelated deployments from colliding when they
+// reuse the same operator-assigned worker_id.
+message StreamId {
+  string namespace = 1;
+  string worker_id = 2;
+  uint32 dp_rank = 3;
+}
+
 // KV components are a fixed set; each component's rule is a property of its
 // type, not a per-worker choice:
 //   FULL  (bit 0, value 1) -- resident on every prefix block.
@@ -89,6 +98,20 @@ message ApplyExternalKvBatchRequest {
   // The worker's component cache spec, carried on every batch so it self-heals
   // across reconnects and indexer restarts. Absent means legacy / full-only.
   WorkerCacheSpec cache_spec = 6;
+
+  // Non-empty for recovery-aware streams. The Indexer rejects a batch whose
+  // epoch differs from the installed snapshot.
+  string worker_epoch = 7;
+  // When true, seq must be exactly the installed sequence + 1. Duplicates are
+  // acknowledged without reapplying; gaps invalidate this worker until a new
+  // snapshot is installed.
+  bool enforce_sequence = 8;
+  // Canonical identity. Absent legacy calls map worker_id to namespace="",
+  // dp_rank=0.
+  StreamId stream_id = 9;
+  // Server-process generation shared by every DP stream and LoadReport from
+  // one Worker process. Distinct from the per-stream worker_epoch.
+  string worker_generation = 10;
 }
 
 // Deliberately empty: applies are unconditional, so there is nothing to report
@@ -96,6 +119,8 @@ message ApplyExternalKvBatchRequest {
 message ApplyExternalKvBatchResponse {
   // Fields 1-3 held the durable seq checkpoint and duplicate flag.
   reserved 1, 2, 3;
+  uint64 applied_seq = 4;
+  bool duplicate = 5;
 }
 
 message TierHashes {
@@ -106,6 +131,117 @@ message TierHashes {
   repeated uint32 component_masks = 3;
   repeated uint32 block_sizes = 4;
 }
+
+message ExpectedWorker {
+  string worker_id = 1;
+  string worker_address = 2;
+  WorkerCacheSpec cache_spec = 3;
+  StreamId stream_id = 4;
+  string worker_generation = 5;
+  string model = 6;
+  uint32 hash_schema_version = 7;
+  uint32 page_size = 8;
+  bool is_bigram = 9;
+}
+
+// Sent once by the 1:1 Bridge before recovery starts. Workers omitted from a
+// later call are removed atomically, which gives scale-in deterministic state.
+message ConfigureExpectedWorkersRequest {
+  repeated ExpectedWorker workers = 1;
+}
+
+message ConfigureExpectedWorkersResponse {
+  uint32 total_workers = 1;
+  uint32 ready_workers = 2;
+  // Changes on every Indexer process restart. Bridges poll this value so an
+  // idle Worker stream is still rebuilt after the paired Indexer restarts.
+  string indexer_epoch = 3;
+}
+
+message InvalidateWorkerRequest {
+  string worker_id = 1;
+  StreamId stream_id = 2;
+}
+
+message InvalidateWorkerResponse {
+  uint32 total_workers = 1;
+  uint32 ready_workers = 2;
+  string indexer_epoch = 3;
+}
+
+// Atomically replaces all placement owned by one worker stream after the
+// Bridge has combined Snapshot + buffered Live Events.
+message ReplaceExternalKvSnapshotRequest {
+  string worker_id = 1;
+  string worker_address = 2;
+  string worker_epoch = 3;
+  uint64 applied_seq = 4;
+  repeated TierHashes hashes_by_tier = 5;
+  WorkerCacheSpec cache_spec = 6;
+  StreamId stream_id = 7;
+  string worker_generation = 8;
+}
+
+message ReplaceExternalKvSnapshotResponse {
+  uint64 applied_seq = 1;
+}
+
+message ExternalKvSnapshotMetadata {
+  string model = 1;
+  string worker_generation = 2;
+  uint32 hash_schema_version = 3;
+  uint32 page_size = 4;
+  bool is_bigram = 5;
+}
+
+message ExternalKvSnapshotPlacement {
+  sfixed64 block_hash = 1;
+  optional sfixed64 parent_block_hash = 2;
+  TierType tier = 3;
+  uint32 component_mask = 4;
+  uint32 block_size = 5;
+}
+
+// Snapshot v2 is staged through bounded Append calls and becomes visible only
+// at Commit. An abandoned transaction never changes query state.
+message BeginExternalKvSnapshotRequest {
+  StreamId stream_id = 1;
+  string worker_address = 2;
+  string worker_epoch = 3;
+  uint64 applied_seq = 4;
+  WorkerCacheSpec cache_spec = 5;
+  ExternalKvSnapshotMetadata metadata = 6;
+  string snapshot_id = 7;
+  uint64 expected_placements = 8;
+}
+
+message BeginExternalKvSnapshotResponse {
+  string transaction_id = 1;
+  string indexer_epoch = 2;
+}
+
+message AppendExternalKvSnapshotRequest {
+  string transaction_id = 1;
+  repeated ExternalKvSnapshotPlacement placements = 2;
+}
+
+message AppendExternalKvSnapshotResponse {
+  uint64 staged_placements = 1;
+}
+
+message CommitExternalKvSnapshotRequest {
+  string transaction_id = 1;
+}
+
+message CommitExternalKvSnapshotResponse {
+  uint64 applied_seq = 1;
+}
+
+message AbortExternalKvSnapshotRequest {
+  string transaction_id = 1;
+}
+
+message AbortExternalKvSnapshotResponse {}
 
 message ExternalKvNodeMatch {
   string worker_id = 1;
@@ -128,6 +264,8 @@ message MatchExternalKvPrefixRequest {
   // RPCs, a prefix query is not rejected for length; its scan holds O(1) state
   // per candidate worker, so length costs time rather than memory.
   uint32 max_blocks = 2;
+  repeated string eligible_worker_addresses = 3;
+  repeated StreamId eligible_streams = 4;
 }
 
 message ExternalKvPrefixMatch {
@@ -142,6 +280,17 @@ message ExternalKvPrefixMatch {
 
   // Opaque worker id, carried for the caller's logs only; not a routing key.
   string worker_id = 3;
+  StreamId stream_id = 4;
+  string worker_generation = 5;
+}
+
+message StreamCoverage {
+  StreamId stream_id = 1;
+  string worker_address = 2;
+  bool ready = 3;
+  string worker_epoch = 4;
+  uint64 watermark = 5;
+  string worker_generation = 6;
 }
 
 message MatchExternalKvPrefixResponse {
@@ -155,6 +304,9 @@ message MatchExternalKvPrefixResponse {
   // and truncation are observable. NOT part of the prefix semantics: backends may
   // report different values for the same matches.
   uint32 blocks_read = 3;
+  repeated StreamCoverage coverage = 4;
+  bool complete_coverage = 5;
+  repeated string uncovered_worker_addresses = 6;
 }
 
 message HitCountEntry {
@@ -171,6 +323,20 @@ message GetExternalKvHitCountsResponse {
 }
 
 service KVIndexer {
+  rpc ConfigureExpectedWorkers(ConfigureExpectedWorkersRequest) returns (ConfigureExpectedWorkersResponse);
+
+  rpc InvalidateWorker(InvalidateWorkerRequest) returns (InvalidateWorkerResponse);
+
+  rpc ReplaceExternalKvSnapshot(ReplaceExternalKvSnapshotRequest) returns (ReplaceExternalKvSnapshotResponse);
+
+  rpc BeginExternalKvSnapshot(BeginExternalKvSnapshotRequest) returns (BeginExternalKvSnapshotResponse);
+
+  rpc AppendExternalKvSnapshot(AppendExternalKvSnapshotRequest) returns (AppendExternalKvSnapshotResponse);
+
+  rpc CommitExternalKvSnapshot(CommitExternalKvSnapshotRequest) returns (CommitExternalKvSnapshotResponse);
+
+  rpc AbortExternalKvSnapshot(AbortExternalKvSnapshotRequest) returns (AbortExternalKvSnapshotResponse);
+
   // The sole mutation API: applies an ordered SGLang KVEventBatch.
   rpc ApplyExternalKvBatch(ApplyExternalKvBatchRequest) returns (ApplyExternalKvBatchResponse);
 

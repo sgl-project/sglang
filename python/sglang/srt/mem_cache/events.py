@@ -18,14 +18,16 @@ consumed by KV-aware routers (e.g. dynamo). A cache holds one recorder and calls
 it; the recorder owns the queue and needs nothing back from its owner.
 """
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     BlockStoredMetadata,
+    BlockStoredWithComponents,
     BlockStoredWithMetadata,
+    BlockStoredWithMetadataAndComponents,
     StorageMedium,
 )
 from sglang.srt.mem_cache.utils import (
@@ -42,9 +44,18 @@ class KVCacheEventRecorder:
     empty list, so callers never have to guard.
     """
 
-    def __init__(self, *, enabled: bool, page_size: int):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        page_size: int,
+        component_types_for_page: Optional[
+            Callable[[Any, StorageMedium, int, int], Optional[list[str]]]
+        ] = None,
+    ):
         self.enabled = enabled
         self.page_size = page_size
+        self.component_types_for_page = component_types_for_page
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -75,6 +86,8 @@ class KVCacheEventRecorder:
                     tail.medium == event.medium
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
+                    and getattr(tail, "component_types", None)
+                    == getattr(event, "component_types", None)
                     and tail_metadata == event_metadata
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
@@ -126,6 +139,7 @@ class KVCacheEventRecorder:
 
         page_index = 0
         logical_len = len(node.key)
+        num_pages = -(-logical_len // self.page_size)
         is_bigram = node.key.is_bigram
         raw = node.key.token_ids
         for start in range(0, logical_len, self.page_size):
@@ -140,6 +154,16 @@ class KVCacheEventRecorder:
 
             block_hash = hash_str_to_int64(event_hash_values[page_index])
 
+            component_types = (
+                self.component_types_for_page(node, medium, page_index, num_pages)
+                if self.component_types_for_page is not None
+                else None
+            )
+            if component_types is not None and not component_types:
+                parent_block_hash = block_hash
+                page_index += 1
+                continue
+
             event_args = {
                 "block_hashes": [block_hash],
                 "parent_block_hash": parent_block_hash,
@@ -148,12 +172,23 @@ class KVCacheEventRecorder:
                 "lora_id": None,
                 "medium": medium,
             }
-            if node.key.cache_salt is None:
+            if node.key.cache_salt is None and component_types is None:
                 event = BlockStored(**event_args)
-            else:
+            elif node.key.cache_salt is None:
+                event = BlockStoredWithComponents(
+                    **event_args,
+                    component_types=component_types,
+                )
+            elif component_types is None:
                 event = BlockStoredWithMetadata(
                     **event_args,
                     metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
+                )
+            else:
+                event = BlockStoredWithMetadataAndComponents(
+                    **event_args,
+                    metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
+                    component_types=component_types,
                 )
             self.enqueue(event)
 

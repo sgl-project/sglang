@@ -421,6 +421,7 @@ class Scheduler(
         # Parse args
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
+        self.instance_id = port_args.instance_id
         self.schedule_policy = get_schedule().schedule_policy
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -2152,6 +2153,16 @@ class Scheduler(
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
+            snapshot_namespace=get_serving().served_model_name,
+            snapshot_model=get_serving().served_model_name,
+            snapshot_worker_id=(
+                f"{get_serving().served_model_name}@"
+                f"{self.server_args.host}:{self.server_args.port}"
+            ),
+            worker_generation=self.instance_id,
+            page_size=self.page_size,
+            is_bigram=self.spec_algorithm.is_eagle(),
+            swa_window_tokens=self.sliding_window_size or 0,
         )
 
     def init_load_inquirer(self) -> None:
@@ -2164,6 +2175,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
+            worker_generation=self.instance_id,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,

@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
-    let prefix_index = cfg
+    let prefix_provider: Option<Arc<dyn sgl_router::prefix_provider::PrefixMatchProvider>> = cfg
         .model
         .cache_aware
         .as_ref()
@@ -109,9 +109,12 @@ async fn main() -> Result<()> {
                 query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
                 max_inflight: indexer.query_max_inflight,
             };
-            sgl_kv_indexer::GrpcPrefixIndex::new(config)
-                .map(Arc::new)
-                .context("configure KV Indexer client")
+            Ok::<Arc<dyn sgl_router::prefix_provider::PrefixMatchProvider>, anyhow::Error>(
+                Arc::new(
+                    sgl_router::prefix_provider::DefaultPrefixMatchProvider::new(config)
+                        .context("configure KV Indexer client")?,
+                ),
+            )
         })
         .transpose()?;
 
@@ -124,7 +127,7 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .expect("default http client builds");
-    let kv_index = if prefix_index.is_some() {
+    let kv_index = if prefix_provider.is_some() {
         sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
             kv_event_http,
             Arc::clone(&block_size_oracle),
@@ -180,6 +183,18 @@ async fn main() -> Result<()> {
         Some(Arc::clone(&active_load)),
     ));
 
+    // External placement needs a fleet-wide load view whose generation can be
+    // compared with the Indexer response. Reuse SGLang's upstream `/v1/loads`
+    // endpoint rather than introducing a second reporting subsystem.
+    let worker_loads = Arc::new(sgl_router::worker_load::WorkerLoadRegistry::default());
+    let load_poller_handle = prefix_provider.as_ref().map(|_| {
+        sgl_router::worker_load::spawn_poller(
+            Arc::clone(&registry),
+            Arc::clone(&worker_loads),
+            sgl_router::worker_load::DEFAULT_POLL_INTERVAL,
+        )
+    });
+
     let proxy = Arc::new(
         sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
             cfg.proxy.request_timeout_secs,
@@ -195,8 +210,9 @@ async fn main() -> Result<()> {
         policies,
         active_load,
     );
-    app_ctx.prefix_index = prefix_index;
+    app_ctx.prefix_provider = prefix_provider;
     app_ctx.block_size_oracle = block_size_oracle;
+    app_ctx.worker_loads = worker_loads;
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
@@ -219,6 +235,10 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    if let Some(handle) = load_poller_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
     janitor_handle.shutdown().await;
     server_result
 }

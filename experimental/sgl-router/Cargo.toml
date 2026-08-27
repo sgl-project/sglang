@@ -56,6 +56,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Utilities
 anyhow = "1"
+async-trait = "0.1"
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
