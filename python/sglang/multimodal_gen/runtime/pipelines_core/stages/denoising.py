@@ -297,6 +297,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # Tag MoE experts (Wan2.2) so TeaCache picks per-expert coefficients.
+        if transformer_2 is not None:
+            transformer._teacache_expert_tag = "high"
+            transformer_2._teacache_expert_tag = "low"
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None

@@ -19,11 +19,20 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
 )
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext, TeaCacheMixin
+from sglang.multimodal_gen.runtime.cache.teacache_calibrate import (
+    TeaCacheCalibrator,
+    get_active_calibrator,
+    set_active_calibrator,
+)
 
 __all__ = [
     # TeaCache (always available)
     "TeaCacheContext",
     "TeaCacheMixin",
+    # TeaCache coefficient calibration
+    "TeaCacheCalibrator",
+    "get_active_calibrator",
+    "set_active_calibrator",
     # Spectrum (always available)
     "SpectrumMixin",
     # cache-dit integration (lazy-loaded, requires cache-dit package)
