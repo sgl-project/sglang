@@ -99,7 +99,7 @@ class SchedulerBatchResultProcessor:
     def _stash_hisparse_spec_info(
         self, batch: ScheduleBatch, batch_index: int, req: Req
     ) -> None:
-        if not self.server_args.enable_hisparse or batch.spec_info is None:
+        if batch.spec_info is None:
             return
         if not hasattr(batch.spec_info, "slice_single"):
             raise RuntimeError(

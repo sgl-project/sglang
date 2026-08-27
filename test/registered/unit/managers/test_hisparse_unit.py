@@ -222,11 +222,6 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
-        object.__setattr__(
-            processor,
-            "server_args",
-            SimpleNamespace(enable_hisparse=True),
-        )
         batch = SimpleNamespace(
             spec_info=EagleDraftInput(
                 topk_p=torch.tensor([[0.25], [0.75]]),
