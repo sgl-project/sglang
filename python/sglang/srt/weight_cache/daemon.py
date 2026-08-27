@@ -470,7 +470,6 @@ class WeightCacheDaemon:
 
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
-                server_args=self.server_args,
                 model_config=model_config,
                 moe_ep_rank=get_parallel().moe_ep_rank,
             )
