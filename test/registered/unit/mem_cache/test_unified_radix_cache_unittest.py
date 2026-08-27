@@ -6655,30 +6655,63 @@ class TestMambaCheckpointGrid(CustomTestCase):
     """
 
     cfg = CacheConfig(
-        page_size=64,
+        page_size=32,
         components=(ComponentType.FULL, ComponentType.MAMBA),
         enable_mamba_extra_buffer=True,
         kv_size=1024,
         max_context_len=1024,
     )
 
-    def _grid(self, cache):
-        component = next(
-            c
-            for c in cache._components_tuple
-            if c.component_type is ComponentType.MAMBA
+    def _branching_seqlen(self, *, tree_page_size: int, full_hit_length: int):
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg,
+            tree_page_size=tree_page_size,
+            mamba_cache_chunk_size=64,
         )
-        return component.mamba_checkpoint_grid
+        prefix = list(range(1, tree_page_size + 1))
+        tokens = list(range(1, full_hit_length + 1))
+        for sequence in (prefix, tokens):
+            value = allocator.alloc(len(sequence))
+            self.assertIsNotNone(value)
+            req = Req(
+                rid=f"checkpoint-grid-{len(sequence)}",
+                origin_input_text="",
+                origin_input_ids=array("q"),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            req_to_token_pool.alloc([req])
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", sequence)),
+                    value=value,
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        cache.tree_core.set_component_device_value_raw(
+            leaf, ComponentType.MAMBA, None
+        )
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(result.full_kv_hit_length, full_hit_length)
+        self.assertEqual(len(result.device_indices), tree_page_size)
+        return result.mamba_branching_seqlen
 
     def test_grid_follows_the_widened_tree_page(self):
-        cache, _, _ = build_fixture(
-            self.cfg, tree_page_size=256, mamba_cache_chunk_size=64
+        # lcm(chunk=64, tree page=96) is 192. Chunk-only alignment would
+        # incorrectly report 256, which is not a radix-node boundary.
+        self.assertEqual(
+            self._branching_seqlen(tree_page_size=96, full_hit_length=288), 192
         )
-        self.assertEqual(self._grid(cache), 256)
 
     def test_grid_is_the_chunk_size_without_widening(self):
-        cache, _, _ = build_fixture(self.cfg, mamba_cache_chunk_size=64)
-        self.assertEqual(self._grid(cache), 64)
+        self.assertEqual(
+            self._branching_seqlen(tree_page_size=32, full_hit_length=160), 128
+        )
 
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):

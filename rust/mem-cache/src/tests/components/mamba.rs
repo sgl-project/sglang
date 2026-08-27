@@ -508,6 +508,32 @@ fn match_reports_the_chunk_aligned_branching_seqlen() {
 }
 
 #[test]
+fn branching_seqlen_uses_the_joint_chunk_and_tree_page_grid() {
+    let mut tc = mamba_core_with_chunk(/* page_size = */ 3, /* chunk = */ 2);
+    let root = tc.arena.root();
+    let node = tc
+        .arena
+        .alloc_child(
+            root,
+            /* key = */ vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap();
+    tc.arena.set_device_value(
+        node,
+        FULL,
+        Tensor::from_slice(&[10i64, 11, 12, 13, 14, 15, 16, 17, 18]),
+    );
+
+    let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7, 8, 9]));
+
+    assert_eq!(result.full_kv_hit_length, 9);
+    // lcm(chunk=2, page=3) is 6; chunk-only alignment would incorrectly yield 8.
+    assert_eq!(result.mamba_branching_seqlen, Some(6));
+}
+
+#[test]
 fn short_walks_have_no_branching_seqlen() {
     let mut tc = mamba_core_with_chunk(/* page_size = */ 1, /* chunk = */ 8);
     let (a, _b) = two_node_path(&mut tc);
@@ -1381,12 +1407,13 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
 }
 
 #[test]
-fn new_stores_the_chunk_size() {
+fn new_combines_the_chunk_and_tree_page_grids() {
     let component = MambaComponent::new(&CacheInitParams {
-        mamba_cache_chunk_size: Some(256),
+        page_size: 6,
+        mamba_cache_chunk_size: Some(4),
         ..CacheInitParams::default()
     });
-    assert_eq!(component.mamba_cache_chunk_size, 256);
+    assert_eq!(component.mamba_checkpoint_grid, 12);
 }
 
 #[test]

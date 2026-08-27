@@ -19,8 +19,8 @@ use crate::unified_tree_core::{
 
 /// Mamba component driver; owns the Mamba device/host value slots.
 pub struct MambaComponent {
-    /// Chunk alignment for the mamba branching seqlen.
-    mamba_cache_chunk_size: usize,
+    /// Joint chunk/tree-page alignment for the mamba branching seqlen.
+    mamba_checkpoint_grid: usize,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     mamba_max_states_per_path: Option<usize>,
 }
@@ -35,13 +35,25 @@ impl MambaComponent {
 impl MambaComponent {
     /// Build the driver from the tree's init params.
     pub fn new(params: &CacheInitParams) -> Self {
+        let mamba_cache_chunk_size = params
+            .mamba_cache_chunk_size
+            .expect("the Mamba component requires mamba_cache_chunk_size");
         MambaComponent {
-            mamba_cache_chunk_size: params
-                .mamba_cache_chunk_size
-                .expect("the Mamba component requires mamba_cache_chunk_size"),
+            // A donated checkpoint must land on both the model's chunk grid and
+            // a radix-node boundary. `params.page_size` is already widened by DCP.
+            mamba_checkpoint_grid: least_common_multiple(mamba_cache_chunk_size, params.page_size),
             mamba_max_states_per_path: params.mamba_max_states_per_path,
         }
     }
+}
+
+fn least_common_multiple(lhs: usize, rhs: usize) -> usize {
+    let mut a = lhs;
+    let mut b = rhs;
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    lhs / a * rhs
 }
 
 impl MambaComponent {
@@ -122,10 +134,10 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         let mamba_boundary_len = result.device_indices.size()[0] as usize + result.host_hit_length;
 
         // Full KV may extend beyond the latest reusable Mamba state. The branching
-        // point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
+        // point is the last checkpoint-grid-aligned position within the Full-KV hit
         // that lies beyond the current Mamba boundary.
         let aligned_seqlen =
-            result.full_kv_hit_length / self.mamba_cache_chunk_size * self.mamba_cache_chunk_size;
+            result.full_kv_hit_length / self.mamba_checkpoint_grid * self.mamba_checkpoint_grid;
         result.mamba_branching_seqlen =
             (aligned_seqlen > mamba_boundary_len).then_some(aligned_seqlen);
 
