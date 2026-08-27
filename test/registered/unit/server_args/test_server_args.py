@@ -1769,6 +1769,87 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
 
 
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
+    def test_rejects_invalid_programmatic_cuda_graph_config_schema(self):
+        cases = (
+            ({"bogus": {"backend": Backend.FULL}}, "unknown phase 'bogus'"),
+            ({Phase.DECODE: {"bogus": 1}}, "unknown key 'bogus'"),
+            ({Phase.DECODE: Backend.FULL}, "must be a dict"),
+        )
+        for config, message in cases:
+            with self.subTest(config=config):
+                args = ServerArgs(model_path="dummy", cuda_graph_config=config)
+                with self.assertRaisesRegex(ValueError, message):
+                    args._handle_cuda_graph_config()
+
+    def test_empty_bs_only_disables_prefill_cuda_graph(self):
+        decode_args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(bs=[])),
+        )
+        with self.assertRaisesRegex(ValueError, "bs must be a non-empty list"):
+            decode_args._validate_cuda_graph_config()
+
+        prefill_args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
+        )
+        prefill_args._validate_cuda_graph_config()
+
+    def test_rejects_invalid_common_cuda_graph_settings(self):
+        cases = (
+            ("max_bs", "4", "max_bs must be a positive integer or None"),
+            ("max_bs", 0, "max_bs must be a positive integer or None"),
+            ("max_bs", True, "max_bs must be a positive integer or None"),
+            ("bs", "4", "bs must be a list of positive integers or None"),
+            ("bs", [1, 0], "bs must be a list of positive integers or None"),
+            ("bs", [True], "bs must be a list of positive integers or None"),
+            ("tc_compiler", "invalid", "tc_compiler must be 'eager' or 'inductor'"),
+        )
+        for phase in Phase.ALL:
+            for key, value, message in cases:
+                with self.subTest(phase=phase, key=key, value=value):
+                    phase_config = PhaseConfig()
+                    setattr(phase_config, key, value)
+                    config = CudaGraphConfig()
+                    setattr(config, phase, phase_config)
+                    args = ServerArgs(model_path="dummy", cuda_graph_config=config)
+                    with self.assertRaisesRegex(ValueError, message):
+                        args._validate_cuda_graph_config()
+
+    def test_full_prefill_optional_positive_integer_settings(self):
+        for key in (
+            "full_prefill_max_req",
+            "full_prefill_prefix_chunk_tokens",
+        ):
+            for value in (1, 4, None):
+                with self.subTest(key=key, value=value):
+                    prefill = PhaseConfig(backend=Backend.FULL)
+                    setattr(prefill, key, value)
+                    args = ServerArgs(
+                        model_path="dummy",
+                        cuda_graph_config=CudaGraphConfig(prefill=prefill),
+                    )
+                    args._validate_cuda_graph_config()
+
+    def test_rejects_invalid_full_prefill_positive_integer_settings(self):
+        for key in (
+            "full_prefill_max_req",
+            "full_prefill_prefix_chunk_tokens",
+        ):
+            for value in ("4", 4.0, True, False, 0, -1):
+                with self.subTest(key=key, value=value):
+                    prefill = PhaseConfig(backend=Backend.FULL)
+                    setattr(prefill, key, value)
+                    args = ServerArgs(
+                        model_path="dummy",
+                        cuda_graph_config=CudaGraphConfig(prefill=prefill),
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"{key} must be a positive integer or None",
+                    ):
+                        args._validate_cuda_graph_config()
+
     @patch(
         "sglang.srt.model_executor.runner_backend."
         "tc_piecewise_cuda_graph_backend.get_moe_a2a_backend"
