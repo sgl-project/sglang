@@ -28,6 +28,7 @@ from sglang.srt.speculative.spec_info import (
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,11 @@ def _make_num_token_non_padded(
 ) -> Optional[torch.Tensor]:
     if not enable_num_token_non_padded():
         return None
-    return torch.tensor(num_tokens, dtype=torch.int32).to(device, non_blocking=True)
+    return torch.tensor(
+        num_tokens,
+        dtype=torch.int32,
+        pin_memory=is_pin_memory_available(device),
+    ).to(device, non_blocking=True)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -205,6 +210,9 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
+        # token) changes per step, so avoid a fresh torch.full every decode.
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -358,12 +366,17 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        draft_block_ids = torch.full(
-            (bs, query_token_num),
-            int(self._mask_token_id),
-            dtype=torch.long,
-            device=device,
-        )
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
+            buf = torch.full(
+                (bs, query_token_num),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            self._draft_block_ids_buf = buf
+        draft_block_ids = buf[:bs]
+
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
@@ -459,16 +472,16 @@ class DraftBlockProposer:
         device = self.draft_model_runner.device
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
-        if enable_num_token_non_padded():
-            forward_batch.num_token_non_padded = torch.tensor(
-                num_tokens, dtype=torch.int32, device=device
-            )
+        num_token_non_padded = _make_num_token_non_padded(num_tokens, device)
+        if num_token_non_padded is not None:
+            forward_batch.num_token_non_padded = num_token_non_padded
         forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
-        forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
+        pin_memory = is_pin_memory_available(device)
+        forward_batch.global_num_tokens_gpu = torch.tensor(
+            gnt, dtype=torch.int64, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-            gnt_logprob, dtype=torch.int64
+            gnt_logprob, dtype=torch.int64, pin_memory=pin_memory
         ).to(device, non_blocking=True)

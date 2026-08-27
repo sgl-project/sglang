@@ -211,7 +211,6 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -310,6 +309,10 @@ def _post_load_weights(model: nn.Module) -> None:
 
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
+
+    # Rank-local weight memory already resident when ModelRunner sampled its
+    # pre-load baseline. Shared allocations must be reported by only one loader.
+    preloaded_weights_bytes: int = 0
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
