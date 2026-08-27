@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -260,8 +261,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
         # (last verified token), not draft-decode step 0.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.dsa_seed_topk_width = (
+            get_dsa_mtp_topk_width(hf_config)
+            if self.dsa_index_topk is not None
+            else None
+        )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+            self.index_share_for_mtp_iteration
+            and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):
@@ -848,11 +855,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
-        """Lazily-grown int32 [num_tokens, index_topk] eager draft-extend seed buffer."""
+        """Lazily grow the eager draft-extend MTP seed buffer."""
         buf = self.dsa_extend_topk_buf
         if buf is None or buf.shape[0] < num_tokens:
             buf = torch.full(
-                (num_tokens, self.dsa_index_topk),
+                (num_tokens, self.dsa_seed_topk_width),
                 -1,
                 dtype=torch.int32,
                 device=self.device,
