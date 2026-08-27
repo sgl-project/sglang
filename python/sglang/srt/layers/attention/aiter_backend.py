@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 
 """
 end to end attention solution with aiter kernels
@@ -56,6 +60,10 @@ try:
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
+
+    from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
+        unified_attention_3d_mtp_func,
+    )
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -65,8 +73,12 @@ from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
+    scaled_fp8_quant,
+)
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
@@ -148,7 +160,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.input_dtype = model_runner.model_config.dtype
 
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
@@ -2282,12 +2294,60 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    if layer.tp_k_head_num == 1 and layer.tp_q_head_num > 1:
-                        # Qwen3.5 can replicate one KV head across multiple TP ranks.
-                        # Present the local KV head as per-Q-head stride-0 views so
-                        # target_verify uses the same local head mapping as the model.
-                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
-                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
+                    # Shape gate, not a model gate: the kernel is tuned for a 16:1
+                    # GQA ratio (block_m=32 -> block_q=2 packs two draft tokens per
+                    # tile), and head_dim 256 is the only validated size. The kv-head
+                    # count itself is free (kv_head_idx = program_id(1)), but K and V
+                    # must share it -- the kernel has a single kv-head grid dim.
+                    # Qwen3.5-397B-A17B at TP1/TP2 is the only config known to
+                    # match today; any model with the same shapes qualifies.
+                    # TODO(yichiche): relax the head_dim gate once other sizes are
+                    # measured -- the wrapper passes HEAD_SIZE_PADDED unpadded, so
+                    # only powers of 2 work (128/256 OK, 192 is not).
+                    num_queries_per_kv = layer.tp_q_head_num // layer.tp_k_head_num
+                    use_unified_attention_3d_mtp = (
+                        is_gfx95_supported()
+                        and 1 < self.forward_metadata.max_q_len <= 4
+                        and max_kv_len > 512
+                        and num_queries_per_kv == 16
+                        and layer.tp_k_head_num == layer.tp_v_head_num
+                        and layer.qk_head_dim == 256
+                        and layer.v_head_dim == 256
+                        and self.page_size == 16
+                        and q_unified.dtype == torch.bfloat16
+                        and k_unified.dtype == fp8_dtype
+                        and window_size == (-1, -1)
+                        and not layer.logit_cap
+                        and sinks is None
+                    )
+                    if use_unified_attention_3d_mtp:
+                        unified_attention_3d_mtp_func(
+                            q=q_unified,
+                            k=k_unified,
+                            v=v_unified,
+                            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            cu_seqlens_q=self.forward_metadata.qo_indptr,
+                            seqused_k=(
+                                forward_batch.seq_lens + self.forward_metadata.max_q_len
+                            ),
+                            max_seqlen_q=self.forward_metadata.max_q_len,
+                            max_seqlen_k=max_kv_len,
+                            softmax_scale=layer.scaling,
+                            block_table=page_table,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                        )
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+                    # GQA-packing fix: do NOT expand the single KV head to
+                    # tp_q_head_num. Passing K/V with the true kv-head count (exactly
+                    # like forward_decode) lets unified_attention derive
+                    # num_queries_per_kv = tp_q_head_num (the GQA group) and pack all Q
+                    # heads against one KV load. The old stride-0 .expand() made the
+                    # wrapper see num_kv_heads=tp_q_head_num -> num_queries_per_kv=1 ->
+                    # full MHA tiling (~7x more KV traffic at long context; trace
+                    # signature num_query_heads_16/num_queries_per_kv_1). GQA head
+                    # mapping here is identical to the proven decode path.
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
@@ -2333,6 +2393,71 @@ class AiterAttnBackend(AttentionBackend):
                     1.0,  # v_scale
                     layer.scaling,
                     logit_cap=layer.logit_cap,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # draft_extend (EAGLE-v2 KV catch-up) is decode-shaped: short Q
+            # (accepted tokens) against long paged KV, GQA. The default
+            # mha_batch_prefill_func FMHA has no split-KV, so at short Q it is
+            # occupancy-starved (~0.2% HBM BW, ~400x over the memory floor).
+            # Route it through unified_attention (GQA-packed + split-KV), exactly
+            # like target_verify, so it runs near the memory floor.
+            if (
+                self._use_unified_verify
+                and forward_batch.forward_mode.is_draft_extend_v2()
+                and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
+            ):
+                bs = forward_batch.batch_size
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                page_table, swa_page_table = self._build_unified_page_table_from_spec(
+                    self.forward_metadata, bs
+                )
+                pt = page_table
+                de_window = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    de_window = (layer.sliding_window_size - 1, 0)
+                    if swa_page_table is not None:
+                        pt = swa_page_table
+                kv_indptr = self.forward_metadata.kv_indptr
+                # seqused_k MUST be int64 (kv_indptr is int32, so the diff is
+                # int32 and has to be widened). unified_attention derives the
+                # per-tile KV addresses from this dtype: with an int32
+                # seqused_k the whole K/V offset chain stays 32-bit and wraps
+                # once a per-layer KV buffer reaches 2 GiB, silently returning
+                # NaN. The verify (seq_lens + max_q_len) and decode
+                # (seq_lens) call sites pass int64 for the same reason.
+                seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.qo_indptr[: bs + 1],
+                    seqused_k=seqused_k,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=pt.shape[1] * self.page_size,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=de_window,
+                    block_table=pt,
+                    softcap=layer.logit_cap,
+                    q_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -2605,6 +2730,12 @@ class AiterAttnBackend(AttentionBackend):
                         page_table = self.forward_metadata.swa_page_table
 
                 max_kv_len = page_table.shape[1] * self.page_size
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    q, _ = scaled_fp8_quant(q, q_descale)
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2624,7 +2755,7 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=window_size,
                     block_table=page_table,
                     softcap=0,
-                    q_descale=None,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
@@ -2886,7 +3017,7 @@ class AiterMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
+        self.page_size = get_schedule().page_size
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int

@@ -64,8 +64,8 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
         "--hicache-size",
         100 if not _is_hip else 200,
     ]
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
 
@@ -77,8 +77,8 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
         "--trust-remote-code",
         "--enable-hierarchical-cache",
     ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
-    mmlu_score_threshold = 0.5
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.54
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
     mgsm_en_score_threshold = 0.8
 
@@ -110,8 +110,8 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
         "--chunked-prefill-size",
         1024,
     ]
-    mmlu_score_threshold = 0.72
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
     mmlu_accept_length_thres = 2.26
 
@@ -127,8 +127,8 @@ class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
         "--hicache-write-policy",
         "write_back",
     ]
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
 

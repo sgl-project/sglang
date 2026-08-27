@@ -20,7 +20,7 @@ Install SGLang from source or use an NVIDIA Docker image:
 
 ```bash Command
 # Install from source
-uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+uv pip install --prerelease=allow 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
 # Or use Docker for NVIDIA GPUs
 docker pull lmsysorg/sglang:latest

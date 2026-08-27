@@ -3,8 +3,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MiniMaxSparseKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
     unwrap_write_loc,
@@ -20,19 +23,26 @@ if is_npu():
 
 
 def _init_npu_conv_state(
-    conv_state_in, conv_state_shape, speculative_num_draft_tokens: Optional[int] = None
+    conv_state_in,
+    conv_state_shape,
+    speculative_num_draft_tokens: Optional[int] = None,
+    is_kda: bool = False,
 ):
     extra_conv_len = 0
     if speculative_num_draft_tokens is not None:
         extra_conv_len = speculative_num_draft_tokens - 1
 
-    # conv_state shape (layers, pool_size, conv_wind + draft_step, dim) for conv1d ascendc ops require dim as last dim
+    # Mamba shapes are (channels, window), while KDA shapes are
+    # (window, channels). NPU kernels consume KDA state as
+    # [layers, pool, channels, window] and other Mamba state as
+    # [layers, pool, window, channels]. KDA keeps the base window fixed;
+    # speculative per-step windows live in the intermediate cache.
     conv_state = [
         torch.zeros(
             size=(
                 conv_state_in.shape[0],
                 conv_state_in.shape[1],
-                conv_shape[1] + extra_conv_len,
+                conv_shape[1] if is_kda else conv_shape[1] + extra_conv_len,
                 conv_shape[0],
             ),
             dtype=conv_state_in.dtype,
@@ -66,6 +76,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         **kwargs,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_triton_prefix_kv_cache_store = (
+            envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
+        )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -201,16 +214,36 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         if self.use_fia:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
+            num_rows = loc.numel()
+            expected_k_numel = num_rows * self.head_num * self.head_dim
+            expected_v_numel = num_rows * self.head_num * self.v_head_dim
+            if (
+                cache_k.numel() != expected_k_numel
+                or cache_v.numel() != expected_v_numel
+            ):
+                raise ValueError(
+                    "NPU FIA KV scatter row mismatch: "
+                    f"loc_rows={num_rows}, cache_k_shape={tuple(cache_k.shape)}, "
+                    f"cache_v_shape={tuple(cache_v.shape)}, "
+                    f"head_num={self.head_num}, head_dim={self.head_dim}, "
+                    f"v_head_dim={self.v_head_dim}."
+                )
 
+            # aclnnScatterNdUpdate on the deployed CANN rejects the otherwise
+            # valid 4-D [slot, 1, head, dim] update during tiling. Flatten only
+            # the singleton FIA layout axis and scatter through an equivalent
+            # 3-D view; the underlying KV storage and attention layout stay
+            # unchanged.
+            loc_indices = loc.contiguous().view(-1, 1)
             torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer,
-                loc.view(-1, 1),
-                cache_k.view(-1, 1, self.head_num, self.head_dim),
+                k_buffer_layer.view(-1, self.head_num, self.head_dim),
+                loc_indices,
+                cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
             )
             torch_npu.npu_scatter_nd_update_(
-                v_buffer_layer,
-                loc.view(-1, 1),
-                cache_v.view(-1, 1, self.head_num, self.v_head_dim),
+                v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
+                loc_indices,
+                cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
             )
         else:
             loc = loc.to(torch.int32)
@@ -225,6 +258,80 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 ),
                 slot_indices=loc,
             )
+
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: "RadixAttention",
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if not self.use_triton_prefix_kv_cache_store:
+            return super().set_kv_buffer_prefix_valid(
+                layer,
+                loc_2d,
+                commit_lens,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+                layer_id_override,
+            )
+
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got {tuple(loc_2d.shape)}")
+
+        num_rows = loc_2d.numel()
+        if (
+            cache_k.numel() != num_rows * self.head_num * self.head_dim
+            or cache_v.numel() != num_rows * self.head_num * self.v_head_dim
+        ):
+            raise ValueError(
+                "dense NPU KV rows must match loc_2d size: "
+                f"cache_k={tuple(cache_k.shape)}, cache_v={tuple(cache_v.shape)}, "
+                f"loc_2d={tuple(loc_2d.shape)}"
+            )
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+
+        k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
+        v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
+        if loc_2d.device != k_buffer_layer.device:
+            loc_2d = loc_2d.to(device=k_buffer_layer.device, non_blocking=True)
+        if commit_lens.device != k_buffer_layer.device:
+            commit_lens = commit_lens.to(
+                device=k_buffer_layer.device, non_blocking=True
+            )
+        self._debug_prefix_valid_backend = "npu_triton"
+        from sgl_kernel_npu.mem_cache.kv_cache_store import (
+            store_kv_cache_prefix_valid_npu_triton,
+        )
+
+        store_kv_cache_prefix_valid_npu_triton(
+            k_buffer_layer.view(-1, self.head_num, self.head_dim),
+            v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
+            cache_k.reshape(num_rows, self.head_num, self.head_dim),
+            cache_v.reshape(num_rows, self.head_num, self.v_head_dim),
+            loc_2d,
+            commit_lens,
+        )
 
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size
@@ -285,6 +392,135 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         torch.npu.synchronize()
 
 
+class NPUMHATokenToKOnlyPool(MHATokenToKOnlyPool):
+    """NPU paged K-only cache used by MiniMax sparse index-only layers."""
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        super(MHATokenToKOnlyPool, self).__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.k_buffer = torch.zeros(
+                (
+                    self.layer_num,
+                    self.size // self.page_size + 1,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            if self.use_fia:
+                self.k_buffer = [
+                    self.k_buffer[i].view(-1, 1, self.head_num, self.head_dim)
+                    for i in range(self.layer_num)
+                ]
+
+        self._finalize_allocation_log(size)
+
+    def _get_key_buffer(self, layer_id: int):
+        k_buffer = self.k_buffer[layer_id - self.start_layer]
+        if self.store_dtype != self.dtype:
+            return k_buffer.view(self.dtype)
+        return k_buffer
+
+    def set_k_buffer(
+        self,
+        layer_id: int,
+        loc_info,
+        cache_k: torch.Tensor,
+    ) -> None:
+        loc, _, _ = unwrap_write_loc(loc_info)
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+
+        k_buffer_layer = self.k_buffer[layer_id - self.start_layer].view(
+            -1, self.head_num, self.head_dim
+        )
+        loc = loc.to(device=cache_k.device, dtype=torch.int32).contiguous()
+        torch_npu.npu_scatter_nd_update_(
+            k_buffer_layer,
+            loc.view(-1, 1),
+            cache_k.contiguous().view(-1, self.head_num, self.head_dim),
+        )
+
+    def get_contiguous_buf_infos(self):
+        data_ptrs = [
+            self.get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        data_lens = [
+            self.get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        if self.use_fia:
+            item_lens = [
+                self.get_key_buffer(i)[0].nbytes * self.page_size
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        else:
+            item_lens = [
+                self.get_key_buffer(i)[0].nbytes
+                for i in range(self.start_layer, self.start_layer + self.layer_num)
+            ]
+        return data_ptrs, data_lens, item_lens
+
+    def get_kv_size_bytes(self):
+        return get_tensor_size_bytes(self.k_buffer), 0
+
+
+class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
+    """MiniMax sparse wrapper backed by NPU paged MHA/index pools."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            *args,
+            main_pool_cls=NPUMHATokenToKVPool,
+            index_kv_pool_cls=NPUMHATokenToKVPool,
+            index_k_pool_cls=NPUMHATokenToKOnlyPool,
+            **kwargs,
+        )
+
+    def get_index_k_state_buf_infos(self):
+        pool = self.index_k_pool
+        n = pool.layer_num
+        data_ptrs = [pool.get_key_buffer(i).data_ptr() for i in range(n)]
+        data_lens = [pool.get_key_buffer(i).nbytes for i in range(n)]
+        if pool.use_fia:
+            item_lens = [
+                pool.get_key_buffer(i)[0].nbytes * pool.page_size for i in range(n)
+            ]
+        else:
+            item_lens = [pool.get_key_buffer(i)[0].nbytes for i in range(n)]
+        return data_ptrs, data_lens, item_lens
+
+
 class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def __init__(
@@ -294,10 +530,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         dtype: torch.dtype,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
-        index_head_dim: Optional[int],
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        index_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):

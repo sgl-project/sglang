@@ -585,6 +585,10 @@ class C4IndexerBackendMixin:
         ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
         gather_seq_lens = ke[-1:]
         ks = torch.zeros_like(ke)
+        # SGL Top-K synthesizes sequential indices for trivial rows without
+        # reading logits, so DeepGEMM can receive an empty range for them.
+        if self.dsa_topk_backend.is_sgl_kernel():
+            ke = torch.where(ke - ks > c4_indexer.index_topk, ke, ks)
         c4_page_size = indexer_metadata.c4_page_size
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
@@ -804,10 +808,7 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if (
-            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
-            or self.dsa_topk_backend.is_torch()
-        ):
+        if self.dsa_topk_backend.is_torch():
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
@@ -900,11 +901,16 @@ class C4Indexer(nn.Module):
             params_dtype=torch.bfloat16,
             prefix=add_prefix("wq_b", prefix),
         )
+        expert_pack_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.get_name() == "expert_pack"
+            else None
+        )
         self.weights_proj = ReplicatedLinear(
             self.dim,
             self.n_heads,
             bias=False,
-            quant_config=None,
+            quant_config=expert_pack_quant_config,
             params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
@@ -917,6 +923,7 @@ class C4Indexer(nn.Module):
             head_dim=self.head_dim,
             rotate=True,
             prefix=add_prefix("compressor", prefix),
+            quant_config=expert_pack_quant_config,
             rotary_emb=rotary_emb,
         )
         self.rotary_emb = rotary_emb

@@ -46,6 +46,7 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
+    fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -58,9 +59,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self.moe_runner_config = moe_runner_config
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        assert (
-            swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -319,6 +317,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
 
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_moe_enable_pdl,
+        )
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -361,6 +363,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
+            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )[0]
 
         return StandardCombineInput(hidden_states=output)
@@ -377,6 +380,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
@@ -390,11 +394,16 @@ def maybe_fuse_routed_scale_and_shared_add(
             Mxfp4FlashinferTrtllmMoEMethod,
             Mxfp4FlashinferCutlassMoEMethod,
             Mxfp4MarlinMoEMethod,
+            ExpertPackMoEMethod,
         ),
     )
     if fused:
+        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
         if shared is not None:
-            return shared.add_(routed, alpha=routed_scaling_factor)
+            alpha = 1.0 if already_scaled else routed_scaling_factor
+            return shared.add_(routed, alpha=alpha)
+        if already_scaled:
+            return routed
         return routed.mul_(routed_scaling_factor)
     if shared is not None:
         routed += shared
