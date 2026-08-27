@@ -260,8 +260,12 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -383,6 +387,10 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -476,7 +484,7 @@ class MultiTokenizerRouter:
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()

@@ -168,7 +168,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_context,
     get_device,
     get_exec,
@@ -223,7 +223,7 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
-    create_offloader_from_server_args,
+    create_offloader,
     get_offloader,
     set_offloader,
 )
@@ -270,7 +270,6 @@ class ModelRunnerOutput:
 def resolve_draft_attention_backend(
     *,
     draft_attention_backend: Optional[str],
-    server_args: ServerArgs,
     is_draft_worker: bool,
 ) -> Optional[str]:
     """The attention backend a runner uses because it is a draft runner.
@@ -332,20 +331,16 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        # Set the global server_args in the scheduler process (target worker
-        # only, so a draft init cannot clobber target-derived global state).
-        # Before the constructor's bag reads (page_size below): a standalone
-        # construction (benchmark/one_batch, the manual runner tests) has no
-        # earlier publish.
+        # The process entry published; a draft runner is not one (it must not
+        # clobber the target's config), so only the target checks.
         if not is_draft_worker:
-            ensure_published(server_args, role="scheduler")
+            assert_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
         self.device = get_device().device
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
-            server_args=server_args,
             is_draft_worker=is_draft_worker,
         )
         # This runner's own load format, resolved before anything keys off it:
@@ -433,9 +428,7 @@ class ModelRunner:
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(
-            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
-        )
+        set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
@@ -489,17 +482,19 @@ class ModelRunner:
         if not (get_exec().moe.elastic_ep_backend is not None and is_ep_scale_joiner()):
             return
 
-        join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
+        join_effective_ep_size = (
+            get_parallel().config.ep_join_rank_offset + self.ps.tp_size
+        )
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
-                get_parallel().ep_join_rank_offset,
+                get_parallel().config.ep_join_rank_offset,
                 join_effective_ep_size,
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -592,7 +587,6 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             req_to_token_pool=self.req_to_token_pool,
-            server_args=self.server_args,
             max_running_requests=self.max_running_requests,
             device=self.device,
         )
@@ -699,11 +693,10 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
+            get_parallel().config.ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_rank=expert_rank,
             )
@@ -728,7 +721,6 @@ class ModelRunner:
     def maybe_init_eplb_manager(self):
         self.eplb_manager = (
             EPLBManager(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 ps=self.ps,
                 get_model=lambda: self.model,
@@ -807,6 +799,15 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
+            if self.spec_algorithm.is_dspark() and self.is_draft_worker:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    get_dspark_sample_from_anchor,
+                )
+
+                if not get_dspark_sample_from_anchor(self.model_config.hf_config):
+                    if num_draft_tokens is None:
+                        num_draft_tokens = get_spec().speculative_num_draft_tokens
+                    return int(num_draft_tokens)
             return resolve_num_tokens_per_req(
                 phase="target_verify",
                 spec_algorithm=self.spec_algorithm,
@@ -888,7 +889,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
-                if get_parallel().enable_dp_attention
+                if get_parallel().config.enable_dp_attention
                 else self.tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -924,7 +925,7 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -964,7 +965,7 @@ class ModelRunner:
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
 
-        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
+        if get_parallel().dcp_enabled and get_parallel().config.dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -1068,9 +1069,7 @@ class ModelRunner:
         self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
-        maybe_init_shared_mooncake_transfer_engine(
-            server_args=self.server_args, gpu_id=self.gpu_id
-        )
+        maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -1083,9 +1082,7 @@ class ModelRunner:
         if self.device != "cpu":
             torch.set_num_threads(1)
         if self.device == "cuda":
-            maybe_downgrade_dtype_for_legacy_gpu(
-                server_args=self.server_args, model_config=self.model_config
-            )
+            maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
 
@@ -1105,7 +1102,6 @@ class ModelRunner:
         # and derive the per-rank daemon socket. Idempotent across reloads.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
-            server_args=self.server_args,
             tp_size=self.ps.tp_size,
             pp_rank=self.ps.pp_rank,
             tp_rank=self.ps.tp_rank,
@@ -1116,7 +1112,6 @@ class ModelRunner:
             )
 
         maybe_trigger_remote_instance_nccl_send_group(
-            server_args=self.server_args,
             tp_rank=self.ps.tp_rank,
             load_format=draft_load_format,
         )
@@ -1187,11 +1182,12 @@ class ModelRunner:
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
 
-        report_online_quantization(model=self.model, server_args=self.server_args)
+        report_online_quantization(
+            model=self.model,
+        )
 
         maybe_register_debug_tensor_dump_hook(
             model=self.model,
-            server_args=self.server_args,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
             tp_size=self.ps.tp_size,
@@ -1206,7 +1202,6 @@ class ModelRunner:
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
             self.model,
-            self.server_args,
             self.model_config,
             logger,
         )
@@ -1248,7 +1243,7 @@ class ModelRunner:
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
-        if get_parallel().dwdp_size <= 1:
+        if get_parallel().config.dwdp_size <= 1:
             return
         from sglang.srt.layers.moe.dwdp import DwdpManager
 
@@ -1273,7 +1268,6 @@ class ModelRunner:
         )
         if not cuda_graph_fully_disabled():
             init_lora_cuda_graph_moe_buffers(
-                server_args=self.server_args,
                 model=self.model,
                 lora_manager=self.lora_manager,
                 dtype=self.dtype,
@@ -1298,9 +1292,12 @@ class ModelRunner:
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""
         if self.is_hybrid_swa:
-            return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
+            capacity = self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
-            return self.max_total_num_tokens
+            capacity = self.max_total_num_tokens
+        if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
+            return req_to_token_pool.schedulable_token_capacity(capacity)
+        return capacity
 
     @property
     def max_token_pool_size(self):
@@ -1419,7 +1416,7 @@ class ModelRunner:
         # rather than spawning additional processes, so dp_size must not be
         # multiplied into the process count here (unlike regular DP, where
         # dp_size * tp_size * pp_size is the true worker count).
-        dp_size = 1 if get_parallel().enable_dp_attention else self.ps.dp_size
+        dp_size = 1 if get_parallel().config.enable_dp_attention else self.ps.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
             numa_index=self.gpu_id,
             world_size=dp_size * self.ps.tp_size * self.ps.pp_size,
@@ -1460,13 +1457,11 @@ class ModelRunner:
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer(self.server_args)
+            and require_gathered_buffer()
             and not is_dsa_enable_prefill_cp()
             and not is_mla_prefill_cp_enabled()
         ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                server_args=self.server_args,
-            )
+            forward_batch.adjust_num_token_non_padded_for_attn_tp()
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
@@ -1904,7 +1899,7 @@ class ModelRunner:
         if added <= 0:
             return
 
-        initial_ep_size = get_parallel().elastic_ep_initial_size
+        initial_ep_size = get_parallel().config.elastic_ep_initial_size
         assert initial_ep_size is not None
         get_context().override("elastic_ep.scale", ep_size=effective_size)
 
@@ -1915,7 +1910,6 @@ class ModelRunner:
             start=old_num_physical - num_local * initial_ep_size,
         )
         new_metadata = ExpertLocationMetadata.init_by_mapping(
-            self.server_args,
             self.model_config,
             physical_to_logical_map=expanded_p2l,
             moe_ep_rank=self._elastic_global_rank(),
@@ -1923,7 +1917,7 @@ class ModelRunner:
         set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
     def _elastic_global_rank(self) -> int:
-        return self.ps.tp_rank + get_parallel().ep_join_rank_offset
+        return self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
 
     def _rearm_eplb_after_elastic_scale(self) -> None:
         if self.eplb_manager is None:

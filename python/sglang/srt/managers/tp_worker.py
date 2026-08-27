@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -536,7 +537,9 @@ class TpModelWorker(BaseTpWorker):
             - 1,
         )
         return (
-            self.model_runner.max_total_num_tokens,
+            self.model_runner.req_to_token_pool.schedulable_token_capacity(
+                self.model_runner.max_total_num_tokens
+            ),
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
@@ -625,6 +628,8 @@ class TpModelWorker(BaseTpWorker):
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
             )
+
+            capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
