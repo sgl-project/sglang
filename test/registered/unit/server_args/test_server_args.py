@@ -1617,6 +1617,33 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         ):
             handle_speculative_decoding(args)
 
+    def test_multi_layer_eagle_accepts_supported_architectures(self):
+        for model_arch in (
+            "InklingForConditionalGeneration",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+            "Step3p5ForCausalLM",
+            "Step3p7ForConditionalGeneration",
+        ):
+            with self.subTest(model_arch=model_arch):
+                args = ServerArgs(
+                    model_path="dummy",
+                    speculative_algorithm="EAGLE",
+                    enable_multi_layer_eagle=True,
+                    speculative_num_steps=3,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                    device="cuda",
+                )
+                args.get_model_config = lambda: SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        architectures=[model_arch],
+                        get_text_config=lambda: SimpleNamespace(),
+                    )
+                )
+
+                handle_speculative_decoding(args)
+
     def test_adaptive_defaults_to_config_step_when_spec_params_omitted(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
