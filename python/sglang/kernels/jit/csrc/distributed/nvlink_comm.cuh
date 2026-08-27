@@ -349,6 +349,11 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
     } else {
       ptx::ld_global_16B(vec, params.input, vid);
     }
+    if constexpr (kHasResidual) {
+      vec_t res;
+      res.load(params.residual, vid);
+      vec = reduce_vec(vec, res);
+    }
     if constexpr (kPrim & Primitive::AG) {
       ptx::st_multimem_16B(vec, params.output_mc, vid);
     } else {
