@@ -814,7 +814,9 @@ class ModelRunner:
                 num_draft_tokens=num_draft_tokens,
             )
         dllm_config = DllmConfig.from_server_args(self.server_args)
-        return dllm_config.block_size if dllm_config is not None else 1
+        if dllm_config is None or dllm_config.needs_full_prefill:
+            return 1
+        return dllm_config.block_size
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""

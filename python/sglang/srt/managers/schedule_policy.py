@@ -655,10 +655,18 @@ class PrefillAdder:
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
-
-        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
+        if dllm_config.needs_full_prefill:
+            # Keep the existing dLLM batch-level prefill budget. Dream may
+            # exceed it only as the first request in a batch because its full
+            # canvas cannot be split; _get_dllm_remain_tokens still gates it
+            # against the real KV capacity.
+            self.rem_dllm_tokens = self.rem_input_tokens
+        else:
+            self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        if self.dllm_config is not None and self.dllm_config.needs_full_prefill:
+            return 0
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -920,6 +928,16 @@ class PrefillAdder:
             self.log_storage_hit_tokens += storage_hit
 
     def _get_dllm_remain_tokens(self) -> int:
+        if self.dllm_config.needs_full_prefill:
+            # As with the first regular non-chunked prefill request, a Dream
+            # canvas may exceed max_prefill_tokens because it cannot be split.
+            # It must still fit the allocator, including one page of slack.
+            return max(
+                min(int(self.cur_rem_tokens), int(self.rem_total_tokens))
+                - self.page_size,
+                0,
+            )
+
         _rem_tokens = min(
             self.rem_dllm_tokens,
             self.dllm_block_size,
@@ -930,10 +948,29 @@ class PrefillAdder:
 
         return _rem_tokens
 
-    def _add_dllm_req(self, req: Req, prefix_len: int):
-        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-        # the diffusion unmask process may have some problems
-        # Make sure at least one page is available
+    def _add_dream_req(self, req: Req, prefix_len: int):
+        """Admit Dream's complete prompt-and-generation canvas."""
+        canvas_len = len(req.full_untruncated_fill_ids) - prefix_len
+        if canvas_len > self._get_dllm_remain_tokens():
+            return AddReqResult.NO_TOKEN
+
+        req.set_extend_range(prefix_len, prefix_len + canvas_len)
+        self.can_run_list.append(req)
+        self._update_prefill_budget(
+            prefix_len,
+            canvas_len,
+            0,
+            req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            host_hit_len=req.host_hit_length,
+            storage_hit_len=req.storage_hit_length,
+        )
+
+    # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
+    # the diffusion unmask process may have some problems
+    # Make sure at least one page is available
+    def _add_block_dllm_req(self, req: Req, prefix_len: int):
+        """Admit one block dLLM block, preserving its truncation behavior."""
         trunc_len = (
             min(self.rem_dllm_tokens, self.dllm_block_size)
             // self.page_size
@@ -973,6 +1010,8 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        if self.dllm_config.needs_full_prefill and cand_extend_input_len > _rem_tokens:
+            return AddReqResult.NO_TOKEN
         if req.dllm_incomplete_ids and cand_extend_input_len > _rem_tokens:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > _rem_tokens
@@ -983,7 +1022,7 @@ class PrefillAdder:
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
             min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            if not truncated
+            if not self.dllm_config.needs_full_prefill and not truncated
             else 0
         )
         self._update_prefill_budget(
@@ -1002,6 +1041,9 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        assert self.dllm_config is None or not self.dllm_config.needs_full_prefill, (
+            "A full-generation dLLM canvas cannot use chunked prefill"
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1092,9 +1134,12 @@ class PrefillAdder:
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
             )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                r.output_ids
-            )
+            if self.dllm_config is not None and self.dllm_config.needs_full_prefill:
+                tokens_left = 0
+            else:
+                tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
+                    r.output_ids
+                )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
             if tokens_left <= 0:
@@ -1157,7 +1202,12 @@ class PrefillAdder:
             ) is not None:
                 return tile_stop
 
-            self._add_dllm_req(req, 0)
+            if self.dllm_config.needs_full_prefill:
+                result = self._add_dream_req(req, 0)
+            else:
+                result = self._add_block_dllm_req(req, 0)
+            if result is not None:
+                return result
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
@@ -1223,9 +1273,13 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        max_new = (
+            0
+            if self.dllm_config is not None and self.dllm_config.needs_full_prefill
+            else min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -1356,7 +1410,12 @@ class PrefillAdder:
                 ) is not None:
                     return tile_stop
 
-                self._add_dllm_req(req, prefix_len)
+                if self.dllm_config.needs_full_prefill:
+                    result = self._add_dream_req(req, prefix_len)
+                else:
+                    result = self._add_block_dllm_req(req, prefix_len)
+                if result is not None:
+                    return result
                 self._req_inc_lock_ref(req)
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
                 if (
@@ -1466,7 +1525,11 @@ class PrefillAdder:
         min_tokens_to_remove = (
             len(req.full_untruncated_fill_ids)
             - len(req.prefix_indices)
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + (
+                0
+                if self.dllm_config is not None and self.dllm_config.needs_full_prefill
+                else min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            )
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:

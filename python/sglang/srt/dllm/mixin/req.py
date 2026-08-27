@@ -21,12 +21,20 @@ class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
-        self.dllm_algo_state = None
+        self.dllm_algo_state = (
+            {"prompt_len": len(self.origin_input_ids)}
+            if dllm_config is not None and dllm_config.needs_full_prefill
+            else None
+        )
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
-            if len(self.origin_input_ids) < self.dllm_config.block_size:
+            if self.dllm_config.needs_full_prefill:
+                # Dream denoises a masked generation canvas, so it is a decode
+                # request even though each round uses a full-attention prefill.
+                self.dllm_phase = DllmReqPhase.INCOMING_DECODE
+            elif len(self.origin_input_ids) < self.dllm_config.block_size:
                 self.dllm_phase = DllmReqPhase.INCOMING_DECODE
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
@@ -41,6 +49,10 @@ class ReqDllmMixin:
         ]
 
     def determine_dllm_phase(self: Req):
+        if self.dllm_config.needs_full_prefill:
+            self.dllm_phase = DllmReqPhase.STAGING_DECODE
+            return
+
         if self.dllm_incomplete_ids:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
             return
@@ -61,6 +73,19 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
+        if self.dllm_config.needs_full_prefill:
+            remaining = max(
+                self.sampling_params.max_new_tokens - len(self.output_ids), 0
+            )
+            self.dllm_block_offset = 0
+            self.full_untruncated_fill_ids = (
+                self.origin_input_ids
+                + self.output_ids
+                + array("q", [self.dllm_config.mask_id] * remaining)
+            )
+            self.dllm_initialized = True
+            return
+
         if self.dllm_incomplete_ids:
             prefix_len = len(self.prefix_indices)
             assert len(self.dllm_incomplete_ids) == self.dllm_config.block_size

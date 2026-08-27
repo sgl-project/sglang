@@ -74,6 +74,10 @@ class SamplingBatchInfo:
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
 
+    # Sampling values before SamplingParams encodes temperature=0 as top_k=1.
+    original_temperatures: Optional[torch.Tensor] = None
+    original_top_ks: Optional[torch.Tensor] = None
+
     # Per-request flag for returning sparse sampling support metadata.
     return_sampling_masks: Optional[List[bool]] = None
     sampling_mask_max_top_k: int = 0
@@ -107,6 +111,16 @@ class SamplingBatchInfo:
         ).to(device, non_blocking=True)
         top_ks = torch.tensor(
             [r.sampling_params.top_k for r in reqs],
+            dtype=torch.int32,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
+        original_temperatures = torch.tensor(
+            [r.sampling_params.original_temperature for r in reqs],
+            dtype=torch.float,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
+        original_top_ks = torch.tensor(
+            [r.sampling_params.original_top_k for r in reqs],
             dtype=torch.int32,
             pin_memory=_pin,
         ).to(device, non_blocking=True)
@@ -202,6 +216,8 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
+            original_temperatures=original_temperatures,
+            original_top_ks=original_top_ks,
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
@@ -333,6 +349,8 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "original_temperatures",
+            "original_top_ks",
         ]:
             value = getattr(self, item, None)
             if value is not None:
@@ -458,6 +476,8 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "original_temperatures",
+            "original_top_ks",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)

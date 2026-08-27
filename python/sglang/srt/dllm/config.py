@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
@@ -9,10 +9,11 @@ class DllmConfig:
         self,
         algorithm: str,
         algorithm_config: dict[str, Any],
-        block_size: int,
+        block_size: Optional[int],
         mask_id: int,
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
+        needs_full_prefill: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -20,6 +21,7 @@ class DllmConfig:
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
+        self.needs_full_prefill = needs_full_prefill
 
     @staticmethod
     def from_server_args(
@@ -37,6 +39,7 @@ class DllmConfig:
             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
+            "DreamModel": {"block_size": None, "mask_id": 151666},
         }
 
         arch = model_config.hf_config.architectures[0]
@@ -46,6 +49,7 @@ class DllmConfig:
             mask_id = params["mask_id"]
         else:
             raise RuntimeError(f"Unknown diffusion LLM: {arch}")
+        needs_full_prefill = arch == "DreamModel"
 
         max_running_requests = (
             1
@@ -74,5 +78,10 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
-            first_done_first_out_mode=server_args.dllm_fdfo,
+            # TODO: Support FDFO for Dream by carrying partial canvas state
+            # across denoising rounds. Keep it synchronous for now.
+            first_done_first_out_mode=(
+                server_args.dllm_fdfo and not needs_full_prefill
+            ),
+            needs_full_prefill=needs_full_prefill,
         )

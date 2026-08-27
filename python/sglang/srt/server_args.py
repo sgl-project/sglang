@@ -9061,6 +9061,26 @@ class ServerArgs:
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
+        is_dream = "DreamModel" in self.get_model_config().hf_config.architectures
+        if is_dream:
+            if self.tp_size != 1:
+                raise ValueError("Dream dLLM currently only supports TP=1")
+            if self.pp_size != 1:
+                raise ValueError("Dream dLLM currently only supports PP=1")
+            logger.warning(
+                "Dream dLLM is experimental: disabling radix prefix cache "
+                "and CUDA graphs"
+            )
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            if self.dllm_fdfo:
+                logger.warning(
+                    "Dream dLLM disables --dllm-fdfo in the initial implementation"
+                )
+                self.dllm_fdfo = False
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+
         # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
         # resolution moved to the pipeline: arg_groups/overrides.py
         # _dllm_attention_backend, invoked below at its legacy slot).

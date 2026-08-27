@@ -1309,6 +1309,16 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        if self.is_dllm() and self.dllm_config.needs_full_prefill:
+            # Bidirectional attention makes cached prefix K/V invalid: every
+            # denoising pass must see prompt and all generated positions.
+            tree_cache = None
+            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+            self.cache_protected_len = 0
+            self.host_hit_length = 0
+            self.swa_host_hit_length = 0
+            self.mamba_host_hit_length = 0
+
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
