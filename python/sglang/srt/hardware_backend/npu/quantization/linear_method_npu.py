@@ -186,7 +186,7 @@ def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]
     if projection not in _W8A8_LINEAR_PROJECTIONS:
         return None
     # w4a4_int4 is mixed precision: dense projections stay W8A8 while MoE
-    # w13 uses W4A4 and w2 uses W8A8.
+    # expert projections use W4A4.
     return NPUOnlineW8A8Int8LinearMethod()
 
 

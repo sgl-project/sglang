@@ -963,6 +963,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             scale=weight_scale,
             spec=spec,
             weight_prefix=weight_prefix,
+            output_dtype=loader.params_dtype,
         )
 
         copy_or_rebind_param(layer, weight_name, quantized_weight)

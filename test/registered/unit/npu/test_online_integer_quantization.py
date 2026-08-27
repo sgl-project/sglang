@@ -11,7 +11,9 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     get_npu_online_linear_method,
 )
 from sglang.srt.hardware_backend.npu.quantization.online_quantization import (
+    get_npu_online_integer_quant_spec,
     get_npu_online_moe_integer_quant_spec,
+    npu_format_online_moe_scale,
     validate_npu_online_source_dtype,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -48,13 +50,33 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
         )
         self.assertEqual(
             get_npu_online_moe_integer_quant_spec("w2").mode,
-            "w8a8_int8",
+            "w4a4_int4",
         )
 
     def test_bf16_source_is_supported(self):
         validate_npu_online_source_dtype(torch.bfloat16)
         with self.assertRaisesRegex(ValueError, "FP16 or BF16"):
             validate_npu_online_source_dtype(torch.float32)
+
+    def test_w8_moe_scale_matches_output_dtype(self):
+        spec = get_npu_online_integer_quant_spec("w8a8_int8")
+        scale = torch.ones((2, 3, 1), dtype=torch.float32)
+
+        bf16_scale = npu_format_online_moe_scale(
+            scale=scale,
+            spec=spec,
+            weight_prefix="w13",
+            output_dtype=torch.bfloat16,
+        )
+        fp16_scale = npu_format_online_moe_scale(
+            scale=scale,
+            spec=spec,
+            weight_prefix="w13",
+            output_dtype=torch.float16,
+        )
+
+        self.assertEqual(bf16_scale.dtype, torch.bfloat16)
+        self.assertEqual(fp16_scale.dtype, torch.float32)
 
 
 if __name__ == "__main__":

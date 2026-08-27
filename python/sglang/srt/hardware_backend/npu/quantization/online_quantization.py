@@ -50,11 +50,11 @@ def get_npu_online_moe_integer_quant_spec(
         mode = get_server_args().online_quantization
     if mode != "w4a4_int4":
         return get_npu_online_integer_quant_spec(mode)
-    if weight_prefix == "w13":
-        return _ONLINE_INTEGER_QUANT_SPECS["w4a4_int4"]
-    if weight_prefix == "w2":
-        return _ONLINE_INTEGER_QUANT_SPECS["w8a8_int8"]
-    raise ValueError(f"Expected an online MoE w13/w2 weight, got {weight_prefix!r}.")
+    if weight_prefix not in {"w13", "w2"}:
+        raise ValueError(
+            f"Expected an online MoE w13/w2 weight, got {weight_prefix!r}."
+        )
+    return _ONLINE_INTEGER_QUANT_SPECS["w4a4_int4"]
 
 
 def validate_npu_online_source_dtype(params_dtype: torch.dtype) -> None:
@@ -149,9 +149,12 @@ def npu_format_online_moe_scale(
     scale: torch.Tensor,
     spec: NPUOnlineIntegerQuantSpec,
     weight_prefix: str,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     if spec.weight_dtype == torch.int8:
-        return scale
+        # Per-token GMM requires BF16 weight scales for BF16 output, while
+        # FP16 output retains FP32 scales.
+        return scale.to(torch.bfloat16) if output_dtype == torch.bfloat16 else scale
 
     scale = scale.transpose(-1, -2).contiguous()
     # GMM1 expects per-channel [E, N], while GMM2 retains [E, 1, N].
