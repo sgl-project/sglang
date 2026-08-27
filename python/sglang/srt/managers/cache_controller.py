@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.utils import log_hicache_event
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -1258,14 +1259,36 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
-                logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                log_hicache_event(
+                    event="backup",
+                    tier="l2_to_l3",
+                    result="failed",
+                    reason="error",
+                    tokens=len(operation.token_ids),
+                    extra=f"Write page to storage: {len(batch_hashes)} pages failed.",
                 )
                 break
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+
+    def _safe_page_backup(self, operation) -> None:
+        # _page_backup runs L2->L3 I/O and may raise (storage backend error,
+        # a bad batch). The backup loop must not die on one failing op -- a
+        # dead thread would silently stall every future L2->L3 backup, so
+        # swallow, log, and let the loop ack and continue.
+        try:
+            self._page_backup(operation)
+        except Exception as e:
+            log_hicache_event(
+                event="backup",
+                tier="l2_to_l3",
+                result="failed",
+                reason="error",
+                tokens=len(operation.token_ids),
+                extra=f"op_id={operation.id} {e!r}",
+            )
 
     def backup_thread_func(self):
         """
@@ -1278,7 +1301,7 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    self._safe_page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

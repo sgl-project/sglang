@@ -23,10 +23,12 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
     hash_str_to_int64,
+    log_hicache_event,
     maybe_init_custom_mem_pool,
     split_node_hash_value,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -473,6 +475,67 @@ class TestSplitNodeHashValue(unittest.TestCase):
                     len(hash_values),
                     f"split_len={split_len}, page_size={page_size}",
                 )
+
+
+class TestLogHiCacheEvent(CustomTestCase):
+    """Pin the `[HICACHE]` log line contract consumed by downstream stats/alert
+    scripts: the prefix, every field name + value, INFO level, the one-decimal
+    `duration_ms` format, and that default args still emit a parseable line.
+
+    These are cross-component contracts (external dashboards parse the line),
+    not internal logic -- a refactor renaming a field or changing the number
+    format silently breaks parsing with no other test to catch it.
+    """
+
+    _LOGGER = "sglang.srt.mem_cache.utils"
+
+    def _capture(self, *args, **kwargs) -> str:
+        with self.assertLogs(self._LOGGER, level="INFO") as cm:
+            log_hicache_event(*args, **kwargs)
+        self.assertEqual(len(cm.records), 1)
+        return cm.records[0].getMessage()
+
+    def test_full_event_message_contract(self):
+        msg = self._capture(
+            event="backup",
+            tier="l1_to_l2",
+            result="failed",
+            reason="capacity",
+            rid="req-1",
+            node_id=42,
+            tokens=1024,
+            duration_ms=12.5,
+            extra="op_id=7",
+        )
+        self.assertTrue(msg.startswith("[HICACHE]"))
+        self.assertIn("rid=req-1", msg)
+        self.assertIn("event=backup", msg)
+        self.assertIn("tier=l1_to_l2", msg)
+        self.assertIn("node=42", msg)
+        self.assertIn("tokens=1024", msg)
+        self.assertIn("result=failed", msg)
+        self.assertIn("reason=capacity", msg)
+        self.assertIn("duration_ms=12.5", msg)
+        self.assertIn("op_id=7", msg)
+
+    def test_default_args_emit_parseable_line(self):
+        msg = self._capture(event="prefetch", tier="l3_to_l2", result="success")
+        self.assertTrue(msg.startswith("[HICACHE]"))
+        self.assertIn("rid=", msg)
+        self.assertIn("node=0", msg)
+        self.assertIn("tokens=0", msg)
+        self.assertIn("reason=", msg)
+        self.assertIn("duration_ms=0.0", msg)
+
+    def test_duration_ms_fixed_one_decimal(self):
+        msg = self._capture(
+            event="backup",
+            tier="l2_to_l3",
+            result="failed",
+            duration_ms=3.14159,
+        )
+        self.assertIn("duration_ms=3.1", msg)
+        self.assertNotIn("duration_ms=3.14", msg)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import hashlib
+import logging
 from typing import Any, Callable, List, Optional, Tuple
 
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -52,6 +53,8 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
+
+logger = logging.getLogger(__name__)
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "lru": LRUStrategy,
@@ -209,3 +212,22 @@ def split_node_hash_value(
     child_hash = child_hash_value[split_pages:]
 
     return new_node_hash, child_hash
+
+
+def log_hicache_event(
+    event: str,
+    tier: str,  # "l1_to_l2" | "l2_to_l3" | "l3_to_l2" | "l2_to_l1"
+    result: str,  # "success" | "failed" | "partial"
+    reason: str = "",  # "capacity" | "error"
+    rid: str = "",
+    node_id: int = 0,
+    tokens: int = 0,
+    duration_ms: float = 0.0,
+    extra: str = "",
+):
+    logger.info(
+        f"[HICACHE] rid={rid} event={event} tier={tier} node={node_id} "
+        f"tokens={tokens} result={result} reason={reason} "
+        f"duration_ms={duration_ms:.1f} {extra}",
+        stacklevel=2,
+    )
