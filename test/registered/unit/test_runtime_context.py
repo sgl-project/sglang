@@ -19,11 +19,15 @@ from sglang.srt.runtime_context import (
     ParallelContext,
     RuntimeContext,
     _FlagGroupBase,
+    assert_published,
     get_context,
+    get_exec,
     get_flags,
     get_parallel,
     get_server_args,
     max_speculative_num_draft_tokens,
+    publish,
+    publish_role,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
@@ -213,8 +217,8 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
     """V2b: the context owns the slot; the legacy getters are identity shims."""
 
     def test_legacy_setter_publishes_into_context(self):
-        # Identity (not equality) is the contract; publish accepts any object.
-        sentinel = object()
+        # Identity, not equality: the slot holds the very object published.
+        sentinel = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(sentinel)
         self.assertIs(server_args_module.get_global_server_args(), sentinel)
         self.assertIs(get_server_args(), sentinel)
@@ -236,16 +240,118 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
             self.assertEqual(str(cm.exception), "Global server args is not set yet!")
 
     def test_republish_overwrite_allowed(self):
-        first, second = object(), object()
+        first = ServerArgs(model_path="dummy")
+        second = ServerArgs(model_path="dummy")
         server_args_module.set_global_server_args_for_scheduler(first)
         server_args_module.set_global_server_args_for_scheduler(second)
         self.assertIs(get_server_args(), second)
 
     def test_reset_context_clears_owned_store(self):
-        server_args_module.set_global_server_args_for_scheduler(object())
+        server_args_module.set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy")
+        )
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestAssertPublished(_IsolatedServerArgs):
+    """Publishing is the process entry's job; the constructors only check.
+
+    `ModelRunner`, `TokenizerManager` and `MMEncoder` assert. A publish inside
+    a process that has already published re-projects the bags, discarding every
+    `override()` taken since and the provenance log with it, so a constructor
+    that finds nothing published fails loud.
+    """
+
+    def _record(self, **fields):
+        return ServerArgs(model_path="dummy", **fields)
+
+    def test_the_check_leaves_a_live_process_alone(self):
+        record = self._record(grammar_backend="xgrammar")
+        publish(record, role="scheduler")
+        get_context().override("grammar.import_fallback", grammar_backend="none")
+
+        assert_published(record, role="scheduler")
+
+        self.assertEqual(
+            get_exec().kernel.grammar_backend,
+            "none",
+            "the check re-projected the bags, so the import fallback was "
+            "discarded and the process reports a backend it is not using",
+        )
+        self.assertEqual(
+            len(get_context().overrides_log()),
+            1,
+            "the provenance of the override went with it",
+        )
+
+    def test_a_different_record_fails(self):
+        first = self._record(grammar_backend="xgrammar")
+        publish(first, role="scheduler")
+        second = self._record(grammar_backend="llguidance")
+
+        with self.assertRaisesRegex(RuntimeError, "a different record is published"):
+            assert_published(second, role="scheduler")
+
+        self.assertIs(
+            get_server_args(),
+            first,
+            "the failing check published anyway",
+        )
+
+    def test_an_empty_slot_fails(self):
+        """An empty slot fails."""
+        reset_context()
+        record = self._record(grammar_backend="xgrammar")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "nothing is published in this process"
+        ):
+            assert_published(record, role="scheduler")
+
+    def test_the_same_record_under_a_different_role_fails(self):
+        """The role decides which namespaces this process may read."""
+        record = self._record()
+        publish(record, role="tokenizer")
+
+        with self.assertRaisesRegex(RuntimeError, "published under role 'tokenizer'"):
+            assert_published(record, role="scheduler")
+
+        self.assertEqual(publish_role(), "tokenizer")
+
+    def test_no_constructor_publishes_outside_the_two_entries(self):
+        """Publishing from an `__init__` is an entry's job or a bug.
+
+        It is right when the constructor *is* the entry -- an `Engine` being
+        (re)built, the Ray actor that stands in for `run_scheduler_process`,
+        where resetting the bags is the point. It is wrong anywhere else,
+        because the process is already live with a record and re-projecting
+        drops its overrides. The census is pinned, so a new constructor publish
+        fails here until it is one of the two.
+
+        Both the publisher set and "which `__init__` reaches one" come from
+        `sglang.test.config_publishers`, which derives them from the code --
+        a hand-written spelling list here missed a constructor that publishes
+        one hop away through a helper. The derivation follows helpers defined
+        in the same module; a constructor that publishes through a helper in
+        *another* module is not seen, which is the one hole left here.
+        """
+        import pathlib
+
+        import sglang
+        from sglang.test.config_publishers import constructor_publishers
+
+        srt = pathlib.Path(sglang.__file__).resolve().parent / "srt"
+        self.assertEqual(
+            constructor_publishers(srt),
+            {
+                ("entrypoints/engine.py", "Engine", "publish"),
+                ("ray/scheduler_actor.py", "SchedulerActor", "publish"),
+            },
+            "a constructor publishes and it is not one of the two entries; "
+            "publish at the process entry and let the constructor assert",
+        )
 
 
 class TestServerArgsScopedOverride(_IsolatedServerArgs):
@@ -413,8 +519,6 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
     swap under the speculative contexts and restore on exit."""
 
     def _init(self, **kw):
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.utils import initialize_moe_config
 
         defaults = dict(
@@ -432,7 +536,12 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
             disable_shared_experts_fusion=False,
         )
         defaults.update(kw)
-        initialize_moe_config(SimpleNamespace(**defaults))
+        # The flags are seeded from the bags, so the test publishes a config
+        # carrying these values.
+        override = get_context().override_server_args(**defaults)
+        override.install()
+        self.addCleanup(override.restore)
+        initialize_moe_config()
 
     def test_lazy_defaults_before_initialize(self):
         from sglang.srt.layers.moe.utils import (
@@ -787,12 +896,11 @@ class TestForwardFlags(_IsolatedServerArgs):
         self.assertEqual(probe(torch.zeros(())).item(), 0)
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
-        # Regression: parallel config leaves resolve through
-        # ``ParallelContext.__getattr__`` (the bag fallback), and gate helpers
-        # such as ``enable_moe_dense_fully_dp()`` read them inside compiled
-        # model forwards — the fallback body must stay dynamo-traceable
-        # (``object.__getattribute__`` graph-breaks). fullgraph=True turns any
-        # graph break back into a failure.
+        # Regression: gate helpers such as ``enable_moe_dense_fully_dp()`` read
+        # parallel config leaves inside compiled model forwards through the
+        # `config` property, which must stay dynamo-traceable
+        # (``object.__getattribute__`` graph-breaks).
+        # fullgraph=True turns any graph break back into a failure.
         import torch
 
         from sglang.srt.runtime_context import get_parallel
@@ -803,11 +911,11 @@ class TestForwardFlags(_IsolatedServerArgs):
             @torch.compile(fullgraph=True, backend="eager", dynamic=False)
             def probe(x):
                 par = get_parallel()
-                if par.enable_prefill_context_parallel:
+                if par.config.enable_prefill_context_parallel:
                     x = x + 1
-                if par.moe_dense_tp_size == 1:
+                if par.config.moe_dense_tp_size == 1:
                     x = x + 2
-                if par.dwdp_size > 1:
+                if par.config.dwdp_size > 1:
                     x = x + 4
                 return x
 
