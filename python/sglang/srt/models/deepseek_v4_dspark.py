@@ -52,6 +52,7 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -487,13 +488,15 @@ class DSparkV4MarkovHead(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            collect_corrected=collect_corrected,
         )
 
 
@@ -691,6 +694,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.gamma = int(
             dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
         )
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)
