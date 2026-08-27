@@ -100,7 +100,6 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
-    is_host_cpu_arm64,
     is_mnnvl_fabric_device,
     is_mps,
     is_musa,
@@ -4492,31 +4491,14 @@ class ServerArgs:
         handle_modelscope_paths(self)
 
     def _handle_hpu_backends(self):
-        cfg = resolving_view(self)
-        if cfg.device == "hpu":
-            self._declare(
-                "_handle_hpu_backends",
-                attention_backend="torch_native",
-            )
-            self._declare(
-                "_handle_hpu_backends",
-                sampling_backend="pytorch",
-            )
+        from sglang.srt.arg_groups.platform_hook import handle_hpu_backends
+
+        handle_hpu_backends(self)
 
     def _handle_cpu_backends(self):
-        cfg = resolving_view(self)
-        if cfg.device == "cpu":
-            if cfg.attention_backend is None:
-                self._declare(
-                    "_handle_cpu_backends",
-                    attention_backend=(
-                        "torch_native" if is_host_cpu_arm64() else "intel_amx"
-                    ),
-                )
-            self._declare(
-                "_handle_cpu_backends",
-                sampling_backend="pytorch",
-            )
+        from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
+
+        handle_cpu_backends(self)
 
     def _handle_hardware_runtime_validation(self):
         # This is intentionally independent of self.device: setting
@@ -4536,33 +4518,9 @@ class ServerArgs:
         handle_mps_backends(self)
 
     def _handle_xpu_backends(self):
-        cfg = resolving_view(self)
-        if cfg.device == "xpu":
-            # Decode graph is opt-in on XPU: unless the user explicitly set
-            # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
-            # disabled so the default startup doesn't require graph capture.
-            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                self._declare(
-                    "_handle_xpu_backends",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-                    ),
-                )
-            elif cfg.cuda_graph_config.decode.backend not in (
-                Backend.DISABLED,
-                Backend.FULL,
-            ):
-                logger.warning(
-                    "XPU platform only supports decode backend 'full'; "
-                    "disabling unsupported decode backend '%s'.",
-                    cfg.cuda_graph_config.decode.backend,
-                )
-                self._declare(
-                    "_handle_xpu_backends",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-                    ),
-                )
+        from sglang.srt.arg_groups.platform_hook import handle_xpu_backends
+
+        handle_xpu_backends(self)
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -5910,71 +5868,9 @@ class ServerArgs:
         handle_linear_attn_backend(self)
 
     def _handle_legacy_cp_arguments(self):
-        cfg = resolving_view(self)
-        legacy_mode_to_strategy = {
-            "in-seq-split": "zigzag",
-            "round-robin-split": "interleave",
-        }
-        strategy_to_legacy_mode = {
-            "zigzag": "in-seq-split",
-            "interleave": "round-robin-split",
-        }
+        from sglang.srt.arg_groups.parallel_hook import handle_legacy_cp_arguments
 
-        if (
-            cfg.enable_prefill_context_parallel
-            or cfg.enable_dsa_prefill_context_parallel
-        ):
-            self._declare(
-                "_handle_legacy_cp_arguments",
-                enable_prefill_cp=True,
-            )
-
-        if cfg.enable_prefill_context_parallel and cfg.cp_strategy is None:
-            self._declare(
-                "_handle_legacy_cp_arguments",
-                cp_strategy=legacy_mode_to_strategy[cfg.prefill_cp_mode],
-            )
-        if cfg.enable_dsa_prefill_context_parallel and cfg.cp_strategy is None:
-            self._declare(
-                "_handle_legacy_cp_arguments",
-                cp_strategy=legacy_mode_to_strategy[cfg.dsa_prefill_cp_mode],
-            )
-
-        if (
-            cfg.enable_prefill_context_parallel
-            and cfg.enable_dsa_prefill_context_parallel
-        ):
-            return
-
-        if not cfg.enable_prefill_cp or cfg.cp_strategy is None:
-            return
-
-        mode = strategy_to_legacy_mode[cfg.cp_strategy]
-        use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
-            self._resolved(), "attention_backend", None
-        ) in ("dsa", "dsv4")
-        if use_dsa_legacy_aliases:
-            self._declare(
-                "_handle_legacy_cp_arguments",
-                enable_dsa_prefill_context_parallel=True,
-            )
-            self._declare(
-                "_handle_legacy_cp_arguments",
-                enable_prefill_context_parallel=False,
-            )
-        else:
-            self._declare(
-                "_handle_legacy_cp_arguments",
-                enable_prefill_context_parallel=True,
-            )
-        self._declare(
-            "_handle_legacy_cp_arguments",
-            dsa_prefill_cp_mode=mode,
-        )
-        self._declare(
-            "_handle_legacy_cp_arguments",
-            prefill_cp_mode=mode,
-        )
+        handle_legacy_cp_arguments(self)
 
     def _handle_context_parallelism(self):
         from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
@@ -5982,163 +5878,14 @@ class ServerArgs:
         handle_context_parallelism(self)
 
     def _handle_dwdp(self):
-        cfg = resolving_view(self)
-        if cfg.dwdp_size <= 1:
-            return
+        from sglang.srt.arg_groups.parallel_hook import handle_dwdp
 
-        assert (
-            cfg.dwdp_size >= 2
-        ), f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
-        assert (
-            cfg.dwdp_size == cfg.tp_size
-        ), f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
-        assert cfg.disaggregation_mode in (
-            "null",
-            "prefill",
-        ), "DWDP requires --disaggregation-mode null or prefill"
-        assert (
-            not cfg.enable_eplb
-        ), "EPLB dynamic migration conflicts with static DWDP partitioning"
-        assert (
-            cfg.speculative_algorithm is None
-        ), "DWDP does not support speculative decoding (MTP/draft workers)"
-        assert cfg.pp_size == 1, "DWDP requires pp_size == 1"
-        assert (
-            not cfg.enable_two_batch_overlap
-        ), "DWDP's prefetch event protocol does not support two-batch overlap"
-
-        if cfg.disaggregation_mode == "null":
-            logger.warning(
-                "DWDP with --disaggregation-mode null: decode steps re-fetch all "
-                "remote expert weights every step, which is slow. DWDP is "
-                "recommended only with --disaggregation-mode prefill."
-            )
-
-        self._declare(
-            "_handle_dwdp",
-            dp_size=cfg.dwdp_size,
-        )
-        self._declare(
-            "_handle_dwdp",
-            enable_dp_attention=True,
-        )
-        self._declare("_handle_dwdp", enable_dp_attention_local_control_broadcast=True)
-        self._declare(
-            "_handle_dwdp",
-            enable_dp_lm_head=True,
-        )
-        self._declare(
-            "_handle_dwdp",
-            moe_dense_tp_size=1,
-        )
-        self._declare(
-            "_handle_dwdp",
-            ep_size=cfg.dwdp_size,
-        )
-        self._declare(
-            "_handle_dwdp",
-            moe_dp_size=1,
-        )
-        self._declare(
-            "_handle_dwdp",
-            moe_a2a_backend="none",
-        )
-
-        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
-
-        self._declare(
-            "_handle_dwdp",
-            disable_cuda_graph=True,
-        )
-
-        logger.info(
-            f"DWDP enabled: dwdp_size={cfg.dwdp_size}, "
-            f"auto-forced dp_size={cfg.dp_size}, ep_size={cfg.dwdp_size}, "
-            f"moe_dense_tp_size=1, moe_a2a_backend=none, "
-            f"dp_attention_local_control_broadcast=True, "
-            f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
-            f"disable_cuda_graph=True"
-        )
+        handle_dwdp(self)
 
     def _handle_data_parallelism(self):
-        # The dp_size==1 resets moved to the resolution pipeline
-        # (arg_groups/overrides.py: _data_parallelism_defaults).
-        cfg = resolving_view(self)
-        from sglang.srt.arg_groups.overrides import (
-            _data_parallelism_defaults,
-            run_post_process_pass,
-        )
+        from sglang.srt.arg_groups.parallel_hook import handle_data_parallelism
 
-        run_post_process_pass(self, _data_parallelism_defaults)
-
-        if cfg.mm_enable_dp_encoder:
-            if cfg.tp_size == 1:
-                logger.warning(
-                    "--mm-enable-dp-encoder is enabled with TP=1, so the encoder "
-                    "has no data-parallel work to distribute. Disable it unless "
-                    "you need to validate this configuration."
-                )
-            else:
-                logger.info(
-                    "--mm-enable-dp-encoder is enabled across TP=%d. It replicates "
-                    "the vision encoder and distributes image work across ranks; "
-                    "this is most useful when high-resolution or multi-image ViT "
-                    "prefill is a material part of TTFT. Measure against the default "
-                    "for small-image workloads because replication and aggregation "
-                    "can increase memory use and overhead.",
-                    cfg.tp_size,
-                )
-
-        if self._resolved().enable_dp_attention:
-            self._declare(
-                "_handle_data_parallelism",
-                schedule_conservativeness=cfg.schedule_conservativeness * 0.3,
-            )
-            assert cfg.tp_size % cfg.dp_size == 0
-            original_chunked_prefill_size = cfg.chunked_prefill_size
-            self._declare(
-                "_handle_data_parallelism",
-                chunked_prefill_size=cfg.chunked_prefill_size // cfg.dp_size,
-            )
-            logger.warning(
-                f"DP attention is enabled. chunked prefill size is adjusted "
-                f"from {original_chunked_prefill_size} to {cfg.chunked_prefill_size}."
-            )
-
-            # The prefill CUDA graph max_bs was derived from the pre-DP-division
-            # chunked_prefill_size in _handle_gpu_memory_settings (which runs
-            # before this handler). Re-clamp it (and the captured shape list) to
-            # the per-DP-rank chunked_prefill_size so breakable CUDA graph
-            # capture never exceeds the MoE all-to-all's max_num_tokens budget,
-            # which is also sized from the DP-adjusted chunked_prefill_size.
-            prefill_cfg = cfg.cuda_graph_config.prefill
-            if (
-                prefill_cfg.backend != Backend.DISABLED
-                and prefill_cfg.max_bs is not None
-                and prefill_cfg.max_bs > cfg.chunked_prefill_size
-                and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
-            ):
-                clamped = {"max_bs": cfg.chunked_prefill_size}
-                if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
-                    clamped["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
-                        clamped["max_bs"]
-                    )
-                self._declare(
-                    "_handle_data_parallelism",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.PREFILL, **clamped
-                    ),
-                )
-
-        # Resolve the phase-aware TP LM-head default before validating the
-        # resulting DP/TP LM-head configuration.
-        from sglang.srt.arg_groups.overrides import (
-            _dp_lm_head_validation,
-            _tp_lm_head_all_to_all_default,
-        )
-
-        run_post_process_pass(self, _tp_lm_head_all_to_all_default)
-        run_post_process_pass(self, _dp_lm_head_validation)
+        handle_data_parallelism(self)
 
     def _handle_moe_kernel_config(self):
         from sglang.srt.arg_groups.moe_hook import handle_moe_kernel_config
@@ -6313,220 +6060,9 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
-        # The backend overrides and the ep_size=tp_size adjustments moved to
-        # the resolution pipeline (arg_groups/overrides.py:
-        # _a2a_backend_overrides / _a2a_ep_size); the per-backend logs,
-        # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
-        cfg = resolving_view(self)
-        from sglang.srt.arg_groups.overrides import (
-            _a2a_backend_overrides,
-            _a2a_ep_size,
-            _a2a_fusion_adjustments,
-            run_post_process_pass,
-        )
+        from sglang.srt.arg_groups.moe_hook import handle_a2a_moe
 
-        run_post_process_pass(self, _a2a_backend_overrides)
-        run_post_process_pass(self, _a2a_ep_size)
-
-        # The a2a-driven shared-experts fusion adjustments moved to the
-        # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
-        # invoked here at the legacy write slots.
-        run_post_process_pass(self, _a2a_fusion_adjustments)
-
-        a2a_backend = resolved_view(self).moe_a2a_backend
-        if cfg.enable_waterfill:
-            self._declare("_handle_a2a_moe", enforce_shared_experts_fusion=True)
-            logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
-
-        if a2a_backend == "deepep":
-            if cfg.moe_runner_backend == "flashinfer_cutedsl":
-                if cfg.deepep_mode == "auto":
-                    self._declare(
-                        "_handle_a2a_moe",
-                        deepep_mode="low_latency",
-                    )
-                    logger.warning(
-                        "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
-                        "FP4 MoE has no DeepEP normal-dispatch handler, so "
-                        "deepep auto mode would crash during prefill. "
-                        "low_latency covers both prefill and decode."
-                    )
-                elif cfg.deepep_mode == "normal":
-                    raise ValueError(
-                        "flashinfer_cutedsl FP4 MoE only supports DeepEP "
-                        "low_latency dispatch (masked layout). DeepEP normal "
-                        "(prefill) dispatch has no CuteDSL FP4 handler. Pass "
-                        "--deepep-mode low_latency or auto."
-                    )
-            if cfg.deepep_mode == "normal":
-                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self._declare(
-                    "_handle_a2a_moe",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-                    ),
-                )
-                self._declare(
-                    "_handle_a2a_moe",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-                    ),
-                )
-
-        if a2a_backend == "deepep_v2":
-            self._validate_deepep_v2_model_architecture()
-            if resolved_view(self).enable_deterministic_inference:
-                raise ValueError(
-                    "DeepEP v2 does not forward deterministic=True to "
-                    "ElasticBuffer, so deterministic sorting remains disabled. "
-                    "Disable --enable-deterministic-inference or use "
-                    "--moe-a2a-backend deepep."
-                )
-            # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
-            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
-            # Respect model-level runner declarations before resolving auto.
-            resolved_runner = resolved_view(self).moe_runner_backend
-            if resolved_runner == "auto":
-                self._declare("_handle_a2a_moe", moe_runner_backend="deep_gemm")
-                logger.warning(
-                    "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
-                )
-            elif resolved_runner != "deep_gemm":
-                raise ValueError(
-                    "DeepEP v2 MoE currently supports only "
-                    f"--moe-runner-backend deep_gemm. Got {resolved_runner!r}. "
-                    "Add a runner adapter before enabling DeepEP v2 with other "
-                    "MoE runners."
-                )
-            if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
-                raise ValueError(
-                    "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
-                    "Disable --enable-two-batch-overlap and "
-                    "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
-                )
-            if cfg.enforce_shared_experts_fusion:
-                raise ValueError(
-                    "DeepEP v2 MoE has not validated fused shared experts yet. "
-                    "Remove --enforce-shared-experts-fusion when using "
-                    "--moe-a2a-backend deepep_v2."
-                )
-            # Prefill reads host counts and is not graph-capturable.
-            self._declare(
-                "_handle_a2a_moe",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-                ),
-            )
-            logger.warning(
-                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
-            )
-            logger.warning(
-                "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
-                "ElasticBuffer direct/hybrid mode and is independent from "
-                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
-                "decode CUDA graph on the masked decode path (any comm mode) "
-                "and disables shared expert fusion. "
-                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
-                "per-rank communication buffer capacity, not a model limit; "
-                "increase it for large prefill/chunked-prefill workloads.",
-                cfg.deepep_v2_mode,
-            )
-
-        # The resolving view, not the field: `_a2a_backend_overrides` may have
-        # moved this already (waterfill forces `deepep`).
-        a2a_now = resolved_view(self).moe_a2a_backend
-        if (a2a_now == "none" and is_npu()) or a2a_now == "ascend_tp":
-            # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
-            self._declare(
-                "_handle_a2a_moe",
-                moe_a2a_backend="none",
-            )
-
-        if cfg.moe_a2a_backend == "flashinfer":
-            assert (
-                resolved_view(self).enable_dp_attention and cfg.dp_size == cfg.tp_size
-            ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
-            if cfg.deepep_mode != "auto":
-                logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-                resolved_view(self).quantization == "modelopt_fp4"
-                or self.get_model_config().nvfp4_moe_meta is not None
-            ):
-                envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
-                logger.warning(
-                    "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
-                )
-            assert resolved_view(self).moe_runner_backend in [
-                "flashinfer_cutlass",
-                "flashinfer_cutedsl",
-                "flashinfer_trtllm_routed",
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
-
-        if a2a_backend == "mori":
-            if cfg.deepep_mode == "auto":
-                self._declare(
-                    "_handle_a2a_moe",
-                    deepep_mode="normal",
-                )
-                logger.warning("auto set deepep_mode=`normal` for MORI EP")
-
-            # Check chunked prefill for mori
-            # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-            # Skip validation if disaggregation mode is decode.
-            if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
-                assert (
-                    self._required_mori_dispatch_tokens_per_rank()
-                ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
-                    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
-                    "must be >= the per-rank MoRI dispatch tokens "
-                    "(chunked_prefill_size by default)"
-                )
-
-        if a2a_backend == "pplx":
-            if cfg.deepep_mode == "normal":
-                raise ValueError(
-                    "moe_a2a_backend='pplx' only supports low-latency mode; "
-                    "set --deepep-mode to 'low_latency' or 'auto'."
-                )
-            if cfg.deepep_mode == "auto":
-                self._declare(
-                    "_handle_a2a_moe",
-                    deepep_mode="low_latency",
-                )
-                logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
-            # pplx-kernels' AllToAll needs numDPGroups (== attention dp_size) > 1;
-            # without DP attention numDPGroups == 1 and construction fails deep in
-            # the kernel. This also implies ep_size >= 2.
-            assert resolved_view(self).enable_dp_attention and cfg.dp_size >= 2, (
-                "moe_a2a_backend='pplx' requires --enable-dp-attention with at "
-                "least 2 DP groups (--dp-size >= 2)."
-            )
-            # pplx runs the masked DeepGEMM expert path (sm_90a): reject other
-            # runners and resolve auto -> deep_gemm. Unquantized bf16 pplx needs
-            # an explicit deep_gemm backend, otherwise the expert layer falls
-            # through to the deprecated masked path and asserts at runtime.
-            assert resolved_view(self).moe_runner_backend in ("deep_gemm", "auto"), (
-                "moe_a2a_backend='pplx' is only supported with --moe-runner-backend "
-                "deep_gemm (or auto)."
-            )
-            if cfg.moe_runner_backend == "auto":
-                self._declare(
-                    "_handle_a2a_moe",
-                    moe_runner_backend="deep_gemm",
-                )
-                logger.warning("auto set moe_runner_backend=`deep_gemm` for PPLX EP")
-
-            # Check per-rank dispatch tokens for pplx
-            # Skip validation if chunked prefill is disabled (i.e., size <= 0)
-            # Skip validation if disaggregation mode is decode
-            if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
-                assert (
-                    self._required_pplx_dispatch_tokens_per_rank()
-                ) <= envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
-                    "SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 128) "
-                    "must be >= the per-rank pplx dispatch tokens "
-                    "(chunked_prefill_size, or the decode cuda-graph batch size)"
-                )
+        handle_a2a_moe(self)
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
@@ -6542,227 +6078,14 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
-        cfg = resolving_view(self)
-        if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
-            self._declare(
-                "_handle_eplb_and_dispatch",
-                expert_distribution_recorder_mode="stat",
-            )
-            logger.warning(
-                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
-            )
+        from sglang.srt.arg_groups.parallel_hook import handle_eplb_and_dispatch
 
-        # Without an a2a backend all EP ranks run the MoE over the same tokens and
-        # sum their partial outputs, so the pick has to agree across ranks.
-        needs_rank_invariant_dispatch = self._resolved().moe_a2a_backend == "none"
-
-        if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
-            cfg.ep_dispatch_algorithm is None
-        ):
-            self._declare(
-                "_handle_eplb_and_dispatch",
-                ep_dispatch_algorithm=(
-                    "dynamic" if needs_rank_invariant_dispatch else "static"
-                ),
-            )
-
-        # `dynamic` / `fake` switch to the row-index pick; `static` reads a
-        # per-rank table and `lp` samples inside its kernel.
-        if needs_rank_invariant_dispatch and cfg.ep_dispatch_algorithm in (
-            "static",
-            "lp",
-        ):
-            raise ValueError(
-                f"--ep-dispatch-algorithm {cfg.ep_dispatch_algorithm} picks a "
-                "different physical replica per rank, which only holds up when an "
-                "a2a backend routes each token to a single rank. Use "
-                "--ep-dispatch-algorithm dynamic with --moe-a2a-backend none."
-            )
-
-        if cfg.enable_eplb and cfg.ep_join_mode != "scale":
-            assert self._resolved().ep_size > 1
+        handle_eplb_and_dispatch(self)
 
     def _handle_elastic_ep(self):
-        cfg = resolving_view(self)
-        if cfg.elastic_ep_rejoin:
-            if cfg.ep_join_mode is None:
-                logger.warning(
-                    "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-                )
-                self._declare(
-                    "_handle_elastic_ep",
-                    ep_join_mode="recover",
-                )
-            else:
-                assert cfg.ep_join_mode == "recover", (
-                    "--elastic-ep-rejoin (deprecated) conflicts with "
-                    f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-                )
-        if cfg.elastic_ep_backend is not None:
-            if cfg.enable_eplb:
-                if cfg.eplb_algorithm == "auto":
-                    self._declare(
-                        "_handle_elastic_ep",
-                        eplb_algorithm="elasticity_aware",
-                    )
-                assert cfg.eplb_algorithm in [
-                    "elasticity_aware",
-                    "elasticity_aware_hierarchical",
-                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+        from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
 
-            assert cfg.pp_size == 1, "PP size should be set to 1 under elastic EP"
-
-            if cfg.elastic_ep_backend == "mooncake":
-                self._declare(
-                    "_handle_elastic_ep",
-                    mooncake_ib_device=self._validate_ib_devices(
-                        cfg.mooncake_ib_device
-                    ),
-                )
-        if cfg.ep_join_mode is not None:
-            assert (
-                cfg.elastic_ep_backend is not None
-            ), "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
-            if cfg.ep_join_mode == "scale":
-                assert cfg.node_rank == 1, (
-                    "Elastic EP scale-up requires one joining TP group at "
-                    f"--node-rank 1 (got {cfg.node_rank})."
-                )
-                assert cfg.ep_join_rank_offset > 0, (
-                    "Elastic EP scale joiners require "
-                    "--elastic-ep-join-rank-offset set to the current "
-                    "effective EP size."
-                )
-        if cfg.ep_join_rank_offset != 0:
-            assert cfg.ep_join_mode == "scale", (
-                "--elastic-ep-join-rank-offset is only valid with "
-                "--elastic-ep-join-mode scale."
-            )
-            assert (
-                cfg.ep_join_rank_offset >= 0
-            ), "elastic EP join rank offset must be >= 0."
-        if cfg.max_ep_size is not None:
-            assert (
-                cfg.elastic_ep_backend is not None
-            ), "--max-ep-size requires --elastic-ep-backend to be set."
-            assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
-
-        scaling_active = (
-            cfg.elastic_ep_backend is not None
-            and cfg.max_ep_size is not None
-            and cfg.max_ep_size > cfg.tp_size
-        )
-        if cfg.elastic_ep_initial_size is not None:
-            assert scaling_active, (
-                "--elastic-ep-initial-size is only valid for an Elastic EP "
-                "deployment with --max-ep-size larger than its local TP size."
-            )
-        if scaling_active:
-            resolved = self._resolved()
-            assert (
-                cfg.elastic_ep_scale_timeout > 0
-            ), "--elastic-ep-scale-timeout must be greater than zero."
-            assert cfg.tokenizer_worker_num == 1, (
-                "Elastic EP runtime scale-up currently requires "
-                "--tokenizer-worker-num 1."
-            )
-            assert (
-                not cfg.use_ray
-            ), "Elastic EP runtime scale-up does not support --use-ray."
-            assert not cfg.enable_elastic_expert_backup, (
-                "Elastic EP runtime scale-up does not support "
-                "--enable-elastic-expert-backup."
-            )
-            self._declare(
-                "_handle_elastic_ep",
-                enable_dp_attention_local_control_broadcast=True,
-            )
-            if cfg.ep_join_mode == "scale":
-                assert cfg.elastic_ep_initial_size is not None, (
-                    "Elastic EP scale joiners require --elastic-ep-initial-size "
-                    "set to the primary deployment's launch-time EP size."
-                )
-                assert cfg.elastic_ep_initial_size <= cfg.ep_join_rank_offset, (
-                    "--elastic-ep-initial-size cannot exceed the current EP size "
-                    f"(initial={cfg.elastic_ep_initial_size}, "
-                    f"current={cfg.ep_join_rank_offset})."
-                )
-                join_target = cfg.ep_join_rank_offset + cfg.tp_size
-                assert join_target <= cfg.max_ep_size, (
-                    "Elastic EP joining group exceeds --max-ep-size "
-                    f"(join_target={join_target}, max_ep_size={cfg.max_ep_size})."
-                )
-                if cfg.tp_size == 1:
-                    assert cfg.moe_dense_tp_size == 1, (
-                        "A single-rank Elastic EP joining group requires "
-                        "--moe-dense-tp-size 1."
-                    )
-            else:
-                if cfg.elastic_ep_initial_size is None:
-                    self._declare(
-                        "_handle_elastic_ep",
-                        elastic_ep_initial_size=cfg.tp_size,
-                    )
-                assert cfg.elastic_ep_initial_size == cfg.tp_size, (
-                    "The primary --elastic-ep-initial-size must equal its "
-                    f"launch-time TP size ({cfg.tp_size})."
-                )
-            assert cfg.elastic_ep_initial_size > 0
-            assert cfg.load_balance_method == "round_robin", (
-                "Elastic EP scale-up requires --load-balance-method round_robin; "
-                "load-aware methods "
-                "require global-rank load snapshots after scale "
-                f"(got {cfg.load_balance_method})."
-            )
-            assert cfg.elastic_ep_backend == "mooncake", (
-                "Elastic EP runtime scale-up requires --elastic-ep-backend "
-                f"mooncake (got elastic_ep_backend={cfg.elastic_ep_backend})."
-            )
-            assert cfg.pp_size == 1, (
-                "Elastic EP scale-up requires --pp-size 1 "
-                f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
-            )
-
-            decode_cuda_graph_disabled = (
-                cfg.cuda_graph_config.decode.backend == Backend.DISABLED
-            )
-            prefill_cuda_graph_disabled = (
-                cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
-            )
-            assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-                "Elastic EP runtime scale-up requires decode and prefill CUDA "
-                "graphs to be disabled."
-            )
-            assert resolved.enable_dp_attention, (
-                "Elastic EP scale-up requires --enable-dp-attention; without it "
-                "the TP group is not equivalent to WORLD and the post-scale "
-                "collective path is invalid."
-            )
-            assert resolved.enable_dp_lm_head, (
-                "Elastic EP scale-up requires --enable-dp-lm-head so output "
-                "projection does not depend on the joining group's TP size."
-            )
-            assert resolved.attn_cp_size == 1, (
-                "Elastic EP scale-up requires --attn-cp-size 1 "
-                f"(got attn_cp_size={resolved.attn_cp_size})."
-            )
-            assert cfg.moe_dp_size == 1, (
-                "Elastic EP scale-up requires --moe-dp-size 1 "
-                f"(got moe_dp_size={cfg.moe_dp_size})."
-            )
-            assert resolved.ep_size == cfg.tp_size, (
-                "Elastic EP scale-up requires ep_size == tp_size "
-                f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); EP, TP "
-                "and the attention DP group must all coincide with WORLD."
-            )
-            assert cfg.dp_size == cfg.tp_size, (
-                "Elastic EP scale-up requires dp_size == tp_size "
-                f"(got dp_size={cfg.dp_size}, tp_size={cfg.tp_size})."
-            )
-            assert resolved.moe_a2a_backend == "nixl", (
-                "Elastic EP scale-up requires --moe-a2a-backend nixl "
-                f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
-            )
+        handle_elastic_ep(self)
 
     def _validate_experimental_sgl_marlin(self):
         view = self._resolved()
@@ -6778,33 +6101,11 @@ class ServerArgs:
         # ===== END TO BE REFACTORED ====
 
     def _handle_expert_distribution_metrics(self):
-        cfg = resolving_view(self)
-        if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-            raise ValueError(
-                "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-                "--expert-balancedness-report-mode with one of: off, server_log, "
-                "prometheus, both."
-            )
+        from sglang.srt.arg_groups.parallel_hook import (
+            handle_expert_distribution_metrics,
+        )
 
-        if self.should_report_expert_balancedness() and (
-            cfg.expert_distribution_recorder_mode is None
-        ):
-            self._declare(
-                "_handle_expert_distribution_metrics",
-                expert_distribution_recorder_mode="stat",
-            )
-
-        if cfg.expert_distribution_recorder_buffer_size is None:
-            if (x := cfg.eplb_rebalance_num_iterations) is not None:
-                self._declare(
-                    "_handle_expert_distribution_metrics",
-                    expert_distribution_recorder_buffer_size=x,
-                )
-            elif cfg.expert_distribution_recorder_mode is not None:
-                self._declare(
-                    "_handle_expert_distribution_metrics",
-                    expert_distribution_recorder_buffer_size=1000,
-                )
+        handle_expert_distribution_metrics(self)
 
     def _handle_pipeline_parallelism(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:

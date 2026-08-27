@@ -20,7 +20,7 @@ class TestServerArgsCPUBackend(unittest.TestCase):
         server_args.sampling_backend = None
         return server_args
 
-    @patch("sglang.srt.server_args.is_host_cpu_arm64", return_value=True)
+    @patch("sglang.srt.arg_groups.platform_hook.is_host_cpu_arm64", return_value=True)
     def test_arm_cpu_defaults_to_torch_native(self, _mock_is_arm64):
         server_args = self._make_server_args()
 
@@ -31,7 +31,7 @@ class TestServerArgsCPUBackend(unittest.TestCase):
         )
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
-    @patch("sglang.srt.server_args.is_host_cpu_arm64", return_value=False)
+    @patch("sglang.srt.arg_groups.platform_hook.is_host_cpu_arm64", return_value=False)
     def test_x86_cpu_defaults_to_intel_amx(self, _mock_is_arm64):
         server_args = self._make_server_args()
 
