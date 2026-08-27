@@ -320,6 +320,23 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
 
+    def free_kv_row(self, owner: Any, ranges: list[tuple[int, int]]) -> None:
+        """Give back the half-open row-position ranges of ``owner``'s kv row.
+
+        ``owner`` is whoever holds the row -- a ``Req`` or a session slot --
+        and only has to carry ``req_pool_idx`` and ``kv``. Ranges must be
+        ascending and disjoint; passing them in one call keeps a page two of
+        them share from going back to the pool twice.
+        """
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+
+        row = self.req_to_token_pool.req_to_token[owner.req_pool_idx]
+        free_kv_row_segments(
+            self.token_to_kv_pool_allocator,
+            [(row[start:end], start) for start, end in ranges],
+            swa_evicted_seqlen=owner.kv.swa_evicted_seqlen,
+        )
+
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass

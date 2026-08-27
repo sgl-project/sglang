@@ -461,13 +461,7 @@ class StreamingSession(BasePrefixCache):
             )
 
         if slot.is_holding_kv:
-            start = protected_len
-            end = slot.kv.kv_allocated_len
-            if start < end:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.req_pool_idx, start:end
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
+            self.free_kv_row(slot, [(protected_len, slot.kv.kv_allocated_len)])
             self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
@@ -561,7 +555,7 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
+        self._free_kv_aligned(slot, prefix_len, slot.kv.kv_allocated_len)
         slot.kv.kv_allocated_len = prefix_len
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
@@ -576,14 +570,14 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
+        self._free_kv_aligned(req, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
+    def _free_kv_aligned(self, owner: Any, target: int, end: int) -> None:
+        """Free owner's kv row over [ceil_align(target), end). Page-aligned
         because PagedTokenToKVPoolAllocator.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
         still holding committed tokens. The range [target, ceil_align(target))
@@ -594,9 +588,7 @@ class StreamingSession(BasePrefixCache):
         start = target
         if self.page_size > 1:
             start = ceil_align(start, self.page_size)
-        if start < end:
-            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
+        self.free_kv_row(owner, [(start, end)])
 
     # -- Pass-through methods --
 

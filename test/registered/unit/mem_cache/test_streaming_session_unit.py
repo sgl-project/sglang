@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -10,9 +11,26 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _FakeAllocator:
-    def __init__(self):
+class _FakeAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
+    def __init__(self, page_size: int = 1):
+        super().__init__(
+            size=1024,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         self.freed = []
+
+    def clear(self):
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
 
     def free(self, free_index: torch.Tensor):
         self.freed.append(free_index.clone())
@@ -96,7 +114,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
     req_to_token_pool = _FakeReqToTokenPool(req_to_token)
-    allocator = _FakeAllocator()
+    allocator = _FakeAllocator(page_size=16)
     inner = _FakeInnerCache(
         req_to_token_pool,
         allocator,
@@ -266,9 +284,9 @@ def test_trim_overshoot_postcondition():
     assert req.kv.kv_allocated_len == target
     assert req.kv.swa_evicted_seqlen == target
     assert len(req.output_ids) == 12
-    # Tail [38, 44) freed by _free_kv_aligned.
-    assert len(allocator.freed) == 1
-    assert allocator.freed[0].tolist() == list(range(38, 44))
+    # Tail [38, 44) freed by _free_kv_aligned, split at the pre-trim eviction
+    # floor 42: [38, 42) gave its SWA peers back already, so it goes back full-only.
+    assert [t.tolist() for t in allocator.freed] == [[38, 39, 40, 41], [42, 43]]
 
 
 if __name__ == "__main__":

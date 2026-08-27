@@ -106,6 +106,39 @@ def free_swa_out_of_window_slots(
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
+def free_kv_row_segments(
+    allocator: BaseTokenToKVPoolAllocator,
+    segments: list[tuple[torch.Tensor, int]],
+    *,
+    swa_evicted_seqlen: int,
+) -> None:
+    """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
+    request's kv row, split at the SWA eviction floor."""
+    dead: list[torch.Tensor] = []
+    alive: list[tuple[torch.Tensor, int]] = []
+    for kv_indices, start_pos in segments:
+        num_indices = kv_indices.numel()
+        if num_indices == 0:
+            continue
+        # Below the floor the SWA peers are already gone -- window eviction, or
+        # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
+        num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
+        if num_dead > 0:
+            dead.append(kv_indices[:num_dead])
+        if num_dead < num_indices:
+            alive.append((kv_indices[num_dead:], start_pos + num_dead))
+
+    # The floor is page-aligned, so no dead piece shares a page with an alive one.
+    if len(dead) == 1:
+        allocator.free_full(dead[0])
+    elif dead:
+        # Two dead pieces can share a boundary page, and only free_full's own
+        # page dedup covers that -- free_segments trims the alive side alone.
+        allocator.free_full(torch.cat(dead))
+    if alive:
+        allocator.free_segments(alive)
+
+
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
         return
@@ -263,12 +296,9 @@ def _release_overallocated_kv_indices(
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
-            start_p:end_p
-        ]
         # start_p is aligned to the allocator's physical page size above, so it
         # never shares a page with cache_finished_req's tail free in this group.
-        allocator.free_segment(indices_to_free, start_pos=start_p)
+        tree_cache.free_kv_row(req, [(start_p, end_p)])
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:

@@ -18,6 +18,8 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -35,10 +37,35 @@ def _make_mock_req(
     req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
-    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
+    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len, swa_evicted_seqlen=0)
     req.prefix_indices = list(range(prefix_indices_len))
     req.effective_kv_committed_len = lambda: req.kv_committed_len
     return req
+
+
+class _RecordingAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
+    def __init__(self, page_size: int):
+        super().__init__(
+            size=1024,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.freed = []
+
+    def clear(self):
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index.clone())
 
 
 def _make_manager(pool_size: int, page_size: int = 1):
@@ -49,15 +76,16 @@ def _make_manager(pool_size: int, page_size: int = 1):
     req_to_token_pool = MagicMock()
     req_to_token_pool.req_to_token = req_to_token
 
-    freed_indices = []
-
-    allocator = MagicMock()
-    allocator.free = MagicMock(
-        side_effect=lambda idx: freed_indices.append(idx.clone())
-    )
+    allocator = _RecordingAllocator(page_size)
+    freed_indices = allocator.freed
 
     tree_cache = MagicMock()
     tree_cache.protected_size_ = 0
+    tree_cache.req_to_token_pool = req_to_token_pool
+    tree_cache.token_to_kv_pool_allocator = allocator
+    tree_cache.free_kv_row = lambda owner, ranges: BasePrefixCache.free_kv_row(
+        tree_cache, owner, ranges
+    )
 
     # Bypass __init__ entirely and set attributes directly
     manager = object.__new__(DecodeKVCacheOffloadManager)
