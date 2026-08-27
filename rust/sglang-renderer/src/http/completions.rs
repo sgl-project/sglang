@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use super::{
+    OpenAIHttpFrontend, collect_output, error_payload, openai_error, renderer_status,
+    submit_generation, unix_seconds_u32,
+};
+use crate::{
+    GenerationEvent, GenerationFinishReason, GenerationInput, GenerationOutput,
+    GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
+};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -19,32 +27,16 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs,
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
 
-use super::super::submit::submit;
-use super::{
-    AppState, collect_output, error_payload, indexed_decode_stream, openai_error,
-    submit_generation, unix_seconds_u32,
-};
-use crate::frontend::AbortGuard;
-use crate::message::finish_reason::Matched;
-use crate::message::ids::Rid;
-use crate::message::request::{GenerateRequest, RequestKind};
-use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
-use crate::message::types::TokenIds;
-use crate::renderer::render_http_status;
-use crate::utils::error::Error;
-
-pub(super) fn routes() -> Router<Arc<AppState>> {
+pub(super) fn routes<B: InferenceBackend>() -> Router<Arc<OpenAIHttpFrontend<B>>> {
     Router::new().route("/v1/completions", post(completions))
 }
 
 pub(super) struct SubmittedChoice {
     pub(super) index: usize,
     pub(super) prompt_index: usize,
-    pub(super) rid: Rid,
     pub(super) echo: String,
-    pub(super) rx: mpsc::Receiver<ResponseItem>,
+    pub(super) submission: GenerationSubmission,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
@@ -54,8 +46,8 @@ pub(super) struct ChoiceExtensions {
     finish_reason_override: Option<String>,
 }
 
-async fn completions(
-    State(state): State<Arc<AppState>>,
+async fn completions<B: InferenceBackend>(
+    State(state): State<Arc<OpenAIHttpFrontend<B>>>,
     body: Result<Json<CreateCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -73,42 +65,34 @@ async fn completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
-        || state
-            .request_lowerer
-            .config()
-            .stream_response_default_include_usage;
+        || state.lowerer.config().stream_response_default_include_usage;
     let continuous_usage = request
         .stream_options
         .as_ref()
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
-    let generation_inputs = match state
-        .request_lowerer
-        .lower_completions(request, &response_id)
-    {
+    let generation_inputs = match state.lowerer.lower_completions(request, &response_id) {
         Ok(requests) => requests,
         Err(error) => {
-            let status = StatusCode::from_u16(render_http_status(&error))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = renderer_status(error.kind());
             return openai_error(status, error.to_string(), false);
         }
     };
     let created = unix_seconds_u32();
-    let mut guard = state.frontend.empty_abort_guard();
+    let mut session = state.backend.begin_session();
     let mut submitted = Vec::with_capacity(generation_inputs.len());
     let mut prompt_echo = String::new();
 
     for (index, generation_input) in generation_inputs.into_iter().enumerate() {
-        let native = GenerateRequest::from(generation_input);
         let prompt_index = index / n;
         let sample_index = index % n;
         if sample_index == 0 {
             prompt_echo = if !echo {
                 String::new()
-            } else if let Some(text) = &native.text {
-                text.clone()
-            } else if let Some(token_ids) = &native.input_ids {
-                match decode_prompt_echo(&state, token_ids.clone()).await {
+            } else if let GenerationInput::Text(request) = &generation_input {
+                request.text.clone()
+            } else if let GenerationInput::TokenIds(request) = &generation_input {
+                match decode_prompt_echo(&mut session, request.input_ids.clone()).await {
                     Ok(echo) => echo,
                     Err(response) => return response,
                 }
@@ -116,24 +100,22 @@ async fn completions(
                 unreachable!("processed completion request has a prompt")
             };
         }
-        let rid = native.rid.clone();
-        let rx = match submit_generation(&state, native, stream, &mut guard).await {
-            Ok(rx) => rx,
+        let submission = match submit_generation(&mut session, generation_input, stream).await {
+            Ok(submission) => submission,
             Err(response) => return response,
         };
         submitted.push(SubmittedChoice {
             index,
             prompt_index,
-            rid,
             echo: prompt_echo.clone(),
-            rx,
+            submission,
         });
     }
 
     if stream {
         let s = completion_event_stream(
             submitted,
-            guard,
+            session,
             response_id,
             model,
             created,
@@ -147,7 +129,7 @@ async fn completions(
     } else {
         unary_completion(
             submitted,
-            guard,
+            session,
             response_id,
             model,
             created,
@@ -162,48 +144,22 @@ async fn completions(
 /// `RequestKind::Detokenize` request through the regular submit path — the
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
-async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    let Ok((_rid, mut rx)) = submit(state, RequestKind::Detokenize { token_ids }, false).await
-    else {
-        // Same rule as `submit_generation`: rebuild the refusal in the OpenAI
-        // error shape rather than forwarding the native-shaped response.
-        return Err(openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable",
+async fn decode_prompt_echo<S: InferenceSession>(
+    session: &mut S,
+    token_ids: crate::TokenIds,
+) -> Result<String, Response> {
+    session.detokenize(token_ids).await.map_err(|error| {
+        openai_error(
+            StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            error.message,
             false,
-        ));
-    };
-    match rx.recv().await {
-        Some(ResponseItem::Data(payload)) => String::from_utf8(payload.to_vec()).map_err(|_| {
-            openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "detokenized prompt is not valid UTF-8",
-                false,
-            )
-        }),
-        Some(ResponseItem::Error(Error::Validation(message))) => {
-            Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
-        }
-        Some(ResponseItem::Error(error)) => {
-            let status = StatusCode::from_u16(error.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            Err(openai_error(
-                status,
-                format!("failed to decode prompt for echo: {error}"),
-                false,
-            ))
-        }
-        Some(_) | None => Err(openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to decode prompt for echo: reply channel closed",
-            false,
-        )),
-    }
+        )
+    })
 }
 
-pub(super) async fn unary_completion(
+pub(super) async fn unary_completion<S: InferenceSession>(
     submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
+    mut session: S,
     response_id: String,
     model: String,
     created: u32,
@@ -219,10 +175,12 @@ pub(super) async fn unary_completion(
     let mut completion_tokens = 0u64;
 
     for choice in submitted {
-        let output = match collect_output(choice.rx, &mut guard, &choice.rid).await {
+        let output = match collect_output(&mut session, choice.submission).await {
             Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, &message, false);
+            Err(error) => {
+                let status = StatusCode::from_u16(error.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return openai_error(status, error.message, false);
             }
         };
 
@@ -272,28 +230,34 @@ pub(super) async fn unary_completion(
 fn completion_choice(
     index: usize,
     text: String,
-    output: &ChunkEvent,
+    output: &GenerationOutput,
     want_logprobs: bool,
     include_input_logprobs: bool,
 ) -> (Choice, ChoiceExtensions) {
     let reason = output.finish_reason.as_ref();
     let (finish_reason, finish_reason_override) = {
-        match reason.and_then(|reason| reason.kind_name()) {
-            Some("stop") => (Some(CompletionFinishReason::Stop), None),
-            Some("length") => (Some(CompletionFinishReason::Length), None),
-            Some("content_filter") => (Some(CompletionFinishReason::ContentFilter), None),
-            Some(other) => (None, Some(other.into())),
+        match reason {
+            Some(GenerationFinishReason::Stop(_)) => (Some(CompletionFinishReason::Stop), None),
+            Some(GenerationFinishReason::Length) => (Some(CompletionFinishReason::Length), None),
+            Some(GenerationFinishReason::ContentFilter) => {
+                (Some(CompletionFinishReason::ContentFilter), None)
+            }
+            Some(GenerationFinishReason::Abort) => (None, Some("abort".into())),
+            Some(GenerationFinishReason::Other(other)) => (None, Some(other.clone())),
             None => (None, None),
         }
     };
     let matched_stop = reason
-        .and_then(|reason| reason.matched())
+        .and_then(|reason| match reason {
+            GenerationFinishReason::Stop(matched) => matched.as_ref(),
+            _ => None,
+        })
         .map(|matched| match matched {
-            Matched::Token(id) => serde_json::json!(id),
-            Matched::Str(value) => serde_json::json!(value),
+            MatchedStop::Token(id) => serde_json::json!(id),
+            MatchedStop::Text(value) => serde_json::json!(value),
             // Python's OpenAI schema supports an integer or string here, not a
             // multi-token list. Preserve the native value rather than dropping it.
-            Matched::Tokens(ids) => serde_json::json!(ids),
+            MatchedStop::Tokens(ids) => serde_json::json!(ids),
         });
     (
         Choice {
@@ -360,7 +324,7 @@ pub(super) fn completion_response_value(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn completion_event_stream(
     submitted: Vec<SubmittedChoice>,
-    mut guard: AbortGuard,
+    mut session: impl InferenceSession,
     response_id: String,
     model: String,
     created: u32,
@@ -371,7 +335,6 @@ pub(super) fn completion_event_stream(
 ) -> impl futures::Stream<Item = String> {
     async_stream::stream! {
         let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
         let mut prompt_indexes = Vec::with_capacity(count);
         let mut echoes = Vec::with_capacity(count);
         let mut first_chunks = vec![true; count];
@@ -381,40 +344,26 @@ pub(super) fn completion_event_stream(
 
         for choice in submitted {
             let index = choice.index;
-            rids.push(choice.rid);
             prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
-            streams.push(indexed_decode_stream(index, choice.rx));
+            let id = choice.submission.id;
+            streams.push(choice.submission.events.map(move |event| (index, id.clone(), event)).boxed());
         }
         let mut events = futures::stream::select_all(streams);
 
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string();
-                continue;
-            };
+        while let Some((index, id, item)) = events.next().await {
             let output = match item {
-                ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => {
-                    guard.disarm(&rids[index]);
+                Ok(GenerationEvent::Frame(output)) => output,
+                Ok(GenerationEvent::Done(output)) => {
+                    session.complete(&id);
                     output
                 }
-                ResponseItem::Error(error) => {
-                    guard.disarm(&rids[index]);
-                    yield error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string();
+                Err(error) => {
+                    session.complete(&id);
+                    yield error_payload(StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.message).to_string();
                     continue;
                 }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
             };
-
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string();
-                continue;
-            }
 
             prompt_tokens_by_prompt
                 .entry(prompt_indexes[index])
@@ -487,7 +436,10 @@ pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> Co
     }
 }
 
-pub(super) fn completion_logprobs(extras: Option<&ChunkExtras>, include_input: bool) -> Logprobs {
+pub(super) fn completion_logprobs(
+    extras: Option<&GenerationOutputExtras>,
+    include_input: bool,
+) -> Logprobs {
     let mut result = Logprobs {
         tokens: Vec::new(),
         token_logprobs: Vec::new(),
@@ -500,30 +452,30 @@ pub(super) fn completion_logprobs(extras: Option<&ChunkExtras>, include_input: b
     if include_input {
         append_selected_logprobs(
             &mut result,
-            &extras.in_lp_val,
-            &extras.in_lp_idx,
-            &extras.in_lp_txt,
+            &extras.input_logprobs,
+            &extras.input_logprob_token_ids,
+            &extras.input_logprob_text,
         );
         append_top_logprobs(
             &mut result,
-            &extras.in_top_val,
-            &extras.in_top_idx,
-            &extras.in_top_lens,
-            &extras.in_top_txt,
+            &extras.input_top_logprobs,
+            &extras.input_top_logprob_token_ids,
+            &extras.input_top_logprob_lengths,
+            &extras.input_top_logprob_text,
         );
     }
     append_selected_logprobs(
         &mut result,
-        &extras.out_lp_val,
-        &extras.out_lp_idx,
-        &extras.out_lp_txt,
+        &extras.output_logprobs,
+        &extras.output_logprob_token_ids,
+        &extras.output_logprob_text,
     );
     append_top_logprobs(
         &mut result,
-        &extras.out_top_val,
-        &extras.out_top_idx,
-        &extras.out_top_lens,
-        &extras.out_top_txt,
+        &extras.output_top_logprobs,
+        &extras.output_top_logprob_token_ids,
+        &extras.output_top_logprob_lengths,
+        &extras.output_top_logprob_text,
     );
     result
 }
@@ -579,19 +531,18 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, senders, submitted};
+    use super::super::test_utils::{TestSession, chunk, submitted};
     use super::{
         ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
         unary_completion,
     };
-    use crate::frontend::AbortGuard;
-    use crate::message::response::ChunkExtras;
+    use crate::GenerationOutputExtras;
+    use crate::openai::{PromptSpec, completion_prompt_specs};
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
     use futures::StreamExt;
-    use sglang_renderer::openai::{PromptSpec, completion_prompt_specs};
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {
@@ -630,11 +581,11 @@ mod tests {
 
     #[test]
     fn zero_top_logprobs_keeps_selected_token_and_empty_top_map() {
-        let extras = ChunkExtras {
-            out_lp_val: vec![-0.25],
-            out_lp_idx: vec![7],
-            out_lp_txt: vec!["x".into()],
-            out_top_lens: vec![0],
+        let extras = GenerationOutputExtras {
+            output_logprobs: vec![-0.25],
+            output_logprob_token_ids: vec![7],
+            output_logprob_text: vec!["x".into()],
+            output_top_logprob_lengths: vec![0],
             ..Default::default()
         };
         let logprobs = completion_logprobs(Some(&extras), false);
@@ -676,7 +627,7 @@ mod tests {
 
         let response = unary_completion(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders().abort_tx),
+            TestSession,
             "cmpl-test".into(),
             "model".into(),
             1,
@@ -704,7 +655,7 @@ mod tests {
 
         let stream = completion_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders().abort_tx),
+            TestSession,
             "cmpl-test".into(),
             "model".into(),
             1,

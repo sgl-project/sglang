@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+http = ["dep:axum", "dep:tokio", "dep:uuid"]
+
 [dependencies]
 async-stream = { workspace = true }
 futures = { workspace = true }
@@ -12,7 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
+axum = { version = "0.8.9", features = ["json"], optional = true }
 dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
@@ -25,3 +32,4 @@ dynamo-tokenizers = "1.7.0"
 [dev-dependencies]
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
+tower = { version = "0.5", features = ["util"] }

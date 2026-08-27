@@ -1,8 +1,14 @@
-//! OpenAI Chat Completions endpoint and chat-template preparation.
+//! OpenAI Chat Completions endpoint.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
+use crate::{
+    ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
+    ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent, GenerationEvent,
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationSubmission,
+    InferenceBackend, InferenceSession,
+};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -14,30 +20,22 @@ use axum::{
     routing::post,
 };
 use dynamo_protocols::types::{
-    ChatChoice, ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
-    ChatCompletionMessageToolCallChunk, ChatCompletionResponseMessage,
-    ChatCompletionStreamResponseDelta, CreateChatCompletionRequest, CreateChatCompletionResponse,
-    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
-    FunctionCallStream, FunctionType, Role, ServiceTier as ChatServiceTier,
+    ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta, ChatCompletionTokenLogprob,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
+    ServiceTier as ChatServiceTier, TopLogprobs,
 };
 use futures::StreamExt;
-use sglang_renderer::{
-    ChatEvent, ChatFinishReason, ChatResponseItem, ChatResponseProcessor, ChatToolCallDelta,
-};
-use tokio::sync::mpsc;
 
 use super::completions::completion_usage;
 use super::{
-    AppState, collect_output, error_payload, openai_error, submit_generation, unix_seconds_u32,
+    OpenAIHttpFrontend, collect_output, error_payload, openai_error, renderer_status,
+    submit_generation, unix_seconds_u32,
 };
-use crate::chat_output::{chat_finish_reason, chat_logprobs, semantic_chat_stream};
-use crate::frontend::AbortGuard;
-use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
-use crate::message::response::ResponseItem;
-use crate::renderer::render_http_status;
 
-pub(super) fn routes() -> Router<Arc<AppState>> {
+pub(super) fn routes<B: InferenceBackend>() -> Router<Arc<OpenAIHttpFrontend<B>>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
@@ -50,8 +48,8 @@ struct ChatStreamWireContext {
     service_tier: Option<ChatServiceTier>,
 }
 
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
+async fn chat_completions<B: InferenceBackend>(
+    State(state): State<Arc<OpenAIHttpFrontend<B>>>,
     body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -68,42 +66,32 @@ async fn chat_completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
-        || state
-            .request_lowerer
-            .config()
-            .stream_response_default_include_usage;
+        || state.lowerer.config().stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let lowered = match state
-        .request_lowerer
-        .lower_chat(request, &response_id)
-        .await
-    {
+    let lowered = match state.lowerer.lower_chat(request, &response_id).await {
         Ok(lowered) => lowered,
         Err(error) => {
-            let status = StatusCode::from_u16(render_http_status(&error))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status = renderer_status(error.kind());
             return openai_error(status, error.to_string(), false);
         }
     };
     let generation_inputs = lowered.generation_inputs;
     let response_processor = lowered.response_processor;
     let created = unix_seconds_u32();
-    let mut guard = state.frontend.empty_abort_guard();
+    let mut session = state.backend.begin_session();
     let mut submitted = Vec::with_capacity(generation_inputs.len());
 
     for (index, generation_input) in generation_inputs.into_iter().enumerate() {
-        let native = GenerateRequest::from(generation_input);
-        let rid = native.rid.clone();
-        let rx = match submit_generation(&state, native, stream, &mut guard).await {
-            Ok(rx) => rx,
+        let submission = match submit_generation(&mut session, generation_input, stream).await {
+            Ok(submission) => submission,
             Err(response) => return response,
         };
-        submitted.push((index, rid, rx));
+        submitted.push((index, submission));
     }
     if stream {
         let event_stream = chat_event_stream(
             submitted,
-            guard,
+            session,
             response_processor,
             ChatStreamWireContext {
                 response_id,
@@ -119,7 +107,7 @@ async fn chat_completions(
     } else {
         unary_chat(
             submitted,
-            guard,
+            session,
             response_processor,
             response_id,
             model,
@@ -132,9 +120,9 @@ async fn chat_completions(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    mut guard: AbortGuard,
+pub(super) async fn unary_chat<S: InferenceSession>(
+    submitted: Vec<(usize, GenerationSubmission)>,
+    mut session: S,
     mut response_processor: ChatResponseProcessor,
     response_id: String,
     model: String,
@@ -146,11 +134,13 @@ pub(super) async fn unary_chat(
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
 
-    for (index, rid, rx) in submitted {
-        let output = match collect_output(rx, &mut guard, &rid).await {
+    for (index, submission) in submitted {
+        let output = match collect_output(&mut session, submission).await {
             Ok(output) => output,
-            Err((status, message)) => {
-                return openai_error(status, message, false);
+            Err(error) => {
+                let status = StatusCode::from_u16(error.status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return openai_error(status, error.message, false);
             }
         };
 
@@ -218,12 +208,17 @@ pub(super) async fn unary_chat(
 }
 
 fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    guard: AbortGuard,
+    submitted: Vec<(usize, GenerationSubmission)>,
+    session: impl InferenceSession,
     response_processor: ChatResponseProcessor,
     context: ChatStreamWireContext,
 ) -> impl futures::Stream<Item = String> {
-    let parsed = semantic_chat_stream(submitted, guard, response_processor, context.want_logprobs);
+    let parsed = semantic_chat_stream(
+        submitted,
+        session,
+        response_processor,
+        context.want_logprobs,
+    );
 
     async_stream::stream! {
         futures::pin_mut!(parsed);
@@ -295,6 +290,120 @@ fn chat_event_stream(
             }
         }
         yield "[DONE]".to_string();
+    }
+}
+
+fn semantic_chat_stream<S: InferenceSession>(
+    submitted: Vec<(usize, GenerationSubmission)>,
+    mut session: S,
+    response_processor: ChatResponseProcessor,
+    want_logprobs: bool,
+) -> impl futures::Stream<Item = ChatResponseItem> {
+    let raw = async_stream::stream! {
+        let mut streams = Vec::with_capacity(submitted.len());
+        for (index, submission) in submitted {
+            let id = submission.id;
+            streams.push(submission.events.map(move |event| (index, id.clone(), event)).boxed());
+        }
+        let mut events = futures::stream::select_all(streams);
+        while let Some((index, id, item)) = events.next().await {
+            let (output, terminal) = match item {
+                Ok(GenerationEvent::Frame(output)) => (output, false),
+                Ok(GenerationEvent::Done(output)) => (output, true),
+                Err(error) => {
+                    session.complete(&id);
+                    yield ChatResponseInput::Error(ChatResponseError {
+                        status_code: error.status_code,
+                        message: error.message,
+                    });
+                    continue;
+                }
+            };
+            if terminal {
+                session.complete(&id);
+            }
+            let finish_reason = chat_finish_reason(&output);
+            let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
+            yield ChatResponseInput::Decoded(DecodedChatEvent {
+                choice: index,
+                text: output.text,
+                token_ids: output.token_ids,
+                finish_reason,
+                logprobs,
+                prompt_tokens: output.prompt_tokens,
+                completion_tokens: output.completion_tokens,
+            });
+        }
+    };
+    response_processor.process_stream(raw)
+}
+
+fn chat_finish_reason(output: &GenerationOutput) -> Option<ChatFinishReason> {
+    output.finish_reason.as_ref().map(|reason| match reason {
+        GenerationFinishReason::Length => ChatFinishReason::Length,
+        GenerationFinishReason::ContentFilter => ChatFinishReason::ContentFilter,
+        GenerationFinishReason::Stop(_)
+        | GenerationFinishReason::Abort
+        | GenerationFinishReason::Other(_) => ChatFinishReason::Stop,
+    })
+}
+
+#[allow(deprecated)]
+fn chat_logprobs(extras: Option<&GenerationOutputExtras>) -> ChatChoiceLogprobs {
+    let mut content = Vec::new();
+    let Some(extras) = extras else {
+        return ChatChoiceLogprobs {
+            content: Some(content),
+            refusal: None,
+        };
+    };
+    let mut top_offset = 0usize;
+    for (position, (&logprob, &token_id)) in extras
+        .output_logprobs
+        .iter()
+        .zip(&extras.output_logprob_token_ids)
+        .enumerate()
+    {
+        let token = extras
+            .output_logprob_text
+            .get(position)
+            .cloned()
+            .unwrap_or_else(|| format!("token_id:{token_id}"));
+        let top_len = extras
+            .output_top_logprob_lengths
+            .get(position)
+            .copied()
+            .unwrap_or(0) as usize;
+        let top_logprobs = extras.output_top_logprobs[top_offset..]
+            .iter()
+            .zip(&extras.output_top_logprob_token_ids[top_offset..])
+            .take(top_len)
+            .enumerate()
+            .map(|(offset, (&logprob, &id))| {
+                let text = extras
+                    .output_top_logprob_text
+                    .get(top_offset + offset)
+                    .cloned()
+                    .unwrap_or_else(|| format!("token_id:{id}"));
+                TopLogprobs {
+                    bytes: Some(text.as_bytes().to_vec()),
+                    token: text,
+                    logprob,
+                }
+            })
+            .collect();
+        top_offset = top_offset.saturating_add(top_len);
+        content.push(ChatCompletionTokenLogprob {
+            bytes: Some(token.as_bytes().to_vec()),
+            token,
+            logprob,
+            token_id: u32::try_from(token_id).ok(),
+            top_logprobs,
+        });
+    }
+    ChatChoiceLogprobs {
+        content: Some(content),
+        refusal: None,
     }
 }
 
@@ -373,18 +482,16 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk, senders};
-    use super::{ChatStreamWireContext, chat_event_stream, unary_chat};
-    use crate::chat_output::chat_logprobs;
-    use crate::frontend::AbortGuard;
-    use crate::message::config::ServerArgs;
-    use crate::message::response::ChunkExtras;
-    use crate::renderer::new_request_lowerer;
+    use super::super::test_utils::{TestSession, chat_submitted, chunk};
+    use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
+    use crate::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
+    use crate::{
+        GenerationOutputExtras, OpenAIRequestLowerer, RendererConfig, RendererLimits,
+        SamplingDefaults as ModelSamplingDefaults,
+    };
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
     use futures::StreamExt;
-    use sglang_renderer::SamplingDefaults as ModelSamplingDefaults;
-    use sglang_renderer::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -397,14 +504,27 @@ mod tests {
     async fn response_processor(
         reasoning_parser: Option<&str>,
         choices: usize,
-    ) -> sglang_renderer::ChatResponseProcessor {
-        let args = ServerArgs {
-            model_path: "test-model".into(),
+    ) -> crate::ChatResponseProcessor {
+        let config = RendererConfig {
+            model_path: String::new(),
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
             chat_template: Some("chatml".into()),
+            tool_call_parser: None,
             reasoning_parser: reasoning_parser.map(str::to_owned),
-            ..Default::default()
+            revision: None,
+            stream_response_default_include_usage: false,
+            skip_tokenizer_init: false,
+            vocab_size: 128,
+            default_sampling_params: ModelSamplingDefaults::default(),
+            limits: RendererLimits {
+                skip_tokenizer_init: false,
+                vocab_size: 128,
+                context_len: 128,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: false,
+                enable_return_hidden_states: false,
+            },
         };
         let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
@@ -412,7 +532,7 @@ mod tests {
             "n": choices
         }))
         .unwrap();
-        new_request_lowerer(&args)
+        OpenAIRequestLowerer::new(config)
             .lower_chat(request, "chatcmpl-test")
             .await
             .unwrap()
@@ -493,14 +613,14 @@ mod tests {
 
     #[test]
     fn chat_logprobs_use_dynamo_wire_types() {
-        let extras = ChunkExtras {
-            out_lp_val: vec![-0.25],
-            out_lp_idx: vec![7],
-            out_lp_txt: vec!["x".into()],
-            out_top_val: vec![-0.25, -1.0],
-            out_top_idx: vec![7, 8],
-            out_top_lens: vec![2],
-            out_top_txt: vec!["x".into(), "y".into()],
+        let extras = GenerationOutputExtras {
+            output_logprobs: vec![-0.25],
+            output_logprob_token_ids: vec![7],
+            output_logprob_text: vec!["x".into()],
+            output_top_logprobs: vec![-0.25, -1.0],
+            output_top_logprob_token_ids: vec![7, 8],
+            output_top_logprob_lengths: vec![2],
+            output_top_logprob_text: vec!["x".into(), "y".into()],
             ..Default::default()
         };
         let logprobs = chat_logprobs(Some(&extras));
@@ -520,7 +640,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders().abort_tx),
+            TestSession,
             response_processor(None, 2).await,
             "chatcmpl-test".into(),
             "model".into(),
@@ -554,7 +674,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            AbortGuard::new_empty(senders().abort_tx),
+            TestSession,
             response_processor(Some("deepseek-r1"), 1).await,
             "chatcmpl-test".into(),
             "model".into(),
@@ -589,7 +709,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders().abort_tx),
+            TestSession,
             response_processor(Some("deepseek-r1"), 1).await,
             wire_context(true),
         );
@@ -625,7 +745,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders().abort_tx),
+            TestSession,
             response_processor(None, 1).await,
             wire_context(true),
         );

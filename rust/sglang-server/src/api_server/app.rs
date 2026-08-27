@@ -10,7 +10,7 @@ use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai, render};
 use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
-use crate::renderer::{OpenAIRequestLowerer, RendererService};
+use crate::renderer::{OpenAIRequestLowerer, RendererService, ServerInferenceBackend};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
@@ -22,9 +22,8 @@ use crate::tokenizer_manager::wiring::Senders;
 /// `flume::Sender` and the lowerer. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
 pub(super) struct AppState {
-    pub(super) frontend: FrontendHandle,
+    pub(super) frontend: Arc<FrontendHandle>,
     pub(super) server_args: Arc<ServerArgs>,
-    pub(super) request_lowerer: Arc<OpenAIRequestLowerer>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
 }
@@ -42,10 +41,15 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
+    let frontend = Arc::new(FrontendHandle::new(senders, response_buf));
+    let renderer_routes =
+        sglang_renderer::http::inference_routes(sglang_renderer::http::OpenAIHttpFrontend::new(
+            request_lowerer,
+            ServerInferenceBackend::new(frontend.clone()),
+        ));
     let state = Arc::new(AppState {
-        frontend: FrontendHandle::new(senders, response_buf),
+        frontend,
         server_args: server_args.clone(),
-        request_lowerer,
         response_activity,
     });
     // Each endpoint module registers its own routes and merges here.
@@ -61,7 +65,8 @@ pub async fn serve(
     // No body limit, matching the Python server.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(state);
+        .with_state(state)
+        .merge(renderer_routes);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the

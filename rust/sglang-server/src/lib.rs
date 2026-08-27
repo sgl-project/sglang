@@ -12,7 +12,6 @@
 //! a `PyObject`.
 
 mod api_server;
-mod chat_output;
 mod frontend;
 mod message;
 mod multi_modality;

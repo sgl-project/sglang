@@ -6,6 +6,9 @@
 
 pub mod config;
 pub mod error;
+#[cfg(feature = "http")]
+pub mod http;
+pub mod inference;
 pub mod openai;
 pub mod output;
 pub mod request;
@@ -19,6 +22,10 @@ mod regex;
 
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
+pub use inference::{
+    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
+    GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
+};
 pub use openai::LoweredChat;
 pub use output::{
     ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,

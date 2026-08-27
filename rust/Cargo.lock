@@ -3702,6 +3702,7 @@ name = "sglang-renderer"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "axum 0.8.9",
  "dynamo-parsers",
  "dynamo-protocols",
  "dynamo-renderer",
@@ -3714,7 +3715,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tower 0.5.3",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

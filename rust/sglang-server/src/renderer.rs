@@ -3,19 +3,187 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use futures::stream::StreamExt;
 use tokio::sync::oneshot;
 
+use crate::frontend::{AbortGuard, FrontendHandle};
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
+use crate::message::request::RequestKind;
 use crate::message::request::{GenerateRequest, Request};
+use crate::message::response::{ChunkEvent, ResponseItem};
 
+use sglang_renderer::{
+    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationOutput,
+    GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
+    RendererLimits, SamplingDefaults, TokenIds, TokenizationBackend,
+};
 pub(crate) use sglang_renderer::{
     GenerationInput, OpenAIRequestLowerer, RendererConfig, RendererError as RenderServiceError,
     RendererService, TextRequest, TokenIdsRequest,
 };
-use sglang_renderer::{
-    GenerationOptions, RendererLimits, SamplingDefaults, TokenIds, TokenizationBackend,
-};
+
+#[derive(Clone)]
+pub(crate) struct ServerInferenceBackend {
+    frontend: Arc<FrontendHandle>,
+}
+
+impl ServerInferenceBackend {
+    pub(crate) fn new(frontend: Arc<FrontendHandle>) -> Self {
+        Self { frontend }
+    }
+}
+
+pub(crate) struct ServerInferenceSession {
+    frontend: Arc<FrontendHandle>,
+    guard: AbortGuard,
+}
+
+impl InferenceBackend for ServerInferenceBackend {
+    type Session = ServerInferenceSession;
+
+    fn begin_session(&self) -> Self::Session {
+        ServerInferenceSession {
+            frontend: self.frontend.clone(),
+            guard: self.frontend.empty_abort_guard(),
+        }
+    }
+}
+
+impl InferenceSession for ServerInferenceSession {
+    fn submit(
+        &mut self,
+        request: GenerationInput,
+        _stream: bool,
+    ) -> BoxFuture<'_, Result<GenerationSubmission, FrontendError>> {
+        Box::pin(async move {
+            let request = GenerateRequest::from(request);
+            let (rid, mut receiver) = self
+                .frontend
+                .submit(RequestKind::Generate(Box::new(request)))
+                .await
+                .map_err(|_| FrontendError {
+                    status_code: 503,
+                    message: "service unavailable".into(),
+                })?;
+            self.guard.arm(rid.clone());
+            let id = rid.as_str().to_owned();
+            let events = async_stream::stream! {
+                while let Some(item) = receiver.recv().await {
+                    match item {
+                        ResponseItem::Frame(output) => match generation_output(output) {
+                            Ok(output) => yield Ok(GenerationEvent::Frame(output)),
+                            Err(error) => { yield Err(error); break; }
+                        },
+                        ResponseItem::Done(output) => {
+                            yield generation_output(output).map(GenerationEvent::Done);
+                            break;
+                        }
+                        ResponseItem::Error(error) => {
+                            yield Err(FrontendError {
+                                status_code: error.http_status(),
+                                message: error.to_string(),
+                            });
+                            break;
+                        }
+                        ResponseItem::Control(_) | ResponseItem::Data(_) => {}
+                    }
+                }
+            }
+            .boxed();
+            Ok(GenerationSubmission { id, events })
+        })
+    }
+
+    fn detokenize(&mut self, token_ids: TokenIds) -> BoxFuture<'_, Result<String, FrontendError>> {
+        Box::pin(async move {
+            let (_rid, mut receiver) = self
+                .frontend
+                .submit(RequestKind::Detokenize { token_ids })
+                .await
+                .map_err(|_| FrontendError {
+                    status_code: 503,
+                    message: "service unavailable".into(),
+                })?;
+            match receiver.recv().await {
+                Some(ResponseItem::Data(bytes)) => {
+                    String::from_utf8(bytes.to_vec()).map_err(|_| FrontendError {
+                        status_code: 500,
+                        message: "detokenized prompt is not valid UTF-8".into(),
+                    })
+                }
+                Some(ResponseItem::Error(error)) => Err(FrontendError {
+                    status_code: error.http_status(),
+                    message: error.to_string(),
+                }),
+                _ => Err(FrontendError {
+                    status_code: 500,
+                    message: "failed to decode prompt: reply channel closed".into(),
+                }),
+            }
+        })
+    }
+
+    fn complete(&mut self, submission_id: &str) {
+        self.guard.disarm(&submission_id.into());
+    }
+}
+
+fn generation_output(output: ChunkEvent) -> Result<GenerationOutput, FrontendError> {
+    if let Some((status_code, message)) = output
+        .finish_reason
+        .as_ref()
+        .and_then(|reason| reason.abort_status())
+    {
+        return Err(FrontendError {
+            status_code,
+            message: message.to_owned(),
+        });
+    }
+    let finish_reason = output.finish_reason.as_ref().and_then(|reason| {
+        Some(match reason.kind_name()? {
+            "stop" => GenerationFinishReason::Stop(reason.matched().map(|matched| match matched {
+                crate::message::finish_reason::Matched::Token(id) => MatchedStop::Token(*id),
+                crate::message::finish_reason::Matched::Str(text) => {
+                    MatchedStop::Text(text.clone())
+                }
+                crate::message::finish_reason::Matched::Tokens(ids) => {
+                    MatchedStop::Tokens(ids.clone())
+                }
+            })),
+            "length" => GenerationFinishReason::Length,
+            "abort" => GenerationFinishReason::Abort,
+            "content_filter" => GenerationFinishReason::ContentFilter,
+            other => GenerationFinishReason::Other(other.to_owned()),
+        })
+    });
+    let extras = output.extras.map(|extras| {
+        Box::new(GenerationOutputExtras {
+            output_logprobs: extras.out_lp_val,
+            output_logprob_token_ids: extras.out_lp_idx,
+            output_logprob_text: extras.out_lp_txt,
+            input_logprobs: extras.in_lp_val,
+            input_logprob_token_ids: extras.in_lp_idx,
+            input_logprob_text: extras.in_lp_txt,
+            output_top_logprobs: extras.out_top_val,
+            output_top_logprob_token_ids: extras.out_top_idx,
+            output_top_logprob_lengths: extras.out_top_lens,
+            output_top_logprob_text: extras.out_top_txt,
+            input_top_logprobs: extras.in_top_val,
+            input_top_logprob_token_ids: extras.in_top_idx,
+            input_top_logprob_lengths: extras.in_top_lens,
+            input_top_logprob_text: extras.in_top_txt,
+        })
+    });
+    Ok(GenerationOutput {
+        text: output.text,
+        token_ids: output.token_ids,
+        finish_reason,
+        prompt_tokens: output.prompt_tokens,
+        completion_tokens: output.completion_tokens,
+        extras,
+    })
+}
 
 /// Work accepted by the shared tokenization pool. Inference requests retain
 /// their FSM, while standalone requests use the renderer crate's contracts.
