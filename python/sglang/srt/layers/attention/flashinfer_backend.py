@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+)
 
 """
 Support different attention backends.
@@ -403,7 +406,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
         # More information can be found here: https://github.com/flashinfer-ai/flashinfer/pull/1675
         self.enable_deterministic = (
-            model_runner.server_args.enable_deterministic_inference
+            get_exec().deterministic.enable_deterministic_inference
         )
         self.prefill_split_tile_size = None
         self.decode_split_tile_size = None
@@ -439,9 +442,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self.workspace_buffer = global_workspace_buffer
-        max_bs = get_cuda_graph_max_batch_size(
-            model_runner.server_args, model_runner.req_to_token_pool.size
-        )
+        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = [
                 torch.zeros(
@@ -1057,6 +1058,23 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+
+    def get_cuda_graph_decode_wrappers(
+        self,
+        *,
+        bs: int,
+        num_tokens: int,
+    ) -> list:
+        wrappers = self.decode_cuda_graph_metadata.get(bs)
+        if wrappers is None:
+            self._prepare_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                ForwardMode.DECODE,
+                spec_info=None,
+            )
+            wrappers = self.decode_cuda_graph_metadata[bs]
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
@@ -2234,7 +2252,7 @@ class FlashInferMultiStepDraftBackend:
         self.page_size = model_runner.page_size
 
         max_bs = get_cuda_graph_max_batch_size(
-            model_runner.server_args, model_runner.req_to_token_pool.size * self.topk
+            model_runner.req_to_token_pool.size * self.topk
         )
         self.kv_indptr = torch.zeros(
             (

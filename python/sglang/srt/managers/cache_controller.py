@@ -13,9 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
@@ -27,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    count_pool_hits,
 )
 
 if TYPE_CHECKING:
@@ -186,6 +189,32 @@ class HiCacheAck(NamedTuple):
     num_bytes: int = 0
 
 
+@dataclass
+class PrefetchAck:
+    """ACK for prefetch operation.
+
+    A sequence of PrefetchAck is sent to the scheduler thread via ack_prefetch_queue,
+    indicating progress or completion of the prefetch operation.
+
+    For example, a prefetch operation may results into the following sequence of PrefetchAck:
+
+    1. PrefetchAck(completed_tokens = 128)
+    2. PrefetchAck(completed_tokens = 256)
+    3. PrefetchAck(pool_hits={INDEXER: 256})
+    4. PrefetchAck(completed_req = True)
+
+    The last PrefetchAck always specifies completed_req = True.
+    """
+
+    rid: str
+    operation: PrefetchOperation
+    # Number of hits in KV pool.
+    completed_tokens: Optional[int] = None
+    # Number of hits in extra pools.
+    pool_hits: Optional[dict[str, int]] = None
+    completed_req: Optional[bool] = None
+
+
 class StorageOperation:
     counter = 0
 
@@ -244,19 +273,13 @@ class PrefetchOperation(StorageOperation):
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
-    def increment(self, num_tokens: int):
-        with self._lock:
-            if self._terminated_flag:
-                return False
-            self.completed_tokens += num_tokens
-            return True
-
     def mark_terminate(self):
         with self._lock:
             self._terminated_flag = True
 
     def is_terminated(self) -> bool:
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
 
 
 class HiCacheController:
@@ -285,7 +308,8 @@ class HiCacheController:
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
-        self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -294,6 +318,7 @@ class HiCacheController:
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
         self.io_backend = io_backend
@@ -305,15 +330,6 @@ class HiCacheController:
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
 
-        # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
-        self.has_draft = False
-        self.mem_pool_device_draft = None
-        self.mem_pool_host_draft = None
-        self.draft_page_get_func = None
-        self.draft_page_set_func = None
-        self.has_mtp_draft = False
-        self.mtp_draft_device_pools = ()
-
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -322,7 +338,10 @@ class HiCacheController:
         self.storage_stop_event = threading.Event()
 
         # Storage control queues, (re)created whenever the storage threads start.
+        self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
+        self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
         self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
+        self.ack_prefetch_queue = Queue[PrefetchAck]()
         self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
 
@@ -369,16 +388,18 @@ class HiCacheController:
             )
         return 0, 1
 
-    def _create_prefetch_sync_groups(self) -> None:
+    def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
-        self.prefetch_sync_groups = []
+        groups: List[torch.distributed.ProcessGroup] = []
         seen_rank_sets = set()
 
         if self.attn_cp_group is not None or self.attn_tp_group is not None:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
         else:
             base_groups = [self.tp_group]
+        if self.pp_group is not None:
+            base_groups.append(self.pp_group)
 
         for group in base_groups:
             if group is None or torch.distributed.get_world_size(group=group) == 1:
@@ -387,22 +408,29 @@ class HiCacheController:
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)
-            self.prefetch_sync_groups.append(
+            groups.append(
                 create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
                 )
             )
+        return groups
 
-    def _destroy_prefetch_sync_groups(self) -> None:
-        for group in self.prefetch_sync_groups:
+    def _destroy_sync_groups(
+        self, groups: List[torch.distributed.ProcessGroup]
+    ) -> None:
+        for group in groups:
             try:
                 torch.distributed.destroy_process_group(group)
             except Exception:
                 pass
-        self.prefetch_sync_groups = []
 
-    def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
-        for group in self.prefetch_sync_groups:
+    def _all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op,
+        groups: List[torch.distributed.ProcessGroup],
+    ) -> None:
+        for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _start_storage_threads(self):
@@ -416,17 +444,27 @@ class HiCacheController:
         self.prefetch_thread = threading.Thread(
             target=self.prefetch_thread_func, daemon=True
         )
+        self.prefetch_io_aux_thread = threading.Thread(
+            target=self.prefetch_io_aux_func, daemon=True
+        )
+        self.prefetch_sync_thread = threading.Thread(
+            target=self.prefetch_sync_thread_func, daemon=True
+        )
         self.backup_thread = threading.Thread(
             target=self.backup_thread_func, daemon=True
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
-
+        self.prefetch_buffer = Queue()
+        self.prefetch_sync_queue = Queue()
         self.prefetch_hit_queue = Queue()
+        self.ack_prefetch_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
         self.prefetch_thread.start()
+        self.prefetch_io_aux_thread.start()
+        self.prefetch_sync_thread.start()
         self.backup_thread.start()
 
     def _stop_storage_threads(self):
@@ -449,6 +487,8 @@ class HiCacheController:
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
                 self.prefetch_buffer.put_nowait(None)
+            if hasattr(self, "prefetch_sync_queue"):
+                self.prefetch_sync_queue.put_nowait(None)
         except Exception:
             pass
 
@@ -460,6 +500,8 @@ class HiCacheController:
             threads.append(self.backup_thread)
         if hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
+        if hasattr(self, "prefetch_sync_thread"):
+            threads.append(self.prefetch_sync_thread)
 
         for t in threads:
             try:
@@ -520,9 +562,9 @@ class HiCacheController:
 
         try:
             self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.mem_pool_host
+                storage_backend, self.storage_config, self.storage_host_pool
             )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -542,7 +584,8 @@ class HiCacheController:
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
-            self._create_prefetch_sync_groups()
+            self.prefetch_hits_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -558,8 +601,6 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
-            self._maybe_register_draft_with_storage()
-
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -569,7 +610,10 @@ class HiCacheController:
                 self._stop_storage_threads()
             except Exception:
                 pass
-            self._destroy_prefetch_sync_groups()
+            self._destroy_sync_groups(self.prefetch_hits_sync_groups)
+            self._destroy_sync_groups(self.prefetch_completion_sync_groups)
+            self.prefetch_hits_sync_groups = []
+            self.prefetch_completion_sync_groups = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -584,8 +628,6 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
-            self.draft_page_get_func = None
-            self.draft_page_set_func = None
             raise
 
     def detach_storage_backend(self):
@@ -609,7 +651,11 @@ class HiCacheController:
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
         # Best-effort destroy process groups created for storage ops.
-        self._destroy_prefetch_sync_groups()
+        self._destroy_sync_groups(
+            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
+        )
+        self.prefetch_hits_sync_groups = []
+        self.prefetch_completion_sync_groups = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -627,8 +673,6 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
-        self.draft_page_get_func = None
-        self.draft_page_set_func = None
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -704,10 +748,15 @@ class HiCacheController:
         self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
+            self.prefetch_io_aux_thread.join()
+            self.prefetch_sync_thread.join()
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
+            self.prefetch_buffer.queue.clear()
+            self.prefetch_sync_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
+            self.ack_prefetch_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
@@ -718,10 +767,18 @@ class HiCacheController:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
+            self.prefetch_io_aux_thread = threading.Thread(
+                target=self.prefetch_io_aux_func, daemon=True
+            )
+            self.prefetch_sync_thread = threading.Thread(
+                target=self.prefetch_sync_thread_func, daemon=True
+            )
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
             self.prefetch_thread.start()
+            self.prefetch_io_aux_thread.start()
+            self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
     def write(
@@ -767,12 +824,7 @@ class HiCacheController:
         )
 
     def _transfer_num_bytes(self, op: CacheOperation) -> int:
-        """Total bytes moved by a merged transfer op (draft piggyback included)."""
-        num_tokens = len(op.device_indices)
-        num_bytes = num_tokens * self.mem_pool_host.size_per_token
-        if self.has_draft:
-            num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
-        return num_bytes
+        return len(op.device_indices) * self.mem_pool_host.size_per_token
 
     def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
         return {PoolName.KV.value: len(op.device_indices)}
@@ -849,15 +901,6 @@ class HiCacheController:
                 device_indices=device_indices,
             )
         ]
-        if self.has_draft and host_indices.numel() > 0:
-            transfers.append(
-                L2Transfer(
-                    host_pool=self.mem_pool_host_draft,
-                    device_pool=self.mem_pool_device_draft,
-                    host_indices=host_indices,
-                    device_indices=device_indices,
-                )
-            )
         return transfers
 
     def _l2_load_transfers(
@@ -910,63 +953,6 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
-        self.has_draft = True
-        self.mem_pool_device_draft = draft_device_pool
-        self.mem_pool_host_draft = draft_host_pool
-        logger.info(
-            "HiCache draft KV registered: %s (host %d slots)",
-            type(draft_device_pool).__name__,
-            draft_host_pool.size,
-        )
-
-        # If storage is already attached, wire up the draft I/O path now.
-        # Otherwise this will be deferred until attach_storage_backend().
-        self._maybe_register_draft_with_storage()
-
-    def set_mtp_draft_pools(self, device_pools) -> None:
-        """Register MTP device pools used for L2 load-back."""
-        self.mtp_draft_device_pools = tuple(device_pools)
-        self.has_mtp_draft = bool(self.mtp_draft_device_pools)
-
-    def _maybe_register_draft_with_storage(self) -> None:
-        """Pick the draft L3 IO implementation."""
-        self.draft_page_get_func = None
-        self.draft_page_set_func = None
-        if not self.has_draft or not self.enable_storage:
-            return
-
-        backend = self.storage_backend_type
-
-        # Multi-pool zero-copy backends.
-        if backend == "mooncake":
-            if self.storage_config.should_split_heads:
-                logger.warning(
-                    "HiCache draft L3 disabled: should_split_heads not yet "
-                    "supported on the mooncake v2 path."
-                )
-                return
-            self.storage_backend.register_mem_host_pool_v2(
-                self.mem_pool_host_draft, PoolName.DRAFT
-            )
-            self.draft_page_get_func = self._draft_page_get_v2
-            self.draft_page_set_func = self._draft_page_set_v2
-            return
-
-        # TODO: support "hf3fs", "eic", "nixl", "simm"
-        if backend in {"hf3fs", "eic", "nixl", "simm"}:
-            logger.warning(
-                "HiCache draft L3 disabled: backend %s does not yet support "
-                "draft pool registration.",
-                backend,
-            )
-            return
-
-        # Generic backends.
-        self.draft_page_get_func = self._draft_page_get_generic
-        self.draft_page_set_func = self._draft_page_set_generic
-
     def prefetch(
         self,
         request_id: str,
@@ -984,6 +970,14 @@ class HiCacheController:
         return operation
 
     def terminate_prefetch(self, operation):
+        """
+        Request to terminate a prefetch operation.
+
+        Must be called in the scheduler thread.
+
+        Asynchronous prefetch tasks may be running in background threads.  When all prefetch
+        tasks are terminated, a PrefetchAck with completed_req=True will be sent to ack_prefetch_queue.
+        """
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
@@ -996,7 +990,7 @@ class HiCacheController:
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
-    ):
+    ) -> int:
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -1007,61 +1001,119 @@ class HiCacheController:
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            inc += self.page_size
-        operation.increment(inc)
+            inc += 1
+        return inc
 
     # todo: deprecate
-    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+    def _generic_page_get(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
         dummy_page_dst = [
-            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+            self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
-            return
+            return 0
+        count = 0
         for i in range(len(hash_values)):
             if page_data[i] is None:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            # Must set the data before increasing the completed tokens.
-            # Otherwise this page may be read before being set.
-            self.mem_pool_host.set_from_flat_data_page(
+            if operation.is_terminated():
+                break
+            self.storage_host_pool.set_from_flat_data_page(
                 host_indices[i * self.page_size],
                 page_data[i],
             )
-            if not operation.increment(self.page_size):
-                break  # Operation terminated by controller
+            count += 1
+        return count
 
-    def _page_transfer(self, operation):
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        kv_derived_transfers = [
+            transfer
+            for transfer in getattr(operation, "pool_transfers", None) or []
+            if transfer.indices_from_pool == PoolName.KV
+        ]
+        all_success = True
+        completed_pages = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
-            batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+            # When an error is occurred, we should keep looping and produce the same number of
+            # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
+            # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
+            if all_success and operation.is_terminated():
+                all_success = False
+            if all_success:
+                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_host_indices = operation.host_indices[
+                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                ]
+
+                # Get one batch token, and update the completed_tokens if succeed
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+                hit_pages = self._page_transfer_kv_batch(
+                    operation,
+                    batch_hashes,
+                    batch_host_indices,
+                    extra_info,
+                    kv_derived_transfers,
+                )
+                # Check termination
+                if hit_pages != len(batch_hashes):
+                    all_success = False
+                if prefix_keys and len(prefix_keys) > 0:
+                    prefix_keys += batch_hashes
+                completed_pages += hit_pages
+            ack = PrefetchAck(
+                rid=operation.request_id,
+                completed_tokens=completed_pages * self.page_size,
+                operation=operation,
+            )
+            self.prefetch_sync_queue.put(ack)
+        return completed_pages
+
+    def _page_transfer_kv_batch(
+        self,
+        operation: PrefetchOperation,
+        batch_hashes: List[str],
+        batch_host_indices: torch.Tensor,
+        extra_info: HiCacheStorageExtraInfo,
+        kv_derived_transfers: List[PoolTransfer],
+    ) -> int:
+        """Read a single batch from KV and KV-derived pools (e.g. indexer pool).
+
+        Return the number of hit pages.  If the hits from KV and KV-derived pools differ,
+        clamp to the minimal number of hits.
+
+        Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
+        """
+        # Read from KV pool.
+        kv_hits = self.page_get_func(
+            operation, batch_hashes, batch_host_indices, extra_info
+        )
+
+        # Read from KV-derived sidecar pools, if any.
+        sidecar_hits: dict[str, int] = {}
+        if len(kv_derived_transfers) > 0:
+            current_kv_derived_transfers = [
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=batch_host_indices,
+                    keys=batch_hashes,
+                )
+                for transfer in kv_derived_transfers
             ]
+            sidecar_results = self.storage_backend.batch_get_v2(
+                current_kv_derived_transfers
+            )
+            sidecar_hits = count_pool_hits(sidecar_results)
 
-            # Best-effort draft L3 read before publishing target completion.
-            # Otherwise wait_complete can race and load back target KV before
-            # draft KV reaches host memory.
-            if self.has_draft:
-                self._draft_page_get(batch_hashes, batch_host_indices)
-
-            prev_completed_tokens = operation.completed_tokens
-            # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
-            # Check termination
-            if (
-                operation.completed_tokens
-                != prev_completed_tokens + len(batch_hashes) * self.page_size
-            ):
-                operation.mark_terminate()
-                break  # Some operations fail or operation terminated by controller
-
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+        # Clamp to minimal number of hits.
+        return min([kv_hits, *sidecar_hits.values()])
 
     def prefetch_io_aux_func(self):
         """
@@ -1073,9 +1125,13 @@ class HiCacheController:
                 if operation is None:
                     continue
                 self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
+
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        completed_req=True,
+                        operation=operation,
+                    )
                 )
             except Empty:
                 continue
@@ -1129,11 +1185,6 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
-        self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
@@ -1146,8 +1197,10 @@ class HiCacheController:
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
-                self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                self._all_reduce(
+                    storage_hit_count_tensor,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_hits_sync_groups,
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
@@ -1181,7 +1234,7 @@ class HiCacheController:
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         data = [
-            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+            self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
@@ -1190,72 +1243,6 @@ class HiCacheController:
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
-
-    def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 alongside the target backup."""
-        if self.draft_page_set_func is None:
-            return
-        try:
-            self.draft_page_set_func(hash_values, host_indices)
-        except Exception:
-            logger.debug(
-                "Draft L3 write failed (best-effort), skipping.", exc_info=True
-            )
-
-    def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
-        if self.draft_page_get_func is None:
-            return
-        try:
-            self.draft_page_get_func(hash_values, host_indices)
-        except Exception:
-            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
-
-    def _draft_page_set_v2(self, hash_values, host_indices) -> None:
-        self.storage_backend.batch_set_v2(
-            [
-                PoolTransfer(
-                    name=PoolName.DRAFT,
-                    host_indices=host_indices,
-                    keys=list(hash_values),
-                )
-            ]
-        )
-
-    def _draft_page_get_v2(self, hash_values, host_indices) -> None:
-        self.storage_backend.batch_get_v2(
-            [
-                PoolTransfer(
-                    name=PoolName.DRAFT,
-                    host_indices=host_indices,
-                    keys=list(hash_values),
-                )
-            ]
-        )
-
-    def _draft_page_set_generic(self, hash_values, host_indices) -> None:
-        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
-        # `{key}.{pool_name}` convention so target/draft pages never collide.
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_data = [
-            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(draft_keys))
-        ]
-        self.storage_backend.batch_set(draft_keys, draft_data)
-
-    def _draft_page_get_generic(self, hash_values, host_indices) -> None:
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_dummy = [
-            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
-        ]
-        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-        if draft_pages is None:
-            return
-        for i, p in enumerate(draft_pages):
-            if p is not None:
-                self.mem_pool_host_draft.set_from_flat_data_page(
-                    host_indices[i * self.page_size], p
-                )
 
     # Backup batch by batch
     def _page_backup(self, operation):
@@ -1275,10 +1262,6 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
-
-            # Best-effort draft L3 write alongside target.
-            if self.has_draft:
-                self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
@@ -1300,3 +1283,29 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def prefetch_sync_thread_func(self):
+        """Synchronize prefetch results across all PP and TP ranks."""
+        while not self.storage_stop_event.is_set():
+            try:
+                ack = self.prefetch_sync_queue.get(block=True, timeout=1)
+                if ack is None:
+                    continue
+                self._reduce_prefetch_ack(ack)
+                self.ack_prefetch_queue.put(ack)
+            except Empty:
+                continue
+
+    def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
+        """Synchronize all ranks to agree on a PrefetchAck."""
+        if ack.completed_tokens is not None:
+            # Determine the minimal successful prefix of tokens.
+            completed_tokens_tensor = torch.tensor(
+                ack.completed_tokens, dtype=torch.int
+            )
+            self._all_reduce(
+                completed_tokens_tensor,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            ack.completed_tokens = completed_tokens_tensor.item()

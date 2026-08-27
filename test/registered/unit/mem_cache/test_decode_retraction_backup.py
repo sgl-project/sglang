@@ -117,7 +117,6 @@ class TestDecodeRetractionBackup(unittest.TestCase):
                 device_pools=(draft_pool,),
             ),
             server_args=server_args,
-            page_size=1,
         )
         self.assertIn(PoolName.DRAFT, cache.host_pool_group.entry_map)
         cache.validate_retraction_host_capacity()
