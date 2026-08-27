@@ -647,11 +647,19 @@ def _weighted_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefix-len", type=int, default=61440)
-    parser.add_argument("--extend-len", type=int, default=4096)
+    parser.add_argument("--prefix-len", type=int, default=0)
+    parser.add_argument(
+        "--extend-len",
+        "--extend-lens",
+        dest="extend_lens",
+        type=int,
+        nargs="+",
+        default=[1024, 2048, 4096, 8192, 16384],
+        help="One or more extend lengths to benchmark (default: 4096).",
+    )
     parser.add_argument("--cp-size", type=int, default=2)
     parser.add_argument("--cp-rank", type=int, default=0)
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16, 24, 32])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16, 32])
     parser.add_argument("--compress-ratios", type=int, nargs="+", default=[0, 4, 128])
     parser.add_argument("--num-heads", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=5)
@@ -675,17 +683,23 @@ def parse_args() -> argparse.Namespace:
 def _main(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
-    if args.prefix_len < 0 or args.extend_len <= 0:
-        raise SystemExit("--prefix-len must be non-negative and --extend-len positive")
+    extend_lens = sorted(set(args.extend_lens))
+    batch_sizes = sorted(set(args.batch_sizes))
+    if args.prefix_len < 0 or any(extend_len <= 0 for extend_len in extend_lens):
+        raise SystemExit(
+            "--prefix-len must be non-negative and every --extend-len positive"
+        )
     if args.cp_size <= 1 or not 0 <= args.cp_rank < args.cp_size:
         raise SystemExit("--cp-size must be >1 and --cp-rank must be in range")
     if args.num_heads <= 0 or any(batch <= 0 for batch in args.batch_sizes):
         raise SystemExit("--batch-sizes and --num-heads must be positive")
     if any(
-        batch_size * args.extend_len % args.cp_size for batch_size in args.batch_sizes
+        batch_size * extend_len % args.cp_size
+        for extend_len in extend_lens
+        for batch_size in batch_sizes
     ):
         raise SystemExit(
-            "Every batch_size * extend_len must be divisible by cp_size so the "
+            "Every batch_size * extend_len pair must be divisible by cp_size so the "
             "single-rank benchmark has production-shaped equal CP padding"
         )
     if args.warmup < 1 or args.repeats < 1:
@@ -705,24 +719,29 @@ def _main(args: argparse.Namespace) -> None:
     print("DeepSeek-V4-Flash prefill function benchmark")
     print(f"device={torch.cuda.get_device_name(device)}")
     print(
-        f"prefix={args.prefix_len}, extend={args.extend_len}, "
-        f"context={args.prefix_len + args.extend_len}, "
+        f"prefix={args.prefix_len}, extends={extend_lens}, "
+        f"contexts={[args.prefix_len + extend_len for extend_len in extend_lens]}, "
         f"cp={args.cp_size}, rank={args.cp_rank}"
     )
     print(
-        f"batches={sorted(set(args.batch_sizes))}, heads={args.num_heads}, "
+        f"batches={batch_sizes}, heads={args.num_heads}, "
         f"warmup={args.warmup}, repeats={args.repeats}"
     )
     print("Q/indices are CP-v2 interleave rank-local; KV capacity is global-context.")
     print("sparse timing includes dequant/workspace/index-combine; CP/NCCL is excluded")
 
     rows: list[dict[str, object]] = []
-    for batch_index, batch_size in enumerate(sorted(set(args.batch_sizes))):
+    case_shapes = [
+        (extend_len, batch_size)
+        for extend_len in extend_lens
+        for batch_size in batch_sizes
+    ]
+    for shape_index, (extend_len, batch_size) in enumerate(case_shapes):
         for ratio_index, compress_ratio in enumerate(args.compress_ratios):
             try:
                 case = build_case(
                     prefix_len=args.prefix_len,
-                    extend_len=args.extend_len,
+                    extend_len=extend_len,
                     batch_size=batch_size,
                     cp_size=args.cp_size,
                     cp_rank=args.cp_rank,
@@ -736,7 +755,7 @@ def _main(args: argparse.Namespace) -> None:
 
                 # Alternate the first measured path by batch size to reduce
                 # persistent clock/thermal ordering bias.
-                if (batch_index + ratio_index) % 2 == 0:
+                if (shape_index + ratio_index) % 2 == 0:
                     sparse_timing, sparse_out = benchmark_cuda(
                         sparse_call, warmup=args.warmup, repeats=args.repeats
                     )
@@ -770,12 +789,12 @@ def _main(args: argparse.Namespace) -> None:
                 speedup = dense_timing.median_ms / sparse_timing.median_ms
                 row: dict[str, object] = {
                     "prefix_len": args.prefix_len,
-                    "extend_len": args.extend_len,
-                    "context_len": args.prefix_len + args.extend_len,
+                    "extend_len": extend_len,
+                    "context_len": args.prefix_len + extend_len,
                     "batch_size": batch_size,
                     "cp_size": args.cp_size,
                     "cp_rank": args.cp_rank,
-                    "global_q_tokens": batch_size * args.extend_len,
+                    "global_q_tokens": batch_size * extend_len,
                     "local_q_tokens": case.local_q_tokens,
                     "compress_ratio": compress_ratio,
                     "sparse_mean_ms": sparse_timing.mean_ms,
@@ -794,7 +813,7 @@ def _main(args: argparse.Namespace) -> None:
                 del case, sparse_out, dense_out, sparse_call, dense_call
             except torch.OutOfMemoryError as exc:
                 print(
-                    f"OOM: prefix={args.prefix_len}, extend={args.extend_len}, "
+                    f"OOM: prefix={args.prefix_len}, extend={extend_len}, "
                     f"batch={batch_size}, "
                     f"C{compress_ratio}: {exc}",
                     flush=True,
@@ -823,16 +842,24 @@ def _main(args: argparse.Namespace) -> None:
         )
 
     print("\nFirst measured sparse-winning batch size:")
-    for ratio in args.compress_ratios:
-        sparse_wins = [
+    for extend_len in extend_lens:
+        print(f"extend={extend_len}:")
+        for ratio in args.compress_ratios:
+            sparse_wins = [
+                int(row["batch_size"])
+                for row in rows
+                if int(row["extend_len"]) == extend_len
+                and int(row["compress_ratio"]) == ratio
+                and row["winner"] == "sparse"
+            ]
+            print(f"  C{ratio}: {min(sparse_wins) if sparse_wins else 'not found'}")
+        weighted_wins = [
             int(row["batch_size"])
-            for row in rows
-            if int(row["compress_ratio"]) == ratio and row["winner"] == "sparse"
+            for row in weighted
+            if int(row["extend_len"]) == extend_len and row["winner"] == "sparse"
         ]
-        print(f"C{ratio}: {min(sparse_wins) if sparse_wins else 'not found'}")
-    weighted_wins = [row["batch_size"] for row in weighted if row["winner"] == "sparse"]
-    if weighted:
-        print(f"weighted: {min(weighted_wins) if weighted_wins else 'not found'}")
+        if any(int(row["extend_len"]) == extend_len for row in weighted):
+            print(f"  weighted: {min(weighted_wins) if weighted_wins else 'not found'}")
     print(f"CSV: {csv_path.resolve()}")
 
 
@@ -852,11 +879,9 @@ def main() -> None:
         attn_cp_rank=args.cp_rank,
     ):
         init_cp_strategy(
-            SimpleNamespace(
-                enable_prefill_cp=True,
-                attn_cp_size=args.cp_size,
-                cp_strategy="interleave",
-            )
+            enable_prefill_cp=True,
+            cp_size=args.cp_size,
+            cp_strategy="interleave",
         )
         if not hasattr(DeepseekV4AttnBackend, "_get_or_build_sparse_prefill_cache"):
             raise SystemExit(
