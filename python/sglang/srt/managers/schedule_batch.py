@@ -2839,6 +2839,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
+    def convert_decode_to_extend(self):
+        """View every decode request as a 1-token extend with its context as
+        prefix, making this a plain extend (prefill) batch. Called after the
+        DP mlp-sync when a peer rank runs extend, so this rank replays the
+        extend graphs; requires prepare_for_decode(); token count unchanged.
+        """
+        bs = self.batch_size()
+        self.forward_mode = ForwardMode.EXTEND
+        # Stale residue from this object's life as a prefill batch; the
+        # extend-merge path would exclude (silently drop) that req otherwise.
+        self.chunked_req = None
+        # Also stale residue; None keeps the prefill result path from
+        # re-reporting old prefill stats for what is decode work.
+        self.prefill_stats = None
+        for req in self.reqs:
+            req._refresh_fill_ids()
+            full_len = len(req.full_untruncated_fill_ids)
+            req.set_extend_range(full_len - 1, full_len)
+
+        # Same one-step output_ids delay handling as mix_with_running.
+        delta = 0 if self.enable_overlap else -1
+        self.prefix_lens = [
+            len(r.origin_input_ids) + len(r.output_ids) + delta for r in self.reqs
+        ]
+        self.extend_lens = [1] * bs
+        self.extend_num_tokens = bs
+        self.extend_logprob_start_lens = [0] * bs
+        self.decoding_reqs = self.reqs
+        self.is_prefill_only = False
+
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
