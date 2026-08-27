@@ -4840,12 +4840,8 @@ class ServerArgs:
 
     def _handle_cuda_graph_config(self):
         cfg = resolving_view(self)
-        from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
         self._parse_cuda_graph_config()
-        # Reads the resolved per-phase backends; must precede the compat rules
-        # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
-        disable_kimi_k3_symm_mem(self)
         self._apply_cuda_graph_compatibility()
         self._apply_deepep_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
