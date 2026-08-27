@@ -62,11 +62,16 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_sm120_supported, logger
+from sglang.srt.utils import is_sm120_supported, is_sm121, logger
+from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _should_interleave_ple_table() -> bool:
+    return is_sm120_supported() and not is_sm121()
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -796,15 +801,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        cpu_weight = nn.Parameter(
-            torch.empty(
-                source_weight.shape,
-                dtype=source_weight.dtype,
-                device="cpu",
-                pin_memory=True,
-            ),
-            requires_grad=False,
+        # The GPU reads this table over PCIe, so it does not need to sit on the
+        # NUMA node local to the GPU; spreading it keeps a multi-GiB shard from
+        # exhausting a single node (see allocate_interleaved_pinned_table).
+        pinned_data, self._pinned_buffer = allocate_interleaved_pinned_table(
+            tuple(source_weight.shape),
+            source_weight.dtype,
+            interleave=_should_interleave_ple_table(),
         )
+        cpu_weight = nn.Parameter(pinned_data, requires_grad=False)
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader

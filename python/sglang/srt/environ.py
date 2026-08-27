@@ -294,6 +294,11 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Spread the offloaded Qwen4-Exp PLE table over all NUMA nodes instead of
+    # letting it land entirely on the node local to the GPU. The GPU reads the
+    # table over PCIe, so node locality buys nothing while a node-local table
+    # can exhaust a small node. Set to 0 to keep the plain node-local pinning.
+    SGLANG_PLE_OFFLOAD_NUMA_INTERLEAVE = EnvBool(True)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
