@@ -7,17 +7,13 @@ error anywhere. These tests pin the conversion.
 
 SGLang publishes KV events carrying ``hash_str_to_int64(page_hash)`` -- the
 leading 16 hex chars of the SHA256 digest, reinterpreted as a signed int64. The
-router indexes that value as ``ExternalSequenceBlockHash(u64)`` and echoes it
-back in the hint as a bare JSON number. So the round trip
-``page hash -> event int64 -> u64 -> hint -> page key`` must land back on the
-same 16 hex chars the store compares against.
+router indexes that as ``ExternalSequenceBlockHash(u64)`` and echoes it back in
+the hint as a bare JSON number, so ``page hash -> event int64 -> u64 -> hint ->
+page key`` must land back on the same 16 hex chars the store compares against.
 
 The hint travels inside the v0.1 KV-hint envelope (dynamo #13134, SGLang RFC
 #36224) as a ``kv.source_locations@1.0`` action; ``EnvelopeTest`` covers that
-outer layer, everything else covers the payload.
-
-Unlike ``test_kvcr_router_hint_e2e.py``, this needs no ``kvcr`` wheel: it is the
-pure parse/normalize layer.
+outer layer, everything else covers the payload. Needs no ``kvcr`` wheel.
 
     python -m pytest test/registered/mem_cache/test_kvcr_router_hint_schema.py -v
 """

@@ -19,13 +19,8 @@ were responsible for returning:
   every backed-up node holds its host reference forever.
 
 None of this raises anywhere visible. The engine keeps serving, every request
-reports an ordinary cache miss, and the host pool quietly drains.
-
-These tests drive the real loop functions against a backend that raises, so
-they assert the *framework's* behaviour rather than a description of it. That is
-the point: the conclusion "a backend must never raise" is what obliges every
-backend -- including KVCR's -- to guard its own surface, and it is worth pinning
-down rather than restating in a comment.
+reports an ordinary cache miss, and the host pool quietly drains. That is what
+obliges every backend -- including KVCR's -- to guard its own surface.
 
 What turns this red: adding a general ``except Exception`` to those loops
 upstream. That would be a fix, and these tests should then be replaced by ones

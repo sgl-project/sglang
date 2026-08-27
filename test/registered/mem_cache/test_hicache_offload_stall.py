@@ -9,16 +9,14 @@ larger than the host pool, the host pool fills first, GPU eviction never fires,
 nothing is ever evictable, and offload stops for the life of the process.
 
 Measured on the 2-worker KVCR POC (Qwen3-8B, page-size 64, ~19-page prefixes):
-offload froze at 1680 of 1696 host pages after 90 prefixes and never resumed;
-halving the host pool to 848 pages moved the freeze to 844 pages after 46
-prefixes; making the device pool smaller than the host pool removed it entirely
-and offload then ran past the host pool size (2354 pages), i.e. pages recycled.
+offload froze at 1680 of 1696 host pages and never resumed; halving the host pool
+moved the freeze to 844 pages; making the device pool smaller than the host pool
+removed it entirely, and offload then ran past the host pool size.
 
-Nothing errors on this path. L2 write-through and L3 offload both just stop, and
-every later request reports an ordinary cache miss -- which is why localizing it
-on the POC took three rounds of instrumentation. The warning is the fix that is
-available here: the reclaim rule itself is HiRadixCache's, but an operator who
-sees this line knows to raise ``--hicache-size``.
+Nothing errors on this path: L2 write-through and L3 offload just stop, and every
+later request reports an ordinary cache miss. The warning is the fix available
+here -- the reclaim rule itself is HiRadixCache's, but an operator who sees this
+line knows to raise ``--hicache-size``.
 
 What turns this red: deleting the ``_log_offload_stalled()`` call from
 ``write_backup``'s ``host_indices is None`` branch, or narrowing the warning so

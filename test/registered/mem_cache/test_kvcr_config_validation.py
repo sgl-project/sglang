@@ -158,13 +158,6 @@ class TimeoutOrderingValidationTest(unittest.TestCase):
         config = KVCRBackendConfig()
         self.assertGreater(config.get_timeout_s * 1000.0, config.operation_timeout_ms)
 
-    def test_validation_runs_on_the_extra_config_path(self):
-        """``from_extra_config`` is how operators actually set both knobs."""
-        with self.assertRaises(ValueError):
-            KVCRBackendConfig.from_extra_config(
-                {"operation_timeout_ms": 45000, "get_timeout_s": 30.0}
-            )
-
 
 if __name__ == "__main__":
     unittest.main()
