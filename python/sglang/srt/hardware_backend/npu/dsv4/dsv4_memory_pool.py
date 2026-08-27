@@ -22,7 +22,7 @@ import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -32,12 +32,12 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.runtime_context import get_schedule
 
-_A5_KV_QUANT_GROUP_SIZE = 64
-_A5_KV_ROW_ALIGNMENT = 128
+_NPU_ARCH35_KV_QUANT_GROUP_SIZE = 64
+_NPU_ARCH35_KV_ROW_ALIGNMENT = 128
 
 
-def _is_atlas_a5() -> bool:
-    return has_npu_a5_support()
+def _is_npu_arch35() -> bool:
+    return is_npu_arch35()
 
 
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
@@ -62,15 +62,18 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     def a5_packed_kv_dim(self) -> int:
         nope_dim = self.qk_nope_head_dim
         rope_dim = self.qk_rope_head_dim
-        scale_dim = math.ceil(nope_dim / _A5_KV_QUANT_GROUP_SIZE)
+        scale_dim = math.ceil(nope_dim / _NPU_ARCH35_KV_QUANT_GROUP_SIZE)
         bytes_per_token = nope_dim + rope_dim * 2 + scale_dim
-        return math.ceil(bytes_per_token / _A5_KV_ROW_ALIGNMENT) * _A5_KV_ROW_ALIGNMENT
+        return (
+            math.ceil(bytes_per_token / _NPU_ARCH35_KV_ROW_ALIGNMENT)
+            * _NPU_ARCH35_KV_ROW_ALIGNMENT
+        )
 
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             kv_dim = self.a5_packed_kv_dim
             kv_dtype = torch.float8_e4m3fn
         else:
@@ -188,7 +191,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         super()._create_buffer()
         kp = self._kernel_page_size
         npu_num_pages = (self.size + kp + 1) // kp
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             index_k_dtype, index_scale_dtype = torch.float8_e4m3fn, torch.float32
         else:
             index_k_dtype, index_scale_dtype = torch.int8, torch.float16
@@ -336,7 +339,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # explicit-location path can share the smaller flat pool, but the A5
         # cycle ABI needs enough physical banks for every req_pool_idx.
         size = self._state_pool_size(ratio)
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
@@ -357,7 +360,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # slot_dim (indexer_head_dim vs attention head_dim).
         ring_size = self.get_ring_size(ratio)
         size = self.c4_state_pool_size
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
@@ -529,7 +532,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """
         # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
         buf = self.swa_kv_pool.kv_buffer[layer_id]
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
@@ -565,7 +568,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             buf.view(-1, 1, buf.shape[-1]),
             cache_2d,
             slot_mapping,
-            quant_group_size=_A5_KV_QUANT_GROUP_SIZE,
+            quant_group_size=_NPU_ARCH35_KV_QUANT_GROUP_SIZE,
             quant_mode=2,
             round_scale_flag=True,
             layout=1,
@@ -643,7 +646,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
-            if _is_atlas_a5():
+            if _is_npu_arch35():
                 self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)

@@ -17,7 +17,7 @@ class TestNPUFP4MethodGate(unittest.TestCase):
         with (
             patch("sglang.srt.layers.quantization.fp8.is_npu", return_value=True),
             patch(
-                "sglang.srt.layers.quantization.fp8.has_npu_a5_support",
+                "sglang.srt.layers.quantization.fp8.is_npu_arch35",
                 return_value=False,
             ),
         ):

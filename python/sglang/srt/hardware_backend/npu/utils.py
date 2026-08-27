@@ -25,19 +25,14 @@ gva_is_inited = False
 
 
 @functools.lru_cache(maxsize=1)
-def has_npu_a5_support() -> bool:
-    """Whether the runtime is on Atlas A5 (Ascend 950) hardware.
-
-    Probing the device name is more robust than checking for a single kernel
-    op: the latter depends on wheel contents and import order, while the device
-    name is a stable hardware fact.
-    """
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
     if not is_npu():
         return False
 
-    import torch_npu
+    import acl
 
-    return torch_npu.npu.get_device_name(0).startswith("Ascend950")
+    return acl.rt.get_device_info(0, 601) == (3501, 0)
 
 
 class NPUACLFormat(IntEnum):

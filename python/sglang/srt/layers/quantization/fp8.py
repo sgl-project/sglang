@@ -23,7 +23,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -402,7 +402,7 @@ class Fp8Config(QuantizationConfig):
                 ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
                 return fp8_method
 
-            if self.is_fp4_experts and is_npu() and has_npu_a5_support():
+            if self.is_fp4_experts and is_npu() and is_npu_arch35():
                 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
                     NPUW4A4Fp4MoEMethod,
                 )
@@ -701,7 +701,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
             return
-        elif _is_npu and has_npu_a5_support():
+        elif _is_npu and is_npu_arch35():
             self._process_npu_a5_mxfp8_linear_weights(layer)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
