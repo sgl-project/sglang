@@ -407,6 +407,33 @@ def test_hicache_write_through_and_load_back_round_trip():
     core.sanity_check([], [])
 
 
+def test_write_through_load_back_is_unpinned_and_refreshes_duplicate_tracking():
+    core = _tree_core()
+    core.set_hicache_enabled()
+    root = core.root_node_handle()
+    leaf = core.insert_host(
+        root, _key([1]), torch.tensor([100], dtype=torch.int64), ["h0"]
+    ).inserted_host_node
+    assert leaf is not None
+
+    kv_xfer, comp_xfers = core.build_load_back_spec(leaf)
+    core.commit_load_back(
+        leaf, torch.tensor([50], dtype=torch.int64), kv_xfer, comp_xfers
+    )
+
+    # Write-through load-back does not pin Full KV against device eviction.
+    core.evict_device_start(ComponentType.FULL, 1)
+    candidate = core.evict_device_next_node(
+        ComponentType.FULL, {ComponentType.FULL: 0}
+    ).node_id
+    core.evict_device_end(ComponentType.FULL)
+    assert candidate == leaf
+
+    # insert_host created no stale duplicate entry, so this checks the ack refresh.
+    core.finish_load_back(leaf)
+    core.sanity_check([], [])
+
+
 def test_insert_host_extends_the_backuped_path():
     core = _tree_core()
     core.set_hicache_enabled()
@@ -742,6 +769,81 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
         sliding_window_size=window,
         **params_overrides,
     )
+
+
+def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
+    core = _swa_tree_core(window=4)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    core.is_write_back = True
+    root = core.root_node_handle()
+    shared = core.insert_host(
+        root, _key([1]), torch.tensor([100], dtype=torch.int64), ["h0"]
+    ).inserted_host_node
+    anchor = core.insert_host(
+        root,
+        _key([1, 2]),
+        torch.tensor([100, 101], dtype=torch.int64),
+        ["h0", "h1"],
+    ).inserted_host_node
+    assert shared is not None and anchor is not None
+
+    core.commit_backup(
+        shared,
+        torch.empty(0, dtype=torch.int64),
+        {
+            ComponentType.SWA: [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.tensor([200], dtype=torch.int64),
+                )
+            ]
+        },
+    )
+    core.commit_load_back(
+        shared,
+        torch.tensor([10], dtype=torch.int64),
+        PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([100], dtype=torch.int64),
+            nodes_to_load=[shared],
+        ),
+        {},
+    )
+
+    # The first Full load is genuinely pinned while awaiting its own ack.
+    core.evict_device_start(ComponentType.FULL, 1)
+    candidate = core.evict_device_next_node(
+        ComponentType.FULL, {ComponentType.FULL: 0}
+    ).node_id
+    core.evict_device_end(ComponentType.FULL)
+    assert candidate is None
+
+    # Loading shared's SWA under another anchor must not claim its Full pin.
+    core.commit_load_back(
+        anchor,
+        torch.tensor([11], dtype=torch.int64),
+        PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([101], dtype=torch.int64),
+            nodes_to_load=[anchor],
+        ),
+        {
+            ComponentType.SWA: [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.tensor([200], dtype=torch.int64),
+                    device_indices=torch.tensor([20], dtype=torch.int64),
+                    nodes_to_load=[shared],
+                )
+            ]
+        },
+    )
+    assert core.get_component_device_value(shared, ComponentType.SWA).tolist() == [20]
+
+    core.finish_load_back(anchor)
+    core.finish_load_back(shared)
+    core.sanity_check([], [])
 
 
 def _swa_cache(window: int = 8, page_size: int = 1):

@@ -2941,27 +2941,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut cache_actions: Vec<CacheAction> = Vec::new();
         kv_xfer.device_indices = Some(device_indices);
         let nodes_to_load = kv_xfer.nodes_to_load.clone();
-        // Pin every host value read by the transfer until its ack.
-        for pinned_id in nodes_to_load
-            .iter()
-            .chain(
-                comp_xfers
-                    .values()
-                    .flatten()
-                    .filter_map(|xfer| xfer.nodes_to_load.as_ref()),
-            )
-            .flatten()
-            .copied()
-        {
-            let pinned_idx = self.arena.resolve(pinned_id);
-            let pinned = self.arena.node_mut(pinned_idx);
-            assert!(
-                pinned.load_back_pending_id.is_none_or(|id| id == anchor_id),
-                "node {pinned_id} pinned by load-back {:?}, new anchor {anchor_id}",
-                pinned.load_back_pending_id
-            );
-            pinned.load_back_pending_id = Some(anchor_id);
-            self.update_evictable_leaf_sets_(pinned_idx);
+        if self.is_write_back {
+            // Pin Full KV host slots against duplicate reclaim until the ack.
+            // Auxiliary pools have independent host locks and may legitimately
+            // load the same radix node under a different anchor.
+            for &pinned_id in nodes_to_load.iter().flatten() {
+                let pinned_idx = self.arena.resolve(pinned_id);
+                let pinned = self.arena.node_mut(pinned_idx);
+                assert!(
+                    pinned.load_back_pending_id.is_none_or(|id| id == anchor_id),
+                    "node {pinned_id} pinned by load-back {:?}, new anchor {anchor_id}",
+                    pinned.load_back_pending_id
+                );
+                pinned.load_back_pending_id = Some(anchor_id);
+                self.update_evictable_leaf_sets_(pinned_idx);
+            }
         }
         self.component_by_type_(BASE_COMPONENT_TYPE)
             .commit_hicache_transfer(
@@ -2993,19 +2987,27 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         cache_actions
     }
 
-    /// Clear load-back pins on the anchor's root path.
+    /// Finalize load-back state along the anchor's root path.
+    ///
+    /// Write-back clears matching Full KV source pins. Write-through has no
+    /// pins, but both policies refresh Full host/device duplicate tracking once
+    /// the device copies are visible.
     pub fn finish_load_back(&mut self, anchor_node_id: NodeId) {
         let mut node_id = Some(self.arena.resolve(anchor_node_id));
         while let Some(idx) = node_id {
             if self.arena.node(idx).is_root() {
                 break;
             }
-            if self.arena.node(idx).load_back_pending_id == Some(anchor_node_id) {
+            if self.is_write_back {
+                if self.arena.node(idx).load_back_pending_id != Some(anchor_node_id) {
+                    node_id = self.arena.node(idx).try_parent();
+                    continue;
+                }
                 self.arena.node_mut(idx).load_back_pending_id = None;
-                self.update_full_coexisting_host_tracking_(idx);
                 // The pin blocked leaf-set membership; re-evaluate it.
                 self.update_evictable_leaf_sets_(idx);
             }
+            self.update_full_coexisting_host_tracking_(idx);
             node_id = self.arena.node(idx).try_parent();
         }
     }

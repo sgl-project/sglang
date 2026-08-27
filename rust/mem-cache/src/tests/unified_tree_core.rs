@@ -3144,6 +3144,10 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
     let (parent, child) = backuped_chain(&mut tc);
     demote_node(&mut tc, child);
     demote_node(&mut tc, parent);
+    // Coexistence tracking is intentionally lazy and may retain stale entries
+    // after demotion. Remove them so this test observes the ack-time refresh.
+    tc.full_coexisting_host_nodes.discard(parent);
+    tc.full_coexisting_host_nodes.discard(child);
     let (kv_xfer, comp_xfers) =
         tc.build_load_back_spec(tc.arena.node(child).id, /* req = */ None);
     let actions = tc.commit_load_back(
@@ -3163,17 +3167,24 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
             .device_value(child, FULL)
             .equal(&Tensor::from_slice(&[52i64, 53]))
     );
+    // Write-through does not need an in-flight Full host pin. Duplicate
+    // tracking is refreshed only when the orchestrator acknowledges the load.
+    assert!(!tc.arena.node(parent).is_load_back_pending());
+    assert!(!tc.arena.node(child).is_load_back_pending());
+    assert!(!tc.full_coexisting_host_nodes.contains(parent));
+    assert!(!tc.full_coexisting_host_nodes.contains(child));
     assert_eq!(tc.full_evictable_size(), 4);
     // The orchestrator re-locks the loaded path right after commit; that lock walk
     // also re-evaluates the parent's transient D-leaf membership.
     tc.inc_lock_ref(tc.arena.node(child).id);
-    tc.sanity_check(&[], &[(1, tc.arena.node(child).id)]);
     tc.dec_lock_ref(
         tc.arena.node(child).id,
         /* params = */ None,
         /* skip_swa = */ false,
     );
     tc.finish_load_back(tc.arena.node(child).id);
+    assert!(tc.full_coexisting_host_nodes.contains(parent));
+    assert!(tc.full_coexisting_host_nodes.contains(child));
     tc.sanity_check(&[], &[]);
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4]));
     assert!(
@@ -3185,10 +3196,18 @@ fn commit_load_back_reattaches_device_slices_and_restores_the_match() {
 
 #[test]
 fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
-    let mut tc = core();
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            ..CacheInitParams::default()
+        },
+        vec![FULL],
+    );
     let (parent, child) = backuped_chain(&mut tc);
     demote_node(&mut tc, child);
     demote_node(&mut tc, parent);
+    tc.full_coexisting_host_nodes.discard(parent);
+    tc.full_coexisting_host_nodes.discard(child);
     let (kv_xfer, comp_xfers) =
         tc.build_load_back_spec(tc.arena.node(child).id, /* req = */ None);
     tc.commit_load_back(
@@ -3197,6 +3216,11 @@ fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
         kv_xfer,
         comp_xfers,
     );
+    let anchor_id = tc.arena.node(child).id;
+    assert_eq!(tc.arena.node(parent).load_back_pending_id, Some(anchor_id));
+    assert_eq!(tc.arena.node(child).load_back_pending_id, Some(anchor_id));
+    assert!(!tc.full_coexisting_host_nodes.contains(parent));
+    assert!(!tc.full_coexisting_host_nodes.contains(child));
     // The pin alone keeps the in-flight chain out of device eviction.
     tc.evict_device_start(FULL, 4);
     let (next, _) = tc.evict_device_next_node(FULL, &HashMap::new());
@@ -3205,6 +3229,10 @@ fn device_eviction_and_demote_skip_a_load_back_pinned_chain() {
     tc.demote(tc.arena.node(child).id);
     assert!(tc.arena.has_device_value(child, FULL));
     tc.finish_load_back(tc.arena.node(child).id);
+    assert!(!tc.arena.node(parent).is_load_back_pending());
+    assert!(!tc.arena.node(child).is_load_back_pending());
+    assert!(tc.full_coexisting_host_nodes.contains(parent));
+    assert!(tc.full_coexisting_host_nodes.contains(child));
     // The ack re-arms leaf-set membership and demotion.
     tc.evict_device_start(FULL, 4);
     let (next, _) = tc.evict_device_next_node(FULL, &HashMap::new());

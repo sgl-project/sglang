@@ -4299,9 +4299,67 @@ fn build_load_back_spec_includes_the_swa_transfers() {
 }
 
 #[test]
+fn auxiliary_load_does_not_reuse_a_full_pending_pin() {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(4)
+        },
+        vec![FULL, SWA],
+    );
+    let [shared, anchor_b] = chain::<2>(&mut tc);
+    set_full_host(&mut tc, shared);
+    set_full_host(&mut tc, anchor_b);
+    set_swa_host(&mut tc, shared);
+
+    let shared_id = tc.arena.node(shared).id;
+    let anchor_b_id = tc.arena.node(anchor_b).id;
+    tc.commit_load_back(
+        shared_id,
+        Tensor::from_slice(&[10i64]),
+        PoolTransfer {
+            name: PoolName::Kv,
+            host_indices: Some(Tensor::from_slice(&[1i64])),
+            nodes_to_load: Some(vec![shared_id]),
+            ..Default::default()
+        },
+        HashMap::new(),
+    );
+    assert_eq!(tc.arena.node(shared).load_back_pending_id, Some(shared_id));
+
+    let swa_xfer = PoolTransfer {
+        name: PoolName::Swa,
+        host_indices: Some(Tensor::from_slice(&[2i64])),
+        device_indices: Some(Tensor::from_slice(&[20i64])),
+        nodes_to_load: Some(vec![shared_id]),
+        ..Default::default()
+    };
+    tc.commit_load_back(
+        anchor_b_id,
+        Tensor::from_slice(&[30i64]),
+        PoolTransfer {
+            name: PoolName::Kv,
+            host_indices: Some(Tensor::from_slice(&[3i64])),
+            nodes_to_load: Some(vec![anchor_b_id]),
+            ..Default::default()
+        },
+        HashMap::from([(SWA, vec![swa_xfer])]),
+    );
+
+    assert_eq!(tc.arena.node(shared).load_back_pending_id, Some(shared_id));
+    assert_eq!(
+        tc.arena.node(anchor_b).load_back_pending_id,
+        Some(anchor_b_id)
+    );
+}
+
+#[test]
 fn swa_device_eviction_skips_a_load_back_pinned_node() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
+            is_write_back: true,
             enable_hicache: true,
             has_swa_host_pool: true,
             ..swa_params_with_window(4)
@@ -4337,6 +4395,7 @@ fn swa_device_eviction_skips_a_load_back_pinned_node() {
 fn swa_host_eviction_skips_a_load_back_pinned_node() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
+            is_write_back: true,
             enable_hicache: true,
             has_swa_host_pool: true,
             ..swa_params_with_window(1)
@@ -4372,7 +4431,9 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
     let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
     assert_eq!(result.tracker[&SWA], 1);
     assert_eq!(result.host_frees[&SWA].len(), 1);
-    assert!(!tc.arena.has_host_value(a, SWA));
+    // Write-back reclaims the loaded node's coexisting host duplicate first.
+    assert!(tc.arena.has_host_value(a, SWA));
+    assert!(!tc.arena.has_host_value(b, SWA));
     tc.sanity_check(&[], &[]);
 }
 
@@ -4380,6 +4441,7 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
 fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
+            is_write_back: true,
             enable_hicache: true,
             has_swa_host_pool: true,
             ..swa_params_with_window(4)

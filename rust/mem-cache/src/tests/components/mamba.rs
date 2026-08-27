@@ -1032,6 +1032,7 @@ fn load_back_commit_moves_the_node_onto_the_device_tier() {
 #[test]
 fn mamba_device_eviction_skips_a_load_back_pinned_node() {
     let mut tc = mamba_core(/* page_size = */ 1);
+    tc.is_write_back = true;
     let [n] = chain::<1>(&mut tc);
     set_full_host(&mut tc, n, 10);
     set_mamba_host(&mut tc, n, 20);
@@ -1061,6 +1062,7 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
 #[test]
 fn mamba_host_eviction_skips_a_load_back_pinned_node() {
     let mut tc = mamba_core(/* page_size = */ 1);
+    tc.is_write_back = true;
     let [a, b] = chain::<2>(&mut tc);
     set_full_host(&mut tc, a, 10);
     set_full_host(&mut tc, b, 11);

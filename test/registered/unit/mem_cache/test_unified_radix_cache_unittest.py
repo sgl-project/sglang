@@ -597,6 +597,79 @@ def build_fixture(
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
+    """Run Full load-back ownership semantics through either TreeCore backend."""
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA),
+        sliding_window_size=4,
+    )
+
+    def test_auxiliary_load_does_not_reuse_full_pending_pin(self):
+        cache, _, _ = build_fixture(self.cfg)
+        core = cache.tree_core
+        core.is_write_back = True
+
+        root = cache.root_node_handle()
+
+        def insert_host(tokens, indices, hashes):
+            return core.insert_host(
+                root,
+                RadixKey(array("q", tokens)),
+                torch.tensor(indices, dtype=torch.int64),
+                hashes,
+            ).inserted_host_node
+
+        def full_transfer(node_id, host_index):
+            return PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.tensor([host_index], dtype=torch.int64),
+                nodes_to_load=[node_id],
+            )
+
+        shared = insert_host([1], [100], ["h0"])
+        anchor_b = insert_host([1, 2], [100, 101], ["h0", "h1"])
+        self.assertIsNotNone(shared)
+        self.assertIsNotNone(anchor_b)
+
+        core.set_component_host_value_raw(
+            shared, ComponentType.SWA, torch.tensor([200], dtype=torch.int64)
+        )
+        core.commit_load_back(
+            shared,
+            torch.tensor([10], dtype=torch.int64),
+            full_transfer(shared, 100),
+            {},
+        )
+
+        actions = core.commit_load_back(
+            anchor_b,
+            torch.tensor([11], dtype=torch.int64),
+            full_transfer(anchor_b, 101),
+            {
+                ComponentType.SWA: [
+                    PoolTransfer(
+                        name=PoolName.SWA,
+                        host_indices=torch.tensor([200], dtype=torch.int64),
+                        device_indices=torch.tensor([20], dtype=torch.int64),
+                        nodes_to_load=[shared],
+                    )
+                ]
+            },
+        )
+
+        self.assertEqual(
+            _device_value(cache, shared, ComponentType.SWA).tolist(), [20]
+        )
+        self.assertTrue(
+            any(isinstance(action, RebuildFullToSWAMapping) for action in actions)
+        )
+        core.finish_load_back(anchor_b)
+        core.finish_load_back(shared)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
     """Allocation targets are observed between real auxiliary-tree steps."""
 
