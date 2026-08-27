@@ -38,13 +38,20 @@ def fast_kpool_topk_transform_fused(
     row_starts: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     page_table_row_index: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_raw_indices: bool = False,
+):
     """
     Pool-level radix top-k for the NSA kpool indexer.
 
     Selects pool groups from ``score`` at pool granularity, expands each selected
     group to ``pool_size`` token indices, and optionally transforms those token
     indices through a page table or a ragged offset.
+
+    With ``return_raw_indices=True`` also returns the same selection as
+    sequence-relative token positions (before the page-table/ragged remap),
+    written by the same kernel launch so the two outputs come from a single
+    radix top-k pass (race-dependent ties stay consistent). Returns
+    ``(dst_token_indices, raw_token_indices)`` in that case.
     """
     assert topk % pool_size == 0
     group_topk = topk // pool_size
@@ -64,6 +71,11 @@ def fast_kpool_topk_transform_fused(
 
     out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
     dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
+    raw_token_indices = (
+        score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
+        if return_raw_indices
+        else None
+    )
 
     module = _jit_kpool_topk_transform_module(group_topk)
     module.kpool_topk_transform(
@@ -76,5 +88,8 @@ def fast_kpool_topk_transform_fused(
         row_starts,
         seq_lens,
         page_table_row_index,
+        raw_token_indices,
     )
+    if return_raw_indices:
+        return dst_token_indices, raw_token_indices
     return dst_token_indices

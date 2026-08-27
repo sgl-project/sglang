@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -91,6 +92,14 @@ class IndexerKPool(MultiPlatformOp):
         self.index_kpool = config.index_kpool
         self.index_kpool_always_select_tail = config.index_kpool_always_select_tail
         self.index_kpool_compress = config.index_kpool_compress
+
+        # Rollout indexer-topk capture (R3 replay): the capturer buffer is
+        # indexed by DSA-layer ordinal (hybrid KDA/DSA models like glm5_next
+        # only carry indexers on the full-attention layers). None for layers
+        # with no capturer slot (e.g. the NextN draft layer).
+        from sglang.srt.configs.model_config import get_indexer_layer_ordinal
+
+        self.capture_ordinal = get_indexer_layer_ordinal(config, layer_id)
 
         assert (
             self.index_kpool > 1
@@ -673,9 +682,47 @@ class IndexerKPool(MultiPlatformOp):
             key[..., : self.rope_head_dim] = k_rope
         return key
 
-    def _full_topk_for_short_sequence(
-        self, metadata: BaseIndexerMetadata, device: torch.device
+    def _should_capture_raw_indices(self) -> bool:
+        return (
+            self.capture_ordinal is not None
+            and get_global_indexer_capturer() is not None
+        )
+
+    def _capture_and_return(
+        self, topk_result: torch.Tensor, raw_result: Optional[torch.Tensor]
     ) -> torch.Tensor:
+        """Capture the sequence-relative topk for rollout R3 replay.
+
+        The attention kernel still receives the transformed (paged/ragged
+        kv-cache) indices in ``topk_result``. Only the ``index_topk``-wide
+        token expansion of the pool budget is captured; the deterministic
+        always-select tail lives in the extra ``index_kpool - 1`` columns and
+        is reconstructed on the training side (for short sequences the whole
+        selection, tail included, already fits in the first ``index_topk``
+        columns).
+        """
+        if not self._should_capture_raw_indices():
+            return topk_result
+        if raw_result is None:
+            # Never capture the transformed (kv-coordinate) indices: replaying
+            # them as token positions would silently corrupt training.
+            raise RuntimeError(
+                "indexer-topk capture is enabled but this kpool path produced "
+                "no raw (sequence-relative) indices"
+            )
+        capturer = get_global_indexer_capturer()
+        capturer.capture(
+            layer_id=self.capture_ordinal,
+            topk_indices=raw_result[:, : self.index_topk],
+        )
+        return topk_result
+
+    def _full_topk_for_short_sequence(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+        return_raw_indices: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
@@ -683,16 +730,22 @@ class IndexerKPool(MultiPlatformOp):
             dtype=torch.float32,
             device=device,
         )
-        topk_full = metadata.topk_transform(dummy_logits, self.index_topk)
+        if return_raw_indices:
+            topk_full, raw_result = metadata.topk_transform(
+                dummy_logits, self.index_topk, return_raw_indices=True
+            )
+        else:
+            topk_full = metadata.topk_transform(dummy_logits, self.index_topk)
+            raw_result = None
         if self.index_kpool == 1:
-            return topk_full
+            return topk_full, raw_result
         padding = torch.full(
             (topk_full.shape[0], self.index_kpool - 1),
             -1,
             dtype=topk_full.dtype,
             device=topk_full.device,
         )
-        return torch.cat([topk_full, padding], dim=1)
+        return torch.cat([topk_full, padding], dim=1), raw_result
 
     def _topk_from_kpool_logits(
         self,
@@ -704,7 +757,8 @@ class IndexerKPool(MultiPlatformOp):
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_raw_indices: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
         )
@@ -721,7 +775,7 @@ class IndexerKPool(MultiPlatformOp):
         if page_table_row_index is not None and page_table_row_index.shape[0] != n_rows:
             page_table_row_index = page_table_row_index[:n_rows]
 
-        return topk_from_pooled_history_logits(
+        result = topk_from_pooled_history_logits(
             logits=logits,
             group_lengths=pool_lens,
             pool_size=self.index_kpool,
@@ -732,7 +786,11 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=row_starts,
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
+            return_raw_indices=return_raw_indices,
         )
+        if return_raw_indices:
+            return result
+        return result, None
 
     def _get_kpool_decode_metadata(
         self,
@@ -841,7 +899,7 @@ class IndexerKPool(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -919,15 +977,16 @@ class IndexerKPool(MultiPlatformOp):
             )
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
-        topk_result = self._topk_from_kpool_logits(
+        topk_result, raw_result = self._topk_from_kpool_logits(
             logits,
             pool_seqlens,
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
             out_rows=num_q_padded if num_q_padded != n_real else None,
+            return_raw_indices=self._should_capture_raw_indices(),
         )
-        return topk_result
+        return topk_result, raw_result
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
@@ -955,7 +1014,7 @@ class IndexerKPool(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             gather_index_k_scale_prefix_into,
         )
@@ -1041,6 +1100,7 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
+            return_raw_indices=self._should_capture_raw_indices(),
         )
 
     def _get_topk_ragged_with_cp(
@@ -1053,7 +1113,7 @@ class IndexerKPool(MultiPlatformOp):
         kv_len: int,
         actual_seq_q: int,
         cp_index: Optional[List[Tuple[int, int, int]]] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             build_pooled_page_table_64,
             gather_index_k_scale_prefix_into,
@@ -1149,6 +1209,7 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets=None,
             row_starts=ks,
             out_rows=out_rows,
+            return_raw_indices=self._should_capture_raw_indices(),
         )
 
     def _get_topk_ragged_kpool(
@@ -1161,7 +1222,7 @@ class IndexerKPool(MultiPlatformOp):
         extend_pooled_cache: Optional[
             List[Optional[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]]
         ] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             build_pooled_page_table_64,
             gather_index_k_scale_prefix_into,
@@ -1181,6 +1242,8 @@ class IndexerKPool(MultiPlatformOp):
             device=q_fp8.device,
             dtype=torch.int32,
         )
+        capture = self._should_capture_raw_indices()
+        raw_result = torch.full_like(topk_result, -1) if capture else None
         block_tables = metadata.get_page_table_64()
         seq_lens_expanded = metadata.get_seqlens_expanded()
         topk_method = metadata.topk_transform_method
@@ -1381,15 +1444,18 @@ class IndexerKPool(MultiPlatformOp):
             ):
                 topk_offsets_local = topk_offsets[q_slice]
 
-            local_topk = self._topk_from_kpool_logits(
+            local_topk, local_raw = self._topk_from_kpool_logits(
                 local_logits,
                 local_pool_lens,
                 seq_lens=local_seqlens,
                 page_table=page_table_local,
                 topk_offsets=topk_offsets_local,
+                return_raw_indices=capture,
             )
 
             topk_result[q_slice] = local_topk
+            if capture:
+                raw_result[q_slice] = local_raw
             if pool_seq_len > 0 and deferred_cache_write is not None:
                 write_locs, curr_k_fp8, curr_k_scale = deferred_cache_write
                 self._write_returned_compressed_pooled_index_cache(
@@ -1405,7 +1471,7 @@ class IndexerKPool(MultiPlatformOp):
             torch.cuda.current_stream().wait_stream(cache_write_stream)
             pending_cache_tensors.clear()
 
-        return topk_result
+        return topk_result, raw_result
 
     def _get_topk_ragged(
         self,
@@ -1417,7 +1483,7 @@ class IndexerKPool(MultiPlatformOp):
         kpool_extend_cache: Optional[
             List[Optional[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]]]
         ] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1453,7 +1519,7 @@ class IndexerKPool(MultiPlatformOp):
         act_quant,
         metadata: BaseIndexerMetadata,
         return_indices: bool = True,
-    ) -> Optional[torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         key = self._get_k_bf16(x, positions)
@@ -1466,10 +1532,19 @@ class IndexerKPool(MultiPlatformOp):
             metadata=metadata,
         )
 
-        if not return_indices:
-            return None
+        capture = self._should_capture_raw_indices()
+        if not return_indices and not capture:
+            return None, None
 
-        return self._full_topk_for_short_sequence(metadata, x.device)
+        # capture-only callers (dense MHA prefill) still need the raw
+        # (sequence-relative) selection for rollout R3 replay even though
+        # the attention kernel ignores the transformed indices.
+        topk_result, raw_result = self._full_topk_for_short_sequence(
+            metadata, x.device, return_raw_indices=capture
+        )
+        if not return_indices:
+            return None, raw_result
+        return topk_result, raw_result
 
     def _forward_cuda_target_verify(
         self,
@@ -1482,7 +1557,7 @@ class IndexerKPool(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         enable_dual_stream: bool,
         return_indices: bool = True,
-    ) -> Optional[torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         assert is_cuda(), "DSA kpool target_verify is CUDA-only"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
@@ -1546,7 +1621,7 @@ class IndexerKPool(MultiPlatformOp):
                 weights = self._get_logits_head_gate(x, q_scale)
 
         if not return_indices:
-            return None
+            return None, None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
     def forward_cuda(
@@ -1582,18 +1657,20 @@ class IndexerKPool(MultiPlatformOp):
         assert forward_batch.seq_lens_cpu is not None
         mode = forward_batch.forward_mode
         if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
-            return torch.full(
+            topk_result = torch.full(
                 (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
                 dtype=torch.int,
                 device=x.device,
             )
+            # -1 rows: replay treats them as padding tokens.
+            return self._capture_and_return(topk_result, topk_result)
 
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-            return self._forward_cuda_target_verify(
+            topk_result, raw_result = self._forward_cuda_target_verify(
                 x=x,
                 q_lora=q_lora,
                 positions=positions,
@@ -1604,6 +1681,9 @@ class IndexerKPool(MultiPlatformOp):
                 enable_dual_stream=enable_dual_stream,
                 return_indices=return_indices,
             )
+            if topk_result is None:
+                return None
+            return self._capture_and_return(topk_result, raw_result)
 
         # CUDA graph capture keeps the full topk path; the skip branch is extend-only.
         skip_logits_computation = False
@@ -1613,7 +1693,7 @@ class IndexerKPool(MultiPlatformOp):
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
-            return self._forward_cuda_skip_logits(
+            topk_result, raw_result = self._forward_cuda_skip_logits(
                 x,
                 positions,
                 forward_batch,
@@ -1622,6 +1702,12 @@ class IndexerKPool(MultiPlatformOp):
                 metadata,
                 return_indices,
             )
+            if raw_result is not None:
+                self._capture_and_return(
+                    topk_result if topk_result is not None else raw_result,
+                    raw_result,
+                )
+            return topk_result
 
         precompute_compress_gate = (
             self.index_kpool > 1
@@ -1691,6 +1777,9 @@ class IndexerKPool(MultiPlatformOp):
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not return_indices
+                # capture-only callers (dense MHA prefill above the short-seq
+                # threshold) still need the topk computed for R3 capture.
+                and not self._should_capture_raw_indices()
             ):
                 return None
 
@@ -1703,7 +1792,7 @@ class IndexerKPool(MultiPlatformOp):
                 or forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-                topk_result = self._get_topk_paged(
+                topk_result, raw_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
@@ -1726,7 +1815,7 @@ class IndexerKPool(MultiPlatformOp):
                     weights_prev, weights_next = torch.split(
                         weights, (weights.shape[0] + 1) // 2, dim=0
                     )
-                    topk_result_prev = self._get_topk_ragged_with_cp(
+                    topk_result_prev, raw_prev = self._get_topk_ragged_with_cp(
                         forward_batch,
                         layer_id,
                         q_fp8_prev,
@@ -1735,7 +1824,7 @@ class IndexerKPool(MultiPlatformOp):
                         kv_len_prev,
                         actual_seq_q_prev,
                     )
-                    topk_result_next = self._get_topk_ragged_with_cp(
+                    topk_result_next, raw_next = self._get_topk_ragged_with_cp(
                         forward_batch,
                         layer_id,
                         q_fp8_next,
@@ -1745,8 +1834,13 @@ class IndexerKPool(MultiPlatformOp):
                         actual_seq_q_next,
                     )
                     topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    raw_result = (
+                        torch.cat([raw_prev, raw_next], dim=0)
+                        if raw_prev is not None
+                        else None
+                    )
                 elif has_kpool_extend_plan:
-                    topk_result = self._get_topk_ragged_kpool_plan(
+                    topk_result, raw_result = self._get_topk_ragged_kpool_plan(
                         forward_batch,
                         layer_id,
                         q_fp8,
@@ -1754,7 +1848,7 @@ class IndexerKPool(MultiPlatformOp):
                         metadata,
                     )
                 else:
-                    topk_result = self._get_topk_ragged(
+                    topk_result, raw_result = self._get_topk_ragged(
                         forward_batch,
                         layer_id,
                         q_fp8,
@@ -1764,4 +1858,9 @@ class IndexerKPool(MultiPlatformOp):
                     )
         else:
             raise NotImplementedError("kpool indexer is only supported on CUDA")
+        topk_result = self._capture_and_return(topk_result, raw_result)
+        if not return_indices:
+            # capture-only path (dense MHA prefill): attention ignores the
+            # transformed indices.
+            return None
         return topk_result

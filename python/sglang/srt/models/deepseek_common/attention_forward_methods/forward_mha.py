@@ -63,15 +63,23 @@ def forward_dsa_indexer_for_mha(
     layer_id: int,
 ) -> None:
     """Fill the indexer K cache and publish an MTP seed when requested."""
+    from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+
     spec_info = forward_batch.spec_info
     seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
+    # With the rollout indexer-topk capturer active, the topk must be computed
+    # even though dense MHA ignores it: the R3 replay payload needs each
+    # token's (sequence-relative) selection, which for these short rows is the
+    # full causal prefix. Without this the capture buffer keeps its zero
+    # initialization for MHA prefill tokens and replay would attend token 0.
+    capture = get_global_indexer_capturer() is not None
     topk_indices = indexer(
         x=hidden_states,
         q_lora=q_lora,
         positions=positions,
         forward_batch=forward_batch,
         layer_id=layer_id,
-        return_indices=seed_buf is not None,
+        return_indices=seed_buf is not None or capture,
     )
     if seed_buf is None:
         return

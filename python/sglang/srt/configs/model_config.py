@@ -289,18 +289,46 @@ def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
 
 
+def get_dsa_indexer_layer_ids(config) -> list:
+    """Transformer layer ids that own an indexer-topk capturer slot.
+
+    Plain DSA models (V3.2 family) have one slot per transformer layer.
+    Hybrid linear-attention DSA models (e.g. glm5_next's KDA/DSA LLLD layout)
+    only carry an indexer on the full-attention layers, so KDA layers get no
+    slot and the capturer buffer is indexed by DSA-layer ordinal.
+    """
+    num_hidden_layers = config.num_hidden_layers
+    linear_attn_config = _hf_attr(config, "linear_attn_config")
+    kda_layers = set()
+    if isinstance(linear_attn_config, dict):
+        kda_layers = set(linear_attn_config.get("kda_layers") or [])
+    return [i for i in range(num_hidden_layers) if i not in kda_layers]
+
+
+def get_indexer_layer_ordinal(config, layer_id: int) -> Optional[int]:
+    """Capturer-slot ordinal of ``layer_id``, or None when it has no slot
+    (KDA layers of a hybrid model, or NextN/draft layers past the trunk)."""
+    layer_ids = get_dsa_indexer_layer_ids(config)
+    if layer_id not in layer_ids:
+        return None
+    return layer_ids.index(layer_id)
+
+
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
     DSA models (V3.2) expose one capturer slot per transformer layer. With
     index_topk_freq > 1 some layers reuse prev layer's topk; those still get a
     slot mirrored at the MLA call site even if no Indexer module is built.
+    Hybrid linear-attention DSA models (glm5_next) only have indexers on the
+    full-attention layers, so the KDA layers get no slot (see
+    get_dsa_indexer_layer_ids).
     DSv4 has C4 indexers only on layers whose compress_ratio == 4. Other
     architectures: set num_indexer_layers on hf_text_config; 0 disables the
     capturer.
     """
     if is_deepseek_dsa(config):
-        return config.num_hidden_layers
+        return len(get_dsa_indexer_layer_ids(config))
     if is_deepseek_v4(config):
         compress_ratios = getattr(config, "compress_ratios", None) or []
         return sum(1 for r in compress_ratios if r == 4)
