@@ -2291,7 +2291,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def mm_embedding_validation_indices(self) -> List[int]:
         if (
-            self.multimodal_inputs is None
+            not self.forward_mode.is_extend_without_speculative()
+            or self.multimodal_inputs is None
             or self.prefix_lens is None
             or self.extend_lens is None
         ):

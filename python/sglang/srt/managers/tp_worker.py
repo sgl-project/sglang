@@ -84,6 +84,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _mm_embedding_validation_indices(
+    batch: Optional[ScheduleBatch], forward_batch: ForwardBatch
+) -> List[int]:
+    if batch is not None:
+        return batch.mm_embedding_validation_indices()
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return []
+    return [
+        i
+        for i, mm_input in enumerate(forward_batch.mm_inputs or [])
+        if mm_input is not None
+    ]
+
+
 class BaseTpWorker(ABC):
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
@@ -638,15 +652,7 @@ class TpModelWorker(BaseTpWorker):
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
         batch_size = len(batch.reqs) if batch is not None else forward_batch.batch_size
-        validated_indices = (
-            batch.mm_embedding_validation_indices()
-            if batch is not None
-            else [
-                i
-                for i, mm_input in enumerate(forward_batch.mm_inputs or [])
-                if mm_input is not None
-            ]
-        )
+        validated_indices = _mm_embedding_validation_indices(batch, forward_batch)
         has_mm_inputs = bool(validated_indices)
 
         if self.pp_group.is_last_rank:
