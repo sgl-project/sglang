@@ -19,6 +19,7 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use super::{openai_error, routes};
+use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem};
@@ -119,8 +120,7 @@ pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
     });
     let renderer = Arc::new(new_renderer_service(server_args.clone(), jobs));
     Arc::new(super::AppState {
-        senders,
-        response_buf: 8,
+        frontend: FrontendHandle::new(senders, 8),
         server_args,
         renderer,
         response_activity: Default::default(),

@@ -21,12 +21,12 @@ use dynamo_protocols::types::{
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
     AppState, collect_output, error_payload, indexed_decode_stream, openai_error,
     submit_generation, unix_seconds_u32,
 };
+use crate::frontend::AbortGuard;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
@@ -77,7 +77,7 @@ async fn completions(
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
     let created = unix_seconds_u32();
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
+    let mut guard = state.frontend.empty_abort_guard();
     let mut submitted = Vec::with_capacity(native_requests.len());
     let n = request.n.unwrap_or(1) as usize;
     let mut prompt_echo = String::new();
@@ -581,7 +581,7 @@ mod tests {
         ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
         unary_completion,
     };
-    use crate::api_server::guard::AbortGuard;
+    use crate::frontend::AbortGuard;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
@@ -673,7 +673,7 @@ mod tests {
 
         let response = unary_completion(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
+            AbortGuard::new_empty(senders().abort_tx),
             "cmpl-test".into(),
             "model".into(),
             1,
@@ -701,7 +701,7 @@ mod tests {
 
         let stream = completion_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
+            AbortGuard::new_empty(senders().abort_tx),
             "cmpl-test".into(),
             "model".into(),
             1,

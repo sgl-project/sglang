@@ -8,21 +8,21 @@ use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai, render};
+use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 use crate::renderer::RendererService;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
-/// Shared handler state: submission handles, immutable server configuration,
-/// and the engine-free renderer service.
+/// Shared HTTP handler state: the protocol-neutral frontend handle, immutable
+/// server configuration, and the engine-free renderer service.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning each
 /// `flume::Sender` and the renderer. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
 pub(super) struct AppState {
-    pub(super) senders: Senders,
-    pub(super) response_buf: usize,
+    pub(super) frontend: FrontendHandle,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) renderer: Arc<RendererService>,
     /// Response heartbeat (bumped per drained ring frame).
@@ -43,8 +43,7 @@ pub async fn serve(
     shutdown: flume::Receiver<()>,
 ) {
     let state = Arc::new(AppState {
-        senders,
-        response_buf,
+        frontend: FrontendHandle::new(senders, response_buf),
         server_args: server_args.clone(),
         renderer,
         response_activity,

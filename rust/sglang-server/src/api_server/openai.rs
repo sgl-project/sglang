@@ -17,8 +17,8 @@ mod tools;
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
-use super::guard::AbortGuard;
 use super::submit::submit;
+use crate::frontend::AbortGuard;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};

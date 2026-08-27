@@ -25,7 +25,6 @@ use futures::StreamExt;
 use sglang_renderer::openai::dynamo_parser_name;
 use tokio::sync::mpsc;
 
-use super::super::guard::AbortGuard;
 use super::completions::completion_usage;
 use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
 use super::tools::{chat_delta, chat_finish_reason, parse_chat_tool_calls};
@@ -33,6 +32,7 @@ use super::{
     AppState, collect_output, error_payload, indexed_decode_stream, openai_error,
     submit_generation, unix_seconds_u32,
 };
+use crate::frontend::AbortGuard;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 use crate::message::response::{ChunkExtras, ResponseItem};
@@ -65,7 +65,7 @@ async fn chat_completions(
     let response = prepared.response;
     let stream = response.stream;
     let created = unix_seconds_u32();
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
+    let mut guard = state.frontend.empty_abort_guard();
     let mut submitted = Vec::with_capacity(response.choice_count);
 
     for (index, rendered) in native_requests.into_iter().enumerate() {
@@ -545,7 +545,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk, senders};
     use super::{chat_event_stream, chat_logprobs, unary_chat};
-    use crate::api_server::guard::AbortGuard;
+    use crate::frontend::AbortGuard;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
@@ -651,7 +651,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
+            AbortGuard::new_empty(senders().abort_tx),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -688,7 +688,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            AbortGuard::new_empty(senders()),
+            AbortGuard::new_empty(senders().abort_tx),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -726,7 +726,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
+            AbortGuard::new_empty(senders().abort_tx),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -772,7 +772,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            AbortGuard::new_empty(senders()),
+            AbortGuard::new_empty(senders().abort_tx),
             "chatcmpl-test".into(),
             "model".into(),
             1,
