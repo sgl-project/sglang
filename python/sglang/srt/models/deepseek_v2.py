@@ -179,7 +179,6 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.deepseek_common.utils import (
-    _device_sm,
     _get_llama_4_scaling,
     _is_block_scale_fp8,
     _is_cpu,
