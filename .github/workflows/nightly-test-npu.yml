@@ -264,9 +264,14 @@ jobs:
 #       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-perf-16-npu-a3:
-    name: nightly-perf-16-npu-a3
+    name: nightly-perf-16-npu-a3-${{ matrix.run_index }}
     if: ${{ !cancelled() }}
     needs: [set-image-config]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        run_index: [1, 2, 3, 4, 5]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
