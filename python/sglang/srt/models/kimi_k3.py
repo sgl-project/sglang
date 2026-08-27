@@ -153,9 +153,7 @@ def _uses_split_gguf_kv_b(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
     """Whether a K3 checkpoint stores MLA K/V as separate GGUF tensors."""
-    return bool(
-        getattr(quant_config, "supports_kimi_k3_split_gguf_kv_b", False)
-    )
+    return bool(getattr(quant_config, "supports_kimi_k3_split_gguf_kv_b", False))
 
 
 def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
