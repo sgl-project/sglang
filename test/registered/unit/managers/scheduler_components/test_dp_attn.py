@@ -36,9 +36,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
 
         with (
             envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
-            patch.object(
-                dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer
-            ),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
             patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
             patch.object(dp_attn.MLPSyncBatchInfo, "all_gather") as all_gather,
