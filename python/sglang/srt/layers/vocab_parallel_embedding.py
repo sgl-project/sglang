@@ -14,7 +14,6 @@ from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_attn_tp_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -507,27 +506,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
-        """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
-        if _is_npu:
-            return False
-        if self.tp_size == 1:
-            return False
-        reduce_group = get_attn_tp_group() if self.use_attn_tp_group else get_tp_group()
-        backend = torch.distributed.get_backend(reduce_group.device_group)
-        if "mooncake" in str(backend).lower():
-            return False
-        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
-            return False
-        if not input_.is_cuda or not input_.is_contiguous():
-            return False
-        if input_.dtype not in (torch.int32, torch.int64):
-            return False
-        return (
-            self.weight.is_cuda
-            and self.weight.ndim == 2
-            and self.weight.stride(1) == 1
-            and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        )
+        return False
 
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
