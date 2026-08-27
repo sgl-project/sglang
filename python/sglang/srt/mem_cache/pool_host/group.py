@@ -86,6 +86,22 @@ class HostPoolGroup:
             indices = host_pool.alloc(need_size)
         return indices
 
+    def alloc_shared(
+        self, requests: list[tuple[PoolName, int]]
+    ) -> list[torch.Tensor] | None:
+        entries = [self.entry_map[name] for name, _ in requests]
+        domain = entries[0].host_pool.shared_allocation_domain if entries else None
+        if domain is None or any(
+            entry.host_pool.shared_allocation_domain is not domain for entry in entries
+        ):
+            raise ValueError("Host pools do not share one allocation domain.")
+        return domain.alloc_many(
+            [
+                (entry.host_pool.pool_label, need_size)
+                for entry, (_, need_size) in zip(entries, requests, strict=True)
+            ]
+        )
+
     def free(self, indices: torch.Tensor, *, pool: PoolName | None = None) -> int:
         return self.get_entry(pool).host_pool.free(indices)
 

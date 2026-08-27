@@ -113,6 +113,7 @@ def synchronized(func):
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
+    shared_allocation_domain = None
 
     def __init__(
         self,
