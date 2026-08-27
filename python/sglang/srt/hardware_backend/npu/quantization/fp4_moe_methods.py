@@ -147,7 +147,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
-        combine_input = npu_apply_w4a4_mxfp_moe_deepep(layer, dispatch_output)
+        combine_input = npu_apply_w4a8_mxfp_moe_deepep(layer, dispatch_output)
         if combine_input is not None:
             return combine_input
 
@@ -394,7 +394,7 @@ def npu_apply_w4a4_mxfp_moe_ascend_tp(
     return AscendTPCombineInput(hidden_states=hidden_states)
 
 
-def npu_apply_w4a4_mxfp_moe_deepep(
+def npu_apply_w4a8_mxfp_moe_deepep(
     layer: torch.nn.Module,
     dispatch_output: "DispatchOutput",
 ) -> Optional["CombineInput"]:
