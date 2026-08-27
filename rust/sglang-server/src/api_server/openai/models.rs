@@ -9,7 +9,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::app::AppState;
+use super::{AppState, openai_error, unix_seconds_u32};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -26,19 +26,11 @@ async fn available_models(State(state): State<Arc<AppState>>) -> Response {
 
 async fn retrieve_model(State(state): State<Arc<AppState>>, Path(model): Path<String>) -> Response {
     if model != state.server_args.served_model_name {
-        return (
+        return openai_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "object": "error",
-                    "message": format!("The model `{model}` does not exist"),
-                    "type": "BadRequestError",
-                    "param": null,
-                    "code": StatusCode::NOT_FOUND.as_u16(),
-                }
-            })),
-        )
-            .into_response();
+            format!("The model `{model}` does not exist"),
+            false,
+        );
     }
     Json(model_card(&state)).into_response()
 }
@@ -54,11 +46,4 @@ fn model_card(state: &AppState) -> serde_json::Value {
         "parent": serde_json::Value::Null,
         "max_model_len": state.server_args.model_config.context_len,
     })
-}
-
-fn unix_seconds_u32() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| u32::try_from(duration.as_secs()).unwrap_or(u32::MAX))
-        .unwrap_or(0)
 }

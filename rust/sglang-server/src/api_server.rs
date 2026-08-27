@@ -9,7 +9,7 @@ mod disaggregation;
 mod frame;
 mod guard;
 mod log;
-mod models;
 mod native_api;
+mod openai;
 mod prefetch;
 mod submit;

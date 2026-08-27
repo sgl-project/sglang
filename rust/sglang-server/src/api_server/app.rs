@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, models, native_api};
+use super::{common, log, native_api, openai};
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
@@ -48,7 +48,7 @@ pub async fn serve(
     let router = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
-        .merge(models::routes());
+        .merge(openai::routes());
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except
     // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
