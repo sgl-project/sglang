@@ -12,7 +12,7 @@ use crate::{SamplingParams, TokenIds};
 ///
 /// Chat and legacy Completions both converge on this type. Chat-specific
 /// response interpretation is retained separately by `ChatResponseProcessor`.
-pub struct TextCompletionRequest {
+pub struct TextRequest {
     pub rid: String,
     pub text: Option<String>,
     pub input_ids: Option<TokenIds>,
@@ -27,7 +27,7 @@ pub struct TextCompletionRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl TextCompletionRequest {
+impl TextRequest {
     pub fn already_tokenized(&self) -> bool {
         self.input_ids.as_ref().is_some_and(|ids| !ids.is_empty())
     }
@@ -54,8 +54,8 @@ pub struct PreparedGenerateRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl From<TextCompletionRequest> for PreparedGenerateRequest {
-    fn from(mut request: TextCompletionRequest) -> Self {
+impl From<TextRequest> for PreparedGenerateRequest {
+    fn from(mut request: TextRequest) -> Self {
         Self {
             rid: request.rid,
             input_ids: request

@@ -11,7 +11,7 @@ use crate::message::request::{GenerateRequest, Request};
 
 pub(crate) use sglang_renderer::{
     RendererConfig, RendererError as RenderServiceError, RendererService, RequestLowerer,
-    TextCompletionRequest,
+    TextRequest,
 };
 use sglang_renderer::{RendererLimits, SamplingDefaults, TokenizationBackend};
 
@@ -23,8 +23,8 @@ pub(crate) enum TokenizationJob {
 }
 
 pub(crate) struct StandaloneTokenizationJob {
-    pub(crate) request: TextCompletionRequest,
-    pub(crate) reply: oneshot::Sender<Result<TextCompletionRequest, RenderServiceError>>,
+    pub(crate) request: TextRequest,
+    pub(crate) reply: oneshot::Sender<Result<TextRequest, RenderServiceError>>,
 }
 
 struct ServerTokenizationBackend {
@@ -34,8 +34,8 @@ struct ServerTokenizationBackend {
 impl TokenizationBackend for ServerTokenizationBackend {
     fn tokenize(
         &self,
-        request: TextCompletionRequest,
-    ) -> BoxFuture<'static, Result<TextCompletionRequest, RenderServiceError>> {
+        request: TextRequest,
+    ) -> BoxFuture<'static, Result<TextRequest, RenderServiceError>> {
         let jobs = self.jobs.clone();
         Box::pin(async move {
             let (reply, result) = oneshot::channel();
@@ -102,8 +102,8 @@ pub(crate) fn render_http_status(error: &RenderServiceError) -> u16 {
     }
 }
 
-impl From<TextCompletionRequest> for GenerateRequest {
-    fn from(request: TextCompletionRequest) -> Self {
+impl From<TextRequest> for GenerateRequest {
+    fn from(request: TextRequest) -> Self {
         Self {
             rid: Rid::from_client(&request.rid),
             text: request.text,
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn engine_conversion_preserves_renderer_fields() {
-        let rendered = TextCompletionRequest {
+        let rendered = TextRequest {
             rid: "client-rid".into(),
             text: Some("prompt".into()),
             input_ids: Some(vec![1, 2, 3]),
@@ -188,7 +188,7 @@ mod tests {
             allow_auto_truncate: true,
             enable_return_hidden_states: false,
         };
-        let request = TextCompletionRequest {
+        let request = TextRequest {
             rid: "completion-1".into(),
             text: Some("one two three".into()),
             sampling_params: SamplingParams {

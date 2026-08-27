@@ -14,7 +14,7 @@ use dynamo_protocols::types::{
 
 use crate::{
     ChatFormatter, OneOrMany, RendererConfig, RendererError, SamplingDefaults, SamplingParams,
-    TextCompletionRequest, TokenIds,
+    TextRequest, TokenIds,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -174,7 +174,7 @@ pub fn apply_tool_constraint(
 }
 
 pub(crate) struct ChatLoweringParts {
-    pub completion_requests: Vec<TextCompletionRequest>,
+    pub completion_requests: Vec<TextRequest>,
     pub parser: Option<String>,
     pub tools: Option<Vec<ToolDefinition>>,
 }
@@ -249,7 +249,7 @@ pub(crate) async fn lower_chat_requests(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        requests.push(TextCompletionRequest {
+        requests.push(TextRequest {
             rid: format!("{response_id}-{index}"),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
@@ -473,7 +473,7 @@ pub(crate) fn lower_completion_requests(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,
-) -> Result<Vec<TextCompletionRequest>, RendererError> {
+) -> Result<Vec<TextRequest>, RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -511,7 +511,7 @@ pub(crate) fn lower_completion_requests(
         };
         for sample_index in 0..n {
             let index = prompt_index * n + sample_index;
-            requests.push(TextCompletionRequest {
+            requests.push(TextRequest {
                 rid: format!("{response_id}-{index}"),
                 text: text.clone(),
                 input_ids: input_ids.clone(),

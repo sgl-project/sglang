@@ -1,8 +1,6 @@
 //! Tokenizer primitives shared by renderer hosts.
 
-use crate::{
-    RendererError as Error, RendererLimits, SamplingParams, TextCompletionRequest, TokenIds,
-};
+use crate::{RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds};
 use std::path::Path;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -172,11 +170,11 @@ pub fn tokenize_text_completion(
 
 /// Run the engine-free validation, normalization, tokenization and context checks.
 pub fn prepare_direct_request(
-    mut request: TextCompletionRequest,
+    mut request: TextRequest,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
     limits: &RendererLimits,
-) -> Result<TextCompletionRequest, Error> {
+) -> Result<TextRequest, Error> {
     validate_request(&request, limits)?;
     request
         .sampling_params
@@ -196,10 +194,7 @@ pub fn prepare_direct_request(
 }
 
 /// Validate fields that must be safe before tokenization or engine submission.
-pub fn validate_request(
-    request: &TextCompletionRequest,
-    limits: &RendererLimits,
-) -> Result<(), Error> {
+pub fn validate_request(request: &TextRequest, limits: &RendererLimits) -> Result<(), Error> {
     if request.rid.len() > 128 {
         return Err(Error::Validation(format!(
             "rid is {} bytes, over the 128-byte limit",
@@ -253,10 +248,7 @@ pub fn validate_completion_fields(
 }
 
 /// Enforce the model context limit after tokenization.
-pub fn check_total_tokens(
-    request: &mut TextCompletionRequest,
-    limits: &RendererLimits,
-) -> Result<(), Error> {
+pub fn check_total_tokens(request: &mut TextRequest, limits: &RendererLimits) -> Result<(), Error> {
     check_completion_token_budget(&mut request.input_ids, &mut request.sampling_params, limits)
 }
 

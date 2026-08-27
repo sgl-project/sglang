@@ -10,7 +10,7 @@ use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_request};
 use crate::{
     ChatFormatter, ChatResponseProcessor, PreparedGenerateRequest, RendererConfig, RendererError,
-    TextCompletionRequest,
+    TextRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one lowered text
@@ -19,8 +19,8 @@ use crate::{
 pub trait TokenizationBackend: Send + Sync {
     fn tokenize(
         &self,
-        request: TextCompletionRequest,
-    ) -> BoxFuture<'static, Result<TextCompletionRequest, RendererError>>;
+        request: TextRequest,
+    ) -> BoxFuture<'static, Result<TextRequest, RendererError>>;
 }
 
 /// Engine-free OpenAI request lowering shared by inference and rendering.
@@ -45,7 +45,7 @@ pub struct RendererService {
 /// Lowered text-completion requests plus the processor retained to interpret
 /// their eventual engine responses.
 pub struct LoweredChat {
-    pub completion_requests: Vec<TextCompletionRequest>,
+    pub completion_requests: Vec<TextRequest>,
     pub response_processor: ChatResponseProcessor,
 }
 
@@ -97,7 +97,7 @@ impl RequestLowerer {
         &self,
         request: &CreateCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<TextCompletionRequest>, RendererError> {
+    ) -> Result<Vec<TextRequest>, RendererError> {
         lower_completion_requests(&self.config, request, response_id)
     }
 }
@@ -127,7 +127,7 @@ impl RendererService {
 
     async fn prepare_many(
         &self,
-        requests: Vec<TextCompletionRequest>,
+        requests: Vec<TextRequest>,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
         let requests = try_join_all(
             requests
@@ -141,10 +141,7 @@ impl RendererService {
             .collect())
     }
 
-    async fn prepare_one(
-        &self,
-        mut request: TextCompletionRequest,
-    ) -> Result<TextCompletionRequest, RendererError> {
+    async fn prepare_one(&self, mut request: TextRequest) -> Result<TextRequest, RendererError> {
         validate_request(&request, &self.lowerer.config.limits)?;
         request.sampling_params.normalize(
             self.lowerer.config.skip_tokenizer_init,
