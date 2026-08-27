@@ -228,7 +228,8 @@ impl RendererService {
             }
             request
                 .sampling_params
-                .normalize(true, self.config.vocab_size)?;
+                .normalize(true, self.config.vocab_size)
+                .map_err(Error::from)?;
             check_total_tokens(&mut request, &self.config.limits)?;
             return Ok(request);
         }

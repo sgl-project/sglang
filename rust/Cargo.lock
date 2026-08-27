@@ -3742,6 +3742,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-mm",
+ "sglang-renderer",
  "socket2 0.6.5",
  "thiserror",
  "tokio",

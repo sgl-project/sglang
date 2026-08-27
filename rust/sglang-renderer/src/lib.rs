@@ -18,4 +18,4 @@ pub use error::{RendererError, RendererErrorKind};
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, RendererRequest};
 pub use sampling::SamplingParams;
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer, resolve_model_file};
-pub use types::{OneOrMany, TokenIds};
+pub use types::{OneOrMany, OneOrManyItem, TokenIds};

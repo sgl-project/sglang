@@ -120,12 +120,11 @@ mod tests {
     use crate::runtime::Runnable;
     use crate::tokenizer_manager::to_scheduler::Limits;
     use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
-    use crate::utils::error::Error;
 
     struct WordTokenizer;
 
     impl TextTokenizer for WordTokenizer {
-        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+        fn encode(&self, text: &str) -> Result<TokenIds, sglang_renderer::RendererError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }

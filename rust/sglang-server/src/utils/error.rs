@@ -48,5 +48,19 @@ impl Error {
     }
 }
 
+impl From<sglang_renderer::RendererError> for Error {
+    fn from(error: sglang_renderer::RendererError) -> Self {
+        match error {
+            sglang_renderer::RendererError::Validation(message) => Self::Validation(message),
+            sglang_renderer::RendererError::Tokenize(message) => Self::Tokenize(message),
+            sglang_renderer::RendererError::Unavailable => Self::QueueFull,
+            sglang_renderer::RendererError::WorkerDropped => {
+                Self::Internal("render preprocessing worker failed".into())
+            }
+            sglang_renderer::RendererError::Internal(message) => Self::Internal(message),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub type Result<T> = std::result::Result<T, Error>;

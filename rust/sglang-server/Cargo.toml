@@ -63,6 +63,7 @@ rmpv = { version = "1", features = ["with-serde"] }
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
+sglang-renderer = { path = "../sglang-renderer" }
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.

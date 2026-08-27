@@ -4,7 +4,6 @@
 //! and `rmp_serde`'s default struct-as-array encoding reproduces it.
 
 use bytes::Bytes;
-use serde::Serialize;
 
 use super::request::GenerateRequest;
 use super::sampling::SamplingParams;

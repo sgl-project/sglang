@@ -254,7 +254,7 @@ impl Intake {
                     };
                     match outcome {
                         Err(e) => {
-                            let _ = req.state.apply(Event::Error(e)); // → Failed
+                            let _ = req.state.apply(Event::Error(e.into())); // → Failed
                         }
                         Ok(o) => {
                             // AlreadyTokenized → Queued, NeedsTokenize → Tokenizing.

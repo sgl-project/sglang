@@ -28,7 +28,6 @@ use crate::runtime::Runnable;
 use crate::tokenizer_manager::to_scheduler::Limits;
 use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
 use crate::tokenizer_manager::wiring::Senders;
-use crate::utils::error::Error;
 
 pub(super) fn senders() -> Senders {
     Senders {
@@ -106,7 +105,7 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
     struct TestTokenizer;
     impl TextTokenizer for TestTokenizer {
-        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+        fn encode(&self, text: &str) -> Result<TokenIds, sglang_renderer::RendererError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }
