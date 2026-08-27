@@ -163,45 +163,47 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
-    is_dummy_rank: Optional[bool] = None
+    is_dummy: bool = False
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
-
-    def is_dummy(self):
-        # A transfer is "dummy" only for CP non-authoritative ranks.
-        # When dst_kv_indices is empty due to a decode-side radix cache
-        # full hit (decode_prefix_len > 0), the transfer is NOT dummy --
-        # aux/state data still needs to be sent.
-        if self.is_dummy_rank is not None:
-            return self.is_dummy_rank
-        if self.dst_kv_indices.size == 0 and self.decode_prefix_len:
-            return False
-        return self.dst_kv_indices.size == 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
         dst_state_indices = (
             unpack_int_lists(msg[7], "i") if len(msg) > 7 and msg[7] != b"" else []
         )
+        dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
+        decode_prefix_len = (
+            int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+        )  # hacky just add it into the message that will be sent
+        dummy_rank = (
+            bool(int(msg[9].decode("ascii")))
+            if len(msg) > 9 and msg[9] != b""
+            else None
+        )
+        # A transfer is "dummy" only for CP non-authoritative ranks. When
+        # dst_kv_indices is empty due to a decode-side radix cache full hit
+        # (decode_prefix_len > 0), the transfer is NOT dummy -- aux/state data
+        # still needs to be sent.
+        if dummy_rank is not None:
+            is_dummy = dummy_rank
+        elif dst_kv_indices.size == 0 and decode_prefix_len:
+            is_dummy = False
+        else:
+            is_dummy = dst_kv_indices.size == 0
 
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             agent_name=msg[3].decode("ascii"),
-            dst_kv_indices=np.frombuffer(msg[4], dtype=np.int32),
+            dst_kv_indices=dst_kv_indices,
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
-            decode_prefix_len=(
-                int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
-            ),  # hacky just add it into the message that will be sent
-            is_dummy_rank=(
-                bool(int(msg[9].decode("ascii")))
-                if len(msg) > 9 and msg[9] != b""
-                else None
-            ),
+            decode_prefix_len=decode_prefix_len,
+            is_dummy=is_dummy,
         )
 
 
@@ -396,6 +398,11 @@ class TransferStatus:
 
 
 class NixlKVManager(StagingManagerMixin, CommonKVManager):
+    # The decode control socket multiplexes tagged messages, so the status
+    # message is tagged too. It is new to NIXL, hence free to carry the reason.
+    kv_status_msg_tag = b"KV_STATUS"
+    kv_status_msg_carries_reason = True
+
     def __init__(
         self,
         args: KVArgs,
@@ -516,9 +523,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if self.enable_staging:
                 self._init_staging_decode_ctx()
-                self._staging_handler = None
-            if self.enable_staging or self.enable_deferred_decode_kv_release:
-                self._start_decode_listener_thread()
+            self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -590,15 +595,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_receivers[room] = receiver
 
     def _start_decode_listener_thread(self):
-        """Decode-side ZMQ listener for STAGING_REQ and ABORT_ACK. A thread, not
-        NIXL notifs: the decode agent has no progress thread, so notifs only drain
-        inside a live receiver's poll() and would be missed while idle."""
+        """Decode-side ZMQ listener for KV_STATUS, STAGING_REQ and ABORT_ACK. A
+        thread, not NIXL notifs: the decode agent has no progress thread, so notifs
+        only drain inside a live receiver's poll() and would be missed while idle.
+
+        Started unconditionally: KV_STATUS carries prefill-side transfer failures,
+        which are independent of staging and deferred KV release."""
 
         def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
                 if msg[0] == b"STAGING_REQ":
-                    self._handle_staging_req(msg)
+                    if self.enable_staging:
+                        self._handle_staging_req(msg)
                     continue
                 if msg[0] == b"ABORT_ACK":
                     # Drain ack for an aborted room; aggregate per prefill rank.
@@ -606,6 +615,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self.note_abort_ack(
                             int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
                         )
+                    continue
+                parsed = self.parse_kv_status_message(msg)
+                if parsed is not None:
+                    self.apply_prefill_status(*parsed)
                     continue
                 logger.warning(
                     "decode_listener_thread: unexpected message tag %s",
@@ -629,7 +642,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         room_infos = self.transfer_infos.get(room, {})
         needs_staging = any(
-            not tinfo.is_dummy()
+            not tinfo.is_dummy
             and tinfo.agent_name in self.decode_kv_args_table
             and self.decode_kv_args_table[tinfo.agent_name].decode_tp_size
             != self.attn_tp_size
@@ -656,12 +669,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        # Keep Failed sticky until the sender clears the room.
-        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
-            return
-        super().update_status(bootstrap_room, status)
 
     def _prep_equal_tp_dlist(
         self,
@@ -1129,7 +1136,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                 for req in reqs_to_be_processed:
                     assert room == req.room
-                    if req.is_dummy():
+                    if req.is_dummy:
                         continue
 
                     assert req.agent_name in self.decode_kv_args_table
@@ -1307,17 +1314,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                # Raise only once every handle of this batch settled, not on the
+                # first ERR: a sibling still in PROC keeps writing into the
+                # decode's KV pages, and the failure path below tells the decode
+                # those pages are free.
                 while handles:
-                    all_done = True
+                    all_settled = True
+                    any_failed = False
                     for handle in handles:
                         state = self.agent.check_xfer_state(handle)
                         if state == "ERR":
+                            any_failed = True
+                        elif state != "DONE":
+                            all_settled = False
+                    if all_settled:
+                        if any_failed:
                             raise RuntimeError(
                                 f"NIXL transfer encountered ERR room={room}"
                             )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
                         break
                     time.sleep(0)
 
@@ -1363,10 +1377,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
-                # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                self.conclude_failure(room, str(e))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2846,6 +2857,13 @@ class NixlKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
+    def clear(self) -> None:
+        super().clear()
+        # transfer_statuses is NIXL's own per-room bookkeeping -- the other
+        # backends track completion through prefill_response_tracker, which
+        # CommonKVReceiver.clear() already drops -- so it needs its own pop.
+        self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+
     def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -2940,11 +2958,7 @@ class NixlKVReceiver(CommonKVReceiver):
         # deadline would otherwise lose to the timeout purely by poll ordering.
         self.kv_mgr.update_transfer_status()
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-                self.bootstrap_room
-            )
             self.conclude_state = KVPoll.Success
-            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
 
         timeout_result = self._check_waiting_timeout()
