@@ -475,15 +475,14 @@ def estimate_candidate_latency_savings_ns(
     stage_duration_ns: Mapping[str, int] | None = None,
     component_stages: Mapping[str, tuple[str, ...]] | None = None,
 ) -> dict[str, int]:
-    """Estimate latency removed by each complete placement option.
+    """Estimate each complete placement relative to the measured one.
 
-    Transfer work remains the ordering signal within one component frontier.
-    Across components, cap the frontier's total benefit by the stages where
-    that component is used. Otherwise two large DiTs in different stages both
-    saturate at the full request duration and the solver cannot distinguish
-    which stage dominates latency. Scaling the intermediate options against
-    the frontier maximum preserves their ordering without claiming that every
-    byte of asynchronous transfer stalls the critical path.
+    Transfer work remains the ordering signal within a component frontier.
+    Removable latency is capped by the measured component stage for one-shot
+    components and by request wall time for repeatedly streamed DiTs. Added
+    transfer time is not capped: an unmeasured mechanism may be slower than the
+    whole request. Callers without a measured current option retain the
+    historical absolute frontier estimate.
     """
     candidates = list(candidates)
     stage_duration_ns = stage_duration_ns or {}
