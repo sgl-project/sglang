@@ -54,23 +54,13 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
 ) -> Response {
-    let mut request = match body {
+    let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let lowered = match state.lowerer.lower_chat(&mut request, &response_id).await {
-        Ok(lowered) => lowered,
-        Err(error) => {
-            let status = StatusCode::from_u16(render_http_status(&error))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            return openai_error(status, error.to_string(), false);
-        }
-    };
-    let completion_requests = lowered.completion_requests;
-    let response_processor = lowered.response_processor;
     let stream = request.stream.unwrap_or(false);
     let model = request.model.clone();
     let want_logprobs = request.logprobs.unwrap_or(false);
@@ -78,14 +68,31 @@ async fn chat_completions(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
-        || state.lowerer.config().stream_response_default_include_usage;
+        || state
+            .request_processor
+            .config()
+            .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
+    let parts = match state
+        .request_processor
+        .process_chat(request, &response_id)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(error) => {
+            let status = StatusCode::from_u16(render_http_status(&error))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return openai_error(status, error.to_string(), false);
+        }
+    };
+    let text_requests = parts.text_requests;
+    let response_processor = parts.response_processor;
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(completion_requests.len());
+    let mut submitted = Vec::with_capacity(text_requests.len());
 
-    for (index, completion_request) in completion_requests.into_iter().enumerate() {
-        let native = GenerateRequest::from(completion_request);
+    for (index, text_request) in text_requests.into_iter().enumerate() {
+        let native = GenerateRequest::from(text_request);
         let rid = native.rid.clone();
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
             Ok(rx) => rx,
@@ -372,7 +379,7 @@ mod tests {
     use crate::frontend::AbortGuard;
     use crate::message::config::ServerArgs;
     use crate::message::response::ChunkExtras;
-    use crate::renderer::new_request_lowerer;
+    use crate::renderer::new_request_processor;
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
     use futures::StreamExt;
@@ -399,15 +406,14 @@ mod tests {
             reasoning_parser: reasoning_parser.map(str::to_owned),
             ..Default::default()
         };
-        let lowerer = new_request_lowerer(&args);
-        let mut request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hi"}],
             "n": choices
         }))
         .unwrap();
-        lowerer
-            .lower_chat(&mut request, "chatcmpl-test")
+        new_request_processor(&args)
+            .process_chat(request, "chatcmpl-test")
             .await
             .unwrap()
             .response_processor

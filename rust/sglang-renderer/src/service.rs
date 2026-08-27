@@ -5,7 +5,7 @@ use std::sync::Arc;
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 use futures::future::{BoxFuture, try_join_all};
 
-use crate::openai::{lower_chat_requests, lower_completion_requests};
+use crate::openai::{process_chat_request, process_completion_request};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_request};
 use crate::{
@@ -13,8 +13,8 @@ use crate::{
     TextRequest,
 };
 
-/// Host-provided tokenizer-dependent CPU execution for one lowered text
-/// completion. Validation, sampling normalization, and context checks remain
+/// Host-provided tokenizer-dependent CPU execution for one model-facing text
+/// request. Validation, sampling normalization, and context checks remain
 /// owned by `RendererService`.
 pub trait TokenizationBackend: Send + Sync {
     fn tokenize(
@@ -23,33 +23,35 @@ pub trait TokenizationBackend: Send + Sync {
     ) -> BoxFuture<'static, Result<TextRequest, RendererError>>;
 }
 
-/// Engine-free OpenAI request lowering shared by inference and rendering.
+/// Engine-free OpenAI request processing shared by inference and rendering.
 ///
-/// This type deliberately has no preprocessing backend. Full inference lowers
-/// requests here, then submits them to its request FSM for normalization and
-/// tokenization.
-pub struct RequestLowerer {
+/// This type deliberately has no preprocessing backend. Full inference
+/// processes protocol semantics here, then submits text requests to its request
+/// FSM for normalization and tokenization.
+pub struct OpenAIRequestProcessor {
     config: RendererConfig,
     chat_formatter: Option<ChatFormatter>,
 }
 
-/// Standalone request preparation: shared lowering plus host-provided CPU work.
+/// Standalone request preparation: shared OpenAI processing plus host-provided
+/// CPU work.
 ///
-/// This service returns transport-ready generation requests. Chat response
-/// processors remain an inference-only result of `RequestLowerer`.
+/// This service returns prepared generation requests. Chat response
+/// processors are created while processing chat semantics, then discarded by
+/// this preparation-only path.
 pub struct RendererService {
-    lowerer: RequestLowerer,
+    processor: OpenAIRequestProcessor,
     backend: Arc<dyn TokenizationBackend>,
 }
 
-/// Lowered text-completion requests plus the processor retained to interpret
+/// Model-facing text requests plus the processor retained to interpret
 /// their eventual engine responses.
-pub struct LoweredChat {
-    pub completion_requests: Vec<TextRequest>,
+pub struct ChatRequestParts {
+    pub text_requests: Vec<TextRequest>,
     pub response_processor: ChatResponseProcessor,
 }
 
-impl RequestLowerer {
+impl OpenAIRequestProcessor {
     pub fn new(config: RendererConfig) -> Self {
         let chat_formatter = load_chat_support(&config);
         Self {
@@ -62,66 +64,66 @@ impl RequestLowerer {
         &self.config
     }
 
-    pub async fn lower_chat(
+    pub async fn process_chat(
         &self,
-        request: &mut CreateChatCompletionRequest,
+        mut request: CreateChatCompletionRequest,
         response_id: &str,
-    ) -> Result<LoweredChat, RendererError> {
-        let lowered = lower_chat_requests(
+    ) -> Result<ChatRequestParts, RendererError> {
+        let processed = process_chat_request(
             &self.config,
             self.chat_formatter.clone(),
-            request,
+            &mut request,
             response_id,
         )
         .await?;
-        let uses_tool_call_structural_tag = lowered
-            .completion_requests
+        let uses_tool_call_structural_tag = processed
+            .text_requests
             .first()
             .is_some_and(|request| request.sampling_params.structural_tag.is_some());
         let response_processor = ChatResponseProcessor::new(
-            lowered.parser,
+            processed.parser,
             self.config.reasoning_parser.clone(),
-            lowered.tools,
+            processed.tools,
             request.tool_choice.clone(),
             uses_tool_call_structural_tag,
             request.parallel_tool_calls.unwrap_or(true),
-            lowered.completion_requests.len(),
+            processed.text_requests.len(),
         );
-        Ok(LoweredChat {
-            completion_requests: lowered.completion_requests,
+        Ok(ChatRequestParts {
+            text_requests: processed.text_requests,
             response_processor,
         })
     }
 
-    pub fn lower_completions(
+    pub fn process_completions(
         &self,
-        request: &CreateCompletionRequest,
+        request: CreateCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<TextRequest>, RendererError> {
-        lower_completion_requests(&self.config, request, response_id)
+        process_completion_request(&self.config, &request, response_id)
     }
 }
 
 impl RendererService {
-    pub fn new(lowerer: RequestLowerer, backend: Arc<dyn TokenizationBackend>) -> Self {
-        Self { lowerer, backend }
+    pub fn new(processor: OpenAIRequestProcessor, backend: Arc<dyn TokenizationBackend>) -> Self {
+        Self { processor, backend }
     }
 
     pub async fn prepare_chat(
         &self,
-        request: &mut CreateChatCompletionRequest,
+        request: CreateChatCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let lowered = self.lowerer.lower_chat(request, response_id).await?;
-        self.prepare_many(lowered.completion_requests).await
+        let parts = self.processor.process_chat(request, response_id).await?;
+        self.prepare_many(parts.text_requests).await
     }
 
     pub async fn prepare_completions(
         &self,
-        request: &CreateCompletionRequest,
+        request: CreateCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let requests = self.lowerer.lower_completions(request, response_id)?;
+        let requests = self.processor.process_completions(request, response_id)?;
         self.prepare_many(requests).await
     }
 
@@ -142,15 +144,15 @@ impl RendererService {
     }
 
     async fn prepare_one(&self, mut request: TextRequest) -> Result<TextRequest, RendererError> {
-        validate_request(&request, &self.lowerer.config.limits)?;
+        validate_request(&request, &self.processor.config.limits)?;
         request.sampling_params.normalize(
-            self.lowerer.config.skip_tokenizer_init,
-            self.lowerer.config.vocab_size,
+            self.processor.config.skip_tokenizer_init,
+            self.processor.config.vocab_size,
         )?;
         if !request.already_tokenized() {
             request = self.backend.tokenize(request).await?;
         }
-        check_total_tokens(&mut request, &self.lowerer.config.limits)?;
+        check_total_tokens(&mut request, &self.processor.config.limits)?;
         Ok(request)
     }
 }
@@ -180,5 +182,59 @@ fn load_chat_support(config: &RendererConfig) -> Option<ChatFormatter> {
             tracing::warn!(%error, "OpenAI chat completions disabled");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OneOrMany, RendererLimits, SamplingDefaults};
+
+    #[test]
+    fn chat_processing_carries_rendered_prompt_and_template_stops() {
+        let processor = OpenAIRequestProcessor::new(RendererConfig {
+            served_model_name: "model".into(),
+            tokenizer_path: ".".into(),
+            revision: None,
+            model_path: String::new(),
+            chat_template: Some("chatml".into()),
+            tool_call_parser: None,
+            reasoning_parser: None,
+            stream_response_default_include_usage: false,
+            skip_tokenizer_init: false,
+            vocab_size: 128,
+            default_sampling_params: SamplingDefaults::default(),
+            limits: RendererLimits {
+                skip_tokenizer_init: false,
+                vocab_size: 128,
+                context_len: 128,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: false,
+                enable_return_hidden_states: false,
+            },
+        });
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stop": "client-stop"
+        }))
+        .unwrap();
+
+        let parts =
+            futures::executor::block_on(processor.process_chat(request, "chatcmpl-test")).unwrap();
+        let text_request = &parts.text_requests[0];
+
+        assert!(
+            text_request
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("<|im_start|>user"))
+        );
+        assert!(matches!(
+            text_request.sampling_params.stop.as_ref(),
+            Some(OneOrMany::Many(stops))
+                if stops.iter().map(String::as_str).collect::<Vec<_>>()
+                    == ["<|endoftext|>", "<|im_end|>", "client-stop"]
+        ));
     }
 }

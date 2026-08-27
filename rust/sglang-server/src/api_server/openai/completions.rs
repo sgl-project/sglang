@@ -65,7 +65,27 @@ async fn completions(
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let completion_requests = match state.lowerer.lower_completions(&request, &response_id) {
+    let stream = request.stream.unwrap_or(false);
+    let echo = request.echo.unwrap_or(false);
+    let model = request.model.clone();
+    let n = request.n.unwrap_or(1) as usize;
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+        || state
+            .request_processor
+            .config()
+            .stream_response_default_include_usage;
+    let continuous_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.continuous_usage_stats);
+    let want_logprobs = request.logprobs.is_some();
+    let text_requests = match state
+        .request_processor
+        .process_completions(request, &response_id)
+    {
         Ok(requests) => requests,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))
@@ -73,17 +93,13 @@ async fn completions(
             return openai_error(status, error.to_string(), false);
         }
     };
-    let stream = request.stream.unwrap_or(false);
-    let echo = request.echo.unwrap_or(false);
-    let model = request.model.clone();
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(completion_requests.len());
-    let n = request.n.unwrap_or(1) as usize;
+    let mut submitted = Vec::with_capacity(text_requests.len());
     let mut prompt_echo = String::new();
 
-    for (index, completion_request) in completion_requests.into_iter().enumerate() {
-        let native = GenerateRequest::from(completion_request);
+    for (index, text_request) in text_requests.into_iter().enumerate() {
+        let native = GenerateRequest::from(text_request);
         let prompt_index = index / n;
         let sample_index = index % n;
         if sample_index == 0 {
@@ -97,7 +113,7 @@ async fn completions(
                     Err(response) => return response,
                 }
             } else {
-                unreachable!("lowered completion request has a prompt")
+                unreachable!("processed completion request has a prompt")
             };
         }
         let rid = native.rid.clone();
@@ -115,16 +131,6 @@ async fn completions(
     }
 
     if stream {
-        let include_usage = request
-            .stream_options
-            .map(|o| o.include_usage)
-            .unwrap_or(false)
-            || state.lowerer.config().stream_response_default_include_usage;
-        let continuous_usage = request
-            .stream_options
-            .map(|o| o.continuous_usage_stats)
-            .unwrap_or(false);
-        let want_logprobs = request.logprobs.is_some();
         let s = completion_event_stream(
             submitted,
             guard,
@@ -146,7 +152,7 @@ async fn completions(
             model,
             created,
             echo,
-            request.logprobs.is_some(),
+            want_logprobs,
         )
         .await
     }

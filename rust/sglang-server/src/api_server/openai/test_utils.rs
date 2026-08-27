@@ -22,7 +22,7 @@ use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::renderer::new_request_lowerer;
+use crate::renderer::new_request_processor;
 use crate::tokenizer_manager::wiring::{Senders, TmEvent};
 use crate::utils::error::Error;
 
@@ -104,11 +104,11 @@ pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
 }
 
 fn app_state_with_args(senders: Senders, server_args: Arc<ServerArgs>) -> Arc<super::AppState> {
-    let lowerer = Arc::new(new_request_lowerer(&server_args));
+    let request_processor = Arc::new(new_request_processor(&server_args));
     Arc::new(super::AppState {
         frontend: FrontendHandle::new(senders, 8),
         server_args,
-        lowerer,
+        request_processor,
         response_activity: Default::default(),
     })
 }

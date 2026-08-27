@@ -1,6 +1,6 @@
 //! Engine-free OpenAI request rendering for SGLang.
 //!
-//! This crate owns request lowering, chat templating, tokenization and the
+//! This crate owns OpenAI request processing, chat templating, tokenization and the
 //! prepared token-in contract. It deliberately has no HTTP, gRPC, PyO3,
 //! scheduler or GPU runtime dependency.
 
@@ -25,7 +25,7 @@ pub use output::{
 };
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, TextRequest};
 pub use sampling::SamplingParams;
-pub use service::{LoweredChat, RendererService, RequestLowerer, TokenizationBackend};
+pub use service::{ChatRequestParts, OpenAIRequestProcessor, RendererService, TokenizationBackend};
 pub use template::ChatFormatter;
 pub use tokenizer::{
     DynamoTokenizer, TextTokenizer, check_completion_token_budget, check_total_tokens,

@@ -1,4 +1,4 @@
-//! OpenAI request lowering owned by the engine-free renderer.
+//! OpenAI request processing owned by the engine-free renderer.
 
 use std::collections::BTreeMap;
 
@@ -173,18 +173,18 @@ pub fn apply_tool_constraint(
     Ok(())
 }
 
-pub(crate) struct ChatLoweringParts {
-    pub completion_requests: Vec<TextRequest>,
+pub(crate) struct ChatProcessingParts {
+    pub text_requests: Vec<TextRequest>,
     pub parser: Option<String>,
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
-pub(crate) async fn lower_chat_requests(
+pub(crate) async fn process_chat_request(
     config: &RendererConfig,
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
-) -> Result<ChatLoweringParts, RendererError> {
+) -> Result<ChatProcessingParts, RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -224,7 +224,7 @@ pub(crate) async fn lower_chat_requests(
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
     let parser = resolve_chat_parser(config, request, &tool_choice)?;
     let tools = chat_tool_definitions(request);
-    let prompt = prepare_chat_request(chat_formatter, request).await?;
+    let prompt = apply_chat_template(chat_formatter, request).await?;
     let sampling = chat_sampling(
         request,
         ChatSamplingDefaults::CHAT,
@@ -264,8 +264,8 @@ pub(crate) async fn lower_chat_requests(
             ..Default::default()
         });
     }
-    Ok(ChatLoweringParts {
-        completion_requests: requests,
+    Ok(ChatProcessingParts {
+        text_requests: requests,
         parser,
         tools,
     })
@@ -306,7 +306,7 @@ fn chat_tool_definitions(request: &CreateChatCompletionRequest) -> Option<Vec<To
 /// formatter or a render failure to the standard 400. The rendered prompt is
 /// submitted as text — the tokenizer pool encodes it (with
 /// `skip_special_tokens`, since the template owns its special tokens).
-pub async fn prepare_chat_request(
+pub async fn apply_chat_template(
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
 ) -> Result<String, RendererError> {
@@ -467,9 +467,9 @@ pub enum PromptSpec {
     Text(String),
     TokenIds(TokenIds),
 }
-/// Validate and lower one OpenAI completion request into the ordered native
-/// requests consumed by inference or standalone rendering.
-pub(crate) fn lower_completion_requests(
+/// Validate and process one OpenAI completion request into the ordered
+/// model-facing requests consumed by inference or standalone rendering.
+pub(crate) fn process_completion_request(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,

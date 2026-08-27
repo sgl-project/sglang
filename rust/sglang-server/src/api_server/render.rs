@@ -47,7 +47,7 @@ async fn render_chat(
     State(state): State<RenderState>,
     body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
 ) -> Response {
-    let mut request = match body {
+    let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -61,11 +61,7 @@ async fn render_chat(
         );
     }
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    match state
-        .renderer
-        .prepare_chat(&mut request, &response_id)
-        .await
-    {
+    match state.renderer.prepare_chat(request, &response_id).await {
         Ok(mut prepared_requests) => Json(
             prepared_requests
                 .pop()
@@ -89,7 +85,7 @@ async fn render_completions(
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     match state
         .renderer
-        .prepare_completions(&request, &response_id)
+        .prepare_completions(request, &response_id)
         .await
     {
         Ok(prepared_requests) => Json(prepared_requests).into_response(),
