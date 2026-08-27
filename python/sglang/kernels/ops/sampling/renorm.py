@@ -6,9 +6,9 @@ ties at the pivot are all retained), and renormalize. A rank-based cutoff would
 instead keep exactly k entries and break ties by sort order, which diverges from
 CUDA whenever probabilities tie at the boundary.
 
-The pivot is found with ``torch.topk`` rather than a full ``torch.sort``. Both are
-exact -- ``topk(..., sorted=True)`` is the true descending prefix -- but selection
-is O(V) where sorting a 100K+ vocabulary is O(V log V) and moves int64 indices.
+Top-k uses a host-provided bounded selection width when request metadata is
+available. Top-p uses an all-device full sort so its correctness fallback never
+introduces a data-dependent GPU-to-host synchronization.
 
 Pivot selection is shared with the Triton path in :mod:`.renorm_triton`; only the
 apply-and-renormalize step differs.
@@ -17,16 +17,6 @@ apply-and-renormalize step differs.
 from typing import Union
 
 import torch
-
-# Nucleus size beyond which top-p falls back to a full sort. Real decode
-# distributions need a handful of entries; flat ones (high temperature, early
-# generation) can need far more, so the fallback must stay correct, not fast.
-#
-# Sized against the selection cost rather than the expected nucleus: on a 151936
-# vocabulary topk is flat from 1024 to 4096 (1.84ms to 1.92ms over 1536 rows) and
-# only starts paying beyond that (2.78ms at 8192). Widening the prefix to the end
-# of that plateau is close to free and keeps rows off the 13.4ms sort.
-_TOP_P_PREFIX = 4096
 
 
 def per_row_threshold(
@@ -45,11 +35,28 @@ def per_row_threshold(
     return torch.full((probs.shape[0],), value, dtype=dtype, device=probs.device)
 
 
-def top_k_pivots(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
-    """Value of the k-th largest entry in each row."""
-    k_max = int(top_ks.max().item())
+def top_k_pivots(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    *,
+    max_top_k: int | None = None,
+) -> torch.Tensor:
+    """Value of the k-th largest entry in each row.
+
+    ``max_top_k`` must be computed from request metadata on the host, excluding
+    ``TOP_K_ALL`` rows. Those rows select a zero pivot and remain unchanged.
+    Without host metadata, use an all-device full sort rather than synchronizing
+    the GPU to discover a dynamic ``torch.topk`` width.
+    """
+    if max_top_k is None or max_top_k <= 0:
+        values = torch.sort(probs, dim=-1, descending=True).values
+        return values.gather(1, (top_ks - 1).unsqueeze(1)).squeeze(1)
+
+    k_max = max(1, min(int(max_top_k), probs.shape[1]))
     values, _ = torch.topk(probs, k_max, dim=-1, sorted=True)
-    return values.gather(1, (top_ks - 1).unsqueeze(1)).squeeze(1)
+    positions = (top_ks - 1).clamp(max=k_max - 1)
+    pivots = values.gather(1, positions.unsqueeze(1)).squeeze(1)
+    return torch.where(top_ks <= k_max, pivots, torch.zeros_like(pivots))
 
 
 def top_p_pivots(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
@@ -60,20 +67,10 @@ def top_p_pivots(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
     the row's own total keeps ``top_p=1`` a no-op instead of truncating the tail on
     a peaked row, where the leading terms round up to one on their own.
     """
-    vocab_size = probs.shape[1]
-    budget = probs.sum(dim=-1) - (1.0 - top_ps)
-    prefix = min(_TOP_P_PREFIX, vocab_size)
-
-    values, _ = torch.topk(probs, prefix, dim=-1, sorted=True)
-    within = (values.cumsum(dim=-1) - values) <= budget.unsqueeze(1)
-    position = (within.sum(dim=-1) - 1).clamp(min=0)
-    pivots = values.gather(1, position.unsqueeze(1)).squeeze(1)
-
-    overflow = within[:, -1]
-    if prefix < vocab_size and bool(overflow.any()):
-        rows = overflow.nonzero(as_tuple=True)[0]
-        pivots[rows] = _top_p_pivots_sorted(probs[rows], top_ps[rows])
-    return pivots
+    # Keep overflow resolution entirely on the device. A data-dependent
+    # prefix/fallback branch would otherwise require ``item()``/``nonzero()`` and
+    # synchronize every speculative verification step.
+    return _top_p_pivots_sorted(probs, top_ps)
 
 
 def _top_p_pivots_sorted(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
@@ -102,6 +99,8 @@ def _apply_pivot(probs: torch.Tensor, pivots: torch.Tensor) -> torch.Tensor:
 def top_k_renorm_probs_torch(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
+    *,
+    max_top_k: int | None = None,
 ) -> torch.Tensor:
     """Keep every entry at least as likely as the k-th largest, then renormalize."""
     assert probs.ndim == 2
@@ -114,7 +113,7 @@ def top_k_renorm_probs_torch(
     top_ks = per_row_threshold(top_k, probs=probs, dtype=torch.int64).clamp(
         1, vocab_size
     )
-    return _apply_pivot(probs, top_k_pivots(probs, top_ks))
+    return _apply_pivot(probs, top_k_pivots(probs, top_ks, max_top_k=max_top_k))
 
 
 def top_p_renorm_probs_torch(

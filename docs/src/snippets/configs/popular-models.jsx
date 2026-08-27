@@ -13,6 +13,40 @@
 
 export const popularModels = [
   {
+    name: "Qwen3.8-27B",
+    vendor: "Qwen",
+    href: "/cookbook/autoregressive/Qwen/Qwen3.8-27B",
+    logo: "/cards/logos/qwen.png",
+    badge: "New",
+    tags: ["4 platforms", "Hybrid GDN", "BF16 / FP8 / NVFP4"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet Qwen3.8-27B on SGLang",
+      blurb:
+        "A dense hybrid Gated Delta Networks model \u2014 48 GDN linear-attention layers interleaved with 16 full-attention, an in-checkpoint MTP head, and a native 262,144-token context. The cookbook covers single-GPU serving on H200 and RTX PRO 6000 / 5090.",
+      tags: ["Dense 27B", "262K context", "Single-GPU"],
+      cta: "Open the Qwen3.8-27B cookbook",
+      caption: "Qwen3.8-27B deployment guide",
+    },
+  },
+  {
+    name: "MiniMax-H3",
+    vendor: "MiniMax",
+    href: "/cookbook/diffusion/MiniMax/MiniMax-H3",
+    logo: "/cards/logos/minimax.png",
+    badge: "New",
+    tags: ["7 platforms", "Video + audio", "BF16 / FP8"],
+    hero: {
+      eyebrow: "Featured model · New",
+      headline: "Meet MiniMax-H3 on SGLang",
+      blurb:
+        "MiniMax's video-and-audio diffusion model — one request returns an MP4 carrying 24 fps video and a synchronized stereo audio track. SGLang Diffusion serves all three task profiles — text, first/last frame, and image / video / audio reference conditioning — with Ulysses × Ring sequence parallelism and recipes across B200, B300, H200, H100, AMD MI300X / MI355X, and 2× RTX 5090.",
+      tags: ["Video + synced audio", "4–15 s at 24 fps", "8× B200 → 2× RTX 5090"],
+      cta: "Open the MiniMax-H3 cookbook",
+      caption: "MiniMax-H3 deployment guide",
+    },
+  },
+  {
     name: "Kimi-K3",
     vendor: "Moonshot AI",
     href: "/cookbook/autoregressive/Moonshotai/Kimi-K3",
@@ -44,23 +78,6 @@ export const popularModels = [
       tags: ["975B · 41B active", "1M context", "Text + image + audio"],
       cta: "Open the Inkling cookbook",
       caption: "Inkling deployment guide",
-    },
-  },
-  {
-    name: "GLM-5.2",
-    vendor: "Z.ai",
-    href: "/cookbook/autoregressive/GLM/GLM-5.2",
-    logo: "/cards/logos/glm.png",
-    badge: "New",
-    tags: ["7 platforms", "DSA attention", "FP8 / NVFP4"],
-    hero: {
-      eyebrow: "Featured model · New",
-      headline: "Meet GLM-5.2 on SGLang",
-      blurb:
-        "Z.ai's DeepSeek-Sparse-Attention Mixture-of-Experts model, with MTP speculative decoding and a 1M-token context window. Recipes cover FP8, BF16, and NVFP4 across H200, B200, B300, GB300, and AMD MI300X / MI325X / MI355X.",
-      tags: ["DSA attention", "1M context", "FP8 / BF16 / NVFP4"],
-      cta: "Open the GLM-5.2 cookbook",
-      caption: "GLM-5.2 deployment guide",
     },
   },
 ];

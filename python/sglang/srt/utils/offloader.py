@@ -12,7 +12,11 @@ from sglang.srt.distributed.naive_distributed import (
     set_naive_distributed,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_stream,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 from sglang.srt.utils.host_shared_memory import (
@@ -63,21 +67,21 @@ def set_offloader(instance: BaseOffloader):
 
 
 def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
-    if server_args.cpu_offload_gb > 0:
+    if get_exec().offload.cpu_offload_gb > 0:
         return OffloaderV1(
-            cpu_offload_max_bytes=int(server_args.cpu_offload_gb * 1024**3)
+            cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
         )
-    if server_args.offload_group_size > 0:
+    if get_exec().offload.offload_group_size > 0:
         assert (
-            server_args.cpu_offload_gb == 0
+            get_exec().offload.cpu_offload_gb == 0
         ), "V2 offload does not support cpu_offload_gb yet"
         return OffloaderV2(
-            group_size=server_args.offload_group_size,
-            num_in_group=server_args.offload_num_in_group,
-            prefetch_step=server_args.offload_prefetch_step,
-            mode=server_args.offload_mode,
+            group_size=get_exec().offload.offload_group_size,
+            num_in_group=get_exec().offload.offload_num_in_group,
+            prefetch_step=get_exec().offload.offload_prefetch_step,
+            mode=get_exec().offload.offload_mode,
             dp_rank=dp_rank,
-            dp_size=server_args.dp_size,
+            dp_size=get_parallel().dp_size,
         )
     return NoopOffloader()
 

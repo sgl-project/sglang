@@ -152,7 +152,7 @@ __global__ __launch_bounds__(1024, 1) void all_reduce_push_res_kernel(const __gr
 
 // --- deferred-finalize staging (finalize_push_norm) ------------------------
 // The trtllm-gen MoE with do_finalize=False hands back its finalize inputs
-// (see kernels/ops/moe/trtllm_gen_moe.py); the fused kernel computes the finalize
+// (see FlashInfer's TRT-LLM-gen MoE); the fused kernel computes the finalize
 // during the push staging pass, so the rank-local latent never materializes.
 
 constexpr uint32_t kFinTopK = 16;

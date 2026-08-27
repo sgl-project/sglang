@@ -117,6 +117,25 @@ class TestDeepseekV2Gate(_FusionGateCase):
             self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
         )
 
+    def test_mixed_precision_quant_vetoes_even_when_enforced(self):
+        """A precision mismatch causes crash when shared expert fusion is enabled,
+        so --enforce-shared-experts-fusion must not override it. Guards the gap
+        where the enforce early-return skipped the quant check entirely."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        mixed = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
+        )
+        self.assertIn(
+            "higher precision",
+            self._reason(DeepseekV2ForCausalLM, self._config(), mixed),
+        )
+        matched = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
+        )
+        self.assertIsNone(self._reason(DeepseekV2ForCausalLM, self._config(), matched))
+
 
 class TestGlmMoeLiteGate(_FusionGateCase):
     def _config(self, **kw):
@@ -497,6 +516,45 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         self.assertIsNone(
             seen["quant"], "the MTP module ships unquantized in that checkpoint"
         )
+
+
+class TestA2ABackendGate(_FusionGateCase):
+    """`can_fuse_shared_expert` must refuse for every DeepEP-class backend it
+    is wired for. MoRI runs the same per-rank EP expert layout as DeepEP, so a
+    fused shared expert would occupy a global slot the layers never allocate —
+    the routed experts then read the wrong rows and accuracy collapses."""
+
+    def _config(self):
+        return SimpleNamespace(
+            model_type="qwen3_5_moe_text",
+            shared_expert_intermediate_size=1024,
+            moe_intermediate_size=1024,
+        )
+
+    def _use_backend(self, name: str):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.runtime_context import get_flags
+
+        moe = get_flags().moe
+        previous = moe.a2a_backend
+        moe.a2a_backend = MoeA2ABackend(name)
+        self.addCleanup(setattr, moe, "a2a_backend", previous)
+
+    def test_the_a2a_backends_refuse_fusion(self):
+        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+
+        self._seed()
+        for backend in ("deepep", "mori"):
+            with self.subTest(backend=backend):
+                self._use_backend(backend)
+                self.assertFalse(can_fuse_shared_expert(self._config(), None))
+
+    def test_a_plain_tp_deployment_still_fuses(self):
+        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+
+        self._seed()
+        self._use_backend("none")
+        self.assertTrue(can_fuse_shared_expert(self._config(), None))
 
 
 class TestFamiliesWithoutAGate(_FusionGateCase):

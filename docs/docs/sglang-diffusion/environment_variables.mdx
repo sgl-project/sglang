@@ -19,6 +19,11 @@ description: "Configure SGLang diffusion behavior with environment variables."
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EXTERNAL_MODEL_PACKAGE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Installed package that registers out-of-tree diffusion pipelines and component models. The package is imported once in every process.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_TARGET_DEVICE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>cuda</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Target device for inference (<code>cuda</code>, <code>rocm</code>, <code>xpu</code>, <code>npu</code>, <code>musa</code>, <code>mps</code>, <code>cpu</code>)</td>
@@ -88,6 +93,16 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>true</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use Run:AI model streamer for model loading</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KITCHEN_INT8_MAX_ROWS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8192</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Max activation rows per <code>kitchen_int8</code> fused GEMM. Set <code>0</code> to disable row splitting.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_KITCHEN_INT8_MIN_SPLIT_N</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>8192</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Minimum output features before <code>kitchen_int8</code> splits large-M GEMMs. Narrow outputs stay as a single call.</td>
+    </tr>
   </tbody>
 </table>
 
@@ -112,7 +127,7 @@ description: "Configure SGLang diffusion behavior with environment variables."
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_MLX</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Set to <code>1</code> to enable MLX fused Metal kernels for norm ops on MPS</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>SRT only: enables the MLX serving backend. It has no effect on SGLang Diffusion, which uses PyTorch MPS.</td>
     </tr>
   </tbody>
 </table>

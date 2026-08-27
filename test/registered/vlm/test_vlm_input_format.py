@@ -74,7 +74,7 @@ class VLMInputTestBase:
             cls.main_image.append(Image.open(BytesIO(response.content)))
 
         cls.processor = AutoProcessor.from_pretrained(
-            cls.model_path, trust_remote_code=True, use_fast=True
+            cls.model_path, trust_remote_code=True
         )
         _fix_added_tokens_encoding(cls.processor.tokenizer)
         cls._init_visual()

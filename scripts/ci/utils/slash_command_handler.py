@@ -702,11 +702,8 @@ def _extract_runner_configs(content):
 
 
 def _extract_legacy_suites(content):
-    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)` calls.
-
-    Mirrors _extract_runner_configs for the legacy nightly/weekly shape: a file
-    may register on multiple pools, so collect all of them rather than the first.
-    """
+    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
+    calls. Used only to report why such a file is not dispatchable."""
     out = []
     for args in re.finditer(
         r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
@@ -715,38 +712,6 @@ def _extract_legacy_suites(content):
         if m:
             out.append(m.group(1))
     return out
-
-
-# Legacy nightly/weekly CUDA suites register with a single-string `suite=`
-# instead of `runner_config=`, so they carry no runner metadata of their own.
-# Map each to the runner_config in scripts/ci/runner_configs.yml whose hardware
-# matches the runner the nightly/weekly pipeline actually uses (see
-# .github/workflows/{nightly,weekly}-test-nvidia.yml), so /rerun-test can still
-# dispatch a single nightly/weekly test. The runner label, install script,
-# timeout and rdma_devices are then resolved from
-# runner_configs.yml as usual, keeping that file the single source of truth for
-# runner details.
-#
-# Suites on hardware with no matching runner_config (e.g. nightly-4-gpu-gb300)
-# and non-CUDA suites (npu/amd) are intentionally absent and stay
-# non-dispatchable until a matching runner_config exists.
-_LEGACY_SUITE_TO_RUNNER_CONFIG = {
-    "nightly-1-gpu": "1-gpu-large",
-    "nightly-kernel-1-gpu": "1-gpu-large",
-    "nightly-eval-text-2-gpu": "2-gpu-large",
-    "nightly-perf-text-2-gpu": "2-gpu-large",
-    "nightly-eval-vlm-2-gpu": "2-gpu-large",
-    "nightly-perf-vlm-2-gpu": "2-gpu-large",
-    "nightly-4-gpu": "4-gpu-h100",
-    "nightly-4-gpu-b200": "4-gpu-b200",
-    "nightly-8-gpu-common": ["8-gpu-h200", "8-gpu-b200"],
-    "nightly-8-gpu-h200": "8-gpu-h200",
-    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
-    "nightly-precision-8-gpu-h200": "8-gpu-h200",
-    "nightly-8-gpu-h20": "8-gpu-h20",
-    "nightly-8-gpu-b200": "8-gpu-b200",
-    "weekly-8-gpu-h200": "8-gpu-h200",
-}
 
 
 def _dispatch_err(suite, msg):
@@ -811,11 +776,10 @@ def detect_suite(file_path_from_test):
     pool it should run on — so this returns a *list* of dispatch dicts, one
     per registration. Runner label, install script, timeout, and rdma_devices
     are all resolved from scripts/ci/runner_configs.yml — the
-    same single source of truth that drives the main PR test pipeline.
-
-    Legacy nightly/weekly CUDA suites (single-string `suite=`) are dispatchable
-    too: each suite name is mapped to the matching runner_config via
-    _LEGACY_SUITE_TO_RUNNER_CONFIG, then resolved the same way.
+    same single source of truth that drives the main PR test pipeline. Every
+    dispatchable CUDA suite, per-commit and scheduled alike, goes through that
+    one path; the legacy single-string `suite=` carries no runner_config and is
+    reported as non-dispatchable.
 
     CPU files yield a single-element list. A file with no recognised (or no
     dispatchable) registration yields a one-element list whose dict has an
@@ -837,19 +801,7 @@ def detect_suite(file_path_from_test):
             results.append(_resolve_runner_config(rc, full_path, suite))
         return results
 
-    # Legacy nightly/weekly CUDA suites: single-string `suite=`, no
-    # runner_config. Map each mappable suite to its runner_config and resolve.
     legacy_suites = _extract_legacy_suites(content)
-    mappable = [s for s in legacy_suites if s in _LEGACY_SUITE_TO_RUNNER_CONFIG]
-    if mappable:
-        results = []
-        for s in mappable:
-            rcs = _LEGACY_SUITE_TO_RUNNER_CONFIG[s]
-            if isinstance(rcs, str):
-                rcs = [rcs]
-            for rc in rcs:
-                results.append(_resolve_runner_config(rc, full_path, s))
-        return results
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         return [
@@ -869,11 +821,11 @@ def detect_suite(file_path_from_test):
         return [
             _dispatch_err(
                 suite,
-                f"Suite `{suite}` in `{full_path}` is not dispatchable via "
-                f"/rerun-test. It has no entry in _LEGACY_SUITE_TO_RUNNER_CONFIG "
-                f"— either it is a non-CUDA suite (npu/amd) or it runs on "
-                f"hardware with no matching runner_config in "
-                f"scripts/ci/runner_configs.yml.",
+                f"Suite `{suite}` in `{full_path}` is registered with the legacy "
+                f"single-string `suite=`, which carries no runner_config and so "
+                f"is not dispatchable via /rerun-test. Re-register it with "
+                f"`stage=`/`runner_config=` (CUDA), or dispatch its own "
+                f"workflow (npu/amd).",
             )
         ]
 
@@ -1081,31 +1033,25 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
     """
     Check permissions shared by /rerun-test and /rerun-group.
     """
-    # SECURITY: These commands check out and execute code from the PR branch on
-    # self-hosted GPU runners, so fork PRs require a trusted collaborator.
-    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-    if is_fork:
-        commenter = comment.user.login
-        perm = gh_repo.get_collaborator_permission(commenter)
-        if perm not in ("admin", "write"):
-            print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
-            comment.create_reaction("confused")
-            pr.create_issue_comment(
-                f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
-                "has write permission on the repo.\n\n"
-                "Please ask a maintainer to run this command, or use the normal CI flow."
-            )
-            return False
-        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
+    # A rerun dispatches rerun-test.yml, which never passes through pr-gate.yml,
+    # so it is unthrottled either way; gate on what pr-gate waives the limit for.
+    if user_perms.get("cooldown_interval_minutes") == 0:
+        return True
 
-    if not (
-        user_perms.get("can_rerun_test", False)
-        or user_perms.get("can_rerun_stage", False)
-    ):
-        print("Permission denied: neither can_rerun_test nor can_rerun_stage is true.")
-        return False
+    commenter = comment.user.login
+    perm = gh_repo.get_collaborator_permission(commenter)
+    if perm in ("admin", "write"):
+        print(f"Commenter {commenter} has write+ permission. Proceeding.")
+        return True
 
-    return True
+    print(f"Permission denied: /{command_name} by {commenter} (permission: {perm}).")
+    comment.create_reaction("confused")
+    pr.create_issue_comment(
+        f"⛔ `/{command_name}` requires `cooldown_interval_minutes: 0` in "
+        "`.github/CI_PERMISSIONS.json`, or write permission on the repo.\n\n"
+        "Please ask a maintainer to run this command, or use the normal CI flow."
+    )
+    return False
 
 
 def handle_rerun_test(
@@ -1368,10 +1314,10 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
-    # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
-    # even if they are not listed in CI_PERMISSIONS.json.
+    # PR authors can always rerun failed CI on their own PRs, even if they are not
+    # listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
-    # Note: /rerun-test is blocked entirely for fork PRs in handle_rerun_test() itself.
+    # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -1384,11 +1330,11 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["can_rerun_test"] = True
 
-    if not user_perms:
-        print(f"User {user_login} does not have any configured permissions. Exiting.")
-        return
+    # No early exit on a missing entry: /rerun-test also gates on repo permission,
+    # so a write-holder absent from the file must still reach its handler.
+    if user_perms is None:
+        user_perms = {}
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
@@ -1427,31 +1373,6 @@ def main():
             print("Combined command processed successfully; reaction added.")
         else:
             print("Combined command finished, but no actions were taken.")
-
-    elif first_line.startswith("/rerun-stage"):
-        print("/rerun-stage is deprecated; posting deprecation notice.")
-        comment.create_reaction("-1")
-        pr.create_issue_comment(
-            "⚠️ **`/rerun-stage` has been deprecated.**\n\n"
-            "Stage granularity is too coarse — a stage usually doesn't map to one "
-            "feature, so rerunning a stage re-pays the cost of unrelated tests. "
-            "If you don't know which exact test files to rerun, you shouldn't be "
-            "using `/rerun-stage` or `/rerun-test` in the first place.\n\n"
-            "**Use one of these instead:**\n"
-            "- **Selective tests** (you know exactly which files to rerun):\n"
-            "  ```\n"
-            "  /rerun-test test_foo.py test_bar.py\n"
-            "  ```\n"
-            "- **Rerun only failed jobs**:\n"
-            "  ```\n"
-            "  /rerun-failed-ci\n"
-            "  ```\n"
-            "- **Full CI rerun** (with extra coverage): add the `run-ci` or "
-            "`run-ci-extra` label and push a new commit (or use `/tag-and-rerun-ci`).\n\n"
-            "**AMD CI**: stage-level dispatch is still available via "
-            "Actions UI → *PR Test (AMD)* / *PR Test ROCm 7.2 (AMD)* → "
-            "*Run workflow* → pick a stage from the dropdown."
-        )
 
     elif first_line.startswith("/rerun-group"):
         group_names = first_line.split()[1:]

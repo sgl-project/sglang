@@ -34,6 +34,13 @@ pub struct RequestTokens {
     pub engine_equivalent: bool,
 }
 
+/// External indexer answer prepared by the async ingress path for the
+/// synchronous cache-aware policy.
+pub struct ExternalPrefixSignal {
+    pub outcome: sgl_kv_indexer::PrefixOutcome,
+    pub query_blocks: usize,
+}
+
 /// Produce the routing tokens — and whether they are engine-equivalent —
 /// from an already-parsed request body, using the shared tokenizer registry.
 ///
@@ -181,6 +188,7 @@ pub struct SelectionContext<'a> {
     request_body: Option<&'a [u8]>,
     routing_key: Option<&'a str>,
     request_tokens: Option<&'a [u32]>,
+    external_prefix: Option<&'a ExternalPrefixSignal>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -190,6 +198,7 @@ impl<'a> SelectionContext<'a> {
             request_body,
             routing_key: None,
             request_tokens: None,
+            external_prefix: None,
         }
     }
 
@@ -203,6 +212,7 @@ impl<'a> SelectionContext<'a> {
             request_body,
             routing_key,
             request_tokens: None,
+            external_prefix: None,
         }
     }
 
@@ -211,6 +221,14 @@ impl<'a> SelectionContext<'a> {
     /// re-tokenizing the body.
     pub fn with_request_tokens(mut self, request_tokens: Option<&'a [u32]>) -> Self {
         self.request_tokens = request_tokens;
+        self
+    }
+
+    pub fn with_external_prefix(
+        mut self,
+        external_prefix: Option<&'a ExternalPrefixSignal>,
+    ) -> Self {
+        self.external_prefix = external_prefix;
         self
     }
 
@@ -230,6 +248,10 @@ impl<'a> SelectionContext<'a> {
     /// must derive tokens itself (e.g. a caller that didn't pre-tokenize).
     pub fn request_tokens(&self) -> Option<&[u32]> {
         self.request_tokens
+    }
+
+    pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
+        self.external_prefix
     }
 }
 

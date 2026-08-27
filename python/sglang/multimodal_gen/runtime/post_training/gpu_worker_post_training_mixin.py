@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_rank,
+    get_tp_world_size,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     iter_materialized_weights,
@@ -14,6 +18,7 @@ from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -22,6 +27,11 @@ if TYPE_CHECKING:
         UpdateWeightFromTensorCheckerReqInput,
         UpdateWeightFromTensorReqInput,
     )
+
+
+def _normalize_gpu_uuid(uuid: str) -> str:
+    # NVML prefixes uuids with "GPU-"/"MIG-"; torch device properties do not.
+    return uuid.removeprefix("MIG-").removeprefix("GPU-").lower()
 
 
 class GPUWorkerPostTrainingMixin:
@@ -52,9 +62,9 @@ class GPUWorkerPostTrainingMixin:
         if not self.pipeline:
             return False, "Pipeline is not initialized"
 
-        payload, error = self._select_rank_scoped_payload(
+        payload, error = self._select_own_gpu_payload(
             payloads=req.serialized_named_tensors,
-            field_name="serialized_named_tensors",
+            payload_gpu_uuids=req.payload_gpu_uuids,
         )
         if error is not None:
             return False, error
@@ -153,23 +163,41 @@ class GPUWorkerPostTrainingMixin:
             )
         return checksums
 
-    def _select_rank_scoped_payload(
+    def _select_own_gpu_payload(
         self,
         payloads: list,
-        field_name: str,
+        payload_gpu_uuids: list[str] | None,
     ) -> tuple[object | None, str | None]:
         if not isinstance(payloads, list):
-            return None, f"{field_name} must be a list"
+            return None, "serialized_named_tensors must be a list"
         if not payloads:
-            return None, f"{field_name} is required"
+            return None, "serialized_named_tensors is required"
 
-        tp_world_size = get_tp_world_size()
-        if len(payloads) not in (1, tp_world_size):
-            return (
-                None,
-                f"{field_name} size must be 1 or tp_size ({tp_world_size}), "
-                f"got {len(payloads)}",
+        if payload_gpu_uuids is None:
+            # Unlabeled fallback: world rank equals tp rank for tp-only runs.
+            if len(payloads) == 1:
+                return payloads[0], None
+            world_group = get_world_group()
+            if len(payloads) != world_group.world_size:
+                return None, (
+                    f"serialized_named_tensors size must be 1 or world_size "
+                    f"({world_group.world_size}), got {len(payloads)}"
+                )
+            return payloads[world_group.rank_in_group], None
+
+        if len(payload_gpu_uuids) != len(payloads):
+            return None, (
+                f"payload_gpu_uuids needs one entry per payload, "
+                f"got {len(payload_gpu_uuids)} for {len(payloads)} payloads"
             )
 
-        payload_idx = get_tp_rank() if len(payloads) == tp_world_size else 0
-        return payloads[payload_idx], None
+        own_gpu_uuid = _normalize_gpu_uuid(
+            current_platform.get_device_uuid(self.local_rank)
+        )
+        normalized_uuids = [_normalize_gpu_uuid(uuid) for uuid in payload_gpu_uuids]
+        if own_gpu_uuid not in normalized_uuids:
+            return None, (
+                f"no payload was exported from this worker's GPU {own_gpu_uuid}, "
+                f"got {payload_gpu_uuids}"
+            )
+        return payloads[normalized_uuids.index(own_gpu_uuid)], None
