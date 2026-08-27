@@ -155,7 +155,16 @@ SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+#ifdef USE_ROCM
+  // The ballot covers the whole hardware wave, which on wave64 holds two of
+  // these 32-lane logical warps, so a plain __popc would report the wave's
+  // lower half to both of them. Shift the caller's mask onto this warp's half
+  // and count all 64 bits. __lane_id() / kWarpSize is 0 on wave32.
+  const uint32_t half = __lane_id() / kWarpSize;
+  return __popcll(__ballot(pred) & (static_cast<uint64_t>(mask) << (kWarpSize * half)));
+#else
   return __popc(__ballot_sync(mask, pred));
+#endif
 }
 
 struct alignas(8) TieValue {
