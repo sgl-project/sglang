@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
+    is_dspark_draft_model,
     is_embedding_gemma,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,6 +55,14 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
 
 
 class TestDraftModelConfig(CustomTestCase):
+    def test_dspark_layout_signal_is_draft_only(self):
+        dspark = SimpleNamespace(architectures=["DeepseekV4ForCausalLMDSpark"])
+        target = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+        self.assertTrue(is_dspark_draft_model(dspark, True))
+        self.assertFalse(is_dspark_draft_model(dspark, False))
+        self.assertFalse(is_dspark_draft_model(target, True))
+
     def test_qwen35_mtp_depth_is_synced_to_text_config(self):
         config = object.__new__(ModelConfig)
         config.is_draft_model = True

@@ -52,6 +52,7 @@ class DeepSeekV4Config(PretrainedConfig):
     bos_token_id: int = 0
     eos_token_id: int = 1
     ep_size: int = 1
+    expert_dtype: Optional[str] = None
     first_k_dense_replace: int = 0
     hidden_act: str = "silu"
     hidden_size: int = 4096

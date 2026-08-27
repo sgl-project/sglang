@@ -165,6 +165,10 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_dspark_draft_model(config, is_draft_model: bool) -> bool:
+    return is_draft_model and _hf_arch(config) == "DeepseekV4ForCausalLMDSpark"
+
+
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -413,6 +417,18 @@ class ModelConfig:
         if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
+                is_dspark_draft_model(self.hf_config, self.is_draft_model)
+                and self.hf_config.expert_dtype is not None
+            ):
+                self.is_fp4_experts = self.hf_config.expert_dtype.lower() in (
+                    "fp4",
+                    "mxfp4",
+                )
+                logger.info(
+                    "Detected bundled DSpark draft expert dtype: %s.",
+                    self.hf_config.expert_dtype,
+                )
+            elif (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
                 or envs.SGLANG_DSV4_FP4_DEQUANT.is_set()
             ):
