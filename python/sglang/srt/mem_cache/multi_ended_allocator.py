@@ -1705,10 +1705,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- free-group --
 
-    def free_group_begin(self) -> None:
-        self.is_not_in_free_group = False
-        self.free_group = []
-
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
         if self.free_group:
@@ -1976,10 +1972,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(free_index)
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
-
-    def free_group_begin(self) -> None:
-        self.is_not_in_free_group = False
-        self.free_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -2492,10 +2484,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return
 
     # -- free-group --
-
-    def free_group_begin(self) -> None:
-        self.is_not_in_free_group = False
-        self.free_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
