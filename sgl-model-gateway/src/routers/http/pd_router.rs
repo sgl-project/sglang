@@ -428,12 +428,10 @@ impl PDRouter {
         // Serialize and inject once. Each retry clones this prepared request,
         // then adds a fresh bootstrap_room for the new transfer attempt.
         let shared_request = match serde_json::to_value(original_request) {
-            Ok(request) => {
-                match Self::inject_request_id_into_value(request, &request_id) {
-                    Ok(request) => Arc::new(request),
-                    Err(error) => return Self::handle_serialization_error(error),
-                }
-            }
+            Ok(request) => match Self::inject_request_id_into_value(request, &request_id) {
+                Ok(request) => Arc::new(request),
+                Err(error) => return Self::handle_serialization_error(error),
+            },
             Err(error) => return Self::handle_serialization_error(error),
         };
 
@@ -2002,18 +2000,14 @@ mod tests {
 
     #[test]
     fn test_inject_request_id_preserves_existing_and_injects_scalar() {
-        let existing = PDRouter::inject_request_id_into_value(
-            json!({"rid": "client-rid"}),
-            "router-rid",
-        )
-        .unwrap();
+        let existing =
+            PDRouter::inject_request_id_into_value(json!({"rid": "client-rid"}), "router-rid")
+                .unwrap();
         assert_eq!(existing["rid"], "client-rid");
 
-        let request = PDRouter::inject_request_id_into_value(
-            json!({"prompt": ["a", "b"]}),
-            "router-rid",
-        )
-        .unwrap();
+        let request =
+            PDRouter::inject_request_id_into_value(json!({"prompt": ["a", "b"]}), "router-rid")
+                .unwrap();
         assert_eq!(request["rid"], "router-rid");
     }
 

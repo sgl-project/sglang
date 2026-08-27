@@ -988,9 +988,10 @@ pub async fn wasm_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::body::Body;
     use tower::{service_fn, ServiceExt};
+
+    use super::*;
 
     #[test]
     fn test_normalize_path_no_ids() {
