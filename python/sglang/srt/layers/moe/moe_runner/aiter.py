@@ -191,20 +191,31 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
     if not 0 < bound < recv_rows:
         return 0
 
-    # Log once per distinct bound, not once overall. Capture visits tiers widest
-    # first, so a single log line only ever shows the widest tier -- which is
-    # where a per-tier bound and a fixed ceiling coincide, and is how a 4-16x
-    # looser bound at the tiers actually replayed went unnoticed.
-    if bound not in _RECV_BOUND_LOGGED:
+    # One INFO line the first time it engages, so an inert bound is not mistaken
+    # for an active one in the results. Per-tier values go to DEBUG: capture
+    # visits every tier, and at INFO on every rank that is dozens of lines.
+    if get_parallel().tp_rank == 0 and bound not in _RECV_BOUND_LOGGED:
+        first = not _RECV_BOUND_LOGGED
         _RECV_BOUND_LOGGED.add(bound)
-        logger.info(
-            "mori recv bound: %d rows -> %d (dp_tokens=%d ep=%d topk=%d)",
-            recv_rows,
-            bound,
-            max_tokens,
-            get_parallel().moe_ep_size,
-            topk,
-        )
+        if first:
+            logger.info(
+                "mori recv bound active: %d rows -> %d for this tier "
+                "(dp_tokens=%d ep=%d topk=%d); per-tier values at DEBUG",
+                recv_rows,
+                bound,
+                max_tokens,
+                get_parallel().moe_ep_size,
+                topk,
+            )
+        else:
+            logger.debug(
+                "mori recv bound: %d rows -> %d (dp_tokens=%d ep=%d topk=%d)",
+                recv_rows,
+                bound,
+                max_tokens,
+                get_parallel().moe_ep_size,
+                topk,
+            )
     return bound
 
 
