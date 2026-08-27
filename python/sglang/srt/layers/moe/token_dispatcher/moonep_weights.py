@@ -32,7 +32,7 @@ class MoonEPWeightPool:
         group,
         specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ):
-        from moonep.buffer import create_nvl_dist_tensor
+        from moonep.buffer import create_nvl_dist_tensor, local_first_chunk_index
 
         self.num_layers = num_layers
         self.num_local_experts = num_local_experts
@@ -40,6 +40,16 @@ class MoonEPWeightPool:
         self.ep_rank = ep_rank
         self.ep_size = ep_size
         self.block_rows = num_local_experts + num_prefetch_slots
+        self._chunk_index = [
+            local_first_chunk_index(owner, ep_rank, ep_size) for owner in range(ep_size)
+        ]
+        if self._chunk_index != [(o - ep_rank) % ep_size for o in range(ep_size)]:
+            raise RuntimeError(
+                "MoonEP's local-first rotation is no longer "
+                "(owner_rank - local_rank) % world_size, which expert_rows "
+                f"assumes; local_first_chunk_index gives {self._chunk_index} "
+                f"on rank {ep_rank} of {ep_size}. Update expert_rows to match."
+            )
         _check_prefetch_tiling(specs)
         self.chunk_rows = _resolve_chunk_rows(specs, num_layers * self.block_rows)
         self._layers: dict[int, int] = {}
@@ -90,10 +100,7 @@ class MoonEPWeightPool:
 
     def chunk_start(self, owner_rank: int) -> int:
         """First row of ``owner_rank``'s chunk in this rank's mapping."""
-        from moonep.buffer import local_first_chunk_index
-
-        index = local_first_chunk_index(owner_rank, self.ep_rank, self.ep_size)
-        return index * self.chunk_rows
+        return self._chunk_index[owner_rank] * self.chunk_rows
 
     def local_view(self, kind: str, layer_id: int) -> torch.Tensor:
         """This rank's ``[num_local_experts, ...]`` slice: what the loader
@@ -164,19 +171,37 @@ def _resolve_chunk_rows(
 
 
 def _num_moe_layers() -> int:
-    """How many layers will ask the pool for storage.
+    """How many layers *this rank* will ask the pool for storage.
 
     Counted from the config rather than tracked dynamically because the ranges
-    are fixed-size VMM mappings that cannot grow; ``layer_offset`` raises if
-    the count turns out to be too small.
+    are fixed-size VMM mappings that cannot grow. Only this rank's pipeline
+    stage is counted: with PP a rank builds an arbitrary slice of the model,
+    and a pool sized for the whole model would waste the rest. ``layer_offset``
+    raises if the count turns out to be too small, so an over-count costs
+    memory and an under-count is loud.
     """
+    from sglang.srt.distributed import get_pp_group
+    from sglang.srt.distributed.utils import get_pp_indices
     from sglang.srt.runtime_context import process_model_config
 
     config = process_model_config()
-    num_layers = int(config.num_hidden_layers)
-    first_dense = config.first_k_dense_replace or 0
-    freq = getattr(config.hf_text_config, "moe_layer_freq", 1) or 1
-    return sum(1 for i in range(num_layers) if i >= first_dense and i % freq == 0)
+    hf_config = config.hf_text_config
+
+    if hasattr(hf_config, "moe_layer_freq") and hf_config.moe_layer_freq != 1:
+        raise NotImplementedError(
+            "MoonEP's expert pool assumes every layer from "
+            "first_k_dense_replace onwards is an MoE layer, but this model "
+            f"sets moe_layer_freq={hf_config.moe_layer_freq!r}. Counting its "
+            "MoE layers is a per-model rule and getting it wrong undersizes a "
+            "VMM mapping that cannot grow."
+        )
+
+    pp_group = get_pp_group()
+    start, end = get_pp_indices(
+        int(config.num_hidden_layers), pp_group.rank_in_group, pp_group.world_size
+    )
+    first_moe = max(start, config.first_k_dense_replace or 0)
+    return max(0, end - first_moe)
 
 
 def get_pool() -> Optional[MoonEPWeightPool]:
@@ -267,27 +292,38 @@ def group_rows(
     return rows
 
 
-def prefetch_pairs(
-    layer_id: int,
-) -> tuple[
-    list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]
-]:
-    """``(weight_pairs, scale_pairs)`` for ``Buffer.prefetch_weight``.
+def prefetch_experts(layer_id: int, source_rows: torch.Tensor, num_sms: int) -> None:
+    """Copy the planned remote experts into this layer's prefetch slots.
 
-    Scales are re-tiled by the copy and so are kept apart from the weights.
-    The scale views are the *storage* orientation, which is what a byte copy
-    has to move -- see the MN-major note in this module's docstring.
+    ``Buffer.prefetch_weight`` does this for BF16, but it takes each source as
+    one ``[E+B, ...]`` block and slices the slots off the end. A symmetric
+    range cannot present that block -- ``create_nvl_dist_tensor`` pads every
+    rank's chunk up to allocation granularity, so an expert's rows and this
+    rank's slots are never adjacent. ``launch_prefetch`` takes source and
+    destination separately and is what ``prefetch_weight`` calls anyway.
+
+    ``source_rows`` are rows of the symmetric range (:func:`expert_rows`), not
+    global expert ids -- the other thing the block API assumes.
     """
+    from moonep.prefetch import launch_prefetch, retile_for_prefetch
+
     assert _pool is not None, "MoonEP expert pool was never created"
-    weights = [
-        (_pool.ranges[k], _pool.slot_view(k, layer_id)) for k in (W13_WEIGHT, W2_WEIGHT)
-    ]
-    scales = [
-        (_pool.ranges[k], _pool.slot_view(k, layer_id))
-        for k in (W13_SCALE, W2_SCALE)
-        if k in _pool.ranges
-    ]
-    return weights, scales
+    for kind in (W13_WEIGHT, W2_WEIGHT):
+        launch_prefetch(
+            _pool.ranges[kind],
+            _pool.slot_view(kind, layer_id),
+            source_rows,
+            num_sms=num_sms,
+        )
+    for kind in (W13_SCALE, W2_SCALE):
+        if kind not in _pool.ranges:
+            continue
+        launch_prefetch(
+            retile_for_prefetch(_pool.ranges[kind]),
+            retile_for_prefetch(_pool.slot_view(kind, layer_id)),
+            source_rows,
+            num_sms=num_sms,
+        )
 
 
 def assert_resident(layer: torch.nn.Module, kind: str, tensor: torch.Tensor) -> None:

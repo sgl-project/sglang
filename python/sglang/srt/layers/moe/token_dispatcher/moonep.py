@@ -189,7 +189,7 @@ class MoonEPBuffer:
         if token_padding is None:
             token_padding = envs.SGLANG_MOONEP_TOKEN_PADDING.get()
         if num_sms is None:
-            num_sms = envs.SGLANG_MOONEP_NUM_SMS.get()
+            num_sms = get_moonep_num_sms()
 
         num_ep_ranks = cls._resolve_num_ep_ranks(group)
         num_experts = cls._require_positive_int("num_experts", int(num_experts))
@@ -308,6 +308,10 @@ class MoonEPBuffer:
         for key in list(state.buffers):
             cls.destroy_buffer(key)
         state.active_key = None
+
+
+def get_moonep_num_sms() -> int:
+    return envs.SGLANG_MOONEP_NUM_SMS.get()
 
 
 def get_moonep_num_prefetch_slots(num_experts: int, num_ep_ranks: int) -> int:

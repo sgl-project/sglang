@@ -1350,34 +1350,36 @@ def pre_permute_moonep_to_deep_gemm(
     running_state["plan"] = dispatch_output.plan
     running_state["num_tokens"] = dispatch_output.num_tokens
 
+    from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+
     expert_ids = dispatch_output.expert_ids
-    if quant_info.w13_weight.dtype != torch.bfloat16:
+    # Keyed on the pool, not on the weight dtype: the pool is what makes a row
+    # id meaningful. BF16 experts are replicated on every rank and need no
+    # remapping, and FusedMoE rejects at init the quant methods that would
+    # arrive here with quantized weights but no pool behind them.
+    pool = moonep_weights.get_pool()
+    if pool is not None:
         # Quantized experts live in MoonEP's symmetric pool, so the duplicated
         # ones have to be pulled in before the GEMM reads them, and the plan's
         # global expert ids have to become pool rows. This runs here rather
         # than in DeepEPMoE.run_moe_core because MXFP4 on DeepGEMM sets
         # deprecate_flag, which delegates past that method entirely.
-        from sglang.srt.layers.moe.token_dispatcher import moonep_weights
-        from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPBuffer
+        from sglang.srt.layers.moe.token_dispatcher.moonep import get_moonep_num_sms
 
         layer_id = runner_config.layer_id
         assert layer_id is not None, "MoonEP pre-permute needs runner_config.layer_id"
-        weight_pairs, scale_pairs = moonep_weights.prefetch_pairs(layer_id)
-        MoonEPBuffer.get_existing_buffer().prefetch_weight(
-            plan=dispatch_output.plan,
-            async_finish=False,
-            weight_pairs=weight_pairs,
-            scale_pairs=scale_pairs or None,
-            experts_to_copy=moonep_weights.expert_rows(
+        moonep_weights.prefetch_experts(
+            layer_id,
+            moonep_weights.expert_rows(
                 layer_id,
                 dispatch_output.plan.experts_to_copy[get_tp_group().rank_in_group],
             ),
+            num_sms=get_moonep_num_sms(),
         )
         # The parameters are this rank's slice of the pool, but m_indices
         # addresses the whole symmetric range -- a duplicated expert's rows
         # live in another rank's chunk. Point the GEMM at the full ranges, of
         # which the parameters are a sub-view.
-        pool = moonep_weights.get_pool()
         quant_info.w13_weight = pool.ranges[moonep_weights.W13_WEIGHT].view(torch.int8)
         quant_info.w2_weight = pool.ranges[moonep_weights.W2_WEIGHT].view(torch.int8)
         quant_info.w13_scale = pool.ranges[moonep_weights.W13_SCALE].permute(0, 2, 1)
