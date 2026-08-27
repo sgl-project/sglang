@@ -576,13 +576,6 @@ pub enum RequestKind {
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
-    /// Internal service call: decode a complete token-id sequence to text. Walks
-    /// the same FSM as every request (validate → register → Queued), but the
-    /// stage that answers it is the detok shard itself, never the scheduler
-    /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
 }
 
 /// A single in-flight `/generate` request (per-item from

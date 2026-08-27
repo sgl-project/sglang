@@ -29,8 +29,6 @@ pub(super) async fn submit(
         // client's, or minted one. Control requests have no client-facing rid.
         RequestKind::Generate(g) => g.rid.clone(),
         RequestKind::Control(c) => c.rid().into(),
-        // Internal service call — no client-facing rid; mint a fresh one.
-        RequestKind::Detokenize { .. } => Rid::new(),
     };
     // Two in-flight requests can name the same client rid, but they cannot share a
     // `Rid`: `into_requests` built each through `Rid::from_client`, which appends a

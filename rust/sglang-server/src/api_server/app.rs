@@ -7,13 +7,12 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, native_api, openai};
+use super::{common, log, models, native_api};
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
-/// Shared handler state: submission handles, immutable server configuration,
-/// and the API-owned chat formatter.
+/// Shared handler state: submission handles and immutable server configuration.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning each
@@ -23,7 +22,6 @@ pub(super) struct AppState {
     pub(super) senders: Senders,
     pub(super) response_buf: usize,
     pub(super) server_args: Arc<ServerArgs>,
-    pub(super) chat_formatter: Option<openai::ChatFormatter>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
 }
@@ -40,19 +38,17 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
-    let chat_formatter = openai::load_chat_support(&server_args);
     let state = Arc::new(AppState {
         senders,
         response_buf,
         server_args: server_args.clone(),
-        chat_formatter,
         response_activity,
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
         .merge(common::routes())
         .merge(native_api::routes())
-        .merge(openai::routes());
+        .merge(models::routes());
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except
     // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
