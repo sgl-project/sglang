@@ -353,14 +353,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
-    # Run the first/last denoising steps of a ModelOpt FP8 (W8A8) DiT as
-    # W8A16: the same FP8 weights are dequantized per call and fed to a
-    # 16-bit GEMM, skipping activation quantization on the steps most
-    # sensitive to it. Middle steps keep the checkpoint's W8A8 path.
-    # On by default; set 0 to run pure W8A8 on every step.
+    # Run the first/last denoising steps of a ModelOpt FP8 (W8A8) Cosmos3 DiT
+    # as W8A16 when the checkpoint's diffusion_step_policy asks for it; the
+    # same FP8 weights are dequantized per call and fed to a 16-bit GEMM.
+    # Kill-switch: set 0 to run pure W8A8 regardless of the checkpoint.
     "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION", "true"
     ),
+    # Manual overrides for experiments: setting either explicitly overrides
+    # that field of the checkpoint policy, or force-enables mixed precision
+    # on a checkpoint without one (the other field then takes the default
+    # below). When neither is set, the checkpoint fully owns the behavior.
     "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS": _lazy_int(
         "SGLANG_DIFFUSION_COSMOS3_STEP_MIXED_PRECISION_FIRST_STEPS", 3
     ),
