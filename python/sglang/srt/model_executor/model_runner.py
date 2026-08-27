@@ -183,6 +183,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     is_ep_joiner,
     is_ep_scale_joiner,
+    max_speculative_num_draft_tokens,
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
@@ -809,6 +810,11 @@ class ModelRunner:
         """Rows the shared logits buffer needs."""
         num_tokens_per_req = self.decode_num_tokens_per_req()
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+        # Adaptive gears capture wider draft-extend/verify graphs after this
+        # buffer is allocated; size it for the widest gear up front.
+        num_tokens_per_req = max(
+            num_tokens_per_req, max_speculative_num_draft_tokens() or 0
+        )
         return max(capture_bs) * num_tokens_per_req
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
@@ -1651,7 +1657,7 @@ class ModelRunner:
                 )
             else:
                 # mamba_pool is a pure PHYSICAL store; translate both COW slot ids.
-                pool.mamba_pool.copy_from(
+                pool.copy_mamba_state(
                     pool.translate_mamba_indices(forward_batch.mamba_cow_src_indices),
                     pool.translate_mamba_indices(forward_batch.mamba_cow_dst_indices),
                 )
