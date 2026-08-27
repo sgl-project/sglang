@@ -7462,7 +7462,7 @@ class ServerArgs:
 
         if view.disaggregation_mode == "prefill":
             return
-        decode_config = getattr(self.cuda_graph_config, "decode", None)
+        decode_config = getattr(view.cuda_graph_config, "decode", None)
         if decode_config is None or decode_config.backend == Backend.DISABLED:
             return
 
@@ -7488,7 +7488,10 @@ class ServerArgs:
 
     def _validate_deepep_v2_model_architecture(self) -> None:
         """Allow DeepEP v2 only where its model workflow is validated."""
-        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
+        if (
+            parse_connector_type(resolved_view(self).model_path)
+            == ConnectorType.INSTANCE
+        ):
             raise ValueError(
                 "DeepEP v2 MoE cannot validate a model loaded through an instance "
                 "connector. Load it from a model path or use "
@@ -7600,22 +7603,22 @@ class ServerArgs:
                     "Add a runner adapter before enabling DeepEP v2 with other "
                     "MoE runners."
                 )
-            if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+            if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
                 raise ValueError(
                     "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
                     "Disable --enable-two-batch-overlap and "
                     "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
                 )
-            if self.enforce_shared_experts_fusion:
+            if cfg.enforce_shared_experts_fusion:
                 raise ValueError(
                     "DeepEP v2 MoE has not validated fused shared experts yet. "
                     "Remove --enforce-shared-experts-fusion when using "
                     "--moe-a2a-backend deepep_v2."
                 )
             # Prefill reads host counts and is not graph-capturable.
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
-                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
             )
             logger.warning(
                 "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
@@ -7626,7 +7629,7 @@ class ServerArgs:
                 "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
                 "per-rank communication buffer capacity, not a model limit; "
                 "increase it for large prefill/chunked-prefill workloads.",
-                self.deepep_v2_mode,
+                cfg.deepep_v2_mode,
             )
 
         # The resolving view, not the field: `_a2a_backend_overrides` may have
