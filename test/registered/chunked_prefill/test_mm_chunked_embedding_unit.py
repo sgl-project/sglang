@@ -9,6 +9,7 @@ of the combined tensor pins the whole concatenated buffer).
 CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
 
+import logging
 from unittest.mock import Mock
 
 import pytest
@@ -259,7 +260,7 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     encoder.assert_called_once()
 
 
-def test_full_mismatched_cache_entry_is_reencoded():
+def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
     combined_hash = mm_schedule.MultiModalStaticCache.combine_hashes(
@@ -272,12 +273,16 @@ def test_full_mismatched_cache_entry_is_reencoded():
     input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
     encoder = Mock(side_effect=_encoder_tensor)
 
-    chunk, _ = mm_schedule._get_chunked_embedding_full(
-        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
-    )
+    with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
+        chunk, _ = mm_schedule._get_chunked_embedding_full(
+            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+        )
 
     assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
     encoder.assert_called_once()
+    assert "Discarding cached multimodal embedding" in caplog.text
+    assert "expected_tokens=15" in caplog.text
+    assert "cached_tokens=1" in caplog.text
 
 
 if __name__ == "__main__":

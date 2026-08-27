@@ -167,6 +167,22 @@ def _embedding_token_count(embedding: torch.Tensor) -> int:
     return embedding.reshape(-1, embedding.shape[-1]).shape[0]
 
 
+def _discard_mismatched_cached_embedding(
+    cache_key: Optional[int],
+    expected_token_count: int,
+    cached_token_count: int,
+) -> None:
+    """Log and remove a cache entry that cannot serve the current item."""
+    logger.warning(
+        "Discarding cached multimodal embedding due to a token-count mismatch: "
+        "cache_key=%s, expected_tokens=%d, cached_tokens=%d. Recomputing embedding.",
+        cache_key,
+        expected_token_count,
+        cached_token_count,
+    )
+    embedding_cache.free(cache_key, None)
+
+
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
     """Models that materialize and batch visual features inside their encoder.
 
@@ -245,8 +261,11 @@ def _get_chunked_embedding_full(
         embedding_per_req, EVSEmbeddingResult
     ):
         expected_token_count = sum(end - start + 1 for start, end in items_offset)
-        if _embedding_token_count(embedding_per_req.embedding) != expected_token_count:
-            embedding_cache.free(embedding_items_hash, None)
+        cached_token_count = _embedding_token_count(embedding_per_req.embedding)
+        if cached_token_count != expected_token_count:
+            _discard_mismatched_cached_embedding(
+                embedding_items_hash, expected_token_count, cached_token_count
+            )
             embedding_per_req = None
 
     if embedding_per_req is None:
@@ -340,10 +359,13 @@ def _batch_encode_per_image_misses(
             cached = embedding_cache.get_single(item.hash)
             if cached is not None:
                 cached_embedding = cached.embedding
-                if _embedding_token_count(cached_embedding) == expected_token_count:
+                cached_token_count = _embedding_token_count(cached_embedding)
+                if cached_token_count == expected_token_count:
                     hash_to_embedding[cache_key] = cached_embedding
                 else:
-                    embedding_cache.free(item.hash, None)
+                    _discard_mismatched_cached_embedding(
+                        item.hash, expected_token_count, cached_token_count
+                    )
                     unique_misses[cache_key] = (item, expected_token_count)
             elif cache_key not in unique_misses:
                 unique_misses[cache_key] = (item, expected_token_count)
@@ -418,11 +440,14 @@ def _get_chunked_embedding_by_item(
         cached = embedding_cache.get_single(item.hash)
         if cached is not None:
             cached_embedding = cached.embedding
-            if _embedding_token_count(cached_embedding) == expected_token_count:
+            cached_token_count = _embedding_token_count(cached_embedding)
+            if cached_token_count == expected_token_count:
                 cached_embeddings[idx] = cached_embedding
                 _acknowledge_deferred_cuda_ipc_cache_hits([item])
             else:
-                embedding_cache.free(item.hash, None)
+                _discard_mismatched_cached_embedding(
+                    item.hash, expected_token_count, cached_token_count
+                )
                 miss_items.append((idx, item, start, end))
         else:
             miss_items.append((idx, item, start, end))
