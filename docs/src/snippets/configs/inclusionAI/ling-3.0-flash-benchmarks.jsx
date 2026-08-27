@@ -169,7 +169,7 @@ export const benchmarks = [
   // GB10 + MXFP4 (TP1, DGX Spark sm121)
   // ====================================================================
   {
-    match: { hw: "gb10", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+    match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
     sglang_version: "PR #33561 @ 2f85329efe",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
@@ -181,7 +181,7 @@ export const benchmarks = [
     notes: "Full GSM8K stop rate 99.55%; single-chip memory ceiling makes c=16 prefill the bottleneck.",
   },
   {
-    match: { hw: "gb10", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
+    match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
     sglang_version: "PR #33561 @ 2f85329efe",
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },

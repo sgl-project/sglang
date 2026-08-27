@@ -1,7 +1,7 @@
 export const config = {
   modelName: "Ling-3.0-flash",
 
-  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "gb10"],
+  supportedHardware: ["h20-3e", "h200", "h800", "h100", "b200", "gb300", "dgx-spark"],
   groupHardware: false,
 
   variants: [{ id: "default", label: "Ling-3.0-flash" }],
@@ -46,7 +46,7 @@ export const config = {
     "h100": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "b200": "lmsysorg/sglang:dev-Ling-3.0-flash",
     "gb300": "lmsysorg/sglang:dev-Ling-3.0-flash",
-    "gb10": "lmsysorg/sglang:latest",
+    "dgx-spark": "lmsysorg/sglang:dev-Ling-3.0-flash",
   },
 
   dockerHostNetworkWhen: (_sel, { flags }) =>
@@ -376,7 +376,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb10", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "low-latency", spec: "dspark", nodes: "single" },
       verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -582,7 +582,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb10", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
+      match: { hw: "dgx-spark", variant: "default", quant: "mxfp4", strategy: "high-throughput", spec: "off", nodes: "single" },
       verified: true,
       flags: [
         "--model-path {{MODEL_NAME}}",
