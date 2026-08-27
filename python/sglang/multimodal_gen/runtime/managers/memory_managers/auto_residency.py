@@ -436,14 +436,50 @@ def estimate_candidate_latency_savings_ns(
     candidates: Iterable[ResidencyTarget],
     request_duration_ns: int,
 ) -> dict[str, int]:
-    """Upper-bound H2D time removed by each complete placement option.
+    """Estimate each complete placement relative to the measured one.
 
     An async prefetch can consume copy-engine and memory bandwidth outside the
     component's own stage, so that stage is not a sound cap. The complete
-    request duration is the only generally valid upper bound.
+    request duration bounds removable latency. Added transfer time is not
+    capped: an unmeasured mechanism may be slower than the whole request.
     """
-    estimates: dict[str, int] = {}
+    candidates = list(candidates)
+    candidates_by_component: dict[str, list[ResidencyTarget]] = {}
     for candidate in candidates:
+        candidates_by_component.setdefault(candidate.component_name, []).append(
+            candidate
+        )
+
+    estimates: dict[str, int] = {}
+    for component_candidates in candidates_by_component.values():
+        current = next(
+            (
+                candidate
+                for candidate in component_candidates
+                if candidate.current_placement
+            ),
+            None,
+        )
+        if current is None:
+            continue
+
+        for candidate in component_candidates:
+            relative_savings_ns = int(
+                (candidate.h2d_bytes_per_request - current.h2d_bytes_per_request)
+                / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+                * 1_000_000_000
+            )
+            # The request duration bounds removable latency, but not latency an
+            # unmeasured placement can add. Capping both directions can make a
+            # repeatedly streamed DiT appear neutral and let an unrelated small
+            # gain select a several-times-slower combined placement.
+            if relative_savings_ns > 0 and request_duration_ns > 0:
+                relative_savings_ns = min(relative_savings_ns, request_duration_ns)
+            estimates[candidate.option_key()] = relative_savings_ns
+
+    for candidate in candidates:
+        if candidate.option_key() in estimates:
+            continue
         transfer_ns = int(
             candidate.h2d_bytes_per_request
             / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND

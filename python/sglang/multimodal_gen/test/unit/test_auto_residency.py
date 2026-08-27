@@ -154,6 +154,42 @@ class TestEstimateDefaultWorkloadTiming:
         assert savings[candidates[1].option_key()] > 400_000_000
         assert savings[candidates[2].option_key()] < 0
 
+    def test_measured_placement_keeps_full_cost_of_slower_dit_target(self):
+        coarse = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=140 * GIB_BYTES,
+            current_placement=True,
+        )
+        virtual_layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+        )
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=60 * GIB_BYTES,
+            h2d_bytes_per_request=150 * GIB_BYTES,
+            permanent_residency=True,
+        )
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=[coarse, virtual_layerwise, resident],
+            request_duration_ns=1_000_000_000,
+        )
+
+        assert savings[coarse.option_key()] == 0
+        assert savings[resident.option_key()] == 416_666_666
+        assert savings[virtual_layerwise.option_key()] == -5_000_000_000
+
 
 class TestEstimateDefaultWorkloadPeak:
     def test_same_shape_uses_measured_peak(self):
