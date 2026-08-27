@@ -1,4 +1,4 @@
-//! OpenAI request processing owned by the engine-free renderer.
+//! OpenAI protocol lowering owned by the engine-free renderer.
 
 use std::collections::BTreeMap;
 
@@ -13,8 +13,9 @@ use dynamo_protocols::types::{
 };
 
 use crate::{
-    ChatFormatter, GenerationInput, GenerationOptions, OneOrMany, RendererConfig, RendererError,
-    SamplingDefaults, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
+    ChatFormatter, ChatResponseProcessor, GenerationInput, GenerationOptions, OneOrMany,
+    RendererConfig, RendererError, SamplingDefaults, SamplingParams, TextRequest, TokenIds,
+    TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -173,18 +174,19 @@ pub fn apply_tool_constraint(
     Ok(())
 }
 
-pub(crate) struct ProcessedChat {
+/// Result of lowering one OpenAI Chat request into generation inputs while
+/// retaining the parser state needed after generation.
+pub struct LoweredChat {
     pub generation_inputs: Vec<GenerationInput>,
-    pub parser: Option<String>,
-    pub tools: Option<Vec<ToolDefinition>>,
+    pub response_processor: ChatResponseProcessor,
 }
 
-pub(crate) async fn process_chat_request(
+pub(crate) async fn lower_chat_request(
     config: &RendererConfig,
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
-) -> Result<ProcessedChat, RendererError> {
+) -> Result<LoweredChat, RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -266,10 +268,18 @@ pub(crate) async fn process_chat_request(
             },
         }));
     }
-    Ok(ProcessedChat {
-        generation_inputs: requests,
+    let response_processor = ChatResponseProcessor::new(
         parser,
+        config.reasoning_parser.clone(),
         tools,
+        request.tool_choice.clone(),
+        sampling.structural_tag.is_some(),
+        request.parallel_tool_calls.unwrap_or(true),
+        n,
+    );
+    Ok(LoweredChat {
+        generation_inputs: requests,
+        response_processor,
     })
 }
 
@@ -471,7 +481,7 @@ pub enum PromptSpec {
 }
 /// Validate and process one OpenAI completion request into the ordered
 /// model-facing requests consumed by inference or standalone rendering.
-pub(crate) fn process_completion_request(
+pub(crate) fn lower_completion_request(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,

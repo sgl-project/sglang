@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
-use crate::renderer::{TokenizationJob, new_renderer_service, new_request_processor};
+use crate::renderer::{TokenizationJob, new_renderer_service, new_request_lowerer};
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -219,7 +219,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
-    let request_processor = Arc::new(new_request_processor(&cfg.server_args));
+    let request_lowerer = Arc::new(new_request_lowerer(&cfg.server_args));
     let senders = Senders {
         tok_manager_tx: tok_manager_tx.clone(),
         abort_tx: abort_tx.clone(),
@@ -360,7 +360,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let response_activity = response_activity.clone();
-        let request_processor = request_processor.clone();
+        let request_lowerer = request_lowerer.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -390,7 +390,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
-                    request_processor,
+                    request_lowerer,
                     // Response heartbeat watched by `/health_generate`.
                     response_activity,
                     shutdown_rx,

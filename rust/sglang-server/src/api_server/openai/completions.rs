@@ -74,7 +74,7 @@ async fn completions(
         .as_ref()
         .is_some_and(|options| options.include_usage)
         || state
-            .request_processor
+            .request_lowerer
             .config()
             .stream_response_default_include_usage;
     let continuous_usage = request
@@ -83,8 +83,8 @@ async fn completions(
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
     let generation_inputs = match state
-        .request_processor
-        .process_completions(request, &response_id)
+        .request_lowerer
+        .lower_completions(request, &response_id)
     {
         Ok(requests) => requests,
         Err(error) => {

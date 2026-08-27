@@ -69,24 +69,24 @@ async fn chat_completions(
         .as_ref()
         .is_some_and(|options| options.include_usage)
         || state
-            .request_processor
+            .request_lowerer
             .config()
             .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let parts = match state
-        .request_processor
-        .process_chat(request, &response_id)
+    let lowered = match state
+        .request_lowerer
+        .lower_chat(request, &response_id)
         .await
     {
-        Ok(parts) => parts,
+        Ok(lowered) => lowered,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return openai_error(status, error.to_string(), false);
         }
     };
-    let generation_inputs = parts.generation_inputs;
-    let response_processor = parts.response_processor;
+    let generation_inputs = lowered.generation_inputs;
+    let response_processor = lowered.response_processor;
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
     let mut submitted = Vec::with_capacity(generation_inputs.len());
@@ -379,7 +379,7 @@ mod tests {
     use crate::frontend::AbortGuard;
     use crate::message::config::ServerArgs;
     use crate::message::response::ChunkExtras;
-    use crate::renderer::new_request_processor;
+    use crate::renderer::new_request_lowerer;
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
     use futures::StreamExt;
@@ -412,8 +412,8 @@ mod tests {
             "n": choices
         }))
         .unwrap();
-        new_request_processor(&args)
-            .process_chat(request, "chatcmpl-test")
+        new_request_lowerer(&args)
+            .lower_chat(request, "chatcmpl-test")
             .await
             .unwrap()
             .response_processor

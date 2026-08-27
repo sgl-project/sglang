@@ -10,7 +10,7 @@ use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, Request};
 
 pub(crate) use sglang_renderer::{
-    GenerationInput, OpenAIRequestProcessor, RendererConfig, RendererError as RenderServiceError,
+    GenerationInput, OpenAIRequestLowerer, RendererConfig, RendererError as RenderServiceError,
     RendererService, TextRequest, TokenIdsRequest,
 };
 use sglang_renderer::{
@@ -59,13 +59,13 @@ pub(crate) fn new_renderer_service(
     jobs: flume::Sender<TokenizationJob>,
 ) -> RendererService {
     RendererService::new(
-        new_request_processor(&server_args),
+        new_request_lowerer(&server_args),
         Arc::new(ServerTokenizationBackend { jobs }),
     )
 }
 
-pub(crate) fn new_request_processor(server_args: &ServerArgs) -> OpenAIRequestProcessor {
-    OpenAIRequestProcessor::new(renderer_config(server_args))
+pub(crate) fn new_request_lowerer(server_args: &ServerArgs) -> OpenAIRequestLowerer {
+    OpenAIRequestLowerer::new(renderer_config(server_args))
 }
 
 fn renderer_config(args: &ServerArgs) -> RendererConfig {

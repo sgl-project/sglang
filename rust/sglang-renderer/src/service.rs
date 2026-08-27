@@ -5,12 +5,12 @@ use std::sync::Arc;
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 use futures::future::{BoxFuture, try_join_all};
 
-use crate::openai::{process_chat_request, process_completion_request};
+use crate::openai::{LoweredChat, lower_chat_request, lower_completion_request};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_generation_input};
 use crate::{
-    ChatFormatter, ChatResponseProcessor, GenerationInput, PreparedGenerateRequest, RendererConfig,
-    RendererError, TextRequest, TokenIdsRequest,
+    ChatFormatter, GenerationInput, PreparedGenerateRequest, RendererConfig, RendererError,
+    TextRequest, TokenIdsRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one model-facing text
@@ -23,12 +23,12 @@ pub trait TokenizationBackend: Send + Sync {
     ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>>;
 }
 
-/// Engine-free OpenAI request processing shared by inference and rendering.
+/// Engine-free OpenAI protocol lowering shared by inference and rendering.
 ///
 /// This type deliberately has no preprocessing backend. Full inference
-/// processes protocol semantics here, then submits text or token-ID inputs to
-/// its existing request FSM.
-pub struct OpenAIRequestProcessor {
+/// lowers protocol semantics here, then submits text or token-ID inputs to its
+/// existing request FSM.
+pub struct OpenAIRequestLowerer {
     config: RendererConfig,
     chat_formatter: Option<ChatFormatter>,
 }
@@ -36,22 +36,14 @@ pub struct OpenAIRequestProcessor {
 /// Standalone request preparation: shared OpenAI processing plus host-provided
 /// CPU work.
 ///
-/// This service returns prepared generation requests. Chat response
-/// processors are created while processing chat semantics, then discarded by
-/// this preparation-only path.
+/// This service returns prepared generation requests. Chat response processors
+/// created during lowering are discarded by this preparation-only path.
 pub struct RendererService {
-    processor: OpenAIRequestProcessor,
+    lowerer: OpenAIRequestLowerer,
     backend: Arc<dyn TokenizationBackend>,
 }
 
-/// Generation inputs plus the processor retained to interpret their eventual
-/// engine responses.
-pub struct ChatProcessingResult {
-    pub generation_inputs: Vec<GenerationInput>,
-    pub response_processor: ChatResponseProcessor,
-}
-
-impl OpenAIRequestProcessor {
+impl OpenAIRequestLowerer {
     pub fn new(config: RendererConfig) -> Self {
         let chat_formatter = load_chat_support(&config);
         Self {
@@ -64,49 +56,32 @@ impl OpenAIRequestProcessor {
         &self.config
     }
 
-    pub async fn process_chat(
+    pub async fn lower_chat(
         &self,
         mut request: CreateChatCompletionRequest,
         response_id: &str,
-    ) -> Result<ChatProcessingResult, RendererError> {
-        let processed = process_chat_request(
+    ) -> Result<LoweredChat, RendererError> {
+        lower_chat_request(
             &self.config,
             self.chat_formatter.clone(),
             &mut request,
             response_id,
         )
-        .await?;
-        let uses_tool_call_structural_tag = processed
-            .generation_inputs
-            .first()
-            .is_some_and(|request| request.options().sampling_params.structural_tag.is_some());
-        let response_processor = ChatResponseProcessor::new(
-            processed.parser,
-            self.config.reasoning_parser.clone(),
-            processed.tools,
-            request.tool_choice.clone(),
-            uses_tool_call_structural_tag,
-            request.parallel_tool_calls.unwrap_or(true),
-            processed.generation_inputs.len(),
-        );
-        Ok(ChatProcessingResult {
-            generation_inputs: processed.generation_inputs,
-            response_processor,
-        })
+        .await
     }
 
-    pub fn process_completions(
+    pub fn lower_completions(
         &self,
         request: CreateCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<GenerationInput>, RendererError> {
-        process_completion_request(&self.config, &request, response_id)
+        lower_completion_request(&self.config, &request, response_id)
     }
 }
 
 impl RendererService {
-    pub fn new(processor: OpenAIRequestProcessor, backend: Arc<dyn TokenizationBackend>) -> Self {
-        Self { processor, backend }
+    pub fn new(lowerer: OpenAIRequestLowerer, backend: Arc<dyn TokenizationBackend>) -> Self {
+        Self { lowerer, backend }
     }
 
     pub async fn prepare_chat(
@@ -114,8 +89,8 @@ impl RendererService {
         request: CreateChatCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let parts = self.processor.process_chat(request, response_id).await?;
-        self.prepare_many(parts.generation_inputs).await
+        let lowered = self.lowerer.lower_chat(request, response_id).await?;
+        self.prepare_many(lowered.generation_inputs).await
     }
 
     pub async fn prepare_completions(
@@ -123,7 +98,7 @@ impl RendererService {
         request: CreateCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let requests = self.processor.process_completions(request, response_id)?;
+        let requests = self.lowerer.lower_completions(request, response_id)?;
         self.prepare_many(requests).await
     }
 
@@ -147,16 +122,16 @@ impl RendererService {
         &self,
         mut request: GenerationInput,
     ) -> Result<TokenIdsRequest, RendererError> {
-        validate_generation_input(&request, &self.processor.config.limits)?;
+        validate_generation_input(&request, &self.lowerer.config.limits)?;
         request.options_mut().sampling_params.normalize(
-            self.processor.config.skip_tokenizer_init,
-            self.processor.config.vocab_size,
+            self.lowerer.config.skip_tokenizer_init,
+            self.lowerer.config.vocab_size,
         )?;
         let mut request = match request {
             GenerationInput::Text(request) => self.backend.tokenize(request).await?,
             GenerationInput::TokenIds(request) => request,
         };
-        check_total_tokens(&mut request, &self.processor.config.limits)?;
+        check_total_tokens(&mut request, &self.lowerer.config.limits)?;
         Ok(request)
     }
 }
@@ -206,8 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn chat_processing_carries_rendered_prompt_and_template_stops() {
-        let processor = OpenAIRequestProcessor::new(RendererConfig {
+    fn chat_lowering_carries_rendered_prompt_and_template_stops() {
+        let lowerer = OpenAIRequestLowerer::new(RendererConfig {
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
             revision: None,
@@ -235,10 +210,10 @@ mod tests {
         }))
         .unwrap();
 
-        let parts =
-            futures::executor::block_on(processor.process_chat(request, "chatcmpl-test")).unwrap();
-        let GenerationInput::Text(text_request) = &parts.generation_inputs[0] else {
-            panic!("Chat processing must produce text input");
+        let lowered =
+            futures::executor::block_on(lowerer.lower_chat(request, "chatcmpl-test")).unwrap();
+        let GenerationInput::Text(text_request) = &lowered.generation_inputs[0] else {
+            panic!("Chat lowering must produce text input");
         };
 
         assert!(text_request.text.contains("<|im_start|>user"));
@@ -252,7 +227,7 @@ mod tests {
 
     #[test]
     fn token_id_completion_bypasses_tokenization_and_is_still_prepared() {
-        let processor = OpenAIRequestProcessor::new(RendererConfig {
+        let lowerer = OpenAIRequestLowerer::new(RendererConfig {
             served_model_name: "model".into(),
             tokenizer_path: String::new(),
             revision: None,
@@ -273,7 +248,7 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         });
-        let service = RendererService::new(processor, Arc::new(UnexpectedTokenizer));
+        let service = RendererService::new(lowerer, Arc::new(UnexpectedTokenizer));
         let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
             "prompt": [11, 12, 13],
