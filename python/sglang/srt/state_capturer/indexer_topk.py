@@ -24,8 +24,23 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
 
+        # Supported layouts:
+        # - DP attention (attn_tp_size == 1): per-rank-local rows.
+        # - Plain TP without DP attention: every attn-TP rank sees the full
+        #   batch and the indexer projections are replicated, so each rank's
+        #   capture covers all rows; the scheduler rank's host cache is
+        #   authoritative.
+        # Hybrid DP attention with attn_tp_size > 1 would scatter rows across
+        # the attn-TP group and is not supported.
         attn_tp_size = get_parallel().attn_tp_size
-        assert attn_tp_size == 1, "IndexerTopkCapturer now only supports DP attention"
+        if attn_tp_size != 1:
+            from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+            assert not is_dp_attention_enabled(), (
+                "IndexerTopkCapturer supports pure DP attention (attn_tp_size == 1) "
+                "or plain TP without DP attention; got DP attention with "
+                f"attn_tp_size={attn_tp_size}"
+            )
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.

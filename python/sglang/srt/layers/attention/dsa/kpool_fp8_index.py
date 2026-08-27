@@ -563,8 +563,17 @@ def topk_from_pooled_history_logits(
     row_starts: torch.Tensor | None = None,
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Select full-pool groups, expand to tokens, and optionally append tail."""
+    return_raw_indices: bool = False,
+):
+    """Select full-pool groups, expand to tokens, and optionally append tail.
+
+    With ``return_raw_indices=True``, returns ``(result, raw)`` where ``raw``
+    is the same selection expanded to sequence-relative token positions
+    (no page-table/ragged remap), same width and -1 padding as ``result``.
+    Both outputs come from a single top-k selection so race-dependent radix
+    ties stay consistent between them; the raw side feeds the rollout
+    indexer-topk capturer (R3 replay).
+    """
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
     assert logits.shape[0] == group_lengths.shape[0]
@@ -591,6 +600,15 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
+    def _pad_rows(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None or out_rows is None or out_rows == t.shape[0]:
+            return t
+        padded = torch.full(
+            (out_rows, t.shape[1]), -1, dtype=t.dtype, device=t.device
+        )
+        padded[: t.shape[0]] = t
+        return padded
+
     if group_topk in (128, 160, 192, 224, 256, 512):
         from sglang.kernels.ops.moe.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
@@ -606,14 +624,12 @@ def topk_from_pooled_history_logits(
             row_starts=row_starts,
             seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
             page_table_row_index=page_table_row_index,
+            return_raw_indices=return_raw_indices,
         )
-        if out_rows is None or out_rows == result.shape[0]:
-            return result
-        padded = torch.full(
-            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-        )
-        padded[: result.shape[0]] = result
-        return padded
+        if return_raw_indices:
+            result, raw = result
+            return _pad_rows(result), _pad_rows(raw)
+        return _pad_rows(result)
 
     assert (
         page_table_row_index is None
@@ -635,32 +651,36 @@ def topk_from_pooled_history_logits(
         torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
     )
     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
-    expanded = expand_pooled_groups_to_topk(
-        selected_groups.contiguous(),
-        group_valid,
-        topk=topk,
-        pool_size=pool_size,
-        page_table=page_table,
-        topk_offsets=topk_offsets,
-    )
-    if seq_lens is None:
-        result = expanded
-    else:
-        result = append_kpool_tail_to_topk(
+
+    def _expand_and_tail(
+        pt: torch.Tensor | None, offs: torch.Tensor | None
+    ) -> torch.Tensor:
+        expanded = expand_pooled_groups_to_topk(
+            selected_groups.contiguous(),
+            group_valid,
+            topk=topk,
+            pool_size=pool_size,
+            page_table=pt,
+            topk_offsets=offs,
+        )
+        if seq_lens is None:
+            return expanded
+        return append_kpool_tail_to_topk(
             expanded,
             seq_lens=seq_lens,
             pool_lens=group_lengths,
             pool_size=pool_size,
-            page_table=page_table,
-            topk_offsets=topk_offsets,
+            page_table=pt,
+            topk_offsets=offs,
         )
-    if out_rows is None or out_rows == result.shape[0]:
-        return result
-    padded = torch.full(
-        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-    )
-    padded[: result.shape[0]] = result
-    return padded
+
+    result = _expand_and_tail(page_table, topk_offsets)
+    if return_raw_indices:
+        # Same selected_groups, expanded without the kv-coordinate remap:
+        # sequence-relative token positions for the rollout capturer.
+        raw = _expand_and_tail(None, None)
+        return _pad_rows(result), _pad_rows(raw)
+    return _pad_rows(result)
 
 
 def kpool_softmax_rotate_write_cache(

@@ -253,7 +253,9 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
     const int64_t page_table_stride,
     const int32_t* __restrict__ page_table_row_index,
     const int32_t* __restrict__ topk_indices_offset,
-    const int32_t* __restrict__ seq_lens) {
+    const int32_t* __restrict__ seq_lens,
+    int32_t* __restrict__ raw_token_indices,
+    const int64_t raw_stride) {
   const auto& [input, row_starts, _, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
@@ -261,6 +263,10 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   const auto length = lengths[bid];
   const auto score = input + bid * input_stride;
   const auto dst = dst_token_indices + bid * dst_stride;
+  // Sequence-relative token positions of the same selection, before the
+  // page-table / ragged-offset remap. Written only when requested; consumed
+  // by the rollout indexer-topk capturer (R3 replay).
+  auto raw_dst = raw_token_indices == nullptr ? nullptr : raw_token_indices + bid * raw_stride;
   const auto page_table_row = page_table_row_index == nullptr ? bid : static_cast<uint64_t>(page_table_row_index[bid]);
   const auto page_table_entry = page_table == nullptr ? nullptr : page_table + page_table_row * page_table_stride;
   const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[bid];
@@ -271,16 +277,22 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
 
   if (length <= K) {
     for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
+      int32_t raw_value = -1;
       if (col < history_len) {
         const auto group_rank = col / pool_size;
         const auto slot = col % pool_size;
         const auto raw_token = group_rank * pool_size + slot;
+        raw_value = raw_token;
         dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
       } else if (append_tail && col < history_len + tail_count) {
         const auto raw_token = length * pool_size + (col - history_len);
+        raw_value = raw_token;
         dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
       } else {
         dst[col] = -1;
+      }
+      if (raw_dst != nullptr) {
+        raw_dst[col] = raw_value;
       }
     }
     return;
@@ -289,17 +301,23 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   __shared__ int s_indices[K];
   fast_topk_cuda_tl_impl<K>(score, s_indices, row_start, length);
   for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
+    int32_t raw_value = -1;
     if (col < history_len) {
       const auto group_rank = col / pool_size;
       const auto group_id = s_indices[group_rank];
       const auto slot = col % pool_size;
       const auto raw_token = group_id * pool_size + slot;
+      raw_value = raw_token;
       dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
     } else if (append_tail && col < history_len + tail_count) {
       const auto raw_token = length * pool_size + (col - history_len);
+      raw_value = raw_token;
       dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
     } else {
       dst[col] = -1;
+    }
+    if (raw_dst != nullptr) {
+      raw_dst[col] = raw_value;
     }
   }
 }
@@ -334,6 +352,9 @@ struct KpoolTopKTransformKernel {
   //   topk_indices_offset  : [B] int32 per-row offset added to raw tokens (ragged)
   //   row_starts  (opt)    : [B] int32 score row start offsets
   //   seq_lens    (opt)    : [B] int32 sequence lengths; enables tail append
+  //   raw_token_indices (opt): [B, out_cols] int32 output of the same selection
+  //                            as sequence-relative token positions (no page
+  //                            table / ragged-offset remap), -1 padded
   static void transform(
       const tvm::ffi::TensorView score,
       const tvm::ffi::TensorView lengths,
@@ -343,7 +364,8 @@ struct KpoolTopKTransformKernel {
       const tvm::ffi::Optional<tvm::ffi::TensorView> topk_indices_offset_opt,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts_opt,
       const tvm::ffi::Optional<tvm::ffi::TensorView> seq_lens_opt,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_token_indices_opt) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -434,6 +456,16 @@ struct KpoolTopKTransformKernel {
           .with_device(device)
           .verify(page_table_row_index_opt.value());
     }
+    int64_t raw_stride = 0;
+    int32_t* raw_token_indices_ptr = nullptr;
+    if (raw_token_indices_opt.has_value()) {
+      TensorMatcher({B, out_cols_sym})  // raw output, contiguous int32
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(raw_token_indices_opt.value());
+      raw_token_indices_ptr = static_cast<int32_t*>(raw_token_indices_opt.value().data_ptr());
+      raw_stride = static_cast<int64_t>(raw_token_indices_opt.value().strides()[0]);
+    }
 
     const auto params = FastTopKParams{
         .input = static_cast<const float*>(score.data_ptr()),
@@ -456,7 +488,9 @@ struct KpoolTopKTransformKernel {
         page_table_stride,
         optional_data_ptr<int32_t>(page_table_row_index_opt),
         optional_data_ptr<int32_t>(topk_indices_offset_opt),
-        optional_data_ptr<int32_t>(seq_lens_opt));
+        optional_data_ptr<int32_t>(seq_lens_opt),
+        raw_token_indices_ptr,
+        raw_stride);
   }
 };
 
