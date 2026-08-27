@@ -1557,6 +1557,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             layerwise_tuning_of=lambda name, dit_group: (
                 self.server_args.layerwise_tuning_for(name, dit_group=dit_group)
             ),
+            layerwise_policy_is_explicit=lambda name, dit_group: (
+                self.server_args.is_layerwise_residency_policy_explicit(
+                    name, dit_group=dit_group
+                )
+            ),
             pin_cpu_memory=self.server_args.pin_cpu_memory,
         )
 

@@ -48,6 +48,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
+)
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
     _resolve_auto_residency_warmup_shape,
@@ -856,6 +860,42 @@ class TestResolveMeasuredDefaultWorkload:
 
 
 class TestPlanAutoResidency:
+    def test_latency_equivalent_partial_dit_prefers_strided_schedule(self):
+        common = dict(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=4 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(8,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=4 * GIB_BYTES,
+        )
+        leading = ResidencyTarget(
+            **common,
+            target_layerwise_residency_policies=(RESIDENCY_POLICY_LEADING,),
+            current_placement=True,
+        )
+        strided = ResidencyTarget(
+            **common,
+            target_layerwise_residency_policies=(RESIDENCY_POLICY_STRIDED,),
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    estimated_gib=30,
+                    candidates=[leading, strided],
+                    target_workload_measured=True,
+                )
+            ]
+        )
+
+        assert len(plan.changes) == 1
+        assert plan.changes[0].target_layerwise_residency_policies == (
+            RESIDENCY_POLICY_STRIDED,
+        )
+
     def test_lower_latency_utility_keeps_the_measured_placement(self):
         resident = ResidencyTarget(
             component_name="transformer",
@@ -2380,7 +2420,8 @@ class _FakeLayerwiseManager:
             tensor.numel() * tensor.element_size() for tensor in self._tensors.values()
         )
 
-    def resident_weight_bytes(self, resident_layers=None):
+    def resident_weight_bytes(self, resident_layers=None, residency_policy=None):
+        del residency_policy
         count = self.resident_layers if resident_layers is None else resident_layers
         return (
             self.offloaded_weight_bytes()
@@ -2388,7 +2429,10 @@ class _FakeLayerwiseManager:
             // self.num_layers
         )
 
-    def peak_managed_device_weight_bytes(self, resident_layers=None):
+    def peak_managed_device_weight_bytes(
+        self, resident_layers=None, residency_policy=None
+    ):
+        del residency_policy
         count = self.resident_layers if resident_layers is None else resident_layers
         return (
             self.offloaded_weight_bytes()
@@ -2427,8 +2471,13 @@ class _FakeLayerwiseManager:
         return previous
 
     def set_resident_layers(self, resident_layers):
-        previous = self.resident_layers
+        previous, _ = self.set_residency_layout(resident_layers, self.residency_policy)
+        return previous
+
+    def set_residency_layout(self, resident_layers, residency_policy):
+        previous = (self.resident_layers, self.residency_policy)
         self.resident_layers = min(max(0, resident_layers), self.num_layers)
+        self.residency_policy = residency_policy
         return previous
 
     def load_all_layers(self):
@@ -2664,6 +2713,45 @@ class TestCollectResidencyTargets:
         assert target.target_resident_weight_bytes > 0
         assert target.active_device_delta_bytes < 0
         assert target.h2d_bytes_per_request > 0
+
+    def test_auto_dit_frontier_tunes_policy_unless_explicit(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+        common = dict(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+
+        candidates = collect_residency_targets(
+            **common,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: False,
+        )
+        policies = {
+            candidate.target_layerwise_residency_policies
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+            and candidate.target_layerwise_pinned_layers == ((),)
+        }
+        assert policies == {
+            (RESIDENCY_POLICY_LEADING,),
+            (RESIDENCY_POLICY_STRIDED,),
+        }
+
+        explicit_candidates = collect_residency_targets(
+            **common,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: True,
+        )
+        assert all(
+            candidate.target_layerwise_residency_policies is None
+            for candidate in explicit_candidates
+        )
 
     def test_fully_pinned_component_can_release_hostpin_for_a_hotter_component(self):
         manager = _FakeLayerwiseManager(
@@ -3346,6 +3434,38 @@ class TestApplyAndRollback:
             server_args=args,
         )
         assert [manager.resident_layers for manager in managers] == [1, 0]
+
+    def test_partial_layerwise_policy_change_rolls_back_exact_layout(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+        args = _StubResidencyArgs()
+        candidate = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=manager.resident_weight_bytes(2),
+            h2d_bytes_per_request=GIB_BYTES,
+            target_layerwise_resident_layers=(2,),
+            target_layerwise_residency_policies=(RESIDENCY_POLICY_STRIDED,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert manager.residency_policy == RESIDENCY_POLICY_STRIDED
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert manager.resident_layers == 2
+        assert manager.residency_policy == RESIDENCY_POLICY_LEADING
 
     def test_permanent_layerwise_can_be_demoted_and_rollback_restores_it(self):
         manager = _FakeLayerwiseManager(

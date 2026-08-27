@@ -1113,6 +1113,18 @@ class ServerArgs(DisaggServerArgsMixin):
             )
         return prefetch, resident, policy
 
+    def is_layerwise_residency_policy_explicit(
+        self, component_name: str, *, dit_group: bool
+    ) -> bool:
+        """Whether auto placement must preserve this component's policy."""
+        policy_map = self._parse_component_value_map(
+            self.layerwise_residency_policy,
+            option="--layerwise-residency-policy",
+        )
+        return component_name in policy_map or (
+            dit_group and self.is_arg_explicitly_set("dit_layerwise_residency_policy")
+        )
+
     @staticmethod
     def _parse_component_attention_backend_map(
         value: dict[str, str] | str | None,
@@ -2480,9 +2492,9 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Which layers --dit-layerwise-resident-layers keeps resident. "
             "'leading' (default) keeps the first N, which crams the whole "
             "weight stream into the tail of each step. 'strided' spreads the "
-            "resident layers evenly over the stack so the same bytes move over "
-            "the whole step instead: same VRAM, same bytes, only a different "
-            "schedule. Worth trying when weight streaming overlaps "
+            "resident layers evenly over the stack so traffic moves over the "
+            "whole step instead. The layer count is unchanged; exact bytes can "
+            "differ when layer sizes are nonuniform. Worth trying when streaming overlaps "
             "memory-bound compute -- the transfers stop competing with it for "
             "L2 and DRAM bandwidth, which is where the gain comes from.",
         )

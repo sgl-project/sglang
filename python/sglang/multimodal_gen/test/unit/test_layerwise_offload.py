@@ -202,6 +202,9 @@ class _TestServerArgs(SimpleNamespace):
     )
     _parse_component_value_map = staticmethod(ServerArgs._parse_component_value_map)
     layerwise_tuning_for = ServerArgs.layerwise_tuning_for
+    is_layerwise_residency_policy_explicit = (
+        ServerArgs.is_layerwise_residency_policy_explicit
+    )
 
 
 def _server_args(**kwargs):
@@ -1041,6 +1044,44 @@ def test_configure_resolves_residency_policy(monkeypatch):
     assert comp.layerwise_offload_managers[0].residency_policy == (
         RESIDENCY_POLICY_STRIDED
     )
+
+
+def test_explicit_residency_policy_is_scoped_to_the_selected_component():
+    args = _server_args(
+        _explicit_arg_names={"dit_layerwise_residency_policy"},
+        dit_layerwise_residency_policy=RESIDENCY_POLICY_STRIDED,
+        layerwise_residency_policy={
+            "text_encoder": RESIDENCY_POLICY_STRIDED,
+        },
+    )
+
+    assert args.is_layerwise_residency_policy_explicit("transformer", dit_group=True)
+    assert args.is_layerwise_residency_policy_explicit("text_encoder", dit_group=False)
+    assert not args.is_layerwise_residency_policy_explicit("vae", dit_group=False)
+
+
+def test_residency_layout_switches_policy_without_rebuilding_host_stores(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(8),
+        num_layers=8,
+        prefetch_size=1,
+        resident_layers=2,
+        residency_policy=RESIDENCY_POLICY_LEADING,
+    )
+    host_stores = manager._consolidated_cpu_weights
+
+    previous = manager.set_residency_layout(3, RESIDENCY_POLICY_STRIDED)
+
+    assert previous == (2, RESIDENCY_POLICY_LEADING)
+    assert manager.resident_layers == 3
+    assert manager.residency_policy == RESIDENCY_POLICY_STRIDED
+    assert manager._streamed_order == compute_streamed_layers(
+        num_layers=8,
+        resident_layers=3,
+        policy=RESIDENCY_POLICY_STRIDED,
+    )
+    assert manager._consolidated_cpu_weights is host_stores
 
 
 def test_configure_logs_component_start_and_completion(monkeypatch):
