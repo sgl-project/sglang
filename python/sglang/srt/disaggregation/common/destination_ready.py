@@ -8,6 +8,8 @@ GPU before making that slot consumable.  It does not validate payload bytes.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -145,3 +147,30 @@ def wait_for_destination_ready_epoch(
             f"ready epoch {expected_epoch} rejected with observed epoch {observed}"
         )
     raise ReadyEpochError(f"ready epoch {expected_epoch} returned status {status}")
+
+
+def enqueue_driver_ready_epoch_acquire(
+    ready_epoch: torch.Tensor,
+    expected_epoch: int,
+    *,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> torch.cuda.Event:
+    """Order the model stream after an RDMA-written epoch without a host wait."""
+
+    from cuda.bindings import driver
+
+    _validate_positive_int("expected_epoch", expected_epoch, (1 << 63) - 1)
+    _validate_ready_epoch(ready_epoch)
+    if stream is None:
+        stream = torch.cuda.current_stream(ready_epoch.device)
+    (result,) = driver.cuStreamWaitValue64(
+        stream.cuda_stream,
+        ready_epoch.data_ptr(),
+        expected_epoch,
+        int(driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ),
+    )
+    if result != driver.CUresult.CUDA_SUCCESS:
+        raise ReadyEpochError(f"cuStreamWaitValue64 failed with {result}")
+    event = torch.cuda.Event()
+    event.record(stream)
+    return event

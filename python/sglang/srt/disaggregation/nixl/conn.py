@@ -587,6 +587,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         self.register_buffer_to_engine()
         self._ready_pool = None
+        self._ready_stream_events: Dict[
+            int, List[Tuple[Tuple[int, int, int], Any]]
+        ] = {}
+        self._ready_release_events: Dict[Tuple[int, int, int], Any] = {}
+        self._ready_wait_stream = None
         self._ready_descs = None
         self._ready_slot_count = 0
         self._ready_next_epoch: List[int] = []
@@ -605,6 +610,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # APIs after backend creation. Keep the scheduler on the model/KV
             # owner before it enters model execution.
             torch.cuda.set_device(self.kv_args.gpu_id)
+            if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") == "1":
+                self._ready_wait_stream = torch.cuda.Stream(
+                    device=self.kv_args.gpu_id
+                )
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
@@ -749,6 +758,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ) -> Tuple[int, int]:
         if aux_index is None or aux_index < 0 or aux_index >= self._ready_slot_count:
             raise ValueError("DCP peer-row ready slot is outside aux-slot bounds")
+        for lease_key, lease in list(self._ready_leases.items()):
+            if lease[0] != aux_index:
+                continue
+            release_event = self._ready_release_events.get(lease_key)
+            if release_event is not None:
+                release_event.synchronize()
+                self._ready_release_events.pop(lease_key, None)
+                self._ready_leases.pop(lease_key, None)
         key = (room, 0, pp_rank)
         if key in self._ready_leases:
             raise RuntimeError(f"DCP peer-row ready lease already exists for {key}")
@@ -1324,6 +1341,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             ready_slots: Set[int] = set()
+            phase_timing_enabled = getattr(
+                self, "enable_dcp_gpunetio_phase_timing", False
+            )
+            worker_start_ns = (
+                time.perf_counter_ns() if phase_timing_enabled else 0
+            )
             try:
                 if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
                     logger.info(
@@ -1373,11 +1396,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                 pending_dcp_handles: List[Any] = []
                 pending_aux_requests: List[Tuple[Any, ...]] = []
-                phase_timing_enabled = getattr(
-                    self, "enable_dcp_gpunetio_phase_timing", False
-                )
                 dcp_phase_samples: List[Tuple[str, Dict[str, float]]] = []
                 ready_publish_us: Dict[Tuple[int, int], float] = {}
+                ready_publish_total_us = 0.0
+                kv_issue_us = 0.0
+                aux_issue_us = 0.0
                 batch_post_start_ns: Optional[int] = None
                 batch_post_end_ns: Optional[int] = None
                 aux_post_us = 0.0
@@ -1485,14 +1508,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     ready_slots.add(req.ready_slot)
                                     ready_key = (req.ready_slot, req.ready_epoch)
                                     if ready_key not in published_ready:
-                                        ready_start_ns = time.perf_counter_ns()
+                                        ready_start_ns = (
+                                            time.perf_counter_ns()
+                                            if phase_timing_enabled
+                                            else 0
+                                        )
                                         published_ready[ready_key] = (
                                             self._publish_ready_epoch(*ready_key)
                                         )
                                         if phase_timing_enabled:
-                                            ready_publish_us[ready_key] = (
+                                            elapsed_ready_us = (
                                                 time.perf_counter_ns() - ready_start_ns
                                             ) / 1000.0
+                                            ready_publish_us[ready_key] = (
+                                                elapsed_ready_us
+                                            )
+                                            ready_publish_total_us += elapsed_ready_us
+                                kv_issue_start_ns = (
+                                    time.perf_counter_ns()
+                                    if phase_timing_enabled
+                                    else 0
+                                )
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -1512,6 +1548,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     ),
                                     post=not batch_dcp_enabled,
                                 )
+                                if phase_timing_enabled:
+                                    kv_issue_us += (
+                                        time.perf_counter_ns() - kv_issue_start_ns
+                                    ) / 1000.0
                                 if phase_timing_enabled and getattr(
                                     self, "enable_dcp_gpunetio_compact_plan", False
                                 ):
@@ -1611,7 +1651,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         if batch_dcp_enabled:
                             pending_aux_requests.append(aux_request)
                         else:
+                            aux_start_ns = (
+                                time.perf_counter_ns()
+                                if phase_timing_enabled
+                                else 0
+                            )
                             handles.append(self.send_aux(*aux_request))
+                            if phase_timing_enabled:
+                                aux_issue_us += (
+                                    time.perf_counter_ns() - aux_start_ns
+                                ) / 1000.0
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
@@ -1629,6 +1678,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             pending_dcp_handles
                         )
                         batch_post_end_ns = time.perf_counter_ns()
+                        if phase_timing_enabled:
+                            kv_issue_us += (
+                                batch_post_end_ns - batch_post_start_ns
+                            ) / 1000.0
                         if batch_state == "ERR":
                             raise RuntimeError(
                                 "NIXL GPUNETIO DCP batch post returned ERR"
@@ -1643,9 +1696,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     if phase_timing_enabled:
                         aux_post_us = (time.perf_counter_ns() - aux_start_ns) / 1000.0
+                        aux_issue_us = aux_post_us
 
+                completion_start_ns = (
+                    time.perf_counter_ns() if phase_timing_enabled else 0
+                )
                 while handles:
-                    if phase_timing_enabled and pending_dcp_handles and dcp_done_ns is None:
+                    if (
+                        phase_timing_enabled
+                        and pending_dcp_handles
+                        and dcp_done_ns is None
+                    ):
                         dcp_states = [
                             self.agent.check_xfer_state(handle)
                             for handle in pending_dcp_handles
@@ -1666,6 +1727,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             all_done_ns = time.perf_counter_ns()
                         break
                     time.sleep(0)
+                completion_us = (
+                    (time.perf_counter_ns() - completion_start_ns) / 1000.0
+                    if phase_timing_enabled
+                    else 0.0
+                )
 
                 if phase_timing_enabled and dcp_phase_samples:
                     if batch_post_start_ns is None or batch_post_end_ns is None:
@@ -1702,6 +1768,31 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     {"peer": peer_name, **phase}
                                     for peer_name, phase in dcp_phase_samples
                                 ],
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+
+                if phase_timing_enabled:
+                    logger.info(
+                        "SGLANG_DCP_COMMON_PHASE %s",
+                        json.dumps(
+                            {
+                                "room": room,
+                                "chunk": kv_chunk.chunk_id,
+                                "variant": (
+                                    "peer" if self.enable_dcp_peer_rows else "legacy"
+                                ),
+                                "peer_count": len(dcp_peer_reqs),
+                                "handle_count": len(handles),
+                                "ready_publish_us": ready_publish_total_us,
+                                "kv_issue_us": kv_issue_us,
+                                "aux_issue_us": aux_issue_us,
+                                "completion_us": completion_us,
+                                "worker_total_us": (
+                                    time.perf_counter_ns() - worker_start_ns
+                                )
+                                / 1000.0,
                             },
                             sort_keys=True,
                         ),
@@ -3022,7 +3113,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
+        phase_timing_enabled = getattr(
+            self, "enable_dcp_gpunetio_phase_timing", False
+        )
+        fetch_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
         notif_map = self.agent.get_new_notifs()
+        fetch_us = (
+            (time.perf_counter_ns() - fetch_start_ns) / 1000.0
+            if phase_timing_enabled
+            else 0.0
+        )
+        process_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
         for peer_name, messages in notif_map.items():
             for msg in messages:
                 # Notification tag layouts (underscore-separated):
@@ -3086,6 +3187,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+        process_us = (
+            (time.perf_counter_ns() - process_start_ns) / 1000.0
+            if phase_timing_enabled
+            else 0.0
+        )
+        return fetch_us, process_us
 
     def _fail_ready_room(self, room: int, reason: str) -> None:
         self.record_failure(room, f"DCP GPUNETIO peer-row ready failure: {reason}")
@@ -3111,13 +3218,58 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ):
             raise RuntimeError("invalid DCP peer-row ready lease")
         from sglang.srt.disaggregation.common.destination_ready import (
+            enqueue_driver_ready_epoch_acquire,
             wait_for_destination_ready_epoch,
         )
 
-        wait_for_destination_ready_epoch(self._ready_pool.narrow(0, slot, 1), epoch)
-        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+        phase_timing_enabled = getattr(
+            self, "enable_dcp_gpunetio_phase_timing", False
+        )
+        ready_wait_start_ns = (
+            time.perf_counter_ns() if phase_timing_enabled else 0
+        )
+        if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") == "1":
+            if self._ready_wait_stream is None:
+                raise RuntimeError("DCP GPUNETIO driver-ready stream is unavailable")
+            self._ready_stream_events.setdefault(room, []).append(
+                (
+                    key,
+                    enqueue_driver_ready_epoch_acquire(
+                        self._ready_pool.narrow(0, slot, 1),
+                        epoch,
+                        stream=self._ready_wait_stream,
+                    ),
+                )
+            )
+        else:
+            wait_for_destination_ready_epoch(
+                self._ready_pool.narrow(0, slot, 1), epoch
+            )
+        if phase_timing_enabled:
             logger.info(
-                "SGLANG_DCP_READY_ACQUIRED "
+                "SGLANG_DCP_READY_WAIT %s",
+                json.dumps(
+                    {
+                        "room": room,
+                        "chunk": chunk_id,
+                        "pp_rank": pp_rank,
+                        "engine_rank": self.kv_args.engine_rank,
+                        "wait_us": (
+                            time.perf_counter_ns() - ready_wait_start_ns
+                        )
+                        / 1000.0,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            ready_marker = (
+                "SGLANG_DCP_READY_WAIT_ENQUEUED"
+                if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") == "1"
+                else "SGLANG_DCP_READY_ACQUIRED"
+            )
+            logger.info(
+                f"{ready_marker} "
                 f"room={room} chunk={chunk_id} pp_rank={pp_rank} "
                 f"slot={slot} epoch={epoch}"
             )
@@ -3188,7 +3340,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             ):
                 self._maybe_submit_last_scatter(room)
         if getattr(self, "enable_dcp_peer_rows", False):
-            self._release_peer_row_ready(room, chunk_id, pp_rank)
+            if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") != "1":
+                self._release_peer_row_ready(room, chunk_id, pp_rank)
 
     def _track_kv_part_arrival(
         self,
@@ -3531,6 +3684,12 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+        self._phase_start_ns = 0
+        self._phase_update_us = 0.0
+        self._phase_fetch_us = 0.0
+        self._phase_process_us = 0.0
+        self._phase_check_us = 0.0
+        self._phase_poll_count = 0
 
     def send_metadata(
         self,
@@ -3548,7 +3707,7 @@ class NixlKVReceiver(CommonKVReceiver):
 
         ready_slot = None
         ready_epoch = None
-        if self.kv_mgr.enable_dcp_peer_rows:
+        if self.kv_mgr.enable_dcp_peer_rows and kv_indices.size != 0:
             if (
                 state_indices
                 or self.kv_mgr.enable_staging
@@ -3634,6 +3793,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+        if getattr(self.kv_mgr, "enable_dcp_gpunetio_phase_timing", False):
+            self._phase_start_ns = time.perf_counter_ns()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -3650,8 +3811,70 @@ class NixlKVReceiver(CommonKVReceiver):
         # completion notifications are only ingested here via
         # update_transfer_status(); a completion queued by NIXL at/after the
         # deadline would otherwise lose to the timeout purely by poll ordering.
-        self.kv_mgr.update_transfer_status()
-        if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
+        phase_timing_enabled = getattr(
+            self.kv_mgr, "enable_dcp_gpunetio_phase_timing", False
+        )
+        if phase_timing_enabled:
+            self._phase_poll_count += 1
+        update_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
+        fetch_us, process_us = self.kv_mgr.update_transfer_status()
+        if phase_timing_enabled:
+            self._phase_update_us += (
+                time.perf_counter_ns() - update_start_ns
+            ) / 1000.0
+            self._phase_fetch_us += fetch_us
+            self._phase_process_us += process_us
+        check_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
+        transfer_done = self.kv_mgr.check_transfer_done(self.bootstrap_room)  # type: ignore
+        if phase_timing_enabled:
+            self._phase_check_us += (
+                time.perf_counter_ns() - check_start_ns
+            ) / 1000.0
+        if transfer_done:
+            ready_events = self.kv_mgr._ready_stream_events.get(
+                self.bootstrap_room, []
+            )
+            if ready_events and not all(event.query() for _, event in ready_events):
+                timeout_result = self._check_waiting_timeout()
+                if timeout_result is not None:
+                    return timeout_result
+                return KVPoll.WaitingForInput  # type: ignore
+            if ready_events:
+                import torch
+
+                self.kv_mgr._ready_stream_events.pop(self.bootstrap_room, None)
+                stream = torch.cuda.current_stream(self.kv_mgr.kv_args.gpu_id)
+                for _, ready_event in ready_events:
+                    stream.wait_event(ready_event)
+                release_event = torch.cuda.Event()
+                release_event.record(stream)
+                for lease_key, _ in ready_events:
+                    self.kv_mgr._ready_release_events[lease_key] = release_event
+            if phase_timing_enabled:
+                logger.info(
+                    "SGLANG_DCP_RECEIVER_PHASE %s",
+                    json.dumps(
+                        {
+                            "room": self.bootstrap_room,
+                            "engine_rank": self.kv_mgr.kv_args.engine_rank,
+                            "variant": (
+                                "peer"
+                                if self.kv_mgr.enable_dcp_peer_rows
+                                else "legacy"
+                            ),
+                            "poll_count": self._phase_poll_count,
+                            "update_transfer_status_us": self._phase_update_us,
+                            "notification_fetch_us": self._phase_fetch_us,
+                            "notification_process_us": self._phase_process_us,
+                            "check_transfer_done_us": self._phase_check_us,
+                            "receiver_total_us": (
+                                time.perf_counter_ns() - self._phase_start_ns
+                            )
+                            / 1000.0,
+                        },
+                        sort_keys=True,
+                    ),
+                )
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
@@ -3664,6 +3887,24 @@ class NixlKVReceiver(CommonKVReceiver):
             return timeout_result
 
         return KVPoll.WaitingForInput  # type: ignore
+
+    def clear(self) -> None:
+        pending_ready = self.kv_mgr._ready_stream_events.pop(
+            self.bootstrap_room, []
+        )
+        for lease_key, _ in pending_ready:
+            lease = self.kv_mgr._ready_leases.get(lease_key)
+            if lease is not None and self.kv_mgr._ready_pool is not None:
+                slot, epoch = lease
+                self.kv_mgr._ready_pool[slot].fill_(epoch)
+        for lease_key, lease in list(self.kv_mgr._ready_leases.items()):
+            if (
+                lease_key[0] == self.bootstrap_room
+                and lease_key not in self.kv_mgr._ready_release_events
+            ):
+                self.kv_mgr._ready_poisoned_slots.add(lease[0])
+                self.kv_mgr._ready_leases.pop(lease_key, None)
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:

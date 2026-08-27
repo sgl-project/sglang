@@ -7,6 +7,7 @@ import torch
 from sglang.srt.disaggregation.common.destination_ready import (
     ReadyEpochStaleError,
     ReadyEpochTimeoutError,
+    enqueue_driver_ready_epoch_acquire,
     wait_for_destination_ready_epoch,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -58,3 +59,32 @@ class TestDestinationReadyCuda(CustomTestCase):
         with torch.cuda.stream(stream):
             ready.fill_(7)
             self.assertEqual(wait_for_destination_ready_epoch(ready, 7), 7)
+
+    def test_driver_wait_orders_consumer_stream(self):
+        ready = self._ready()
+        waiter = torch.cuda.Stream()
+        consumer = torch.cuda.Stream()
+        producer = torch.cuda.Stream()
+        observed = torch.empty_like(ready)
+
+        with torch.cuda.stream(waiter):
+            event = enqueue_driver_ready_epoch_acquire(ready, 7, stream=waiter)
+        with torch.cuda.stream(consumer):
+            consumer.wait_event(event)
+            observed.copy_(ready)
+        with torch.cuda.stream(producer):
+            ready.fill_(7)
+
+        torch.cuda.synchronize()
+        self.assertEqual(int(observed.item()), 7)
+
+    def test_driver_wait_can_be_released_from_another_stream(self):
+        ready = self._ready()
+        waiter = torch.cuda.Stream()
+        event = enqueue_driver_ready_epoch_acquire(ready, 7, stream=waiter)
+
+        self.assertFalse(event.query())
+        ready.fill_(7)
+        event.synchronize()
+
+        self.assertTrue(event.query())

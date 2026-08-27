@@ -1,8 +1,10 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import os
 import struct
 import sys
 import threading
+import time
 import types
 import unittest
 from collections import defaultdict
@@ -589,6 +591,7 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
         mgr._ready_slot_count = 2
         mgr._ready_next_epoch = [0, 0]
         mgr._ready_leases = {}
+        mgr._ready_release_events = {}
         mgr._ready_poisoned_slots = set()
         return mgr
 
@@ -602,6 +605,18 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
             mgr.reserve_ready_lease(2, 0)
         mgr._ready_leases.pop((1, 0, -1))
         self.assertEqual(mgr.reserve_ready_lease(2, 0), (0, 2))
+
+    def test_ready_slot_reuse_waits_for_stream_release(self):
+        mgr = self._make_ready_manager()
+        self.assertEqual(mgr.reserve_ready_lease(1, 0), (0, 1))
+        release_event = MagicMock()
+        mgr._ready_release_events[(1, 0, -1)] = release_event
+
+        self.assertEqual(mgr.reserve_ready_lease(2, 0), (0, 2))
+
+        release_event.synchronize.assert_called_once_with()
+        self.assertNotIn((1, 0, -1), mgr._ready_leases)
+        self.assertNotIn((1, 0, -1), mgr._ready_release_events)
 
     def test_peer_rows_requires_rank_local_oob_port(self):
         params = {"oob_port": "6544"}
@@ -637,6 +652,25 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
         self.assertEqual(mgr.transfer_statuses[9].received_kvs_per_pp[3], {0})
         self.assertNotIn((9, 0, 3), mgr._ready_leases)
 
+    def test_driver_ready_notification_retains_lease_until_stream_release(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = NotificationFakeAgent(["9_kv_0_1_3"])
+        mgr.transfer_statuses = defaultdict(TransferStatus)
+        mgr.required_prefill_response_num_table = {9: 1}
+        mgr.enable_staging = False
+        mgr._staging_handler = None
+        mgr._chunk_writer_counts = defaultdict(lambda: defaultdict(list))
+        mgr.enable_dcp_peer_rows = True
+        mgr._ready_leases = {(9, 0, 3): (1, 4)}
+        mgr._wait_for_peer_row_ready = MagicMock()
+
+        with patch.dict(
+            os.environ, {"SGLANG_DCP_GPUNETIO_DRIVER_READY": "1"}
+        ):
+            mgr.update_transfer_status()
+
+        self.assertIn((9, 0, 3), mgr._ready_leases)
+
     def test_notification_gate_failure_fails_before_arrival(self):
         mgr = object.__new__(NixlKVManager)
         mgr.agent = NotificationFakeAgent(["10_kv_0_1_0"])
@@ -667,6 +701,42 @@ class TestDcpPeerRowReadyProtocol(CustomTestCase):
         sender.chunk_id = 0
         with self.assertRaisesRegex(ValueError, "exactly one KV chunk"):
             sender.send(np.array([1], dtype=np.int32))
+
+    def test_full_hit_metadata_does_not_reserve_ready_slot(self):
+        mgr = MagicMock()
+        mgr.enable_dcp_peer_rows = True
+        mgr.enable_staging = False
+        mgr.transfer_statuses = defaultdict(TransferStatus)
+        mgr.local_ip = "127.0.0.1"
+        mgr.rank_port = 1234
+        mgr.agent.name = "decode"
+        receiver = object.__new__(NixlKVReceiver)
+        receiver.kv_mgr = mgr
+        receiver.bootstrap_room = 9
+        receiver.bootstrap_addr = "prefill:8998"
+        receiver.bootstrap_infos = [
+            {"rank_ip": "127.0.0.1", "rank_port": 1235, "is_dummy": False}
+        ]
+        receiver.target_tp_rank = 0
+        receiver.target_pp_ranks = [0]
+        receiver.required_dst_info_num = 1
+        receiver.started_transfer = False
+        receiver.init_time = None
+        sock = MagicMock()
+        lock = MagicMock()
+
+        with patch.object(
+            NixlKVReceiver,
+            "_connect_to_bootstrap_server",
+            return_value=(sock, lock),
+        ):
+            receiver.send_metadata(
+                np.array([], dtype=np.int32), aux_index=0, decode_prefix_len=128
+            )
+
+        mgr.reserve_ready_lease.assert_not_called()
+        frames = sock.send_multipart.call_args.args[0]
+        self.assertEqual(frames[11:13], [b"", b""])
 
     def test_ready_tail_is_last_and_uses_fixed_gpunetio_qp(self):
         class TailAgent:
@@ -1177,9 +1247,18 @@ class TestNixlReceiverPoll(CustomTestCase):
         mgr.waiting_timeout = 5
         mgr.check_status.return_value = status
         mgr.check_transfer_done.return_value = False
+        mgr.update_transfer_status.return_value = (0.0, 0.0)
+        mgr.enable_dcp_gpunetio_phase_timing = False
+        mgr.enable_dcp_peer_rows = False
         mgr.transfer_statuses = {}
         mgr.addr_to_rooms_tracker = defaultdict(set)
         mgr.addr_to_rooms_tracker["prefill:8998"].add(11)
+        mgr._ready_stream_events = {}
+        mgr._ready_release_events = {}
+        mgr._ready_leases = {}
+        mgr._ready_poisoned_slots = set()
+        mgr._ready_pool = None
+        mgr.kv_args = SimpleNamespace(gpu_id=0)
 
         receiver = object.__new__(NixlKVReceiver)
         receiver.kv_mgr = mgr
@@ -1259,6 +1338,68 @@ class TestNixlReceiverPoll(CustomTestCase):
         self.assertNotIn(11, mgr.transfer_statuses)
         self.assertNotIn(11, mgr.addr_to_rooms_tracker["prefill:8998"])
         self.assertEqual(receiver.conclude_state, KVPoll.Success)
+
+    @patch("torch.cuda.Event")
+    @patch("torch.cuda.current_stream")
+    def test_transfer_done_orders_all_ready_events(
+        self, mock_current_stream, mock_event
+    ):
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = 10.0
+        mgr.transfer_statuses = {11: TransferStatus()}
+        mgr.check_transfer_done.return_value = True
+        key0 = (11, 0, 0)
+        key1 = (11, 0, 1)
+        ready0 = MagicMock()
+        ready1 = MagicMock()
+        ready0.query.return_value = True
+        ready1.query.return_value = True
+        mgr._ready_stream_events = {11: [(key0, ready0), (key1, ready1)]}
+        stream = mock_current_stream.return_value
+        release_event = mock_event.return_value
+
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+        self.assertEqual(
+            [call.args[0] for call in stream.wait_event.call_args_list],
+            [ready0, ready1],
+        )
+        release_event.record.assert_called_once_with(stream)
+        self.assertIs(mgr._ready_release_events[key0], release_event)
+        self.assertIs(mgr._ready_release_events[key1], release_event)
+
+    @patch("torch.cuda.current_stream")
+    def test_transfer_done_waits_for_pending_ready_event(self, mock_current_stream):
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        receiver.started_transfer = True
+        receiver.init_time = time.time()
+        mgr.transfer_statuses = {11: TransferStatus()}
+        mgr.check_transfer_done.return_value = True
+        key = (11, 0, 0)
+        ready = MagicMock()
+        ready.query.return_value = False
+        mgr._ready_stream_events = {11: [(key, ready)]}
+
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+
+        mock_current_stream.assert_not_called()
+        self.assertIn(11, mgr.transfer_statuses)
+        self.assertIn(11, mgr._ready_stream_events)
+
+    def test_clear_unblocks_and_poisons_pending_ready_slot(self):
+        receiver, mgr = self._make_receiver(status=KVPoll.WaitingForInput)
+        key = (11, 0, 0)
+        ready = MagicMock()
+        mgr._ready_stream_events = {11: [(key, ready)]}
+        mgr._ready_leases = {key: (1, 7)}
+        mgr._ready_pool = MagicMock()
+
+        receiver.clear()
+
+        mgr._ready_pool.__getitem__.return_value.fill_.assert_called_once_with(7)
+        self.assertIn(1, mgr._ready_poisoned_slots)
+        self.assertNotIn(key, mgr._ready_leases)
 
 
 class TestNixlNodeFailure(CustomTestCase):
