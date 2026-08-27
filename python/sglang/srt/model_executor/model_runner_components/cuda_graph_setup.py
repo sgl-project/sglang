@@ -165,34 +165,45 @@ def capture_cuda_graphs(
             available_memory_gb,
         )
 
+    # Residue NVFP4: the CuTeDSL fold JIT-compiles; every compile must happen
+    # before capture. No-ops unless residue layers registered shapes at load.
+    from sglang.srt.layers.quantization.residue_nvfp4.warmup import (
+        maybe_warmup_residue_fold,
+        observe_residue_fold_compiles,
+    )
+
+    maybe_warmup_residue_fold()
+
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
-    prefill = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
-    )
+    with observe_residue_fold_compiles("cuda graph capture"):
+        prefill = capture_prefill_graph(
+            model_runner=model_runner, eager_runner=eager_runner
+        )
 
-    decode_phase = "draft_decode" if model_runner.is_draft_worker else "decode"
-    decode = GraphCapture(
-        runner=None,
-        memory_phase=decode_phase,
-        memory_usage_gb=0,
-        capture_time=0,
-    )
-    if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
-            decode = capture_decode_graph(model_runner=model_runner)
-    else:
+        decode_phase = "draft_decode" if model_runner.is_draft_worker else "decode"
         decode = GraphCapture(
-            runner=eager_runner,
+            runner=None,
             memory_phase=decode_phase,
             memory_usage_gb=0,
             capture_time=0,
         )
+        if capture_decode_cuda_graph:
+            if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+                decode = capture_decode_graph(model_runner=model_runner)
+            elif (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            ):
+                decode = capture_decode_graph(model_runner=model_runner)
+        else:
+            decode = GraphCapture(
+                runner=eager_runner,
+                memory_phase=decode_phase,
+                memory_usage_gb=0,
+                capture_time=0,
+            )
 
     # Register forward hooks AFTER cuda-graph capture so their tensor ops are
     # not traced into any captured graph — capture stays hook-free and hooks

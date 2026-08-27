@@ -617,6 +617,11 @@ class TestWrapperEntryClassGates(_FusionGateCase):
 
         # The normalization the constructor applies, shared with the gate.
         self.assertIsNone(_mtp_quant_config(_quant("modelopt_mixed")))
+        fp8_mtp = object()
+        mixed_with_fp8_mtp = SimpleNamespace(
+            get_name=lambda: "modelopt_mixed", mtp_quant_config=fp8_mtp
+        )
+        self.assertIs(_mtp_quant_config(mixed_with_fp8_mtp), fp8_mtp)
         serialized = SimpleNamespace(
             get_name=lambda: "modelopt_fp4", is_checkpoint_nvfp4_serialized=True
         )

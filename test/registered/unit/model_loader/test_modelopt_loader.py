@@ -696,6 +696,49 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_qwen_embedded_mtp_can_use_independent_block_fp8(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                },
+                "mtp_quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": "dynamic",
+                    "weight_block_size": [128, 128],
+                    "modules_to_not_convert": ["mtp.fc", "mtp.norm"],
+                },
+            }
+        )
+
+        self.assertIsInstance(quant_config.mtp_quant_config, Fp8Config)
+        self.assertTrue(quant_config.mtp_quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(
+            quant_config.mtp_quant_config.weight_block_size, [128, 128]
+        )
+        self.assertTrue(quant_config.mtp_quant_config.force_triton_moe_runner)
+        self.assertFalse(quant_config.fp8_config.force_triton_moe_runner)
+        self.assertIn("mtp.fc", quant_config.mtp_quant_config.ignored_layers)
+
+    def test_qwen_embedded_mtp_rejects_non_fp8_subconfig(self):
+        with self.assertRaisesRegex(ValueError, "only an FP8"):
+            ModelOptMixedPrecisionConfig.from_config(
+                {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.self_attn.q_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        }
+                    },
+                    "mtp_quantization_config": {"quant_method": "modelopt_fp4"},
+                }
+            )
+
     def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {

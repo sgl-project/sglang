@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_RESIDUE_BLACKWELL = frozenset(
+    CapabilityRequirement.cuda(min_sm=sm, max_sm=sm) for sm in ((10, 0), (10, 3))
+)
 
 register_kernel(
     KernelSpec(
@@ -205,5 +208,45 @@ register_kernel(
         ),
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
         description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.residue_nvfp4_scaled_fp4_quant_mext_r1",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.quantization.residue_nvfp4_quant"
+            ":scaled_fp4_quant_mext_r1"
+        ),
+        capabilities=_RESIDUE_BLACKWELL,
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16"),
+            description=(
+                "ratio-1.0 M-extension NVFP4 activation quant: row-doubled "
+                "packed FP4 data + swizzled fp8-e4m3 scales"
+            ),
+        ),
+        description="Residue NVFP4 mext_r1 activation quantization (JIT).",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.residue_nvfp4_scaled_fp4_quant_with_mask",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.quantization.residue_nvfp4_quant"
+            ":scaled_fp4_quant_with_mask"
+        ),
+        capabilities=_RESIDUE_BLACKWELL,
+        format_signature=FormatSignature(
+            supported_dtypes=("float16", "bfloat16"),
+            description=(
+                "k_ext NVFP4 activation quant (ratios 1/8, 2/8, 4/8): "
+                "[base | residue] extended packed FP4 rows + swizzled scales"
+            ),
+        ),
+        description="Residue NVFP4 k_ext activation quantization (JIT).",
     )
 )
