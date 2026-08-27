@@ -196,10 +196,14 @@ def prepare_raw_kimi_server_args(
     server_args: Any, loader_config: dict[str, Any]
 ) -> None:
     """Resolve a raw GGUF model path into the normal loader inputs."""
-    model_path = Path(server_args.model_path).expanduser()
+
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    cfg = resolving_view(server_args)
+    model_path = Path(cfg.model_path).expanduser()
     if not model_path.is_file() or model_path.suffix.lower() != ".gguf":
         return
-    tokenizer_path = server_args.tokenizer_path
+    tokenizer_path = cfg.tokenizer_path
     if tokenizer_path and Path(tokenizer_path).expanduser() == model_path:
         tokenizer_path = None
     assets = ensure_kimi_assets(
@@ -503,7 +507,11 @@ def prepare_raw_deepseek_server_args(
     server_args: Any, loader_config: dict[str, Any]
 ) -> None:
     """Resolve a raw DeepSeek V4 GGUF into metadata and Expert Pack inputs."""
-    source = Path(server_args.model_path).expanduser().resolve(strict=True)
+
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    cfg = resolving_view(server_args)
+    source = Path(cfg.model_path).expanduser().resolve(strict=True)
     if not source.is_file():
         return
     repo = _repo_root()
@@ -546,7 +554,11 @@ def prepare_raw_expert_pack_server_args(
     server_args: Any, loader_config: dict[str, Any]
 ) -> None:
     """Dispatch a raw GGUF to the model-specific expert-pack preparation path."""
-    source = Path(server_args.model_path).expanduser()
+
+    from sglang.srt.arg_groups.overrides import resolving_view
+
+    cfg = resolving_view(server_args)
+    source = Path(cfg.model_path).expanduser()
     if not source.is_file():
         return
     name = source.name.upper()

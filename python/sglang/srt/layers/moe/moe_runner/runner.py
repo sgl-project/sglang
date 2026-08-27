@@ -50,6 +50,15 @@ class MoeRunner:
                 "--moe-runner-backend hpc_ops for this model."
             )
 
+        if get_moe_a2a_backend().is_deepep_v2() and not runner_backend.is_deep_gemm():
+            raise ValueError(
+                "--moe-a2a-backend deepep_v2 requires the deep_gemm MoE runner, "
+                f"but this MoE layer's quantization method selected the "
+                f"'{runner_backend.value}' runner. deepep_v2 dispatches FP8 "
+                "activations plus scales, which only deep_gemm consumes; use an "
+                "FP8 blockwise-quantized checkpoint, or --moe-a2a-backend deepep."
+            )
+
         self.fused_func = None
 
         if runner_backend.is_triton():

@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING
+from typing import NamedTuple
 
 import torch
 
@@ -12,13 +12,17 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_model,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import log_info_on_rank0
@@ -37,6 +41,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     CUSTOMIZED = "customized"
 
@@ -76,6 +81,9 @@ class MoeA2ABackend(Enum):
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
 
+    def is_deepep_v2(self):
+        return self == MoeA2ABackend.DEEPEP_V2
+
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
 
@@ -111,6 +119,7 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    INTEL_XPU = "intel_xpu"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -173,6 +182,16 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+    def is_intel_xpu(self):
+        return self == MoeRunnerBackend.INTEL_XPU
+
+
+class DeepEPv2Fp8ScaleFormat(NamedTuple):
+    """DeepGEMM FP8 activation-scale layout expected from DeepEP v2."""
+
+    tma_aligned: bool
+    ue8m0: bool
 
 
 class DeepEPMode(Enum):
@@ -308,37 +327,60 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
     return DispatcherOutputDtype.BF16
 
 
-def initialize_moe_config(server_args: ServerArgs):
+def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return DeepEPv2Fp8ScaleFormat(
+        tma_aligned=(
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ),
+        ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+
+
+def initialize_moe_config():
+    """Seed the MoE runtime flags from the published configuration.
+
+    Reads the bags: `moe_a2a_backend` and its siblings are resolution's
+    answers, and the record carries the operator's input. Called once per
+    process after publish
+    (scheduler init, the benchmark work functions).
+    """
+    exec_moe = get_exec().moe
+    overlap = get_exec().overlap
+    spec = get_spec()
     moe = get_flags().moe
-    moe.a2a_backend = MoeA2ABackend(server_args.moe_a2a_backend)
-    moe.runner_backend = MoeRunnerBackend(server_args.moe_runner_backend)
+    moe.a2a_backend = MoeA2ABackend(exec_moe.moe_a2a_backend)
+    moe.runner_backend = MoeRunnerBackend(exec_moe.moe_runner_backend)
     moe.speculative_runner_backend = (
-        MoeRunnerBackend(server_args.speculative_moe_runner_backend)
-        if server_args.speculative_moe_runner_backend is not None
+        MoeRunnerBackend(spec.speculative_moe_runner_backend)
+        if spec.speculative_moe_runner_backend is not None
         else moe.runner_backend
     )
     moe.speculative_a2a_backend = (
-        MoeA2ABackend(server_args.speculative_moe_a2a_backend)
-        if server_args.speculative_moe_a2a_backend is not None
+        MoeA2ABackend(spec.speculative_moe_a2a_backend)
+        if spec.speculative_moe_a2a_backend is not None
         else moe.a2a_backend
     )
-    moe.deepep_mode = DeepEPMode(server_args.deepep_mode)
-    moe.deepep_config = server_args.deepep_config or ""
-    moe.tbo_enabled = server_args.enable_two_batch_overlap
-    moe.sbo_enabled = server_args.enable_single_batch_overlap
+    moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
+    moe.deepep_config = exec_moe.deepep_config or ""
+    moe.tbo_enabled = overlap.enable_two_batch_overlap
+    moe.sbo_enabled = overlap.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
         if torch.cuda.get_device_capability()[0] == 9:
             raise ValueError(
                 "SBO (single batch overlap) is not supported on SM90 GPUs with latest sgl-deep-gemm wheel. Please try removing --enable-single-batch-overlap argument."
             )
-    moe.tbo_token_distribution_threshold = server_args.tbo_token_distribution_threshold
-    moe.disable_fp4_allgather = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
-    moe.quantization = server_args.quantization
+    moe.tbo_token_distribution_threshold = overlap.tbo_token_distribution_threshold
+    moe.disable_fp4_allgather = exec_moe.disable_flashinfer_cutlass_moe_fp4_allgather
+    moe.quantization = get_model().quantization
     # Seeded with the user's intent; each model's gate refines the ACTIVE
     # value for its own build (install_shared_experts_fusion_decision).
-    moe.disable_shared_experts_fusion = server_args.disable_shared_experts_fusion
+    moe.disable_shared_experts_fusion = exec_moe.disable_shared_experts_fusion
     moe.speculative_disable_shared_experts_fusion = (
-        server_args.disable_shared_experts_fusion
+        exec_moe.disable_shared_experts_fusion
     )
 
 
@@ -489,9 +531,15 @@ def is_sbo_enabled() -> bool:
 
 
 def is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, Mori, or PPLX)."""
+    """Return whether A2A combine occurs inside a DeepEP-family dispatcher."""
     b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
+    return (
+        b.is_deepep()
+        or b.is_deepep_v2()
+        or b.is_mooncake()
+        or b.is_mori()
+        or b.is_pplx()
+    )
 
 
 def uses_per_rank_fused_shared_slots() -> bool:
