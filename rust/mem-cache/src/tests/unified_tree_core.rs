@@ -2232,26 +2232,22 @@ fn take_events_is_empty_when_events_are_disabled() {
 }
 
 #[test]
-fn insert_emits_one_block_stored_per_page_with_the_chained_parent() {
+fn insert_coalesces_parent_linked_block_stores() {
     let mut tc = events_core(2);
     tc.insert(&insert_params(&vec![1, 2, 7, 8], &[10, 11, 12, 13]));
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1, 2, 7, 8], None, 2);
     assert_eq!(
         tc.take_events(),
-        vec![
-            KvCacheEvent::BlockStored {
-                block_hash: crate::node::hash_str_to_int64(&hashes[0]),
-                parent_block_hash: None,
-                token_ids: vec![1, 2],
-                medium: StorageMedium::Gpu,
-            },
-            KvCacheEvent::BlockStored {
-                block_hash: crate::node::hash_str_to_int64(&hashes[1]),
-                parent_block_hash: Some(crate::node::hash_str_to_int64(&hashes[0])),
-                token_ids: vec![7, 8],
-                medium: StorageMedium::Gpu,
-            },
-        ]
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: vec![1, 2, 7, 8],
+            block_size: 2,
+            medium: StorageMedium::Gpu,
+        }]
     );
     // Events hash lazily even though the storage tier is off.
     let leaf = tc
@@ -2261,6 +2257,77 @@ fn insert_emits_one_block_stored_per_page_with_the_chained_parent() {
         tc.arena.node(tc.arena.resolve(leaf)).hash_value,
         Some(hashes)
     );
+}
+
+#[test]
+fn event_coalescing_respects_store_remove_and_clear_boundaries() {
+    let mut tc = events_core(2);
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![1],
+        parent_block_hash: None,
+        token_ids: vec![10, 11],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 1);
+    // A different block size must not join the parent-linked store tail.
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![2],
+        parent_block_hash: Some(1),
+        token_ids: vec![12],
+        block_size: 1,
+        medium: StorageMedium::Gpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 2);
+    // Matching size and parent are still separated across media.
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![3],
+        parent_block_hash: Some(2),
+        token_ids: vec![13],
+        block_size: 1,
+        medium: StorageMedium::Cpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 3);
+    // Matching size and medium are still separated without the parent link.
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![4],
+        parent_block_hash: None,
+        token_ids: vec![14],
+        block_size: 1,
+        medium: StorageMedium::Cpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 4);
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![1],
+        medium: StorageMedium::Gpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 5);
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![2, 3],
+        medium: StorageMedium::Gpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 5);
+    assert!(matches!(
+        tc.kv_event_queue.last(),
+        Some(KvCacheEvent::BlockRemoved { block_hashes, .. })
+            if block_hashes.as_slice() == [1, 2, 3]
+    ));
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![4],
+        medium: StorageMedium::Cpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 6);
+    tc.record_all_cleared_event();
+    assert_eq!(tc.kv_event_queue.len(), 7);
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![5],
+        medium: StorageMedium::Cpu,
+    });
+    assert_eq!(tc.kv_event_queue.len(), 8);
+    assert!(matches!(
+        &tc.kv_event_queue[6],
+        KvCacheEvent::AllBlocksCleared
+    ));
 }
 
 #[test]
@@ -2315,20 +2382,16 @@ fn bigram_insert_events_carry_pair_token_payloads() {
     let hashes = crate::node::get_hash_str::<Vec<(i64, i64)>>(&key, None, 1);
     assert_eq!(
         tc.take_events(),
-        vec![
-            KvCacheEvent::BlockStored {
-                block_hash: crate::node::hash_str_to_int64(&hashes[0]),
-                parent_block_hash: None,
-                token_ids: vec![(1, 2)],
-                medium: StorageMedium::Gpu,
-            },
-            KvCacheEvent::BlockStored {
-                block_hash: crate::node::hash_str_to_int64(&hashes[1]),
-                parent_block_hash: Some(crate::node::hash_str_to_int64(&hashes[0])),
-                token_ids: vec![(2, 3)],
-                medium: StorageMedium::Gpu,
-            },
-        ]
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: vec![(1, 2), (2, 3)],
+            block_size: 1,
+            medium: StorageMedium::Gpu,
+        }]
     );
 }
 
@@ -2344,9 +2407,10 @@ fn finish_write_through_emits_cpu_stored_events() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
-            block_hash: crate::node::hash_str_to_int64(&hashes[0]),
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             parent_block_hash: None,
             token_ids: vec![1],
+            block_size: 1,
             medium: StorageMedium::Cpu,
         }]
     );
@@ -2393,9 +2457,10 @@ fn load_back_commit_emits_gpu_stored_events() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
-            block_hash: crate::node::hash_str_to_int64(&hashes[0]),
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             parent_block_hash: None,
             token_ids: vec![1],
+            block_size: 1,
             medium: StorageMedium::Gpu,
         }]
     );
@@ -2410,9 +2475,10 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
-            block_hash: crate::node::hash_str_to_int64(&hashes[0]),
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             parent_block_hash: None,
             token_ids: vec![1],
+            block_size: 1,
             medium: StorageMedium::Gpu,
         }]
     );
@@ -2496,9 +2562,10 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
     assert_eq!(
         tc.take_events(),
         vec![KvCacheEvent::BlockStored {
-            block_hash: crate::node::hash_str_to_int64(&leaf_hashes[0]),
+            block_hashes: vec![crate::node::hash_str_to_int64(&leaf_hashes[0])],
             parent_block_hash: Some(crate::node::hash_str_to_int64(&base_hashes[0])),
             token_ids: vec![5, 6],
+            block_size: 2,
             medium: StorageMedium::Gpu,
         }]
     );
@@ -2563,20 +2630,16 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
     let hashes = crate::node::get_hash_str::<Vec<i64>>(&[1, 2, 3, 4], None, 2);
     assert_eq!(
         tc.take_events(),
-        vec![
-            KvCacheEvent::BlockStored {
-                block_hash: crate::node::hash_str_to_int64(&hashes[0]),
-                parent_block_hash: None,
-                token_ids: vec![1, 2],
-                medium: StorageMedium::Cpu,
-            },
-            KvCacheEvent::BlockStored {
-                block_hash: crate::node::hash_str_to_int64(&hashes[1]),
-                parent_block_hash: Some(crate::node::hash_str_to_int64(&hashes[0])),
-                token_ids: vec![3, 4],
-                medium: StorageMedium::Cpu,
-            },
-        ]
+        vec![KvCacheEvent::BlockStored {
+            block_hashes: hashes
+                .iter()
+                .map(|hash| crate::node::hash_str_to_int64(hash))
+                .collect(),
+            parent_block_hash: None,
+            token_ids: vec![1, 2, 3, 4],
+            block_size: 2,
+            medium: StorageMedium::Cpu,
+        }]
     );
     // The matching ack cleared the pending mark on both fragments.
     assert_eq!(

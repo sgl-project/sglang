@@ -1541,15 +1541,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         for event in events {
             match event {
                 KvCacheEvent::BlockStored {
-                    block_hash,
+                    block_hashes,
                     parent_block_hash,
                     token_ids,
+                    block_size,
                     medium,
                 } => {
-                    let block_size = token_ids.len();
                     let item: Py<PyAny> = (
                         "block_stored",
-                        vec![block_hash],
+                        block_hashes,
                         parent_block_hash,
                         token_ids,
                         block_size,

@@ -2408,7 +2408,47 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     // ==== KV cache placement events ====
 
-    /// Queue one BlockStored per page of the node's key; hashes lazily if needed.
+    /// Append an event, coalescing it with a compatible queue tail.
+    fn enqueue_kv_event_(&mut self, event: KvCacheEvent<K::Atom>) {
+        match (self.kv_event_queue.last_mut(), event) {
+            (
+                Some(KvCacheEvent::BlockRemoved {
+                    block_hashes: tail_hashes,
+                    medium: tail_medium,
+                }),
+                KvCacheEvent::BlockRemoved {
+                    mut block_hashes,
+                    medium,
+                },
+            ) if *tail_medium == medium => tail_hashes.append(&mut block_hashes),
+            (
+                Some(KvCacheEvent::BlockStored {
+                    block_hashes: tail_hashes,
+                    token_ids: tail_token_ids,
+                    block_size: tail_block_size,
+                    medium: tail_medium,
+                    ..
+                }),
+                KvCacheEvent::BlockStored {
+                    mut block_hashes,
+                    parent_block_hash,
+                    mut token_ids,
+                    block_size,
+                    medium,
+                },
+            ) if *tail_medium == medium
+                && *tail_block_size == block_size
+                && !tail_hashes.is_empty()
+                && parent_block_hash == tail_hashes.last().copied() =>
+            {
+                tail_hashes.append(&mut block_hashes);
+                tail_token_ids.append(&mut token_ids);
+            }
+            (_, event) => self.kv_event_queue.push(event),
+        }
+    }
+
+    /// Build one BlockStored per page and coalesce compatible queue neighbors.
     fn record_store_event_(&mut self, node_id: NodeIdx_, medium: StorageMedium) {
         if !self.enable_kv_cache_events {
             return;
@@ -2417,29 +2457,41 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
-        let node = self.arena.node(node_id);
-        let mut parent_block_hash = node.parent.and_then(|parent_id| {
-            self.arena
-                .node(parent_id)
-                .get_last_hash_value()
-                .map(crate::node::hash_str_to_int64)
-        });
-        let hash_value = node.hash_value.as_ref().expect("hashed above");
-        let num_pages = node.key.atom_len().div_ceil(self.page_size);
-        assert!(
-            hash_value.len() >= num_pages,
-            "store event: {} page hashes for {num_pages} pages",
-            hash_value.len()
-        );
-        for (page, hash) in node.key.as_ref().chunks(self.page_size).zip(hash_value) {
-            let block_hash = crate::node::hash_str_to_int64(hash);
-            self.kv_event_queue.push(KvCacheEvent::BlockStored {
-                block_hash,
-                parent_block_hash,
-                token_ids: page.to_vec(),
-                medium,
+        let events = {
+            let node = self.arena.node(node_id);
+            let mut parent_block_hash = node.parent.and_then(|parent_id| {
+                self.arena
+                    .node(parent_id)
+                    .get_last_hash_value()
+                    .map(crate::node::hash_str_to_int64)
             });
-            parent_block_hash = Some(block_hash);
+            let hash_value = node.hash_value.as_ref().expect("hashed above");
+            let num_pages = node.key.atom_len().div_ceil(self.page_size);
+            assert!(
+                hash_value.len() >= num_pages,
+                "store event: {} page hashes for {num_pages} pages",
+                hash_value.len()
+            );
+            node.key
+                .as_ref()
+                .chunks(self.page_size)
+                .zip(hash_value)
+                .map(|(page, hash)| {
+                    let block_hash = crate::node::hash_str_to_int64(hash);
+                    let event = KvCacheEvent::BlockStored {
+                        block_hashes: vec![block_hash],
+                        parent_block_hash,
+                        token_ids: page.to_vec(),
+                        block_size: page.len(),
+                        medium,
+                    };
+                    parent_block_hash = Some(block_hash);
+                    event
+                })
+                .collect::<Vec<_>>()
+        };
+        for event in events {
+            self.enqueue_kv_event_(event);
         }
     }
 
@@ -2459,7 +2511,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .map(|hash| crate::node::hash_str_to_int64(hash))
             .collect();
         if !block_hashes.is_empty() {
-            self.kv_event_queue.push(KvCacheEvent::BlockRemoved {
+            self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
             });
@@ -2469,7 +2521,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Queue the all-cleared marker.
     pub fn record_all_cleared_event(&mut self) {
         if self.enable_kv_cache_events {
-            self.kv_event_queue.push(KvCacheEvent::AllBlocksCleared);
+            self.enqueue_kv_event_(KvCacheEvent::AllBlocksCleared);
         }
     }
 
@@ -4104,13 +4156,14 @@ impl StorageMedium {
     }
 }
 
-/// A KV placement event; token ids carry one page's key atoms.
+/// A KV placement event; one stored event may carry multiple same-sized pages.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum KvCacheEvent<A> {
     BlockStored {
-        block_hash: i64,
+        block_hashes: Vec<i64>,
         parent_block_hash: Option<i64>,
         token_ids: Vec<A>,
+        block_size: usize,
         medium: StorageMedium,
     },
     BlockRemoved {

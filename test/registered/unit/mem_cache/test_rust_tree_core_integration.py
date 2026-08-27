@@ -499,17 +499,9 @@ def test_insert_emits_block_stored_events():
     ]
     assert core.take_events() == [
         BlockStored(
-            block_hashes=[hashes[0]],
+            block_hashes=hashes,
             parent_block_hash=None,
-            token_ids=[1, 2],
-            block_size=2,
-            lora_id=None,
-            medium=StorageMedium.GPU,
-        ),
-        BlockStored(
-            block_hashes=[hashes[1]],
-            parent_block_hash=hashes[0],
-            token_ids=[7, 8],
+            token_ids=[1, 2, 7, 8],
             block_size=2,
             lora_id=None,
             medium=StorageMedium.GPU,
