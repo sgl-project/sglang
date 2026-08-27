@@ -21,7 +21,10 @@ import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+from sglang.srt.mem_cache.common import (
+    free_kv_row_range,
+    free_swa_out_of_window_slots,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -169,7 +172,13 @@ class TestSWAEvictionBoundary(unittest.TestCase):
                         insert_len,
                         f"page={page_size}, win={window}, seq={seq_len}",
                     )
-                    allocator.free(kv)
+                    # _evict_swa already released the SWA side of the row head.
+                    free_kv_row_range(
+                        allocator,
+                        kv,
+                        start_pos=0,
+                        swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+                    )
 
     # -- Eviction formula: page_size <= window --
 

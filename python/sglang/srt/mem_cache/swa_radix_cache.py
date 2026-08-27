@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import free_kv_row_range
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
@@ -467,7 +468,12 @@ class SWARadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            free_kv_row_range(
+                self.token_to_kv_pool_allocator,
+                kv_indices,
+                start_pos=0,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+            )
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -497,12 +503,20 @@ class SWARadixCache(BasePrefixCache):
                 )
             )
         else:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[old_prefix_len:page_aligned_len]
+            free_kv_row_range(
+                self.token_to_kv_pool_allocator,
+                kv_indices[old_prefix_len:page_aligned_len],
+                start_pos=old_prefix_len,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+        free_kv_row_range(
+            self.token_to_kv_pool_allocator,
+            kv_indices[page_aligned_len:],
+            start_pos=page_aligned_len,
+            swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+        )
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(
@@ -538,12 +552,16 @@ class SWARadixCache(BasePrefixCache):
         old_prefix_len = req.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
-        # Note: the insert function already frees the overlapped kv_indices
+        # Note: the insert function already frees the overlapped kv_indices.
+        # The eviction floor has to travel with the insert (as it already does
+        # from cache_finished_req): the overlap frees below it must not touch
+        # the SWA side a second time.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
@@ -611,11 +629,13 @@ class SWARadixCache(BasePrefixCache):
 
                 # 1. free node kv indices, evict full and swa tokens
                 self.kv_events.record_remove(x)
-                self.token_to_kv_pool_allocator.free(x.value)
-                full_num_evicted += len(x.value)
                 # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
-                if not x.swa_tombstone:
+                if x.swa_tombstone:
+                    self.token_to_kv_pool_allocator.free_full(x.value)
+                else:
+                    self.token_to_kv_pool_allocator.free(x.value)
                     swa_num_evicted += len(x.value)
+                full_num_evicted += len(x.value)
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
@@ -1191,7 +1211,7 @@ class SWARadixCache(BasePrefixCache):
                             )
                         else:
                             # Free full tokens in the original tree node.
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 node.value[:prefix_len]
                             )
                             # Overwrite the new value in request to the tree node.
@@ -1209,18 +1229,20 @@ class SWARadixCache(BasePrefixCache):
                             self._recover_tombstone_keeping_locked_full(
                                 node, value[start_update_idx:prefix_len]
                             )
-                            self.token_to_kv_pool_allocator.free(
+                            # [total_prefix_length, swa_evicted_seqlen): this
+                            # request already released the SWA peers itself.
+                            self.token_to_kv_pool_allocator.free_full(
                                 value[:start_update_idx]
                             )
                         else:
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 node.value[start_update_idx:prefix_len]
                             )
                             self._split_node(node.key, node, start_update_idx)
                             # Here node is the new node after split, so we can overwrite the value to the new node.
                             # The old node is still swa tombstone and the full token is not freed.
                             node.value = value[start_update_idx:prefix_len].clone()
-                            self.token_to_kv_pool_allocator.free(
+                            self.token_to_kv_pool_allocator.free_full(
                                 value[:start_update_idx]
                             )
                             node.swa_tombstone = False
@@ -1228,10 +1250,17 @@ class SWARadixCache(BasePrefixCache):
                             self.swa_evictable_size_ += len(node.value)
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
-                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                        self.token_to_kv_pool_allocator.free_full(value[:prefix_len])
                 else:
                     # The node is not tombstone, so we don't need to update the node.
-                    self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                    # The incoming slice may still straddle this request's own
+                    # eviction floor, so split it there.
+                    free_kv_row_range(
+                        self.token_to_kv_pool_allocator,
+                        value[:prefix_len],
+                        start_pos=total_prefix_length,
+                        swa_evicted_seqlen=swa_evicted_seqlen,
+                    )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1258,7 +1287,7 @@ class SWARadixCache(BasePrefixCache):
             #    occurring in normal operation. This check is a defensive guard
             #    against unexpected eviction states from other code paths.
             if swa_evicted_seqlen == total_prefix_length + len(key):
-                self.token_to_kv_pool_allocator.free(value)
+                self.token_to_kv_pool_allocator.free_full(value)
                 return total_prefix_length
 
             if (
@@ -1346,7 +1375,7 @@ class SWARadixCache(BasePrefixCache):
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             self.kv_events.record_remove(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
+            self.token_to_kv_pool_allocator.free_full(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)

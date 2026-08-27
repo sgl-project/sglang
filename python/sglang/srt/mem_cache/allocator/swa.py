@@ -6,6 +6,14 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.invariants import (
+    Bucket,
+    Invariant,
+    InvariantCheckLevel,
+    IsTrue,
+    expect,
+    resolve_level,
+)
 
 _is_npu = is_npu()
 
@@ -15,6 +23,14 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.allocator_npu import (
         NPUPagedTokenToKVPoolAllocator,
     )
+
+
+# A full slot reaching free_swa must still own its SWA peer; a released one reads
+# as the padding slot, and handing that to the SWA pool corrupts an unrelated
+# request's KV with no containment. Callers use free_full for those.
+_SWA_PEER_MAPPED = Invariant(
+    "mem_cache.swa_peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -96,6 +112,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.full_free_group = []
 
         self._kvcache = kvcache
         self.clear()
@@ -351,16 +368,34 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
 
     def free_swa(self, free_index: torch.Tensor):
+        """Release only the SWA peers of these FULL slot ids, keeping the full
+        side live. The mapping is the source of truth, so callers pass full ids
+        rather than a cached SWA copy that may already read as the sentinel."""
         if free_index.numel() == 0:
             return
 
         if self.page_size == 1:
+            # Per-token mapping, so no page to expand and every entry is mapped:
+            # the caller's host-side liveness proof (`free_full` covers the rest)
+            # is enough, and filtering here would need a device-side count.
             mapping_indices = free_index
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+            if resolve_level() >= InvariantCheckLevel.WARN:
+                expect(_SWA_PEER_MAPPED, swa_indices > 0, msg="caller wants free_full")
         else:
+            # Paged: two things break a page-representative read, so keep the
+            # legacy expand-and-filter until both are closed.
+            #   1. A partially filled page owns full slots that never got an SWA
+            #      peer, so the gather sees the padding slot.
+            #   2. HiCache LOAD_BACK re-pairs a page-aligned full chunk with an
+            #      arbitrarily offset SWA chunk
+            #      (`swa_component.commit_hicache_transfer` advances by raw token
+            #      count), so one full page can span three SWA pages and share one
+            #      with its neighbour.
             mapping_indices = self._expand_to_full_pages(free_index)
+            swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+            swa_indices = swa_indices[swa_indices > 0]
 
-        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if not self.is_not_in_free_group:
@@ -371,9 +406,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.swa_attn_allocator.free(swa_indices)
 
+    def free_full(self, free_index: torch.Tensor):
+        """Free the full-attention slots of a range whose SWA peers are already
+        gone -- a tombstoned tree node, or a row prefix below
+        ``swa_evicted_seqlen``. Their mapping entries are 0, so routing them
+        through ``free`` would push the padding slot into the SWA free list."""
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+        else:
+            self.full_free_group.append(self._copy_for_free_group(free_index))
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
+        self.full_free_group = []
 
     def free_group_end(self):
         super().free_group_end()
@@ -381,6 +433,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
             self.swa_attn_allocator.free(torch.cat(swa_free_group))
+        if self.full_free_group:
+            full_free_group = self.full_free_group
+            self.full_free_group = []
+            self.free_full(torch.cat(full_free_group))
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
@@ -411,6 +467,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.swa_free_group = []
+        self.full_free_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -518,6 +575,11 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
+
+    def free_full(self, free_index: torch.Tensor):
+        # All-SWA models have no full-attention pool, so there is nothing to
+        # release once the SWA side is gone.
+        return
 
     def free_group_begin(self):
         self.is_not_in_free_group = False

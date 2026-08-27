@@ -42,6 +42,14 @@ class RecordingAllocator:
     def free(self, slots: torch.Tensor):
         self.live.difference_update(slots.tolist())
 
+    # Single pool, so the base allocator contract makes free_full a plain free
+    # and free_swa a no-op: there is no SWA peer to release.
+    def free_full(self, slots: torch.Tensor):
+        self.free(slots)
+
+    def free_swa(self, slots: torch.Tensor):
+        return
+
     def available_size(self):
         return self.capacity - len(self.live)
 
@@ -226,7 +234,7 @@ def test_streaming_session_release_frees_compressed_slots():
     )
     session.slots["session-a"] = SessionSlot(
         req_pool_idx=req_pool_idx,
-        kv=SimpleNamespace(kv_allocated_len=16),
+        kv=SimpleNamespace(kv_allocated_len=16, swa_evicted_seqlen=0),
     )
 
     session.release_session("session-a")

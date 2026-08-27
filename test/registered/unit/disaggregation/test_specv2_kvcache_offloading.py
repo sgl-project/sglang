@@ -35,7 +35,7 @@ def _make_mock_req(
     req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
-    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
+    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len, swa_evicted_seqlen=0)
     req.prefix_indices = list(range(prefix_indices_len))
     req.effective_kv_committed_len = lambda: req.kv_committed_len
     return req
@@ -52,9 +52,12 @@ def _make_manager(pool_size: int, page_size: int = 1):
     freed_indices = []
 
     allocator = MagicMock()
-    allocator.free = MagicMock(
-        side_effect=lambda idx: freed_indices.append(idx.clone())
-    )
+    # Row ranges reach the allocator as free_full (whole range) plus free_swa
+    # (from the eviction floor up); record the full side, which is what a leak
+    # would show up in. Hook free() too so a direct caller still registers.
+    record = MagicMock(side_effect=lambda idx: freed_indices.append(idx.clone()))
+    allocator.free = record
+    allocator.free_full = record
 
     tree_cache = MagicMock()
     tree_cache.protected_size_ = 0

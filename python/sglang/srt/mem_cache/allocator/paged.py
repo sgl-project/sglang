@@ -302,6 +302,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self._copy_for_free_group(piece) for piece in pieces
             )
 
+    def free_page_reps(self, reps: torch.Tensor):
+        """Free the pages owning `reps`, one representative per page.
+
+        Fixed-shape counterpart of free() for callers that already hold page
+        representatives: no dedup, so `reps` must not name a page twice."""
+        if reps.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self._release_page_ids(reps // self.page_size)
+            if self.debug_mode:
+                self._debug_check_no_duplicate_pages()
+        else:
+            self.free_page_reps_group.append(self._copy_for_free_group(reps))
+
     def _debug_check_no_duplicate_pages(self):
         # span both containers: need_sort (PD disagg) routes frees into release_pages
         pages = torch.cat((self.free_pages, self.release_pages))

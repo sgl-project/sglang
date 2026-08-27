@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -939,7 +940,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -990,9 +994,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
             if dup_start < consumed_from:
-                step_actions.append(
-                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
+                # The duplicate slice may straddle this request's own eviction
+                # floor; below it only the full side is still ours to release.
+                dup = value_slice[dup_start:consumed_from]
+                abs_start = state.total_prefix_length + dup_start
+                swa_already_freed = min(
+                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
                 )
+                if swa_already_freed > 0:
+                    step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
+                if swa_already_freed < dup.numel():
+                    step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))

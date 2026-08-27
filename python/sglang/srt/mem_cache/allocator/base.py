@@ -124,6 +124,23 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free(self, free_index: torch.Tensor):
         raise NotImplementedError()
 
+    def free_full(self, free_index: torch.Tensor):
+        """Free slots whose SWA peers the caller already released.
+
+        Hybrid SWA allocators pair every full-attention slot with an SWA slot
+        that can outlive it or die first; this releases the full side alone.
+        With a single pool there is no peer, so it is a plain free()."""
+        self.free(free_index)
+
+    def free_swa(self, free_index: torch.Tensor):
+        """Free the SWA peers of these full slots, keeping the full side live.
+
+        Together with free_full this partitions free(): for every allocator,
+        ``free(x) == free_full(x) + free_swa(x)``. A single pool has no peer to
+        release, hence the no-op; callers reach here only through
+        ``supports_swa()`` paths."""
+        return
+
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
         page-aligned copy); subclasses may use ``start_pos`` to skip the
