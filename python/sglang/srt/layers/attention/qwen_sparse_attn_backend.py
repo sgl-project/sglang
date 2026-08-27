@@ -53,9 +53,9 @@ def _resolve_trtllm_sparse_decode():
     at decode row counts; the trtllm-gen decode kernel over a page-aligned
     scratch measures ~35% faster for the gather+attention pair.
     """
-    from sglang.srt.utils import is_sm100_supported
+    from sglang.srt.utils import is_sm100_supported, is_sm121
 
-    if not is_sm100_supported():
+    if not (is_sm100_supported() or is_sm121()):
         return None
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
