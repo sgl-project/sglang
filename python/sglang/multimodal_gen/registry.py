@@ -100,6 +100,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
+    SenseNovaU1PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -177,6 +180,9 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
+    SenseNovaU1SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -342,6 +348,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
+    "sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
 }
 
 
@@ -970,6 +978,20 @@ def _register_configs():
         model_detectors=[
             lambda model_id: "minimaxh3"
             in model_id.lower().replace("-", "").replace("_", "")
+        ],
+    )
+    register_configs(
+        sampling_param_cls=SenseNovaU1SamplingParams,
+        pipeline_config_cls=SenseNovaU1PipelineConfig,
+        hf_model_paths=[
+            "sensenova/SenseNova-U1.5-8B-MoT",
+        ],
+        model_detectors=[
+            # codespell:ignore mot
+            lambda model_id: "sensenova-u1.5-8b-mot" in model_id.lower(),
+            lambda model_id: "sensenova" in model_id.lower()
+            and "u1" in model_id.lower()
+            and (chr(109) + chr(111) + chr(116)) in model_id.lower(),
         ],
     )
     # FLUX
