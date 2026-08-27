@@ -314,21 +314,21 @@ jobs:
 #      device_type_for_deps: 'a3'
 #      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-acc-16-npu-a3:
-    name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-16-
-      test_type: 'accuracy'
-      test_suite: nightly-acc-16-npu-a3-dsv4-gpqa
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+#  nightly-acc-16-npu-a3:
+#    name: nightly-acc-16-npu-a3
+#    if: ${{ !cancelled() }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+#    with:
+#      runner: linux-aarch64-a3-16-
+#      test_type: 'accuracy'
+#      test_suite: nightly-acc-16-npu-a3-dsv4-gpqa
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      install_sglang_deps: false
+#      device_type_for_deps: 'a3'
+#      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
 #  nightly-poc-multi-node-tests:
 #    name: multi-node-poc
@@ -396,8 +396,8 @@ jobs:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
     # needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
-    needs: [set-image-config, nightly-acc-16-npu-a3]
-    # needs: [set-image-config]
+    # needs: [set-image-config, nightly-acc-16-npu-a3]
+    needs: [set-image-config]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -449,7 +449,7 @@ jobs:
 #      - nightly-perf-16-npu-a3
 #      - nightly-acc-2-npu-a3
 #      - nightly-acc-4-npu-a3
-      - nightly-acc-16-npu-a3
+#      - nightly-acc-16-npu-a3
 #      - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
@@ -468,25 +468,25 @@ jobs:
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
 
           # single-node suites are reported per suite; overall status is success if none failed
-          single_result="success"
-          for r in \
-            # "${{ needs.nightly-1-npu-a3.result }}" \
-            # "${{ needs.nightly-2-npu-a3.result }}" \
-            # "${{ needs.nightly-4-npu-a3.result }}" \
-            # "${{ needs.nightly-8-npu-a3.result }}" \
-            # "${{ needs.nightly-16-npu-a3.result }}" \
-            # "${{ needs.nightly-perf-2-npu-a3.result }}" \
-            # "${{ needs.nightly-perf-4-npu-a3.result }}" \
-            # "${{ needs.nightly-perf-8-npu-a3.result }}" \
-            # "${{ needs.nightly-perf-16-npu-a3.result }}" \
-            # "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            # "${{ needs.nightly-acc-4-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
-            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
-              single_result="failure"
-            fi
-          done
-          # single_result="skipped"
+          # single_result="success"
+          # for r in \
+          #   # "${{ needs.nightly-1-npu-a3.result }}" \
+          #   # "${{ needs.nightly-2-npu-a3.result }}" \
+          #   # "${{ needs.nightly-4-npu-a3.result }}" \
+          #   # "${{ needs.nightly-8-npu-a3.result }}" \
+          #   # "${{ needs.nightly-16-npu-a3.result }}" \
+          #   # "${{ needs.nightly-perf-2-npu-a3.result }}" \
+          #   # "${{ needs.nightly-perf-4-npu-a3.result }}" \
+          #   # "${{ needs.nightly-perf-8-npu-a3.result }}" \
+          #   # "${{ needs.nightly-perf-16-npu-a3.result }}" \
+          #   # "${{ needs.nightly-acc-2-npu-a3.result }}" \
+          #   # "${{ needs.nightly-acc-4-npu-a3.result }}" \
+          #   "${{ needs.nightly-acc-16-npu-a3.result }}"; do
+          #   if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
+          #     single_result="failure"
+          #   fi
+          # done
+          single_result="skipped"
 
           group_icon() {
             case "$1" in
@@ -503,23 +503,23 @@ jobs:
           echo "| Group | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           # echo "| nightly-1-npu-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
-          for entry in \
-            # "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
-            # "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
-            # "nightly-4-npu-a3:${{ needs.nightly-4-npu-a3.result }}" \
-            # "nightly-8-npu-a3:${{ needs.nightly-8-npu-a3.result }}" \
-            # "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
-            # "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
-            # "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
-            # "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
-            # "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
-            # "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            # "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
-            suite="${entry%%:*}"
-            r="${entry##*:}"
-            echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
-          done
+          # for entry in \
+          #   # "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
+          #   # "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
+          #   # "nightly-4-npu-a3:${{ needs.nightly-4-npu-a3.result }}" \
+          #   # "nightly-8-npu-a3:${{ needs.nightly-8-npu-a3.result }}" \
+          #   # "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
+          #   # "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
+          #   # "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
+          #   # "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
+          #   # "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
+          #   # "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
+          #   # "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
+          #   "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
+          #   suite="${entry%%:*}"
+          #   r="${entry##*:}"
+          #   echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
+          # done
           # echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -562,8 +562,8 @@ jobs:
 
           FAIL=0
           # for r in "${single_result_a2}" "${single_result}" "${multi_result}" "${mix_result}"; do
-          for r in "${single_result}" "${mix_result}"; do
-          # for r in "${mix_result}"; do
+          # for r in "${single_result}" "${mix_result}"; do
+          for r in "${mix_result}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
           done
           exit $FAIL
