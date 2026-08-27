@@ -24,8 +24,8 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredWithComponents,
     BlockStoredMetadata,
+    BlockStoredWithComponents,
     BlockStoredWithMetadata,
     BlockStoredWithMetadataAndComponents,
     StorageMedium,
@@ -155,9 +155,7 @@ class KVCacheEventRecorder:
             block_hash = hash_str_to_int64(event_hash_values[page_index])
 
             component_types = (
-                self.component_types_for_page(
-                    node, medium, page_index, num_pages
-                )
+                self.component_types_for_page(node, medium, page_index, num_pages)
                 if self.component_types_for_page is not None
                 else None
             )

@@ -208,7 +208,7 @@ where
 /// One stream retiring must not unroute the others. A permanent failure means
 /// the Bridge and the Indexer disagree about that stream -- an RPC the Indexer
 /// does not implement after a partial rollout, a credential it rejects, a batch
-/// no retry can make appliable -- which says nothing about its peers. The
+/// no retry can make applicable -- which says nothing about its peers. The
 /// retiring stream is left invalidated so the Router stops trusting its
 /// placement, and the fleet gives up only once every stream is gone, which is
 /// the case that says the disagreement is systemic.

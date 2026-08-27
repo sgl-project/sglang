@@ -27,8 +27,8 @@ from sglang.srt.disaggregation.kv_events import (
     SNAPSHOT_SEND_TIMEOUT_MS,
     BlockRemoved,
     BlockStored,
-    BlockStoredWithComponents,
     BlockStoredMetadata,
+    BlockStoredWithComponents,
     BlockStoredWithMetadata,
     EventPublisher,
     EventPublisherFactory,
@@ -548,18 +548,14 @@ class TestKvPlacementSnapshotProtocol(CustomTestCase):
             dealer.connect(endpoint)
             dealer.send_multipart([b"", SNAPSHOT_REQUEST_V2])
             header_frames = dealer.recv_multipart()
-            header = msgspec.msgpack.decode(
-                header_frames[2], type=KVSnapshotHeaderV2
-            )
+            header = msgspec.msgpack.decode(header_frames[2], type=KVSnapshotHeaderV2)
             placements = []
             while True:
                 frames = dealer.recv_multipart()
                 if frames[1] == SNAPSHOT_END:
                     break
                 placements.extend(
-                    msgspec.msgpack.decode(
-                        frames[2], type=list[KVSnapshotPlacementV2]
-                    )
+                    msgspec.msgpack.decode(frames[2], type=list[KVSnapshotPlacementV2])
                 )
 
             self.assertEqual(header.version, 2)

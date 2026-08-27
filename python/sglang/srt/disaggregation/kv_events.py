@@ -481,9 +481,9 @@ class ZmqEventPublisher(EventPublisher):
         self._snapshot_blocks: dict[int, KVSnapshotBlock] = {}
         # Snapshot v2 keeps exact placement identity. A block may exist at
         # several tiers, so block_hash alone is not a valid mirror key.
-        self._snapshot_placements: dict[
-            tuple[str, int, int], KVSnapshotPlacementV2
-        ] = {}
+        self._snapshot_placements: dict[tuple[str, int, int], KVSnapshotPlacementV2] = (
+            {}
+        )
         # At most one capture may wait behind the publisher thread. This keeps
         # a stalled publisher from accumulating timed-out requests forever.
         self._snapshot_requests: Queue[_SnapshotCaptureRequest] = Queue(maxsize=1)
@@ -707,14 +707,14 @@ class ZmqEventPublisher(EventPublisher):
                         parent_block_hash=parent,
                         block_hashes=[block_hash],
                     )
-                    self._snapshot_placements[
-                        (self._namespace, block_hash, tier)
-                    ] = KVSnapshotPlacementV2(
-                        parent_block_hash=parent,
-                        block_hash=block_hash,
-                        tier=tier,
-                        component_mask=component_mask,
-                        block_size=event.block_size,
+                    self._snapshot_placements[(self._namespace, block_hash, tier)] = (
+                        KVSnapshotPlacementV2(
+                            parent_block_hash=parent,
+                            block_hash=block_hash,
+                            tier=tier,
+                            component_mask=component_mask,
+                            block_size=event.block_size,
+                        )
                     )
                     parent = block_hash
             elif isinstance(event, BlockRemoved):
@@ -925,7 +925,9 @@ class ZmqEventPublisher(EventPublisher):
             return
 
         if len(frame) == 6:
-            client_id, delimiter, command, expected_epoch, start_bytes, end_bytes = frame
+            client_id, delimiter, command, expected_epoch, start_bytes, end_bytes = (
+                frame
+            )
             if delimiter or command != b"replay-v2":
                 logger.warning("Invalid replay-v2 request: %s", frame)
                 return
@@ -933,9 +935,7 @@ class ZmqEventPublisher(EventPublisher):
             end_seq = int.from_bytes(end_bytes, "big")
             epoch = self._epoch.encode("utf-8")
             if expected_epoch != epoch or end_seq < start_seq:
-                self._replay.send_multipart(
-                    (client_id, b"", epoch, self.END_SEQ, b"")
-                )
+                self._replay.send_multipart((client_id, b"", epoch, self.END_SEQ, b""))
                 return
 
             for seq, buf in self._buffer:
