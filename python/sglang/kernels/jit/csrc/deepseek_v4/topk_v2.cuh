@@ -557,7 +557,9 @@ struct TopKKernel {
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
+#ifndef USE_ROCM
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+#endif
     constexpr bool kUsePDL = true;
     const auto mode = page_table.has_value() ? TopKMode::PAGE_TABLE : TopKMode::INDICES;
     const auto dispatch = [&]<typename F>(F&& f) {
@@ -569,6 +571,7 @@ struct TopKKernel {
       }
     };
     dispatch([&]<TopKMode kMode>() {
+#ifndef USE_ROCM
       if (use_cluster) {
         if (batch_size <= kNumPersistentClusters) {
           LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
@@ -583,7 +586,10 @@ struct TopKKernel {
               .config({.use_pdl = kUsePDL})
               .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
         }
-      } else if (max_seq_len <= kReg2MaxSeqLen) {
+        return;
+      }
+#endif
+      if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, kMode>, params);
