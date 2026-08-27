@@ -18,7 +18,12 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -82,6 +87,64 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     server_args = ctx.server_args
     params = ctx.params
 
+    if get_memory().enable_unified_lmcache:
+        if get_memory().enable_lmcache:
+            raise ValueError(
+                "--enable-lmcache and --enable-unified-lmcache are mutually exclusive"
+            )
+        if ctx.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-unified-lmcache and --enable-hierarchical-cache are "
+                "mutually exclusive"
+            )
+        if ctx.server_args.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--enable-unified-lmcache and "
+                "--enable-unified-cache-external-linker are mutually exclusive"
+            )
+        if ctx.disable_radix_cache:
+            raise ValueError(
+                "--enable-unified-lmcache requires radix cache to be enabled"
+            )
+        if params.is_eagle:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support EAGLE bigram keys"
+            )
+        if params.mtp_draft_device_pools:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet transfer MTP draft KV pools"
+            )
+        if get_parallel().enable_dp_attention:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support DP attention"
+            )
+        if get_parallel().dcp_size > 1:
+            raise NotImplementedError(
+                "--enable-unified-lmcache with --dcp-size > 1 is not supported: "
+                "LMCache has no DCP-aware index translation"
+            )
+        if ctx.server_args.enable_streaming_session:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support streaming sessions"
+            )
+        if ctx.server_args.hicache_host_memory_mode == "buffer_only":
+            raise ValueError(
+                "--hicache-host-memory-mode=buffer_only is a HiCache-only mode"
+            )
+        if get_disagg().disaggregation_mode != "null":
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache currently supports colocated "
+                "prefill/decode scheduling only"
+            )
+        if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support pure-SWA models"
+            )
+        if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+            raise NotImplementedError(
+                "LMCacheUnifiedRadixCache does not yet support C128 sidecar pools"
+            )
+
     if (
         ctx.disable_radix_cache
         and get_disagg().disaggregation_decode_retraction_backup == "host_pool"
@@ -100,6 +163,27 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if get_memory().enable_unified_lmcache:
+        from sglang.srt.mem_cache.lmcache_unified_radix_cache import (
+            LMCacheUnifiedRadixCache,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+        tree_components = [ComponentType.FULL]
+        if ctx.is_hybrid_swa:
+            tree_components.append(ComponentType.SWA)
+        if ctx.is_hybrid_ssm:
+            tree_components.append(ComponentType.MAMBA)
+        params.tree_components = tuple(tree_components)
+        return LMCacheUnifiedRadixCache(
+            params,
+            model_config=ctx.model_config,
+            tp_size=ctx.tp_size,
+            tp_rank=ctx.tp_rank,
+            lmcache_config_file=get_memory().lmcache_config_file,
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
+        )
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
