@@ -139,6 +139,7 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     phase_peak_allocated_bytes: dict[str, int] = {}
     phase_active_components: dict[str, tuple[str, ...]] = {}
     phase_used_components: dict[str, tuple[str, ...]] = {}
+    phase_prefetched_components: dict[str, tuple[str, ...]] = {}
     phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
     num_inference_steps: int = 1
     total_duration_ms: float = 0.0
@@ -178,6 +179,10 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
     # Delta when the component is already present because of async prefetch,
     # but is not the semantic owner of this phase.
     present_device_delta_bytes: int = 0
+    # Delta for a prefetched component while another component owns the phase.
+    # Component offload suppresses that overlap; resident and layerwise targets
+    # use the same footprint as an ordinary active use.
+    concurrent_prefetch_device_delta_bytes: int | None = None
     inactive_device_delta_bytes: int = 0
     # None preserves the historical derived target for hand-built callers:
     # partial layerwise targets remain layerwise, every other option is
@@ -196,6 +201,11 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
         ):
             return LAYERWISE_OFFLOAD
         return RESIDENT
+
+    def concurrent_prefetch_delta(self) -> int:
+        if self.concurrent_prefetch_device_delta_bytes is not None:
+            return self.concurrent_prefetch_device_delta_bytes
+        return self.active_device_delta_bytes
 
     def option_key(self) -> str:
         target_mode = self.target_mode()
@@ -247,6 +257,7 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     estimated_peak_bytes_by_phase: dict[str, int] = {}
     active_components_by_phase: dict[str, tuple[str, ...]] = {}
     used_components_by_phase: dict[str, tuple[str, ...]] = {}
+    prefetched_components_by_phase: dict[str, tuple[str, ...]] = {}
     full_weight_transition_components_by_phase: dict[str, tuple[str, ...]] = {}
     current_device_weight_bytes_by_component: dict[str, int] = {}
     current_active_weight_bytes_by_component: dict[str, int] = {}
@@ -646,6 +657,7 @@ def estimate_workload_phase_peaks(
     dict[str, tuple[str, ...]],
     dict[str, tuple[str, ...]],
     dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
 ]:
     """Estimate each measured execution phase at the target workload.
 
@@ -665,7 +677,13 @@ def estimate_workload_phase_peaks(
             successful = covering
 
     grouped: dict[
-        tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+        tuple[
+            str,
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+        ],
         list[WarmupMemoryRecord],
     ] = {}
     for record in successful:
@@ -673,28 +691,33 @@ def estimate_workload_phase_peaks(
         for phase_name in record.phase_peak_allocated_bytes:
             active = tuple(sorted(record.phase_active_components.get(phase_name, ())))
             used = tuple(sorted(used_by_phase.get(phase_name, ())))
+            prefetched = tuple(
+                sorted(record.phase_prefetched_components.get(phase_name, ()))
+            )
             full_weight_transitions = tuple(
                 sorted(
                     record.phase_full_weight_transition_components.get(phase_name, ())
                 )
             )
             grouped.setdefault(
-                (phase_name, active, used, full_weight_transitions), []
+                (phase_name, active, used, prefetched, full_weight_transitions), []
             ).append(record)
 
     layouts_per_phase: dict[str, int] = {}
-    for phase_name, _, _, _ in grouped:
+    for phase_name, _, _, _, _ in grouped:
         layouts_per_phase[phase_name] = layouts_per_phase.get(phase_name, 0) + 1
 
     estimated_peaks: dict[str, int] = {}
     active_components: dict[str, tuple[str, ...]] = {}
     used_components: dict[str, tuple[str, ...]] = {}
+    prefetched_components: dict[str, tuple[str, ...]] = {}
     full_weight_transition_components: dict[str, tuple[str, ...]] = {}
     layout_indices: dict[str, int] = {}
     for (
         phase_name,
         active,
         used,
+        prefetched,
         full_weight_transitions,
     ), phase_records in sorted(grouped.items()):
         output_name = phase_name
@@ -727,11 +750,13 @@ def estimate_workload_phase_peaks(
         estimated_peaks[output_name] = estimate
         active_components[output_name] = active
         used_components[output_name] = used
+        prefetched_components[output_name] = prefetched
         full_weight_transition_components[output_name] = full_weight_transitions
     return (
         estimated_peaks,
         active_components,
         used_components,
+        prefetched_components,
         full_weight_transition_components,
     )
 
@@ -743,6 +768,7 @@ def measured_failed_workload_phase_peaks(
 ) -> tuple[
     int | None,
     dict[str, int],
+    dict[str, tuple[str, ...]],
     dict[str, tuple[str, ...]],
     dict[str, tuple[str, ...]],
     dict[str, tuple[str, ...]],
@@ -760,10 +786,17 @@ def measured_failed_workload_phase_peaks(
         if not record.succeeded and record.workload_units() <= target_units
     ]
     if not failed:
-        return None, {}, {}, {}, {}
+        return None, {}, {}, {}, {}, {}
 
     grouped: dict[
-        tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], int
+        tuple[
+            str,
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+        ],
+        int,
     ] = {}
     for record in failed:
         used_by_phase = record.phase_used_components or record.phase_active_components
@@ -773,24 +806,34 @@ def measured_failed_workload_phase_peaks(
         for phase_name, phase_peak in phases.items():
             active = tuple(sorted(record.phase_active_components.get(phase_name, ())))
             used = tuple(sorted(used_by_phase.get(phase_name, ())))
+            prefetched = tuple(
+                sorted(record.phase_prefetched_components.get(phase_name, ()))
+            )
             transitions = tuple(
                 sorted(
                     record.phase_full_weight_transition_components.get(phase_name, ())
                 )
             )
-            key = (phase_name, active, used, transitions)
+            key = (phase_name, active, used, prefetched, transitions)
             grouped[key] = max(grouped.get(key, 0), phase_peak)
 
     layout_counts: dict[str, int] = {}
-    for phase_name, _, _, _ in grouped:
+    for phase_name, _, _, _, _ in grouped:
         layout_counts[phase_name] = layout_counts.get(phase_name, 0) + 1
 
     peaks: dict[str, int] = {}
     active_components: dict[str, tuple[str, ...]] = {}
     used_components: dict[str, tuple[str, ...]] = {}
+    prefetched_components: dict[str, tuple[str, ...]] = {}
     transition_components: dict[str, tuple[str, ...]] = {}
     layout_indices: dict[str, int] = {}
-    for (phase_name, active, used, transitions), phase_peak in sorted(grouped.items()):
+    for (
+        phase_name,
+        active,
+        used,
+        prefetched,
+        transitions,
+    ), phase_peak in sorted(grouped.items()):
         output_name = phase_name
         if layout_counts[phase_name] > 1:
             index = layout_indices.get(phase_name, 0)
@@ -799,6 +842,7 @@ def measured_failed_workload_phase_peaks(
         peaks[output_name] = phase_peak
         active_components[output_name] = active
         used_components[output_name] = used
+        prefetched_components[output_name] = prefetched
         transition_components[output_name] = transitions
 
     return (
@@ -806,6 +850,7 @@ def measured_failed_workload_phase_peaks(
         peaks,
         active_components,
         used_components,
+        prefetched_components,
         transition_components,
     )
 
@@ -1242,6 +1287,11 @@ def _unconfigured_layerwise_targets(
                         + active_managed_bytes
                         - full_weight_bytes
                     ),
+                    concurrent_prefetch_device_delta_bytes=(
+                        unmanaged_weight_bytes
+                        + active_managed_bytes
+                        - (full_weight_bytes if current_resident else 0)
+                    ),
                     present_device_delta_bytes=(
                         unmanaged_weight_bytes
                         + active_managed_bytes
@@ -1357,6 +1407,7 @@ def collect_residency_targets(
             if (
                 isinstance(module, LayerwiseOffloadableModuleMixin)
                 and layerwise_tuning_of is not None
+                and name not in mixed_dtype_names
             ):
                 prefetch_value, _, residency_policy = layerwise_tuning_of(
                     name, module.layerwise_offload_dit_group_enabled
@@ -1405,6 +1456,9 @@ def collect_residency_targets(
                         present_device_delta_bytes=(
                             -weight_bytes if current_resident else 0
                         ),
+                        concurrent_prefetch_device_delta_bytes=(
+                            -weight_bytes if current_resident else 0
+                        ),
                         current_placement=not current_resident,
                     ),
                     ResidencyTarget(
@@ -1420,6 +1474,9 @@ def collect_residency_targets(
                             0 if current_resident else weight_bytes
                         ),
                         present_device_delta_bytes=0,
+                        concurrent_prefetch_device_delta_bytes=(
+                            0 if current_resident else weight_bytes
+                        ),
                         current_placement=current_resident,
                         target_device_weight_bytes=weight_bytes,
                     ),
@@ -1489,33 +1546,37 @@ def collect_residency_targets(
             current_pinned_layers=current_pinned_layers,
             target_pinned_layers=empty_pinned_layers,
         )
-        candidates.append(
-            ResidencyTarget(
-                component_name=name,
-                residency_mode=frontier_mode,
-                target_residency_mode=COMPONENT_OFFLOAD,
-                target_resident_weight_bytes=0,
-                h2d_bytes_per_request=max(
-                    0, maximum_transfer_work - component_transfer_work
-                ),
-                target_layerwise_resident_layers=empty_resident_layers,
-                target_layerwise_pinned_layers=empty_pinned_layers,
-                pinned_host_delta_bytes=-current_pinned_bytes,
-                host_unpin_scratch_bytes=unpin_scratch,
-                device_transition_delta_bytes=(
-                    0 if current_permanent else managed_weight_bytes
-                ),
-                active_device_delta_bytes=(
-                    full_weight_bytes - current_peak_device_bytes
-                ),
-                present_device_delta_bytes=(
-                    full_weight_bytes - current_peak_device_bytes
-                ),
-                inactive_device_delta_bytes=-current_inactive_device_bytes,
-                target_device_weight_bytes=0,
-                target_pinned_host_bytes=0,
+        if name not in mixed_dtype_names:
+            candidates.append(
+                ResidencyTarget(
+                    component_name=name,
+                    residency_mode=frontier_mode,
+                    target_residency_mode=COMPONENT_OFFLOAD,
+                    target_resident_weight_bytes=0,
+                    h2d_bytes_per_request=max(
+                        0, maximum_transfer_work - component_transfer_work
+                    ),
+                    target_layerwise_resident_layers=empty_resident_layers,
+                    target_layerwise_pinned_layers=empty_pinned_layers,
+                    pinned_host_delta_bytes=-current_pinned_bytes,
+                    host_unpin_scratch_bytes=unpin_scratch,
+                    device_transition_delta_bytes=(
+                        0 if current_permanent else managed_weight_bytes
+                    ),
+                    active_device_delta_bytes=(
+                        managed_weight_bytes - current_peak_device_bytes
+                    ),
+                    present_device_delta_bytes=(
+                        managed_weight_bytes - current_peak_device_bytes
+                    ),
+                    concurrent_prefetch_device_delta_bytes=(
+                        -unmanaged_weight_bytes - current_peak_device_bytes
+                    ),
+                    inactive_device_delta_bytes=-current_inactive_device_bytes,
+                    target_device_weight_bytes=0,
+                    target_pinned_host_bytes=0,
+                )
             )
-        )
 
         for target_resident_layers in _layerwise_resident_targets(managers):
             target_resident_bytes = sum(
@@ -1577,6 +1638,9 @@ def collect_residency_targets(
                         active_device_delta_bytes=(
                             target_peak_device_bytes - current_peak_device_bytes
                         ),
+                        concurrent_prefetch_device_delta_bytes=(
+                            target_peak_device_bytes - current_peak_device_bytes
+                        ),
                         inactive_device_delta_bytes=-current_inactive_device_bytes,
                         present_device_delta_bytes=-current_inactive_device_bytes,
                         current_placement=(
@@ -1591,11 +1655,10 @@ def collect_residency_targets(
                     )
                 )
 
-        # Layerwise stores have one fixed dtype. ResidentStrategy instead casts
-        # at every declared use, so a component with mixed use dtypes cannot be
-        # switched permanently without changing its numerical path. HostPin
-        # repacking and stage-scoped layer residency keep the layerwise strategy
-        # active and remain valid candidates.
+        # Layerwise stores have one fixed dtype, while both coarse strategies
+        # cast at every declared use. A mixed-dtype component may be tuned within
+        # its current strategy family, but crossing that boundary would change
+        # its numerical path.
         if name in mixed_dtype_names:
             continue
 
@@ -1647,6 +1710,9 @@ def collect_residency_targets(
                     ),
                     present_device_delta_bytes=(
                         managed_weight_bytes - current_inactive_device_bytes
+                    ),
+                    concurrent_prefetch_device_delta_bytes=(
+                        managed_weight_bytes - current_peak_device_bytes
                     ),
                     current_placement=(
                         current_permanent and permanent_pins == current_pinned_layers
@@ -1727,6 +1793,7 @@ def _binding_phase_constraints(
         tuple[str, ...],
         tuple[str, ...],
         tuple[str, ...],
+        tuple[str, ...],
     ]
 ]:
     """Keep the binding measured and conservative unobserved phases.
@@ -1781,6 +1848,7 @@ def _binding_phase_constraints(
             tuple[str, ...],
             tuple[str, ...],
             tuple[str, ...],
+            tuple[str, ...],
         ],
         tuple[str, int],
     ] = {}
@@ -1788,6 +1856,9 @@ def _binding_phase_constraints(
     for phase_name, phase_peak in phase_peaks.items():
         measured_components = set(report.active_components_by_phase.get(phase_name, ()))
         used = tuple(sorted(report.used_components_by_phase.get(phase_name, ())))
+        prefetched = tuple(
+            sorted(report.prefetched_components_by_phase.get(phase_name, ()))
+        )
         full_weight_transitions = tuple(
             sorted(
                 set(
@@ -1821,7 +1892,12 @@ def _binding_phase_constraints(
         # snapshot. The resulting request:untracked peak is useful as a
         # conservative baseline for the synthetic component phases below, but
         # no placement can release an empty-layout constraint directly.
-        if report.warmup_oom and not used and not full_weight_transitions:
+        if (
+            report.warmup_oom
+            and not used
+            and not prefetched
+            and not full_weight_transitions
+        ):
             continue
         present = tuple(
             sorted(
@@ -1830,14 +1906,16 @@ def _binding_phase_constraints(
             )
         )
         measured = tuple(sorted(measured_components & candidate_component_names))
-        layout = (present, measured, used, full_weight_transitions)
+        layout = (present, measured, used, prefetched, full_weight_transitions)
         current = binding.get(layout)
         if current is None or (phase_peak, phase_name) > (current[1], current[0]):
             binding[layout] = (phase_name, phase_peak)
     observed_components = {
         component_name
-        for (_, _, used, full_weight_transitions) in binding
-        for component_name in set(used) | set(full_weight_transitions)
+        for (_, _, used, prefetched, full_weight_transitions) in binding
+        for component_name in (
+            set(used) | set(prefetched) | set(full_weight_transitions)
+        )
     }
     # Separate the stable/request activation baseline from transient component
     # weights before constructing phases that a short failed probe did not
@@ -1859,7 +1937,7 @@ def _binding_phase_constraints(
                 (steady_state_components | {component_name}) & candidate_component_names
             )
         )
-        layout = (present, (), (component_name,), ())
+        layout = (present, (), (component_name,), (), ())
         synthetic = (
             (
                 f"lower-bound:{component_name}"
@@ -1883,9 +1961,10 @@ def _binding_phase_constraints(
             present,
             measured,
             used,
+            prefetched,
             full_weight_transitions,
         )
-        for (present, measured, used, full_weight_transitions), (
+        for (present, measured, used, prefetched, full_weight_transitions), (
             phase_name,
             phase_peak,
         ) in sorted(binding.items(), key=lambda item: item[1][0])
@@ -1971,6 +2050,10 @@ def _consensus_candidates(
                 ),
                 present_device_delta_bytes=max(
                     candidate.present_device_delta_bytes
+                    for candidate in rank_candidates
+                ),
+                concurrent_prefetch_device_delta_bytes=max(
+                    candidate.concurrent_prefetch_delta()
                     for candidate in rank_candidates
                 ),
                 inactive_device_delta_bytes=max(
@@ -2061,7 +2144,9 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 max(
                     (
                         phase_peak + reserves_by_rank[report.rank] - report.budget_bytes
-                        for _, phase_peak, _, _, _, _ in phase_constraints[report.rank]
+                        for _, phase_peak, _, _, _, _, _ in phase_constraints[
+                            report.rank
+                        ]
                     ),
                     default=0,
                 )
@@ -2072,7 +2157,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     current_placement_reserve_shortfall = max(0, current_placement_reserve_shortfall)
     resource_budgets: dict[str, int] = {}
     for report in reports:
-        for resource_name, phase_peak, _, _, _, _ in phase_constraints[report.rank]:
+        for resource_name, phase_peak, _, _, _, _, _ in phase_constraints[report.rank]:
             # The measured placement has already completed warmup. A negative
             # reserve headroom therefore means "do not grow this phase", not
             # that the current zero-delta placement is infeasible.
@@ -2189,6 +2274,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 present_components,
                 measured_components,
                 used_components,
+                prefetched_components,
                 full_weight_transition_components,
             ) in phase_constraints[report.rank]:
                 # ``present_components`` also includes request-end placement
@@ -2218,6 +2304,12 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                     phase_cost = rank_full_device_weight_bytes[candidate.component_name]
                 elif candidate.component_name in used_components:
                     phase_cost = rank_candidate.active_device_delta_bytes
+                elif candidate.component_name in prefetched_components:
+                    phase_cost = (
+                        rank_candidate.concurrent_prefetch_delta()
+                        if used_components
+                        else rank_candidate.active_device_delta_bytes
+                    )
                 elif candidate.component_name in present_components:
                     phase_cost = rank_candidate.present_device_delta_bytes
                 elif rank_candidate.permanent_residency:

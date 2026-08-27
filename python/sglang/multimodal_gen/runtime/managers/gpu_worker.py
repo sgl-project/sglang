@@ -86,6 +86,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     rollback_residency_changes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    get_global_component_residency_manager,
     peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
@@ -743,6 +744,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
         phase_used_components: dict[str, tuple[str, ...]] = {}
+        phase_prefetched_components: dict[str, tuple[str, ...]] = {}
         phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
         untracked_active_components: tuple[str, ...] = ()
         residency_manager = peek_global_component_residency_manager()
@@ -751,6 +753,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_allocated_peaks[phase_name] = peak.allocated_bytes
                 phase_components[phase_name] = peak.active_components
                 phase_used_components[phase_name] = peak.used_components
+                phase_prefetched_components[phase_name] = peak.prefetched_components
                 phase_full_weight_transition_components[phase_name] = (
                     peak.full_weight_transition_components
                 )
@@ -767,6 +770,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             phase_allocated_peaks["request:untracked"] = request_allocated_peak
             phase_components["request:untracked"] = untracked_active_components
             phase_used_components["request:untracked"] = ()
+            phase_prefetched_components["request:untracked"] = ()
             phase_full_weight_transition_components["request:untracked"] = ()
         metrics = req.metrics
         stage_duration_ms = {}
@@ -791,6 +795,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_peak_allocated_bytes=phase_allocated_peaks,
                 phase_active_components=phase_components,
                 phase_used_components=phase_used_components,
+                phase_prefetched_components=phase_prefetched_components,
                 phase_full_weight_transition_components=(
                     phase_full_weight_transition_components
                 ),
@@ -1609,6 +1614,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             estimated_peak_bytes_by_phase=phase_peaks,
             active_components_by_phase=phase_active,
             used_components_by_phase=phase_used,
+            prefetched_components_by_phase={},
             current_device_weight_bytes_by_component=current_device_weights,
             current_active_weight_bytes_by_component=active_weights,
             node_rank=self.server_args.node_rank,
@@ -1659,6 +1665,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 estimated_phase_peaks,
                 active_components_by_phase,
                 used_components_by_phase,
+                prefetched_components_by_phase,
                 full_weight_transition_components_by_phase,
             ) = measured_failed_workload_phase_peaks(
                 records=records,
@@ -1676,6 +1683,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 estimated_phase_peaks,
                 active_components_by_phase,
                 used_components_by_phase,
+                prefetched_components_by_phase,
                 full_weight_transition_components_by_phase,
             ) = estimate_workload_phase_peaks(
                 records=records,
@@ -1685,9 +1693,38 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         budget_bytes = self._auto_residency_budget_bytes()
         candidates = self._collect_auto_residency_targets(workload)
         if warmup_oom:
+            dit_candidate_deltas: dict[str, list[tuple[int, int, int]]] = {}
+            for candidate in candidates:
+                if not is_dit_component_name(candidate.component_name):
+                    continue
+                dit_candidate_deltas.setdefault(candidate.component_name, []).append(
+                    (
+                        round(candidate.active_device_delta_bytes / 1024**2),
+                        round(candidate.inactive_device_delta_bytes / 1024**2),
+                        round(candidate.device_transition_delta_bytes / 1024**2),
+                    )
+                )
+            candidate_summary = {
+                name: {
+                    "count": len(deltas),
+                    "active_mib": (
+                        min(d[0] for d in deltas),
+                        max(d[0] for d in deltas),
+                    ),
+                    "inactive_mib": (
+                        min(d[1] for d in deltas),
+                        max(d[1] for d in deltas),
+                    ),
+                    "transition_mib": (
+                        min(d[2] for d in deltas),
+                        max(d[2] for d in deltas),
+                    ),
+                }
+                for name, deltas in dit_candidate_deltas.items()
+            }
             logger.debug(
                 "Auto residency OOM report on rank %d: phase_peaks_gib=%s, "
-                "active=%s, used=%s, candidate_deltas_mib=%s",
+                "active=%s, used=%s, prefetched=%s, candidate_deltas_mib=%s",
                 self.rank,
                 {
                     phase: round(peak / GIB_BYTES, 3)
@@ -1695,17 +1732,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 },
                 active_components_by_phase,
                 used_components_by_phase,
-                [
-                    (
-                        candidate.option_key(),
-                        round(candidate.active_device_delta_bytes / 1024**2),
-                        round(candidate.inactive_device_delta_bytes / 1024**2),
-                        round(candidate.device_transition_delta_bytes / 1024**2),
-                        candidate.current_placement,
-                    )
-                    for candidate in candidates
-                    if is_dit_component_name(candidate.component_name)
-                ],
+                prefetched_components_by_phase,
+                candidate_summary,
             )
         (
             measured_request_duration_ns,
@@ -1765,6 +1793,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             estimated_peak_bytes_by_phase=estimated_phase_peaks,
             active_components_by_phase=active_components_by_phase,
             used_components_by_phase=used_components_by_phase,
+            prefetched_components_by_phase=prefetched_components_by_phase,
             full_weight_transition_components_by_phase=(
                 full_weight_transition_components_by_phase
             ),
@@ -1804,12 +1833,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return gathered
 
-    @staticmethod
-    def _mixed_dtype_residency_components() -> set[str]:
-        manager = peek_global_component_residency_manager()
-        if manager is None:
+    def _mixed_dtype_residency_components(self) -> set[str]:
+        if self.pipeline is None:
             return set()
-        return manager.components_with_mixed_use_dtypes()
+        manager = get_global_component_residency_manager(
+            self.pipeline, self.server_args
+        )
+        return manager.components_with_mixed_use_dtypes(
+            self.pipeline.stages, self.server_args
+        )
 
     def _auto_residency_modules(self) -> dict[str, object]:
         assert self.pipeline is not None

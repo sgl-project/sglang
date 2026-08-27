@@ -458,7 +458,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, active, used, _ = estimate_workload_phase_peaks(
+        peaks, active, used, _, _ = estimate_workload_phase_peaks(
             records=[small, large],
             target_units=832 * 480 * 81,
             component_weight_bytes={"transformer": 28 * GIB_BYTES},
@@ -492,7 +492,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_used_components={"denoise": ("transformer_2",)},
         )
 
-        peak, phases, active, used, _ = measured_failed_workload_phase_peaks(
+        peak, phases, active, used, _, _ = measured_failed_workload_phase_peaks(
             records=[first, second],
             target_units=first.workload_units(),
         )
@@ -517,7 +517,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, _, _, _ = estimate_workload_phase_peaks(
+        peaks, _, _, _, _ = estimate_workload_phase_peaks(
             records=[record],
             target_units=record.workload_units(),
             component_weight_bytes={"transformer": 10 * GIB_BYTES},
@@ -537,7 +537,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_full_weight_transition_components={"lora_switch": ("transformer",)},
         )
 
-        peaks, _, _, transitions = estimate_workload_phase_peaks(
+        peaks, _, _, _, transitions = estimate_workload_phase_peaks(
             records=[record],
             target_units=record.workload_units(),
             component_weight_bytes={"transformer": 2 * GIB_BYTES},
@@ -568,7 +568,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, active, used, _ = estimate_workload_phase_peaks(
+        peaks, active, used, _, _ = estimate_workload_phase_peaks(
             records=[small, target],
             target_units=target.workload_units(),
             component_weight_bytes={"transformer": 40 * GIB_BYTES},
@@ -600,7 +600,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("text_encoder",)},
         )
 
-        peaks, active, used, _ = estimate_workload_phase_peaks(
+        peaks, active, used, _, _ = estimate_workload_phase_peaks(
             records=[transformer_phase, encoder_phase],
             target_units=transformer_phase.workload_units(),
             component_weight_bytes={
@@ -618,6 +618,53 @@ class TestEstimateDefaultWorkloadPeak:
             "denoise:layout:1": ("transformer",),
         }
         assert used == active
+
+    def test_phase_estimation_keeps_distinct_prefetch_layouts_separate(self):
+        without_prefetch = WarmupMemoryRecord(
+            width=768,
+            height=512,
+            num_frames=25,
+            baseline_allocated_bytes=2 * GIB_BYTES,
+            peak_allocated_bytes=20 * GIB_BYTES,
+            succeeded=True,
+            phase_peak_allocated_bytes={"encode": 20 * GIB_BYTES},
+            phase_active_components={"encode": ("text_encoder",)},
+            phase_used_components={"encode": ("text_encoder",)},
+        )
+        with_prefetch = WarmupMemoryRecord(
+            width=768,
+            height=512,
+            num_frames=25,
+            baseline_allocated_bytes=2 * GIB_BYTES,
+            peak_allocated_bytes=30 * GIB_BYTES,
+            succeeded=True,
+            phase_peak_allocated_bytes={"encode": 30 * GIB_BYTES},
+            phase_active_components={
+                "encode": ("text_encoder", "transformer"),
+            },
+            phase_used_components={"encode": ("text_encoder",)},
+            phase_prefetched_components={"encode": ("transformer",)},
+        )
+
+        peaks, active, used, prefetched, _ = estimate_workload_phase_peaks(
+            records=[without_prefetch, with_prefetch],
+            target_units=without_prefetch.workload_units(),
+            component_weight_bytes={
+                "transformer": 10 * GIB_BYTES,
+                "text_encoder": 8 * GIB_BYTES,
+            },
+        )
+
+        assert peaks == {
+            "encode:layout:0": 20 * GIB_BYTES,
+            "encode:layout:1": 30 * GIB_BYTES,
+        }
+        assert set(active.values()) == {
+            ("text_encoder",),
+            ("text_encoder", "transformer"),
+        }
+        assert set(used.values()) == {("text_encoder",)}
+        assert set(prefetched.values()) == {(), ("transformer",)}
 
 
 def _candidate(
@@ -653,6 +700,7 @@ def _report(
     phase_peaks_gib: dict[str, float] | None = None,
     phase_components: dict[str, tuple[str, ...]] | None = None,
     phase_present_components: dict[str, tuple[str, ...]] | None = None,
+    phase_prefetched_components: dict[str, tuple[str, ...]] | None = None,
     phase_full_weight_transition_components: dict[str, tuple[str, ...]] | None = None,
     component_weight_gib: dict[str, int] | None = None,
     component_active_weight_gib: dict[str, int] | None = None,
@@ -688,6 +736,7 @@ def _report(
             else phase_components or {}
         ),
         used_components_by_phase=phase_components or {},
+        prefetched_components_by_phase=phase_prefetched_components or {},
         full_weight_transition_components_by_phase=(
             phase_full_weight_transition_components or {}
         ),
@@ -1246,6 +1295,9 @@ class TestPlanAutoResidency:
                         "text_and_prefetch": ("text_encoder", "transformer"),
                         "denoise": ("transformer",),
                     },
+                    phase_prefetched_components={
+                        "text_and_prefetch": ("transformer",),
+                    },
                     candidates=[offload, resident],
                 )
             ]
@@ -1253,6 +1305,56 @@ class TestPlanAutoResidency:
 
         assert [candidate.option_key() for candidate in plan.changes] == [
             "transformer:resident"
+        ]
+
+    def test_component_offload_can_release_an_overlapped_layerwise_prefetch(self):
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            current_placement=True,
+        )
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            concurrent_prefetch_device_delta_bytes=-10 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=18,
+                    estimated_gib=18,
+                    warmup_oom=True,
+                    candidates=[layerwise, component_offload],
+                    phase_peaks_gib={"encode_prefetch": 18},
+                    phase_components={"encode_prefetch": ("text_encoder",)},
+                    phase_present_components={
+                        "encode_prefetch": ("text_encoder", "transformer"),
+                    },
+                    phase_prefetched_components={
+                        "encode_prefetch": ("transformer",),
+                    },
+                    component_active_weight_gib={
+                        "text_encoder": 8,
+                        "transformer": 10,
+                    },
+                )
+            ]
+        )
+
+        assert plan.skip_reason is None
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            COMPONENT_OFFLOAD
         ]
 
     def test_request_end_residency_is_carried_into_the_next_request(self):
@@ -1665,11 +1767,14 @@ class TestPlanAutoResidency:
                         "prefetch:transformer": 11.75,
                     },
                     phase_components={
-                        "prefetch:transformer": ("transformer",),
+                        "prefetch:transformer": (),
                     },
                     phase_present_components={
                         "setup": ("vae",),
                         "prefetch:transformer": ("transformer", "vae"),
+                    },
+                    phase_prefetched_components={
+                        "prefetch:transformer": ("transformer",),
                     },
                     component_weight_gib={"vae": 1},
                     component_active_weight_gib={"transformer": 11, "vae": 1},
@@ -2554,7 +2659,32 @@ class TestCollectResidencyTargets:
             mixed_dtype_components={"vae"},
         )
 
-        assert not any(candidate.permanent_residency for candidate in candidates)
+        assert candidates
+        assert {candidate.target_mode() for candidate in candidates} == {
+            LAYERWISE_OFFLOAD
+        }
+
+    def test_mixed_dtype_coarse_component_does_not_add_virtual_layerwise(self):
+        module = _FakeLazyLayerwiseDit()
+
+        candidates = collect_residency_targets(
+            modules={"vae": module},
+            residency_mode_of=self._modes({"vae": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            mixed_dtype_components={"vae"},
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+            ),
+        )
+
+        assert {candidate.target_mode() for candidate in candidates} == {
+            COMPONENT_OFFLOAD,
+            RESIDENT,
+        }
 
     def test_non_dit_layerwise_frontier_includes_partial_residency(self):
         manager = _FakeLayerwiseManager(

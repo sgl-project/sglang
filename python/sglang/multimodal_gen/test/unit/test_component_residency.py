@@ -233,6 +233,24 @@ def test_reports_components_with_mixed_use_dtypes():
     assert manager.components_with_mixed_use_dtypes() == {"vae"}
 
 
+def test_reports_mixed_use_dtypes_before_first_request():
+    encode = _Stage(ComponentUse("encode", "vae", target_dtype=torch.float32))
+    decode = _Stage(ComponentUse("decode", "vae", target_dtype=torch.bfloat16))
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"encode": encode, "decode": decode},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    assert manager.components_with_mixed_use_dtypes([encode, decode], server_args) == {
+        "vae"
+    }
+    assert manager._ordered_uses == ()
+
+
 def test_warmup_records_use_and_transition_peaks(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,
@@ -312,7 +330,7 @@ def test_failed_warmup_phase_survives_cleanup(monkeypatch):
 
     peaks = manager.take_warmup_phase_peaks()
     assert peaks["0:denoise:prefetch:transformer"] == WarmupPhasePeak(
-        ("transformer",), 7, used_components=("transformer",)
+        ("transformer",), 7, prefetched_components=("transformer",)
     )
     assert peaks["request:cleanup"] == WarmupPhasePeak((), 2)
 
@@ -437,7 +455,12 @@ def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
 
     assert manager._warmup_phase_peaks[
         "0:encode:prefetch:transformer"
-    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    ] == WarmupPhasePeak(
+        ("text_encoder", "transformer"),
+        7,
+        used_components=("text_encoder",),
+        prefetched_components=("transformer",),
+    )
     assert manager._warmup_phase_peaks["0:encode:between"] == WarmupPhasePeak((), 7)
 
 
