@@ -285,7 +285,7 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
 def _jit_mtp_demand_writeback_module() -> Module:
     return load_jit(
         "mtp_demand_writeback",
-        cuda_files=["hisparse.cuh"],
+        cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             ("backup_mtp_demand_window_mla", "backup_mtp_demand_window_mla"),
         ],
