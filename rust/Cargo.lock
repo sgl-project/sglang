@@ -3670,6 +3670,7 @@ dependencies = [
  "protoc-bin-vendored",
  "pyo3",
  "serde_json",
+ "sglang-renderer",
  "tokenizers",
  "tokio",
  "tokio-stream",

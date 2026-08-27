@@ -29,6 +29,7 @@ tokio-stream = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+sglang-renderer = { path = "../sglang-renderer" }
 
 prost = "0.13"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

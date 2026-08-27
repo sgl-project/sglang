@@ -1,0 +1,72 @@
+syntax = "proto3";
+package sglang.renderer.v1;
+
+// Contract for a future gRPC adapter over sglang-renderer. The prototype
+// generates these bindings and tests the DTO mapping, but does not register
+// this service in the inference gRPC runtime.
+service RendererService {
+  rpc RenderChat(OpenAIRequest) returns (PreparedGenerateRequest);
+  rpc RenderCompletions(OpenAIRequest) returns (PreparedGenerateRequests);
+}
+
+message OpenAIRequest {
+  bytes json_body = 1;
+  map<string, string> trace_headers = 2;
+}
+
+message PreparedGenerateRequests {
+  repeated PreparedGenerateRequest requests = 1;
+}
+
+message OptionalInt32List {
+  repeated int32 values = 1;
+}
+
+message OptionalInt64List {
+  repeated int64 values = 1;
+}
+
+message OptionalLogitBias {
+  map<string, double> values = 1;
+}
+
+message PreparedGenerateRequest {
+  string rid = 1;
+  repeated int32 input_ids = 2;
+  PreparedSamplingParams sampling_params = 3;
+  bool stream = 4;
+  bool return_logprob = 5;
+  int64 logprob_start_len = 6;
+  int64 top_logprobs_num = 7;
+  OptionalInt32List token_ids_logprob = 8;
+  bool return_hidden_states = 9;
+  optional bool return_text_in_logprobs = 10;
+}
+
+message PreparedSamplingParams {
+  optional int64 max_new_tokens = 1;
+  repeated string stop = 2;
+  OptionalInt64List stop_token_ids = 3;
+  repeated string stop_regex = 4;
+  double temperature = 5;
+  double top_p = 6;
+  int64 top_k = 7;
+  double min_p = 8;
+  double frequency_penalty = 9;
+  double presence_penalty = 10;
+  double repetition_penalty = 11;
+  int64 min_new_tokens = 12;
+  int64 n = 13;
+  optional string json_schema = 14;
+  optional string regex = 15;
+  optional string ebnf = 16;
+  optional string structural_tag = 17;
+  bool ignore_eos = 18;
+  bool skip_special_tokens = 19;
+  bool spaces_between_special_tokens = 20;
+  bool no_stop_trim = 21;
+  optional int64 stream_interval = 22;
+  OptionalLogitBias logit_bias = 23;
+  optional int64 sampling_seed = 24;
+  optional bytes custom_params_json = 25;
+}
