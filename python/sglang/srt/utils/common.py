@@ -2227,8 +2227,9 @@ def kill_process_tree(
     `terminate_timeout` (seconds) sends SIGTERM to the parent first and gives it
     that long to exit on its own, so a server releases its CUDA context and
     pinned host memory in userspace instead of leaving the driver to reclaim
-    them after SIGKILL. It reaps the parent, so a `subprocess.Popen` handle on
-    the same process reports a meaningless returncode afterwards.
+    them after SIGKILL. A graceful exit reaps the parent here, so a
+    `subprocess.Popen` handle on the same process later reports returncode 0 --
+    a clean exit it never observed -- rather than the signal that landed.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
     raises `RuntimeError` on timeout; `None` is fire-and-forget. The

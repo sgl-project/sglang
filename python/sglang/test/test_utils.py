@@ -841,8 +841,9 @@ def terminate_and_kill_process_tree(
         terminate_timeout=terminate_timeout,
     )
     # The kill already reaped the child, so the handle never learns it exited
-    # and warns "subprocess N is still running" at GC. Poll to settle it; the
-    # resulting returncode is meaningless because we did not do the reaping.
+    # and warns "subprocess N is still running" at GC. Poll to settle it. Never
+    # assert on the resulting returncode: when the graceful wait did the reaping
+    # this poll hits ECHILD and records 0, a clean exit that never happened.
     process.poll()
 
 

@@ -6,7 +6,7 @@ import psutil
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import terminate_and_kill_process_tree
+from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
@@ -27,7 +27,7 @@ STUBBORN_PARENT_SCRIPT = (
 CHILD_SCRIPT = "import time; time.sleep(60)"
 
 
-class TestTerminateAndKillProcessTree(unittest.TestCase):
+class TestTerminateAndKillProcessTree(CustomTestCase):
     def _launch(self, parent_script):
         """A parent holding one child, plus psutil handles for both."""
         process = subprocess.Popen(
@@ -64,15 +64,19 @@ class TestTerminateAndKillProcessTree(unittest.TestCase):
         Once the parent PID is gone its children are unwalkable, so a cleanup
         that only discovers the tree after termination silently leaks them.
         """
-        process, _, child = self._launch(PARENT_SCRIPT)
+        process, parent, child = self._launch(PARENT_SCRIPT)
 
         terminate_and_kill_process_tree(process, terminate_timeout=5, wait_timeout=5)
 
-        self.assertIsNotNone(process.poll(), "parent survived the cleanup")
+        self._assert_gone(parent, "parent")
         self._assert_gone(child, "child")
 
     def test_reaps_tree_when_parent_ignores_sigterm(self):
-        """A parent that outlives SIGTERM still gets the whole tree SIGKILLed."""
+        """A parent that outlives SIGTERM still gets the whole tree SIGKILLed.
+
+        The parent stays walkable here, so this path holds either side of the
+        snapshot move; it pins the SIGKILL fallback against a later regression.
+        """
         process, parent, child = self._launch(STUBBORN_PARENT_SCRIPT)
 
         terminate_and_kill_process_tree(process, terminate_timeout=2, wait_timeout=5)
