@@ -1640,6 +1640,144 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
 
+class TestMultiLayerEagleArgs(CustomTestCase):
+    def _make_args(self, architecture: str, **overrides):
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="EAGLE",
+            enable_multi_layer_eagle=True,
+        )
+        args.device = "cuda"
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_llama_autofill_is_rejected_before_worker_startup(self):
+        args = self._make_args("LlamaForCausalLM")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "LlamaForCausalLM.*not supported",
+        ):
+            handle_speculative_decoding(args)
+
+        self.assertIsNone(resolution_result(args, "speculative_num_steps"))
+        self.assertIsNone(resolution_result(args, "speculative_eagle_topk"))
+        self.assertIsNone(resolution_result(args, "speculative_num_draft_tokens"))
+
+    def test_llama_explicit_chain_is_rejected_before_model_loading(self):
+        args = self._make_args(
+            "LlamaForCausalLM",
+            speculative_num_steps=5,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=6,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "LlamaForCausalLM.*not supported",
+        ):
+            handle_speculative_decoding(args)
+
+    def test_bundled_multi_layer_mtp_architectures_remain_supported(self):
+        supported_architectures = (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+            "Step3p5ForCausalLM",
+            "Step3p7ForConditionalGeneration",
+            "InklingForConditionalGeneration",
+        )
+        for architecture in supported_architectures:
+            with self.subTest(architecture=architecture):
+                args = self._make_args(
+                    architecture,
+                    speculative_num_steps=3,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                )
+
+                handle_speculative_decoding(args)
+
+    def test_separate_draft_model_remains_supported_without_multi_layer_mode(self):
+        args = self._make_args(
+            "LlamaForCausalLM",
+            enable_multi_layer_eagle=False,
+            page_size=1,
+            speculative_draft_model_path="dummy-draft",
+        )
+
+        with patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        ):
+            handle_speculative_decoding(args)
+
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 5)
+        self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 4)
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 8)
+
+    def test_multi_layer_mode_rejects_separate_draft_model(self):
+        args = self._make_args(
+            "Step3p5ForCausalLM",
+            speculative_draft_model_path="dummy-draft",
+        )
+
+        with (
+            patch(
+                "sglang.srt.utils.hf_transformers_utils.get_config",
+                return_value=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            ),
+            self.assertRaisesRegex(ValueError, "cannot be combined"),
+        ):
+            handle_speculative_decoding(args)
+
+    def test_multi_layer_mode_rejects_transformers_implementation(self):
+        args = self._make_args(
+            "Step3p5ForCausalLM",
+            model_impl="transformers",
+        )
+
+        with self.assertRaisesRegex(ValueError, "native SGLang"):
+            handle_speculative_decoding(args)
+
+    def test_multi_layer_mode_rejects_eagle3(self):
+        args = self._make_args(
+            "Step3p5ForCausalLM",
+            speculative_algorithm="EAGLE3",
+        )
+
+        with self.assertRaisesRegex(ValueError, "not EAGLE3"):
+            handle_speculative_decoding(args)
+
+    def test_nextn_alias_uses_supported_multi_layer_eagle_path(self):
+        args = self._make_args(
+            "Step3p5ForCausalLM",
+            speculative_algorithm="NEXTN",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+        )
+
+        handle_speculative_decoding(args)
+
+        self.assertEqual(resolution_result(args, "speculative_algorithm"), "EAGLE")
+
+    def test_flag_does_not_restrict_standalone_algorithm(self):
+        args = self._make_args(
+            "LlamaForCausalLM",
+            speculative_algorithm="STANDALONE",
+        )
+
+        handle_speculative_decoding(args)
+
+        self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
+        self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 1)
+        self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
+
+
 class TestWaterfillArgs(CustomTestCase):
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(

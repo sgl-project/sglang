@@ -707,6 +707,36 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]
+    if resolved_view(server_args).enable_multi_layer_eagle:
+        if cfg.speculative_algorithm == "EAGLE3":
+            raise ValueError(
+                "--enable-multi-layer-eagle only supports --speculative-algorithm "
+                "EAGLE (or its NEXTN alias), not EAGLE3."
+            )
+        if cfg.speculative_algorithm == "EAGLE":
+            from sglang.srt.configs.model_config import MULTI_LAYER_EAGLE_MODEL_ARCHS
+
+            if cfg.speculative_draft_model_path is not None:
+                raise ValueError(
+                    "--enable-multi-layer-eagle uses MTP weights bundled in "
+                    "--model-path and cannot be combined with "
+                    "--speculative-draft-model-path. For a separate EAGLE draft "
+                    "model, remove --enable-multi-layer-eagle."
+                )
+            if cfg.model_impl not in ("auto", "sglang"):
+                raise ValueError(
+                    "--enable-multi-layer-eagle requires the native SGLang model "
+                    f"implementation, but --model-impl is {cfg.model_impl!r}."
+                )
+            if model_arch not in MULTI_LAYER_EAGLE_MODEL_ARCHS:
+                raise ValueError(
+                    "--enable-multi-layer-eagle requires a model with bundled "
+                    "multi-layer MTP weights, but model architecture "
+                    f"{model_arch!r} is not supported. Supported architectures: "
+                    f"{', '.join(MULTI_LAYER_EAGLE_MODEL_ARCHS)}. For a separate "
+                    "EAGLE draft model, remove --enable-multi-layer-eagle and set "
+                    "--speculative-draft-model-path."
+                )
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

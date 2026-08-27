@@ -49,6 +49,15 @@ MIMO_V2_MODEL_ARCHS = (
 )
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
+# Native target architectures with bundled multi-layer MTP support. Their
+# draft remaps implement the per-head construction and weight-selection contract.
+MULTI_LAYER_EAGLE_MODEL_ARCHS = (
+    *MIMO_V2_MODEL_ARCHS,
+    "Step3p5ForCausalLM",
+    "Step3p7ForConditionalGeneration",
+    "InklingForConditionalGeneration",
+)
+
 SWA_SINK_ARCHS = frozenset(
     {
         "GptOssForCausalLM",

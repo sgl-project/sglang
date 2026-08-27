@@ -2342,7 +2342,11 @@ class ServerArgs:
     enable_multi_layer_eagle: A[
         bool,
         Arg(
-            help="Enable multi-layer Eagle speculative decoding.",
+            help=(
+                "Enable multi-layer EAGLE for supported native models whose "
+                "target checkpoint bundles multi-layer MTP weights. This mode "
+                "cannot use a separate speculative draft model."
+            ),
             resolvable=True,
         ),
         NS("spec"),
