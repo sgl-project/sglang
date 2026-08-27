@@ -9,6 +9,7 @@ export const LTX25Deployment = () => {
         { id: 'sp2', label: '2 GPUs', subtitle: 'sequence parallel', default: false },
         { id: 'tp2', label: '2 GPUs', subtitle: 'tensor parallel', default: false },
         { id: 'cfg2', label: '2 GPUs', subtitle: 'CFG parallel', default: false },
+        { id: 'xeon', label: 'XEON', subtitle: 'CPU mode', default: false },
       ],
     },
     precision: {
@@ -100,6 +101,9 @@ export const LTX25Deployment = () => {
   const generateCommand = () => {
     let command = `sglang serve \\\n  --model-path ${REPO_ID}`;
     command += ` \\\n  --pipeline-class-name ${PIPELINE_CLASSES[values.pipeline]}`;
+    if (values.hardware === 'xeon') {
+      command = `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu ` + command;
+    }
     if (values.weights === 'dev') {
       command += ` \\\n  --model-variant dev`;
     }
