@@ -579,11 +579,11 @@ class DsparkVerifyEpilogue:
         self._main_proj_stream = (
             torch.cuda.Stream() if self._early_main_proj else None
         )
-        # Graph replay updates the same captured aux-hidden storage without
-        # rerunning the Python pre-logits hook.  Keep each graph's projected
-        # output keyed by that storage instead of consuming a one-shot Python
-        # reference during capture.
-        self._captured_main_proj: dict[int, torch.Tensor] = {}
+        # Graph replay can expose the captured aux hidden through a different
+        # Python tensor/storage without rerunning the pre-logits hook.  Static
+        # graph batches have distinct compact shapes, so retain the projected
+        # output by shape rather than by the transient data_ptr.
+        self._captured_main_proj: dict[tuple[int, ...], torch.Tensor] = {}
 
     def install_pre_logits_hook(self, model) -> None:
         setter = getattr(model, "set_dspark_pre_logits_hook", None)
@@ -593,7 +593,7 @@ class DsparkVerifyEpilogue:
     def pre_logits_capture_hook(self, compact_hidden: torch.Tensor) -> None:
         projected = self._start_main_proj(compact_hidden)
         if projected is not None:
-            self._captured_main_proj[compact_hidden.data_ptr()] = projected
+            self._captured_main_proj[tuple(compact_hidden.shape)] = projected
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -675,7 +675,7 @@ class DsparkVerifyEpilogue:
     ) -> None:
         self.strided_logits = self._ensure_out(self.strided_logits, compact_logits)
         verify_lens = self.verify_lens_buf[:bs]
-        projected_hidden = self._captured_main_proj.get(compact_hidden.data_ptr())
+        projected_hidden = self._captured_main_proj.get(tuple(compact_hidden.shape))
         if projected_hidden is None:
             projected_hidden = self._start_main_proj(compact_hidden)
         self._scatter_logits(compact_logits, verify_lens, bs)
