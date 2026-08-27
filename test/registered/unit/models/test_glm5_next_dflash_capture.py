@@ -7,6 +7,9 @@ from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def test_glm5_next_dflash_contracts_mhc_hidden_state():
