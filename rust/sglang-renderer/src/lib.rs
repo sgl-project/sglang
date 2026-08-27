@@ -8,9 +8,11 @@
 mod chat;
 mod config;
 mod error;
+#[cfg(any(feature = "http", test))]
 mod generation;
 #[cfg(feature = "http")]
 mod http;
+#[cfg(any(feature = "http", test))]
 mod output;
 mod protocol;
 mod request;
@@ -22,15 +24,19 @@ mod types;
 
 mod regex;
 
-pub(crate) use chat::{ChatPreprocessor, ChatRequest, LoweredChat};
+#[cfg(any(feature = "http", test))]
+pub(crate) use chat::LoweredChat;
+pub(crate) use chat::{ChatPreprocessor, ChatRequest};
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
+#[cfg(any(feature = "http", test))]
 pub(crate) use generation::{
     FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
     GenerationOutputExtras, GenerationStream, MatchedStop,
 };
 #[cfg(feature = "http")]
 pub use http::{RendererRuntimeConfig, serve};
+#[cfg(any(feature = "http", test))]
 pub(crate) use output::{
     ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
     ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
@@ -40,6 +46,7 @@ pub use request::{
     TextRequest, TokenIdsRequest,
 };
 pub use sampling::SamplingParams;
+#[cfg(any(feature = "http", test))]
 pub(crate) use sampling::SamplingParamsOverrides;
 pub use service::{RendererService, TokenizationBackend};
 pub(crate) use template::ChatFormatter;

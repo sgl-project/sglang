@@ -9,6 +9,8 @@ use futures::future::{BoxFuture, try_join_all};
 #[cfg(any(feature = "http", test))]
 use crate::GenerateRequestMetadata;
 #[cfg(any(feature = "http", test))]
+use crate::LoweredChat;
+#[cfg(any(feature = "http", test))]
 use crate::protocol::openai::lower_chat_request_with_template_args;
 use crate::protocol::openai::{
     lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
@@ -19,8 +21,8 @@ use crate::tokenizer::{
     validate_token_ids_request,
 };
 use crate::{
-    ChatFormatter, ChatPreprocessor, ChatRequest, GenerateRequest, LoweredChat, RendererConfig,
-    RendererError, TextRequest, TokenIdsRequest,
+    ChatFormatter, ChatPreprocessor, ChatRequest, GenerateRequest, RendererConfig, RendererError,
+    TextRequest, TokenIdsRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one model-facing text
@@ -230,6 +232,7 @@ impl RendererService {
         Ok(self.backend.tokenize(request).await?.input_ids)
     }
 
+    #[cfg(any(feature = "http", test))]
     pub(crate) async fn tokenize_chat(
         &self,
         request: ChatRequest,
