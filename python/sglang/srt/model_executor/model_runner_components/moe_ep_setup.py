@@ -13,6 +13,7 @@ from sglang.srt.eplb.lplb_solver import (
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -54,7 +55,7 @@ def prepare_moe_topk(
         # Redundant experts therefore need to be included in the per-rank
         # expert count used for Waterfill's shared-expert slot remapping.
         num_physical_routed_experts = (
-            num_routed_experts + server_args.ep_num_redundant_experts
+            num_routed_experts + get_exec().moe.ep_num_redundant_experts
         )
         if isinstance(module, TopK):
             routed_scaling_factor = module.topk_config.routed_scaling_factor
