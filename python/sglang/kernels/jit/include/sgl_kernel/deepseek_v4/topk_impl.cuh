@@ -24,15 +24,20 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <cfloat>
-#include <cooperative_groups.h>
 #include <cstdint>
 #include <limits>
+
+#ifndef USE_ROCM
+#include <cooperative_groups.h>
+#endif
 
 namespace sglang {
 
 namespace device::topk {
 
+#ifndef USE_ROCM
 namespace cg = cooperative_groups;
+#endif
 
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
