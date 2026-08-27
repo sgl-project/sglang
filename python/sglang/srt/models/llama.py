@@ -416,7 +416,7 @@ class LlamaModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
         self.flashinfer_agmm_true_sp = None
-        if get_parallel().enable_flashinfer_agmm_true_sp:
+        if get_parallel().config.enable_flashinfer_agmm_true_sp:
             from sglang.srt.models.llama_flashinfer_agmm import (
                 LlamaFlashInferAgmmTrueSP,
             )

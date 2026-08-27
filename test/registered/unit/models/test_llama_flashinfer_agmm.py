@@ -17,6 +17,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "python/sglang/srt/models/llama_flashinfer_agmm.py"
+LLAMA_SOURCE = ROOT / "python/sglang/srt/models/llama.py"
 
 
 def load_module():
@@ -189,6 +190,15 @@ class EligibilityTests(unittest.TestCase):
 
 
 class ServerArgumentTests(unittest.TestCase):
+    def test_llama_reads_true_sp_flag_from_parallel_config(self):
+        source = LLAMA_SOURCE.read_text()
+        self.assertIn(
+            "get_parallel().config.enable_flashinfer_agmm_true_sp", source
+        )
+        self.assertNotIn(
+            "get_parallel().enable_flashinfer_agmm_true_sp", source
+        )
+
     def test_true_sp_flag_parses_from_cli_and_yaml(self):
         from sglang.srt.server_args import ServerArgs
         from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
