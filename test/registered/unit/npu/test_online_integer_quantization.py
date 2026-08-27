@@ -31,9 +31,7 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
         "sglang.srt.hardware_backend.npu.quantization.online_quantization.get_server_args"
     )
     def test_w4a4_mode_is_mixed_dense_and_moe(self, get_server_args):
-        get_server_args.return_value = SimpleNamespace(
-            online_quantization="w4a4_int"
-        )
+        get_server_args.return_value = SimpleNamespace(online_quantization="w4a4_int")
 
         for projection in (
             "qkv_proj",
@@ -60,9 +58,7 @@ class TestOnlineIntegerQuantizationSelection(CustomTestCase):
     )
     @patch("sglang.srt.layers.linear.current_platform.is_npu")
     def test_linear_selection_uses_live_platform(self, is_npu, get_server_args):
-        get_server_args.return_value = SimpleNamespace(
-            online_quantization="w8a8_int"
-        )
+        get_server_args.return_value = SimpleNamespace(online_quantization="w8a8_int")
         is_npu.return_value = True
         npu_layer = LinearBase(2, 2, prefix="model.layers.0.qkv_proj")
         self.assertIsInstance(npu_layer.quant_method, NPUOnlineW8A8Int8LinearMethod)

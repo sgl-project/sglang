@@ -950,9 +950,10 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
                 "Ascend online integer MoE hot reload must use the registered "
                 "completion-tracked weight loader."
             )
-        if hasattr(layer, f"{weight_name}_scale") and loader.state[
-            weight_prefix
-        ] in {"converted", "ready_reload"}:
+        if hasattr(layer, f"{weight_name}_scale") and loader.state[weight_prefix] in {
+            "converted",
+            "ready_reload",
+        }:
             self._configure_online_integer(layer, weight_prefix, weight_name, spec)
             loader.state[weight_prefix] = "ready_reload"
             return

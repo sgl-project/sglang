@@ -39,14 +39,13 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
         QuantizationConfig,
-        QuantizeMethodBase,
     )
 
 _is_hip = is_hip()

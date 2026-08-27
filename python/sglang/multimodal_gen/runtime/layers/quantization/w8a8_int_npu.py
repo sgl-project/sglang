@@ -55,7 +55,7 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "NPUOnlineW8A8DiffusionConfig":
+    def from_config(cls, config: dict[str, Any]) -> NPUOnlineW8A8DiffusionConfig:
         return cls(
             ignored_layers=cls.get_from_keys_or(config, ["ignored_layers"], None)
         )
@@ -118,9 +118,7 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
             )
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        quantized_weight, weight_scale = npu_dynamic_quantize_weight(
-            weight, self.spec
-        )
+        quantized_weight, weight_scale = npu_dynamic_quantize_weight(weight, self.spec)
         weight = Parameter(
             npu_format_online_dense_weight(quantized_weight, self.spec),
             requires_grad=False,

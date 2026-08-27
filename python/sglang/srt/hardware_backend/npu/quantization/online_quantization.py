@@ -102,9 +102,7 @@ def _convert_packed_int4_weight(weight: torch.Tensor) -> torch.Tensor:
         for row_offset, source_shift in enumerate(range(0, 32, 4)):
             values = ((matrix >> source_shift) & 0xF).transpose(0, 1)
             unpacked[row_offset::8] = torch.where(values < 8, values, values - 16)
-        converted[matrix_index] = torch.ops.npu.npu_convert_weight_to_int4pack(
-            unpacked
-        )
+        converted[matrix_index] = torch.ops.npu.npu_convert_weight_to_int4pack(unpacked)
 
     return converted.reshape(*weight.shape[:-2], input_size, output_size // 8)
 
@@ -130,8 +128,7 @@ def npu_format_online_dense_weight(
 def _encode_online_int4_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype != torch.float32:
         raise TypeError(
-            "Ascend INT4 matmul requires FP32 source scales, got "
-            f"{scale.dtype}."
+            "Ascend INT4 matmul requires FP32 source scales, got " f"{scale.dtype}."
         )
 
     # QuantMatmul and GMM consume each FP32 bit pattern in the low half of an
@@ -221,9 +218,13 @@ class NPUOnlineDenseWeightLoader:
                 self.loaded_numel = 0
                 self.state = "loading"
             current = self.layer.weight
-            if current.device.type == "meta" or was_ready_reload or (
-                tuple(current.shape) != self.source_shape
-                or current.dtype != self.params_dtype
+            if (
+                current.device.type == "meta"
+                or was_ready_reload
+                or (
+                    tuple(current.shape) != self.source_shape
+                    or current.dtype != self.params_dtype
+                )
             ):
                 current = self._materialize_source()
             param = current
@@ -285,9 +286,7 @@ class NPUOnlineMoEWeightLoader:
         self.source_shapes = {}
         self.target_numel = {}
 
-    def register_sources(
-        self, w13_weight: Parameter, w2_weight: Parameter
-    ) -> None:
+    def register_sources(self, w13_weight: Parameter, w2_weight: Parameter) -> None:
         self.source_shapes = {
             "w13": tuple(w13_weight.shape),
             "w2": tuple(w2_weight.shape),
