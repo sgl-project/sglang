@@ -61,6 +61,37 @@ class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):
             _reshape_mxfp4_scale_for_npu(torch.zeros(1, 2, 3, dtype=torch.uint8))
 
 
+class TestMxfp4ScaleWeightLoader(unittest.TestCase):
+    def test_reinterprets_e8m0_scale_as_raw_uint8(self):
+        loaded = []
+
+        def weight_loader(param, loaded_weight, *args, **kwargs):
+            loaded.append(loaded_weight.clone())
+
+        layer = torch.nn.Module()
+        method = NPUW4A4Fp4MoEMethod(fp8_method=MagicMock(), prefix="test")
+        method.create_weights(
+            layer,
+            num_experts=1,
+            hidden_size=64,
+            intermediate_size_per_partition=64,
+            params_dtype=torch.bfloat16,
+            weight_loader=weight_loader,
+        )
+        checkpoint_scale = torch.tensor([0.5, 0.25, 0.125], dtype=torch.float8_e8m0fnu)
+
+        layer.w13_weight_scale_inv.weight_loader(
+            layer.w13_weight_scale_inv,
+            checkpoint_scale,
+            "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+            "w1",
+            0,
+        )
+
+        self.assertEqual(loaded[0].dtype, torch.uint8)
+        self.assertTrue(torch.equal(loaded[0], checkpoint_scale.view(torch.uint8)))
+
+
 class TestPairPackMxfpActScale(unittest.TestCase):
     def test_packs_as_view(self):
         # The GMM expects a pair-packed *view* of the per-token scale, not a copy;

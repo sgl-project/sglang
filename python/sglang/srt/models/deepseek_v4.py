@@ -3796,21 +3796,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 skip_unmaterialized_expert_param = True
                                 continue
                             param = params_dict[resolved_name]
-                            if (
-                                _is_npu
-                                and getattr(self.quant_config, "is_fp4_experts", False)
-                                and resolved_name.endswith(
-                                    (".w13_weight_scale_inv", ".w2_weight_scale_inv")
-                                )
-                                and param.data.dtype == torch.uint8
-                                and loaded_weight.dtype == torch.float8_e8m0fnu
-                            ):
-                                # FP4 expert scales ship as E8M0 (float8_e8m0fnu)
-                                # but the param is uint8 and the GMM consumes the
-                                # raw exponent byte. weight_loader's copy_ would
-                                # cast numerically (2^-k -> 0) and silently zero
-                                # every routed expert, so reinterpret the bits.
-                                loaded_weight = loaded_weight.view(torch.uint8)
                             weight_loader = param.weight_loader
                             maybe_executor_submit(
                                 executor=executor,
