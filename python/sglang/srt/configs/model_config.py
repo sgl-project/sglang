@@ -58,6 +58,12 @@ SWA_SINK_ARCHS = frozenset(
 )
 
 
+def _quant_config_to_dict(quant_config):
+    if quant_config is not None and not isinstance(quant_config, dict):
+        return quant_config.to_dict()
+    return quant_config
+
+
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
     if layout is None:
@@ -391,11 +397,20 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
-        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
-        # FP8 expert tensor layout.
-        self.is_fp4_experts: bool = False
-        if is_deepseek_v4(self.hf_config):
+        # Mixed FP8/MXFP4 ckpts mark mxfp4 routed experts via this key.
+        quantization_config = (
+            _quant_config_to_dict(getattr(self.hf_config, "quantization_config", None))
+            or {}
+        )
+        routed_experts_quant_method = quantization_config.get(
+            "routed_experts_quant_method"
+        )
+        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
+        if self.is_fp4_experts:
+            logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
+
+        # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
+        if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
@@ -426,9 +441,9 @@ class ModelConfig:
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
-        hybrid_quant_cfg = getattr(self.hf_config, "quantization_config", None)
-        if hybrid_quant_cfg is not None and not isinstance(hybrid_quant_cfg, dict):
-            hybrid_quant_cfg = hybrid_quant_cfg.to_dict()
+        hybrid_quant_cfg = _quant_config_to_dict(
+            getattr(self.hf_config, "quantization_config", None)
+        )
         if (
             hybrid_quant_cfg is not None
             and str(hybrid_quant_cfg.get("quant_algo", "")).upper() == "MIXED_PRECISION"
@@ -715,6 +730,7 @@ class ModelConfig:
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
             "BailingMoeV2_5ForCausalLM",
+            "BailingMoeV3ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
         if (
@@ -1015,6 +1031,16 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
+        elif "BailingMoeV3ForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 128
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = (
+                0 if self.hf_config.use_mla_nope else self.hf_config.qk_rope_head_dim
+            )
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
         elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
@@ -1214,9 +1240,9 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
-        quant_cfg = getattr(self.hf_config, "quantization_config", None)
-        if quant_cfg is not None and not isinstance(quant_cfg, dict):
-            quant_cfg = quant_cfg.to_dict()
+        quant_cfg = _quant_config_to_dict(
+            getattr(self.hf_config, "quantization_config", None)
+        )
         if quant_cfg is not None:
             # Identify modelopt quantization
             if (
@@ -1241,7 +1267,6 @@ class ModelConfig:
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
                 if envs.SGLANG_USE_MODELSCOPE.get():
-
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
@@ -2079,8 +2104,7 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(
-            "rope_scaling missing 'factor', defaulting to 1.0. "
-            "Check model accuracy.",
+            "rope_scaling missing 'factor', defaulting to 1.0. Check model accuracy.",
         )
     scaling_factor = rope_scaling.get("factor", 1.0)
     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
