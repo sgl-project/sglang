@@ -2156,29 +2156,30 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_kv_item_lens = _pack_list(self.kv_mgr.kv_args.kv_item_lens)
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            payload = [
-                MORI_GUARD,
-                "None".encode("ascii"),
-                self.kv_mgr.local_ip.encode("ascii"),
-                str(self.kv_mgr.rank_port).encode("ascii"),
-                engine_desc_blob,
-                packed_kv_descs,
-                packed_aux_descs,
-                packed_state_descs,
-                gpu_id,
-                decode_tp_size,
-                decode_tp_rank,
-                kv_item_len,
-                packed_state_item_lens,
-                packed_state_dim_per_tensor,
-                packed_kv_mem_kinds,
-                packed_kv_item_lens,
-                packed_kv_desc_groups,
-            ]
             try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
-                    sock.send_multipart(payload)
+                    sock.send_multipart(
+                        [
+                            MORI_GUARD,
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            engine_desc_blob,
+                            packed_kv_descs,
+                            packed_aux_descs,
+                            packed_state_descs,
+                            gpu_id,
+                            decode_tp_size,
+                            decode_tp_rank,
+                            kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            packed_kv_mem_kinds,
+                            packed_kv_item_lens,
+                            packed_kv_desc_groups,
+                        ]
+                    )
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
