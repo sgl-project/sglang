@@ -118,6 +118,7 @@ impl InferenceSession for HttpInferenceSession {
             let events = stream! {
                 let mut parser = SseParser::default();
                 let mut terminal = false;
+                let mut emitted_tokens = 0;
                 while let Some(chunk) = chunks.next().await {
                     let chunk = match chunk {
                         Ok(chunk) => chunk,
@@ -140,6 +141,10 @@ impl InferenceSession for HttpInferenceSession {
                                 return;
                             }
                         };
+                        if let Err(error) = normalize_engine_output(&mut output, &mut emitted_tokens) {
+                            yield Err(error);
+                            return;
+                        }
                         output.text = match decode_ids(&mut decoder, &output.token_ids) {
                             Ok(text) => text,
                             Err(error) => {
@@ -454,6 +459,115 @@ fn parse_engine_frame(payload: &str) -> Result<GenerationOutput, FrontendError> 
     })
 }
 
+fn normalize_engine_output(
+    output: &mut GenerationOutput,
+    emitted_tokens: &mut u64,
+) -> Result<(), FrontendError> {
+    let total = output.completion_tokens;
+    let delta = total.checked_sub(*emitted_tokens).ok_or_else(|| {
+        internal(format!(
+            "engine completion token count decreased from {} to {total}",
+            *emitted_tokens
+        ))
+    })?;
+    let output_len = u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX);
+
+    if output_len == total {
+        let prefix = usize::try_from(*emitted_tokens)
+            .map_err(|_| internal("engine completion token count exceeds addressable memory"))?;
+        output.token_ids.drain(..prefix);
+        if let Some(extras) = output.extras.as_deref_mut() {
+            trim_cumulative_output_extras(extras, prefix)?;
+        }
+    } else if output_len != delta {
+        return Err(internal(format!(
+            "engine returned {output_len} output token IDs after reporting {delta} new completion tokens"
+        )));
+    }
+
+    output.completion_tokens = delta;
+    *emitted_tokens = total;
+    Ok(())
+}
+
+fn trim_cumulative_output_extras(
+    extras: &mut GenerationOutputExtras,
+    prefix: usize,
+) -> Result<(), FrontendError> {
+    drain_optional_prefix(&mut extras.output_logprobs, prefix, "output logprobs")?;
+    drain_optional_prefix(
+        &mut extras.output_logprob_token_ids,
+        prefix,
+        "output logprob token IDs",
+    )?;
+    drain_optional_prefix(
+        &mut extras.output_logprob_text,
+        prefix,
+        "output logprob text",
+    )?;
+
+    if extras.output_top_logprob_lengths.is_empty() {
+        return Ok(());
+    }
+    if extras.output_top_logprob_lengths.len() < prefix {
+        return Err(internal(format!(
+            "engine returned {} top-logprob positions for a {prefix}-token cumulative prefix",
+            extras.output_top_logprob_lengths.len()
+        )));
+    }
+    let alternatives = extras.output_top_logprob_lengths[..prefix]
+        .iter()
+        .try_fold(0usize, |total, &length| -> Result<usize, FrontendError> {
+            let length = usize::try_from(length)
+                .map_err(|_| internal("engine top-logprob count exceeds addressable memory"))?;
+            total
+                .checked_add(length)
+                .ok_or_else(|| internal("engine top-logprob count overflowed"))
+        })?;
+    extras.output_top_logprob_lengths.drain(..prefix);
+    drain_prefix(
+        &mut extras.output_top_logprobs,
+        alternatives,
+        "output top logprobs",
+    )?;
+    drain_prefix(
+        &mut extras.output_top_logprob_token_ids,
+        alternatives,
+        "output top-logprob token IDs",
+    )?;
+    drain_optional_prefix(
+        &mut extras.output_top_logprob_text,
+        alternatives,
+        "output top-logprob text",
+    )
+}
+
+fn drain_prefix<T>(
+    values: &mut Vec<T>,
+    prefix: usize,
+    description: &str,
+) -> Result<(), FrontendError> {
+    if values.len() < prefix {
+        return Err(internal(format!(
+            "engine returned {} {description} values for a {prefix}-token cumulative prefix",
+            values.len()
+        )));
+    }
+    values.drain(..prefix);
+    Ok(())
+}
+
+fn drain_optional_prefix<T>(
+    values: &mut Vec<T>,
+    prefix: usize,
+    description: &str,
+) -> Result<(), FrontendError> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    drain_prefix(values, prefix, description)
+}
+
 fn flatten_logprobs(
     values: Vec<WireLogprob>,
     logprobs: &mut Vec<f32>,
@@ -617,6 +731,52 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.status_code, 400);
         assert_eq!(error.message, "too long");
+    }
+
+    #[test]
+    fn cumulative_engine_frames_become_deltas() {
+        let mut emitted_tokens = 1;
+        let mut output = GenerationOutput {
+            token_ids: vec![7, 8],
+            completion_tokens: 2,
+            extras: Some(Box::new(GenerationOutputExtras {
+                output_logprobs: vec![-0.5, -0.25],
+                output_logprob_token_ids: vec![7, 8],
+                output_top_logprobs: vec![-0.5, -1.0, -0.25],
+                output_top_logprob_token_ids: vec![7, 9, 8],
+                output_top_logprob_lengths: vec![2, 1],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        normalize_engine_output(&mut output, &mut emitted_tokens).unwrap();
+
+        assert_eq!(output.token_ids, [8]);
+        assert_eq!(output.completion_tokens, 1);
+        assert_eq!(emitted_tokens, 2);
+        let extras = output.extras.unwrap();
+        assert_eq!(extras.output_logprobs, [-0.25]);
+        assert_eq!(extras.output_logprob_token_ids, [8]);
+        assert_eq!(extras.output_top_logprobs, [-0.25]);
+        assert_eq!(extras.output_top_logprob_token_ids, [8]);
+        assert_eq!(extras.output_top_logprob_lengths, [1]);
+    }
+
+    #[test]
+    fn inconsistent_engine_token_counts_are_rejected() {
+        let mut emitted_tokens = 2;
+        let mut output = GenerationOutput {
+            token_ids: vec![7, 8],
+            completion_tokens: 3,
+            ..Default::default()
+        };
+
+        let error = normalize_engine_output(&mut output, &mut emitted_tokens).unwrap_err();
+
+        assert_eq!(error.status_code, 500);
+        assert!(error.message.contains("2 output token IDs"));
+        assert_eq!(emitted_tokens, 2);
     }
 
     #[derive(Clone)]
