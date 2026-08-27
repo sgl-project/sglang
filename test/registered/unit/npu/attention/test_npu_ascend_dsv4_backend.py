@@ -204,14 +204,14 @@ class TestApplyHadamard(unittest.TestCase):
 
 
 class TestCompressorStateTableABI(unittest.TestCase):
-    def test_a5_cycle_table_is_one_bank_per_request(self):
+    def test_arch35_cycle_table_is_one_bank_per_request(self):
         req_pool_indices = torch.tensor([7, 3], dtype=torch.int64)
         table = _build_cycle_state_block_table(req_pool_indices)
         self.assertEqual(tuple(table.shape), (2,))
         self.assertEqual(table.dtype, torch.int32)
         self.assertEqual(table.tolist(), [7, 3])
 
-    def test_a5_cycle_table_rejects_explicit_shape(self):
+    def test_arch35_cycle_table_rejects_explicit_shape(self):
         with self.assertRaises(ValueError):
             _build_cycle_state_block_table(torch.zeros((2, 8), dtype=torch.int32))
 
@@ -219,7 +219,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
         return_value=True,
     )
-    def test_a5_eager_metadata_builds_cycle_table(self, _):
+    def test_arch35_eager_metadata_builds_cycle_table(self, _):
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
         backend.forward_metadata = SimpleNamespace()
         backend.token_to_kv_pool = MagicMock()
@@ -251,7 +251,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
         return_value=True,
     )
-    def test_a5_graph_replay_slices_static_req_pool_buffer_to_graph_bs(self, _):
+    def test_arch35_graph_replay_slices_static_req_pool_buffer_to_graph_bs(self, _):
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
         table = torch.zeros(1, dtype=torch.int32)
         graph_mode = MagicMock()
@@ -285,7 +285,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
         return_value=True,
     )
-    def test_a5_graph_capture_allocates_cycle_table_buffer(self, _):
+    def test_arch35_graph_capture_allocates_cycle_table_buffer(self, _):
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
         metadata = SimpleNamespace()
         backend.device = "cpu"
@@ -320,7 +320,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
         return_value=True,
     )
-    def test_a5_forward_reuses_batch_cycle_table(self, _):
+    def test_arch35_forward_reuses_batch_cycle_table(self, _):
         table = torch.tensor([7, 3], dtype=torch.int32)
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
         backend.graph_mode = False
@@ -387,13 +387,13 @@ class TestCompressorStateTableABI(unittest.TestCase):
         )
 
 
-class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
-    _A5_PATCH_TARGET = (
+class TestArch35SparseAttentionDispatch(unittest.TestCase):
+    _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35"
     )
 
-    @patch(_A5_PATCH_TARGET, return_value=True)
-    def test_a5_uses_kv_quant_ops_and_layout_kwargs(self, _):
+    @patch(_ARCH35_PATCH_TARGET, return_value=True)
+    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _):
         with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
             metadata_op, attention_op = _sparse_attn_ops()
             kwargs = _sparse_attn_kv_quant_kwargs()
@@ -407,8 +407,8 @@ class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
             {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
         )
 
-    @patch(_A5_PATCH_TARGET, return_value=False)
-    def test_pre_a5_keeps_legacy_ops_without_quant_kwargs(self, _):
+    @patch(_ARCH35_PATCH_TARGET, return_value=False)
+    def test_pre_arch35_keeps_legacy_ops_without_quant_kwargs(self, _):
         with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
             metadata_op, attention_op = _sparse_attn_ops()
             kwargs = _sparse_attn_kv_quant_kwargs()
@@ -419,7 +419,7 @@ class TestAtlasA5SparseAttentionDispatch(unittest.TestCase):
 
 
 class TestSparseAttentionMetadata(unittest.TestCase):
-    _A5_PATCH_TARGET = (
+    _ARCH35_PATCH_TARGET = (
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35"
     )
 
@@ -427,13 +427,13 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
         seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
 
-        for is_a5, metadata_op_name in (
+        for is_arch35, metadata_op_name in (
             (False, "npu_sparse_attn_sharedkv_metadata"),
             (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
         ):
             with (
-                self.subTest(is_a5=is_a5),
-                patch(self._A5_PATCH_TARGET, return_value=is_a5),
+                self.subTest(is_arch35=is_arch35),
+                patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
                 patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
             ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
