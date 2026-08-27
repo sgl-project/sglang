@@ -37,24 +37,31 @@ use super::{
     AppState, ChatFormatter, OpenAIRequestError, collect_output, contains_media, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::config::DefaultSamplingParams;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 use crate::message::response::{ChunkExtras, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use crate::renderer::RendererConfig;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
-pub(in crate::http_server) async fn lower_chat_requests(
-    server_args: &ServerArgs,
+pub(crate) struct LoweredChatRequests {
+    pub(crate) requests: Vec<GenerateRequest>,
+    pub(crate) parser: Option<String>,
+    pub(crate) tools: Option<Vec<ToolDefinition>>,
+}
+
+pub(crate) async fn lower_chat_requests(
+    config: &RendererConfig,
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
-) -> Result<Vec<GenerateRequest>, OpenAIRequestError> {
-    if request.model != server_args.served_model_name {
+) -> Result<LoweredChatRequests, OpenAIRequestError> {
+    if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
     if request.messages.is_empty() {
@@ -91,7 +98,7 @@ pub(in crate::http_server) async fn lower_chat_requests(
     }
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let parser = resolve_chat_parser(server_args, request, &tool_choice)?;
+    let parser = resolve_chat_parser(config, request, &tool_choice)?;
     let tools = chat_tool_definitions(request);
     let prompt = prepare_chat_request(chat_formatter, request).await?;
     let sampling = chat_sampling(
@@ -101,7 +108,7 @@ pub(in crate::http_server) async fn lower_chat_requests(
         &tool_choice,
         tools.as_deref().unwrap_or_default(),
         request.parallel_tool_calls,
-        server_args,
+        config,
     )?;
 
     let n = request.n.unwrap_or(1) as usize;
@@ -133,11 +140,15 @@ pub(in crate::http_server) async fn lower_chat_requests(
             ..Default::default()
         });
     }
-    Ok(requests)
+    Ok(LoweredChatRequests {
+        requests,
+        parser,
+        tools,
+    })
 }
 
 fn resolve_chat_parser(
-    server_args: &ServerArgs,
+    config: &RendererConfig,
     request: &CreateChatCompletionRequest,
     tool_choice: &DynamoToolChoice,
 ) -> Result<Option<String>, &'static str> {
@@ -147,7 +158,7 @@ fn resolve_chat_parser(
         .is_some_and(|tools| !tools.is_empty())
         && *tool_choice != DynamoToolChoice::None;
     let parser = tools_enabled
-        .then(|| server_args.tool_call_parser.clone())
+        .then(|| config.tool_call_parser.clone())
         .flatten();
     if tools_enabled && parser.is_none() {
         return Err("tool calls require --tool-call-parser");
@@ -179,43 +190,24 @@ async fn chat_completions(
         }
     };
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests = match lower_chat_requests(
-        &state.server_args,
-        state.chat_formatter.clone(),
-        &mut request,
-        &response_id,
-    )
-    .await
+    let prepared = match state
+        .renderer
+        .prepare_chat(&mut request, &response_id)
+        .await
     {
-        Ok(requests) => requests,
-        Err(error) => return error.into_response(),
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let status = StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return openai_error(status, error.to_string(), false);
+        }
     };
-    let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let parser = match resolve_chat_parser(&state.server_args, &request, &tool_choice) {
-        Ok(parser) => parser,
-        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
-    };
-    let tools = chat_tool_definitions(&request);
-    // Python gates the split on `request.separate_reasoning` (default true);
-    // the Dynamo request type has no such field, so it is always on when the
-    // server was launched with `--reasoning-parser`.
-    let reasoning_parser = state.server_args.reasoning_parser.clone();
-    let stream = request.stream.unwrap_or(false);
-    let n = request.n.unwrap_or(1) as usize;
-    let want_logprobs = request.logprobs.unwrap_or(false);
-    let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
-    let stream_tool_choice = request.tool_choice.clone();
-    let uses_tool_call_structural_tag = native_requests
-        .first()
-        .is_some_and(|request| request.sampling_params.structural_tag.is_some());
+    let native_requests = prepared.requests;
+    let response = prepared.response;
+    let stream = response.stream;
     let created = unix_seconds_u32();
-    let include_usage = request
-        .stream_options
-        .as_ref()
-        .is_some_and(|options| options.include_usage)
-        || state.server_args.stream_response_default_include_usage;
     let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut submitted = Vec::with_capacity(n);
+    let mut submitted = Vec::with_capacity(response.choice_count);
 
     for (index, native) in native_requests.into_iter().enumerate() {
         let rid = native.rid.clone();
@@ -225,25 +217,22 @@ async fn chat_completions(
         };
         submitted.push((index, rid, rx));
     }
-    let model = request.model;
-    let service_tier = request.service_tier;
-
     if stream {
         let event_stream = chat_event_stream(
             submitted,
             guard,
-            response_id,
-            model,
+            response.response_id,
+            response.model,
             created,
-            want_logprobs,
-            include_usage,
-            parser,
-            reasoning_parser,
-            tools,
-            stream_tool_choice,
-            uses_tool_call_structural_tag,
-            parallel_tool_calls,
-            service_tier,
+            response.want_logprobs,
+            response.include_usage,
+            response.parser,
+            response.reasoning_parser,
+            response.tools,
+            response.stream_tool_choice,
+            response.uses_tool_call_structural_tag,
+            response.parallel_tool_calls,
+            response.service_tier,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(event_stream).into_response()
@@ -251,15 +240,15 @@ async fn chat_completions(
         unary_chat(
             submitted,
             guard,
-            response_id,
-            model,
+            response.response_id,
+            response.model,
             created,
-            want_logprobs,
-            parser,
-            reasoning_parser,
-            tools,
-            parallel_tool_calls,
-            service_tier,
+            response.want_logprobs,
+            response.parser,
+            response.reasoning_parser,
+            response.tools,
+            response.parallel_tool_calls,
+            response.service_tier,
         )
         .await
     }
@@ -298,11 +287,11 @@ pub(super) fn chat_sampling(
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
-    server_args: &ServerArgs,
+    config: &RendererConfig,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
-        &defaults.with_model_defaults(&server_args.model_config.default_sampling_params),
+        &defaults.with_model_defaults(&config.default_sampling_params),
     )?;
     apply_tool_constraint(
         &mut sampling,
@@ -312,10 +301,7 @@ pub(super) fn chat_sampling(
         parallel_tool_calls,
     )?;
     sampling
-        .normalize(
-            server_args.skip_tokenizer_init,
-            server_args.model_config.vocab_size,
-        )
+        .normalize(config.skip_tokenizer_init, config.vocab_size)
         .map_err(|error| error.to_string())?;
     Ok(sampling)
 }

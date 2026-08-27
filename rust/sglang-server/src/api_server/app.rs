@@ -9,22 +9,22 @@ use axum::Router;
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai, render};
 use crate::message::config::ServerArgs;
-use crate::renderer::RenderJob;
+use crate::renderer::RendererService;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
 /// Shared handler state: submission handles, immutable server configuration,
-/// and the API-owned chat formatter.
+/// and the engine-free renderer service.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning each
-/// `flume::Sender` and the chat formatter. Deliberately not `Clone`, so it
+/// `flume::Sender` and the renderer. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
 pub(super) struct AppState {
     pub(super) senders: Senders,
     pub(super) response_buf: usize,
     pub(super) server_args: Arc<ServerArgs>,
-    pub(super) chat_formatter: Option<openai::ChatFormatter>,
+    pub(super) renderer: Arc<RendererService>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
 }
@@ -34,6 +34,7 @@ pub async fn serve(
     senders: Senders,
     response_buf: usize,
     server_args: Arc<ServerArgs>,
+    renderer: Arc<RendererService>,
     response_activity: ActivityCounter,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
@@ -41,12 +42,11 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
-    let chat_formatter = openai::load_chat_support(&server_args);
     let state = Arc::new(AppState {
         senders,
         response_buf,
         server_args: server_args.clone(),
-        chat_formatter,
+        renderer,
         response_activity,
     });
     // Each endpoint module registers its own routes and merges here.
@@ -86,15 +86,11 @@ pub async fn serve(
 pub(crate) async fn serve_render(
     listener: std::net::TcpListener,
     server_args: Arc<ServerArgs>,
-    jobs: flume::Sender<RenderJob>,
+    renderer: Arc<RendererService>,
     shutdown: flume::Receiver<()>,
 ) {
-    let app = render::routes(render::RenderState::new(
-        server_args.clone(),
-        openai::load_chat_support(&server_args),
-        jobs,
-    ))
-    .layer(axum::extract::DefaultBodyLimit::disable());
+    let app = render::routes(render::RenderState::new(renderer))
+        .layer(axum::extract::DefaultBodyLimit::disable());
     let app = log::apply(app, &server_args);
     serve_http(listener, app, shutdown).await;
 }

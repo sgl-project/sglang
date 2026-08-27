@@ -20,18 +20,18 @@ mod reasoning;
 mod template;
 mod tools;
 
-pub(in crate::http_server) use chat::lower_chat_requests;
-pub(in crate::http_server) use completions::lower_completion_requests;
-pub(super) use template::ChatFormatter;
+pub(crate) use chat::lower_chat_requests;
+pub(crate) use completions::lower_completion_requests;
+pub(crate) use template::ChatFormatter;
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::renderer::RendererConfig;
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
@@ -50,22 +50,22 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
 /// `--chat-template` name or a model-path-inferred legacy template resolve
 /// without it, so its absence must not disable chat.
-pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatter> {
+pub(crate) fn load_chat_support(config: &RendererConfig) -> Option<ChatFormatter> {
     // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
     // there is none (text cannot be submitted), so chat is disabled.
-    if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
+    if config.skip_tokenizer_init || config.tokenizer_path.is_empty() {
         return None;
     }
     let config_file = tokenizer::resolve_model_file(
-        &server_args.tokenizer_path,
-        server_args.revision.as_deref(),
+        &config.tokenizer_path,
+        config.revision.as_deref(),
         "tokenizer_config.json",
     );
 
     match template::load_chat_formatter(
         config_file.as_deref(),
-        (!server_args.model_path.is_empty()).then_some(server_args.model_path.as_str()),
-        server_args.chat_template.as_deref(),
+        (!config.model_path.is_empty()).then_some(config.model_path.as_str()),
+        config.chat_template.as_deref(),
     ) {
         Ok(formatter) => {
             tracing::info!(
@@ -121,7 +121,7 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(in crate::http_server) struct OpenAIRequestError(String);
+pub(crate) struct OpenAIRequestError(String);
 
 impl From<String> for OpenAIRequestError {
     fn from(message: String) -> Self {

@@ -27,13 +27,13 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, OpenAIRequestError, collect_output, error_payload,
     indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::message::config::ServerArgs;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
+use crate::renderer::RendererConfig;
 use crate::utils::error::Error;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -63,12 +63,12 @@ pub(super) struct ChoiceExtensions {
 
 /// Validate and lower one OpenAI completion request into the ordered native
 /// requests consumed by inference or standalone rendering.
-pub(in crate::http_server) fn lower_completion_requests(
-    server_args: &ServerArgs,
+pub(crate) fn lower_completion_requests(
+    config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,
 ) -> Result<Vec<GenerateRequest>, OpenAIRequestError> {
-    if request.model != server_args.served_model_name {
+    if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
     if request.prompt_embeds.is_some() {
@@ -89,10 +89,7 @@ pub(in crate::http_server) fn lower_completion_requests(
     let prompt_specs = completion_prompt_specs(&request.prompt)?;
     let mut sampling = completion_sampling_params(request)?;
     sampling
-        .normalize(
-            server_args.skip_tokenizer_init,
-            server_args.model_config.vocab_size,
-        )
+        .normalize(config.skip_tokenizer_init, config.vocab_size)
         .map_err(|error| error.to_string())?;
     let n = request.n.unwrap_or(1) as usize;
     let choice_count = prompt_specs
@@ -143,11 +140,18 @@ async fn completions(
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests =
-        match lower_completion_requests(&state.server_args, &request, &response_id) {
-            Ok(requests) => requests,
-            Err(error) => return error.into_response(),
-        };
+    let native_requests = match state
+        .renderer
+        .prepare_completions(&request, &response_id)
+        .await
+    {
+        Ok(requests) => requests,
+        Err(error) => {
+            let status = StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return openai_error(status, error.to_string(), false);
+        }
+    };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -193,7 +197,10 @@ async fn completions(
             .stream_options
             .map(|o| o.include_usage)
             .unwrap_or(false)
-            || state.server_args.stream_response_default_include_usage;
+            || state
+                .renderer
+                .config()
+                .stream_response_default_include_usage;
         let continuous_usage = request
             .stream_options
             .map(|o| o.continuous_usage_stats)

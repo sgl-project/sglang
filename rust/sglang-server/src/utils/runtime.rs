@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
-use crate::renderer::{RenderJob, RenderWorker};
+use crate::renderer::{PreprocessJob, RendererService};
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -150,14 +150,21 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
             cfg.rust_server_args.http_addr
         )
     })?;
-    let (render_tx, render_rx) = flume::bounded::<RenderJob>(cfg.rust_server_args.channel_cap);
+    let (render_tx, render_rx) = flume::bounded::<PreprocessJob>(cfg.rust_server_args.channel_cap);
     let mut threads = Vec::new();
     spawn_pool(
         "renderer",
         None,
         cfg.server_args.tokenizer_worker_num,
         &mut threads,
-        |_| RenderWorker::new(render_rx.clone(), text_tokenizer.clone(), limits.clone()),
+        |_| {
+            tokenizer::TokenizerWorker::new(
+                render_rx.clone(),
+                None,
+                text_tokenizer.clone(),
+                limits.clone(),
+            )
+        },
     );
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let handle = std::thread::Builder::new()
@@ -168,10 +175,11 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
                 .enable_all()
                 .build()
                 .expect("build render runtime");
-            runtime.block_on(http_server::app::serve_render(
+            let renderer = Arc::new(RendererService::new(cfg.server_args.clone(), render_tx));
+            runtime.block_on(api_server::app::serve_render(
                 listener,
                 cfg.server_args,
-                render_tx,
+                renderer,
                 shutdown_rx,
             ));
         })
@@ -201,7 +209,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let (tok_manager_tx, tok_manager_rx) =
         flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
     let (tokenizer_tx, tokenizer_rx) =
-        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.channel_cap);
+        flume::bounded::<PreprocessJob>(cfg.rust_server_args.channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
     let (mm_worker_tx, mm_worker_rx) =
@@ -218,6 +226,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
+    let renderer = Arc::new(RendererService::new(
+        cfg.server_args.clone(),
+        tokenizer_tx.clone(),
+    ));
     let senders = Senders {
         tok_manager_tx: tok_manager_tx.clone(),
         abort_tx: abort_tx.clone(),
@@ -289,8 +301,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             |_i| {
                 tokenizer::TokenizerWorker::new(
                     tokenizer_rx.clone(),
-                    tok_manager_tx.clone(),
+                    Some(tok_manager_tx.clone()),
                     tokenizer.clone(),
+                    tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
                 )
             },
         );
@@ -358,6 +371,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let response_activity = response_activity.clone();
+        let renderer = renderer.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -387,6 +401,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
+                    renderer,
                     // Response heartbeat watched by `/health_generate`.
                     response_activity,
                     shutdown_rx,

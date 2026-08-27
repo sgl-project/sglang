@@ -14,9 +14,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::message::request::{GenerateRequest, Request, RequestKind};
+use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::types::TokenIds;
+use crate::renderer::{PreprocessJob, prepare_direct_request};
 use crate::runtime::Runnable;
+use crate::tokenizer_manager::to_scheduler::Limits;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
 
@@ -191,17 +193,19 @@ pub(crate) fn tokenize_generate_request(
 /// [`GenerateRequest`]'s `skip_special_tokens` — so chat prompts gain no
 /// extra BOS/EOS while native text keeps the post-processor specials.
 pub struct TokenizerWorker {
-    rx: flume::Receiver<Request>,
-    tm: flume::Sender<TmEvent>,
+    rx: flume::Receiver<PreprocessJob>,
+    tm: Option<flume::Sender<TmEvent>>,
     tokenizer: Arc<dyn TextTokenizer>,
     auto_specials: Vec<i32>,
+    limits: Limits,
 }
 
 impl TokenizerWorker {
     pub fn new(
-        rx: flume::Receiver<Request>,
-        tm: flume::Sender<TmEvent>,
+        rx: flume::Receiver<PreprocessJob>,
+        tm: Option<flume::Sender<TmEvent>>,
         tokenizer: Arc<dyn TextTokenizer>,
+        limits: Limits,
     ) -> Self {
         let auto_specials = tokenizer.auto_specials();
         Self {
@@ -209,29 +213,53 @@ impl TokenizerWorker {
             tm,
             tokenizer,
             auto_specials,
+            limits,
         }
     }
 }
 
 impl Runnable for TokenizerWorker {
     fn run(self) {
-        while let Ok(mut req) = self.rx.recv() {
-            // The tokenizer pool only ever receives generate requests. Encode,
-            // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
-            let event = {
-                let RequestKind::Generate(g) = &mut req.kind else {
-                    tracing::error!("tokenizer pool received a non-generate request");
-                    continue;
-                };
-                match tokenize_generate_request(g, self.tokenizer.as_ref(), &self.auto_specials) {
-                    Ok(()) => Event::TokenizeDone,
-                    Err(err) => Event::Error(err),
+        while let Ok(job) = self.rx.recv() {
+            match job {
+                PreprocessJob::Inference(mut req) => {
+                    // Normal inference already validated and normalized in the
+                    // intake FSM. Fill ids, then return through its existing
+                    // lifecycle.
+                    let event = {
+                        let RequestKind::Generate(g) = &mut req.kind else {
+                            tracing::error!("tokenizer pool received a non-generate request");
+                            continue;
+                        };
+                        match tokenize_generate_request(
+                            g,
+                            self.tokenizer.as_ref(),
+                            &self.auto_specials,
+                        ) {
+                            Ok(()) => Event::TokenizeDone,
+                            Err(err) => Event::Error(err),
+                        }
+                    };
+                    let _ = req.state.apply(event);
+                    let Some(tm) = &self.tm else {
+                        tracing::error!("standalone tokenizer received an inference job");
+                        continue;
+                    };
+                    if tm.send(TmEvent::Tokenized(req)).is_err() {
+                        tracing::error!("tm inbox closed; dropping request");
+                        break;
+                    }
                 }
-            };
-            let _ = req.state.apply(event);
-            if self.tm.send(TmEvent::Tokenized(req)).is_err() {
-                tracing::error!("tm inbox closed; dropping request");
-                break;
+                PreprocessJob::Render(job) => {
+                    let result = prepare_direct_request(
+                        job.request,
+                        self.tokenizer.as_ref(),
+                        &self.auto_specials,
+                        &self.limits,
+                    );
+                    // The HTTP request may have been cancelled while preparing.
+                    let _ = job.reply.send(result);
+                }
             }
         }
     }
@@ -240,7 +268,8 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::request::{GenerateRequest, RequestKind};
+    use crate::message::config::ServerArgs;
+    use crate::message::request::{GenerateRequest, Request, RequestKind};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::RequestState;
@@ -264,7 +293,7 @@ mod tests {
     /// tokenizer, so it is where the exact count is resolved.
     #[test]
     fn tokenizing_replaces_the_byte_window_with_a_token_count() {
-        let (req_tx, req_rx) = flume::unbounded::<Request>();
+        let (req_tx, req_rx) = flume::unbounded::<PreprocessJob>();
         let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
 
         // 8 bytes vs 3 "tokens" under WordTokenizer — units are distinguishable.
@@ -275,7 +304,7 @@ mod tests {
         };
         let (sink_tx, _sink_rx) = mpsc::channel(4);
         req_tx
-            .send(Request {
+            .send(PreprocessJob::Inference(Request {
                 rid: "1".into(),
                 state: RequestState::Tokenizing,
                 sink: ResponseSink::Local(sink_tx),
@@ -285,11 +314,17 @@ mod tests {
                     sampling_params: sp,
                     ..Default::default()
                 })),
-            })
+            }))
             .expect("send");
         drop(req_tx); // closes the loop after one request
 
-        TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer)).run();
+        TokenizerWorker::new(
+            req_rx,
+            Some(tm_tx),
+            Arc::new(WordTokenizer),
+            Limits::from(&ServerArgs::default()),
+        )
+        .run();
 
         let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
             panic!("expected Tokenized");
@@ -332,10 +367,10 @@ mod tests {
     #[test]
     fn skip_special_tokens_strips_the_auto_added_specials() {
         let run = |skip_special_tokens: bool| {
-            let (req_tx, req_rx) = flume::unbounded::<Request>();
+            let (req_tx, req_rx) = flume::unbounded::<PreprocessJob>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             req_tx
-                .send(Request {
+                .send(PreprocessJob::Inference(Request {
                     rid: "1".into(),
                     state: RequestState::Tokenizing,
                     sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
@@ -345,10 +380,16 @@ mod tests {
                         skip_special_tokens,
                         ..Default::default()
                     })),
-                })
+                }))
                 .expect("send");
             drop(req_tx);
-            TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+            TokenizerWorker::new(
+                req_rx,
+                Some(tm_tx),
+                Arc::new(MarkedTokenizer),
+                Limits::from(&ServerArgs::default()),
+            )
+            .run();
             let TmEvent::Tokenized(req) = tm_rx.try_recv().expect("returned") else {
                 panic!("expected Tokenized");
             };

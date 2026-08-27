@@ -22,7 +22,13 @@ use super::{openai_error, routes};
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::types::TokenIds;
+use crate::renderer::{PreprocessJob, RendererService};
+use crate::runtime::Runnable;
+use crate::tokenizer_manager::to_scheduler::Limits;
+use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
 use crate::tokenizer_manager::wiring::Senders;
+use crate::utils::error::Error;
 
 pub(super) fn senders() -> Senders {
     Senders {
@@ -98,11 +104,25 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 }
 
 pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
+    struct TestTokenizer;
+    impl TextTokenizer for TestTokenizer {
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            Ok(text.split_whitespace().map(|_| 7).collect())
+        }
+    }
+
+    let server_args = server_args();
+    let limits = Limits::from(&*server_args);
+    let (jobs, worker_jobs) = flume::unbounded::<PreprocessJob>();
+    std::thread::spawn(move || {
+        TokenizerWorker::new(worker_jobs, None, Arc::new(TestTokenizer), limits).run()
+    });
+    let renderer = Arc::new(RendererService::new(server_args.clone(), jobs));
     Arc::new(super::AppState {
         senders,
         response_buf: 8,
-        server_args: server_args(),
-        chat_formatter: None,
+        server_args,
+        renderer,
         response_activity: Default::default(),
     })
 }

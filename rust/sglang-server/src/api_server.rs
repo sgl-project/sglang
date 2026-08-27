@@ -10,7 +10,7 @@ mod frame;
 mod guard;
 mod log;
 mod native_api;
-mod openai;
+pub(crate) mod openai;
 mod prefetch;
 mod render;
 mod submit;

@@ -300,9 +300,16 @@ impl Intake {
                 // `Tokenized` event (PreSendValidating, or Failed on error).
                 // Doesn't loop.
                 RequestState::Tokenizing => {
-                    if let Err(err) = self.senders.tokenizer_tx.send(req) {
+                    if let Err(err) = self
+                        .senders
+                        .tokenizer_tx
+                        .send(crate::renderer::PreprocessJob::Inference(req))
+                    {
                         // Pool gone (workers exited); flume hands the request back.
-                        let mut req = err.into_inner();
+                        let crate::renderer::PreprocessJob::Inference(mut req) = err.into_inner()
+                        else {
+                            unreachable!("inference send returned a render job")
+                        };
                         // Past `Received`, so registration happened.
                         self.fail(
                             &mut req,

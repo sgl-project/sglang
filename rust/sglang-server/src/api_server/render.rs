@@ -1,8 +1,6 @@
-//! Standalone text preprocessing HTTP surface. OpenAI adapters lower requests
-//! into SGLang's native text-generate shape, then tokenizer primitives shared
-//! with inference produce a request accepted by `/generate`.
+//! Standalone HTTP transport for the shared engine-free renderer service.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -12,34 +10,18 @@ use axum::{
     routing::{get, post},
 };
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
-use futures::future::try_join_all;
-use serde::Serialize;
-use tokio::sync::oneshot;
 
-use super::openai::{ChatFormatter, lower_chat_requests, lower_completion_requests, openai_error};
-use crate::message::config::ServerArgs;
-use crate::message::request::GenerateRequest;
-use crate::message::sampling::SamplingParams;
-use crate::renderer::RenderJob;
+use super::openai::openai_error;
+use crate::renderer::{PreparedGenerateRequest, RenderServiceError, RendererService};
 
 #[derive(Clone)]
 pub(super) struct RenderState {
-    server_args: Arc<ServerArgs>,
-    chat_formatter: Option<ChatFormatter>,
-    jobs: flume::Sender<RenderJob>,
+    renderer: Arc<RendererService>,
 }
 
 impl RenderState {
-    pub(super) fn new(
-        server_args: Arc<ServerArgs>,
-        chat_formatter: Option<ChatFormatter>,
-        jobs: flume::Sender<RenderJob>,
-    ) -> Self {
-        Self {
-            server_args,
-            chat_formatter,
-            jobs,
-        }
+    pub(super) fn new(renderer: Arc<RendererService>) -> Self {
+        Self { renderer }
     }
 }
 
@@ -55,87 +37,10 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// Text-only token-in request for the current public `/generate` endpoint.
-/// Renderer scope exclusions such as multimodal features, cache identity,
-/// priority, and extra keys are documented at the HTTP boundary.
-#[derive(Debug, Serialize)]
-struct PreparedGenerateRequest {
-    rid: String,
-    input_ids: Vec<i32>,
-    sampling_params: RenderedSamplingParams,
-    stream: bool,
-    return_logprob: bool,
-    logprob_start_len: i64,
-    top_logprobs_num: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_ids_logprob: Option<Vec<i32>>,
-    return_hidden_states: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    return_text_in_logprobs: Option<bool>,
-}
-
-/// Public `/generate` sampling shape. The internal `SamplingParams` serializer
-/// contains scheduler-only normalized fields, so the render boundary folds
-/// normalized stops back into the aliases accepted by the public endpoint.
-#[derive(Debug, Serialize)]
-struct RenderedSamplingParams {
-    max_new_tokens: Option<i64>,
-    stop: Vec<String>,
-    stop_token_ids: Option<Vec<i64>>,
-    stop_regex: Vec<String>,
-    temperature: f64,
-    top_p: f64,
-    top_k: i64,
-    min_p: f64,
-    frequency_penalty: f64,
-    presence_penalty: f64,
-    repetition_penalty: f64,
-    min_new_tokens: i64,
-    n: i64,
-    json_schema: Option<String>,
-    regex: Option<String>,
-    ebnf: Option<String>,
-    structural_tag: Option<String>,
-    ignore_eos: bool,
-    skip_special_tokens: bool,
-    spaces_between_special_tokens: bool,
-    no_stop_trim: bool,
-    stream_interval: Option<i64>,
-    logit_bias: Option<BTreeMap<String, f64>>,
-    sampling_seed: Option<i64>,
-    custom_params: Option<serde_json::Value>,
-}
-
-impl From<SamplingParams> for RenderedSamplingParams {
-    fn from(params: SamplingParams) -> Self {
-        Self {
-            max_new_tokens: params.max_new_tokens,
-            stop: params.stop_strs,
-            stop_token_ids: params.stop_token_ids,
-            stop_regex: params.stop_regex_strs,
-            temperature: params.temperature,
-            top_p: params.top_p,
-            top_k: params.top_k,
-            min_p: params.min_p,
-            frequency_penalty: params.frequency_penalty,
-            presence_penalty: params.presence_penalty,
-            repetition_penalty: params.repetition_penalty,
-            min_new_tokens: params.min_new_tokens,
-            n: params.n,
-            json_schema: params.json_schema,
-            regex: params.regex,
-            ebnf: params.ebnf,
-            structural_tag: params.structural_tag,
-            ignore_eos: params.ignore_eos,
-            skip_special_tokens: params.skip_special_tokens,
-            spaces_between_special_tokens: params.spaces_between_special_tokens,
-            no_stop_trim: params.no_stop_trim,
-            stream_interval: params.stream_interval,
-            logit_bias: params.logit_bias,
-            sampling_seed: params.sampling_seed,
-            custom_params: params.custom_params,
-        }
-    }
+fn render_error(error: RenderServiceError) -> Response {
+    let status =
+        StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    openai_error(status, error.to_string(), false)
 }
 
 async fn render_chat(
@@ -156,24 +61,19 @@ async fn render_chat(
         );
     }
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests = match lower_chat_requests(
-        &state.server_args,
-        state.chat_formatter.clone(),
-        &mut request,
-        &response_id,
-    )
-    .await
+    match state
+        .renderer
+        .prepare_chat(&mut request, &response_id)
+        .await
     {
-        Ok(requests) => requests,
-        Err(error) => return error.into_response(),
-    };
-    let native = native_requests
-        .into_iter()
-        .next()
-        .expect("lowered chat request contains one choice");
-    match prepare_one(&state, native).await {
-        Ok(prepared) => Json(prepared).into_response(),
-        Err(response) => response,
+        Ok(mut prepared) => Json(PreparedGenerateRequest::from(
+            prepared
+                .requests
+                .pop()
+                .expect("lowered chat request contains one choice"),
+        ))
+        .into_response(),
+        Err(error) => render_error(error),
     }
 }
 
@@ -188,66 +88,20 @@ async fn render_completions(
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests =
-        match lower_completion_requests(&state.server_args, &request, &response_id) {
-            Ok(requests) => requests,
-            Err(error) => return error.into_response(),
-        };
-    let futures = native_requests
-        .into_iter()
-        .map(|request| prepare_one(&state, request));
-    match try_join_all(futures).await {
-        Ok(prepared) => Json(prepared).into_response(),
-        Err(response) => response,
+    match state
+        .renderer
+        .prepare_completions(&request, &response_id)
+        .await
+    {
+        Ok(requests) => Json(
+            requests
+                .into_iter()
+                .map(PreparedGenerateRequest::from)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => render_error(error),
     }
-}
-
-async fn prepare_one(
-    state: &RenderState,
-    request: GenerateRequest,
-) -> Result<PreparedGenerateRequest, Response> {
-    let (reply, result) = oneshot::channel();
-    state
-        .jobs
-        .send_async(RenderJob { request, reply })
-        .await
-        .map_err(|_| {
-            openai_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "renderer is shutting down",
-                false,
-            )
-        })?;
-    let mut prepared = result
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "renderer worker dropped reply");
-            openai_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "render preprocessing worker failed",
-                false,
-            )
-        })?
-        .map_err(|error| {
-            let status = StatusCode::from_u16(error.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            openai_error(status, error.to_string(), false)
-        })?;
-    Ok(PreparedGenerateRequest {
-        rid: prepared.rid.client_facing().to_owned(),
-        input_ids: prepared
-            .input_ids
-            .take()
-            .expect("text preparation always produces input_ids"),
-        sampling_params: prepared.sampling_params.into(),
-        stream: prepared.stream,
-        return_logprob: prepared.return_logprob,
-        logprob_start_len: prepared.logprob_start_len,
-        top_logprobs_num: prepared.top_logprobs_num,
-        token_ids_logprob: prepared.token_ids_logprob,
-        return_hidden_states: prepared.return_hidden_states,
-        return_text_in_logprobs: prepared.return_text_in_logprobs,
-    })
 }
 
 #[cfg(test)]
@@ -259,12 +113,13 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    use crate::message::config::{ModelConfig, ServerArgs};
     use crate::message::request::GenerateBody;
     use crate::message::types::TokenIds;
-    use crate::renderer::RenderWorker;
+    use crate::renderer::{PreprocessJob, RendererService};
     use crate::runtime::Runnable;
     use crate::tokenizer_manager::to_scheduler::Limits;
-    use crate::tokenizer_manager::tokenizer::TextTokenizer;
+    use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
     use crate::utils::error::Error;
 
     struct WordTokenizer;
@@ -296,41 +151,39 @@ mod tests {
         }
     }
 
-    fn test_app(enable_chat: bool) -> TestApp {
-        let server_args = ServerArgs {
+    fn test_app() -> TestApp {
+        let server_args = Arc::new(ServerArgs {
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
             tokenizer_worker_num: 2,
             chat_template: Some("chatml".into()),
-            model_config: crate::message::config::ModelConfig {
+            model_config: ModelConfig {
                 context_len: 64,
                 vocab_size: 100,
                 ..Default::default()
             },
             ..Default::default()
-        };
-        let chat_formatter = enable_chat
-            .then(|| super::super::openai::load_chat_support(&server_args))
-            .flatten();
-        let limits = Limits::from(&server_args);
+        });
+        let limits = Limits::from(&*server_args);
         let tokenizer: Arc<dyn TextTokenizer> = Arc::new(WordTokenizer);
-        let (jobs, worker_jobs) = flume::bounded(8);
+        let (jobs, worker_jobs) = flume::bounded::<PreprocessJob>(8);
         let workers = (0..server_args.tokenizer_worker_num)
-            .map(|worker| {
-                let renderer =
-                    RenderWorker::new(worker_jobs.clone(), tokenizer.clone(), limits.clone());
+            .map(|worker_index| {
+                let worker = TokenizerWorker::new(
+                    worker_jobs.clone(),
+                    None,
+                    tokenizer.clone(),
+                    limits.clone(),
+                );
                 std::thread::Builder::new()
-                    .name(format!("test-renderer-{worker}"))
-                    .spawn(move || renderer.run())
+                    .name(format!("test-renderer-{worker_index}"))
+                    .spawn(move || worker.run())
                     .unwrap()
             })
             .collect();
+        let renderer = Arc::new(RendererService::new(server_args, jobs));
         TestApp {
-            router: Some(routes(RenderState::new(
-                Arc::new(server_args),
-                chat_formatter,
-                jobs,
-            ))),
+            router: Some(routes(RenderState::new(renderer))),
             workers,
         }
     }
@@ -352,7 +205,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(false).request(request).await;
+        let response = test_app().request(request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -391,7 +244,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(true).request(request).await;
+        let response = test_app().request(request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let value: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -418,7 +271,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(true).request(request).await;
+        let response = test_app().request(request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -444,7 +297,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(false).request(request).await;
+        let response = test_app().request(request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -464,7 +317,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from("{}"))
             .unwrap();
-        let response = test_app(false).request(request).await;
+        let response = test_app().request(request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
