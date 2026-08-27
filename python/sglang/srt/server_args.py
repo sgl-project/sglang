@@ -45,7 +45,6 @@ import logging
 import math
 import os
 import random
-import socket
 import tempfile
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
@@ -4250,37 +4249,9 @@ class ServerArgs:
         handle_pd_disaggregation(self)
 
     def _handle_dcp_validation(self):
-        cfg = resolving_view(self)
-        if cfg.dcp_size < 1:
-            raise ValueError(
-                "Decode context parallel size (--dcp-size / "
-                "--decode-context-parallel-size) must be >= 1, but got "
-                f"dcp_size={cfg.dcp_size}."
-            )
-        if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
-            raise ValueError(
-                f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
-                "decode context-parallel attention reduction and therefore "
-                "requires --dcp-size / --decode-context-parallel-size > 1, but "
-                f"got dcp_size={cfg.dcp_size}."
-            )
-        if cfg.dcp_comm_backend == "fi_a2a" and not is_cuda():
-            raise ValueError(
-                "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-                "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
-                "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
-                "authoritative fabric probe runs at model-runner init; use 'a2a' "
-                "or 'ag_rs' on clusters without MNNVL."
-            )
-        if cfg.dcp_replicate_q_proj:
-            if cfg.dcp_size <= 1:
-                raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-            if cfg.dcp_comm_backend not in ("a2a", "fi_a2a"):
-                raise ValueError(
-                    "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
-                    "communication backend (it removes the head-dim Q all-gather); "
-                    f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
-                )
+        from sglang.srt.arg_groups.parallel_hook import handle_dcp_validation
+
+        handle_dcp_validation(self)
 
     def _handle_load_balance_method(self):
         cfg = resolving_view(self)
@@ -4303,91 +4274,14 @@ class ServerArgs:
             return
 
     def _handle_ssl_validation(self):
-        """Ensure SSL arguments are consistent and referenced files exist."""
-        cfg = resolving_view(self)
-        if cfg.ssl_keyfile and not cfg.ssl_certfile:
-            raise ValueError(
-                "--ssl-keyfile requires --ssl-certfile to be specified as well."
-            )
-        if cfg.ssl_certfile and not cfg.ssl_keyfile:
-            raise ValueError(
-                "--ssl-certfile requires --ssl-keyfile to be specified as well."
-            )
-        if not cfg.ssl_certfile and not cfg.ssl_keyfile:
-            if cfg.ssl_ca_certs:
-                raise ValueError(
-                    "--ssl-ca-certs has no effect without --ssl-certfile and --ssl-keyfile."
-                )
-            if cfg.ssl_keyfile_password:
-                raise ValueError(
-                    "--ssl-keyfile-password has no effect without --ssl-certfile and --ssl-keyfile."
-                )
-        # Validate files exist early to avoid late failures after model loading.
-        if cfg.ssl_keyfile and not os.path.isfile(cfg.ssl_keyfile):
-            raise ValueError(
-                f"SSL key file not found: '{cfg.ssl_keyfile}'. "
-                f"Please check the --ssl-keyfile path."
-            )
-        if cfg.ssl_certfile and not os.path.isfile(cfg.ssl_certfile):
-            raise ValueError(
-                f"SSL certificate file not found: '{cfg.ssl_certfile}'. "
-                f"Please check the --ssl-certfile path."
-            )
-        if cfg.ssl_ca_certs and not os.path.isfile(cfg.ssl_ca_certs):
-            raise ValueError(
-                f"SSL CA certificates file not found: '{cfg.ssl_ca_certs}'. "
-                f"Please check the --ssl-ca-certs path."
-            )
-        if cfg.enable_ssl_refresh and not (cfg.ssl_certfile and cfg.ssl_keyfile):
-            raise ValueError(
-                "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
-                "to be specified."
-            )
+        from sglang.srt.arg_groups.serving_hook import handle_ssl_validation
 
-        if cfg.enable_http2:
-            if not 0 < cfg.http2_max_concurrent_streams < 2**32:
-                raise ValueError(
-                    "--http2-max-concurrent-streams must be between 1 and "
-                    "4294967295."
-                )
-
-            try:
-                import granian  # noqa: F401
-            except ImportError:
-                raise ValueError(
-                    "--enable-http2 requires the 'granian' package. "
-                    'Install it with: pip install "sglang[http2]"'
-                )
-
-            if cfg.enable_ssl_refresh:
-                raise ValueError(
-                    "--enable-ssl-refresh is not supported with --enable-http2. "
-                    "Granian does not support SSL certificate hot-reloading. "
-                    "Use Uvicorn (the default) or handle certificate rotation externally."
-                )
+        handle_ssl_validation(self)
 
     def _handle_multimodal(self):
-        """Validate mm_process_config structure before model loading."""
-        cfg = resolving_view(self)
-        if (
-            cfg.mm_preprocess_cache_size_mb is not None
-            and cfg.mm_preprocess_cache_size_mb < 0
-        ):
-            raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
-        if cfg.mm_process_config is not None:
-            if not isinstance(cfg.mm_process_config, dict):
-                raise TypeError(
-                    f"mm_process_config must be a dict, "
-                    f"but got {type(cfg.mm_process_config)}"
-                )
-            for key in ("image", "video", "audio"):
-                if key in cfg.mm_process_config and not isinstance(
-                    cfg.mm_process_config[key], dict
-                ):
-                    raise TypeError(
-                        f"mm_process_config['{key}'] must be a dict, "
-                        f"but got {type(cfg.mm_process_config[key])}"
-                    )
+        from sglang.srt.arg_groups.serving_hook import handle_multimodal
+
+        handle_multimodal(self)
 
     def _handle_media_url_security(self):
         """Normalize and publish the media URL policy before workers start."""
@@ -6670,82 +6564,14 @@ class ServerArgs:
             self._declare("_handle_grammar_backend", grammar_backend="xgrammar")
 
     def _handle_mamba_backend(self):
-        cfg = resolving_view(self)
-        if cfg.mamba_cache_philox_rounds < 0:
-            raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
+        from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 
-        if cfg.mamba_max_states_per_path == 0 or cfg.mamba_max_states_per_path < -1:
-            raise ValueError(
-                "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
-                f"integer, got {cfg.mamba_max_states_per_path}."
-            )
-
-        if cfg.enable_mamba_cache_stochastic_rounding:
-            if cfg.mamba_ssm_dtype != "float16":
-                raise ValueError(
-                    "Stochastic rounding for the Mamba SSM cache requires "
-                    f"--mamba-ssm-dtype float16, got {cfg.mamba_ssm_dtype!r}. "
-                    "Run with --mamba-ssm-dtype float16 or disable "
-                    "--enable-mamba-cache-stochastic-rounding."
-                )
-            if not is_cuda():
-                raise ValueError(
-                    "Stochastic rounding for the Mamba SSM cache is only "
-                    "supported on NVIDIA CUDA platforms. Disable "
-                    "--enable-mamba-cache-stochastic-rounding on this platform."
-                )
-            if cfg.mamba_backend == "triton" and not is_sm100_supported():
-                raise ValueError(
-                    "Stochastic rounding for the Mamba SSM cache with "
-                    "--mamba-backend triton requires SM100 with CUDA >= 12.8 "
-                    "because it uses the cvt.rs.f16x2.f32 PTX instruction. On "
-                    "H100/SM90, run with --mamba-backend flashinfer "
-                    "--mamba-ssm-dtype float16, or disable "
-                    "--enable-mamba-cache-stochastic-rounding."
-                )
-
-        if cfg.mamba_backend == "flashinfer":
-            flashinfer_error = (
-                "FlashInfer mamba module not available, please check the "
-                "FlashInfer installation."
-            )
-            if cfg.enable_mamba_cache_stochastic_rounding:
-                flashinfer_error += (
-                    " Stochastic rounding with --mamba-backend flashinfer "
-                    "requires FlashInfer Mamba and --mamba-ssm-dtype float16."
-                )
-            if is_flashinfer_available():
-                try:
-                    import flashinfer.mamba  # noqa: F401
-
-                    logger.info("Successfully imported FlashInfer mamba module")
-                except (ImportError, AttributeError):
-                    raise ValueError(flashinfer_error)
-            else:
-                raise ValueError(flashinfer_error)
+        handle_mamba_backend(self)
 
     def _handle_int8_mamba_checkpoint(self):
-        # The int8 mamba checkpoint pool is only wired into the built-in
-        # MambaRadixCache. The host-offload path (enabled by
-        # --enable-hierarchical-cache) and custom radix-cache backends are NOT
-        # int8-aware: they would read int8 checkpoint slots as bf16 active slots
-        # (wrong pool / out-of-range). Reject the combination up front rather than
-        # silently corrupting state.
-        cfg = resolving_view(self)
-        if not cfg.enable_int8_mamba_checkpoint:
-            return
-        if cfg.enable_hierarchical_cache:
-            raise ValueError(
-                "--enable-int8-mamba-checkpoint is not supported together with "
-                "--enable-hierarchical-cache: the host-offload path "
-                "is not int8-aware. Disable one of them."
-            )
-        if cfg.radix_cache_backend is not None:
-            raise ValueError(
-                "--enable-int8-mamba-checkpoint only supports the built-in mamba "
-                f"radix cache; --radix-cache-backend={cfg.radix_cache_backend!r} "
-                "is not int8-aware. Omit --radix-cache-backend."
-            )
+        from sglang.srt.arg_groups.mamba_hook import handle_int8_mamba_checkpoint
+
+        handle_int8_mamba_checkpoint(self)
 
     def _handle_linear_attn_backend(self):
         cfg = resolving_view(self)
@@ -7044,105 +6870,9 @@ class ServerArgs:
         )
 
     def _handle_context_parallelism(self):
-        cfg = resolving_view(self)
-        if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
-            from sglang.srt.configs.model_config import is_deepseek_dsa
-            from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
 
-            model_config = self.get_model_config()
-            hf_config = model_config.hf_config
-            model_arch = hf_config.architectures[0]
-            if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:
-                is_dsa_default_model = is_deepseek_dsa(hf_config)
-                # DSA CP-v2 currently supports only the interleave strategy.
-                enable_default_cp_v2 = not is_dsa_default_model or (
-                    cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
-                )
-                if enable_default_cp_v2 and not envs.SGLANG_ENABLE_CP_V2.is_set():
-                    envs.SGLANG_ENABLE_CP_V2.set(True)
-
-            if (
-                cfg.enable_prefill_cp
-                and model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
-                and envs.SGLANG_ENABLE_CP_V2.get()
-            ):
-                if cfg.cp_strategy != "zigzag":
-                    raise ValueError(
-                        "MiMo V2 CP-v2 only supports --cp-strategy zigzag."
-                    )
-                if (
-                    model_config.is_multimodal
-                    and not cfg.language_only
-                    and not cfg.language_model_only
-                ):
-                    raise ValueError(
-                        "MiMo V2 CP-v2 only supports text inference; add "
-                        "--language-only."
-                    )
-
-        if cfg.enable_prefill_cp and cfg.cp_strategy is None:
-            raise ValueError(
-                "--cp-strategy must be set when --enable-prefill-cp is enabled."
-            )
-
-        if (
-            cfg.enable_prefill_context_parallel
-            and cfg.enable_dsa_prefill_context_parallel
-        ):
-            raise ValueError(
-                "--enable-prefill-context-parallel and "
-                "--enable-nsa-prefill-context-parallel are mutually "
-                "exclusive. Use --enable-nsa-prefill-context-parallel for "
-                "DeepSeek V3.2 (NSA) models and "
-                "--enable-prefill-context-parallel for MLA-based models "
-                "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
-            )
-
-        view = self._resolved()
-        if view.attn_cp_size > 1:
-            # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                cfg.tp_size % view.attn_cp_size == 0
-            ), "tp_size must be divisible by attn_cp_size"
-            assert (
-                cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0
-            ), "tp_size must be divisible by dp_size * attn_cp_size"
-
-            assert (
-                not cfg.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
-
-        if cfg.moe_dp_size > 1:
-            # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                cfg.tp_size % cfg.moe_dp_size == 0
-            ), "tp_size must be divisible by moe_dp_size"
-            assert (
-                view.ep_size * cfg.moe_dp_size <= cfg.tp_size
-            ), "ep_size * moe_dp_size must be less than or equal to tp_size"
-            assert cfg.pp_size == 1, "PP is not supported with context parallelism"
-
-            if view.ep_size > 1:
-                assert (
-                    view.ep_size * cfg.moe_dp_size == cfg.tp_size
-                ), "ep_size * moe_dp_size must be equal to tp_size"
-
-            assert (
-                not cfg.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
-
-        if view.attn_cp_size != cfg.moe_dp_size:
-            assert (
-                cfg.moe_dp_size == 1
-            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
-
-        from sglang.srt.layers.cp.base import init_cp_strategy
-
-        init_cp_strategy(
-            enable_prefill_cp=bool(cfg.enable_prefill_cp),
-            cp_size=cfg.attn_cp_size,
-            cp_strategy=cfg.cp_strategy,
-        )
+        handle_context_parallelism(self)
 
     def _handle_dwdp(self):
         cfg = resolving_view(self)
@@ -9332,18 +9062,9 @@ class ServerArgs:
             )
 
     def _handle_asr_validation(self):
-        """Validate transcription/ASR-specific server args."""
-        cfg = resolving_view(self)
-        if cfg.asr_max_buffer_seconds <= 0:
-            raise ValueError(
-                f"--asr-max-buffer-seconds must be positive "
-                f"(got {cfg.asr_max_buffer_seconds})."
-            )
-        if cfg.asr_max_concurrent_sessions <= 0:
-            raise ValueError(
-                f"--asr-max-concurrent-sessions must be positive "
-                f"(got {cfg.asr_max_concurrent_sessions})."
-            )
+        from sglang.srt.arg_groups.serving_hook import handle_asr_validation
+
+        handle_asr_validation(self)
 
     def _validate_prefill_decode_interval(self):
         cfg = resolving_view(self)
@@ -9462,45 +9183,9 @@ class ServerArgs:
                 test_params.normalize(None)
 
     def _handle_crash_dump_env(self):
-        cfg = resolving_view(self)
-        if not cfg.crash_dump_folder:
-            return
-        _CUDA_COREDUMP_DEFAULTS = {
-            "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
-            "CUDA_ENABLE_USER_TRIGGERED_COREDUMP": "1",
-            "CUDA_COREDUMP_SHOW_PROGRESS": "1",
-            "CUDA_COREDUMP_GENERATION_FLAGS": (
-                "skip_nonrelocated_elf_images,skip_global_memory,"
-                "skip_shared_memory,skip_local_memory,skip_constbank_memory"
-            ),
-            "CUDA_COREDUMP_FILE": f"{cfg.crash_dump_folder}/%h/core.cuda.%t.%p",
-            "CUDA_COREDUMP_PIPE": "/tmp/corepipe.cuda.%h.%p",
-        }
-        for key, value in _CUDA_COREDUMP_DEFAULTS.items():
-            if key not in os.environ:
-                os.environ[key] = value
-                logger.info("Auto-set %s=%s (from --crash-dump-folder)", key, value)
+        from sglang.srt.arg_groups.serving_hook import handle_crash_dump_env
 
-        coredump_dir = os.path.dirname(
-            os.environ["CUDA_COREDUMP_FILE"].replace("%h", socket.gethostname())
-        )
-        if "%" in coredump_dir:
-            logger.warning(
-                "Cannot pre-create CUDA coredump directory %s: only %%h is "
-                "supported in the directory part of CUDA_COREDUMP_FILE; "
-                "coredumps may fail to write.",
-                coredump_dir,
-            )
-        elif coredump_dir:
-            try:
-                os.makedirs(coredump_dir, exist_ok=True)
-            except OSError as e:
-                logger.warning(
-                    "Failed to create CUDA coredump directory %s: %s; "
-                    "coredumps may fail to write.",
-                    coredump_dir,
-                    e,
-                )
+        handle_crash_dump_env(self)
 
     def _handle_debug_utils(self):
         cfg = resolving_view(self)
