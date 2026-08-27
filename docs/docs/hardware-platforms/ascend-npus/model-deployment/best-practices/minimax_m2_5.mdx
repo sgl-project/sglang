@@ -211,7 +211,7 @@ python3 -m sglang.launch_server \
     --enable-prefill-delayer \
     --prefill-max-requests 10 \
     --chunked-prefill-size 67072 \
-    --max-prefill-token 67000 \
+    --max-prefill-tokens 67000 \
     --cuda-graph-bs 2 4 8 12 16 18 20 22 24 26 \
     --moe-a2a-backend ascend_fuseep \
     --deepep-mode auto \
@@ -540,7 +540,7 @@ python3 -m sglang.launch_server \
     --prefill-delayer-max-delay-passes 500 \
     --enable-prefill-delayer \
     --chunked-prefill-size 196608 \
-    --max-prefill-token 8192 \
+    --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 4 8 12 16 20 \
     --moe-a2a-backend ascend_fuseep \
     --fuseep-mode 2 \
