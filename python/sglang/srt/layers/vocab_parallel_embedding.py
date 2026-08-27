@@ -14,6 +14,7 @@ from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_attn_tp_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -510,6 +511,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         if _is_npu:
             return False
         if self.tp_size == 1:
+            return False
+        reduce_group = get_attn_tp_group() if self.use_attn_tp_group else get_tp_group()
+        backend = torch.distributed.get_backend(reduce_group.device_group)
+        if "mooncake" in str(backend).lower():
             return False
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             return False
