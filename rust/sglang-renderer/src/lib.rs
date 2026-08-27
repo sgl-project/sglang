@@ -7,6 +7,7 @@
 pub mod config;
 pub mod error;
 pub mod openai;
+pub mod output;
 pub mod request;
 pub mod sampling;
 pub mod service;
@@ -18,9 +19,13 @@ mod regex;
 
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
+pub use output::{
+    ChatEvent, ChatFinishReason, ChatOutputError, ChatOutputInput, ChatOutputItem,
+    ChatOutputProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatOutput,
+};
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, RendererRequest};
 pub use sampling::SamplingParams;
-pub use service::{ChatRequestBatch, ChatResponsePlan, PreprocessBackend, RendererService};
+pub use service::{LoweredChat, PreprocessBackend, RendererService, RequestLowerer};
 pub use template::ChatFormatter;
 pub use tokenizer::{
     DynamoTokenizer, TextTokenizer, check_total_tokens, load_tokenizer, prepare_direct_request,

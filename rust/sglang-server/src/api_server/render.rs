@@ -68,13 +68,21 @@ async fn render_chat(
         .prepare_chat(&mut request, &response_id)
         .await
     {
-        Ok(mut prepared) => Json(PreparedGenerateRequest::from(
-            prepared
-                .requests
-                .pop()
-                .expect("lowered chat request contains one choice"),
-        ))
-        .into_response(),
+        Ok(prepared) => {
+            // Render-only callers need the prepared generation request, not the
+            // live parser state used after inference. Dropping `output` here is
+            // an explicit property of the preprocess-only contract.
+            let sglang_renderer::LoweredChat {
+                mut requests,
+                output: _,
+            } = prepared;
+            Json(PreparedGenerateRequest::from(
+                requests
+                    .pop()
+                    .expect("lowered chat request contains one choice"),
+            ))
+            .into_response()
+        }
         Err(error) => render_error(error),
     }
 }

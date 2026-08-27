@@ -1,8 +1,7 @@
 //! Shared HTTP test harness and `openai.rs`-level handler tests.
 //!
-//! Submodule tests live next to the code they cover: `chat`, `completions`,
-//! `tools`, and `reasoning` each carry their own
-//! `#[cfg(test)] mod tests`. This module keeps the fixtures they all share —
+//! Submodule tests live next to the code they cover. This module keeps the
+//! fixtures shared by chat and completions —
 //! channel fixtures (`senders`, `chunk`, `submitted`, `chat_submitted`) and the
 //! full-router harness (`server_args`, `app_state`,
 //! `oneshot`, `post_json`, `body_json`) — plus the handler-level tests that
@@ -23,11 +22,7 @@ use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::message::types::TokenIds;
-use crate::renderer::{PreprocessJob, new_renderer_service};
-use crate::runtime::Runnable;
-use crate::tokenizer_manager::to_scheduler::Limits;
-use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
+use crate::renderer::new_request_lowerer;
 use crate::tokenizer_manager::wiring::{Senders, TmEvent};
 use crate::utils::error::Error;
 
@@ -105,24 +100,15 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 }
 
 pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
-    struct TestTokenizer;
-    impl TextTokenizer for TestTokenizer {
-        fn encode(&self, text: &str) -> Result<TokenIds, sglang_renderer::RendererError> {
-            Ok(text.split_whitespace().map(|_| 7).collect())
-        }
-    }
+    app_state_with_args(senders, server_args())
+}
 
-    let server_args = server_args();
-    let limits = Limits::from(&*server_args);
-    let (jobs, worker_jobs) = flume::unbounded::<PreprocessJob>();
-    std::thread::spawn(move || {
-        TokenizerWorker::new(worker_jobs, None, Arc::new(TestTokenizer), limits).run()
-    });
-    let renderer = Arc::new(new_renderer_service(server_args.clone(), jobs));
+fn app_state_with_args(senders: Senders, server_args: Arc<ServerArgs>) -> Arc<super::AppState> {
+    let lowerer = Arc::new(new_request_lowerer(&server_args));
     Arc::new(super::AppState {
         frontend: FrontendHandle::new(senders, 8),
         server_args,
-        renderer,
+        lowerer,
         response_activity: Default::default(),
     })
 }
@@ -271,6 +257,59 @@ async fn completions_enter_the_fsm_before_tokenization() {
         panic!("completion must lower to a generate request")
     };
     assert_eq!(generate.text.as_deref(), Some("two words"));
+    assert!(
+        generate.input_ids.is_none(),
+        "full inference must leave tokenization to the shared FSM"
+    );
+    assert!(
+        !generate.sampling_params.is_normalized,
+        "the shared FSM must own sampling normalization"
+    );
+
+    request
+        .sink
+        .try_send(ResponseItem::Error(Error::Validation(
+            "test terminal".into(),
+        )))
+        .unwrap();
+    assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn chat_enters_the_fsm_after_renderer_lowering() {
+    let (tm_tx, tm_rx) = flume::unbounded();
+    let mut frontend_senders = senders();
+    frontend_senders.tok_manager_tx = tm_tx;
+    let server_args = Arc::new(ServerArgs {
+        model_path: "test-model".into(),
+        served_model_name: "model".into(),
+        tokenizer_path: ".".into(),
+        chat_template: Some("chatml".into()),
+        ..Default::default()
+    });
+    let app = routes().with_state(app_state_with_args(frontend_senders, server_args));
+
+    let response = tokio::spawn(post_json(
+        app,
+        "/v1/chat/completions",
+        json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "two words"}]
+        }),
+    ));
+    let TmEvent::Intake(request) = tm_rx.recv_async().await.unwrap() else {
+        panic!("OpenAI request must enter through the FSM intake lane")
+    };
+    let crate::message::request::RequestKind::Generate(generate) = &request.kind else {
+        panic!("chat must lower to a generate request")
+    };
+    assert!(
+        generate
+            .text
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("two words")),
+        "renderer lowering must apply the chat template before FSM intake"
+    );
     assert!(
         generate.input_ids.is_none(),
         "full inference must leave tokenization to the shared FSM"

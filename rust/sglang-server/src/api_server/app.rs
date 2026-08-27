@@ -10,21 +10,21 @@ use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai, render};
 use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
-use crate::renderer::RendererService;
+use crate::renderer::{RendererService, RequestLowerer};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
-/// Shared HTTP handler state: the protocol-neutral frontend handle, immutable
-/// server configuration, and the engine-free renderer service.
+/// Shared inference handler state: the protocol-neutral frontend handle,
+/// immutable server configuration, and engine-free OpenAI request lowerer.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning each
-/// `flume::Sender` and the renderer. Deliberately not `Clone`, so it
+/// `flume::Sender` and the lowerer. Deliberately not `Clone`, so it
 /// can only be shared through that `Arc`.
 pub(super) struct AppState {
     pub(super) frontend: FrontendHandle,
     pub(super) server_args: Arc<ServerArgs>,
-    pub(super) renderer: Arc<RendererService>,
+    pub(super) lowerer: Arc<RequestLowerer>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
 }
@@ -34,7 +34,7 @@ pub async fn serve(
     senders: Senders,
     response_buf: usize,
     server_args: Arc<ServerArgs>,
-    renderer: Arc<RendererService>,
+    lowerer: Arc<RequestLowerer>,
     response_activity: ActivityCounter,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
@@ -45,7 +45,7 @@ pub async fn serve(
     let state = Arc::new(AppState {
         frontend: FrontendHandle::new(senders, response_buf),
         server_args: server_args.clone(),
-        renderer,
+        lowerer,
         response_activity,
     });
     // Each endpoint module registers its own routes and merges here.

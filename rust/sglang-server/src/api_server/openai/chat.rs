@@ -13,33 +13,41 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::ToolDefinition;
-use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_protocols::types::{
-    ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
-    ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, Role, ServiceTier as ChatServiceTier, TopLogprobs,
+    ChatChoice, ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallChunk, ChatCompletionResponseMessage,
+    ChatCompletionStreamResponseDelta, CreateChatCompletionRequest, CreateChatCompletionResponse,
+    CreateChatCompletionStreamResponse, FinishReason as OpenAIFinishReason, FunctionCall,
+    FunctionCallStream, FunctionType, Role, ServiceTier as ChatServiceTier,
 };
 use futures::StreamExt;
-use sglang_renderer::openai::dynamo_parser_name;
+use sglang_renderer::{
+    ChatEvent, ChatFinishReason, ChatOutputItem, ChatOutputProcessor, ChatToolCallDelta,
+};
 use tokio::sync::mpsc;
 
 use super::completions::completion_usage;
-use super::reasoning::{ReasoningStreamSplitter, split_reasoning_unary};
-use super::tools::{chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
-    AppState, collect_output, error_payload, indexed_decode_stream, openai_error,
-    submit_generation, unix_seconds_u32,
+    AppState, collect_output, error_payload, openai_error, submit_generation, unix_seconds_u32,
 };
+use crate::chat_output::{chat_finish_reason, chat_logprobs, semantic_chat_stream};
 use crate::frontend::AbortGuard;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
-use crate::message::response::{ChunkExtras, ResponseItem};
+use crate::message::response::ResponseItem;
 use crate::renderer::render_http_status;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
+}
+
+struct ChatStreamWireContext {
+    response_id: String,
+    model: String,
+    created: u32,
+    want_logprobs: bool,
+    include_usage: bool,
+    service_tier: Option<ChatServiceTier>,
 }
 
 async fn chat_completions(
@@ -53,7 +61,7 @@ async fn chat_completions(
         }
     };
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let prepared = match state.renderer.lower_chat(&mut request, &response_id).await {
+    let prepared = match state.lowerer.lower_chat(&mut request, &response_id).await {
         Ok(prepared) => prepared,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))
@@ -62,11 +70,19 @@ async fn chat_completions(
         }
     };
     let native_requests = prepared.requests;
-    let response = prepared.response;
-    let stream = response.stream;
+    let output = prepared.output;
+    let stream = request.stream.unwrap_or(false);
+    let model = request.model.clone();
+    let want_logprobs = request.logprobs.unwrap_or(false);
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+        || state.lowerer.config().stream_response_default_include_usage;
+    let service_tier = request.service_tier.clone();
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(response.choice_count);
+    let mut submitted = Vec::with_capacity(native_requests.len());
 
     for (index, rendered) in native_requests.into_iter().enumerate() {
         let native = GenerateRequest::from(rendered);
@@ -81,18 +97,15 @@ async fn chat_completions(
         let event_stream = chat_event_stream(
             submitted,
             guard,
-            response.response_id,
-            response.model,
-            created,
-            response.want_logprobs,
-            response.include_usage,
-            response.parser,
-            response.reasoning_parser,
-            response.tools,
-            response.stream_tool_choice,
-            response.uses_tool_call_structural_tag,
-            response.parallel_tool_calls,
-            response.service_tier,
+            output,
+            ChatStreamWireContext {
+                response_id,
+                model,
+                created,
+                want_logprobs,
+                include_usage,
+                service_tier,
+            },
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(event_stream).into_response()
@@ -100,15 +113,12 @@ async fn chat_completions(
         unary_chat(
             submitted,
             guard,
-            response.response_id,
-            response.model,
+            output,
+            response_id,
+            model,
             created,
-            response.want_logprobs,
-            response.parser,
-            response.reasoning_parser,
-            response.tools,
-            response.parallel_tool_calls,
-            response.service_tier,
+            want_logprobs,
+            service_tier,
         )
         .await
     }
@@ -118,14 +128,11 @@ async fn chat_completions(
 pub(super) async fn unary_chat(
     submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
+    mut output_processor: ChatOutputProcessor,
     response_id: String,
     model: String,
     created: u32,
     want_logprobs: bool,
-    parser: Option<String>,
-    reasoning_parser: Option<String>,
-    tools: Option<Vec<ToolDefinition>>,
-    parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
     let mut choices = Vec::with_capacity(submitted.len());
@@ -145,34 +152,39 @@ pub(super) async fn unary_chat(
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-        let finish_reason = chat_finish_reason(&output);
-        // Split reasoning markers out of the content first (Python splits
-        // before tool-call parsing too), then parse tool calls on the clean
-        // normal text.
-        let (reasoning_text, text) =
-            split_reasoning_unary(reasoning_parser.as_deref(), &output.text, &output.token_ids);
-        let (content, tool_calls) = parse_chat_tool_calls(
-            text,
-            parser.as_deref(),
-            tools.as_deref(),
-            parallel_tool_calls,
-        )
-        .await;
-        let finish_reason = if tool_calls.is_some() {
+        let finish_reason = chat_finish_reason(&output).map(openai_finish_reason);
+        let parsed = output_processor
+            .process_unary(output.text, &output.token_ids)
+            .await;
+        let finish_reason = if parsed.tool_calls.is_some() {
             Some(OpenAIFinishReason::ToolCalls)
         } else {
             finish_reason
         };
         #[allow(deprecated)]
         let message = ChatCompletionResponseMessage {
-            content: (!content.is_empty()).then_some(ChatCompletionMessageContent::Text(content)),
+            content: (!parsed.content.is_empty())
+                .then_some(ChatCompletionMessageContent::Text(parsed.content)),
             refusal: None,
-            tool_calls,
+            tool_calls: parsed.tool_calls.map(|calls| {
+                calls
+                    .into_iter()
+                    .map(|call| ChatCompletionMessageToolCall {
+                        id: call.id,
+                        r#type: FunctionType::Function,
+                        function: FunctionCall {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                    })
+                    .collect()
+            }),
             role: Role::Assistant,
             function_call: None,
             audio: None,
             // Python: `reasoning_text if reasoning_text else None`.
-            reasoning_content: (!reasoning_text.is_empty()).then_some(reasoning_text),
+            reasoning_content: (!parsed.reasoning_content.is_empty())
+                .then_some(parsed.reasoning_content),
         };
         choices.push(ChatChoice {
             index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -198,281 +210,144 @@ pub(super) async fn unary_chat(
     .into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn chat_event_stream(
+fn chat_event_stream(
     submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
-    mut guard: AbortGuard,
-    response_id: String,
-    model: String,
-    created: u32,
-    want_logprobs: bool,
-    include_usage: bool,
-    parser: Option<String>,
-    reasoning_parser: Option<String>,
-    tools: Option<Vec<ToolDefinition>>,
-    tool_choice: Option<ChatCompletionToolChoiceOption>,
-    uses_tool_call_structural_tag: bool,
-    parallel_tool_calls: bool,
-    service_tier: Option<ChatServiceTier>,
+    guard: AbortGuard,
+    output_processor: ChatOutputProcessor,
+    context: ChatStreamWireContext,
 ) -> impl futures::Stream<Item = String> {
-    let count = submitted.len();
-    let raw = async_stream::stream! {
-        let count = submitted.len();
-        let mut rids = Vec::with_capacity(count);
-        let mut streams = Vec::with_capacity(count);
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u64;
-        // One stateful reasoning splitter per choice (Python keeps a
-        // `reasoning_parser_dict` per index).
-        let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
-            if reasoning_parser.is_some() {
-                (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref()))
-                    .collect()
-            } else {
-                vec![]
-            };
-        let reasoning_enabled = !reasoning_splitters.is_empty();
-
-        for (index, rid, rx) in submitted {
-            rids.push(rid);
-            streams.push(indexed_decode_stream(index, rx));
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id.clone(),
-                    choices: vec![ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, Some(Role::Assistant), None, None),
-                        finish_reason: None,
-                        logprobs: None,
-                    }],
-                    created,
-                    model: model.clone(),
-                    service_tier: service_tier.clone(),
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: None,
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
-        }
-
-        let mut events = futures::stream::select_all(streams);
-        while let Some((index, item)) = events.next().await {
-            let Some(item) = item else {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::INTERNAL_SERVER_ERROR, "response truncated before completion").to_string()),
-                };
-                continue;
-            };
-            let output = match item {
-                ResponseItem::Frame(output) => output,
-                ResponseItem::Done(output) => {
-                    guard.disarm(&rids[index]);
-                    output
-                }
-                ResponseItem::Error(error) => {
-                    guard.disarm(&rids[index]);
-                    yield Annotated {
-                        data: None,
-                        id: None,
-                        event: None,
-                        comment: None,
-                        error: Some(error_payload(StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.to_string()).to_string()),
-                    };
-                    continue;
-                }
-                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
-            };
-            if let Some((code, message)) = output
-                .finish_reason
-                .as_ref()
-                .and_then(|reason| reason.abort_status())
-            {
-                yield Annotated {
-                    data: None,
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: Some(error_payload(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), message).to_string()),
-                };
-                continue;
-            }
-
-            if prompt_tokens == 0 {
-                prompt_tokens = output.prompt_tokens;
-            }
-            completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-            let finish_reason = chat_finish_reason(&output);
-            // Split the step's text into (reasoning, normal) deltas when
-            // `--reasoning-parser` is set. Mirrors Python's per-step emission:
-            // reasoning chunk first (logprobs ride it), then the content chunk.
-            let mut emitted = Vec::with_capacity(2);
-            if reasoning_enabled {
-                let (reasoning_text, normal_text) =
-                    reasoning_splitters[index].split(&output.text, &output.token_ids);
-                let mut remaining_logprobs =
-                    want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-                if !reasoning_text.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(reasoning_text)),
-                        finish_reason: None,
-                        logprobs: remaining_logprobs.clone(),
-                    });
-                    remaining_logprobs = None;
-                }
-                if !normal_text.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(normal_text), None, None, None),
-                        finish_reason: None,
-                        logprobs: remaining_logprobs,
-                    });
-                }
-            } else {
-                emitted.push(ChatChoiceStream {
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    delta: chat_delta(
-                        (!output.text.is_empty()).then_some(output.text),
-                        None,
-                        None,
-                        None,
-                    ),
-                    finish_reason: None,
-                    logprobs: want_logprobs.then(|| chat_logprobs(output.extras.as_deref())),
-                });
-            };
-            // Flush the choice's buffered reasoning tail before its terminal
-            // frame (Python `parse_stream_end`, which skips aborts — abort
-            // frames already became error chunks above). Both columns flush:
-            // some parsers buffer the answer text until EOF.
-            if reasoning_enabled && finish_reason.is_some() {
-                let (reasoning_tail, normal_tail) = reasoning_splitters[index].finish();
-                if !reasoning_tail.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(None, None, None, Some(reasoning_tail)),
-                        finish_reason: None,
-                        logprobs: None,
-                    });
-                }
-                if !normal_tail.is_empty() {
-                    emitted.push(ChatChoiceStream {
-                        index: u32::try_from(index).unwrap_or(u32::MAX),
-                        delta: chat_delta(Some(normal_tail), None, None, None),
-                        finish_reason: None,
-                        logprobs: None,
-                    });
-                }
-            }
-            // The finish reason rides the last emitted chunk (the wire format
-            // the equivalence tests pin); a step whose text was entirely
-            // buffered inside the parser still gets a finish-only frame.
-            match emitted.last_mut() {
-                Some(last) => last.finish_reason = finish_reason,
-                None => emitted.push(ChatChoiceStream {
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    delta: chat_delta(None, None, None, None),
-                    finish_reason,
-                    logprobs: None,
-                }),
-            }
-            for choice in emitted {
-                yield Annotated {
-                    data: Some(CreateChatCompletionStreamResponse {
-                        id: response_id.clone(),
-                        choices: vec![choice],
-                        created,
-                        model: model.clone(),
-                        service_tier: service_tier.clone(),
-                        system_fingerprint: None,
-                        object: "chat.completion.chunk".into(),
-                        usage: None,
-                    }),
-                    id: None,
-                    event: None,
-                    comment: None,
-                    error: None,
-                };
-            }
-        }
-
-        if include_usage {
-            yield Annotated {
-                data: Some(CreateChatCompletionStreamResponse {
-                    id: response_id,
-                    choices: vec![],
-                    created,
-                    model,
-                    service_tier,
-                    system_fingerprint: None,
-                    object: "chat.completion.chunk".into(),
-                    usage: Some(completion_usage(
-                        prompt_tokens,
-                        u32::try_from(completion_tokens).unwrap_or(u32::MAX),
-                    )),
-                }),
-                id: None,
-                event: None,
-                comment: None,
-                error: None,
-            };
-        }
-    };
-
-    let parsed: std::pin::Pin<
-        Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
-    > = if let Some(parser) = parser {
-        Box::pin(apply_tool_calling_jail(
-            Some(dynamo_parser_name(&parser).to_owned()),
-            tool_choice,
-            tools,
-            uses_tool_call_structural_tag,
-            raw,
-        ))
-    } else {
-        Box::pin(raw)
-    };
+    let parsed = semantic_chat_stream(submitted, guard, output_processor, context.want_logprobs);
 
     async_stream::stream! {
-        let mut tool_calls_seen = vec![false; count];
         futures::pin_mut!(parsed);
-        while let Some(mut item) = parsed.next().await {
-            if let Some(response) = item.data.as_mut() {
-                if !parallel_tool_calls {
-                    for choice in &mut response.choices {
-                        let index = choice.index as usize;
-                        if let Some(calls) = choice.delta.tool_calls.as_mut() {
-                            if tool_calls_seen.get(index).copied().unwrap_or(false) {
-                                calls.clear();
-                            } else {
-                                calls.truncate(1);
-                                if !calls.is_empty()
-                                    && let Some(seen) = tool_calls_seen.get_mut(index)
-                                {
-                                    *seen = true;
-                                }
-                            }
-                            if calls.is_empty() {
-                                choice.delta.tool_calls = None;
-                            }
-                        }
-                    }
+        while let Some(item) = parsed.next().await {
+            match item {
+                ChatOutputItem::Event(ChatEvent::Role { choice }) => {
+                    yield serialize_chat_stream_response(chat_stream_response(
+                        &context.response_id,
+                        &context.model,
+                        context.created,
+                        context.service_tier.clone(),
+                        vec![ChatChoiceStream {
+                            index: choice as u32,
+                            delta: chat_delta(None, Some(Role::Assistant), None, None),
+                            finish_reason: None,
+                            logprobs: None,
+                        }],
+                        None,
+                    ));
                 }
-                yield serialize_chat_stream_response(response.clone());
-            } else if let Some(error) = item.error {
-                yield error;
+                ChatOutputItem::Event(ChatEvent::Delta {
+                    choice,
+                    content,
+                    reasoning_content,
+                    tool_calls,
+                    finish_reason,
+                    logprobs,
+                }) => {
+                    yield serialize_chat_stream_response(chat_stream_response(
+                        &context.response_id,
+                        &context.model,
+                        context.created,
+                        context.service_tier.clone(),
+                        vec![ChatChoiceStream {
+                            index: choice as u32,
+                            delta: chat_delta(
+                                content,
+                                None,
+                                tool_calls.map(|calls| {
+                                    calls.into_iter().map(openai_tool_call_delta).collect()
+                                }),
+                                reasoning_content,
+                            ),
+                            finish_reason: finish_reason.map(openai_finish_reason),
+                            logprobs,
+                        }],
+                        None,
+                    ));
+                }
+                ChatOutputItem::Event(ChatEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                }) if context.include_usage => {
+                    yield serialize_chat_stream_response(chat_stream_response(
+                        &context.response_id,
+                        &context.model,
+                        context.created,
+                        context.service_tier.clone(),
+                        Vec::new(),
+                        Some((prompt_tokens, completion_tokens)),
+                    ));
+                }
+                ChatOutputItem::Event(ChatEvent::Usage { .. }) => {}
+                ChatOutputItem::Error(error) => {
+                    let status = StatusCode::from_u16(error.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    yield error_payload(status, error.message).to_string();
+                }
             }
         }
         yield "[DONE]".to_string();
+    }
+}
+
+#[allow(deprecated)]
+fn chat_delta(
+    content: Option<String>,
+    role: Option<Role>,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    reasoning_content: Option<String>,
+) -> ChatCompletionStreamResponseDelta {
+    ChatCompletionStreamResponseDelta {
+        content: content.map(ChatCompletionMessageContent::Text),
+        function_call: None,
+        tool_calls,
+        role,
+        refusal: None,
+        reasoning_content,
+    }
+}
+
+fn chat_stream_response(
+    response_id: &str,
+    model: &str,
+    created: u32,
+    service_tier: Option<ChatServiceTier>,
+    choices: Vec<ChatChoiceStream>,
+    usage: Option<(u32, u64)>,
+) -> CreateChatCompletionStreamResponse {
+    CreateChatCompletionStreamResponse {
+        id: response_id.to_owned(),
+        choices,
+        created,
+        model: model.to_owned(),
+        service_tier,
+        system_fingerprint: None,
+        object: "chat.completion.chunk".into(),
+        usage: usage.map(|(prompt, completion)| {
+            completion_usage(prompt, u32::try_from(completion).unwrap_or(u32::MAX))
+        }),
+    }
+}
+
+fn openai_finish_reason(reason: ChatFinishReason) -> OpenAIFinishReason {
+    match reason {
+        ChatFinishReason::Stop => OpenAIFinishReason::Stop,
+        ChatFinishReason::Length => OpenAIFinishReason::Length,
+        ChatFinishReason::ContentFilter => OpenAIFinishReason::ContentFilter,
+        ChatFinishReason::ToolCalls => OpenAIFinishReason::ToolCalls,
+    }
+}
+
+fn openai_tool_call_delta(call: ChatToolCallDelta) -> ChatCompletionMessageToolCallChunk {
+    ChatCompletionMessageToolCallChunk {
+        index: call.index,
+        id: call.id,
+        r#type: Some(FunctionType::Function),
+        function: Some(FunctionCallStream {
+            name: call.name,
+            arguments: call.arguments,
+        }),
     }
 }
 
@@ -489,64 +364,15 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
     response.to_string()
 }
 
-#[allow(deprecated)]
-pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs {
-    let mut content = Vec::new();
-    let Some(extras) = extras else {
-        return ChatChoiceLogprobs {
-            content: Some(content),
-            refusal: None,
-        };
-    };
-    let mut top_offset = 0usize;
-    for (position, (&logprob, &token_id)) in
-        extras.out_lp_val.iter().zip(&extras.out_lp_idx).enumerate()
-    {
-        let token = extras
-            .out_lp_txt
-            .get(position)
-            .cloned()
-            .unwrap_or_else(|| format!("token_id:{token_id}"));
-        let top_len = extras.out_top_lens.get(position).copied().unwrap_or(0) as usize;
-        let top_logprobs = extras.out_top_val[top_offset..]
-            .iter()
-            .zip(&extras.out_top_idx[top_offset..])
-            .take(top_len)
-            .enumerate()
-            .map(|(offset, (&logprob, &id))| {
-                let text = extras
-                    .out_top_txt
-                    .get(top_offset + offset)
-                    .cloned()
-                    .unwrap_or_else(|| format!("token_id:{id}"));
-                TopLogprobs {
-                    bytes: Some(text.as_bytes().to_vec()),
-                    token: text,
-                    logprob,
-                }
-            })
-            .collect();
-        top_offset = top_offset.saturating_add(top_len);
-        content.push(ChatCompletionTokenLogprob {
-            bytes: Some(token.as_bytes().to_vec()),
-            token,
-            logprob,
-            token_id: u32::try_from(token_id).ok(),
-            top_logprobs,
-        });
-    }
-    ChatChoiceLogprobs {
-        content: Some(content),
-        refusal: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk, senders};
-    use super::{chat_event_stream, chat_logprobs, unary_chat};
+    use super::{ChatStreamWireContext, chat_event_stream, unary_chat};
+    use crate::chat_output::chat_logprobs;
     use crate::frontend::AbortGuard;
+    use crate::message::config::ServerArgs;
     use crate::message::response::ChunkExtras;
+    use crate::renderer::new_request_lowerer;
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
     use futures::StreamExt;
@@ -559,6 +385,43 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    async fn output_processor(
+        reasoning_parser: Option<&str>,
+        choices: usize,
+    ) -> sglang_renderer::ChatOutputProcessor {
+        let args = ServerArgs {
+            model_path: "test-model".into(),
+            served_model_name: "model".into(),
+            tokenizer_path: ".".into(),
+            chat_template: Some("chatml".into()),
+            reasoning_parser: reasoning_parser.map(str::to_owned),
+            ..Default::default()
+        };
+        let lowerer = new_request_lowerer(&args);
+        let mut request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": choices
+        }))
+        .unwrap();
+        lowerer
+            .lower_chat(&mut request, "chatcmpl-test")
+            .await
+            .unwrap()
+            .output
+    }
+
+    fn wire_context(include_usage: bool) -> ChatStreamWireContext {
+        ChatStreamWireContext {
+            response_id: "chatcmpl-test".into(),
+            model: "model".into(),
+            created: 1,
+            want_logprobs: false,
+            include_usage,
+            service_tier: None,
+        }
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
@@ -652,14 +515,11 @@ mod tests {
         let response = unary_chat(
             vec![choice0, choice1],
             AbortGuard::new_empty(senders().abort_tx),
+            output_processor(None, 2).await,
             "chatcmpl-test".into(),
             "model".into(),
             1,
             false,
-            None,
-            None,
-            None,
-            true,
             None,
         )
         .await;
@@ -689,14 +549,11 @@ mod tests {
         let response = unary_chat(
             vec![choice],
             AbortGuard::new_empty(senders().abort_tx),
+            output_processor(Some("deepseek-r1"), 1).await,
             "chatcmpl-test".into(),
             "model".into(),
             1,
             false,
-            None,
-            Some("deepseek-r1".into()),
-            None,
-            true,
             None,
         )
         .await;
@@ -727,18 +584,8 @@ mod tests {
         let stream = chat_event_stream(
             vec![choice],
             AbortGuard::new_empty(senders().abort_tx),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            true,
-            None,
-            Some("deepseek-r1".into()),
-            None,
-            None,
-            false,
-            true,
-            None,
+            output_processor(Some("deepseek-r1"), 1).await,
+            wire_context(true),
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;
@@ -773,18 +620,8 @@ mod tests {
         let stream = chat_event_stream(
             vec![choice],
             AbortGuard::new_empty(senders().abort_tx),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            true,
-            None,
-            None,
-            None,
-            None,
-            false,
-            true,
-            None,
+            output_processor(None, 1).await,
+            wire_context(true),
         );
         futures::pin_mut!(stream);
         let frames: Vec<String> = stream.collect().await;

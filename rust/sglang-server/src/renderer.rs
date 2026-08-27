@@ -11,7 +11,7 @@ use crate::message::request::{GenerateRequest, Request};
 
 pub(crate) use sglang_renderer::{
     PreparedGenerateRequest, RendererConfig, RendererError as RenderServiceError, RendererRequest,
-    RendererService,
+    RendererService, RequestLowerer,
 };
 use sglang_renderer::{PreprocessBackend, RendererLimits, SamplingDefaults};
 
@@ -58,9 +58,13 @@ pub(crate) fn new_renderer_service(
     jobs: flume::Sender<PreprocessJob>,
 ) -> RendererService {
     RendererService::new(
-        renderer_config(&server_args),
+        new_request_lowerer(&server_args),
         Arc::new(ServerPreprocessBackend { jobs }),
     )
+}
+
+pub(crate) fn new_request_lowerer(server_args: &ServerArgs) -> RequestLowerer {
+    RequestLowerer::new(renderer_config(server_args))
 }
 
 fn renderer_config(args: &ServerArgs) -> RendererConfig {

@@ -12,8 +12,6 @@ use tokio::sync::mpsc;
 mod chat;
 mod completions;
 mod models;
-mod reasoning;
-mod tools;
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;

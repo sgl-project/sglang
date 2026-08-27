@@ -3701,6 +3701,7 @@ dependencies = [
 name = "sglang-renderer"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "dynamo-parsers",
  "dynamo-protocols",
  "dynamo-renderer",

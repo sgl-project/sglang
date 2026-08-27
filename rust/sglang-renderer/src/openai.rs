@@ -608,3 +608,138 @@ pub fn completion_sampling_params(
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_protocols::types::{
+        ChatCompletionNamedToolChoice, ChatCompletionToolType, FunctionName,
+    };
+
+    fn tool(name: &str, strict: bool) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            })),
+            strict: Some(strict),
+        }
+    }
+
+    #[test]
+    fn tool_parser_names_and_wire_choices_are_canonicalized() {
+        assert_eq!(dynamo_parser_name("llama3"), "llama3_json");
+        assert_eq!(dynamo_parser_name("qwen"), "qwen25");
+        assert_eq!(dynamo_parser_name("glm45"), "glm47");
+
+        let named = Some(ChatCompletionToolChoiceOption::Named(
+            ChatCompletionNamedToolChoice {
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionName {
+                    name: "get_weather".into(),
+                },
+            },
+        ));
+        assert!(matches!(dynamo_tool_choice(&None), DynamoToolChoice::Auto));
+        assert!(matches!(
+            dynamo_tool_choice(&Some(ChatCompletionToolChoiceOption::Required)),
+            DynamoToolChoice::Required
+        ));
+        assert!(matches!(
+            dynamo_tool_choice(&named),
+            DynamoToolChoice::Named(name) if name == "get_weather"
+        ));
+    }
+
+    #[test]
+    fn required_and_named_choices_build_tool_constraints() {
+        let tools = [tool("get_weather", false), tool("get_time", false)];
+
+        let mut required = SamplingParams::default();
+        apply_tool_constraint(
+            &mut required,
+            Some("llama3"),
+            &DynamoToolChoice::Required,
+            &tools,
+            Some(false),
+        )
+        .unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(required.json_schema.as_deref().unwrap()).unwrap();
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], 1);
+
+        let mut named = SamplingParams::default();
+        apply_tool_constraint(
+            &mut named,
+            Some("llama3"),
+            &DynamoToolChoice::Named("get_time".into()),
+            &tools,
+            None,
+        )
+        .unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(named.json_schema.as_deref().unwrap()).unwrap();
+        assert_eq!(schema["items"]["properties"]["name"]["enum"][0], "get_time");
+    }
+
+    #[test]
+    fn strict_auto_uses_the_parser_structural_tag() {
+        let mut unconstrained = SamplingParams::default();
+        apply_tool_constraint(
+            &mut unconstrained,
+            Some("llama3"),
+            &DynamoToolChoice::Auto,
+            &[tool("get_weather", false)],
+            None,
+        )
+        .unwrap();
+        assert!(unconstrained.json_schema.is_none());
+        assert!(unconstrained.structural_tag.is_none());
+
+        let mut sampling = SamplingParams::default();
+        apply_tool_constraint(
+            &mut sampling,
+            Some("llama3"),
+            &DynamoToolChoice::Auto,
+            &[tool("get_weather", true)],
+            None,
+        )
+        .unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(sampling.structural_tag.as_deref().unwrap()).unwrap();
+        assert_eq!(schema["type"], "structural_tag");
+        assert_eq!(schema["format"]["type"], "triggered_tags");
+    }
+
+    #[test]
+    fn invalid_tool_choices_are_rejected_without_a_parser() {
+        let mut sampling = SamplingParams::default();
+        let error =
+            apply_tool_constraint(&mut sampling, None, &DynamoToolChoice::Required, &[], None)
+                .unwrap_err();
+        assert!(error.contains("required"));
+
+        let error = apply_tool_constraint(
+            &mut sampling,
+            None,
+            &DynamoToolChoice::Named("missing".into()),
+            &[tool("get_weather", false)],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("missing"));
+
+        let error = apply_tool_constraint(
+            &mut sampling,
+            Some("not-a-parser"),
+            &DynamoToolChoice::Auto,
+            &[tool("get_weather", false)],
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("not supported"));
+    }
+}

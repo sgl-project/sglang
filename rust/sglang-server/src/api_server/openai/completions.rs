@@ -65,7 +65,7 @@ async fn completions(
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests = match state.renderer.lower_completions(&request, &response_id) {
+    let native_requests = match state.lowerer.lower_completions(&request, &response_id) {
         Ok(requests) => requests,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))
@@ -119,10 +119,7 @@ async fn completions(
             .stream_options
             .map(|o| o.include_usage)
             .unwrap_or(false)
-            || state
-                .renderer
-                .config()
-                .stream_response_default_include_usage;
+            || state.lowerer.config().stream_response_default_include_usage;
         let continuous_usage = request
             .stream_options
             .map(|o| o.continuous_usage_stats)
