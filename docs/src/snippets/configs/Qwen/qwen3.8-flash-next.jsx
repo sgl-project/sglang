@@ -182,10 +182,24 @@ export const config = {
   // Deploy panel's default selection.
   //
   // Within a quantization the NVIDIA cells are identical across
-  // H200/B200/B300/GB300, and `--linear-attn-{prefill,decode}-backend flashinfer` is
+  // H200/B200/B300/GB300 except for `--mamba-ssm-dtype`, and
+  // `--linear-attn-{prefill,decode}-backend flashinfer` is
   // pinned explicitly rather than left to the GDN default, which differs by GPU
   // generation (Triton on SM90, and the flashinfer decode default is gated on
-  // `--mamba-ssm-dtype bfloat16`). Pinning both makes one recipe portable.
+  // `--mamba-ssm-dtype bfloat16`).
+  //
+  // The state dtype is the one flag that cannot be shared. SM100+ *requires*
+  // bfloat16 whenever the flashinfer linear-attn decode backend is selected;
+  // server_args rejects anything else up front. SM90 needs the opposite as
+  // soon as speculation is on: FlashInferGDNKernels installs the bf16 MTP
+  // adapter only when `use_state_pool` (SM100+), so on Hopper the verify path
+  // still calls flashinfer's fp32-only `gated_delta_rule_mtp`, which asserts
+  //     initial_state must be float32, got torch.bfloat16
+  // during CUDA graph capture -- after the model has fully loaded, and with no
+  // mention of the flag that caused it. Nothing validates that direction, so
+  // the H200 speculative cells below pin float32 explicitly. The H200
+  // non-speculative cells keep bfloat16: SM90 decode gathers and casts the
+  // state itself, so only the verify path is affected.
   cells: [
     // ==== BF16 ====
     // Low latency: MTP on, concurrency capped at 96. Without an explicit
@@ -202,7 +216,9 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
-        "--mamba-ssm-dtype bfloat16",
+        // SM90 has no bf16 GDN MTP-verify kernel, so a speculative run needs
+        // a float32 state here. See the note above the cells.
+        "--mamba-ssm-dtype float32",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -443,7 +459,9 @@ export const config = {
         "--chunked-prefill-size 8192",
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
-        "--mamba-ssm-dtype bfloat16",
+        // SM90 has no bf16 GDN MTP-verify kernel, so a speculative run needs
+        // a float32 state here. See the note above the cells.
+        "--mamba-ssm-dtype float32",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
