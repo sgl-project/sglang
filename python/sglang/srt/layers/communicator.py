@@ -707,10 +707,8 @@ class LayerCommunicator:
                         fuse_quant=fuse_quant,
                     )
                     # Else per-group FP8 fused path (opt-in via
-                    # enable_fused_ar_quant). Needs a positive per-group
-                    # FP8 signal (quant_format == "fp8"); an empty quant_format
-                    # means a bf16 consumer that must get a plain tensor, not a
-                    # (fp8, scale) tuple. "fp8_per_token"/"mxfp4" handled above.
+                    # enable_fused_ar_quant). Skip fp8_per_token/mxfp4 (wrong
+                    # scale layout); empty quant_format still uses this path.
                     if (
                         quant_result is None
                         and _use_aiter
@@ -730,8 +728,9 @@ class LayerCommunicator:
                         )
                     elif (
                         quant_result is None
-                        and quant_format == "fp8"
                         and self.enable_fused_ar_quant
+                        and quant_format != "fp8_per_token"
+                        and "mxfp4" not in quant_format
                         and _use_aiter
                         and hasattr(
                             self.input_layernorm,
@@ -749,6 +748,9 @@ class LayerCommunicator:
                     if quant_result is not None:
                         hidden_states, residual = quant_result
                     else:
+                        # Fused 1-kernel quant unavailable (shape/capture): fall
+                        # back to plain AR+RMSNorm (bf16). Downstream linears that
+                        # need a quant tuple self-quantize on bf16 input.
                         hidden_states, residual = (
                             self.input_layernorm.forward_with_allreduce_fusion(
                                 hidden_states, residual, use_attn_tp_group=False

@@ -89,6 +89,9 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 def _should_use_1stage_mxfp4_ar(input_: torch.Tensor) -> bool:
     hidden_size = input_.shape[-1]
     tokens = input_.numel() // hidden_size
+    # AITER's 1-stage custom AR kernel is capped at 80 tokens (kMaxBlocks).
+    if tokens > 80:
+        return False
     if hidden_size == 7168:
         # CUDA-graph microbench: direct MXFP4 epilogue is faster through 56
         # tokens, while fallback wins from 64 tokens onward.
@@ -866,17 +869,22 @@ class GroupCoordinator:
         else:
             use_1stage_ar = _should_use_1stage_mxfp4_ar(input_)
 
-        try:
-            return ca_comm.custom_fused_ar_rms_mxfp4_quant(
-                input_,
-                residual_inp_,
-                weight_,
-                eps,
-                use_1stage_ar,
-                emit_bf16=emit_bf16,
-            )
-        except Exception:
+        # TC-piecewise CUDA-graph capture guard (mirrors fused_allreduce_rmsnorm).
+        if (
+            getattr(ca_comm, "_IS_CAPTURING", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and is_in_tc_piecewise_cuda_graph()
+        ):
             return None
+
+        return ca_comm.custom_fused_ar_rms_mxfp4_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+            emit_bf16=emit_bf16,
+        )
 
     def fused_allreduce_rmsnorm_quant_per_group(
         self,
@@ -946,8 +954,10 @@ class GroupCoordinator:
                 use_1stage_ar,
                 emit_bf16=emit_bf16,
             )
-        except Exception:
-            return None
+        except Exception as e:
+            raise RuntimeError(
+                "fused_allreduce_rmsnorm_quant_per_group collective failed"
+            ) from e
 
     def fused_allreduce_rmsnorm_quant_per_token(
         self,
@@ -1007,16 +1017,13 @@ class GroupCoordinator:
         ):
             return None
 
-        try:
-            return ca_comm.custom_fused_ar_rms_quant(
-                input_,
-                residual_inp_,
-                weight_,
-                eps,
-                use_1stage_ar,
-            )
-        except Exception:
-            return None
+        return ca_comm.custom_fused_ar_rms_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
 
     def _resolve_outplace_all_reduce_method(
         self,

@@ -251,9 +251,26 @@ def _linear_accepts_quant_tuple(linear: nn.Module) -> bool:
     return False
 
 
+def _fused_ar_num_tokens(hidden_states) -> int:
+    """Token dim of a plain hidden tensor or a fused AR (quant, scale) tuple."""
+    x = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    return x.shape[0]
+
+
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
+    # Fused RMSNorm+per-token quant emits (fp8, scale, orig_dtype). The
+    # keep-bf16 path emits (bf16, fp8, scale); both of those first slots
+    # are tensors. Distinguish by whether the last slot is a Tensor so a
+    # dtype is not passed to apply_fp8_linear as x_scale.
+    if len(hidden_states) == 3 and not isinstance(hidden_states[2], torch.Tensor):
+        if _linear_accepts_quant_tuple(linear):
+            return hidden_states
+        raise TypeError(
+            f"{linear.__class__.__name__} cannot consume fused AR "
+            "(fp8, scale, orig_dtype) tuple input"
+        )
     if len(hidden_states) == 3:
         hs_bf16, hs_fp8, hs_scale = hidden_states
         if _linear_accepts_quant_tuple(linear):
@@ -700,7 +717,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
         hs_ba = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_ba)
-        seq_len = hidden_states[0].shape[0]
+        seq_len = _fused_ar_num_tokens(hidden_states)
 
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
@@ -922,7 +939,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _fused_ar_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1169,6 +1189,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
+        if _use_aiter and isinstance(hidden_states, tuple):
+            hidden_states = _select_fused_ar_input_for_linear(
+                hidden_states, self.qkv_proj
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -1190,7 +1214,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
         )
-        seq_len = hidden_states.shape[0]
+        seq_len = _fused_ar_num_tokens(hidden_states)
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
@@ -1336,7 +1360,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _fused_ar_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
