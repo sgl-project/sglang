@@ -456,7 +456,7 @@ struct TopKKernel {
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
@@ -493,7 +493,7 @@ struct TopKKernel {
     auto P = SymbolicSize{"page_table_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
@@ -624,7 +624,7 @@ struct TopKKernel {
     auto S = SymbolicSize{"score_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
