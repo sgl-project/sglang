@@ -230,12 +230,12 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 ]
 
 
-def _use_npu_a5_mxfp8_wo_a(quant_config) -> bool:
-    """Whether wo_a runs the native A5 MXFP8 GEMM.
+def _use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
+    """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
 
     Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
     ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
-    A5 MXFP8 scale layout.
+    NPU arch35 MXFP8 scale layout.
     """
     if not _is_npu or not is_npu_arch35() or quant_config is None:
         return False
@@ -671,10 +671,10 @@ class MqaAttentionBase(nn.Module):
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
-        # A5 runs wo_a as a batched MXFP8 GEMM instead of the deep_gemm FP8 one,
+        # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
-        self.use_npu_a5_mxfp8_wo_a = _use_npu_a5_mxfp8_wo_a(quant_config)
-        quantize_wo_a = fp8 or self.use_npu_a5_mxfp8_wo_a
+        self.use_npu_arch35_mxfp8_wo_a = _use_npu_arch35_mxfp8_wo_a(quant_config)
+        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -739,10 +739,10 @@ class MqaAttentionBase(nn.Module):
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
-        if self.use_npu_a5_mxfp8_wo_a:
-            # Read by Fp8LinearMethod.process_weights_after_loading to batch the
+        if self.use_npu_arch35_mxfp8_wo_a:
+            # Read by the NPU arch35 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
-            self.wo_a._dsv4_a5_mxfp8_wo_a = True
+            self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
         elif fp8:
@@ -1742,7 +1742,7 @@ class MQALayer(MqaAttentionBase):
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
-        if self.use_npu_a5_mxfp8_wo_a:
+        if self.use_npu_arch35_mxfp8_wo_a:
             o, o_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
             o = torch_npu.npu_transpose_quant_batchmatmul(
                 o,
@@ -3636,7 +3636,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (_FP8_WO_A_GEMM or _use_npu_a5_mxfp8_wo_a(self.quant_config)):
+        if not (_FP8_WO_A_GEMM or _use_npu_arch35_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING

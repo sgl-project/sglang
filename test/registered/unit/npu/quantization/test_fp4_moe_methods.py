@@ -22,8 +22,8 @@ from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     _apply_swiglu_limit_npu,
     _pair_pack_mxfp_act_scale,
     _reshape_mxfp4_scale_for_npu,
-    _w4a8_mxfp_gmm,
     npu_apply_without_routing_weights_w4a4_mxfp,
+    w4a8_mxfp_gmm,
 )
 
 
@@ -81,10 +81,10 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         self.input_scale = torch.ones(2, 1, 2)
         self.weight = torch.empty(2, 64, 32, dtype=torch.uint8)
         self.weight_scale = torch.ones(2, 1, 32, 2, dtype=torch.uint8)
-        self.group_list = torch.tensor([1, 1], dtype=torch.int64)
+        self.group_list = torch.tensor([1, 1], dtype=torch.int32)
 
     def _call_gmm(self, input_scale):
-        return _w4a8_mxfp_gmm(
+        return w4a8_mxfp_gmm(
             input=self.input,
             input_scale=input_scale,
             weight=self.weight,
@@ -113,7 +113,8 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         self.assertIs(output, expected)
         call_kwargs = grouped_matmul.call_args.kwargs
         self.assertIs(call_kwargs["per_token_scale"][0], self.input_scale)
-        self.assertIs(call_kwargs["group_list"], self.group_list)
+        self.assertEqual(call_kwargs["group_list"].dtype, torch.int64)
+        self.assertTrue(torch.equal(call_kwargs["group_list"], self.group_list))
 
     def test_missing_scale_uses_dynamic_quant(self):
         quantized = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
@@ -160,7 +161,7 @@ class TestW4A8MxfpGmmChain(unittest.TestCase):
 
         with (
             patch.object(
-                fp4_moe_methods, "w4a4_mxfp_gmm_npu", side_effect=[gate_up, expected]
+                fp4_moe_methods, "w4a8_mxfp_gmm", side_effect=[gate_up, expected]
             ) as gmm,
             patch.object(
                 torch.ops.npu, "npu_swiglu", return_value=activated, create=True

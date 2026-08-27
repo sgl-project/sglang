@@ -56,9 +56,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
-    block_quant_dequant,
     can_auto_enable_marlin_fp8,
-    ceil_to_ue8m0,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
@@ -123,8 +121,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-_A5_MXFP8_BLOCK_SIZE = 32
-_FP8_E4M3FN_MAX = torch.finfo(torch.float8_e4m3fn).max
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -703,7 +699,11 @@ class Fp8LinearMethod(LinearMethodBase):
             self._process_mxfp8_linear_weight_scale(layer)
             return
         elif _is_npu and is_npu_arch35():
-            self._process_npu_a5_mxfp8_linear_weights(layer)
+            from sglang.srt.hardware_backend.npu.quantization.mxfp8 import (
+                process_npu_arch35_mxfp8_linear_weights,
+            )
+
+            process_npu_arch35_mxfp8_linear_weights(layer, self.weight_block_size)
             return
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
@@ -753,87 +753,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
-
-    def _process_npu_a5_mxfp8_linear_weights(self, layer: Module) -> None:
-        """Convert block-FP8 weights to the A5 MXFP8 layout.
-
-        The checkpoint stores arbitrary FP32 scale factors per quantization block,
-        while the A5 GEMM consumes one UE8M0 scale per 32 K elements. Requantize
-        the dequantized weights so the FP8 values and UE8M0 scales remain
-        consistent.
-        """
-        weight = block_quant_dequant(
-            layer.weight.data,
-            layer.weight_scale_inv.data,
-            self.weight_block_size,
-            torch.bfloat16,
-        )
-        n_dim, k_dim = weight.shape
-        if k_dim % (2 * _A5_MXFP8_BLOCK_SIZE) != 0:
-            raise ValueError(
-                "A5 MXFP8 linear requires K to be divisible by "
-                f"{2 * _A5_MXFP8_BLOCK_SIZE}, got {k_dim}."
-            )
-
-        weight_groups = weight.float().reshape(
-            n_dim, k_dim // _A5_MXFP8_BLOCK_SIZE, _A5_MXFP8_BLOCK_SIZE
-        )
-        scale = ceil_to_ue8m0(
-            weight_groups.abs().amax(dim=-1, keepdim=True) / _FP8_E4M3FN_MAX
-        )
-        qweight = (weight_groups / scale).to(torch.float8_e4m3fn).reshape(n_dim, k_dim)
-        scale_u8 = (scale.squeeze(-1).view(torch.int32) >> 23).to(torch.uint8)
-
-        layer.weight.data = qweight.transpose(0, 1)
-        layer.weight_scale_inv.data = scale_u8.reshape(
-            n_dim, k_dim // (2 * _A5_MXFP8_BLOCK_SIZE), 2
-        ).transpose(0, 1)
-        layer.weight_scale_inv.format_ue8m0 = True
-
-        if getattr(layer, "_dsv4_a5_mxfp8_wo_a", False):
-            self._batch_npu_a5_wo_a_weights(layer)
-
-    @staticmethod
-    def _batch_npu_a5_wo_a_weights(layer: Module) -> None:
-        """Reshape DSV4's ``wo_a`` into the per-group batched layout that
-        ``npu_transpose_quant_batchmatmul`` expects weight
-        ``[D, G*R] -> [G, D, R]``, scale ``[D/64, G*R, 2] -> [G, D/64, R, 2]``.
-        """
-        num_groups = layer._dsv4_num_groups
-        rank = layer._dsv4_o_lora_rank
-        hidden_dim = layer.weight.shape[0]
-        scale_k64 = layer.weight_scale_inv.shape[0]
-        output_dim = num_groups * rank
-
-        if layer.weight.shape != (hidden_dim, output_dim):
-            raise ValueError(
-                "Unexpected A5 wo_a weight layout after FP8 post-processing: "
-                f"got {tuple(layer.weight.shape)}, expected "
-                f"({hidden_dim}, {output_dim})."
-            )
-        if layer.weight_scale_inv.shape != (scale_k64, output_dim, 2):
-            raise ValueError(
-                "Unexpected A5 wo_a scale layout after FP8 post-processing: "
-                f"got {tuple(layer.weight_scale_inv.shape)}, expected "
-                f"({scale_k64}, {output_dim}, 2)."
-            )
-        if scale_k64 * 64 != hidden_dim:
-            raise ValueError(
-                "Unexpected A5 wo_a scale K dimension: "
-                f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
-            )
-
-        layer.weight.data = (
-            layer.weight.data.T.reshape(num_groups, rank, hidden_dim)
-            .transpose(1, 2)
-            .contiguous()
-        )
-        layer.weight_scale_inv.data = (
-            layer.weight_scale_inv.data.transpose(0, 1)
-            .reshape(num_groups, rank, scale_k64, 2)
-            .transpose(1, 2)
-            .contiguous()
-        )
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:

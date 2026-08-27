@@ -19,7 +19,9 @@ import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     npu_w8a8_block_fp8_linear,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.hardware_backend.npu.quantization.mxfp8 import (
+    process_npu_arch35_mxfp8_linear_weights,
+)
 
 
 class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
@@ -32,10 +34,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
                 torch.ones(1, 1, dtype=torch.float32), requires_grad=False
             ),
         )
-        method = object.__new__(Fp8LinearMethod)
-        method.weight_block_size = [64, 128]
-
-        method._process_npu_a5_mxfp8_linear_weights(layer)
+        process_npu_arch35_mxfp8_linear_weights(layer, [64, 128])
 
         self.assertEqual(layer.weight.data.shape, (128, 64))
         self.assertEqual(layer.weight_scale_inv.data.shape, (2, 64, 2))
