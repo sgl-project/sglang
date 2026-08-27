@@ -114,8 +114,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
-if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-    SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -142,6 +140,7 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+add_load_format_choices = LOAD_FORMAT_CHOICES.extend
 # NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
 # It is an internal dispatch format set automatically by ModelRunner when the
 # weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
@@ -186,6 +185,7 @@ QUANTIZATION_CHOICES = [
     "unquant",
     "humming",
 ]
+add_quantization_method_choices = QUANTIZATION_CHOICES.extend
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -218,6 +218,7 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "intel_xpu",
 ]
+add_attention_backend_choices = ATTENTION_BACKEND_CHOICES.extend
 
 # trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
 # earlier when its per-layer attention requirements are not met.
@@ -229,6 +230,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "trtllm_mha",
 ]
+add_draft_attention_backend_choices = DRAFT_ATTENTION_BACKEND_CHOICES.extend
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
 # Out-of-tree platforms may extend this list (via
@@ -244,6 +246,9 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "tokenspeed_mla",
 ]
+add_chunked_prefix_cache_attention_backend = (
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append
+)
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
@@ -253,8 +258,14 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
     "triton",
 ]
+add_deterministic_attention_backend_choices = (
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend
+)
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+add_radix_supported_deterministic_attention_backend_choices = (
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
+)
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -264,8 +275,10 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mori",
     "mooncake_tcp",
 ]
+add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+add_grammar_backend_choices = GRAMMAR_BACKEND_CHOICES.extend
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
@@ -292,21 +305,9 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
+    "intel_xpu",
 ]
-
-MOE_A2A_BACKEND_CHOICES = [
-    "none",
-    "deepep",
-    "mooncake",
-    "nixl",
-    "mori",
-    "ascend_fuseep",
-    "flashinfer",
-    "megamoe",
-    "deepep_v2",
-    "pplx",
-    "ascend_tp",
-]
+add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.extend
 
 # These architectures take the A2A MoE path and skip post-expert all-reduce.
 _DEEPEP_V2_VALIDATED_ARCHITECTURES = frozenset(
@@ -323,6 +324,7 @@ MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
+add_mxfp8_moe_runner_backend_choices = MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -335,6 +337,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "triton",
     "aiter",
 ]
+add_fp8_gemm_runner_backend_choices = FP8_GEMM_RUNNER_BACKEND_CHOICES.extend
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -344,76 +347,19 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
     "marlin",
 ]
-
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
+add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.extend
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
-RETRACTION_POLICY_CHOICES = ["length", "priority"]
+add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.extend
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.extend
 
 # Speculative algorithms whose verify forward presents a uniform per-request
 # token width, which is what the LoRA segment layout assumes.
 _LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
 
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
-
-ENCODER_TRANSFER_BACKEND_CHOICES = [
-    "auto",
-    "zmq_to_scheduler",
-    "zmq_to_tokenizer",
-    "mooncake",
-]
-
-
-def resolve_encoder_transfer_backend(
-    backend: str, model_arch: str, tp_size: int
-) -> str:
-    if backend != "auto":
-        return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
-        return "zmq_to_tokenizer"
-    return "zmq_to_scheduler"
-
-
-DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
-NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
-
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
-
 DEFAULT_LORA_EVICTION_POLICY = "lru"
-
-DSA_CHOICES = [
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-    "flashmla_kv",
-    "flashmla_auto",
-    "flashinfer_sparse_mla",
-    "fa3",
-    "tilelang",
-    "aiter",
-    "trtllm",
-]
-NSA_CHOICES = DSA_CHOICES  # deprecated alias
-
-DSV4_PREFILL_BACKEND_CHOICES = [
-    "auto",
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-]
-
-DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
-
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
-
-MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
-    "auto",
-    "no_buffer",
-    "extra_buffer",
-    "extra_buffer_lazy",
-]
-
-MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
@@ -425,71 +371,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "helion",
     "intel_xpu",
 ]
-
-
-# Allow external code to add more choices
-def add_load_format_choices(choices):
-    LOAD_FORMAT_CHOICES.extend(choices)
-
-
-def add_quantization_method_choices(choices):
-    QUANTIZATION_CHOICES.extend(choices)
-
-
-def add_attention_backend_choices(choices):
-    ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_draft_attention_backend_choices(choices):
-    DRAFT_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-
-
-def add_deterministic_attention_backend_choices(choices):
-    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_supported_deterministic_attention_backend_choices(choices):
-    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
-
-
-def add_disagg_transfer_backend_choices(choices):
-    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
-
-
-def add_grammar_backend_choices(choices):
-    GRAMMAR_BACKEND_CHOICES.extend(choices)
-
-
-def add_moe_runner_backend_choices(choices):
-    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_mxfp8_moe_runner_backend_choices(choices):
-    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp8_gemm_runner_backend_choices(choices):
-    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp4_gemm_runner_backend_choices(choices):
-    FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_eviction_policy_choices(choices):
-    RADIX_EVICTION_POLICY_CHOICES.extend(choices)
-
-
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
-
-
-def add_linear_attn_kernel_backend_choices(choices):
-    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend
 
 
 @dataclasses.dataclass
@@ -935,7 +817,7 @@ class ServerArgs:
                 "requests first, using the same priority direction as priority "
                 "scheduling."
             ),
-            choices=RETRACTION_POLICY_CHOICES,
+            choices=["length", "priority"],
         ),
         NS("schedule"),
     ] = "length"
@@ -1710,7 +1592,12 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
+        NS("observability"),
+    ] = None
+    load_publish_endpoint: A[
+        Optional[str],
+        "Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or 'off'). Use 'auto' to reserve the dp_size ports packed after the --kv-events-config range, or a wildcard-host TCP address (e.g. tcp://*:6000) to place it explicitly; rank r binds port+r and /server_info advertises the base under the kv_events block. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range. Note: 'auto' reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly. The router-facing update cadence follows --load-snapshot-publish-interval (shared to avoid double-collecting the snapshot), so a large value there also staleness-caps this feed.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -1802,7 +1689,7 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Choose the kernels for sampling layers.",
-            choices=SAMPLING_BACKEND_CHOICES,
+            no_cli=True,
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1863,7 +1750,7 @@ class ServerArgs:
         Arg(
             help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
-            choices=BF16_GEMM_BACKEND_CHOICES,
+            choices=["auto", "cutedsl", "gemv", "torch"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1871,7 +1758,17 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1884,7 +1781,7 @@ class ServerArgs:
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
                 "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
             ),
-            choices=DSV4_PREFILL_BACKEND_CHOICES,
+            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1892,7 +1789,17 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1901,7 +1808,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
-            choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
+            choices=["auto", "deepgemm", "cutedsl", "aiter"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1909,7 +1816,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=DSA_TOPK_BACKEND_CHOICES,
+            choices=["sgl-kernel", "torch", "flashinfer"],
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
@@ -1932,7 +1839,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
-            choices=MAMBA_BACKEND_CHOICES,
+            choices=["triton", "flashinfer"],
         ),
         NS("exec.mamba"),
     ] = "triton"
@@ -2279,7 +2186,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=DSA_TOPK_BACKEND_CHOICES,
+            choices=["sgl-kernel", "torch", "flashinfer"],
         ),
         NS("spec"),
     ] = "sgl-kernel"
@@ -2315,7 +2222,19 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Choose the backend for MoE A2A in speculative decoding",
-            choices=MOE_A2A_BACKEND_CHOICES,
+            choices=[
+                "none",
+                "deepep",
+                "mooncake",
+                "nixl",
+                "mori",
+                "ascend_fuseep",
+                "flashinfer",
+                "megamoe",
+                "deepep_v2",
+                "pplx",
+                "ascend_tp",
+            ],
             resolvable=True,
         ),
         NS("spec"),
@@ -2459,7 +2378,19 @@ class ServerArgs:
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
-            choices=MOE_A2A_BACKEND_CHOICES,
+            choices=[
+                "none",
+                "deepep",
+                "mooncake",
+                "nixl",
+                "mori",
+                "ascend_fuseep",
+                "flashinfer",
+                "megamoe",
+                "deepep_v2",
+                "pplx",
+                "ascend_tp",
+            ],
             resolvable=True,
         ),
         NS("exec.moe"),
@@ -2688,7 +2619,7 @@ class ServerArgs:
         str,
         Arg(
             help="The strategy to use for mamba radix cache.",
-            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            choices=["auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"],
             resolvable=True,
         ),
         NS("exec.mamba"),
@@ -3057,7 +2988,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=LORA_BACKEND_CHOICES,
+            choices=["triton", "csgmv", "ascend", "torch_native"],
         ),
         NS("lora"),
     ] = "csgmv"
@@ -3312,10 +3243,10 @@ class ServerArgs:
         str,
         Arg(
             help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
-            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+            choices=["auto", "zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"],
         ),
         NS("disagg"),
-    ] = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    ] = "auto"
     encoder_urls: A[List[str], "List of encoder server urls.", NS("disagg")] = (
         dataclasses.field(default_factory=list)
     )
@@ -9579,6 +9510,17 @@ class ServerArgs:
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
+        sampling_backend_choices = set(SAMPLING_BACKEND_CHOICES)
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            sampling_backend_choices.add("token_oracle")
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=sampling_backend_choices,
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
+
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
@@ -9657,7 +9599,17 @@ class ServerArgs:
             new_flag="--dsa-prefill-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             help="[Deprecated] Use --dsa-prefill-backend instead.",
         )
         parser.add_argument(
@@ -9667,7 +9619,17 @@ class ServerArgs:
             new_flag="--dsa-decode-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(
@@ -9797,7 +9759,7 @@ class ServerArgs:
             new_flag="--cp-strategy",
             type=str,
             default=ServerArgs.dsa_prefill_cp_mode,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split", "round-robin-split"],
             help=(
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
                 "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
@@ -9811,7 +9773,7 @@ class ServerArgs:
             new_flag="--cp-strategy",
             type=str,
             default=argparse.SUPPRESS,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split", "round-robin-split"],
             help="[Deprecated] Use --cp-strategy instead.",
         )
         parser.add_argument(
@@ -9821,7 +9783,7 @@ class ServerArgs:
             new_flag="--cp-strategy",
             type=str,
             default=ServerArgs.prefill_cp_mode,
-            choices=PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split"],
             help=(
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
                 "'in-seq-split' maps to 'zigzag'."
@@ -10303,6 +10265,50 @@ class ServerArgs:
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
+        self.check_load_publish_args()
+
+    def check_load_publish_args(self):
+        """Fail fast at the entrypoint on a --load-publish-endpoint the
+        scheduler would decline (no active kv-events publisher to advertise
+        through, unbindable, overlapping the KV range, u16 overflow) rather
+        than only warning — or silently doing nothing — from a scheduler
+        subprocess. Routes through the same resolver the scheduler binds and
+        /server_info advertises with."""
+        mode = (self.load_publish_endpoint or "").strip()
+        if not mode or mode.lower() == "off":
+            return  # disabled; nothing to validate
+
+        server_cfg = resolving_view(self)
+
+        from sglang.srt.disaggregation.kv_events import (
+            KVEventsConfig,
+            resolve_load_pub_range,
+        )
+
+        if not self.kv_events_config:
+            raise ValueError(
+                "--load-publish-endpoint requires --kv-events-config: routers"
+                " discover the load range through /server_info's kv_events"
+                " block, absent without a publisher."
+            )
+        try:
+            cfg = KVEventsConfig.from_cli(self.kv_events_config)
+        except Exception as e:
+            raise ValueError(f"--kv-events-config is not parseable: {e}")
+        if cfg.publisher == "null" or not cfg.endpoint:
+            raise ValueError(
+                "--load-publish-endpoint needs an active --kv-events-config"
+                " publisher; got publisher='null' or an empty endpoint."
+            )
+        _, reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=server_cfg.dp_size,
+            load_publish_endpoint=mode,
+        )
+        if reason:
+            raise ValueError(reason)
+
     def check_lora_server_args(self):
         cfg = resolving_view(self)
 
@@ -10678,6 +10684,19 @@ class ServerArgs:
                                                   # DCP shards within a rank
                                                   # rather than adding
                                                   # publishers
+                "load_endpoint_port_base": <resolved>,
+                                                  # base TCP port of the load
+                                                  # range (load rank r = base
+                                                  # + r). Consumers MUST read
+                                                  # this key, not re-derive
+                                                  # it; present only when
+                                                  # --load-publish-endpoint
+                                                  # opted in and a range
+                                                  # resolved
+                "load_topic": "load",             # SUB filter for the load
+                                                  # socket; present iff
+                                                  # load_endpoint_port_base
+                                                  # is present
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -10688,17 +10707,27 @@ class ServerArgs:
           block_size would cause silent KV-cache misses by hashing
           prompts at the wrong granularity on the router side),
         * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, or port outside
-          1..65535).
+          ipc://, missing port, non-integer port, port outside
+          1..65535, or a bare unbracketed IPv6 host, which is
+          ambiguous).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
+        NOTE for load-socket consumers: pair the load port with the worker's
+        own URL host, as with the KV SUB endpoints — endpoint_host is a
+        wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
+        so splicing it yields tcp://*:PORT and connects to nothing.
+
+        Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
+        helpers the scheduler binds through — so the advertisement cannot
+        drift from the sockets.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+        from sglang.srt.disaggregation.kv_events import (
+            LOAD_TOPIC,
+            KVEventsConfig,
+            parse_advertisable_tcp,
+            resolve_load_pub_range,
+        )
 
         resolved = resolving_view(self)
         raw = resolved.kv_events_config
@@ -10714,21 +10743,12 @@ class ServerArgs:
             return None
         if cfg.publisher == "null" or not cfg.endpoint:
             return None
-        if not cfg.endpoint.startswith("tcp://"):
+        resolved_kv = parse_advertisable_tcp(cfg.endpoint)
+        if resolved_kv is None:
             return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
-            return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
+        host, port = resolved_kv
 
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -10736,6 +10756,19 @@ class ServerArgs:
             "block_size": resolved.kv_event_block_size,
             "dp_size": resolved.dp_size,
         }
+        # Load range, from the same resolver SchedulerLoadPublisher binds
+        # with (so the two can't drift). The decline reason is logged once at
+        # startup, not here — this runs per /server_info request.
+        resolved_range, _reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=resolved.dp_size,
+            load_publish_endpoint=self.load_publish_endpoint,
+        )
+        if resolved_range is not None:
+            descriptor["load_endpoint_port_base"] = resolved_range[1]
+            descriptor["load_topic"] = LOAD_TOPIC
+        return descriptor
 
     def should_report_expert_balancedness(self) -> bool:
         cfg = resolving_view(self)
@@ -10750,6 +10783,16 @@ class ServerArgs:
         cfg = resolving_view(self)
 
         return cfg.expert_balancedness_report_mode in ("prometheus", "both")
+
+
+def resolve_encoder_transfer_backend(
+    backend: str, model_arch: str, tp_size: int
+) -> str:
+    if backend != "auto":
+        return backend
+    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+        return "zmq_to_tokenizer"
+    return "zmq_to_scheduler"
 
 
 def compute_world_size(config) -> int:
@@ -10862,7 +10905,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
-        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+        from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
         # Extract boolean actions from the parser to handle them correctly
         config_merger = ConfigArgumentMerger(parser)
