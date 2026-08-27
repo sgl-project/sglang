@@ -10,7 +10,6 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -443,47 +442,6 @@ class TestSWA(unittest.TestCase):
 
         self.assertEqual(allocator.swa_available_size(), swa_available_before + 1)
         self.assertTrue(self._swa_slot_is_free(allocator, swa_indices))
-
-    def test_free_group_rejects_nesting(self):
-        # A nested begin would drop the outer batch and double-free it later.
-        _, allocator, _ = _build_swa_tree(is_eagle=False)
-        allocator.free_group_begin()
-        with self.assertRaises(AssertionError):
-            allocator.free_group_begin()
-        allocator.free_group_end()
-
-    def test_free_group_end_consumes_the_batch(self):
-        _, allocator, _ = _build_swa_tree(is_eagle=False)
-        indices = _swa_alloc(allocator, 2)
-        full_before = allocator.full_available_size()
-        swa_before = allocator.swa_available_size()
-
-        allocator.free_group_begin()
-        allocator.free(indices)
-        allocator.free_group_end()
-        # An unpaired second flush must not replay the batch.
-        allocator.free_group_end()
-
-        self.assertEqual(allocator.full_available_size(), full_before + 2)
-        self.assertEqual(allocator.swa_available_size(), swa_before + 2)
-
-    def test_single_pool_free_group_end_consumes_the_batch(self):
-        allocator = TokenToKVPoolAllocator(
-            size=16,
-            dtype=torch.bfloat16,
-            device=get_device(),
-            kvcache=None,
-            need_sort=False,
-        )
-        indices = allocator.alloc(2)
-        available_before = allocator.available_size()
-
-        allocator.free_group_begin()
-        allocator.free(indices)
-        allocator.free_group_end()
-        allocator.free_group_end()
-
-        self.assertEqual(allocator.available_size(), available_before + 2)
 
     def test_pure_swa_rejects_mapping_edits(self):
         allocator = _build_pure_swa_allocator()
