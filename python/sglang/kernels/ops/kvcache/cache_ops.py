@@ -17,7 +17,11 @@ def concat_and_cast_mha_k_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
 ):
-    pid_loc = tl.program_id(0)
+    # int64: k_nope is the strided view kv[..., :nope_dim], so nope_stride0 is
+    # the full row of kv (3072 for Kimi-K3 at TP8), and pid_loc * nope_stride0
+    # wraps int32 past 699052 rows -- reachable under DCP MHA_ONE_SHOT, which
+    # assembles whole sequences (measured fault at 778610 rows).
+    pid_loc = tl.program_id(0).to(tl.int64)
     head_range = tl.arange(0, head_cnt)
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
@@ -62,7 +66,8 @@ def concat_and_cast_mha_k_pad_kernel(
     tl.arange needs a power-of-two extent, so walk HEAD_BLOCK == next_power_of_2(head_cnt)
     lanes and mask the tail.
     """
-    pid_loc = tl.program_id(0)
+    # int64 for the same reason as concat_and_cast_mha_k_kernel above.
+    pid_loc = tl.program_id(0).to(tl.int64)
     head_range = tl.arange(0, HEAD_BLOCK)
     head_mask = head_range < head_cnt
 
