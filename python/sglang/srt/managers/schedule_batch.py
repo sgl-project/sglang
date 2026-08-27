@@ -1041,6 +1041,9 @@ class Req(ReqDllmMixin):
         self.is_retracted = False
         # Indicates if the req has ever been demoted.
         self.is_demoted = False
+        # Indicates if the req has once been demoted and recovered. If so, the
+        # req will be demoted when getting into the running batch or need demotion.
+        self.is_demoted_recovered = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
@@ -1701,6 +1704,11 @@ class Req(ReqDllmMixin):
         else:
             self.is_retracted = True
         self.retracted_stain = True
+        if self.is_demoted_recovered:
+            self.is_demoted_recovered = False
+            logger.warning(
+                "req %s: demoted-recovered request is being demoted again; "
+            )
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None

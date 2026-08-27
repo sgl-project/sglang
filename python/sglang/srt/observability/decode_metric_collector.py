@@ -79,6 +79,10 @@ class DecodeMetricCollector:
         self.last_stat_time = self._clock()
         self.p50_output_len: Optional[int] = None
         self.p95_output_len: Optional[int] = None
+        
+    def get_output_len(self) -> Tuple[Optional[int], Optional[int]]:
+        """Return the current P50 and P95 output-length quantiles."""
+        return self.p50_output_len, self.p95_output_len
 
     def observe_output_len(self, output_len: int) -> None:
         """Record one request's completed output length for the current forward."""

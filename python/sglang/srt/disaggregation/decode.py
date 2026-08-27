@@ -920,6 +920,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_retraction_backup,
             )
             req.is_demoted = False
+            req.is_demoted_recovered = True
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             full_allocatable_tokens -= full_required
@@ -2728,18 +2729,41 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        num_remain_used_batch = num_not_used_batch
 
         # pop req from waiting queue
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
+        p50_output_len, _ = self.decode_metric_collector.get_output_len()
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if (num_remain_used_batch > 0 
+                and (
+                    not req.is_demoted_recovered 
+                    or (
+                        p50_output_len is not None 
+                        and len(req.output_ids)
+                        <= self.server_args.candidate_demotion_output_len_threthold 
+                        * p50_output_len))):
                 can_run_list.append(req)
+                num_remain_used_batch -= 1
             else:
                 waiting_queue.append(req)
+                if req.is_demoted_recovered:
+                    logger.warning(
+                        "Demoted request is promoted again, rid=%s, output_len=%s, p50_output_len=%s",
+                        req.rid,
+                        len(req.output_ids),
+                        p50_output_len,
+                    )
+                
+        # Need to double check the promoted demote recovered req if there are slots.
+        for req in waiting_queue[:num_remain_used_batch]:
+            req.is_demoted_recovered = False
+        can_run_list.extend(waiting_queue[:num_remain_used_batch])
+        waiting_queue = waiting_queue[num_remain_used_batch:]
 
         if self.enable_priority_preemption and waiting_queue:
             victims = self._swap_out_by_priority(running_batch, waiting_queue)
@@ -2842,6 +2866,14 @@ class SchedulerDisaggregationDecodeMixin:
             and len(req.output_ids) > candidate_threshold * p50_output_len
         ]
         candidates.sort(key=lambda req: req.seqlen, reverse=True)
+        # Put demoted_recovered requests in the waiting queue to the front of
+        # the candidates list to be demoted first.
+        p50_output_len, _ = self.decode_metric_collector.get_output_len()
+        demoted_recovered_candidates = [
+            req for req in self.waiting_queue if req.is_demoted_recovered
+            and len(req.output_ids) > candidate_threshold * p50_output_len
+        ]
+        candidates = demoted_recovered_candidates + candidates
         demoted_reqs = []
         while (
             self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
