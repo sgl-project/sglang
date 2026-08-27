@@ -19,11 +19,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
-from sglang.srt.cuda_vmm_utils import _gpu_fabric_clique
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils.cuda_vmm_utils import _gpu_fabric_clique
 
 logger = logging.getLogger(__name__)
 

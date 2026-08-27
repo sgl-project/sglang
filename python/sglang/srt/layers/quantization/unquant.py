@@ -31,7 +31,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_exec, get_lora
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -100,7 +103,9 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     backend_str = server_args.bf16_gemm_backend
     if backend_str == "auto" and is_sm100_supported():
         backend_str = (
-            "torch" if server_args.enable_deterministic_inference else "cutedsl"
+            "torch"
+            if get_exec().deterministic.enable_deterministic_inference
+            else "cutedsl"
         )
 
     backend = Bf16GemmBackend(backend_str)
@@ -118,7 +123,7 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
         _hopper_bf16_gemv = hopper_bf16_gemv
         _use_hopper_bf16_gemv = use_hopper_bf16_gemv
     elif backend.is_cutedsl():
-        if server_args.enable_deterministic_inference:
+        if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
                 "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
                 "be combined with --enable-deterministic-inference"
@@ -595,7 +600,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
-
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
@@ -628,6 +632,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and moe_runner_config.gemm1_alpha is None
             and moe_runner_config.gemm1_clamp_limit is None
             and moe_runner_config.swiglu_limit is None
+            and not moe_runner_config.apply_router_weight_on_input
             # The LoRA MoE hooks read and write the full-width pre-activation
             # buffer in halves layout; both assumptions break here.
             and not get_lora().enable_lora
