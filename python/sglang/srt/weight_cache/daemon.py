@@ -184,6 +184,7 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
     def _init_distributed(self, server_args, model_config):
@@ -316,6 +317,7 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
+        self._initialize_eplb_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -345,6 +347,9 @@ class WeightCacheDaemon:
             revision=self.revision or "",
             **compute_env_stamp(),
         )
+
+        current_platform.empty_cache()
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -376,6 +381,10 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+        current_platform.empty_cache()
+        self.preloaded_weights_bytes = max(
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+        )
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -455,6 +464,23 @@ class WeightCacheDaemon:
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+        )
+
+    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
+        """Build the same initial physical expert layout as the engine."""
+        if not self.server_args.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import (
+            compute_initial_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                model_config=model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
         )
 
     def serve(self):
@@ -564,6 +590,7 @@ class WeightCacheDaemon:
                 # process dies while clients hold IPC mappings, their
                 # param.data (and any CUDA-graph-captured addresses) dangle.
                 pid=os.getpid(),
+                preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
 
         elif req.get("type") == "ping":
