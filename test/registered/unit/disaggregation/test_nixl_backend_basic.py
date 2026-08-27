@@ -874,16 +874,16 @@ class TestNixlStaging(CustomTestCase):
         agent = StagingFakeAgent(register_result=["staging"])
         mgr = self._make_manager(agent)
 
-        mgr._register_staging_memory(0x1000, 4096, 3)
+        mgr._register_staging_memory(0x1000, 4096)
 
         self.assertEqual(
             agent.register_memory_calls,
-            [([(0x1000, 4096, 3, "")], "VRAM")],
+            [([(0x1000, 4096, 1, "")], "VRAM")],
         )
 
         mgr = self._make_manager(StagingFakeAgent(register_result=[]))
         with self.assertRaisesRegex(RuntimeError, "staging buffer"):
-            mgr._register_staging_memory(0x1000, 4096, 3)
+            mgr._register_staging_memory(0x1000, 4096)
 
     def test_prefetch_staging_reqs_noops_when_disabled_or_missing_kv_buffers(self):
         mgr = self._make_manager()
