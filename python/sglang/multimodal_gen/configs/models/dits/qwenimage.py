@@ -26,6 +26,25 @@ class QwenImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # Merge the short text-stream projections into one tensor-parallel
+            # GEMM. The loader only applies these rules when the fused target
+            # exists, so quantization backends that keep the original modules
+            # continue to load their unfused parameters.
+            r"^(.*\.attn)\.add_q_proj\.(.+)$": (
+                r"\1.to_added_qkv.\2",
+                0,
+                3,
+            ),
+            r"^(.*\.attn)\.add_k_proj\.(.+)$": (
+                r"\1.to_added_qkv.\2",
+                1,
+                3,
+            ),
+            r"^(.*\.attn)\.add_v_proj\.(.+)$": (
+                r"\1.to_added_qkv.\2",
+                2,
+                3,
+            ),
             # LoRA mappings
             r"^(transformer_blocks\.\d+\.attn\..*\.lora_[AB])\.default$": r"\1",
             # SVDquant mappings
