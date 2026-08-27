@@ -1693,9 +1693,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        # Resolve the state before the generator starts: batch dispatch builds
-        # every waiter before advancing any. Holding the ReqState keeps the output
-        # deliverable; both removers append it after the del.
+        # Batch dispatch builds every waiter before advancing any.
+        # Both removers append the output after the del, so the ReqState stays valid.
         state = self.rid_to_state[obj.rid]
         return self._stream_one_response(obj=obj, state=state, request=request)
 
