@@ -133,9 +133,7 @@ def _resolve_platform() -> SRTPlatform:
             )
             return CudaSRTPlatform()
         if _is_npu_available():
-            logger.debug(
-                "No platform plugin detected. Using NPU SRTPlatform defaults."
-            )
+            logger.debug("No platform plugin detected. Using NPU SRTPlatform defaults.")
             return NpuSRTPlatform()
         if _is_rocm_available():
             logger.debug(

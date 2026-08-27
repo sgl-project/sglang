@@ -1,4 +1,5 @@
 """NPU (Huawei Ascend)device operations for the SRT platform layer."""
+
 from typing import Optional
 
 import torch
