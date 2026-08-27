@@ -252,6 +252,7 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
     )
     worker.pipeline = SimpleNamespace(
         modules={"transformer": quantized_module},
+        stages=[],
         _stage_name_mapping={},
         component_residency_strategies={},
     )
@@ -307,6 +308,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     worker._auto_residency_reference_component_stages = {}
     worker.pipeline = SimpleNamespace(
         modules={"transformer": torch.nn.Linear(1, 1)},
+        stages=[],
         _stage_name_mapping={},
         component_residency_strategies={},
     )
