@@ -1688,13 +1688,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         return None
 
-    async def _wait_one_response(
+    def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
-        """Wait for the response of one request."""
+        # Look the state up now rather than inside the generator: a batch builds
+        # every generator before advancing any, and _handle_batch_output drops the
+        # rid_to_state entry as soon as a request finishes.
         state = self.rid_to_state[obj.rid]
+        return self._stream_one_response(obj, state, request)
+
+    async def _stream_one_response(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        state: ReqState,
+        request: Optional[fastapi.Request] = None,
+    ):
+        """Wait for the response of one request."""
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
         while True:
