@@ -23,13 +23,18 @@ pub use output::{
     ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
     ChatResponseProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatChoice,
 };
-pub use request::{PreparedGenerateRequest, PreparedSamplingParams, TextRequest};
+pub use request::{
+    GenerationInput, GenerationOptions, PreparedGenerateRequest, PreparedSamplingParams,
+    TextRequest, TokenIdsRequest,
+};
 pub use sampling::SamplingParams;
-pub use service::{ChatRequestParts, OpenAIRequestProcessor, RendererService, TokenizationBackend};
+pub use service::{
+    ChatProcessingResult, OpenAIRequestProcessor, RendererService, TokenizationBackend,
+};
 pub use template::ChatFormatter;
 pub use tokenizer::{
     DynamoTokenizer, TextTokenizer, check_completion_token_budget, check_total_tokens,
-    load_tokenizer, prepare_direct_request, resolve_model_file, tokenize_text_completion,
-    validate_completion_fields, validate_request,
+    load_tokenizer, prepare_direct_request, resolve_model_file, tokenize_text_prompt,
+    tokenize_text_request, validate_completion_fields, validate_generation_input,
 };
 pub use types::{OneOrMany, OneOrManyItem, TokenIds};

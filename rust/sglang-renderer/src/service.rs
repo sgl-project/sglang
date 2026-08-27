@@ -7,10 +7,10 @@ use futures::future::{BoxFuture, try_join_all};
 
 use crate::openai::{process_chat_request, process_completion_request};
 use crate::template::load_chat_formatter;
-use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_request};
+use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_generation_input};
 use crate::{
-    ChatFormatter, ChatResponseProcessor, PreparedGenerateRequest, RendererConfig, RendererError,
-    TextRequest,
+    ChatFormatter, ChatResponseProcessor, GenerationInput, PreparedGenerateRequest, RendererConfig,
+    RendererError, TextRequest, TokenIdsRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one model-facing text
@@ -20,14 +20,14 @@ pub trait TokenizationBackend: Send + Sync {
     fn tokenize(
         &self,
         request: TextRequest,
-    ) -> BoxFuture<'static, Result<TextRequest, RendererError>>;
+    ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>>;
 }
 
 /// Engine-free OpenAI request processing shared by inference and rendering.
 ///
 /// This type deliberately has no preprocessing backend. Full inference
-/// processes protocol semantics here, then submits text requests to its request
-/// FSM for normalization and tokenization.
+/// processes protocol semantics here, then submits text or token-ID inputs to
+/// its existing request FSM.
 pub struct OpenAIRequestProcessor {
     config: RendererConfig,
     chat_formatter: Option<ChatFormatter>,
@@ -44,10 +44,10 @@ pub struct RendererService {
     backend: Arc<dyn TokenizationBackend>,
 }
 
-/// Model-facing text requests plus the processor retained to interpret
-/// their eventual engine responses.
-pub struct ChatRequestParts {
-    pub text_requests: Vec<TextRequest>,
+/// Generation inputs plus the processor retained to interpret their eventual
+/// engine responses.
+pub struct ChatProcessingResult {
+    pub generation_inputs: Vec<GenerationInput>,
     pub response_processor: ChatResponseProcessor,
 }
 
@@ -68,7 +68,7 @@ impl OpenAIRequestProcessor {
         &self,
         mut request: CreateChatCompletionRequest,
         response_id: &str,
-    ) -> Result<ChatRequestParts, RendererError> {
+    ) -> Result<ChatProcessingResult, RendererError> {
         let processed = process_chat_request(
             &self.config,
             self.chat_formatter.clone(),
@@ -77,9 +77,9 @@ impl OpenAIRequestProcessor {
         )
         .await?;
         let uses_tool_call_structural_tag = processed
-            .text_requests
+            .generation_inputs
             .first()
-            .is_some_and(|request| request.sampling_params.structural_tag.is_some());
+            .is_some_and(|request| request.options().sampling_params.structural_tag.is_some());
         let response_processor = ChatResponseProcessor::new(
             processed.parser,
             self.config.reasoning_parser.clone(),
@@ -87,10 +87,10 @@ impl OpenAIRequestProcessor {
             request.tool_choice.clone(),
             uses_tool_call_structural_tag,
             request.parallel_tool_calls.unwrap_or(true),
-            processed.text_requests.len(),
+            processed.generation_inputs.len(),
         );
-        Ok(ChatRequestParts {
-            text_requests: processed.text_requests,
+        Ok(ChatProcessingResult {
+            generation_inputs: processed.generation_inputs,
             response_processor,
         })
     }
@@ -99,7 +99,7 @@ impl OpenAIRequestProcessor {
         &self,
         request: CreateCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<TextRequest>, RendererError> {
+    ) -> Result<Vec<GenerationInput>, RendererError> {
         process_completion_request(&self.config, &request, response_id)
     }
 }
@@ -115,7 +115,7 @@ impl RendererService {
         response_id: &str,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
         let parts = self.processor.process_chat(request, response_id).await?;
-        self.prepare_many(parts.text_requests).await
+        self.prepare_many(parts.generation_inputs).await
     }
 
     pub async fn prepare_completions(
@@ -129,7 +129,7 @@ impl RendererService {
 
     async fn prepare_many(
         &self,
-        requests: Vec<TextRequest>,
+        requests: Vec<GenerationInput>,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
         let requests = try_join_all(
             requests
@@ -143,15 +143,19 @@ impl RendererService {
             .collect())
     }
 
-    async fn prepare_one(&self, mut request: TextRequest) -> Result<TextRequest, RendererError> {
-        validate_request(&request, &self.processor.config.limits)?;
-        request.sampling_params.normalize(
+    async fn prepare_one(
+        &self,
+        mut request: GenerationInput,
+    ) -> Result<TokenIdsRequest, RendererError> {
+        validate_generation_input(&request, &self.processor.config.limits)?;
+        request.options_mut().sampling_params.normalize(
             self.processor.config.skip_tokenizer_init,
             self.processor.config.vocab_size,
         )?;
-        if !request.already_tokenized() {
-            request = self.backend.tokenize(request).await?;
-        }
+        let mut request = match request {
+            GenerationInput::Text(request) => self.backend.tokenize(request).await?,
+            GenerationInput::TokenIds(request) => request,
+        };
         check_total_tokens(&mut request, &self.processor.config.limits)?;
         Ok(request)
     }
@@ -190,6 +194,17 @@ mod tests {
     use super::*;
     use crate::{OneOrMany, RendererLimits, SamplingDefaults};
 
+    struct UnexpectedTokenizer;
+
+    impl TokenizationBackend for UnexpectedTokenizer {
+        fn tokenize(
+            &self,
+            _request: TextRequest,
+        ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>> {
+            Box::pin(async { panic!("token-ID input must not enter the tokenizer backend") })
+        }
+    }
+
     #[test]
     fn chat_processing_carries_rendered_prompt_and_template_stops() {
         let processor = OpenAIRequestProcessor::new(RendererConfig {
@@ -222,19 +237,54 @@ mod tests {
 
         let parts =
             futures::executor::block_on(processor.process_chat(request, "chatcmpl-test")).unwrap();
-        let text_request = &parts.text_requests[0];
+        let GenerationInput::Text(text_request) = &parts.generation_inputs[0] else {
+            panic!("Chat processing must produce text input");
+        };
 
-        assert!(
-            text_request
-                .text
-                .as_deref()
-                .is_some_and(|text| text.contains("<|im_start|>user"))
-        );
+        assert!(text_request.text.contains("<|im_start|>user"));
         assert!(matches!(
-            text_request.sampling_params.stop.as_ref(),
+            text_request.options.sampling_params.stop.as_ref(),
             Some(OneOrMany::Many(stops))
                 if stops.iter().map(String::as_str).collect::<Vec<_>>()
                     == ["<|endoftext|>", "<|im_end|>", "client-stop"]
         ));
+    }
+
+    #[test]
+    fn token_id_completion_bypasses_tokenization_and_is_still_prepared() {
+        let processor = OpenAIRequestProcessor::new(RendererConfig {
+            served_model_name: "model".into(),
+            tokenizer_path: String::new(),
+            revision: None,
+            model_path: String::new(),
+            chat_template: None,
+            tool_call_parser: None,
+            reasoning_parser: None,
+            stream_response_default_include_usage: false,
+            skip_tokenizer_init: false,
+            vocab_size: 128,
+            default_sampling_params: SamplingDefaults::default(),
+            limits: RendererLimits {
+                skip_tokenizer_init: false,
+                vocab_size: 128,
+                context_len: 5,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: true,
+                enable_return_hidden_states: false,
+            },
+        });
+        let service = RendererService::new(processor, Arc::new(UnexpectedTokenizer));
+        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "prompt": [11, 12, 13],
+            "max_tokens": 4
+        }))
+        .unwrap();
+
+        let prepared =
+            futures::executor::block_on(service.prepare_completions(request, "cmpl-test")).unwrap();
+
+        assert_eq!(prepared[0].input_ids, vec![11, 12, 13]);
+        assert_eq!(prepared[0].sampling_params.max_new_tokens, Some(2));
     }
 }

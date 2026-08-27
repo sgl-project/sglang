@@ -8,8 +8,8 @@ use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::fsm::Event;
 
-use sglang_renderer::tokenize_text_completion;
 pub use sglang_renderer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+use sglang_renderer::{tokenize_text_prompt, tokenize_text_request};
 
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
@@ -54,15 +54,17 @@ impl Runnable for TokenizerWorker {
                             tracing::error!("tokenizer pool received a non-generate request");
                             continue;
                         };
-                        match tokenize_text_completion(
-                            g.text.as_deref(),
-                            &mut g.input_ids,
+                        match tokenize_text_prompt(
+                            g.text.as_deref().unwrap_or_default(),
                             g.skip_special_tokens,
                             &mut g.sampling_params,
                             self.tokenizer.as_ref(),
                             &self.auto_specials,
                         ) {
-                            Ok(()) => Event::TokenizeDone,
+                            Ok(input_ids) => {
+                                g.input_ids = Some(input_ids);
+                                Event::TokenizeDone
+                            }
                             Err(err) => Event::Error(err.into()),
                         }
                     };
@@ -77,16 +79,12 @@ impl Runnable for TokenizerWorker {
                     }
                 }
                 TokenizationJob::Standalone(job) => {
-                    let crate::renderer::StandaloneTokenizationJob { mut request, reply } = *job;
-                    let result = tokenize_text_completion(
-                        request.text.as_deref(),
-                        &mut request.input_ids,
-                        request.skip_special_tokens,
-                        &mut request.sampling_params,
+                    let crate::renderer::StandaloneTokenizationJob { request, reply } = *job;
+                    let result = tokenize_text_request(
+                        request,
                         self.tokenizer.as_ref(),
                         &self.auto_specials,
-                    )
-                    .map(|()| request);
+                    );
                     // The HTTP request may have been cancelled while preparing.
                     let _ = reply.send(result);
                 }

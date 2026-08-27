@@ -13,8 +13,8 @@ use dynamo_protocols::types::{
 };
 
 use crate::{
-    ChatFormatter, OneOrMany, RendererConfig, RendererError, SamplingDefaults, SamplingParams,
-    TextRequest, TokenIds,
+    ChatFormatter, GenerationInput, GenerationOptions, OneOrMany, RendererConfig, RendererError,
+    SamplingDefaults, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -173,8 +173,8 @@ pub fn apply_tool_constraint(
     Ok(())
 }
 
-pub(crate) struct ChatProcessingParts {
-    pub text_requests: Vec<TextRequest>,
+pub(crate) struct ProcessedChat {
+    pub generation_inputs: Vec<GenerationInput>,
     pub parser: Option<String>,
     pub tools: Option<Vec<ToolDefinition>>,
 }
@@ -184,7 +184,7 @@ pub(crate) async fn process_chat_request(
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
-) -> Result<ChatProcessingParts, RendererError> {
+) -> Result<ProcessedChat, RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -249,23 +249,25 @@ pub(crate) async fn process_chat_request(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        requests.push(TextRequest {
+        requests.push(GenerationInput::Text(TextRequest {
             rid: format!("{response_id}-{index}"),
-            text: Some(choice_prompt),
+            text: choice_prompt,
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
-            sampling_params: sampling.clone(),
-            stream,
-            return_logprob: want_logprobs,
-            logprob_start_len: -1,
-            top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
-            return_text_in_logprobs: want_logprobs.then_some(true),
-            ..Default::default()
-        });
+            options: GenerationOptions {
+                sampling_params: sampling.clone(),
+                stream,
+                return_logprob: want_logprobs,
+                logprob_start_len: -1,
+                top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
+                return_text_in_logprobs: want_logprobs.then_some(true),
+                ..Default::default()
+            },
+        }));
     }
-    Ok(ChatProcessingParts {
-        text_requests: requests,
+    Ok(ProcessedChat {
+        generation_inputs: requests,
         parser,
         tools,
     })
@@ -473,7 +475,7 @@ pub(crate) fn process_completion_request(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,
-) -> Result<Vec<TextRequest>, RendererError> {
+) -> Result<Vec<GenerationInput>, RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -505,16 +507,9 @@ pub(crate) fn process_completion_request(
 
     let mut requests = Vec::with_capacity(choice_count);
     for (prompt_index, prompt) in prompt_specs.into_iter().enumerate() {
-        let (text, input_ids) = match prompt {
-            PromptSpec::Text(text) => (Some(text), None),
-            PromptSpec::TokenIds(ids) => (None, Some(ids)),
-        };
         for sample_index in 0..n {
             let index = prompt_index * n + sample_index;
-            requests.push(TextRequest {
-                rid: format!("{response_id}-{index}"),
-                text: text.clone(),
-                input_ids: input_ids.clone(),
+            let options = GenerationOptions {
                 sampling_params: sampling.clone(),
                 stream: request.stream.unwrap_or(false),
                 return_logprob: request.logprobs.is_some(),
@@ -526,6 +521,20 @@ pub(crate) fn process_completion_request(
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
                 ..Default::default()
+            };
+            let rid = format!("{response_id}-{index}");
+            requests.push(match &prompt {
+                PromptSpec::Text(text) => GenerationInput::Text(TextRequest {
+                    rid,
+                    text: text.clone(),
+                    skip_special_tokens: false,
+                    options,
+                }),
+                PromptSpec::TokenIds(input_ids) => GenerationInput::TokenIds(TokenIdsRequest {
+                    rid,
+                    input_ids: input_ids.clone(),
+                    options,
+                }),
             });
         }
     }

@@ -85,14 +85,14 @@ async fn chat_completions(
             return openai_error(status, error.to_string(), false);
         }
     };
-    let text_requests = parts.text_requests;
+    let generation_inputs = parts.generation_inputs;
     let response_processor = parts.response_processor;
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(text_requests.len());
+    let mut submitted = Vec::with_capacity(generation_inputs.len());
 
-    for (index, text_request) in text_requests.into_iter().enumerate() {
-        let native = GenerateRequest::from(text_request);
+    for (index, generation_input) in generation_inputs.into_iter().enumerate() {
+        let native = GenerateRequest::from(generation_input);
         let rid = native.rid.clone();
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
             Ok(rx) => rx,

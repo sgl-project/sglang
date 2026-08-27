@@ -7,16 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::{SamplingParams, TokenIds};
 
 #[derive(Debug, Clone, Default)]
-/// Model-facing text completion after protocol-specific lowering and before
-/// tokenizer-dependent preparation.
-///
-/// Chat and legacy Completions both converge on this type. Chat-specific
-/// response interpretation is retained separately by `ChatResponseProcessor`.
-pub struct TextRequest {
-    pub rid: String,
-    pub text: Option<String>,
-    pub input_ids: Option<TokenIds>,
-    pub skip_special_tokens: bool,
+/// Generation options shared by text and token-ID inputs.
+pub struct GenerationOptions {
     pub sampling_params: SamplingParams,
     pub stream: bool,
     pub return_logprob: bool,
@@ -27,9 +19,50 @@ pub struct TextRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl TextRequest {
-    pub fn already_tokenized(&self) -> bool {
-        self.input_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+#[derive(Debug, Clone)]
+/// A generation request whose prompt still requires tokenization.
+pub struct TextRequest {
+    pub rid: String,
+    pub text: String,
+    pub skip_special_tokens: bool,
+    pub options: GenerationOptions,
+}
+
+#[derive(Debug, Clone)]
+/// A generation request whose prompt is already represented by token IDs.
+pub struct TokenIdsRequest {
+    pub rid: String,
+    pub input_ids: TokenIds,
+    pub options: GenerationOptions,
+}
+
+#[derive(Debug, Clone)]
+/// Protocol processing output before tokenizer-dependent preparation.
+pub enum GenerationInput {
+    Text(TextRequest),
+    TokenIds(TokenIdsRequest),
+}
+
+impl GenerationInput {
+    pub fn rid(&self) -> &str {
+        match self {
+            Self::Text(request) => &request.rid,
+            Self::TokenIds(request) => &request.rid,
+        }
+    }
+
+    pub fn options(&self) -> &GenerationOptions {
+        match self {
+            Self::Text(request) => &request.options,
+            Self::TokenIds(request) => &request.options,
+        }
+    }
+
+    pub fn options_mut(&mut self) -> &mut GenerationOptions {
+        match self {
+            Self::Text(request) => &mut request.options,
+            Self::TokenIds(request) => &mut request.options,
+        }
     }
 }
 
@@ -54,22 +87,20 @@ pub struct PreparedGenerateRequest {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-impl From<TextRequest> for PreparedGenerateRequest {
-    fn from(mut request: TextRequest) -> Self {
+impl From<TokenIdsRequest> for PreparedGenerateRequest {
+    fn from(request: TokenIdsRequest) -> Self {
+        let options = request.options;
         Self {
             rid: request.rid,
-            input_ids: request
-                .input_ids
-                .take()
-                .expect("renderer preparation always produces input_ids"),
-            sampling_params: request.sampling_params.into(),
-            stream: request.stream,
-            return_logprob: request.return_logprob,
-            logprob_start_len: request.logprob_start_len,
-            top_logprobs_num: request.top_logprobs_num,
-            token_ids_logprob: request.token_ids_logprob,
-            return_hidden_states: request.return_hidden_states,
-            return_text_in_logprobs: request.return_text_in_logprobs,
+            input_ids: request.input_ids,
+            sampling_params: options.sampling_params.into(),
+            stream: options.stream,
+            return_logprob: options.return_logprob,
+            logprob_start_len: options.logprob_start_len,
+            top_logprobs_num: options.top_logprobs_num,
+            token_ids_logprob: options.token_ids_logprob,
+            return_hidden_states: options.return_hidden_states,
+            return_text_in_logprobs: options.return_text_in_logprobs,
         }
     }
 }

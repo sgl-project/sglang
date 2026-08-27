@@ -82,7 +82,7 @@ async fn completions(
         .as_ref()
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
-    let text_requests = match state
+    let generation_inputs = match state
         .request_processor
         .process_completions(request, &response_id)
     {
@@ -95,11 +95,11 @@ async fn completions(
     };
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(text_requests.len());
+    let mut submitted = Vec::with_capacity(generation_inputs.len());
     let mut prompt_echo = String::new();
 
-    for (index, text_request) in text_requests.into_iter().enumerate() {
-        let native = GenerateRequest::from(text_request);
+    for (index, generation_input) in generation_inputs.into_iter().enumerate() {
+        let native = GenerateRequest::from(generation_input);
         let prompt_index = index / n;
         let sample_index = index % n;
         if sample_index == 0 {

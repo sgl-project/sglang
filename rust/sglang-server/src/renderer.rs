@@ -10,10 +10,12 @@ use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, Request};
 
 pub(crate) use sglang_renderer::{
-    OpenAIRequestProcessor, RendererConfig, RendererError as RenderServiceError, RendererService,
-    TextRequest,
+    GenerationInput, OpenAIRequestProcessor, RendererConfig, RendererError as RenderServiceError,
+    RendererService, TextRequest, TokenIdsRequest,
 };
-use sglang_renderer::{RendererLimits, SamplingDefaults, TokenizationBackend};
+use sglang_renderer::{
+    GenerationOptions, RendererLimits, SamplingDefaults, TokenIds, TokenizationBackend,
+};
 
 /// Work accepted by the shared tokenization pool. Inference requests retain
 /// their FSM, while standalone requests use the renderer crate's contracts.
@@ -24,7 +26,7 @@ pub(crate) enum TokenizationJob {
 
 pub(crate) struct StandaloneTokenizationJob {
     pub(crate) request: TextRequest,
-    pub(crate) reply: oneshot::Sender<Result<TextRequest, RenderServiceError>>,
+    pub(crate) reply: oneshot::Sender<Result<TokenIdsRequest, RenderServiceError>>,
 }
 
 struct ServerTokenizationBackend {
@@ -35,7 +37,7 @@ impl TokenizationBackend for ServerTokenizationBackend {
     fn tokenize(
         &self,
         request: TextRequest,
-    ) -> BoxFuture<'static, Result<TextRequest, RenderServiceError>> {
+    ) -> BoxFuture<'static, Result<TokenIdsRequest, RenderServiceError>> {
         let jobs = self.jobs.clone();
         Box::pin(async move {
             let (reply, result) = oneshot::channel();
@@ -104,20 +106,57 @@ pub(crate) fn render_http_status(error: &RenderServiceError) -> u16 {
 
 impl From<TextRequest> for GenerateRequest {
     fn from(request: TextRequest) -> Self {
-        Self {
-            rid: Rid::from_client(&request.rid),
-            text: request.text,
-            input_ids: request.input_ids,
-            skip_special_tokens: request.skip_special_tokens,
-            sampling_params: request.sampling_params,
-            stream: request.stream,
-            return_logprob: request.return_logprob,
-            logprob_start_len: request.logprob_start_len,
-            top_logprobs_num: request.top_logprobs_num,
-            token_ids_logprob: request.token_ids_logprob,
-            return_hidden_states: request.return_hidden_states,
-            return_text_in_logprobs: request.return_text_in_logprobs,
-            ..Default::default()
+        native_generate_request(
+            request.rid,
+            Some(request.text),
+            None,
+            request.skip_special_tokens,
+            request.options,
+        )
+    }
+}
+
+impl From<TokenIdsRequest> for GenerateRequest {
+    fn from(request: TokenIdsRequest) -> Self {
+        native_generate_request(
+            request.rid,
+            None,
+            Some(request.input_ids),
+            false,
+            request.options,
+        )
+    }
+}
+
+fn native_generate_request(
+    rid: String,
+    text: Option<String>,
+    input_ids: Option<TokenIds>,
+    skip_special_tokens: bool,
+    options: GenerationOptions,
+) -> GenerateRequest {
+    GenerateRequest {
+        rid: Rid::from_client(&rid),
+        text,
+        input_ids,
+        skip_special_tokens,
+        sampling_params: options.sampling_params,
+        stream: options.stream,
+        return_logprob: options.return_logprob,
+        logprob_start_len: options.logprob_start_len,
+        top_logprobs_num: options.top_logprobs_num,
+        token_ids_logprob: options.token_ids_logprob,
+        return_hidden_states: options.return_hidden_states,
+        return_text_in_logprobs: options.return_text_in_logprobs,
+        ..Default::default()
+    }
+}
+
+impl From<GenerationInput> for GenerateRequest {
+    fn from(request: GenerationInput) -> Self {
+        match request {
+            GenerationInput::Text(request) => request.into(),
+            GenerationInput::TokenIds(request) => request.into(),
         }
     }
 }
@@ -126,7 +165,7 @@ impl From<TextRequest> for GenerateRequest {
 mod tests {
     use super::*;
     use sglang_renderer::{
-        SamplingParams, TextTokenizer, prepare_direct_request, tokenize_text_completion,
+        SamplingParams, TextTokenizer, prepare_direct_request, tokenize_text_prompt,
     };
 
     use crate::tokenizer_manager::to_scheduler::{
@@ -137,27 +176,28 @@ mod tests {
     fn engine_conversion_preserves_renderer_fields() {
         let rendered = TextRequest {
             rid: "client-rid".into(),
-            text: Some("prompt".into()),
-            input_ids: Some(vec![1, 2, 3]),
+            text: "prompt".into(),
             skip_special_tokens: true,
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(17),
-                temperature: 0.25,
-                ..Default::default()
+            options: GenerationOptions {
+                sampling_params: SamplingParams {
+                    max_new_tokens: Some(17),
+                    temperature: 0.25,
+                    ..Default::default()
+                },
+                stream: true,
+                return_logprob: true,
+                logprob_start_len: 2,
+                top_logprobs_num: 4,
+                token_ids_logprob: Some(vec![5, 6]),
+                return_hidden_states: true,
+                return_text_in_logprobs: Some(true),
             },
-            stream: true,
-            return_logprob: true,
-            logprob_start_len: 2,
-            top_logprobs_num: 4,
-            token_ids_logprob: Some(vec![5, 6]),
-            return_hidden_states: true,
-            return_text_in_logprobs: Some(true),
         };
 
         let engine = GenerateRequest::from(rendered);
         assert_eq!(engine.rid.client_facing(), "client-rid");
         assert_eq!(engine.text.as_deref(), Some("prompt"));
-        assert_eq!(engine.input_ids, Some(vec![1, 2, 3]));
+        assert_eq!(engine.input_ids, None);
         assert!(engine.skip_special_tokens);
         assert_eq!(engine.sampling_params.max_new_tokens, Some(17));
         assert_eq!(engine.sampling_params.temperature, 0.25);
@@ -190,17 +230,20 @@ mod tests {
         };
         let request = TextRequest {
             rid: "completion-1".into(),
-            text: Some("one two three".into()),
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(4),
-                stop: Some(crate::message::types::OneOrMany::One("two words".into())),
+            text: "one two three".into(),
+            skip_special_tokens: false,
+            options: GenerationOptions {
+                sampling_params: SamplingParams {
+                    max_new_tokens: Some(4),
+                    stop: Some(crate::message::types::OneOrMany::One("two words".into())),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
         };
 
         let standalone = prepare_direct_request(
-            request.clone(),
+            GenerationInput::Text(request.clone()),
             &WordTokenizer,
             &[],
             &RendererLimits::from(&limits),
@@ -213,19 +256,23 @@ mod tests {
             .sampling_params
             .normalize(limits.skip_tokenizer_init, limits.vocab_size)
             .unwrap();
-        tokenize_text_completion(
-            inference.text.as_deref(),
-            &mut inference.input_ids,
-            inference.skip_special_tokens,
-            &mut inference.sampling_params,
-            &WordTokenizer,
-            &[],
-        )
-        .unwrap();
+        inference.input_ids = Some(
+            tokenize_text_prompt(
+                inference.text.as_deref().unwrap_or_default(),
+                inference.skip_special_tokens,
+                &mut inference.sampling_params,
+                &WordTokenizer,
+                &[],
+            )
+            .unwrap(),
+        );
         check_total_tokens(&mut inference, &limits).unwrap();
 
-        assert_eq!(inference.input_ids, standalone.input_ids);
-        assert_eq!(inference.sampling_params, standalone.sampling_params);
+        assert_eq!(inference.input_ids, Some(standalone.input_ids));
+        assert_eq!(
+            inference.sampling_params,
+            standalone.options.sampling_params
+        );
         assert_eq!(inference.sampling_params.stop_str_max_len, 2);
         assert_eq!(inference.sampling_params.max_new_tokens, Some(2));
     }

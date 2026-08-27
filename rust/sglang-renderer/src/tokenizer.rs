@@ -1,6 +1,9 @@
 //! Tokenizer primitives shared by renderer hosts.
 
-use crate::{RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds};
+use crate::{
+    GenerationInput, RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds,
+    TokenIdsRequest,
+};
 use std::path::Path;
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
@@ -135,17 +138,14 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
     ids
 }
 
-/// Apply the tokenizer-dependent stage to the common fields of one text
-/// completion. Full inference and standalone rendering both call this exact
-/// operation, even though they retain different enclosing request types.
-pub fn tokenize_text_completion(
-    text: Option<&str>,
-    input_ids: &mut Option<TokenIds>,
+/// Tokenize one text prompt and resolve tokenizer-dependent stop sizing.
+pub fn tokenize_text_prompt(
+    text: &str,
     skip_special_tokens: bool,
     sampling_params: &mut SamplingParams,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
-) -> Result<(), Error> {
+) -> Result<TokenIds, Error> {
     // Size the scheduler's stop-match window in TOKENS, as Python's
     // `normalize(tokenizer)` does.
     if let Some(stop_tokens) = sampling_params
@@ -159,52 +159,86 @@ pub fn tokenize_text_completion(
     {
         sampling_params.stop_str_max_len = stop_tokens;
     }
-    let ids = tokenizer.encode(text.unwrap_or(""))?;
-    *input_ids = Some(if skip_special_tokens {
+    let ids = tokenizer.encode(text)?;
+    Ok(if skip_special_tokens {
         strip_auto_specials(ids, auto_specials)
     } else {
         ids
-    });
-    Ok(())
+    })
+}
+
+/// Convert a text input into the token-ID request consumed by shared
+/// post-tokenization preparation.
+pub fn tokenize_text_request(
+    request: TextRequest,
+    tokenizer: &dyn TextTokenizer,
+    auto_specials: &[i32],
+) -> Result<TokenIdsRequest, Error> {
+    let mut options = request.options;
+    let input_ids = tokenize_text_prompt(
+        &request.text,
+        request.skip_special_tokens,
+        &mut options.sampling_params,
+        tokenizer,
+        auto_specials,
+    )?;
+    Ok(TokenIdsRequest {
+        rid: request.rid,
+        input_ids,
+        options,
+    })
 }
 
 /// Run the engine-free validation, normalization, tokenization and context checks.
 pub fn prepare_direct_request(
-    mut request: TextRequest,
+    mut request: GenerationInput,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
     limits: &RendererLimits,
-) -> Result<TextRequest, Error> {
-    validate_request(&request, limits)?;
+) -> Result<TokenIdsRequest, Error> {
+    validate_generation_input(&request, limits)?;
     request
+        .options_mut()
         .sampling_params
         .normalize(limits.skip_tokenizer_init, limits.vocab_size)?;
-    if !request.already_tokenized() {
-        tokenize_text_completion(
-            request.text.as_deref(),
-            &mut request.input_ids,
-            request.skip_special_tokens,
-            &mut request.sampling_params,
-            tokenizer,
-            auto_specials,
-        )?;
-    }
+    let mut request = match request {
+        GenerationInput::Text(request) => tokenize_text_request(request, tokenizer, auto_specials)?,
+        GenerationInput::TokenIds(request) => request,
+    };
     check_total_tokens(&mut request, limits)?;
     Ok(request)
 }
 
 /// Validate fields that must be safe before tokenization or engine submission.
-pub fn validate_request(request: &TextRequest, limits: &RendererLimits) -> Result<(), Error> {
-    if request.rid.len() > 128 {
+pub fn validate_generation_input(
+    request: &GenerationInput,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
+    if request.rid().len() > 128 {
         return Err(Error::Validation(format!(
             "rid is {} bytes, over the 128-byte limit",
-            request.rid.len()
+            request.rid().len()
         )));
     }
+    let input_ids = match request {
+        GenerationInput::Text(request) => {
+            if request.text.is_empty() {
+                return Err(Error::Validation("prompt cannot be empty".into()));
+            }
+            None
+        }
+        GenerationInput::TokenIds(request) => {
+            if request.input_ids.is_empty() {
+                return Err(Error::Validation("input_ids cannot be empty".into()));
+            }
+            Some(request.input_ids.as_slice())
+        }
+    };
+    let options = request.options();
     validate_completion_fields(
-        request.input_ids.as_deref(),
-        request.token_ids_logprob.as_deref(),
-        request.return_hidden_states,
+        input_ids,
+        options.token_ids_logprob.as_deref(),
+        options.return_hidden_states,
         limits,
     )
 }
@@ -248,8 +282,15 @@ pub fn validate_completion_fields(
 }
 
 /// Enforce the model context limit after tokenization.
-pub fn check_total_tokens(request: &mut TextRequest, limits: &RendererLimits) -> Result<(), Error> {
-    check_completion_token_budget(&mut request.input_ids, &mut request.sampling_params, limits)
+pub fn check_total_tokens(
+    request: &mut TokenIdsRequest,
+    limits: &RendererLimits,
+) -> Result<(), Error> {
+    let mut input_ids = Some(std::mem::take(&mut request.input_ids));
+    let result =
+        check_completion_token_budget(&mut input_ids, &mut request.options.sampling_params, limits);
+    request.input_ids = input_ids.expect("prepared token-ID request retains input_ids");
+    result
 }
 
 /// Enforce the context limit over the common prepared completion fields.
