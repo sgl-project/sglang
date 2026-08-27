@@ -84,7 +84,13 @@ MI35X_DEEPSEEK_V32_MODELS = [
             "--watchdog-timeout",
             "1200",  # 20 minutes for weight loading
         ],
-        env_vars={},
+        # On ROCm 7.2 the AITER gluon `pa_mqa_logits` Preshuffle=True / page_size=64
+        # path is broken under the custom-built Triton, causing the NSA indexer to
+        # pick wrong top-k tokens during pure decode (next_n=1). Force the legacy
+        # page_size=1 / Preshuffle=False path so basic decode matches the ROCm 7.0
+        # behaviour. The MTP variant is unaffected because target_verify uses
+        # next_n=4 and bypasses that fast path.
+        env_vars={"SGLANG_NSA_HIP_DISABLE_PRESHUFFLE": "1"},
     ),
 ]
 
