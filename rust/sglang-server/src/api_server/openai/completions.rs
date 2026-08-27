@@ -65,7 +65,7 @@ async fn completions(
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests = match state.lowerer.lower_completions(&request, &response_id) {
+    let completion_requests = match state.lowerer.lower_completions(&request, &response_id) {
         Ok(requests) => requests,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))
@@ -78,12 +78,12 @@ async fn completions(
     let model = request.model.clone();
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(native_requests.len());
+    let mut submitted = Vec::with_capacity(completion_requests.len());
     let n = request.n.unwrap_or(1) as usize;
     let mut prompt_echo = String::new();
 
-    for (index, rendered) in native_requests.into_iter().enumerate() {
-        let native = GenerateRequest::from(rendered);
+    for (index, completion_request) in completion_requests.into_iter().enumerate() {
+        let native = GenerateRequest::from(completion_request);
         let prompt_index = index / n;
         let sample_index = index % n;
         if sample_index == 0 {

@@ -45,15 +45,15 @@ pub struct DecodedChatEvent {
 
 /// A host error carried through semantic processing without interpreting it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatOutputError {
+pub struct ChatResponseError {
     pub status_code: u16,
     pub message: String,
 }
 
-/// Input to the output processor. Errors are passed through unchanged.
-pub enum ChatOutputInput {
+/// Input to the response processor. Errors are passed through unchanged.
+pub enum ChatResponseInput {
     Decoded(DecodedChatEvent),
-    Error(ChatOutputError),
+    Error(ChatResponseError),
 }
 
 /// One semantic tool-call delta, independent of HTTP or gRPC framing.
@@ -96,20 +96,20 @@ pub enum ChatEvent {
 
 /// Output from semantic processing. Request lifecycle errors remain owned by
 /// the host and are merely preserved while parser streams are running.
-pub enum ChatOutputItem {
+pub enum ChatResponseItem {
     Event(ChatEvent),
-    Error(ChatOutputError),
+    Error(ChatResponseError),
 }
 
-/// Parsed result for one completed non-streaming choice.
-pub struct ParsedChatOutput {
+/// Parsed response semantics for one completed non-streaming choice.
+pub struct ParsedChatChoice {
     pub content: String,
     pub reasoning_content: String,
     pub tool_calls: Option<Vec<ChatToolCall>>,
 }
 
 /// Mutable parser state for one generated choice.
-struct ChoiceOutputProcessor {
+struct ChoiceResponseProcessor {
     reasoning: ReasoningStreamSplitter,
 }
 
@@ -118,16 +118,16 @@ struct ChoiceOutputProcessor {
 /// Parser names, tool definitions, structural-tag decisions, and mutable
 /// per-choice state are private so protocol adapters cannot accidentally
 /// reimplement the semantic contract.
-pub struct ChatOutputProcessor {
+pub struct ChatResponseProcessor {
     tool_parser: Option<String>,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
     parallel_tool_calls: bool,
-    choices: Vec<ChoiceOutputProcessor>,
+    choices: Vec<ChoiceResponseProcessor>,
 }
 
-impl ChatOutputProcessor {
+impl ChatResponseProcessor {
     pub(crate) fn new(
         tool_parser: Option<String>,
         reasoning_parser: Option<String>,
@@ -144,7 +144,7 @@ impl ChatOutputProcessor {
             uses_tool_call_structural_tag,
             parallel_tool_calls,
             choices: (0..choice_count)
-                .map(|_| ChoiceOutputProcessor {
+                .map(|_| ChoiceResponseProcessor {
                     reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref()),
                 })
                 .collect(),
@@ -157,7 +157,7 @@ impl ChatOutputProcessor {
 
     /// Interpret one completed generation using the same parser selection that
     /// affected request lowering.
-    pub async fn process_unary(&mut self, text: String, token_ids: &[i32]) -> ParsedChatOutput {
+    pub async fn process_unary(&mut self, text: String, token_ids: &[i32]) -> ParsedChatChoice {
         let reasoning_parser = self
             .choices
             .first()
@@ -171,7 +171,7 @@ impl ChatOutputProcessor {
             self.parallel_tool_calls,
         )
         .await;
-        ParsedChatOutput {
+        ParsedChatChoice {
             content,
             reasoning_content,
             tool_calls,
@@ -187,9 +187,9 @@ impl ChatOutputProcessor {
     pub fn process_stream<S>(
         mut self,
         input: S,
-    ) -> Pin<Box<dyn Stream<Item = ChatOutputItem> + Send>>
+    ) -> Pin<Box<dyn Stream<Item = ChatResponseItem> + Send>>
     where
-        S: Stream<Item = ChatOutputInput> + Send + 'static,
+        S: Stream<Item = ChatResponseInput> + Send + 'static,
     {
         let count = self.choices.len();
         let raw = async_stream::stream! {
@@ -208,8 +208,8 @@ impl ChatOutputProcessor {
             futures::pin_mut!(input);
             while let Some(item) = input.next().await {
                 let decoded = match item {
-                    ChatOutputInput::Decoded(decoded) => decoded,
-                    ChatOutputInput::Error(error) => {
+                    ChatResponseInput::Decoded(decoded) => decoded,
+                    ChatResponseInput::Error(error) => {
                         yield Annotated {
                             data: None,
                             id: None,
@@ -232,7 +232,7 @@ impl ChatOutputProcessor {
                         id: None,
                         event: None,
                         comment: None,
-                        error: serde_json::to_string(&ChatOutputError {
+                        error: serde_json::to_string(&ChatResponseError {
                             status_code: 500,
                             message: format!("output choice {} is out of range", decoded.choice),
                         }).ok(),
@@ -320,7 +320,7 @@ impl ChatOutputProcessor {
                     if response.choices.is_empty()
                         && let Some(usage) = response.usage
                     {
-                        yield ChatOutputItem::Event(ChatEvent::Usage {
+                        yield ChatResponseItem::Event(ChatEvent::Usage {
                             prompt_tokens: usage.prompt_tokens,
                             completion_tokens: u64::from(usage.completion_tokens),
                         });
@@ -355,10 +355,10 @@ impl ChatOutputProcessor {
                             && tool_calls.is_none()
                             && choice.finish_reason.is_none()
                         {
-                            yield ChatOutputItem::Event(ChatEvent::Role { choice: index });
+                            yield ChatResponseItem::Event(ChatEvent::Role { choice: index });
                             continue;
                         }
-                        yield ChatOutputItem::Event(ChatEvent::Delta {
+                        yield ChatResponseItem::Event(ChatEvent::Delta {
                             choice: index,
                             content,
                             reasoning_content: choice.delta.reasoning_content,
@@ -368,11 +368,11 @@ impl ChatOutputProcessor {
                         });
                     }
                 } else if let Some(error) = item.error {
-                    let error = serde_json::from_str(&error).unwrap_or(ChatOutputError {
+                    let error = serde_json::from_str(&error).unwrap_or(ChatResponseError {
                         status_code: 500,
                         message: error,
                     });
-                    yield ChatOutputItem::Error(error);
+                    yield ChatResponseItem::Error(error);
                 }
             }
         })
@@ -581,8 +581,8 @@ mod tests {
         tool_parser: Option<&str>,
         reasoning_parser: Option<&str>,
         choices: usize,
-    ) -> ChatOutputProcessor {
-        ChatOutputProcessor::new(
+    ) -> ChatResponseProcessor {
+        ChatResponseProcessor::new(
             tool_parser.map(str::to_owned),
             reasoning_parser.map(str::to_owned),
             None,
@@ -593,8 +593,8 @@ mod tests {
         )
     }
 
-    fn chunk(choice: usize, text: &str, done: bool) -> ChatOutputInput {
-        ChatOutputInput::Decoded(DecodedChatEvent {
+    fn chunk(choice: usize, text: &str, done: bool) -> ChatResponseInput {
+        ChatResponseInput::Decoded(DecodedChatEvent {
             choice,
             text: text.into(),
             token_ids: vec![],
@@ -631,7 +631,7 @@ mod tests {
         let reasoning = events
             .iter()
             .filter_map(|event| match event {
-                ChatOutputItem::Event(ChatEvent::Delta {
+                ChatResponseItem::Event(ChatEvent::Delta {
                     reasoning_content: Some(text),
                     ..
                 }) => Some(text.as_str()),
@@ -641,13 +641,13 @@ mod tests {
         assert_eq!(reasoning, "because");
         assert!(events.iter().any(|event| matches!(
             event,
-            ChatOutputItem::Event(ChatEvent::Delta {
+            ChatResponseItem::Event(ChatEvent::Delta {
                 content: Some(text), ..
             }) if text == "Paris"
         )));
         assert!(matches!(
             events.last(),
-            Some(ChatOutputItem::Event(ChatEvent::Usage {
+            Some(ChatResponseItem::Event(ChatEvent::Usage {
                 prompt_tokens: 5,
                 completion_tokens: 2
             }))
@@ -667,7 +667,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let deltas = events.iter().filter_map(|event| match event {
-            ChatOutputItem::Event(ChatEvent::Delta {
+            ChatResponseItem::Event(ChatEvent::Delta {
                 choice,
                 content: Some(content),
                 ..

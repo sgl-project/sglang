@@ -5,7 +5,7 @@
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::request::Request;
-use crate::renderer::PreprocessJob;
+use crate::renderer::TokenizationJob;
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
 /// *or* the `shutdown` sender is dropped.
@@ -65,7 +65,7 @@ pub struct Senders {
     /// → the same loop, but UNBOUNDED and abort-only.
     pub abort_tx: flume::Sender<AbortSource>,
     /// → Tokenizer pool (CPU-bound, pinned threads).
-    pub tokenizer_tx: flume::Sender<PreprocessJob>,
+    pub tokenizer_tx: flume::Sender<TokenizationJob>,
     /// → Detokenizer shards, indexed by `Rid::shard(detok.len())`.
     pub detokenizer_tx: Vec<flume::Sender<DetokMsg>>,
 }

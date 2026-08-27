@@ -173,18 +173,18 @@ pub fn apply_tool_constraint(
     Ok(())
 }
 
-pub struct LoweredChatRequests {
-    pub requests: Vec<TextCompletionRequest>,
+pub(crate) struct ChatLoweringParts {
+    pub completion_requests: Vec<TextCompletionRequest>,
     pub parser: Option<String>,
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
-pub async fn lower_chat_requests(
+pub(crate) async fn lower_chat_requests(
     config: &RendererConfig,
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
-) -> Result<LoweredChatRequests, RendererError> {
+) -> Result<ChatLoweringParts, RendererError> {
     if request.model != config.served_model_name {
         return Err(format!("The model `{}` does not exist", request.model).into());
     }
@@ -264,8 +264,8 @@ pub async fn lower_chat_requests(
             ..Default::default()
         });
     }
-    Ok(LoweredChatRequests {
-        requests,
+    Ok(ChatLoweringParts {
+        completion_requests: requests,
         parser,
         tools,
     })
@@ -469,7 +469,7 @@ pub enum PromptSpec {
 }
 /// Validate and lower one OpenAI completion request into the ordered native
 /// requests consumed by inference or standalone rendering.
-pub fn lower_completion_requests(
+pub(crate) fn lower_completion_requests(
     config: &RendererConfig,
     request: &CreateCompletionRequest,
     response_id: &str,

@@ -20,8 +20,8 @@ mod regex;
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
 pub use output::{
-    ChatEvent, ChatFinishReason, ChatOutputError, ChatOutputInput, ChatOutputItem,
-    ChatOutputProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatOutput,
+    ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
+    ChatResponseProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatChoice,
 };
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, TextCompletionRequest};
 pub use sampling::SamplingParams;

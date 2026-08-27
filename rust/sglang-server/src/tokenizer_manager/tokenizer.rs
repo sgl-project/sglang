@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::message::request::RequestKind;
-use crate::renderer::PreprocessJob;
+use crate::renderer::TokenizationJob;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::fsm::Event;
@@ -19,7 +19,7 @@ pub use sglang_renderer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 /// [`GenerateRequest`]'s `skip_special_tokens` — so chat prompts gain no
 /// extra BOS/EOS while native text keeps the post-processor specials.
 pub struct TokenizerWorker {
-    rx: flume::Receiver<PreprocessJob>,
+    rx: flume::Receiver<TokenizationJob>,
     tm: Option<flume::Sender<TmEvent>>,
     tokenizer: Arc<dyn TextTokenizer>,
     auto_specials: Vec<i32>,
@@ -27,7 +27,7 @@ pub struct TokenizerWorker {
 
 impl TokenizerWorker {
     pub fn new(
-        rx: flume::Receiver<PreprocessJob>,
+        rx: flume::Receiver<TokenizationJob>,
         tm: Option<flume::Sender<TmEvent>>,
         tokenizer: Arc<dyn TextTokenizer>,
     ) -> Self {
@@ -45,7 +45,7 @@ impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(job) = self.rx.recv() {
             match job {
-                PreprocessJob::Inference(mut req) => {
+                TokenizationJob::Inference(mut req) => {
                     // Normal inference already validated and normalized in the
                     // intake FSM. Fill ids, then return through its existing
                     // lifecycle.
@@ -76,8 +76,8 @@ impl Runnable for TokenizerWorker {
                         break;
                     }
                 }
-                PreprocessJob::Render(job) => {
-                    let crate::renderer::RenderJob { mut request, reply } = *job;
+                TokenizationJob::Standalone(job) => {
+                    let crate::renderer::StandaloneTokenizationJob { mut request, reply } = *job;
                     let result = tokenize_text_completion(
                         request.text.as_deref(),
                         &mut request.input_ids,
@@ -123,7 +123,7 @@ mod tests {
     /// tokenizer, so it is where the exact count is resolved.
     #[test]
     fn tokenizing_replaces_the_byte_window_with_a_token_count() {
-        let (req_tx, req_rx) = flume::unbounded::<PreprocessJob>();
+        let (req_tx, req_rx) = flume::unbounded::<TokenizationJob>();
         let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
 
         // 8 bytes vs 3 "tokens" under WordTokenizer — units are distinguishable.
@@ -134,7 +134,7 @@ mod tests {
         };
         let (sink_tx, _sink_rx) = mpsc::channel(4);
         req_tx
-            .send(PreprocessJob::Inference(Request {
+            .send(TokenizationJob::Inference(Request {
                 rid: "1".into(),
                 state: RequestState::Tokenizing,
                 sink: ResponseSink::Local(sink_tx),
@@ -180,10 +180,10 @@ mod tests {
     #[test]
     fn skip_special_tokens_strips_the_auto_added_specials() {
         let run = |skip_special_tokens: bool| {
-            let (req_tx, req_rx) = flume::unbounded::<PreprocessJob>();
+            let (req_tx, req_rx) = flume::unbounded::<TokenizationJob>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             req_tx
-                .send(PreprocessJob::Inference(Request {
+                .send(TokenizationJob::Inference(Request {
                     rid: "1".into(),
                     state: RequestState::Tokenizing,
                     sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),

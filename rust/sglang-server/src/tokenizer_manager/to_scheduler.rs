@@ -317,10 +317,10 @@ impl Intake {
                     if let Err(err) = self
                         .senders
                         .tokenizer_tx
-                        .send(crate::renderer::PreprocessJob::Inference(req))
+                        .send(crate::renderer::TokenizationJob::Inference(req))
                     {
                         // Pool gone (workers exited); flume hands the request back.
-                        let crate::renderer::PreprocessJob::Inference(mut req) = err.into_inner()
+                        let crate::renderer::TokenizationJob::Inference(mut req) = err.into_inner()
                         else {
                             unreachable!("inference send returned a render job")
                         };

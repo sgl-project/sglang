@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
-use crate::renderer::{PreprocessJob, new_renderer_service, new_request_lowerer};
+use crate::renderer::{TokenizationJob, new_renderer_service, new_request_lowerer};
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -149,7 +149,8 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
             cfg.rust_server_args.http_addr
         )
     })?;
-    let (render_tx, render_rx) = flume::bounded::<PreprocessJob>(cfg.rust_server_args.channel_cap);
+    let (render_tx, render_rx) =
+        flume::bounded::<TokenizationJob>(cfg.rust_server_args.channel_cap);
     let mut threads = Vec::new();
     spawn_pool(
         "renderer",
@@ -201,7 +202,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let (tok_manager_tx, tok_manager_rx) =
         flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
     let (tokenizer_tx, tokenizer_rx) =
-        flume::bounded::<PreprocessJob>(cfg.rust_server_args.channel_cap);
+        flume::bounded::<TokenizationJob>(cfg.rust_server_args.channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
     let (mm_worker_tx, mm_worker_rx) =

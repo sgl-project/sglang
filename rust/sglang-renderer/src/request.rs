@@ -11,7 +11,7 @@ use crate::{SamplingParams, TokenIds};
 /// tokenizer-dependent preparation.
 ///
 /// Chat and legacy Completions both converge on this type. Chat-specific
-/// response interpretation is retained separately by `ChatOutputProcessor`.
+/// response interpretation is retained separately by `ChatResponseProcessor`.
 pub struct TextCompletionRequest {
     pub rid: String,
     pub text: Option<String>,

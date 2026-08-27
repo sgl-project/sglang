@@ -70,14 +70,14 @@ async fn render_chat(
     {
         Ok(prepared) => {
             // Render-only callers need the prepared generation request, not the
-            // live parser state used after inference. Dropping `output` here is
-            // an explicit property of the preprocess-only contract.
+            // retained response processor used after inference. Dropping it
+            // here is an explicit property of the preprocess-only contract.
             let sglang_renderer::LoweredChat {
-                mut requests,
-                output: _,
+                mut completion_requests,
+                response_processor: _,
             } = prepared;
             Json(PreparedGenerateRequest::from(
-                requests
+                completion_requests
                     .pop()
                     .expect("lowered chat request contains one choice"),
             ))
@@ -126,7 +126,7 @@ mod tests {
     use crate::message::config::{ModelConfig, ServerArgs};
     use crate::message::request::GenerateBody;
     use crate::message::types::TokenIds;
-    use crate::renderer::{PreprocessJob, new_renderer_service};
+    use crate::renderer::{TokenizationJob, new_renderer_service};
     use crate::runtime::Runnable;
     use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
 
@@ -173,7 +173,7 @@ mod tests {
             ..Default::default()
         });
         let tokenizer: Arc<dyn TextTokenizer> = Arc::new(WordTokenizer);
-        let (jobs, worker_jobs) = flume::bounded::<PreprocessJob>(8);
+        let (jobs, worker_jobs) = flume::bounded::<TokenizationJob>(8);
         let workers = (0..server_args.tokenizer_worker_num)
             .map(|worker_index| {
                 let worker = TokenizerWorker::new(worker_jobs.clone(), None, tokenizer.clone());

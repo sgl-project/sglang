@@ -7,8 +7,8 @@
 use dynamo_protocols::types::{ChatChoiceLogprobs, ChatCompletionTokenLogprob, TopLogprobs};
 use futures::StreamExt;
 use sglang_renderer::{
-    ChatFinishReason, ChatOutputError, ChatOutputInput, ChatOutputItem, ChatOutputProcessor,
-    DecodedChatEvent,
+    ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
+    ChatResponseProcessor, DecodedChatEvent,
 };
 use tokio::sync::mpsc;
 
@@ -19,9 +19,9 @@ use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
 pub(crate) fn semantic_chat_stream(
     submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
-    output_processor: ChatOutputProcessor,
+    response_processor: ChatResponseProcessor,
     want_logprobs: bool,
-) -> impl futures::Stream<Item = ChatOutputItem> {
+) -> impl futures::Stream<Item = ChatResponseItem> {
     let count = submitted.len();
     let raw = async_stream::stream! {
         let mut rids = Vec::with_capacity(count);
@@ -35,7 +35,7 @@ pub(crate) fn semantic_chat_stream(
         let mut events = futures::stream::select_all(streams);
         while let Some((index, item)) = events.next().await {
             let Some(item) = item else {
-                yield ChatOutputInput::Error(ChatOutputError {
+                yield ChatResponseInput::Error(ChatResponseError {
                     status_code: 500,
                     message: "response truncated before completion".into(),
                 });
@@ -49,7 +49,7 @@ pub(crate) fn semantic_chat_stream(
                 }
                 ResponseItem::Error(error) => {
                     guard.disarm(&rids[index]);
-                    yield ChatOutputInput::Error(ChatOutputError {
+                    yield ChatResponseInput::Error(ChatResponseError {
                         status_code: error.http_status(),
                         message: error.to_string(),
                     });
@@ -62,7 +62,7 @@ pub(crate) fn semantic_chat_stream(
                 .as_ref()
                 .and_then(|reason| reason.abort_status())
             {
-                yield ChatOutputInput::Error(ChatOutputError {
+                yield ChatResponseInput::Error(ChatResponseError {
                     status_code: code,
                     message: message.to_owned(),
                 });
@@ -70,7 +70,7 @@ pub(crate) fn semantic_chat_stream(
             }
 
             let finish_reason = chat_finish_reason(&output);
-            yield ChatOutputInput::Decoded(DecodedChatEvent {
+            yield ChatResponseInput::Decoded(DecodedChatEvent {
                 choice: index,
                 text: output.text,
                 token_ids: output.token_ids,
@@ -82,7 +82,7 @@ pub(crate) fn semantic_chat_stream(
         }
     };
 
-    output_processor.process_stream(raw)
+    response_processor.process_stream(raw)
 }
 
 pub(crate) fn chat_finish_reason(output: &ChunkEvent) -> Option<ChatFinishReason> {

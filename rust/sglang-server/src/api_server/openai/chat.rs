@@ -22,7 +22,7 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use sglang_renderer::{
-    ChatEvent, ChatFinishReason, ChatOutputItem, ChatOutputProcessor, ChatToolCallDelta,
+    ChatEvent, ChatFinishReason, ChatResponseItem, ChatResponseProcessor, ChatToolCallDelta,
 };
 use tokio::sync::mpsc;
 
@@ -61,16 +61,16 @@ async fn chat_completions(
         }
     };
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let prepared = match state.lowerer.lower_chat(&mut request, &response_id).await {
-        Ok(prepared) => prepared,
+    let lowered = match state.lowerer.lower_chat(&mut request, &response_id).await {
+        Ok(lowered) => lowered,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return openai_error(status, error.to_string(), false);
         }
     };
-    let native_requests = prepared.requests;
-    let output = prepared.output;
+    let completion_requests = lowered.completion_requests;
+    let response_processor = lowered.response_processor;
     let stream = request.stream.unwrap_or(false);
     let model = request.model.clone();
     let want_logprobs = request.logprobs.unwrap_or(false);
@@ -82,10 +82,10 @@ async fn chat_completions(
     let service_tier = request.service_tier.clone();
     let created = unix_seconds_u32();
     let mut guard = state.frontend.empty_abort_guard();
-    let mut submitted = Vec::with_capacity(native_requests.len());
+    let mut submitted = Vec::with_capacity(completion_requests.len());
 
-    for (index, rendered) in native_requests.into_iter().enumerate() {
-        let native = GenerateRequest::from(rendered);
+    for (index, completion_request) in completion_requests.into_iter().enumerate() {
+        let native = GenerateRequest::from(completion_request);
         let rid = native.rid.clone();
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
             Ok(rx) => rx,
@@ -97,7 +97,7 @@ async fn chat_completions(
         let event_stream = chat_event_stream(
             submitted,
             guard,
-            output,
+            response_processor,
             ChatStreamWireContext {
                 response_id,
                 model,
@@ -113,7 +113,7 @@ async fn chat_completions(
         unary_chat(
             submitted,
             guard,
-            output,
+            response_processor,
             response_id,
             model,
             created,
@@ -128,7 +128,7 @@ async fn chat_completions(
 pub(super) async fn unary_chat(
     submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
-    mut output_processor: ChatOutputProcessor,
+    mut response_processor: ChatResponseProcessor,
     response_id: String,
     model: String,
     created: u32,
@@ -153,7 +153,7 @@ pub(super) async fn unary_chat(
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output).map(openai_finish_reason);
-        let parsed = output_processor
+        let parsed = response_processor
             .process_unary(output.text, &output.token_ids)
             .await;
         let finish_reason = if parsed.tool_calls.is_some() {
@@ -213,16 +213,16 @@ pub(super) async fn unary_chat(
 fn chat_event_stream(
     submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     guard: AbortGuard,
-    output_processor: ChatOutputProcessor,
+    response_processor: ChatResponseProcessor,
     context: ChatStreamWireContext,
 ) -> impl futures::Stream<Item = String> {
-    let parsed = semantic_chat_stream(submitted, guard, output_processor, context.want_logprobs);
+    let parsed = semantic_chat_stream(submitted, guard, response_processor, context.want_logprobs);
 
     async_stream::stream! {
         futures::pin_mut!(parsed);
         while let Some(item) = parsed.next().await {
             match item {
-                ChatOutputItem::Event(ChatEvent::Role { choice }) => {
+                ChatResponseItem::Event(ChatEvent::Role { choice }) => {
                     yield serialize_chat_stream_response(chat_stream_response(
                         &context.response_id,
                         &context.model,
@@ -237,7 +237,7 @@ fn chat_event_stream(
                         None,
                     ));
                 }
-                ChatOutputItem::Event(ChatEvent::Delta {
+                ChatResponseItem::Event(ChatEvent::Delta {
                     choice,
                     content,
                     reasoning_content,
@@ -266,7 +266,7 @@ fn chat_event_stream(
                         None,
                     ));
                 }
-                ChatOutputItem::Event(ChatEvent::Usage {
+                ChatResponseItem::Event(ChatEvent::Usage {
                     prompt_tokens,
                     completion_tokens,
                 }) if context.include_usage => {
@@ -279,8 +279,8 @@ fn chat_event_stream(
                         Some((prompt_tokens, completion_tokens)),
                     ));
                 }
-                ChatOutputItem::Event(ChatEvent::Usage { .. }) => {}
-                ChatOutputItem::Error(error) => {
+                ChatResponseItem::Event(ChatEvent::Usage { .. }) => {}
+                ChatResponseItem::Error(error) => {
                     let status = StatusCode::from_u16(error.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     yield error_payload(status, error.message).to_string();
@@ -387,10 +387,10 @@ mod tests {
         .unwrap()
     }
 
-    async fn output_processor(
+    async fn response_processor(
         reasoning_parser: Option<&str>,
         choices: usize,
-    ) -> sglang_renderer::ChatOutputProcessor {
+    ) -> sglang_renderer::ChatResponseProcessor {
         let args = ServerArgs {
             model_path: "test-model".into(),
             served_model_name: "model".into(),
@@ -410,7 +410,7 @@ mod tests {
             .lower_chat(&mut request, "chatcmpl-test")
             .await
             .unwrap()
-            .output
+            .response_processor
     }
 
     fn wire_context(include_usage: bool) -> ChatStreamWireContext {
@@ -515,7 +515,7 @@ mod tests {
         let response = unary_chat(
             vec![choice0, choice1],
             AbortGuard::new_empty(senders().abort_tx),
-            output_processor(None, 2).await,
+            response_processor(None, 2).await,
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -549,7 +549,7 @@ mod tests {
         let response = unary_chat(
             vec![choice],
             AbortGuard::new_empty(senders().abort_tx),
-            output_processor(Some("deepseek-r1"), 1).await,
+            response_processor(Some("deepseek-r1"), 1).await,
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -584,7 +584,7 @@ mod tests {
         let stream = chat_event_stream(
             vec![choice],
             AbortGuard::new_empty(senders().abort_tx),
-            output_processor(Some("deepseek-r1"), 1).await,
+            response_processor(Some("deepseek-r1"), 1).await,
             wire_context(true),
         );
         futures::pin_mut!(stream);
@@ -620,7 +620,7 @@ mod tests {
         let stream = chat_event_stream(
             vec![choice],
             AbortGuard::new_empty(senders().abort_tx),
-            output_processor(None, 1).await,
+            response_processor(None, 1).await,
             wire_context(true),
         );
         futures::pin_mut!(stream);

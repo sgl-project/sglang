@@ -9,7 +9,7 @@ use crate::openai::{lower_chat_requests, lower_completion_requests};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_request};
 use crate::{
-    ChatFormatter, ChatOutputProcessor, RendererConfig, RendererError, TextCompletionRequest,
+    ChatFormatter, ChatResponseProcessor, RendererConfig, RendererError, TextCompletionRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one lowered text
@@ -38,11 +38,13 @@ pub struct RendererService {
     backend: Arc<dyn TokenizationBackend>,
 }
 
-/// Lowered generation requests plus their request-scoped output processor.
-/// `requests` are tokenized only when returned by `prepare_chat`.
+/// Lowered text-completion requests plus the processor retained to interpret
+/// their eventual engine responses.
+///
+/// `completion_requests` are tokenized only when returned by `prepare_chat`.
 pub struct LoweredChat {
-    pub requests: Vec<TextCompletionRequest>,
-    pub output: ChatOutputProcessor,
+    pub completion_requests: Vec<TextCompletionRequest>,
+    pub response_processor: ChatResponseProcessor,
 }
 
 impl RequestLowerer {
@@ -71,21 +73,21 @@ impl RequestLowerer {
         )
         .await?;
         let uses_tool_call_structural_tag = lowered
-            .requests
+            .completion_requests
             .first()
             .is_some_and(|request| request.sampling_params.structural_tag.is_some());
-        let output = ChatOutputProcessor::new(
+        let response_processor = ChatResponseProcessor::new(
             lowered.parser,
             self.config.reasoning_parser.clone(),
             lowered.tools,
             request.tool_choice.clone(),
             uses_tool_call_structural_tag,
             request.parallel_tool_calls.unwrap_or(true),
-            lowered.requests.len(),
+            lowered.completion_requests.len(),
         );
         Ok(LoweredChat {
-            requests: lowered.requests,
-            output,
+            completion_requests: lowered.completion_requests,
+            response_processor,
         })
     }
 
@@ -108,9 +110,9 @@ impl RendererService {
         request: &mut CreateChatCompletionRequest,
         response_id: &str,
     ) -> Result<LoweredChat, RendererError> {
-        let mut batch = self.lowerer.lower_chat(request, response_id).await?;
-        batch.requests = self.prepare_many(batch.requests).await?;
-        Ok(batch)
+        let mut lowered = self.lowerer.lower_chat(request, response_id).await?;
+        lowered.completion_requests = self.prepare_many(lowered.completion_requests).await?;
+        Ok(lowered)
     }
 
     pub async fn prepare_completions(

@@ -15,20 +15,20 @@ pub(crate) use sglang_renderer::{
 };
 use sglang_renderer::{RendererLimits, SamplingDefaults, TokenizationBackend};
 
-/// Shared tokenizer-pool work. Engine requests retain their FSM, while renderer
-/// requests use the crate-owned request and error contracts.
-pub(crate) enum PreprocessJob {
+/// Work accepted by the shared tokenization pool. Inference requests retain
+/// their FSM, while standalone requests use the renderer crate's contracts.
+pub(crate) enum TokenizationJob {
     Inference(Request),
-    Render(Box<RenderJob>),
+    Standalone(Box<StandaloneTokenizationJob>),
 }
 
-pub(crate) struct RenderJob {
+pub(crate) struct StandaloneTokenizationJob {
     pub(crate) request: TextCompletionRequest,
     pub(crate) reply: oneshot::Sender<Result<TextCompletionRequest, RenderServiceError>>,
 }
 
 struct ServerTokenizationBackend {
-    jobs: flume::Sender<PreprocessJob>,
+    jobs: flume::Sender<TokenizationJob>,
 }
 
 impl TokenizationBackend for ServerTokenizationBackend {
@@ -39,10 +39,9 @@ impl TokenizationBackend for ServerTokenizationBackend {
         let jobs = self.jobs.clone();
         Box::pin(async move {
             let (reply, result) = oneshot::channel();
-            jobs.send_async(PreprocessJob::Render(Box::new(RenderJob {
-                request,
-                reply,
-            })))
+            jobs.send_async(TokenizationJob::Standalone(Box::new(
+                StandaloneTokenizationJob { request, reply },
+            )))
             .await
             .map_err(|_| RenderServiceError::Unavailable)?;
             result.await.map_err(|error| {
@@ -55,7 +54,7 @@ impl TokenizationBackend for ServerTokenizationBackend {
 
 pub(crate) fn new_renderer_service(
     server_args: Arc<ServerArgs>,
-    jobs: flume::Sender<PreprocessJob>,
+    jobs: flume::Sender<TokenizationJob>,
 ) -> RendererService {
     RendererService::new(
         new_request_lowerer(&server_args),
