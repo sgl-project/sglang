@@ -2093,7 +2093,8 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
+    # Only numeric scheduler knobs are accepted; the allowlist is
+    # HOT_UPDATABLE_SERVER_ARGS in scheduler_components/server_args_updater.py.
     server_args: Dict[str, Union[int, float]]
 
 
