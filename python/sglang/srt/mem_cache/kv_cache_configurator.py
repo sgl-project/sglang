@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from dataclasses import dataclass, field
@@ -1812,6 +1813,12 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # Weight-loading temporaries can still be referenced at this point, and
+        # empty_cache() (which get_available_gpu_memory already calls) cannot
+        # reclaim referenced blocks. Without collecting first, the KV budget is
+        # measured against an understated free-memory figure and the pool can be
+        # sized orders of magnitude too small while GPU memory sits idle.
+        gc.collect()
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
