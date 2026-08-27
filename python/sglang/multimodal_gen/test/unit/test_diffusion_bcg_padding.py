@@ -54,6 +54,48 @@ class ZImageTransformer2DModel(torch.nn.Module):
         return torch.zeros(pos_ids.shape[0], 8, device=pos_ids.device)
 
 
+class SanaVideoTransformer3DModel(torch.nn.Module):
+    pass
+
+
+class TestQualityFusionBCGCompatibility(unittest.TestCase):
+    def setUp(self):
+        self.stage = DenoisingStage.__new__(DenoisingStage)
+        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+        self.stage.transformer = OtherTransformer2DModel()
+        self.stage.transformer_2 = None
+        self.stage._quality_fusions_mounted = False
+
+    @staticmethod
+    def _batch(quality: str):
+        return SimpleNamespace(sampling_params=SimpleNamespace(quality=quality))
+
+    def test_rejects_high_when_dit_fusion_would_replace_captured_graph(self):
+        unmounted = []
+        handlers = (
+            (
+                "test fusion",
+                lambda _: True,
+                lambda transformer: unmounted.append(transformer),
+            ),
+        )
+
+        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            with self.assertRaisesRegex(ValueError, "lossless warmup graphs"):
+                self.stage._maybe_toggle_quality_fusions(self._batch("high"))
+
+        self.assertEqual(unmounted, [self.stage.transformer])
+        self.assertFalse(self.stage._quality_fusions_mounted)
+
+    def test_allows_high_when_model_has_no_dit_quality_fusions(self):
+        handlers = (("test fusion", lambda _: False, lambda _: None),)
+
+        with patch.object(denoising_module, "_QUALITY_FUSION_HANDLERS", handlers):
+            self.stage._maybe_toggle_quality_fusions(self._batch("high"))
+
+        self.assertTrue(self.stage._quality_fusions_mounted)
+
+
 def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:
     return SimpleNamespace(
         is_warmup=is_warmup,
@@ -69,6 +111,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.longcat_model = LongCatImageTransformer2DModel()
         self.minimax_h3_model = MiniMaxH3DiTModel()
         self.zimage_model = ZImageTransformer2DModel()
+        self.sana_video_model = SanaVideoTransformer3DModel()
         self.other_model = OtherTransformer2DModel()
 
     def _patch_buckets(self, *buckets: int):
@@ -434,6 +477,28 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         )
         self.assertIn(
             "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+
+    def test_sana_video_keeps_its_fixed_prompt_shape(self):
+        kwargs = {
+            "encoder_hidden_states": torch.zeros(1, 300, 2304),
+            "encoder_attention_mask": torch.ones(1, 300, dtype=torch.long),
+        }
+        with self._patch_buckets(64, 128, 256, 512, 1024):
+            out = self.stage._bcg_pad_prompt_kwargs(
+                kwargs, current_model=self.sana_video_model
+            )
+
+        self.assertIs(out, kwargs)
+        self.assertEqual(out["encoder_hidden_states"].shape, (1, 300, 2304))
+        self.assertEqual(out["encoder_attention_mask"].shape, (1, 300))
+        self.assertIn(
+            "efficient-large-model/sana-video_2b_480p_diffusers",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
+        )
+        self.assertIn(
+            "SanaVideoPipelineConfig",
+            BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
         )
 
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
