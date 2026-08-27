@@ -220,6 +220,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
+        assert cfg.disaggregation_decode_retraction_backup != "host_pool", (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "--disaggregation-decode-retraction-backup=host_pool; use "
+            "cpu_tensor (the automatic default for unified pools)."
+        )
+        assert not cfg.disaggregation_decode_enable_offload_kvcache, (
+            "--enable-unified-memory with PD disaggregation does not yet support "
+            "--disaggregation-decode-enable-offload-kvcache."
+        )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
         "DSPARK (chain draft); other speculative algorithms are not yet "

@@ -45,6 +45,9 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    # Target KV buffers come first; any remaining buffers belong to an
+    # independent draft pool and may require a different index vector.
+    num_target_kv_data_ptrs: int
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
@@ -101,6 +104,8 @@ class KVPoll:
 class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
+    uses_separate_draft_kv_indices: bool = False
+
     @abstractmethod
     def __init__(
         self,
@@ -146,6 +151,17 @@ class BaseKVSender(ABC):
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
         """
         ...
+
+    def send_with_draft_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        draft_kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
+    ):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support separate draft KV indices"
+        )
 
     def pop_decode_prefix_len(self) -> int:
         return 0
@@ -216,6 +232,18 @@ class BaseKVReceiver(ABC):
         Notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
+
+    def send_metadata_with_draft_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        draft_kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+        state_indices: Optional[List] = None,
+        decode_prefix_len: Optional[int] = None,
+    ):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support separate draft KV indices"
+        )
 
     @abstractmethod
     def poll(self) -> KVPoll:

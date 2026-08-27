@@ -453,13 +453,6 @@ class KVCacheConfigurator:
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.is_hybrid_swa and not is_dsv4:
-                if pd_enabled:
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation does "
-                        "not support hybrid-SWA models yet (no whole-envelope "
-                        "transfer scheme for the SWA sub-pool). Drop "
-                        "--enable-unified-memory or run without PD."
-                    )
                 bundle = self._init_unified_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,

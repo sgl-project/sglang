@@ -150,13 +150,17 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
+        # Unified page-envelope host pools are enabled by a separate feature.
+        # Until then, keep decode retraction on the direct CPU-tensor backup.
         # Host-pool retraction transfers full and sliding-window components
         # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        supports_host_pool = (
+            not memory.enable_unified_memory
+            and not uses_ssm_state(tp_worker.model_runner.model_config)
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (

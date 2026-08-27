@@ -624,19 +624,32 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "unified layout has no per-layer contiguous regions; "
-            "KV transfer / disaggregation is unsupported."
+        """Register the raw buffer as physical page envelopes for PD transfer.
+
+        Full and SWA expose the same allocation with different envelope sizes;
+        the transfer backend preserves both logical entries while deduplicating
+        the underlying memory registration.
+        """
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map physical token ids to this pool's page-envelope row ids."""
+        return (
+            (indices // self.page_size)
+            * (self.page_size * self.kernel_page_blocks)
+            + indices % self.page_size
         )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the unified layout."
-        )
+        """Copy rows addressed by physical token ids from page envelopes."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the unified layout."
+        """Restore rows addressed by physical token ids into page envelopes."""
+        super().load_cpu_copy(
+            kv_cache_cpu, self._physical_to_kernel_indices(indices)
         )
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
@@ -1632,7 +1645,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         swa_cpu = None
         if bool(valid.any().item()):
             swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
-        return {"full": full_cpu, "swa": swa_cpu}
+        return {"full": full_cpu, "swa": swa_cpu, "swa_mask": valid.cpu()}
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         assert self._full_allocator is not None
@@ -1641,7 +1654,14 @@ class UnifiedSWAKVPool(SWAKVPool):
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-            self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
+            old_swa_mask = kv_cache_cpu["swa_mask"].to(indices.device)
+            assert old_swa_mask.shape == indices.shape
+            row_mask = (swa_phys >= 0)[old_swa_mask].cpu()
+            swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
+            if swa_phys.numel() == 0:
+                return
+            swa_cpu = self._filter_swa_cpu_copy(kv_cache_cpu["swa"], row_mask)
+            self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_phys)
 
 
 class UnifiedSWAPoolBundle(NamedTuple):

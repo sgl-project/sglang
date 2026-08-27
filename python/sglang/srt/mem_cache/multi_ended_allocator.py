@@ -246,7 +246,11 @@ def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
 
 
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
-    """Allocator for one sub-pool over a `UnifiedKVPool`."""
+    """Allocator for one sub-pool over a `UnifiedKVPool`.
+
+    ``need_sort`` applies to transfer-facing physical ids, not virtual ids.
+    Physical free pages are sorted during compaction.
+    """
 
     # Capacity-bearing state: any rebind bumps `_capacity_epoch`, invalidating
     # the epoch-keyed capacity memos across the whole chain (see
@@ -1242,11 +1246,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
             bs = len(prefix_lens)
-            if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-                self.free_virtual_ids
-            ):
-                self.merge_and_sort_free()
-
             # Snapshot the virtual pages the kernel will consume, to bind them to
             # physical pages afterward (else v2p stays -1 → CUDA OOB).
             if num_new_pages > 0:
@@ -1309,9 +1308,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if need_tokens > self.available_size():
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
-            if self.need_sort and bs > len(self.free_virtual_ids):
-                self.merge_and_sort_free()
-
             # Most decode steps reuse the prefix's tail page → num_new_pages == 0.
             if num_new_pages > 0:
                 new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
@@ -3629,6 +3625,22 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Translate virtual token ids to full-pool physical ids for PD."""
+        return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the PD compaction gate on both physical sub-allocators."""
+        assert self.lazy_compaction, (
+            "PD disaggregation with the unified memory pool requires lazy "
+            "compaction (eager free-path compaction moves pages under "
+            "in-flight transfers)."
+        )
+        self.full_attn_allocator.disagg_move_gate = gate
+        self.swa_attn_allocator.disagg_move_gate = gate
+
     def translate_loc_from_full_to_swa(
         self,
         kv_indices: torch.Tensor,
@@ -3747,6 +3759,68 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
             return out_indices  # virtual TOKEN ids
+
+    def alloc_extend_swa_tail(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        swa_tail_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Allocate full KV for an extend and SWA KV only for its aligned tail."""
+        with record_function("UnifiedSWAAlloc.alloc_extend_swa_tail"):
+            assert self.page_size > 1
+            assert len(seq_lens_cpu) == len(prefix_lens_cpu) == 1
+            prefix_len = int(prefix_lens_cpu[0])
+            seq_len = int(seq_lens_cpu[0])
+            assert seq_len - prefix_len == extend_num_tokens
+            assert 0 <= swa_tail_len <= extend_num_tokens
+            tail_start = seq_len - swa_tail_len
+            assert prefix_len <= tail_start
+            assert swa_tail_len == 0 or tail_start % self.page_size == 0, (
+                "unified SWA tail allocation requires a page-aligned tail; "
+                f"got extend_num_tokens={extend_num_tokens}, "
+                f"tail_len={swa_tail_len}, page_size={self.page_size}"
+            )
+
+            num_full_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            num_swa_pages = (swa_tail_len + self.page_size - 1) // self.page_size
+            if not self.ensure_capacity(
+                num_full_pages * self.page_size,
+                num_swa_pages * self.page_size,
+            ):
+                return None
+
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_full_pages].clone()
+            tail_virtual_pages = (
+                new_virtual_pages[-num_swa_pages:]
+                if num_swa_pages > 0
+                else new_virtual_pages[:0]
+            )
+            out_indices = fa.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_full_pages,
+            )
+            assert out_indices is not None, (
+                "UnifiedSWA.alloc_extend_swa_tail: full.alloc_extend returned "
+                "None after the capacity check passed"
+            )
+            if num_swa_pages > 0:
+                self.swa_attn_allocator.alloc_with_virtual(tail_virtual_pages)
+            return out_indices
 
     def alloc_decode(
         self,

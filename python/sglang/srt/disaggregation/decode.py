@@ -538,6 +538,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
+        kv_args.num_target_kv_data_ptrs = len(kv_data_ptrs)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -1358,6 +1359,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
+            raw_kv_indices = self.req_to_token_pool.req_to_token[
+                decode_req.req.kv.req_pool_idx
+            ][total_prefix_len:origin_input_len]
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
@@ -1369,12 +1373,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx
-                ][total_prefix_len:origin_input_len]
                 kv_indices = (
                     self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                        kv_indices
+                        raw_kv_indices
                     )
                 )
 
@@ -1477,6 +1478,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
             )
+            draft_page_indices = None
+            if self.kv_manager.uses_separate_draft_kv_indices:
+                if self.scheduler.enable_hisparse:
+                    raise NotImplementedError(
+                        "separate draft KV indices are not supported with HiSparse"
+                    )
+                draft_page_indices = kv_to_page_indices(
+                    raw_kv_indices, page_size
+                ).astype(np.int32)
             device_page_indices = None
             if (
                 self.scheduler.enable_hisparse
@@ -1513,12 +1523,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                **metadata_kwargs,
-            )
+            if draft_page_indices is not None:
+                decode_req.kv_receiver.send_metadata_with_draft_indices(
+                    page_indices,
+                    draft_page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
+                )
+            else:
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    **metadata_kwargs,
+                )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
