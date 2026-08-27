@@ -520,8 +520,11 @@ class TestProgramsResolveBeforeReadingResolution(CustomTestCase):
         declarers = {"_declare", "declare_resolution", "declare_late_resolution"}
         fields = set()
         field_names = {field.name for field in _dataclasses.fields(_ServerArgs)}
-        for name in ("server_args.py", "arg_groups/overrides.py"):
-            tree = ast.parse((srt / name).read_text(encoding="utf-8-sig"))
+        # The record plus every module under `arg_groups/`: a handler that
+        # moved out of the record declares from its own file now.
+        sources = [srt / "server_args.py", *sorted((srt / "arg_groups").rglob("*.py"))]
+        for source in sources:
+            tree = ast.parse(source.read_text(encoding="utf-8-sig"))
             for node in ast.walk(tree):
                 # Registry data: provider dict keys are field names as
                 # *data*, invisible to the keyword scan below. Filtered
