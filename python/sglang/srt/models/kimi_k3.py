@@ -679,6 +679,13 @@ class KimiK3MoE(nn.Module):
             # current stream; the non-fused shared MLP still uses SBO.
             and not (_is_npu and self._npu_fused_shared_experts)
         )
+        self._npu_overlap_shared_rs = (
+            _is_npu
+            and envs.SGLANG_NPU_OVERLAP_SHARED_RS.get()
+            and self._sbo_shared_overlap
+            and self._shared_experts_attn_tp_comm
+            and not self._npu_fused_shared_experts
+        )
 
         if self.use_latent_moe:
             latent_quant_config = (
@@ -1276,6 +1283,29 @@ class KimiK3MoE(nn.Module):
                 shared_output_needs_reduce_scatter,
             )
 
+        def submit_shared_reduce_scatter():
+            """Run shared RS after routed combine, beside latent norm/up-proj."""
+            nonlocal shared_output, shared_event
+            nonlocal shared_output_needs_reduce_scatter
+            if (
+                not self._npu_overlap_shared_rs
+                or shared_event is None
+                or not shared_output_needs_reduce_scatter
+            ):
+                return
+            current_stream = torch.cuda.current_stream()
+            # Called immediately after the routed experts return. This wait
+            # keeps RS behind DeepEP combine, avoiding network contention, but
+            # leaves the following latent norm/up-proj free to overlap it.
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._finalize_shared_experts_output(
+                    shared_output, hidden_states, True
+                )
+                shared_event = self.alt_stream.record_event()
+            shared_output_needs_reduce_scatter = False
+            shared_output.record_stream(current_stream)
+
         # Front: gate + TopK (+ latent down-proj when the merged front covers it).
         # The gate and the latent down-proj read the same hidden_states, so the
         # merged-weight strategies compute both in one GEMM; see
@@ -1298,6 +1328,7 @@ class KimiK3MoE(nn.Module):
 
         if not self.use_latent_moe:
             expert_output = self.experts(hidden_states, topk_output)
+            submit_shared_reduce_scatter()
             join_shared()
             if shared_output is not None:
                 expert_output = expert_output + shared_output
@@ -1328,6 +1359,7 @@ class KimiK3MoE(nn.Module):
             if self._use_mega_moe
             else self.experts(routed_input, topk_output)
         )
+        submit_shared_reduce_scatter()
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
