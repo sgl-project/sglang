@@ -890,6 +890,8 @@ class Envs:
     SGLANG_NPU_K3_BFA_OVERLAP = EnvBool(False)
     # Append K3 KDA's tiny beta projection to the wide qkvg GEMM on NPU.
     SGLANG_NPU_K3_MERGED_QKVGB = EnvBool(False)
+    # Also append f_a so the wide GEMM replaces its decode-side skinny GEMM.
+    SGLANG_NPU_K3_MERGED_QKVGBFA = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_VERIFY_GATES = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_RAGGED_IO = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)

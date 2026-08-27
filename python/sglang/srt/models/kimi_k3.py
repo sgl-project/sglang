@@ -1850,6 +1850,10 @@ class KimiK3DeltaAttention(nn.Module):
             and self.do_fuse_qkvbfg
             and self.use_full_rank_gate
         )
+        self._npu_merged_qkvgb_fa = (
+            self._npu_merged_qkvgb
+            and envs.SGLANG_NPU_K3_MERGED_QKVGBFA.get()
+        )
 
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, self.attn_tp_size), dtype=torch.float32)
@@ -2002,6 +2006,8 @@ class KimiK3DeltaAttention(nn.Module):
         if not self._npu_merged_qkvgb:
             return
         mods = [self.fused_qkvg_proj, self.b_proj]
+        if self._npu_merged_qkvgb_fa:
+            mods.append(self.f_a_proj)
         if self._bfa_uses_block_fp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
             sizes = [weight.shape[0] for weight in weights]
@@ -2019,7 +2025,8 @@ class KimiK3DeltaAttention(nn.Module):
                 offset += size
         else:
             self._qkvgb_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-        self._qkvgb_qkvg_size, self._qkvgb_b_size = sizes
+        self._qkvgb_qkvg_size, self._qkvgb_b_size = sizes[:2]
+        self._qkvgb_fa_size = sizes[2] if len(sizes) == 3 else 0
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -2081,7 +2088,12 @@ class KimiK3DeltaAttention(nn.Module):
             if getattr(self, "_qkvgb_w", None) is not None:
                 n_qkvg = self._qkvgb_qkvg_size
                 n_b = self._qkvgb_b_size
-                if (
+                n_fa = self._qkvgb_fa_size
+                if n_fa:
+                    qkvgb = _k3_bf16_gemm(hidden_states, self._qkvgb_w)
+                    fa = qkvgb[..., n_qkvg + n_b : n_qkvg + n_b + n_fa]
+                    forget_gate = self.f_b_proj(fa)[0]
+                elif (
                     self._npu_bfa_overlap
                     and get_is_capture_mode()
                     and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
