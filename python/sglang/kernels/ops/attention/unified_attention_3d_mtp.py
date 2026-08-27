@@ -599,7 +599,7 @@ def qwen35_mtp_reduce_segments_kernel(
     )
 
 
-def qwen35_mtp_unified_attention(
+def unified_attention_3d_mtp_qwen35(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

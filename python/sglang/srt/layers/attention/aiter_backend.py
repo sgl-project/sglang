@@ -62,7 +62,7 @@ try:
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
-        qwen35_mtp_unified_attention,
+        unified_attention_3d_mtp_qwen35,
     )
 except ImportError:
     print(
@@ -2319,7 +2319,7 @@ class AiterAttnBackend(AttentionBackend):
                         and sinks is None
                     )
                     if use_qwen35_mtp_kernel:
-                        qwen35_mtp_unified_attention(
+                        unified_attention_3d_mtp_qwen35(
                             q=q_unified,
                             k=k_unified,
                             v=v_unified,

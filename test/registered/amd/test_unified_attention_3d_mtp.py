@@ -16,7 +16,7 @@ if _RUNNABLE:
         from aiter.ops.triton.utils.types import e4m3_dtype
 
         from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
-            qwen35_mtp_unified_attention,
+            unified_attention_3d_mtp_qwen35,
         )
     except Exception:
         _RUNNABLE = False
@@ -91,7 +91,7 @@ class TestAiterUnifiedAttentionMTP(CustomTestCase):
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        qwen35_mtp_unified_attention(
+        unified_attention_3d_mtp_qwen35(
             q=query,
             k=key,
             v=value,
