@@ -4,7 +4,9 @@
 the process groups, so they answer only after distributed init. The launcher
 decides how many processes to spawn *before* that, and a live read there raises
 `Distributed environment is not initialized` -- a startup crash no unit test
-reaches, because nothing short of booting a server runs the launcher.
+reaches, because nothing short of booting a server runs the launcher. The
+configured answer is one hop away on the same object,
+`get_parallel().config.pp_size`, which reads the published `parallel` bag.
 """
 
 import ast
@@ -19,17 +21,39 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 _PACKAGE_ROOT = pathlib.Path(sglang.__file__).resolve().parent
 
-# Live-shadowed sizes a launch path is known to have read. ParallelContext
-# shadows more properties than these (every `_v(name, ...)` one raises the same
-# "Distributed environment is not initialized"); this dict carries the ones a
-# `configured_*` accessor answers, so it is a remedy map, not a census.
-_LIVE_SHADOWED = {
-    "tp_size": "configured_tp_size()",
-    "pp_size": "configured_pp_size()",
-    "moe_dp_size": "configured_moe_dp_size()",
-    "attn_cp_size": "configured_attn_cp_size()",
-    "dcp_size": "a configured accessor (none exists yet; add one beside configured_pp_size)",
-}
+
+def _live_shadowed() -> dict:
+    """{name: remedy} for every name that is BOTH a live ParallelContext
+    property and a `parallel` config leaf.
+
+    Derived from the two sides themselves, so a new size that gains a live
+    property (or a live property that gains a leaf) is watched without a second
+    list here. ParallelContext shadows more properties than these -- every
+    `_v(name, ...)` one raises the same "Distributed environment is not
+    initialized" -- but only a shadowed name has a configured answer to point a
+    launcher at.
+    """
+    from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.runtime_context import ParallelContext
+    from sglang.srt.server_args import ServerArgs
+
+    live = {
+        name
+        for name, value in vars(ParallelContext).items()
+        if isinstance(value, property)
+    }
+    leaves = {
+        field for field, path in namespace_of(ServerArgs).items() if path == "parallel"
+    }
+    shadowed = live & leaves
+    assert shadowed, (
+        "no live-shadowed parallel size found; the derivation is broken, not "
+        "the tree"
+    )
+    return {name: f"get_parallel().config.{name}" for name in sorted(shadowed)}
+
+
+_LIVE_SHADOWED = _live_shadowed()
 
 # Launch paths that decide how many children to spawn are derived below
 # from the spawn itself. These launch without a size-driven spawn, so no
@@ -82,80 +106,41 @@ def _multiprocessing_names(tree):
     return modules, constructors
 
 
-def _configured_accessors() -> frozenset:
-    """The `configured_*_size()` names `runtime_context` exports.
-
-    Derived from that module, so a new accessor keeps its launcher watched
-    without a second list here.
-    """
-    tree = ast.parse(
-        (_PACKAGE_ROOT / "srt/runtime_context.py").read_text(encoding="utf-8-sig")
-    )
-    names = frozenset(
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("configured_")
-        and node.name.endswith("_size")
-    )
-    assert names, (
-        "no configured_*_size accessors found in runtime_context; the "
-        "derivation is broken, not the tree"
-    )
-    return names
-
-
 def _spawns_from_a_size(tree) -> bool:
-    """Does any function here construct a child process *and* read one of the
-    five sizes -- live off the parallel bag, or through its `configured_*_size()`
-    answer? That is a spawn count decided from the topology.
+    """Does a function here spawn a child *and* read a live-shadowed size?
 
-    Counting the configured read too is what keeps a launcher watched after it
-    is converted. Deriving on the live read alone means the file drops out of
-    the scan the moment it stops offending, so the guard would only ever watch
-    the launchers that already fail it.
+    Both tiers count: deriving on the live read alone drops a launcher from the
+    scan the moment it is converted, so the guard would only watch the ones
+    that already fail it.
     """
-    configured = _configured_accessors()
     modules, constructors = _multiprocessing_names(tree)
-    names, qualified = _parallel_bag_names(tree)
-    aliases = _bag_aliases(tree, names, qualified)
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        spawns = reads = False
+        spawns = False
         for node in ast.walk(fn):
-            if isinstance(node, ast.Call):
-                func = node.func
-                if isinstance(func, ast.Attribute) and func.attr in (
-                    "Process",
-                    "ProcessPoolExecutor",
-                    "Popen",
-                    "spawn",
-                ):
-                    # `mp.Process(`, `mp.get_context("spawn").Process(` and
-                    # `subprocess.Popen(` all reach a child process; the
-                    # receiver of a chained call is itself a call, so this
-                    # cannot require a bare Name.
-                    spawns = True
-                elif isinstance(func, ast.Name) and func.id in constructors:
-                    spawns = True
-                if (isinstance(func, ast.Name) and func.id in configured) or (
-                    isinstance(func, ast.Attribute) and func.attr in configured
-                ):
-                    reads = True
-            elif (
-                isinstance(node, ast.Attribute)
-                and node.attr in _LIVE_SHADOWED
-                and (
-                    _is_parallel_bag_call(node.value, names, qualified)
-                    or (isinstance(node.value, ast.Name) and node.value.id in aliases)
-                )
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in (
+                "Process",
+                "ProcessPoolExecutor",
+                "Popen",
+                "spawn",
             ):
-                # A record read (`server_args.tp_size`) sizes a spawn too, but
-                # it cannot raise pre-dist; only the bag read is this guard's
-                # subject, so only it forces a module into _PRE_DIST.
-                reads = True
-        if spawns and reads:
+                # `mp.Process(`, `mp.get_context("spawn").Process(` and
+                # `subprocess.Popen(` all reach a child process; the receiver of
+                # a chained call is itself a call, so this cannot require a bare
+                # Name.
+                spawns = True
+            elif isinstance(func, ast.Name) and func.id in constructors:
+                spawns = True
+        if not spawns:
+            continue
+        # A record read (`server_args.tp_size`) sizes a spawn too, but it cannot
+        # raise pre-dist; only a bag read is this guard's subject.
+        live, configured = _shadowed_size_reads(tree, scope=fn)
+        if live or configured:
             return True
     return False
 
@@ -176,6 +161,12 @@ def _parallel_bag_names(tree):
             names |= {
                 a.asname or a.name for a in node.names if a.name == "get_parallel"
             }
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            # `from sglang.srt import runtime_context as rc` binds the module,
+            # so `rc.get_parallel()` is the same call under another spelling.
+            for a in node.names:
+                if f"{node.module}.{a.name}".endswith("runtime_context"):
+                    modules.add(a.asname or a.name)
         elif isinstance(node, ast.Import):
             for a in node.names:
                 if a.name.endswith("runtime_context"):
@@ -197,16 +188,75 @@ def _is_parallel_bag_call(node, names, modules) -> bool:
 
 
 def _bag_aliases(tree, names, qualified):
-    """Locals bound to the parallel bag: `p = get_parallel()` then `p.pp_size`
-    is the same read one line later."""
-    return {
-        target.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and _is_parallel_bag_call(node.value, names, qualified)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
+    """Locals bound to either tier: `p = get_parallel()` then `p.pp_size` is the
+    same live read one line later, and `cfg = get_parallel().config` then
+    `cfg.pp_size` is the same configured read."""
+    live, config = set(), set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if _is_parallel_bag_call(value, names, qualified):
+            bucket = live
+        elif (
+            isinstance(value, ast.Attribute)
+            and value.attr == "config"
+            and _is_parallel_bag_call(value.value, names, qualified)
+        ):
+            bucket = config
+        else:
+            continue
+        bucket |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    return live, config
+
+
+def _shadowed_size_reads(module_tree, scope=None):
+    """(live, configured) reads of a live-shadowed size in `scope`.
+
+    `<parallel bag>.tp_size` is the live group; `<parallel bag>.config.tp_size`
+    is the published leaf. Both spellings are reported so a caller can tell a
+    launcher that reads the topology at all from one that reads it live.
+
+    What binds the bag -- the import, a module-level alias -- lives at module
+    scope, so those names always come from `module_tree` even when only one
+    function is being walked. Deriving them from the function alone finds no
+    import, reports no reads, and quietly answers "this launcher reads nothing".
+    """
+    names, qualified = _parallel_bag_names(module_tree)
+    live_aliases, config_aliases = _bag_aliases(module_tree, names, qualified)
+
+    def is_live_bag(node):
+        return _is_parallel_bag_call(node, names, qualified) or (
+            isinstance(node, ast.Name) and node.id in live_aliases
+        )
+
+    def is_config_bag(node):
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "config"
+            and is_live_bag(node.value)
+        ) or (isinstance(node, ast.Name) and node.id in config_aliases)
+
+    live, configured = [], []
+    for node in ast.walk(scope if scope is not None else module_tree):
+        if isinstance(node, ast.Attribute) and node.attr in _LIVE_SHADOWED:
+            base, name, spelling = node.value, node.attr, "attribute"
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in _LIVE_SHADOWED
+        ):
+            base, name, spelling = node.args[0], node.args[1].value, "getattr"
+        else:
+            continue
+        if is_config_bag(base):
+            configured.append((node.lineno, name, spelling))
+        elif is_live_bag(base):
+            live.append((node.lineno, name, spelling))
+    return live, configured
 
 
 def _launch_paths():
@@ -217,10 +267,13 @@ def _launch_paths():
     nothing, which no derivation can reach.
     """
     seen = {}
+    sizes = frozenset(_LIVE_SHADOWED)
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
         source = path.read_text()
         # Every spawn shape below names Process, ProcessPoolExecutor or Popen.
         if not any(name in source for name in ("Process", "Popen", "spawn")):
+            continue
+        if not any(name in source for name in sizes):
             continue
         try:
             tree = ast.parse(source)
@@ -234,41 +287,121 @@ def _launch_paths():
 
 
 class TestLaunchPathsReadConfiguredSizes(CustomTestCase):
+    def test_configured_sizes_hold_when_the_live_topology_disagrees(self):
+        """The other direction: groups exist and answer something else.
+
+        The check above proves nobody reads a live size too early. It says
+        nothing about what `.config.<size>` returns once the groups *are* up and
+        answering a different number -- which is not hypothetical: elastic EP
+        scales the live topology away from what the operator configured, and
+        that divergence is the entire reason the two tiers are separate. With
+        only the early-read direction covered, a `config` hop that quietly
+        delegated to the live property would look correct.
+        """
+        import json
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.runtime_context import (
+            get_parallel,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        directory = tempfile.mkdtemp(prefix="configured_sizes_")
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        # No resolve_once() here: `tp_size` is raw input, so the configured
+        # value is 2 either way.
+        server_args = ServerArgs(model_path=directory, device="cuda", tp_size=2)
+        self.addCleanup(reset_context)
+        publish(server_args, role="scheduler")
+
+        # The live getter behind each property, read out of ParallelContext
+        # rather than listed here.
+        context_source = ast.parse(
+            (_PACKAGE_ROOT / "srt" / "runtime_context.py").read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        parallel_class = next(
+            node
+            for node in ast.walk(context_source)
+            if isinstance(node, ast.ClassDef) and node.name == "ParallelContext"
+        )
+        live_getter = {}
+        for method in parallel_class.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            for call in ast.walk(method):
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_v"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                ):
+                    continue
+                getter = call.args[1]
+                if isinstance(getter, ast.Attribute):
+                    live_getter[call.args[0].value] = getter.attr
+        state = "sglang.srt.distributed.parallel_state"
+        missing = sorted(set(_LIVE_SHADOWED) - set(live_getter))
+        self.assertEqual(
+            missing,
+            [],
+            f"these sizes no longer have a live property to diverge from: {missing}",
+        )
+        for name in sorted(_LIVE_SHADOWED):
+            with self.subTest(size=name):
+                target = f"{state}.{live_getter[name]}"
+                configured = getattr(get_parallel().config, name)
+                with patch(target, return_value=configured + 41):
+                    self.assertEqual(
+                        get_parallel().__getattribute__(name),
+                        configured + 41,
+                        f"{name} no longer follows the live topology",
+                    )
+                    self.assertEqual(
+                        getattr(get_parallel().config, name),
+                        configured,
+                        f"get_parallel().config.{name} followed the live topology "
+                        "instead of the published configuration",
+                    )
+        # A bare read of a leaf with no live property is not a config read any
+        # more, and the error says where it went. Spelled through `getattr` so a
+        # mechanical `.config` sweep cannot "fix" the very read under test.
+        with self.assertRaisesRegex(
+            AttributeError, r"read it as get_parallel\(\)\.config\.nccl_port"
+        ):
+            getattr(get_parallel(), "nccl_port")
+        reset_context()
+
     def test_no_live_topology_read_before_distributed_init(self):
         offenders = []
         for rel, tree in _launch_paths():
-            names, modules = _parallel_bag_names(tree)
-            aliases = _bag_aliases(tree, names, modules)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Attribute) and node.attr in _LIVE_SHADOWED:
-                    base = node.value
-                    if _is_parallel_bag_call(base, names, modules) or (
-                        isinstance(base, ast.Name) and base.id in aliases
-                    ):
-                        offenders.append(
-                            f"{rel}:{node.lineno} reads the live {node.attr}; "
-                            f"use {_LIVE_SHADOWED[node.attr]}"
-                        )
-                elif (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "getattr"
-                    and len(node.args) >= 2
-                    and isinstance(node.args[1], ast.Constant)
-                    and node.args[1].value in _LIVE_SHADOWED
-                    and (
-                        _is_parallel_bag_call(node.args[0], names, modules)
-                        or (
-                            isinstance(node.args[0], ast.Name)
-                            and node.args[0].id in aliases
-                        )
-                    )
-                ):
-                    offenders.append(
-                        f"{rel}:{node.lineno} reads the live "
-                        f"{node.args[1].value} through getattr; "
-                        f"use {_LIVE_SHADOWED[node.args[1].value]}"
-                    )
+            live, _ = _shadowed_size_reads(tree)
+            for lineno, name, spelling in live:
+                through = " through getattr" if spelling == "getattr" else ""
+                offenders.append(
+                    f"{rel}:{lineno} reads the live {name}{through}; "
+                    f"use {_LIVE_SHADOWED[name]}"
+                )
         self.assertEqual(
             offenders,
             [],
