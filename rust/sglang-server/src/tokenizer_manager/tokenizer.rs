@@ -232,8 +232,8 @@ mod tests {
     use super::*;
     use crate::message::request::{GenerateRequest, RequestKind};
     use crate::message::response::ResponseSink;
+    use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::RequestState;
-    use sglang_renderer::SamplingParams;
     use tokio::sync::mpsc;
 
     /// One token per whitespace-separated word, so a stop's token count differs

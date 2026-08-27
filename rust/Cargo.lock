@@ -3670,7 +3670,6 @@ dependencies = [
  "protoc-bin-vendored",
  "pyo3",
  "serde_json",
- "sglang-renderer",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -3711,6 +3710,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "regex-syntax",
+ "reqwest",
  "rmp-serde",
  "rmpv",
  "serde",
@@ -3719,6 +3719,7 @@ dependencies = [
  "tokio",
  "tower 0.5.3",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3749,7 +3750,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-mm",
- "sglang-renderer",
  "socket2 0.6.5",
  "thiserror",
  "tokio",

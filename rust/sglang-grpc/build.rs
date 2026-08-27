@@ -11,8 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { std::env::set_var("PROTOC", vendored) };
     }
 
-    let runtime_proto = "../../proto/sglang/runtime/v1/sglang.proto";
-    let renderer_proto = "../../proto/sglang/renderer/v1/renderer.proto";
+    let proto_path = "../../proto/sglang/runtime/v1/sglang.proto";
 
     tonic_build::configure()
         .build_server(true)
@@ -22,9 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
                 .join("sglang_descriptor.bin"),
         )
-        .compile_protos(&[runtime_proto, renderer_proto], &["../../proto"])?;
+        .compile_protos(&[proto_path], &["../../proto"])?;
 
-    println!("cargo:rerun-if-changed={}", runtime_proto);
-    println!("cargo:rerun-if-changed={}", renderer_proto);
+    println!("cargo:rerun-if-changed={}", proto_path);
     Ok(())
 }

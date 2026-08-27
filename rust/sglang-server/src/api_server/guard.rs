@@ -10,7 +10,7 @@ use crate::tokenizer_manager::wiring::{AbortSource, Senders};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.
-pub(crate) struct AbortGuard {
+pub(super) struct AbortGuard {
     senders: Senders,
     /// Rids still in flight. `Rid` carries its own partition key, so there is no
     /// separate routing value to keep alongside it.
@@ -27,7 +27,7 @@ pub(crate) struct AbortGuard {
 }
 
 impl AbortGuard {
-    pub(crate) fn new(senders: Senders, rid: Rid) -> Self {
+    pub(super) fn new(senders: Senders, rid: Rid) -> Self {
         Self {
             senders,
             rids: HashSet::from([rid]),
@@ -36,7 +36,7 @@ impl AbortGuard {
 
     /// Guard covering no rids yet — a batch arms each as it's submitted so a
     /// mid-fan-out disconnect aborts every request already handed to the scheduler.
-    pub(crate) fn new_empty(senders: Senders) -> Self {
+    pub(super) fn new_empty(senders: Senders) -> Self {
         Self {
             senders,
             rids: HashSet::new(),
@@ -44,12 +44,12 @@ impl AbortGuard {
     }
 
     /// Track a request for abort-on-drop.
-    pub(crate) fn arm(&mut self, rid: Rid) {
+    pub(super) fn arm(&mut self, rid: Rid) {
         self.rids.insert(rid);
     }
 
     /// Request finished naturally — don't abort it on drop.
-    pub(crate) fn disarm(&mut self, rid: &Rid) {
+    pub(super) fn disarm(&mut self, rid: &Rid) {
         self.rids.remove(rid);
     }
 }

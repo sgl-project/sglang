@@ -5,7 +5,9 @@ use std::sync::Arc;
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 use futures::future::{BoxFuture, try_join_all};
 
-use crate::openai::{LoweredChat, lower_chat_request, lower_completion_request};
+use crate::openai::{
+    LoweredChat, lower_chat_request, lower_completion_request, render_chat_prompt,
+};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_generation_input};
 use crate::{
@@ -77,6 +79,13 @@ impl OpenAIRequestLowerer {
     ) -> Result<Vec<GenerationInput>, RendererError> {
         lower_completion_request(&self.config, &request, response_id)
     }
+
+    async fn render_chat_prompt(
+        &self,
+        mut request: CreateChatCompletionRequest,
+    ) -> Result<String, RendererError> {
+        render_chat_prompt(&self.config, self.chat_formatter.clone(), &mut request).await
+    }
 }
 
 impl RendererService {
@@ -138,13 +147,13 @@ impl RendererService {
         &self,
         request: CreateChatCompletionRequest,
     ) -> Result<crate::TokenIds, RendererError> {
-        let lowered = self.lowerer.lower_chat(request, "tokenize").await?;
-        let request = lowered
-            .generation_inputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| RendererError::Internal("Chat rendering produced no prompt".into()))?;
-        Ok(self.prepare_one(request).await?.input_ids)
+        let request = TextRequest {
+            rid: "tokenize".into(),
+            text: self.lowerer.render_chat_prompt(request).await?,
+            skip_special_tokens: true,
+            options: Default::default(),
+        };
+        Ok(self.backend.tokenize(request).await?.input_ids)
     }
 
     pub async fn prepare_completions(

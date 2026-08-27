@@ -254,7 +254,7 @@ impl Intake {
                     };
                     match outcome {
                         Err(e) => {
-                            let _ = req.state.apply(Event::Error(e.into())); // → Failed
+                            let _ = req.state.apply(Event::Error(e)); // → Failed
                         }
                         Ok(o) => {
                             // AlreadyTokenized → Queued, NeedsTokenize → Tokenizing.
@@ -694,9 +694,9 @@ mod tests {
     use super::*;
     use crate::message::request::GenerateRequest;
     use crate::message::response::ResponseSink;
+    use crate::message::sampling::SamplingParams;
     use crate::tokenizer_manager::channel::{ToSchedulerRx, to_scheduler};
     use crate::utils::fsm::RequestState;
-    use sglang_renderer::SamplingParams;
     use tokio::sync::mpsc;
 
     /// An `Intake` plus its detok-shard receiver, to_scheduler channel consumer (keep alive —

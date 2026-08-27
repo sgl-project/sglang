@@ -9,11 +9,11 @@ use axum::Router;
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai};
 use crate::message::config::ServerArgs;
-use crate::renderer::{RendererService, ServerInferenceBackend};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
-/// Shared handler state for native server routes.
+/// Shared handler state: submission handles, immutable server configuration,
+/// and the API-owned chat formatter.
 ///
 /// axum clones the router state into **every** request, so it is mounted as
 /// `Arc<AppState>` — one refcount bump per request instead of cloning each
@@ -23,6 +23,7 @@ pub(super) struct AppState {
     pub(super) senders: Senders,
     pub(super) response_buf: usize,
     pub(super) server_args: Arc<ServerArgs>,
+    pub(super) chat_formatter: Option<openai::ChatFormatter>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
 }
@@ -32,7 +33,6 @@ pub async fn serve(
     senders: Senders,
     response_buf: usize,
     server_args: Arc<ServerArgs>,
-    renderer: Arc<RendererService>,
     response_activity: ActivityCounter,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
@@ -40,15 +40,12 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
-    let renderer_routes =
-        sglang_renderer::http::inference_routes(sglang_renderer::http::OpenAIHttpFrontend::new(
-            renderer,
-            ServerInferenceBackend::new(senders.clone(), response_buf),
-        ));
+    let chat_formatter = openai::load_chat_support(&server_args);
     let state = Arc::new(AppState {
         senders,
         response_buf,
         server_args: server_args.clone(),
+        chat_formatter,
         response_activity,
     });
     // Each endpoint module registers its own routes and merges here.
@@ -64,8 +61,7 @@ pub async fn serve(
     // No body limit, matching the Python server.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(state)
-        .merge(renderer_routes);
+        .with_state(state);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the

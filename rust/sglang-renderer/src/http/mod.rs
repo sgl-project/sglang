@@ -19,11 +19,13 @@ use crate::{
 
 mod chat;
 mod completions;
+mod engine;
 mod render;
 mod runtime;
 mod tokenize;
 
-pub use runtime::{RendererRuntime, RendererRuntimeConfig};
+pub use engine::HttpInferenceBackend;
+pub use runtime::{RendererRuntimeConfig, serve};
 #[cfg(test)]
 mod test_utils;
 
@@ -52,6 +54,14 @@ where
 
 pub fn render_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
     render::routes(renderer.clone()).merge(tokenize::routes(renderer))
+}
+
+pub fn standalone_routes<B>(frontend: OpenAIHttpFrontend<B>) -> Router<()>
+where
+    B: InferenceBackend,
+{
+    let renderer = frontend.renderer.clone();
+    inference_routes(frontend).merge(render::routes(renderer))
 }
 
 pub(crate) fn unix_seconds_u32() -> u32 {

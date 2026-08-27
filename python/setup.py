@@ -34,7 +34,7 @@ from pathlib import Path
 from setuptools import setup
 
 try:
-    from setuptools_rust import Binding, RustExtension, build_rust
+    from setuptools_rust import Binding, RustBin, RustExtension, build_rust
 except ModuleNotFoundError as exc:
     if exc.name != "setuptools_rust":
         raise
@@ -103,29 +103,37 @@ def _match_by_substring(declared, tokens, source):
 
 
 def _discovered_rust_extensions():
-    """One RustExtension per workspace crate declaring a python-module."""
+    """Rust extensions and executables declared by workspace crates."""
     extensions = []
     for package in sorted(
         _cargo_workspace_metadata()["packages"], key=lambda p: p["name"]
     ):
         sglang_meta = (package["metadata"] or {}).get("sglang", {})
-        if "python-module" not in sglang_meta:
-            continue
-        extensions.append(
-            RustExtension(
-                target=sglang_meta["python-module"],
-                path=package["manifest_path"],
-                binding=Binding.PyO3,
-                debug=sglang_meta.get("debug"),
-                # Crates that gate their PyO3 bindings behind a non-default
-                # feature (so the pure-Rust core stays pyo3-free) declare it here.
-                features=sglang_meta.get("features"),
+        if "python-module" in sglang_meta:
+            extensions.append(
+                RustExtension(
+                    target=sglang_meta["python-module"],
+                    path=package["manifest_path"],
+                    binding=Binding.PyO3,
+                    debug=sglang_meta.get("debug"),
+                    # Crates that gate their PyO3 bindings behind a non-default
+                    # feature (so the pure-Rust core stays pyo3-free) declare it here.
+                    features=sglang_meta.get("features"),
+                )
             )
-        )
+        if "python-bin" in sglang_meta:
+            extensions.append(
+                RustBin(
+                    target=sglang_meta["python-bin"],
+                    path=package["manifest_path"],
+                    debug=sglang_meta.get("debug"),
+                    features=sglang_meta.get("features"),
+                )
+            )
     if not extensions:
         raise RuntimeError(
             f"no crate under {_RUST_WORKSPACE_DIR} declares "
-            "[package.metadata.sglang] python-module; set "
+            "[package.metadata.sglang] python-module or python-bin; set "
             f"{_BUILD_RUST_EXTS_ENV}=none to build without Rust extensions"
         )
     return extensions

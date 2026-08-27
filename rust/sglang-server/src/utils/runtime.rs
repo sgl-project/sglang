@@ -19,7 +19,6 @@ use std::thread::JoinHandle;
 
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
-use crate::renderer::new_renderer_service;
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -163,18 +162,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
         .as_ref()
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
-    let renderer_backend: Arc<dyn sglang_renderer::TokenizationBackend> = match &dyn_tokenizer {
-        Some(tokenizer) => Arc::new(sglang_renderer::PooledTokenizer::new(
-            Arc::new(sglang_renderer::DynamoTokenizer::new(tokenizer.clone())),
-            cfg.server_args.tokenizer_worker_num,
-            cfg.rust_server_args.channel_cap,
-        )),
-        None => Arc::new(sglang_renderer::NoTokenizer),
-    };
-    let renderer = Arc::new(new_renderer_service(
-        cfg.server_args.clone(),
-        renderer_backend,
-    ));
 
     // Shared: MM workers park, the Python drain pops.
     let mm_sidecar: crate::multi_modality::sidecar::Sidecar = Default::default();
@@ -289,7 +276,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
         let response_activity = response_activity.clone();
-        let renderer = renderer.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -319,7 +305,6 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
-                    renderer,
                     // Response heartbeat watched by `/health_generate`.
                     response_activity,
                     shutdown_rx,

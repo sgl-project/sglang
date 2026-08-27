@@ -187,41 +187,7 @@ pub(crate) async fn lower_chat_request(
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
 ) -> Result<LoweredChat, RendererError> {
-    if request.model != config.served_model_name {
-        return Err(format!("The model `{}` does not exist", request.model).into());
-    }
-    if request.messages.is_empty() {
-        return Err("messages cannot be empty".into());
-    }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return Err("image, audio, video, and file message content is not supported".into());
-    }
-    if request.n == Some(0) {
-        return Err("n must be at least 1".into());
-    }
-    #[allow(deprecated)]
-    let max_tokens = request.max_completion_tokens.or(request.max_tokens);
-    if max_tokens == Some(0) {
-        return Err("max_completion_tokens must be positive".into());
-    }
-    if request.modalities.as_ref().is_some_and(|modalities| {
-        serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
-    }) || request.audio.is_some()
-        || request.prediction.is_some()
-        || request.web_search_options.is_some()
-        || request.mm_processor_kwargs.is_some()
-    {
-        return Err(
-            "audio, prediction, web search, and multimodal inputs are not supported".into(),
-        );
-    }
-    #[allow(deprecated)]
-    if request.function_call.is_some() || request.functions.is_some() {
-        return Err(
-            "deprecated function_call/functions are not supported; use tools and tool_choice"
-                .into(),
-        );
-    }
+    validate_chat_request(config, request)?;
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
     let parser = resolve_chat_parser(config, request, &tool_choice)?;
@@ -281,6 +247,57 @@ pub(crate) async fn lower_chat_request(
         generation_inputs: requests,
         response_processor,
     })
+}
+
+pub(crate) async fn render_chat_prompt(
+    config: &RendererConfig,
+    chat_formatter: Option<ChatFormatter>,
+    request: &mut CreateChatCompletionRequest,
+) -> Result<String, RendererError> {
+    validate_chat_request(config, request)?;
+    apply_chat_template(chat_formatter, request).await
+}
+
+fn validate_chat_request(
+    config: &RendererConfig,
+    request: &CreateChatCompletionRequest,
+) -> Result<(), RendererError> {
+    if request.model != config.served_model_name {
+        return Err(format!("The model `{}` does not exist", request.model).into());
+    }
+    if request.messages.is_empty() {
+        return Err("messages cannot be empty".into());
+    }
+    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
+        return Err("image, audio, video, and file message content is not supported".into());
+    }
+    if request.n == Some(0) {
+        return Err("n must be at least 1".into());
+    }
+    #[allow(deprecated)]
+    let max_tokens = request.max_completion_tokens.or(request.max_tokens);
+    if max_tokens == Some(0) {
+        return Err("max_completion_tokens must be positive".into());
+    }
+    if request.modalities.as_ref().is_some_and(|modalities| {
+        serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
+    }) || request.audio.is_some()
+        || request.prediction.is_some()
+        || request.web_search_options.is_some()
+        || request.mm_processor_kwargs.is_some()
+    {
+        return Err(
+            "audio, prediction, web search, and multimodal inputs are not supported".into(),
+        );
+    }
+    #[allow(deprecated)]
+    if request.function_call.is_some() || request.functions.is_some() {
+        return Err(
+            "deprecated function_call/functions are not supported; use tools and tool_choice"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn resolve_chat_parser(

@@ -1,12 +1,14 @@
 //! Immutable configuration required during request rendering.
 
-#[derive(Clone, Debug, Default, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SamplingDefaults {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendererLimits {
     pub skip_tokenizer_init: bool,
     pub vocab_size: u64,
@@ -16,7 +18,7 @@ pub struct RendererLimits {
     pub enable_return_hidden_states: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendererConfig {
     pub served_model_name: String,
     pub tokenizer_path: String,

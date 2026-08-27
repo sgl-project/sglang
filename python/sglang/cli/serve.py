@@ -52,7 +52,7 @@ def _extract_model_type_override(extra_argv):
     return backend_name, filtered_argv
 
 
-def _normalize_positional_model_path(extra_argv):
+def normalize_positional_model_path(extra_argv):
     """Allow `sglang serve <model>` while preserving existing flag parsing."""
     if extra_argv and not extra_argv[0].startswith("-"):
         return ["--model-path", extra_argv[0], *extra_argv[1:]], True
@@ -167,7 +167,7 @@ def serve(args, extra_argv):
     del args  # The top-level parser currently has no serve-owned fields.
 
     backend_name, dispatch_argv = _extract_model_type_override(extra_argv)
-    dispatch_argv, positional_model_path = _normalize_positional_model_path(
+    dispatch_argv, positional_model_path = normalize_positional_model_path(
         dispatch_argv
     )
     request = ServeRequest(

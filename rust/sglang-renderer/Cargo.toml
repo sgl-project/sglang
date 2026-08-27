@@ -5,9 +5,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[package.metadata.sglang]
+python-bin = "sglang-renderer"
+features = ["http"]
+debug = false
+
 [features]
 default = []
-http = ["dep:axum", "dep:tokio", "dep:uuid"]
+http = [
+    "dep:axum",
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+    "dep:uuid",
+]
+
+[[bin]]
+name = "sglang-renderer"
+path = "src/main.rs"
+required-features = ["http"]
 
 [dependencies]
 async-stream = { workspace = true }
@@ -21,6 +37,8 @@ tokio = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 axum = { version = "0.8.9", features = ["json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"

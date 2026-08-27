@@ -33,11 +33,11 @@ use super::submit::submit;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::sampling::SamplingParams;
 use crate::utils::{
     environ,
     response::{error_response, error_value},
 };
-use sglang_renderer::SamplingParams;
 
 /// API-local timing for one request.
 ///

@@ -26,7 +26,7 @@ def main():
     )
     subparsers.add_parser(
         "render",
-        help="Launch a standalone text preprocessing server.",
+        help="Launch the standalone Rust OpenAI frontend.",
         add_help=False,
     )
 

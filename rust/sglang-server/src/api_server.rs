@@ -7,7 +7,7 @@ pub mod app;
 mod common;
 mod disaggregation;
 mod frame;
-pub(crate) mod guard;
+mod guard;
 mod log;
 mod native_api;
 mod openai;

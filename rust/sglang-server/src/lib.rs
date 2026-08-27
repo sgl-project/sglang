@@ -14,7 +14,6 @@
 mod api_server;
 mod message;
 mod multi_modality;
-mod renderer;
 mod tokenizer_manager;
 mod utils;
 
@@ -257,42 +256,6 @@ impl Server {
     }
 }
 
-/// Handle for the standalone text-only preprocessing server.
-#[pyclass]
-struct Renderer {
-    rt: sglang_renderer::http::RendererRuntime,
-}
-
-#[pymethods]
-impl Renderer {
-    #[new]
-    #[pyo3(signature = (server_args, http_addr = None))]
-    fn start(server_args: ServerArgs, http_addr: Option<String>) -> PyResult<Self> {
-        server_args
-            .validate()
-            .map_err(|e| value_error("server_args", e))?;
-        let http_addr: SocketAddr = http_addr
-            .unwrap_or_else(|| server_args.bind())
-            .parse()
-            .map_err(|e| value_error("bad http_addr", e))?;
-        let rt = sglang_renderer::http::RendererRuntime::start(
-            sglang_renderer::http::RendererRuntimeConfig {
-                http_addr,
-                http_workers: server_args.http_api_worker_num(),
-                tokenizer_workers: server_args.tokenizer_worker_num,
-                queue_capacity: 8192,
-                renderer: crate::renderer::renderer_config(&server_args),
-            },
-        )
-        .map_err(|e| value_error("renderer start failed", e))?;
-        Ok(Self { rt })
-    }
-
-    fn shutdown(&self) {
-        self.rt.request_shutdown();
-    }
-}
-
 impl Server {
     /// Hand one already-framed message to the ring. Shared by every push path —
     /// they differ solely in how the frame is built. `false` only on shutdown.
@@ -319,7 +282,6 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MmResample>()?;
     m.add_class::<MmSpec>()?;
     m.add_class::<Server>()?;
-    m.add_class::<Renderer>()?;
     m.add_class::<RequestBatch>()?;
     m.add_class::<MmEncodeResult>()?;
     Ok(())
