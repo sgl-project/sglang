@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -140,3 +141,7 @@ def test_decode_is_deferred_when_any_rank_prefills(monkeypatch):
     assert _should_defer_decode_for_mega_rank_sync(
         SimpleNamespace(forward_mode=ForwardMode.DECODE), sync
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
