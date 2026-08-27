@@ -7,6 +7,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import (
@@ -802,7 +803,9 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
+        if inputs_on_cuda(*args, **kwargs) and (
+            not _is_npu or envs.SGLANG_NPU_DSPARK_FUSED_OUT_TOKENS.get()
+        ):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -883,8 +886,12 @@ def _build_out_tokens_kernel(
     bonus = tl.load(bonus_ptr + b, mask=mask, other=0)
     draft_mask = mask & (k < gamma)
     draft = tl.load(draft_tokens_ptr + b * gamma + k, mask=draft_mask, other=0)
-    val = tl.where(k == cl, bonus, tl.where(k < gamma, draft, 0))
-    tl.store(out_ptr + offs, val.to(tl.int64), mask=mask)
+    # BiShengIR cannot lower the nested tl.where used by the CUDA version: its
+    # boolean mask becomes a mixture of i1 and i8. These masks are disjoint, so
+    # every output still receives exactly one store without a nested select.
+    is_bonus = k == cl
+    tl.store(out_ptr + offs, draft.to(tl.int64), mask=mask & (k != cl))
+    tl.store(out_ptr + offs, bonus.to(tl.int64), mask=mask & is_bonus)
 
 
 def build_out_tokens_triton(
