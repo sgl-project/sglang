@@ -354,10 +354,6 @@ def xpu_has_xmx_support():
     return False
 
 
-def use_intel_xpu_backend():
-    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
-
-
 @lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
@@ -2219,14 +2215,17 @@ def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
     skip_pid: int = None,
-    wait_timeout: Optional[float] = None,
+    wait_timeout: Optional[float] = 60,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
-    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    raises `RuntimeError` on timeout. SIGKILL only queues the teardown, so
+    returning without waiting leaves the GPU context, the pinned host memory
+    and the ports held for seconds; pass `None` only where blocking is
+    unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
+    calls `sys.exit(0)` and cannot wait for itself -- use
+    `include_parent=False` if child reap must finish first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2239,10 +2238,10 @@ def kill_process_tree(
 
     try:
         itself = psutil.Process(parent_pid)
+        children = itself.children(recursive=True)
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
     killed = []
     for child in children:
         if child.pid == skip_pid:

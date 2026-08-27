@@ -42,9 +42,9 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -343,18 +343,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
 def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     """Whether MoE expert weights should get a padded row stride for XPU.
 
-    use_intel_xpu_backend() only tells us an XPU exists on this machine, not
-    that the weights being created land on it -- the env var can be set while
-    serving on CPU/CUDA. create_weights takes no device argument and allocates
-    under the model loader's ambient device context, so check that context too:
-    padding a non-XPU weight would make it non-contiguous for no benefit, and
-    other backends' MoE kernels expect contiguous expert tensors.
+    is_xpu() only tells us an XPU exists on this machine, not that the weights
+    being created land on it -- this can be true while serving on CPU/CUDA.
+    create_weights takes no device argument and allocates under the model
+    loader's ambient device context, so check that context too: padding a
+    non-XPU weight would make it non-contiguous for no benefit, and other
+    backends' MoE kernels expect contiguous expert tensors.
 
     The Triton path stores B transposed and does not read a row stride, so it
-    is excluded even on XPU.
+    is excluded even on XPU (either via --moe-runner-backend triton or the
+    triton_kernels build).
     """
     return (
-        use_intel_xpu_backend()
+        is_xpu()
+        and not get_moe_runner_backend().is_triton()
         and torch.get_default_device().type == "xpu"
         and not use_triton_kernels
     )
@@ -600,7 +602,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
 
         self._maybe_interleave_w13_for_fused_swiglu(layer)
-
         return
 
     def _maybe_interleave_w13_for_fused_swiglu(self, layer: torch.nn.Module) -> None:
@@ -633,6 +634,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             and moe_runner_config.gemm1_alpha is None
             and moe_runner_config.gemm1_clamp_limit is None
             and moe_runner_config.swiglu_limit is None
+            and not moe_runner_config.apply_router_weight_on_input
             # The LoRA MoE hooks read and write the full-width pre-activation
             # buffer in halves layout; both assumptions break here.
             and not get_lora().enable_lora
@@ -948,7 +950,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
-        if use_intel_xpu_backend():
+        if not get_moe_runner_backend().is_triton():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
@@ -974,7 +976,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             assert (
                 moe_runner_config.activation == "silu"
             ), f"activation = {moe_runner_config.activation} is not supported \
-            for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+            for Triton PATH, please drop --moe-runner-backend triton to use \
+            the sgl-kernel-xpu path, which supports more activations."
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
