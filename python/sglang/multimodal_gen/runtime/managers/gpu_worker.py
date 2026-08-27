@@ -115,6 +115,9 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    resolve_keep_resident_min_available_gb,
+)
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
@@ -1570,11 +1573,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 skip_reason="pipeline not initialized",
             )
 
+        budget_bytes = self._auto_residency_budget_bytes()
+        admission_gib = resolve_keep_resident_min_available_gb(self.server_args)
+        budget_gib = budget_bytes / GIB_BYTES
+        if budget_gib < admission_gib:
+            return RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=budget_bytes,
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason=(
+                    f"{budget_gib:.1f} GiB VRAM budget is below the "
+                    f"{admission_gib:.1f} GiB uncalibrated residency threshold"
+                ),
+            )
+
         candidates = self._collect_auto_residency_targets(workload)
         if not candidates:
             return RankResidencyReport(
                 rank=self.rank,
-                budget_bytes=self._auto_residency_budget_bytes(),
+                budget_bytes=budget_bytes,
                 estimated_peak_bytes=None,
                 candidates=[],
                 skip_reason="no eligible residency alternatives",
@@ -1609,7 +1627,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         pin_budget = self.server_args.host_pin_budget()
         return RankResidencyReport(
             rank=self.rank,
-            budget_bytes=self._auto_residency_budget_bytes(),
+            budget_bytes=budget_bytes,
             estimated_peak_bytes=max(phase_peaks.values()),
             estimated_peak_bytes_by_phase=phase_peaks,
             active_components_by_phase=phase_active,

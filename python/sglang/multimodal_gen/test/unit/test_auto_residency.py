@@ -1112,6 +1112,42 @@ class TestPlanAutoResidency:
             LAYERWISE_OFFLOAD
         ]
 
+    def test_pre_warmup_report_skips_uncalibrated_promotion_below_threshold(
+        self, monkeypatch
+    ):
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
+
+        worker = SimpleNamespace(
+            rank=0,
+            pipeline=object(),
+            server_args=object(),
+            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
+            _collect_auto_residency_targets=lambda _workload: pytest.fail(
+                "candidate collection should be skipped"
+            ),
+        )
+        monkeypatch.setattr(
+            gpu_worker, "resolve_keep_resident_min_available_gb", lambda _args: 60.0
+        )
+
+        report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
+            worker,
+            workload=DefaultWorkload(
+                width=832,
+                height=480,
+                num_frames=24,
+                num_inference_steps=50,
+            ),
+        )
+
+        assert report.budget_bytes == 30 * GIB_BYTES
+        assert report.estimated_peak_bytes is None
+        assert report.candidates == []
+        assert report.skip_reason == (
+            "30.0 GiB VRAM budget is below the 60.0 GiB uncalibrated residency "
+            "threshold"
+        )
+
     def test_reserve_floor_is_capped_on_a_small_card(self):
         # Keep enough room for unmeasured activations without applying the
         # datacenter-card 4 GiB floor verbatim.
