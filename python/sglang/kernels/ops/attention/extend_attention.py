@@ -605,7 +605,16 @@ def _fwd_kernel(
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
-    for start_n in range(0, extend_end, BLOCK_N):
+    # The mask below keeps (q, kv) iff q <= kv + SLIDING_WINDOW_SIZE, so no tile
+    # under this floor can hold an unmasked element -- tight for any BLOCK_M/BLOCK_N.
+    # SKIP_TILE already made those tiles no-ops, so bounding the loop is
+    # bit-identical and drops their cross-wave tl.max reduction.
+    extend_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        extend_start = (
+            tl.maximum(cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0) // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(extend_start, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
