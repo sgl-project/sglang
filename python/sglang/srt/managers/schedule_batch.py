@@ -949,6 +949,7 @@ class Req(ReqDllmMixin):
 
         # For req-level memory management
         self.kv = ReqKvInfo()
+        self.pp_prefetch_ticketed = False
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids

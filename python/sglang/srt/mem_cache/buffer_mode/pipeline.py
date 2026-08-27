@@ -42,11 +42,16 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
     ComponentType,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
@@ -163,19 +168,11 @@ def staged_splice_tokens(f: _StagedPrefetch, device_prefix_len: int) -> int:
     return splice_tokens
 
 
-def validate_buffer_only_stack(
-    sidecar_pool_specs: list, swa_component: Optional[SWAComponent]
-) -> None:
+def validate_buffer_only_stack(swa_component: Optional[SWAComponent]) -> None:
     """Post-assembly buffer-mode fences.
 
-    Sidecar pools (DSv4 compressed regions) and unified_kv SWA (device-only
-    ring, never offloaded) have no per-pool staging path yet.
+    unified_kv SWA (device-only ring, never offloaded) has no staging path.
     """
-    if sidecar_pool_specs:
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "sidecar storage pools (DeepSeek-V4 compressed regions)."
-        )
     swa = swa_component
     if swa is not None and swa._swa_kv_pool_host is None:
         # Only reachable on SWA models with the unified_kv layout (SWA as
@@ -507,6 +504,13 @@ class BufferModePipeline:
         # tombstoned since admission backs up FULL-only, as in cache mode.
         device_value, comp_xfers = cache.tree_core.build_backup_spec(node.id)
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(
+            cache._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_HOST,
+                PoolTransfer(name=PoolName.KV, device_indices=device_value),
+                comp_xfers,
+            )
+        )
         host_indices = cc.write(
             device_value,
             node_id=node.id,
@@ -581,6 +585,26 @@ class BufferModePipeline:
         # Mamba state is a single slot (host pool page_size 1 -> one key).
         storage_xfers: list[PoolTransfer] = []
         for staged in entry.aux_xfers:
+            if staged.indices_from_pool is not None:
+                source = next(
+                    (
+                        transfer
+                        for transfer in storage_xfers
+                        if transfer.name == staged.indices_from_pool
+                    ),
+                    None,
+                )
+                assert source is not None or staged.indices_from_pool == PoolName.KV
+                keys = intent.hash_values if source is None else source.keys
+                storage_xfers.append(
+                    PoolTransfer(
+                        name=staged.name,
+                        keys=keys,
+                        hit_policy=staged.hit_policy,
+                        indices_from_pool=staged.indices_from_pool,
+                    )
+                )
+                continue
             keys = self._aux_window_keys(intent.hash_values, staged)
             if keys is None:
                 continue

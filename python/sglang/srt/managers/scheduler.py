@@ -2633,6 +2633,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        req.pp_prefetch_ticketed = recv_req.pp_prefetch_ticketed
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
@@ -2804,6 +2805,15 @@ class Scheduler(
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+            controller = getattr(self.tree_cache, "cache_controller", None)
+            if (
+                self.ps.pp_rank == 0
+                and controller is not None
+                and controller.pp_prefetch_command_group is not None
+            ):
+                ticketed = req.rid in controller.pp_prefetch_states
+                req.pp_prefetch_ticketed = ticketed
+                recv_req.pp_prefetch_ticketed = ticketed
 
     def handle_batch_generate_request(
         self,
@@ -2897,14 +2907,22 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        skip_pp_prefetch = (
+            self.ps.pp_rank > 0
+            and controller is not None
+            and controller.pp_prefetch_command_group is not None
+        )
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            self._prefetch_kvcache(req)
+            if not skip_pp_prefetch:
+                self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
+            if not skip_pp_prefetch:
+                self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
@@ -3532,14 +3550,22 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
-                if loaded_tokens > 0:
-                    req.storage_hit_length = loaded_tokens
+                controller = getattr(self.tree_cache, "cache_controller", None)
+                pp_ticket = (
+                    controller is not None
+                    and controller.pp_prefetch_command_group is not None
+                )
+                if not pp_ticket or req.pp_prefetch_ticketed:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        continue
+                    if pp_ticket:
+                        req.pp_prefetch_ticketed = False
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                    if loaded_tokens > 0:
+                        req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
             if (
