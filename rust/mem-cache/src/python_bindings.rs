@@ -937,9 +937,22 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// Bump the reference count on a node's component locks.
-    fn inc_lock_ref(&self, py: Python<'_>, node_id: NodeId) -> IncLockRefResultBinding {
-        let result = py.allow_threads(|| self.core().inc_lock_ref(node_id));
-        IncLockRefResultBinding {
+    fn inc_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        skip_lock_components: Option<Vec<u8>>,
+    ) -> PyResult<IncLockRefResultBinding> {
+        let skip_lock_components = skip_lock_components
+            .unwrap_or_default()
+            .into_iter()
+            .map(parse_component_type)
+            .collect::<PyResult<Vec<_>>>()?;
+        let result = py.allow_threads(|| {
+            self.core()
+                .inc_lock_ref_with_skip(node_id, &skip_lock_components)
+        });
+        Ok(IncLockRefResultBinding {
             delta: result.delta,
             swa_uuid_for_lock: result.swa_uuid_for_lock,
             swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
@@ -948,7 +961,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 .into_iter()
                 .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
                 .collect(),
-        }
+        })
     }
 
     /// Decrease the reference count on a node's component locks.
@@ -971,13 +984,20 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
         swa_uuid_for_lock: Option<i64>,
+        skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
     ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
+        let skip_lock_node_ids = skip_lock_node_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(ct, node_ids)| Ok((parse_component_type(ct)?, node_ids)))
+            .collect::<PyResult<HashMap<_, _>>>()?;
         let (device_frees, host_frees) = py.allow_threads(|| {
             let mut device_frees = HashMap::new();
             let mut host_frees = HashMap::new();
-            self.core().dec_swa_lock_only(
+            self.core().dec_swa_lock_only_with_skip(
                 node_id,
                 swa_uuid_for_lock,
+                Some(&skip_lock_node_ids),
                 &mut device_frees,
                 &mut host_frees,
             );
@@ -2061,8 +2081,14 @@ macro_rules! tree_core_binding {
             }
 
             /// Bump the reference count on a node's component locks.
-            fn inc_lock_ref(&self, py: Python<'_>, node_id: NodeId) -> IncLockRefResultBinding {
-                self.inner.inc_lock_ref(py, node_id)
+            #[pyo3(signature = (node_id, skip_lock_components = None))]
+            fn inc_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                skip_lock_components: Option<Vec<u8>>,
+            ) -> PyResult<IncLockRefResultBinding> {
+                self.inner.inc_lock_ref(py, node_id, skip_lock_components)
             }
 
             /// Decrease the reference count on a node's component locks.
@@ -2079,14 +2105,20 @@ macro_rules! tree_core_binding {
 
             /// Early-release the SWA portion of a request's tree lock; returns this
             /// release's per-component (device_frees, host_frees).
-            #[pyo3(signature = (node_id, swa_uuid_for_lock = None))]
+            #[pyo3(signature = (node_id, swa_uuid_for_lock = None, skip_lock_node_ids = None))]
             fn dec_swa_lock_only(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
                 swa_uuid_for_lock: Option<i64>,
+                skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
             ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-                self.inner.dec_swa_lock_only(py, node_id, swa_uuid_for_lock)
+                self.inner.dec_swa_lock_only(
+                    py,
+                    node_id,
+                    swa_uuid_for_lock,
+                    skip_lock_node_ids,
+                )
             }
 
             /// Store a component's device value on a node (the SWA rebuild write-back).

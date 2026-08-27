@@ -366,11 +366,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         node_id: NodeId,
         skip_lock_components: Sequence[ComponentType] = (),
     ) -> IncLockRefResult:
-        if skip_lock_components:
-            raise NotImplementedError(
-                "skip_lock_components: not yet ported to the Rust tree core"
-            )
-        result = self._binding.inc_lock_ref(node_id)
+        result = self._binding.inc_lock_ref(
+            node_id, [int(component) for component in skip_lock_components]
+        )
         return IncLockRefResult(
             delta=result.delta,
             swa_uuid_for_lock=result.swa_uuid_for_lock,
@@ -406,13 +404,15 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         swa_uuid_for_lock: Optional[int],
         skip_lock_node_ids: Optional[dict] = None,
     ) -> DecSwaLockOnlyResult:
-        if skip_lock_node_ids:
-            raise NotImplementedError(
-                "skip_lock_node_ids: not yet ported to the Rust tree core"
-            )
         result = DecSwaLockOnlyResult()
         new_device_frees, new_host_frees = self._binding.dec_swa_lock_only(
-            node_id, swa_uuid_for_lock
+            node_id,
+            swa_uuid_for_lock,
+            (
+                _skip_lock_node_ids_to_binding(skip_lock_node_ids)
+                if skip_lock_node_ids
+                else None
+            ),
         )
         for component, tensors in new_device_frees.items():
             result.device_frees[ComponentType(component)].extend(tensors)

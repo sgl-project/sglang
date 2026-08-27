@@ -1901,6 +1901,44 @@ class UnifiedRadixCacheSuite:
             "Full stays locked",
         )
 
+    def test_swa_early_release_preserves_an_owners_skipped_mamba_lock(self):
+        if not self.cfg.has_swa or not self.cfg.has_mamba:
+            self.skipTest("requires SWA and Mamba components")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+
+        seq_a = self._make_seq(
+            1, (self.cfg.sliding_window_size // self.cfg.page_size) + 4
+        )
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        node_a = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
+        ).last_device_node
+
+        owner = cache.inc_lock_ref(node_a)
+        skipped = cache.inc_lock_ref(
+            node_a, skip_lock_components=(ComponentType.MAMBA,)
+        )
+        self.assertEqual(
+            skipped.skip_lock_node_ids, {ComponentType.MAMBA: {node_a}}
+        )
+        self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
+
+        cache.dec_swa_lock_only(
+            node_a,
+            skipped.swa_uuid_for_lock,
+            skip_lock_node_ids=skipped.skip_lock_node_ids,
+        )
+        self.assertEqual(
+            _device_lock_ref(cache, node_a, ComponentType.MAMBA),
+            1,
+            "the early release must not drop another request's Mamba lock",
+        )
+
+        cache.dec_lock_ref(node_a, skipped.to_dec_params(), skip_swa=True)
+        cache.dec_lock_ref(node_a, owner.to_dec_params())
+        self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 0)
+        cache.sanity_check()
+
     def test_cascade_evict_asserts_on_locked_internal_mamba(self):
         if not self.cfg.has_swa or not self.cfg.has_mamba:
             self.skipTest("requires SWA and Mamba components")

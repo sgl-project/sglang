@@ -30,6 +30,28 @@ fn mamba_core_with_chunk(page_size: usize, chunk: usize) -> UnifiedTreeCore<Vec<
     )
 }
 
+fn hybrid_lock_core() -> (UnifiedTreeCore<Vec<i64>>, NodeIdx_, NodeIdx_) {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            swa_sliding_window_size: Some(2),
+            mamba_cache_chunk_size: Some(256),
+            ..CacheInitParams::default()
+        },
+        vec![FULL, SWA, MAMBA],
+    );
+    let [parent, leaf] = chain::<2>(&mut tc);
+    for (node, full_slot, swa_slot, mamba_slot) in [(parent, 10, 20, 30), (leaf, 11, 21, 31)] {
+        tc.arena
+            .set_device_value(node, FULL, Tensor::from_slice(&[full_slot]));
+        tc.set_component_device_value(tc.arena.node(node).id, SWA, Tensor::from_slice(&[swa_slot]));
+        set_mamba_device(&mut tc, node, mamba_slot);
+        tc.update_evictable_leaf_sets_(node);
+    }
+    tc.component_state_mut(FULL).evictable_size = 2;
+    (tc, parent, leaf)
+}
+
 fn insert_params_mamba<'k>(
     key: &'k Vec<i64>,
     value: &[i64],
@@ -284,6 +306,81 @@ fn device_lock_moves_the_slot_between_evictable_and_protected_once() {
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
+}
+
+#[test]
+fn skip_aware_lock_records_only_the_mamba_target() {
+    let (mut tc, parent, leaf) = hybrid_lock_core();
+    let leaf_handle = tc.arena.node(leaf).id;
+
+    let result = tc.inc_lock_ref_with_skip(leaf_handle, &[MAMBA]);
+
+    assert_eq!(result.skip_lock_node_ids[&MAMBA].len(), 1);
+    assert!(result.skip_lock_node_ids[&MAMBA].contains(&leaf_handle));
+    assert_eq!(tc.arena.node(parent).device_lock_ref(MAMBA), 0);
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 0);
+    assert_eq!(tc.evictable_size_(MAMBA), 2);
+    assert_eq!(tc.protected_size_(MAMBA), 0);
+    assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 1);
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 1);
+
+    tc.dec_lock_ref(
+        leaf_handle,
+        Some(&DecLockRefParams {
+            swa_uuid_for_lock: result.swa_uuid_for_lock,
+            skip_lock_node_ids: result.skip_lock_node_ids,
+            ..Default::default()
+        }),
+        /* skip_swa = */ false,
+    );
+    assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 0);
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 0);
+}
+
+#[test]
+fn swa_only_release_honors_a_skipped_mamba_target() {
+    let (mut tc, _parent, leaf) = hybrid_lock_core();
+    let leaf_handle = tc.arena.node(leaf).id;
+    let owner = tc.inc_lock_ref(leaf_handle);
+    let skipped = tc.inc_lock_ref_with_skip(leaf_handle, &[MAMBA]);
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
+
+    let mut device_frees = HashMap::new();
+    let mut host_frees = HashMap::new();
+    tc.dec_swa_lock_only_with_skip(
+        leaf_handle,
+        skipped.swa_uuid_for_lock,
+        Some(&skipped.skip_lock_node_ids),
+        &mut device_frees,
+        &mut host_frees,
+    );
+
+    assert!(device_frees.is_empty());
+    assert!(host_frees.is_empty());
+    assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
+    assert_eq!(tc.protected_size_(MAMBA), 1);
+
+    let skipped_params = DecLockRefParams {
+        swa_uuid_for_lock: skipped.swa_uuid_for_lock,
+        skip_lock_node_ids: skipped.skip_lock_node_ids,
+        ..Default::default()
+    };
+    tc.dec_lock_ref(
+        leaf_handle,
+        Some(&skipped_params),
+        /* skip_swa = */ true,
+    );
+    let owner_params = DecLockRefParams {
+        swa_uuid_for_lock: owner.swa_uuid_for_lock,
+        skip_lock_node_ids: owner.skip_lock_node_ids,
+        ..Default::default()
+    };
+    tc.dec_lock_ref(
+        leaf_handle,
+        Some(&owner_params),
+        /* skip_swa = */ false,
+    );
+    assert_eq!(tc.protected_size_(MAMBA), 0);
 }
 
 #[test]

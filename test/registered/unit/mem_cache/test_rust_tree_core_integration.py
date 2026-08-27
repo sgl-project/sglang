@@ -970,6 +970,21 @@ def _mamba_tree_core_with_cap(cap: int) -> RustUnifiedTreeCore:
     return _mamba_tree_core(mamba_max_states_per_path=cap)
 
 
+def _hybrid_swa_mamba_tree_core(window: int) -> RustUnifiedTreeCore:
+    with get_context().override_server_args(
+        _mamba_cache_chunk_size=256,
+        mamba_max_states_per_path=-1,
+    ):
+        return _tree_core(
+            tree_components=(
+                ComponentType.FULL,
+                ComponentType.SWA,
+                ComponentType.MAMBA,
+            ),
+            sliding_window_size=window,
+        )
+
+
 def _mamba_insert(core, token_ids, indices, mamba_slot):
     return _pump_insert(
         core,
@@ -1006,6 +1021,37 @@ def test_component_set_guard_accepts_the_hybrid_swa_mamba_set():
             int(ComponentType.MAMBA),
         ],
     )
+
+
+def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
+    core = _hybrid_swa_mamba_tree_core(window=2)
+    inserted = _mamba_insert(core, [1, 2], [10, 11], 7)
+    for action in inserted.cache_actions:
+        if isinstance(action, SWARebuild):
+            core.set_component_device_value(
+                action.node_id, ComponentType.SWA, action.source_value
+            )
+    node = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
+
+    owner = core.inc_lock_ref(node)
+    skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,))
+    assert skipped.skip_lock_node_ids == {ComponentType.MAMBA: {node}}
+    assert core.mamba_protected_size() == 1
+
+    released = core.dec_swa_lock_only(
+        node,
+        skipped.swa_uuid_for_lock,
+        skip_lock_node_ids=skipped.skip_lock_node_ids,
+    )
+    assert dict(released.device_frees) == {}
+    assert dict(released.host_frees) == {}
+    assert core.mamba_protected_size() == 1
+
+    core.dec_lock_ref(node, skipped.to_dec_params(), skip_swa=True)
+    core.dec_lock_ref(node, owner.to_dec_params())
+    assert core.protected_size() == 0
+    assert core.swa_protected_size() == 0
+    assert core.mamba_protected_size() == 0
 
 
 def test_component_set_guard_still_rejects_invalid_sets():

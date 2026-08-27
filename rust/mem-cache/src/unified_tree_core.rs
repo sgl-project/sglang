@@ -711,9 +711,32 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Bump the reference count on a node's component locks.
     pub fn inc_lock_ref(&mut self, node_id: NodeId) -> IncLockRefResult {
+        self.inc_lock_ref_with_skip(node_id, &[])
+    }
+
+    /// Bump component locks, leaving explicitly skipped target components evictable.
+    pub fn inc_lock_ref_with_skip(
+        &mut self,
+        node_id: NodeId,
+        skip_lock_components: &[ComponentType],
+    ) -> IncLockRefResult {
         let node_id = self.arena.resolve(node_id);
+        let node = self.arena.node(node_id);
+        let node_handle = node.id;
+        let is_root = node.is_root();
         let mut result = IncLockRefResult::default();
         for i in 0..self.components.len() {
+            let component_type = self.components[i].component_type();
+            if skip_lock_components.contains(&component_type) {
+                if !is_root {
+                    result
+                        .skip_lock_node_ids
+                        .entry(component_type)
+                        .or_default()
+                        .insert(node_handle);
+                }
+                continue;
+            }
             let component = Arc::clone(&self.components[i]);
             result = component
                 .acquire_component_lock(self, node_id, result, /* lock_host = */ false);
@@ -751,6 +774,24 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
+        self.dec_swa_lock_only_with_skip(
+            node_id,
+            swa_uuid_for_lock,
+            /* skip_lock_node_ids = */ None,
+            device_frees,
+            host_frees,
+        );
+    }
+
+    /// Skip-aware variant used when an acquire deliberately omitted a component.
+    pub fn dec_swa_lock_only_with_skip(
+        &mut self,
+        node_id: NodeId,
+        swa_uuid_for_lock: Option<i64>,
+        skip_lock_node_ids: Option<&HashMap<ComponentType, HashSet<NodeId>>>,
+        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+    ) {
         let node_id = self.arena.resolve(node_id);
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return;
@@ -761,6 +802,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let swa_priority = swa.eviction_priority(/* is_leaf = */ false);
         let dec_params = DecLockRefParams {
             swa_uuid_for_lock,
+            skip_lock_node_ids: skip_lock_node_ids.cloned().unwrap_or_default(),
             ..Default::default()
         };
         for i in 0..self.components.len() {
