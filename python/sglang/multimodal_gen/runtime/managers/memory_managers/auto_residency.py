@@ -488,15 +488,57 @@ def estimate_candidate_latency_savings_ns(
     candidates = list(candidates)
     stage_duration_ns = stage_duration_ns or {}
     component_stages = component_stages or {}
+    candidates_by_component: dict[str, list[ResidencyTarget]] = {}
     maximum_h2d_bytes: dict[str, int] = {}
     for candidate in candidates:
+        candidates_by_component.setdefault(candidate.component_name, []).append(
+            candidate
+        )
         maximum_h2d_bytes[candidate.component_name] = max(
             maximum_h2d_bytes.get(candidate.component_name, 0),
             candidate.h2d_bytes_per_request,
         )
 
     estimates: dict[str, int] = {}
+    for component_name, component_candidates in candidates_by_component.items():
+        current = next(
+            (
+                candidate
+                for candidate in component_candidates
+                if candidate.current_placement
+            ),
+            None,
+        )
+        if current is None:
+            continue
+
+        component_stage_duration_ns = sum(
+            stage_duration_ns.get(stage_name, 0)
+            for stage_name in component_stages.get(component_name, ())
+        )
+        latency_upper_bound_ns = (
+            request_duration_ns
+            if is_dit_component_name(component_name)
+            else component_stage_duration_ns or request_duration_ns
+        )
+        for candidate in component_candidates:
+            relative_savings_ns = int(
+                (candidate.h2d_bytes_per_request - current.h2d_bytes_per_request)
+                / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+                * 1_000_000_000
+            )
+            # A measured stage bounds how much latency a placement can remove,
+            # but not how much an unmeasured mechanism can add. Clipping both
+            # directions made a repeatedly streamed DiT appear merely neutral
+            # once its transfer time exceeded the whole request; another small
+            # component gain could then select a several-times-slower layout.
+            if relative_savings_ns > 0 and latency_upper_bound_ns > 0:
+                relative_savings_ns = min(relative_savings_ns, latency_upper_bound_ns)
+            estimates[candidate.option_key()] = relative_savings_ns
+
     for candidate in candidates:
+        if candidate.option_key() in estimates:
+            continue
         component_maximum_bytes = maximum_h2d_bytes[candidate.component_name]
         if component_maximum_bytes <= 0:
             estimates[candidate.option_key()] = int(
