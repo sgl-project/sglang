@@ -337,6 +337,53 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
+    def test_unified_pd_decode_uses_decode_req_pool(self):
+        import torch
+
+        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=2,
+            enable_unified_memory=True,
+        )
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.device = "cpu"
+        configurator.model_config = mr.model_config
+        configurator.kv_cache_dtype = torch.bfloat16
+        configurator.page_size = 1
+        configurator.is_hybrid_swa = True
+        configurator.is_hybrid_swa_compress = False
+        configurator.use_mla_backend = False
+        configurator.layer_info = mr.layer_info
+        configurator.forward_stream = None
+        configurator.mambaish_config = None
+
+        initialized_pools = SimpleNamespace(
+            unified_memory_pool=MagicMock(),
+            token_to_kv_pool=MagicMock(),
+            token_to_kv_pool_allocator=MagicMock(),
+        )
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.mem_cache.unified_memory_pool.init_unified_swa_pools",
+                return_value=initialized_pools,
+            ),
+        ):
+            pools = configurator._init_unified_swa_pools(
+                max_num_reqs=4,
+                unified_memory_pool_bytes=4096,
+            )
+
+        self.assertIsInstance(pools.req_to_token_pool, DecodeReqToTokenPool)
+        self.assertEqual(pools.req_to_token_pool.pre_alloc_size, 2)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
