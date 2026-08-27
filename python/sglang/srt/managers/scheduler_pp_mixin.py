@@ -27,6 +27,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
+    MM_EMBEDDING_ERRORS_KEY,
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
@@ -54,6 +55,9 @@ if TYPE_CHECKING:
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
+    overlaps_mm_placeholder = bool(
+        batch is not None and batch.mm_embedding_validation_indices()
+    )
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
@@ -61,7 +65,19 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and not overlaps_mm_placeholder
     )
+
+
+def _pp_filter_failed_rows(
+    indices: torch.Tensor,
+    values: torch.Tensor,
+    mm_embedding_errors: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if mm_embedding_errors is None:
+        return indices, values
+    keep = mm_embedding_errors[: indices.shape[0], 1].to(indices.device) == 0
+    return indices[keep], values[keep.to(values.device)]
 
 
 @dataclass
@@ -1026,6 +1042,8 @@ class SchedulerPPMixin:
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
+        if result.mm_embedding_errors is not None:
+            tensor_dict[MM_EMBEDDING_ERRORS_KEY] = result.mm_embedding_errors
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1174,12 +1192,14 @@ class SchedulerPPMixin:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        mm_embedding_errors = pp_outputs.tensors.get(MM_EMBEDDING_ERRORS_KEY)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion
         # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+        stash_indices, stash_token_ids = _pp_filter_failed_rows(
+            batch.req_pool_indices, next_token_ids, mm_embedding_errors
         )
+        self.future_map.stash(stash_indices, RelayPayload(bonus_tokens=stash_token_ids))
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1188,7 +1208,9 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            mm_embedding_errors=mm_embedding_errors,
         )
+        output_result.copy_mm_embedding_errors_to_cpu()
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
 

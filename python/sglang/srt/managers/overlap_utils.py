@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -143,6 +144,18 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
+
+    def select_rows(self, keep: torch.Tensor) -> RelayPayload:
+        return RelayPayload(
+            **{
+                field.name: (
+                    getattr(self, field.name)[keep.to(getattr(self, field.name).device)]
+                    if isinstance(getattr(self, field.name), torch.Tensor)
+                    else getattr(self, field.name)
+                )
+                for field in dataclasses.fields(self)
+            }
+        )
 
     @classmethod
     def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:

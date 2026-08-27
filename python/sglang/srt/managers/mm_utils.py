@@ -437,7 +437,7 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
-            embedding, mask, input_ids = get_embedding_and_mask(
+            embedding, mask, input_ids, embedding_errors = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
                 placeholder_tensor=placeholder_tensor,
@@ -458,6 +458,7 @@ def embed_mm_inputs(
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
+            other_info.setdefault("mm_embedding_errors", []).extend(embedding_errors)
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
@@ -602,6 +603,11 @@ def _embed_mm_inputs_with_split(
                 ][offset : offset + req_len]
             offset += req_len
 
+        for req_idx, expected, actual in sub_info.get("mm_embedding_errors", []):
+            other_info.setdefault("mm_embedding_errors", []).append(
+                (group_req_indices[req_idx], expected, actual)
+            )
+
     return input_embeds, other_info
 
 
@@ -715,6 +721,17 @@ def general_mm_embed_routine(
                                             "cpu", non_blocking=True
                                         )
                                     )
+            mm_batch_indices = [
+                i
+                for i, mm_input in enumerate(forward_batch.mm_inputs)
+                if mm_input is not None
+            ]
+            forward_batch.mm_embedding_errors = [
+                (mm_batch_indices[req_idx], expected, actual)
+                for req_idx, expected, actual in other_info.get(
+                    "mm_embedding_errors", []
+                )
+            ]
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:

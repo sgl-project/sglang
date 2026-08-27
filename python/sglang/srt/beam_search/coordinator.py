@@ -250,7 +250,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         return sorted(stop_ids)
 
     def maybe_select_and_relay(
-        self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
+        self,
+        batch: ScheduleBatch,
+        batch_result,
+        chunked_req: Optional[Req] = None,
+        skip_rows: Optional[set[int]] = None,
     ) -> None:
         """Per-forward relay hook: overwrite beam rows' relayed tokens with
         joint-selected ones. O(1) when no beam group is live."""
@@ -275,6 +279,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 group = req.beam_group
                 if (
                     group is None
+                    or (skip_rows is not None and i in skip_rows)
                     or group.state != BeamGroupState.DECODING
                     or group.num_generated > 0
                     or req is chunked_req  # mid-chunk leader: no selection yet
@@ -506,6 +511,15 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group.state = BeamGroupState.FINISHED
         group.final_results = []
         self._retire_group(group)
+
+    def abort_group_preserving_finish_reason(self, req: Req) -> None:
+        group = req.beam_group
+        if group is None or group.retired:
+            return
+        finished_reason = req.finished_reason
+        self._abort_group(group)
+        if finished_reason is not None:
+            req.finished_reason = finished_reason
 
     def _free_member_rows(self, group: BeamGroup) -> None:
         # Staged orphans are unreachable from every row, so the group-wide

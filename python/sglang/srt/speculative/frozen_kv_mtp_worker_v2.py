@@ -758,7 +758,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft-extend so the fence is at target-end.
-            if on_publish is not None:
+            if on_publish is not None and batch_output.mm_embedding_errors is None:
                 on_publish(batch_output.new_seq_lens)
 
             # Draft prefill seed (no forward).
