@@ -12,12 +12,9 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
 class TestMiniMaxH3EncoderDevice(unittest.TestCase):
     """`device` must name the compute side, not the parameter storage side.
 
-    `--text-encoder-cpu-offload` loads this encoder under an FSDP CPU offload
-    policy: the sharded parameters sit on CPU and are all-gathered to the
-    accelerator for the forward. Reporting the parameter device there sent
-    `encode_ids` to build `input_ids`/`attention_mask`/`position_ids` on CPU
-    while the forward ran on the accelerator, and the rope matmul died with
-    "Expected all tensors to be on the same device ... mat2 is on cpu".
+    Component offload stores parameters on CPU between uses. Input construction
+    must still target the accelerator selected for the forward rather than infer
+    the compute device from an offloaded parameter.
     """
 
     def _encoder_with_param_on(self, device: torch.device) -> MiniMaxH3Qwen3VLEncoder:

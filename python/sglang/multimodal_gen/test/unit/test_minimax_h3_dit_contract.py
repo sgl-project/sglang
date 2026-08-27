@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Mixed-precision weight and TP/Ulysses numerical contracts for H3 DiT."""
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -14,7 +15,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
@@ -25,10 +32,14 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
+    _diffusers_h3_checkpoint,
+    _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -39,6 +50,24 @@ def _ensure_single_process_parallel_runtime() -> None:
         return
     ensure_distributed_env_defaults()
     maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+
+
+def test_pruned_adaln_lora_projection_preserves_affine_term():
+    model = SimpleNamespace(
+        arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
+        adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
+        adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+    )
+    prefix = "blocks.0.adaln_proj.linear."
+    a = torch.tensor([[2.0, 3.0, 4.0]])
+    b = torch.tensor([[5.0], [6.0]])
+    actual = MiniMaxH3DiTModel.prepare_lora_adapter(
+        model, {prefix + "lora_A": a, prefix + "lora_B": b}
+    )
+    torch.testing.assert_close(actual[prefix + "lora_A"], a @ model.adaln_basis.T)
+    torch.testing.assert_close(
+        actual[prefix + "lora_output_offset"], b @ (a @ model.adaln_mean)
+    )
 
 
 def test_native_weight_names_and_grouped_qkv_reorder():
@@ -82,6 +111,50 @@ def test_native_weight_names_and_grouped_qkv_reorder():
         None,
     )
 
+    assert mapping("transformer_blocks.7.attn.to_k.qweight") == (
+        "blocks.7.attn.qkv_proj.qweight",
+        1,
+        3,
+    )
+    assert mapping("time_embedder.table") == ("adaln_t_table", None, None)
+    assert mapping("transformer_blocks.7.adaln_proj.folded_bias") == (
+        "blocks.7.adaln_proj.linear.bias",
+        None,
+        None,
+    )
+
+    diffusers_weights = [
+        ("transformer_blocks.0.attn.to_q.qweight", torch.full((2, 3), 1)),
+        ("transformer_blocks.0.attn.to_k.qweight", torch.full((2, 3), 2)),
+        ("transformer_blocks.0.attn.to_v.qweight", torch.full((2, 3), 3)),
+        (
+            "transformer_blocks.0.ff.net.0.proj.weight",
+            torch.arange(8).reshape(4, 2),
+        ),
+    ]
+    converted = dict(_diffusers_h3_checkpoint(diffusers_weights))
+    assert torch.equal(
+        converted["blocks.0.attn.qkv_proj.qweight"],
+        torch.cat([tensor for _, tensor in diffusers_weights[:3]], dim=1),
+    )
+    assert torch.equal(
+        converted["blocks.0.mlp.fc1.weight"],
+        torch.tensor([[4, 5], [6, 7], [0, 1], [2, 3]]),
+    )
+
+    pruned_config = MiniMaxH3DiTConfig()
+    pruned_config.update_model_arch(
+        {
+            "_class_name": "MiniMaxH3PrunedTransformer3DModel",
+            "adaln_rank": 8,
+            "time_embed_dim": 2688,
+            "time_table_size": 1025,
+        }
+    )
+    assert pruned_config.arch_config.time_embed_dim == 8
+    assert pruned_config.arch_config.adaln_curve_grid == 1025
+    assert pruned_config.arch_config.adaln_affine_input_dim == 2688
+
     weight = torch.arange(12, dtype=torch.float32).reshape(12, 1)
     actual = _reorder_grouped_qkv_to_qkv(
         weight,
@@ -95,36 +168,187 @@ def test_native_weight_names_and_grouped_qkv_reorder():
     ).reshape(12, 1)
     torch.testing.assert_close(actual, expected)
 
-    grouped = torch.arange(48, dtype=torch.int16).reshape(24, 2).view(torch.bfloat16)
-    reordered = _reorder_grouped_qkv_to_qkv(
-        grouped,
-        num_query_groups=4,
-        heads_per_group=1,
-        head_dim=2,
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        grouped = torch.arange(48, dtype=torch.float32).reshape(24, 2).to(dtype)
+        reordered = _reorder_grouped_qkv_to_qkv(
+            grouped,
+            num_query_groups=4,
+            heads_per_group=1,
+            head_dim=2,
+        )
+        for tp_size in (1, 2, 4):
+            local_rows = 8 // tp_size
+            for tp_rank in range(tp_size):
+                start = tp_rank * local_rows
+                param = torch.nn.Parameter(
+                    torch.empty(3 * local_rows, 2, dtype=dtype),
+                    requires_grad=False,
+                )
+                param.output_dim = 0
+                assert _copy_grouped_qkv_tp_shard(
+                    param,
+                    grouped,
+                    num_query_groups=4,
+                    head_dim=2,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+                expected_shard = reordered.view(3, 8, 2)[
+                    :, start : start + local_rows
+                ].reshape(-1, 2)
+                assert torch.equal(param, expected_shard)
+
+
+def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.time_embedder = None
+    model.adaln_t_table = torch.nn.Parameter(
+        torch.tensor([[0.0, 2.0], [2.0, 4.0], [4.0, 6.0]]),
+        requires_grad=False,
     )
-    for tp_size in (1, 2, 4):
-        local_rows = 8 // tp_size
-        for tp_rank in range(tp_size):
-            start = tp_rank * local_rows
-            param = torch.nn.Parameter(
-                torch.empty(3 * local_rows, 2, dtype=torch.bfloat16),
-                requires_grad=False,
-            )
-            param.output_dim = 0
-            assert _copy_grouped_qkv_tp_shard(
-                param,
-                grouped,
-                num_query_groups=4,
-                head_dim=2,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-            )
-            expected_shard = reordered.view(3, 8, 2)[
-                :, start : start + local_rows
-            ].reshape(-1, 2)
-            assert torch.equal(
-                param.view(torch.int16), expected_shard.view(torch.int16)
-            )
+
+    result = model._time_embedding(torch.tensor([0.0, 0.25, 1.0]))
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, 2.0], [1.0, 3.0], [4.0, 6.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+
+class _KwargIdentity(torch.nn.Module):
+    def forward(self, x, **_kwargs):
+        return x
+
+
+def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
+    block = MiniMaxH3DiTBlock.__new__(MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.norm1 = torch.nn.Identity()
+    block.norm2 = torch.nn.Identity()
+    block.attn = _KwargIdentity()
+    block.mlp = torch.nn.Identity()
+    gate_modes = []
+
+    def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
+        gate_modes.append(allow_inplace)
+        return residual.to(dtype)
+
+    def run(preserve):
+        block.preserve_input_for_cache_dit = preserve
+        gate_modes.clear()
+        block(
+            torch.zeros(2, 4),
+            adaln_input=torch.zeros(1, 4),
+            combined_indices=torch.zeros(2, dtype=torch.long),
+            rope_cache=None,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen=2,
+            adaln_params=tuple(torch.zeros(1, 4) for _ in range(6)),
+        )
+        return list(gate_modes)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            side_effect=lambda value, *_args, **_kwargs: value,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_gate",
+            side_effect=fake_gate,
+        ),
+    ):
+        assert run(preserve=False) == [True, True]
+        # Only the first gated residual can alias the block input Cache-DiT
+        # holds by reference, so only it goes out-of-place. The second works on
+        # a block-local buffer and keeps the fused in-place kernel.
+        assert run(preserve=True) == [False, True]
+
+
+def test_cache_dit_input_preservation_toggles_every_block():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+
+    model.set_cache_dit_input_preservation(True)
+    assert all(block.preserve_input_for_cache_dit for block in model.blocks)
+
+    model.set_cache_dit_input_preservation(False)
+    assert not any(block.preserve_input_for_cache_dit for block in model.blocks)
+
+
+@pytest.mark.parametrize(
+    ("global_backend", "expected_backend"),
+    [
+        (None, AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN),
+        (AttentionBackendEnum.FA, AttentionBackendEnum.FA),
+    ],
+)
+def test_lazy_attention_resolution_preserves_backend_precedence(
+    global_backend, expected_backend
+):
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.arch = SimpleNamespace(attention_head_dim=128)
+    model._component_attention_backend_override = (
+        AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+    )
+    model._resolved_attention_backend = None
+    backend = Mock()
+    backend.get_enum.return_value = expected_backend
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "get_global_forced_attn_backend",
+            return_value=global_backend,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+            return_value=backend,
+        ) as get_attn_backend,
+    ):
+        model._resolve_attention_backend_once()
+
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=expected_backend,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    assert model._resolved_attention_backend is expected_backend
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cache_dit_out_of_place_gate_preserves_cuda_input():
+    x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16)
+    original = x.clone()
+    gate = torch.randn(2, 16, device="cuda", dtype=torch.bfloat16)
+    other = torch.randn_like(x)
+    indices = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.long)
+    expected = _modulate_gate(
+        x.clone(),
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=True,
+    )
+
+    output = _modulate_gate(
+        x,
+        gate,
+        other,
+        indices,
+        dtype=torch.bfloat16,
+        allow_inplace=False,
+    )
+
+    assert output.data_ptr() != x.data_ptr()
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():
@@ -181,6 +405,27 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
         )
 
 
+def test_meta_model_captures_component_attention_override():
+    _ensure_single_process_parallel_runtime()
+    with (
+        component_attn_backend_context_manager(
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            component_name="transformer",
+        ),
+        torch.device("meta"),
+    ):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert (
+        model._component_attention_backend_override
+        is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+    )
+
+
 def test_meta_model_enforces_mixed_precision_weight_contract():
     expected_fp32 = set(MINIMAX_H3_FP32_PARAM_NAMES) | set(MINIMAX_H3_FP32_BUFFER_NAMES)
     _ensure_single_process_parallel_runtime()
@@ -199,6 +444,27 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.float32, name
         elif tensor.is_floating_point():
             assert tensor.dtype == torch.bfloat16, name
+
+
+def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
+    _ensure_single_process_parallel_runtime()
+    config = MiniMaxH3DiTConfig(
+        arch_config=MiniMaxH3DiTArchConfig(
+            adaln_curve_grid=1025,
+            time_embed_dim=8,
+        )
+    )
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=config,
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert model.time_embedder is None
+    assert model.adaln_t_table.dtype == torch.float32
+    assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float32
+    assert model.final_layer.adaln_proj.linear.weight.dtype == torch.float32
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
@@ -307,9 +573,7 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_ulysses_qkv_pack_is_bit_exact():
-    from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-        pack_qkv_destination_major,
-    )
+    from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 
     torch.manual_seed(23)
     rows, world_size, heads, head_size = 65, 8, 56, 128

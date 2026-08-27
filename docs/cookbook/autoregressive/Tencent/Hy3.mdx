@@ -21,11 +21,11 @@ pip install -U uv
 uv venv --python 3.12 && source .venv/bin/activate
 
 # Install from source (main carries the suffix-aware `hunyuan` parser + the
-# HYV3 model code). Once a tagged release picks it up, `uv pip install sglang`
-# is enough.
+# HYV3 model code). Once a tagged release picks it up,
+# `uv pip install --prerelease=allow sglang` is enough.
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-uv pip install -e python
+uv pip install --prerelease=allow -e python
 ```
 
 Run the **Python** output of the command panel below in that environment.
