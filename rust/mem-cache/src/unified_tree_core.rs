@@ -1478,7 +1478,33 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state.phase = InsertPhase::Tail;
     }
 
-    /// Refresh the LRUs and append the terminal new-leaf backup.
+    /// Whether an auxiliary component has new device data missing from Host.
+    fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
+        self.components.iter().any(|component| {
+            component.component_type() != BASE_COMPONENT_TYPE
+                && component.needs_incremental_backup(self, node_id)
+        })
+    }
+
+    /// Check whether the insert target needs a Host backup.
+    fn should_backup_after_insert_(
+        &mut self,
+        state: &InsertWalkState<K>,
+        target_node_id: NodeIdx_,
+    ) -> bool {
+        if state.is_new_leaf {
+            return self.inc_hit_count_and_check_(target_node_id, state.chunked);
+        }
+
+        let node = self.arena.node(target_node_id);
+        self.enable_hicache
+            && !self.is_write_back
+            && node.backuped()
+            && node.write_through_pending_id.is_none()
+            && self.needs_incremental_component_backup_(target_node_id)
+    }
+
+    /// Refresh the LRUs and append terminal backup actions.
     fn insert_tail_step_(&mut self, state: &mut InsertWalkState<K>) {
         let target_node_id = state
             .target_node_id
@@ -1494,7 +1520,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             }
         }
 
-        if state.is_new_leaf && self.inc_hit_count_and_check_(target_node_id, state.chunked) {
+        if self.should_backup_after_insert_(state, target_node_id) {
             let backup = self.build_backup_kv_action_(
                 self.arena.node(target_node_id),
                 /* write_back = */ false,

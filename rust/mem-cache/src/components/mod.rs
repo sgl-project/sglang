@@ -62,6 +62,15 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
 
+    /// Whether this component has device data that still needs a host backup.
+    fn needs_incremental_backup(
+        &self,
+        _tree_core: &UnifiedTreeCore<K>,
+        _node_id: NodeIdx_,
+    ) -> bool {
+        false
+    }
+
     /// Refresh this component's LRU position for `node_id` at the given walk phase.
     fn refresh_lru(
         &self,

@@ -418,6 +418,49 @@ fn reinsert_keeps_the_existing_slot_and_flags_the_caller() {
 }
 
 #[test]
+fn reinsert_full_backed_target_schedules_mamba_only_backup() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let key = vec![1, 2];
+    tc.insert(&insert_params_mamba(&key, &[10, 11], Some(7)));
+    let leaf = tc.match_prefix(&match_params(&key)).best_match_node_id;
+    tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new());
+
+    let result = tc.insert(&insert_params_mamba(&key, &[20, 21], Some(8)));
+    let backups = result
+        .cache_actions
+        .iter()
+        .filter_map(|action| match action {
+            CacheAction::BackupKV(backup) => Some(backup),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(backups[0].node_ids, vec![leaf]);
+
+    let (full_device_indices, comp_xfers) = tc.build_backup_spec(leaf);
+    assert_eq!(full_device_indices.numel(), 0);
+    let mamba_xfers = &comp_xfers[&MAMBA];
+    assert_eq!(mamba_xfers.len(), 1);
+    assert!(
+        mamba_xfers[0]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[7i64]))
+    );
+
+    tc.mark_write_through_pending(leaf);
+    let pending = tc.insert(&insert_params_mamba(&key, &[30, 31], Some(9)));
+    assert!(
+        !pending
+            .cache_actions
+            .iter()
+            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+    );
+}
+
+#[test]
 fn tombstone_refill_moves_the_node_from_host_to_device_lru() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);

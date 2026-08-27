@@ -72,6 +72,11 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         MAMBA
     }
 
+    fn needs_incremental_backup(&self, tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_) -> bool {
+        let node = tree_core.arena.node(node_id);
+        node.has_device_value(MAMBA) && !node.has_host_value(MAMBA)
+    }
+
     /// A match consumes only the best-match node's mamba state, so MATCH_END
     /// touches just that node; new-leaf states enter the LRU at insert commit,
     /// so WALKDOWN and INSERT_END are no-ops.
