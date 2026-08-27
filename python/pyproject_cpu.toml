@@ -19,7 +19,6 @@ dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
-  "apache-tvm-ffi==0.1.11",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
