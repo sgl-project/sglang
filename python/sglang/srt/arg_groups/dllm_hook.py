@@ -78,6 +78,15 @@ def handle_dllm_inference(server_args: Any):
             declare_resolution(
                 server_args, "_handle_dllm_inference", enable_lmcache=False
             )
+        if cfg.enable_unified_lmcache:
+            logger.warning(
+                "Unified LMCache is disabled because of using diffusion LLM inference"
+            )
+            declare_resolution(
+                server_args,
+                "_handle_dllm_inference",
+                enable_unified_lmcache=False,
+            )
         if cfg.enable_flexkv:
             logger.warning(
                 "FlexKV is disabled because of using diffusion LLM inference"

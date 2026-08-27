@@ -36,6 +36,8 @@ def _make_ctx(
     backend=None,
     enable_streaming=False,
     enable_lmcache=False,
+    enable_unified_lmcache=False,
+    enable_unified_cache_external_linker=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
@@ -52,12 +54,19 @@ def _make_ctx(
         radix_cache_backend=backend,
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
+        enable_unified_lmcache=enable_unified_lmcache,
         enable_flexkv=False,
-        enable_unified_cache_external_linker=False,
+        enable_unified_cache_external_linker=enable_unified_cache_external_linker,
     )
+    params = MagicMock()
+    params.is_eagle = False
+    params.mtp_draft_device_pools = ()
+    # A plain object accurately models a request pool without an optional
+    # C128 sidecar; MagicMock would make every hasattr() probe succeed.
+    params.req_to_token_pool = object()
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=params,
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
@@ -432,9 +441,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
 
     def test_lmc_radix_cache_when_enable_lmcache(self):
         ctx = _make_ctx(self, enable_lmcache=True)
-        # The lmcache backend raises at import time when the `lmcache`
-        # package isn't installed, so inject a stand-in module instead
-        # of letting patch() trigger the real import.
         fake_module = MagicMock()
         with patch.dict(
             "sys.modules",
@@ -449,6 +455,129 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 tp_group=ctx.tp_group,
             )
             self.assertIs(result, fake_module.LMCRadixCache.return_value)
+
+    def test_lmcache_unified_radix_cache_when_enable_unified_lmcache(self):
+        ctx = _make_ctx(self, enable_unified_lmcache=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            result = default_radix_cache_factory(ctx)
+            fake_module.LMCacheUnifiedRadixCache.assert_called_once_with(
+                ctx.params,
+                model_config=ctx.model_config,
+                tp_size=ctx.tp_size,
+                tp_rank=ctx.tp_rank,
+                lmcache_config_file=None,
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
+            )
+            self.assertEqual(
+                ctx.params.tree_components,
+                (fake_components.ComponentType.FULL,),
+            )
+            self.assertIs(
+                result, fake_module.LMCacheUnifiedRadixCache.return_value
+            )
+
+    def test_lmcache_rejects_hicache(self):
+        ctx = _make_ctx(
+            self, enable_unified_lmcache=True, enable_hierarchical_cache=True
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            default_radix_cache_factory(ctx)
+
+    def test_lmcache_supports_hybrid_swa_components(self):
+        ctx = _make_ctx(self, enable_unified_lmcache=True, is_hybrid_swa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.SWA,
+            ),
+        )
+
+    def test_lmcache_supports_hybrid_ssm_components(self):
+        ctx = _make_ctx(self, enable_unified_lmcache=True, is_hybrid_ssm=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (
+                fake_components.ComponentType.FULL,
+                fake_components.ComponentType.MAMBA,
+            ),
+        )
+
+    def test_lmcache_supports_dsa_as_full_sidecar(self):
+        ctx = _make_ctx(self, enable_unified_lmcache=True, is_dsa=True)
+        fake_module = MagicMock()
+        fake_components = MagicMock()
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.lmcache_unified_radix_cache": fake_module,
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+            },
+        ):
+            default_radix_cache_factory(ctx)
+
+        self.assertEqual(
+            ctx.params.tree_components,
+            (fake_components.ComponentType.FULL,),
+        )
+
+    def test_lmcache_rejects_pure_swa(self):
+        ctx = _make_ctx(
+            self,
+            enable_unified_lmcache=True,
+            is_hybrid_swa=True,
+            full_tokens_per_layer=0,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "pure-SWA"):
+            default_radix_cache_factory(ctx)
+
+    def test_legacy_and_unified_lmcache_are_mutually_exclusive(self):
+        ctx = _make_ctx(
+            self,
+            enable_lmcache=True,
+            enable_unified_lmcache=True,
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            default_radix_cache_factory(ctx)
+
+    def test_unified_lmcache_and_external_linker_are_mutually_exclusive(self):
+        ctx = _make_ctx(
+            self,
+            enable_unified_lmcache=True,
+            enable_unified_cache_external_linker=True,
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            default_radix_cache_factory(ctx)
 
 
 if __name__ == "__main__":
