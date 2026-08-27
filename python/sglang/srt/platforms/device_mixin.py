@@ -164,20 +164,49 @@ class DeviceMixin:
         return False
 
     # ------------------------------------------------------------------
-    # Planned methods — reserved interface.  Core still uses hardcoded
-    # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
-    # effect until the core is migrated in a future PR.
+    # Device-management migration. ModelRunner now uses get/set/create_stream
+    # through current_platform; the remaining methods are being adopted by
+    # common helpers and other subsystems incrementally.
     # ------------------------------------------------------------------
 
     # ---- Device management ----
 
-    def get_device(self, device_id: int = 0) -> str:
-        """[Planned] Return ``torch.device`` for the given device id."""
-        raise NotImplementedError
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        """[Active] Return ``torch.device`` for the given device id.
+
+        The generic implementation preserves the device-module path used by
+        ModelRunner before platform lifecycle hooks became active.  In-tree
+        platforms may still override this when their rank-to-device mapping is
+        special (CPU and MPS do so), while existing OOT platforms that only
+        declare ``device_type`` keep working without an immediate API rewrite.
+        """
+        return torch.device(self.device_type, device_id)
 
     def set_device(self, device: "torch.device") -> None:
-        """[Planned] Set the current device."""
-        raise NotImplementedError
+        """[Active] Set the current device through its PyTorch module.
+
+        Pass the integer index when one exists, matching ModelRunner's legacy
+        ``module.set_device(gpu_id)`` call.  CPU-like unindexed devices retain
+        their device object so their no-op setters continue to work.
+        """
+        device = torch.device(device)
+        module = torch.get_device_module(device)
+        module.set_device(device.index if device.index is not None else device)
+
+    def create_stream(self, device: Optional["torch.device"] = None):
+        """[Active] Create the stream used by the model runner."""
+        module = torch.get_device_module(device or self.device_type)
+        return module.Stream()
+
+    def get_device_count(self) -> int:
+        """[Planned] Return the number of visible devices."""
+        module = torch.get_device_module(self.device_type)
+        count = getattr(module, "device_count", None)
+        return int(count()) if callable(count) else 0
+
+    def get_device_core_count(self, device_id: int = 0) -> int:
+        """[Planned] Return a vendor core count, or zero when unavailable."""
+        return 0
 
     def get_device_name(self, device_id: int = 0) -> str:
         """[Planned] Get human-readable device name."""

@@ -42,7 +42,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -58,7 +57,6 @@ from sglang.srt.utils.common import (
     is_gfx95_supported,
     is_hip,
     is_mnnvl_fabric_device,
-    is_mps,
     is_musa,
     is_npu,
     is_sm90_supported,
@@ -1102,10 +1100,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["attention_backend"] = "intel_xpu"
         elif is_hip():
             overrides["attention_backend"] = "aiter"
-        elif not (is_mps() and use_mlx()):
-            # Exempt MLX only -- it owns attention in its own runner.  macOS
-            # without MLX still falls through to triton and fails fast below,
-            # rather than landing on torch_native (no sliding window, no sinks).
+        else:
             overrides["attention_backend"] = "triton"
     if is_xpu():
         # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,

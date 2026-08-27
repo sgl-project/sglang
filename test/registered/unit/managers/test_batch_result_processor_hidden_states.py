@@ -30,7 +30,6 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         is_generation=True,
         disaggregation_mode=None,
         enable_overlap=False,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,

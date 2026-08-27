@@ -243,7 +243,7 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif current_platform.is_out_of_tree():
+elif current_platform.is_mps() or current_platform.is_out_of_tree():
     current_platform.init_backend()
 
 # Detect stragger ranks in model loading
@@ -404,9 +404,16 @@ class ModelRunner:
             torch.set_float32_matmul_precision("high")
 
         # Set device early so that TransferEngine init (e.g. Ascend NPU)
-        # can access the device context.
+        # can access the device context. MPS has no CUDA-shaped set_device API,
+        # so route the active platform through its lifecycle boundary.
+        platform_matches_device = (
+            str(self.device).split(":", 1)[0] == current_platform.device_type
+        )
         try:
-            torch.get_device_module(self.device).set_device(ps.gpu_id)
+            if platform_matches_device:
+                current_platform.set_device(current_platform.get_device(ps.gpu_id))
+            else:
+                torch.get_device_module(self.device).set_device(ps.gpu_id)
         except Exception:
             import os
 
@@ -425,7 +432,11 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = (
+            current_platform.create_stream(current_platform.get_device(ps.gpu_id))
+            if platform_matches_device
+            else torch.get_device_module(self.device).Stream()
+        )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

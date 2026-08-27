@@ -1199,7 +1199,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             is_generation=True,
             disaggregation_mode=None,
             enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,

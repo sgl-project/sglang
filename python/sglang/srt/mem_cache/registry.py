@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import get_disagg, get_memory
@@ -176,14 +175,6 @@ def _create_unified_radix_cache(
         }
 
     params.tree_components = tuple(tree_components)
-    if use_mlx() and ctx.is_hybrid_ssm:
-        from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
-            MlxAuxiliaryStateComponent,
-        )
-
-        params.component_registry_override = {
-            ComponentType.MAMBA: MlxAuxiliaryStateComponent,
-        }
     cache = UnifiedRadixCache(params)
     if (
         ctx.enable_hierarchical_cache
