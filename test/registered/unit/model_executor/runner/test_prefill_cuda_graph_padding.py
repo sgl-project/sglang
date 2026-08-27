@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import patch
 
 import torch
@@ -58,6 +59,25 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    def test_replay_snapshot_uses_padded_token_count(self):
+        runner = self._make_runner()
+        runner.use_captured_attn_metadata = False
+        attn_backend = mock.Mock()
+        runner.model_runner = SimpleNamespace(attn_backend=attn_backend)
+        forward_batch = self._make_forward_batch(8)
+        static_forward_batch = self._make_forward_batch(16)
+
+        runner._prepare_forward_metadata_for_replay(
+            forward_batch,
+            static_forward_batch,
+            num_tokens=16,
+        )
+
+        attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)
+        attn_backend.prepare_prefill_shared_read_snapshot.assert_called_once_with(
+            forward_batch, num_qo_tokens=16
+        )
 
     def test_context_bucket_is_a_graph_key_axis(self):
         runner = self._make_runner()
