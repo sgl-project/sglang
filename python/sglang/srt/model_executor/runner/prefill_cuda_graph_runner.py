@@ -316,7 +316,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
-            pp_size=model_runner.server_args.pp_size,
+            pp_size=self.pp_size,
             hc_hidden_size=model_runner.model_config.hc_hidden_size,
             pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=(
