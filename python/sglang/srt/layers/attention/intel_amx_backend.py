@@ -28,6 +28,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.use_mla = model_runner.use_mla_backend
         self.max_context_len = model_runner.model_config.context_len
 
         # full->SWA translated out_cache_loc, computed once per forward (the only
@@ -202,18 +203,24 @@ class IntelAMXAttnBackend(AttentionBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if save_kv_cache and k is not None and v is not None:
             # Cross-attention never writes to the SWA pool, so only thread the
             # full->SWA location for non-cross-attention layers.
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
-            self.token_to_kv_pool.set_kv_buffer(
-                layer,
-                KVWriteLoc(cache_loc, swa_loc),
-                k,
-                v,
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+            write_loc = KVWriteLoc(cache_loc, swa_loc)
+            if not self.use_mla and key_buffer.dtype == torch.float8_e4m3fn:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    write_loc,
+                    k,
+                    v,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(layer, write_loc, k, v)
 
         # Precomputed once per forward pass in init_forward_metadata (spec
         # verify batches carry no extend_* fields; see _build_extend_metadata).
@@ -223,8 +230,6 @@ class IntelAMXAttnBackend(AttentionBackend):
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
 
-        key_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        value_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         key_scale = layer.k_scale_float or 1.0
         value_scale = layer.v_scale_float or 1.0
 
