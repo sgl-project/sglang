@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
@@ -51,6 +52,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
+    Cosmos3DenoisingStage,
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
     Cosmos3TimestepPreparationStage,
@@ -70,7 +72,7 @@ def _apply(mapping_fn, key):
     return mapping_fn(key)
 
 
-def _cosmos3_server_args(config=None):
+def _cosmos3_server_args(config=None, batching_max_size=1):
     return types.SimpleNamespace(
         model_id=None,
         model_path="nvidia/Cosmos3-Nano",
@@ -84,6 +86,7 @@ def _cosmos3_server_args(config=None):
         sp_degree=1,
         ulysses_degree=1,
         ring_degree=1,
+        batching_max_size=batching_max_size,
         pipeline_config=config or Cosmos3Config(),
     )
 
@@ -497,6 +500,31 @@ class TestCosmos3SamplingParamsDataType(unittest.TestCase):
 
 
 class TestCosmos3ActionEndpoint(unittest.TestCase):
+    @staticmethod
+    def _policy_payload(
+        batch_size=2,
+        prompt="pick up the block",
+        *,
+        tensor_payload=False,
+    ):
+        images = torch.zeros(batch_size, 8, 8, 3, dtype=torch.uint8).numpy()
+        input_reference = (
+            {
+                "dtype": "uint8",
+                "shape": list(images.shape),
+                "values": images.tolist(),
+            }
+            if tensor_payload
+            else images
+        )
+        return {
+            "input": {"prompt": prompt, "input_reference": input_reference},
+            "parameters": {
+                "action_mode": "policy",
+                "domain_name": "droid_lerobot",
+            },
+        }
+
     def test_policy_request_builds_action_sampling_params(self):
         image = torch.zeros(8, 8, 3, dtype=torch.uint8).numpy()
         payload = {
@@ -535,6 +563,49 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(params.seed, 7)
         self.assertEqual(params.image_path.size, (8, 8))
 
+    def test_batched_policy_request_preserves_input_pairing(self):
+        payload = self._policy_payload(
+            prompt=["pick up the block", "close the drawer"],
+            tensor_payload=True,
+        )
+
+        params = build_action_sampling_params(
+            payload, _cosmos3_server_args(batching_max_size=2)
+        )
+
+        self.assertEqual(params.prompt, ["pick up the block", "close the drawer"])
+        self.assertEqual(len(params.image_path), 2)
+        self.assertTrue(
+            all(isinstance(image, Image.Image) for image in params.image_path)
+        )
+
+    def test_batched_policy_request_broadcasts_scalar_prompt(self):
+        params = build_action_sampling_params(
+            self._policy_payload(), _cosmos3_server_args(batching_max_size=2)
+        )
+
+        self.assertEqual(params.prompt, ["pick up the block"] * 2)
+
+    def test_batched_policy_request_rejects_cardinality_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "one prompt per image"):
+            build_action_sampling_params(
+                self._policy_payload(prompt=["one", "two", "three"]),
+                _cosmos3_server_args(batching_max_size=3),
+            )
+
+    def test_batched_policy_request_honors_server_batch_limit(self):
+        with self.assertRaisesRegex(ValueError, "--batching-max-size=1"):
+            build_action_sampling_params(self._policy_payload(), _cosmos3_server_args())
+
+    def test_single_item_image_batch_keeps_single_input_contract(self):
+        params = build_action_sampling_params(
+            self._policy_payload(batch_size=1, prompt="pick"),
+            _cosmos3_server_args(),
+        )
+
+        self.assertEqual(params.prompt, "pick")
+        self.assertIsInstance(params.image_path, Image.Image)
+
     def test_inverse_dynamics_maps_video_input(self):
         payload = {
             "input": {
@@ -554,6 +625,21 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(params.video_path, "observation.mp4")
         self.assertEqual(params.num_frames, 61)
 
+    def test_inverse_dynamics_rejects_prompt_batch(self):
+        payload = {
+            "input": {
+                "prompt": ["first", "second"],
+                "video": "observation.mp4",
+            },
+            "parameters": {
+                "action_mode": "inverse_dynamics",
+                "domain_name": "droid_lerobot",
+            },
+        }
+
+        with self.assertRaisesRegex(ValueError, "prompt must be a string"):
+            build_action_sampling_params(payload, _cosmos3_server_args())
+
     def test_forward_dynamics_is_rejected_by_action_endpoint(self):
         payload = {
             "input": {
@@ -567,7 +653,7 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
             build_action_sampling_params(payload, _cosmos3_server_args())
 
     def test_metadata_describes_cosmos_action_contract(self):
-        metadata = action_metadata(_cosmos3_server_args())
+        metadata = action_metadata(_cosmos3_server_args(batching_max_size=4))
 
         self.assertEqual(metadata["model"], "cosmos3-production")
         self.assertEqual(metadata["policy_family"], "cosmos3")
@@ -575,6 +661,15 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(metadata["output"]["action_horizon"], 16)
         self.assertEqual(metadata["output"]["padded_action_dim"], 64)
         self.assertFalse(metadata["capabilities"]["openpi_websocket"])
+        self.assertTrue(metadata["capabilities"]["batch_inputs"])
+        self.assertEqual(metadata["capabilities"]["max_batch_size"], 4)
+        self.assertEqual(metadata["capabilities"]["batched_action_modes"], ["policy"])
+
+    def test_metadata_keeps_batching_opt_in(self):
+        metadata = action_metadata(_cosmos3_server_args())
+
+        self.assertFalse(metadata["capabilities"]["batch_inputs"])
+        self.assertEqual(metadata["capabilities"]["max_batch_size"], 1)
 
     def test_action_response_includes_cosmos_metadata(self):
         output = {
@@ -594,6 +689,33 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(action["domain_id"], 8)
         self.assertEqual(action["raw_action_dim"], 10)
         self.assertEqual(response["usage"]["denoise_steps"], 30)
+
+    def test_batched_action_response_emits_one_data_item_per_input(self):
+        output = {
+            "request_id": "cosmos-action-batch",
+            "actions": torch.arange(24, dtype=torch.float32).reshape(2, 4, 3).numpy(),
+            "action_mode": "policy",
+            "domain_id": 8,
+            "raw_action_dim": 3,
+        }
+
+        response = action_generation_response(output, _cosmos3_server_args())
+
+        self.assertEqual(len(response["data"]), 2)
+        self.assertEqual(response["data"][0]["action"]["shape"], [4, 3])
+        self.assertEqual(response["data"][1]["input_index"], 1)
+        self.assertEqual(response["usage"]["batch_size"], 2)
+        self.assertEqual(response["usage"]["action_horizon"], 4)
+        self.assertEqual(response["usage"]["action_dim"], 3)
+
+    def test_action_response_rejects_empty_batch(self):
+        output = {
+            "request_id": "cosmos-action-empty",
+            "actions": torch.empty(0, 4, 3).numpy(),
+        }
+
+        with self.assertRaisesRegex(ValueError, "dimensions must be non-zero"):
+            action_generation_response(output, _cosmos3_server_args())
 
     def test_action_decode_skips_vae(self):
         class FailIfDecoded:
@@ -628,6 +750,35 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(output.output[0]["actions"].shape, (4, 3))
         self.assertEqual(output.output[0]["domain_id"], 8)
         self.assertEqual(output.action_pred.shape, (1, 4, 3))
+
+    def test_batched_action_decode_keeps_batch_dimension(self):
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.vae = mock.Mock()
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+        stage.log_info = lambda *_args, **_kwargs: None
+        batch = types.SimpleNamespace(
+            data_type=DataType.ACTION,
+            action_latents=torch.arange(48, dtype=torch.float32).reshape(2, 4, 6),
+            extra={
+                "raw_action_dim": 3,
+                "action_domain_ids": torch.tensor([8, 8]),
+            },
+            sampling_params=Cosmos3SamplingParams(
+                prompt=["one", "two"],
+                action_mode="policy",
+                domain_name="droid_lerobot",
+            ),
+            request_id="cosmos-action-batch",
+            num_inference_steps=30,
+            num_frames=5,
+            metrics=None,
+        )
+
+        output = stage.forward(batch, types.SimpleNamespace(vae_cpu_offload=False))
+
+        self.assertEqual(output.output[0]["actions"].shape, (2, 4, 3))
+        self.assertEqual(output.action_pred.shape, (2, 4, 3))
 
 
 class TestCosmos3ModelResolution(unittest.TestCase):
@@ -972,10 +1123,13 @@ class TestCosmos3ActionLatentPrep(unittest.TestCase):
         cls.device = torch.device("cpu")
         cls.dtype = torch.float32
 
-    def _run(self, num_frames=17, **sp_kwargs):
+    def _run(self, num_frames=17, batch_size=1, **sp_kwargs):
         sp = Cosmos3SamplingParams(prompt="t", num_frames=num_frames, **sp_kwargs)
         batch = types.SimpleNamespace(
-            sampling_params=sp, num_frames=num_frames, extra={}
+            sampling_params=sp,
+            num_frames=num_frames,
+            raw_latent_shape=(batch_size, 48, 1, 1, 1),
+            extra={},
         )
         gen = torch.Generator(device=self.device).manual_seed(0)
         self.stage._prepare_action_latents(batch, gen, self.device, self.dtype)
@@ -1010,6 +1164,17 @@ class TestCosmos3ActionLatentPrep(unittest.TestCase):
         # padding dims beyond raw_action_dim start at zero.
         self.assertTrue(torch.all(batch.action_latents[:, :, 10:] == 0))
 
+    def test_batched_policy_prepares_one_action_stream_per_observation(self):
+        batch = self._run(
+            batch_size=3,
+            action_mode="policy",
+            domain_name="droid_lerobot",
+        )
+
+        self.assertEqual(tuple(batch.action_latents.shape), (3, 16, 64))
+        self.assertEqual(tuple(batch.extra["action_domain_ids"].shape), (3,))
+        self.assertEqual(tuple(batch.extra["action_velocity_mask"].shape), (3, 16, 1))
+
     def test_inverse_dynamics_denoises_from_noise(self):
         batch = self._run(
             num_frames=61,
@@ -1039,6 +1204,113 @@ class TestCosmos3ActionLatentPrep(unittest.TestCase):
     def test_unknown_action_mode_raises(self):
         with self.assertRaises(ValueError):
             self._run(action_mode="teleport", domain_id=0)
+
+
+class TestCosmos3BatchedActionStages(unittest.TestCase):
+    class _Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        @staticmethod
+        def convert_tokens_to_ids(_token):
+            return 2
+
+        @staticmethod
+        def apply_chat_template(conversations, **_kwargs):
+            text = conversations[-1]["content"]
+            return list(range(3, 3 + len(text.split())))
+
+    @staticmethod
+    def _preprocess_images(data_type, action_mode=None):
+        stage = Cosmos3ImagePreprocessStage.__new__(Cosmos3ImagePreprocessStage)
+        stage.log_info = lambda *_args, **_kwargs: None
+        seen = []
+        batch = types.SimpleNamespace(
+            image_path=["first.png", "second.png"],
+            video_path=None,
+            height=16,
+            width=16,
+            data_type=data_type,
+            sampling_params=types.SimpleNamespace(action_mode=action_mode),
+            preprocessed_image=None,
+        )
+
+        def fake_load_image(path):
+            seen.append(path)
+            return Image.new("RGB", (16, 16))
+
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.load_image",
+            side_effect=fake_load_image,
+        ):
+            stage.forward(batch, types.SimpleNamespace())
+        return seen, batch.preprocessed_image
+
+    def test_tokenization_rejects_unequal_prompt_lengths(self):
+        stage = Cosmos3TokenizationStage.__new__(Cosmos3TokenizationStage)
+        stage.tokenizer = self._Tokenizer()
+
+        with self.assertRaisesRegex(ValueError, "same length"):
+            stage._tokenize_prompt(
+                ["pick block", "close the top drawer"],
+                max_sequence_length=16,
+                device=torch.device("cpu"),
+            )
+
+    def test_tokenization_preserves_equal_length_prompt_batch(self):
+        stage = Cosmos3TokenizationStage.__new__(Cosmos3TokenizationStage)
+        stage.tokenizer = self._Tokenizer()
+
+        input_ids, attention_mask, seq_len = stage._tokenize_prompt(
+            ["pick block", "push cube"],
+            max_sequence_length=16,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(tuple(input_ids.shape), (2, 16))
+        self.assertEqual(tuple(attention_mask.shape), (2, 16))
+        self.assertEqual(seq_len, 4)
+
+    def test_cfg_duplicates_batched_timesteps(self):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        captured = {}
+
+        def fake_run_transformer(**kwargs):
+            captured.update(kwargs)
+            return kwargs["latents"]
+
+        stage._run_transformer = fake_run_transformer
+        latents = torch.zeros(3, 1, 1, 1, 1)
+        text_ids = torch.ones(3, 4, dtype=torch.long)
+        text_mask = torch.ones_like(text_ids)
+
+        output = stage._predict_noise_cfg_batched(
+            latents=latents,
+            timestep=torch.ones(3),
+            cond_text_ids=text_ids,
+            cond_text_mask=text_mask,
+            uncond_text_ids=text_ids,
+            uncond_text_mask=text_mask,
+            video_shape=(1, 1, 1),
+            fps=20.0,
+            guidance_scale=2.0,
+        )
+
+        self.assertEqual(tuple(captured["timestep"].shape), (6,))
+        self.assertEqual(tuple(output.shape), tuple(latents.shape))
+
+    def test_visual_i2v_keeps_single_conditioning_image(self):
+        seen, image = self._preprocess_images(DataType.VIDEO)
+
+        self.assertEqual(seen, ["first.png"])
+        self.assertEqual(tuple(image.shape), (1, 3, 16, 16))
+
+    def test_action_preprocess_stacks_all_images(self):
+        seen, image = self._preprocess_images(DataType.ACTION, "policy")
+
+        self.assertEqual(seen, ["first.png", "second.png"])
+        self.assertEqual(tuple(image.shape), (2, 3, 16, 16))
 
 
 class TestCosmos3ModalitySamplingParams(unittest.TestCase):

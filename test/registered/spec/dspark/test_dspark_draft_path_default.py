@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
@@ -63,8 +64,13 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
         )
         _handle_dspark(server_args)
-        self.assertEqual(server_args.speculative_draft_model_path, _BUNDLED_MODEL_PATH)
-        self.assertEqual(server_args.speculative_num_draft_tokens, 6)
+        self.assertEqual(
+            resolution_result(server_args, "speculative_draft_model_path"),
+            _BUNDLED_MODEL_PATH,
+        )
+        self.assertEqual(
+            resolution_result(server_args, "speculative_num_draft_tokens"), 6
+        )
 
     def test_plain_target_without_draft_path_raises(self):
         server_args = _make_dspark_server_args(
@@ -80,7 +86,7 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args.speculative_draft_model_path = "deepseek-ai/some-other-dspark-draft"
         _handle_dspark(server_args)
         self.assertEqual(
-            server_args.speculative_draft_model_path,
+            resolution_result(server_args, "speculative_draft_model_path"),
             "deepseek-ai/some-other-dspark-draft",
         )
 
