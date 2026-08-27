@@ -1265,9 +1265,12 @@ _RECORD_DUMP_REGISTERED = False
 def _is_compiling() -> bool:
     # Recording has Python side effects (set mutation, file I/O, atexit) that
     # must never run under tracing; torch.compiler.is_compiling() is dynamo's
-    # sanctioned probe. The lazy lookup keeps this module import-light.
-    torch = sys.modules.get("torch")
-    return torch is not None and torch.compiler.is_compiling()
+    # sanctioned probe. The function-level import keeps this module
+    # import-light; a sys.modules lookup here breaks fullgraph tracing (dynamo
+    # enumerates the dict, which other imports mutate mid-trace).
+    import torch
+
+    return torch.compiler.is_compiling()
 
 
 def _ensure_record_dump_registered() -> None:

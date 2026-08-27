@@ -976,7 +976,13 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--kv-events-config`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see `--load-publish-endpoint`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--load-publish-endpoint`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or `off`). Use `auto` to reserve the dp_size ports packed after the `--kv-events-config` range, or a wildcard-host TCP address (e.g. `tcp://*:6000`) to place it explicitly; rank r binds port+r and `/server_info` advertises the base under the `kv_events` block. Requires `--kv-events-config`; startup fails if set without one, not bindable, or overlapping the KV range. `auto` reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly. The router-facing update cadence follows `--load-snapshot-publish-interval`, so a large value there also staleness-caps this feed.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>

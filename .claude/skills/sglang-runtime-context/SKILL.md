@@ -290,7 +290,8 @@ where an object was handed one; it is not a global accessor.
   theirs from `spec` / `schedule` / `exec.graph`.
 - **a value only the instance can compute** → the named accessor in
   `runtime_context`, which is the one module allowed to read the slot:
-  `mamba_cache_chunk_size()`, `uses_mla_backend()`, `process_model_config()`.
+  `mamba_cache_chunk_size()`, `mamba_state_chunk_size()`, `uses_mla_backend()`,
+  `process_model_config()`.
   These have no leaf to read — they combine several fields, the HF config, or a
   property with no bag of its own. A new derived member gets an accessor here
   rather than call sites reaching for the record, and only when the bag-derived
