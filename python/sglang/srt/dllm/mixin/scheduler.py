@@ -103,7 +103,11 @@ class SchedulerDllmMixin:
                     req.update_finish_state(new_accepted_len=new_tokens)
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=not self.dllm_config.needs_full_prefill,
+                        )
                         req.time_stats.set_completion_time()
                     continue
 
