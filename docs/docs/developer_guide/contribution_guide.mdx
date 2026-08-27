@@ -125,8 +125,6 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, or `/rerun-test test_*backend*.py`.
 - `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group hicache`) and dispatches their tests through the same selective-rerun workflow.
 
-Maintainers can apply `run-mori-pd` or `run-mori-hicache` to run only the corresponding AMD Mori end-to-end tests. These labels do not require `run-ci` and remain active for later commits on the PR.
-
 The rerun commands have the following permission rules:
 
 | Command | PR author | Other users | Additional rule for fork PRs |
