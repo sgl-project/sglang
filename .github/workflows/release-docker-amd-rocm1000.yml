@@ -1,4 +1,4 @@
-name: Build ROCm 10.0.0 GA Docker Images (AMD)
+name: Build ROCm 10.0.0 GA + AITER a6d2b564 Images (AMD)
 on:
   workflow_dispatch:
     inputs:
@@ -10,11 +10,10 @@ on:
         options:
           - 'all'
           - publish
-  # A new workflow cannot be dispatched until it exists on the default branch,
-  # so this temporary branch trigger builds the two validation images.
+  # Keep the AITER comparison isolated from the GA baseline branch.
   push:
     branches:
-      - codex/rocm10-rc4-gfx942-950
+      - codex/rocm1000-ga-aiter-a6d2b564
 
 concurrency:
   # Tags are date-based, so only the newest build for a ref may publish them.
@@ -30,8 +29,10 @@ permissions:
   pull-requests: read
 
 env:
-  # Scratch registry for the ROCm 10.0.0 GA bring-up images.
+  # Scratch registry and unique tag namespace for the AITER comparison images.
   IMAGE_REPO: bingxche/sgl-test
+  ROCM_VARIANT: rocm1000-aiter-a6d2b564
+  AITER_COMMIT: a6d2b564fd671724a3720b8edf70e8d674e4d694
 
 jobs:
   publish:
@@ -86,7 +87,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
 
-      - name: Build and push to test registry
+      - name: Build and push AITER comparison image
         run: |
           version=${{ steps.version.outputs.version }}
           pretend_version=${{ steps.version.outputs.pretend_version }}
@@ -94,43 +95,59 @@ jobs:
           echo "Pretend version: ${pretend_version}"
 
           case "${{ matrix.gpu_arch }}" in
-            gfx942-rocm1000) rocm_tag="rocm1000-mi30x" ;;
-            gfx950-rocm1000) rocm_tag="rocm1000-mi35x" ;;
+            gfx942-rocm1000) gpu_tag="mi30x" ;;
+            gfx950-rocm1000) gpu_tag="mi35x" ;;
             *)
               echo "Unsupported gfx arch"
               exit 1
               ;;
           esac
 
-          tag=v${version}-${rocm_tag}
+          tag=v${version}-${ROCM_VARIANT}-${gpu_tag}
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t ${IMAGE_REPO}:${tag}-${{ env.DATE }} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg AITER_COMMIT=${AITER_COMMIT} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t ${IMAGE_REPO}:${tag}-${{ env.DATE }} --no-cache
+
+          stamped_aiter_commit=$(docker run --rm --entrypoint /usr/bin/printenv \
+            ${IMAGE_REPO}:${tag}-${{ env.DATE }} AITER_COMMIT)
+          actual_aiter_commit=$(docker run --rm --entrypoint /bin/bash \
+            ${IMAGE_REPO}:${tag}-${{ env.DATE }} \
+            -lc 'git -C /sgl-workspace/aiter rev-parse HEAD')
+          echo "AITER commit stamped in image: ${stamped_aiter_commit}"
+          echo "AITER commit in image: ${actual_aiter_commit}"
+          if [[ "${stamped_aiter_commit}" != "${AITER_COMMIT}" || \
+                "${actual_aiter_commit}" != "${AITER_COMMIT}" ]]; then
+            echo "::error::Expected AITER ${AITER_COMMIT}; stamp=${stamped_aiter_commit}, git=${actual_aiter_commit}"
+            exit 1
+          fi
+
           docker push ${IMAGE_REPO}:${tag}-${{ env.DATE }}
 
   validate-pr:
-    name: Run full AMD PR suite with ROCm 10.0.0 GA
+    name: Run full AMD PR suite with ROCm 10.0.0 GA + AITER a6d2b564
     needs: publish
     if: github.event_name == 'push' || inputs.job_select == 'all'
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     with:
-      rocm_version: rocm1000
+      rocm_version: rocm1000-aiter-a6d2b564
       ref: ${{ github.sha }}
       runner_arch: mi300
       run_all_tests: true
+      aiter_ref: a6d2b564fd671724a3720b8edf70e8d674e4d694
       continue_on_error: true
     secrets: inherit
 
   validate-nightly:
-    name: Run full AMD nightly suite with ROCm 10.0.0 GA
+    name: Run full AMD nightly suite with ROCm 10.0.0 GA + AITER a6d2b564
     needs: publish
     if: github.event_name == 'push' || inputs.job_select == 'all'
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
-      rocm_version: rocm1000
+      rocm_version: rocm1000-aiter-a6d2b564
       ref: ${{ github.sha }}
+      aiter_ref: a6d2b564fd671724a3720b8edf70e8d674e4d694
       job_filter: all
       continue_on_error: true
     secrets: inherit

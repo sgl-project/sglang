@@ -20,6 +20,7 @@ on:
           - rocm724
           - rocm720
           - rocm1000
+          - rocm1000-aiter-a6d2b564
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -141,9 +142,9 @@ on:
         default: true
 
 env:
-  AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  AITER_COMMIT_OVERRIDE: ${{ inputs.rocm_version == 'rocm1000-aiter-a6d2b564' && 'a6d2b564fd671724a3720b8edf70e8d674e4d694' || inputs.aiter_ref }}
   # ROCm 10.0.0 GA bring-up images are published to the scratch registry.
-  AMD_CI_IMAGE_REPO: ${{ inputs.rocm_version == 'rocm1000' && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
+  AMD_CI_IMAGE_REPO: ${{ startsWith(inputs.rocm_version, 'rocm1000') && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -448,9 +449,14 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Probe ROCm 10.0.0 GA runtime
-        if: matrix.rocm_version == 'rocm1000'
+        if: startsWith(matrix.rocm_version, 'rocm1000')
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh python3 -c 'import amdsmi, os, torch; image_arch = os.environ.get("GPU_ARCH"); count = torch.cuda.device_count(); archs = [getattr(torch.cuda.get_device_properties(i), "gcnArchName", "unknown") for i in range(count)]; props = [(torch.cuda.get_device_name(i), archs[i]) for i in range(count)]; amdsmi.amdsmi_init(); handles = amdsmi.amdsmi_get_processor_handles(); print({"torch": torch.__version__, "hip": torch.version.hip, "image_arch": image_arch, "devices": props, "amdsmi_handles": len(handles)}); amdsmi.amdsmi_shut_down(); assert image_arch == "gfx942-rocm1000" and count >= 2 and len(handles) > 0 and all(arch.startswith("gfx942") for arch in archs)'
+
+      - name: Probe AITER a6d2b564 image pin
+        if: matrix.rocm_version == 'rocm1000-aiter-a6d2b564'
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh python3 -c 'import os, subprocess; expected="a6d2b564fd671724a3720b8edf70e8d674e4d694"; stamped=os.environ.get("AITER_COMMIT"); actual=subprocess.check_output(["git", "-C", "/sgl-workspace/aiter", "rev-parse", "HEAD"], text=True).strip(); print({"expected": expected, "stamped": stamped, "actual": actual}); assert stamped == expected and actual == expected'
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
@@ -1166,9 +1172,14 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Probe ROCm 10.0.0 GA runtime
-        if: matrix.rocm_version == 'rocm1000'
+        if: startsWith(matrix.rocm_version, 'rocm1000')
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh python3 -c 'import amdsmi, os, torch; image_arch = os.environ.get("GPU_ARCH"); count = torch.cuda.device_count(); archs = [getattr(torch.cuda.get_device_properties(i), "gcnArchName", "unknown") for i in range(count)]; props = [(torch.cuda.get_device_name(i), archs[i]) for i in range(count)]; amdsmi.amdsmi_init(); handles = amdsmi.amdsmi_get_processor_handles(); print({"torch": torch.__version__, "hip": torch.version.hip, "image_arch": image_arch, "devices": props, "amdsmi_handles": len(handles)}); amdsmi.amdsmi_shut_down(); assert image_arch == "gfx950-rocm1000" and count >= 8 and len(handles) > 0 and all(arch.startswith("gfx950") for arch in archs)'
+
+      - name: Probe AITER a6d2b564 image pin
+        if: matrix.rocm_version == 'rocm1000-aiter-a6d2b564'
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh python3 -c 'import os, subprocess; expected="a6d2b564fd671724a3720b8edf70e8d674e4d694"; stamped=os.environ.get("AITER_COMMIT"); actual=subprocess.check_output(["git", "-C", "/sgl-workspace/aiter", "rev-parse", "HEAD"], text=True).strip(); print({"expected": expected, "stamped": stamped, "actual": actual}); assert stamped == expected and actual == expected'
 
       - name: Install dependencies
         run: |

@@ -359,7 +359,9 @@ echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
 #############################################
 IMAGE_AITER_VERSION=$(docker exec ci_sglang bash -c "pip show amd-aiter 2>/dev/null | grep '^Version:' | awk '{print \$2}'" || echo "none")
 IMAGE_AITER_VERSION="v${IMAGE_AITER_VERSION}"
+IMAGE_AITER_COMMIT=$(docker exec ci_sglang printenv AITER_COMMIT 2>/dev/null || true)
 echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
+echo "[CI-AITER-CHECK] AITER commit stamped in CI image: ${IMAGE_AITER_COMMIT:-none}"
 
 #############################################
 # 3. Decide rebuild
@@ -367,11 +369,20 @@ echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 NEED_REBUILD="false"
 
 if [[ -n "${AITER_COMMIT_OVERRIDE:-}" ]]; then
-    echo "[CI-AITER-CHECK] AITER_COMMIT_OVERRIDE=${AITER_COMMIT_OVERRIDE} → forcing rebuild"
+    echo "[CI-AITER-CHECK] AITER_COMMIT_OVERRIDE=${AITER_COMMIT_OVERRIDE}"
     REPO_AITER_COMMIT="${AITER_COMMIT_OVERRIDE}"
-    NEED_REBUILD="true"
-elif [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]]; then
+fi
+
+if [[ "${IMAGE_AITER_VERSION}" == "vnone" || "${IMAGE_AITER_VERSION}" == "v" ]]; then
     echo "[CI-AITER-CHECK] No AITER found in image → rebuild needed"
+    NEED_REBUILD="true"
+elif [[ -n "${IMAGE_AITER_COMMIT}" && "${IMAGE_AITER_COMMIT}" == "${REPO_AITER_COMMIT}" ]]; then
+    echo "[CI-AITER-CHECK] Image AITER commit stamp matches"
+elif [[ -n "${IMAGE_AITER_COMMIT}" ]]; then
+    echo "[CI-AITER-CHECK] Commit stamp mismatch: image=${IMAGE_AITER_COMMIT}, repo=${REPO_AITER_COMMIT}"
+    NEED_REBUILD="true"
+elif [[ -n "${AITER_COMMIT_OVERRIDE:-}" ]]; then
+    echo "[CI-AITER-CHECK] Override requested but image has no commit stamp → rebuild needed"
     NEED_REBUILD="true"
 elif [[ "${IMAGE_AITER_VERSION}" == "${REPO_AITER_COMMIT}" ]]; then
     echo "[CI-AITER-CHECK] AITER version matches"
