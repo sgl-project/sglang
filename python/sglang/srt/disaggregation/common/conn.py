@@ -381,16 +381,14 @@ class CommonKVManager(BaseKVManager):
             self.failure_records[bootstrap_room] = failure_reason
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
-        """Every decode endpoint of a room that expects data from this rank.
-
-        A failure on one endpoint means the room is dead for all of them: the
-        other endpoints never receive the remaining chunks either, so telling
-        only the endpoint that raised leaves the rest waiting for the timeout.
-        """
-        infos = getattr(self, "transfer_infos", {}).get(bootstrap_room)
+        infos = self.transfer_infos.get(bootstrap_room)
         if not infos:
             return []
+        # Every non-dummy endpoint, not just the one a caller failed on: the
+        # others never receive the room's remaining chunks either.
         targets: List[Tuple[str, int]] = []
+        # Snapshot: the control thread can register a late peer for this room
+        # while we walk it, and iterating the live view would then raise.
         for info in list(infos.values()):
             if info.is_dummy:
                 continue
@@ -401,6 +399,7 @@ class CommonKVManager(BaseKVManager):
 
     def _encode_kv_status_message(
         self,
+        *,
         bootstrap_room: int,
         status: KVPoll,
         failure_reason: Optional[str],
@@ -445,6 +444,7 @@ class CommonKVManager(BaseKVManager):
 
     def send_kv_status_message(
         self,
+        *,
         targets: List[Tuple[str, int]],
         bootstrap_room: int,
         status: KVPoll,
@@ -453,7 +453,11 @@ class CommonKVManager(BaseKVManager):
         """Push of a terminal transfer status to decode endpoints."""
         if not targets:
             return
-        parts = self._encode_kv_status_message(bootstrap_room, status, failure_reason)
+        parts = self._encode_kv_status_message(
+            bootstrap_room=bootstrap_room,
+            status=status,
+            failure_reason=failure_reason,
+        )
         for endpoint, dst_port in targets:
             na = NetworkAddress(endpoint, dst_port)
             try:
@@ -466,21 +470,17 @@ class CommonKVManager(BaseKVManager):
 
     def conclude_transfer(
         self,
+        *,
         bootstrap_room: int,
         status: KVPoll,
         targets: Optional[List[Tuple[str, int]]] = None,
         failure_reason: Optional[str] = None,
     ) -> Optional[KVPoll]:
-        """Mark a room's terminal status and push it to decode.
+        """Returns the status that was emitted, or None for a cleared room.
 
-        A Success requested after a failure was recorded is downgraded, so decode
-        never sees Success for a transfer that already broke. Returns the status
-        that was emitted, or None when the room had already been cleared.
-
-        Callers are transfer workers, and a room is sharded onto a single worker,
-        so this runs at most once per room without any at-most-once bookkeeping.
-
-        ``targets`` defaults to every non-dummy decode endpoint of the room.
+        A room is sharded onto a single transfer worker, so this runs at most
+        once per room without any at-most-once bookkeeping. ``targets`` defaults
+        to every non-dummy decode endpoint of the room.
         """
         if bootstrap_room not in self.request_status:
             # The sender already cleared this room. Concluding now would
@@ -508,22 +508,32 @@ class CommonKVManager(BaseKVManager):
         self.update_status(bootstrap_room, status)
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
-        self.send_kv_status_message(targets, bootstrap_room, status, failure_reason)
+        self.send_kv_status_message(
+            targets=targets,
+            bootstrap_room=bootstrap_room,
+            status=status,
+            failure_reason=failure_reason,
+        )
         return status
 
     def conclude_failure(
         self,
+        *,
         bootstrap_room: int,
         failure_reason: str,
         targets: Optional[List[Tuple[str, int]]] = None,
     ) -> Optional[KVPoll]:
         """Record the reason, mark the room Failed and tell decode."""
         return self.conclude_transfer(
-            bootstrap_room, KVPoll.Failed, targets, failure_reason
+            bootstrap_room=bootstrap_room,
+            status=KVPoll.Failed,
+            targets=targets,
+            failure_reason=failure_reason,
         )
 
     def apply_prefill_status(
         self,
+        *,
         bootstrap_room: int,
         status: int,
         prefill_rank: int,

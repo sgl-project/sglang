@@ -425,7 +425,9 @@ class MoriKVManager(CommonKVManager):
                 except Exception:
                     pass
                 try:
-                    self.conclude_failure(kv_chunk.room, failure_reason)
+                    self.conclude_failure(
+                        bootstrap_room=kv_chunk.room, failure_reason=failure_reason
+                    )
                 except Exception:
                     try:
                         logger.exception(
@@ -462,14 +464,14 @@ class MoriKVManager(CommonKVManager):
         if self._should_skip_transfer(room):
             return
         if failure_reason is not None:
-            self.conclude_failure(room, failure_reason)
+            self.conclude_failure(bootstrap_room=room, failure_reason=failure_reason)
             return
 
         if kv_chunk.is_last_chunk:
             # conclude_transfer downgrades to Failed when a failure was recorded
             # while this chunk was in flight, and applies the same status locally
             # and on the wire.
-            self.conclude_transfer(room, KVPoll.Success)
+            self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
 
     def _should_skip_transfer(self, room: int) -> bool:
         if room not in self.request_status or self.check_status(room) == KVPoll.Failed:
@@ -674,7 +676,13 @@ class MoriKVManager(CommonKVManager):
                             "Received malformed status message on decode worker"
                         )
                         continue
-                    self.apply_prefill_status(*parsed)
+                    room, status, prefill_rank, reason = parsed
+                    self.apply_prefill_status(
+                        bootstrap_room=room,
+                        status=status,
+                        prefill_rank=prefill_rank,
+                        failure_reason=reason,
+                    )
                 except Exception:
                     logger.exception("Decode status worker failed")
 

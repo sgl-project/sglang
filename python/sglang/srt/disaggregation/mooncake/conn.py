@@ -1632,8 +1632,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
                                 self.conclude_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason=(
+                                        "Decode instance could be dead, remote "
+                                        f"mooncake session {req.mooncake_session_id} "
+                                        "is not alive"
+                                    ),
                                 )
                                 break
 
@@ -1770,9 +1774,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         f"Session {req.mooncake_session_id} failed."
                                     )
                             self.conclude_failure(
-                                kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to "
-                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                bootstrap_room=kv_chunk.room,
+                                failure_reason=(
+                                    f"Failed to send kv chunk of {kv_chunk.room} to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}"
+                                ),
                             )
                             break
 
@@ -1793,9 +1799,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                             req.mooncake_session_id
                                         )
                                     self.conclude_failure(
-                                        kv_chunk.room,
-                                        f"Failed to send state components of {kv_chunk.room} to "
-                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                        bootstrap_room=kv_chunk.room,
+                                        failure_reason=(
+                                            "Failed to send state components of "
+                                            f"{kv_chunk.room} to "
+                                            f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}"
+                                        ),
                                     )
                                     break
 
@@ -1812,8 +1821,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.conclude_transfer(
-                                    req.room,
-                                    status,
+                                    bootstrap_room=req.room,
+                                    status=status,
                                     targets=dst_ranks_infos,
                                     failure_reason=(
                                         None
@@ -2060,7 +2069,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is None:
                     continue
-                self.apply_prefill_status(*parsed)
+                room, status, prefill_rank, reason = parsed
+                self.apply_prefill_status(
+                    bootstrap_room=room,
+                    status=status,
+                    prefill_rank=prefill_rank,
+                    failure_reason=reason,
+                )
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()

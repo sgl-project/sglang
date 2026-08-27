@@ -618,7 +618,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is not None:
-                    self.apply_prefill_status(*parsed)
+                    room, status, prefill_rank, reason = parsed
+                    self.apply_prefill_status(
+                        bootstrap_room=room,
+                        status=status,
+                        prefill_rank=prefill_rank,
+                        failure_reason=reason,
+                    )
                     continue
                 logger.warning(
                     "decode_listener_thread: unexpected message tag %s",
@@ -1377,7 +1383,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
-                self.conclude_failure(room, str(e))
+                self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
