@@ -750,20 +750,12 @@ class LoRAPagePool:
                 w_b = temp_B.get(target_module)
 
                 if w_a is not None:
-                    w_a_shard = (
-                        module.slice_lora_a_weights(w_a, self.tp_rank)
-                        if self.tp_size > 1
-                        else w_a
-                    )
+                    w_a_shard = module.slice_lora_a_weights(w_a)
                 else:
                     w_a_shard = None
 
                 if w_b is not None:
-                    w_b_shard = (
-                        module.slice_lora_b_weights(w_b, self.tp_rank)
-                        if self.tp_size > 1
-                        else w_b
-                    )
+                    w_b_shard = module.slice_lora_b_weights(w_b)
                 else:
                     w_b_shard = None
 
