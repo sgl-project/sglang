@@ -240,6 +240,9 @@ ARG ROCM_TORCHVISION_VERSION="0.26.0"
 ARG ROCM_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM_TRITON_VERSION="3.8.0+git4cff872c"
 ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
+# Keep device targets data-driven: adding a new image should require one list
+# entry here, not another pairwise OTHER_ROCM_DEVICE_ARCH mapping.
+ARG ROCM_DEVICE_ARCH_LIST="gfx942 gfx950 gfx1250"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -267,9 +270,8 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 # makes the intended per-image device payload explicit to the resolver.
 RUN set -eux; \
     ROCM_DEVICE_ARCH="${GPU_ARCH%%-*}"; \
-    case "${ROCM_DEVICE_ARCH}" in \
-      gfx942) OTHER_ROCM_DEVICE_ARCH="gfx950" ;; \
-      gfx950) OTHER_ROCM_DEVICE_ARCH="gfx942" ;; \
+    case " ${ROCM_DEVICE_ARCH_LIST} " in \
+      *" ${ROCM_DEVICE_ARCH} "*) ;; \
       *) echo "Unsupported ROCm 10.0.0 GA GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
     esac; \
     python3 -m pip install --no-cache-dir \
@@ -284,18 +286,26 @@ RUN set -eux; \
         "amd-torch-device-${ROCM_DEVICE_ARCH}==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "amd-torchvision-device-${ROCM_DEVICE_ARCH}==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"; \
-    python3 -m pip show \
+    for package in \
         "rocm-sdk-device-${ROCM_DEVICE_ARCH}" \
         "amd-torch-device-${ROCM_DEVICE_ARCH}" \
-        "amd-torchvision-device-${ROCM_DEVICE_ARCH}" >/dev/null; \
-    for package in \
-        "rocm-sdk-device-${OTHER_ROCM_DEVICE_ARCH}" \
-        "amd-torch-device-${OTHER_ROCM_DEVICE_ARCH}" \
-        "amd-torchvision-device-${OTHER_ROCM_DEVICE_ARCH}"; do \
-      if python3 -m pip show "${package}" >/dev/null 2>&1; then \
-        echo "Unexpected non-target ROCm device package: ${package}"; \
+        "amd-torchvision-device-${ROCM_DEVICE_ARCH}"; do \
+      if ! python3 -m pip show "${package}" >/dev/null 2>&1; then \
+        echo "Missing target ROCm device package: ${package}"; \
         exit 1; \
       fi; \
+    done; \
+    for candidate_arch in ${ROCM_DEVICE_ARCH_LIST}; do \
+      [ "${candidate_arch}" = "${ROCM_DEVICE_ARCH}" ] && continue; \
+      for package in \
+          "rocm-sdk-device-${candidate_arch}" \
+          "amd-torch-device-${candidate_arch}" \
+          "amd-torchvision-device-${candidate_arch}"; do \
+        if python3 -m pip show "${package}" >/dev/null 2>&1; then \
+          echo "Unexpected non-target ROCm device package: ${package}"; \
+          exit 1; \
+        fi; \
+      done; \
     done
 
 RUN rocm-sdk init && rocm-sdk targets
