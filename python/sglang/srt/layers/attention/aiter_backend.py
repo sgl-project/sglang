@@ -2379,7 +2379,14 @@ class AiterAttnBackend(AttentionBackend):
                     if swa_page_table is not None:
                         pt = swa_page_table
                 kv_indptr = self.forward_metadata.kv_indptr
-                seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+                # seqused_k MUST be int64 (kv_indptr is int32, so the diff is
+                # int32 and has to be widened). unified_attention derives the
+                # per-tile KV addresses from this dtype: with an int32
+                # seqused_k the whole K/V offset chain stays 32-bit and wraps
+                # once a per-layer KV buffer reaches 2 GiB, silently returning
+                # NaN. The verify (seq_lens + max_q_len) and decode
+                # (seq_lens) call sites pass int64 for the same reason.
+                seqused_k = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int64)
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
