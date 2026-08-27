@@ -5,6 +5,7 @@ Usage:
 python3 -m unittest test_xpu_reward.TestXPUReward
 """
 
+import gc
 import multiprocessing as mp
 import unittest
 
@@ -12,7 +13,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, xpu_free_cache
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
 
@@ -53,7 +54,8 @@ class TestXPUReward(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(convs)
 
-        xpu_free_cache()
+        gc.collect()
+        empty_gpu_cache()
 
         with SRTRunner(
             model_path,

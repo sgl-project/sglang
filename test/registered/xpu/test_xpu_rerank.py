@@ -10,6 +10,7 @@ python3 -m unittest test_xpu_rerank.TestXPUDecoderRerank
 python3 -m unittest test_xpu_rerank.TestXpuCrossEncoderReank
 """
 
+import gc
 import math
 import multiprocessing as mp
 import unittest
@@ -20,7 +21,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, xpu_free_cache
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 
 def _xpu_total_gib() -> float:
@@ -206,7 +207,8 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
         ) as hf_runner:
             hf_scores = hf_runner.forward(prompts).scores
 
-        xpu_free_cache()
+        gc.collect()
+        empty_gpu_cache()
 
         with SRTRunner(
             model_path,

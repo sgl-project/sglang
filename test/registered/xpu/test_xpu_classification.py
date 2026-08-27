@@ -4,6 +4,7 @@ Usage:
 python3 -m unittest test_xpu_classification.TestXPUClassification
 """
 
+import gc
 import multiprocessing as mp
 import unittest
 
@@ -11,7 +12,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, xpu_free_cache
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 register_xpu_ci(est_time=120, suite="stage-b-test-1-gpu-xpu")
 
@@ -73,7 +74,8 @@ class TestXPUClassification(CustomTestCase):
 
     def test_classification_logits(self):
         hf_probs = self._hf_probs()
-        xpu_free_cache()
+        gc.collect()
+        empty_gpu_cache()
         srt_probs = self._srt_probs()
 
         self.assertEqual(len(hf_probs), len(PROMPTS))

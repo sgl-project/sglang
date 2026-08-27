@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import copy
 import doctest
-import gc
 import importlib.util
 import inspect
 import json
@@ -2422,18 +2421,6 @@ def empty_gpu_cache():
         return
 
     return
-
-
-def xpu_free_cache():
-    """gc + empty_cache + synchronize on XPU; no-op elsewhere.
-
-    Call between HFRunner __exit__ and SRTRunner __enter__ on XPU: HFRunner
-    leaks a ZMQ context on shutdown and the second engine can OOM otherwise.
-    """
-    gc.collect()
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        torch.xpu.empty_cache()
-        torch.xpu.synchronize()
 
 
 def get_gpu_memory_gb():
