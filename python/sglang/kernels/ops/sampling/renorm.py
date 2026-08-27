@@ -20,6 +20,7 @@ import torch
 
 _TOP_P_FAST_PREFIX = 32
 
+
 def per_row_threshold(
     value: Union[torch.Tensor, int, float],
     *,

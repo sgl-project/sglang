@@ -70,6 +70,32 @@ def _normalize_kernel(
     tl.store(out_ptr + offsets, values * scale, mask=mask)
 
 
+@triton.jit
+def _scale_from_metadata_kernel(
+    probs_ptr,
+    pivots_ptr,
+    normalizers_ptr,
+    out_ptr,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1).to(tl.int64)
+    offsets = chunk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < vocab_size
+    indices = row * vocab_size + offsets
+
+    probs = tl.load(probs_ptr + indices, mask=mask, other=0.0)
+    pivot = tl.load(pivots_ptr + row)
+    normalizer = tl.load(normalizers_ptr + row)
+    scale = tl.where(normalizer > 0.0, 1.0 / normalizer, 0.0)
+    tl.store(
+        out_ptr + indices,
+        tl.where(probs >= pivot, probs * scale, 0.0),
+        mask=mask,
+    )
+
+
 def apply_pivot_triton(probs: torch.Tensor, pivots: torch.Tensor) -> torch.Tensor:
     """Keep ``probs >= pivots`` row-wise and renormalize what survives."""
     batch_size, vocab_size = probs.shape
@@ -136,7 +162,7 @@ def top_p_renorm_probs_triton_baseline(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
-    """Exact general top-p path with 4096-prefix selection and dense apply."""
+    """Exact general top-p path with all-device selection and dense apply."""
     probs, top_ps = _prepare_top_p(probs, top_p)
     if probs.shape[0] == 0:
         return probs.clone()
@@ -161,7 +187,7 @@ def top_p_renorm_probs_triton_scale_fast(
     batch_size, vocab_size = probs.shape
     grid = (batch_size, triton.cdiv(vocab_size, _BLOCK_SIZE))
     out = torch.empty_like(probs)
-    _masked_scale_kernel[grid](
+    _scale_from_metadata_kernel[grid](
         probs,
         pivots,
         normalizers,
@@ -228,7 +254,7 @@ def top_p_renorm_probs_triton_hierarchical(
     batch_size, vocab_size = probs.shape
     grid = (batch_size, triton.cdiv(vocab_size, _BLOCK_SIZE))
     out = torch.empty_like(probs)
-    _masked_scale_kernel[grid](
+    _scale_from_metadata_kernel[grid](
         probs,
         pivots,
         normalizers,
