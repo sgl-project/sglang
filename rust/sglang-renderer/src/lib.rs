@@ -34,10 +34,10 @@ pub use output::{
     ChatResponseProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatChoice,
 };
 pub use request::{
-    GenerationOptions, PreparedGenerateRequest, PreparedSamplingParams, TextPrompt, TextRequest,
-    TokenIdsRequest,
+    GenerateRequestMetadata, GenerationOptions, PreparedGenerateRequest, PreparedSamplingParams,
+    TextPrompt, TextRequest, TokenIdsRequest,
 };
-pub use sampling::SamplingParams;
+pub use sampling::{SamplingParams, SamplingParamsOverrides};
 pub use service::{OpenAIRequestLowerer, RendererService, TokenizationBackend};
 pub use template::ChatFormatter;
 pub use tokenizer::{

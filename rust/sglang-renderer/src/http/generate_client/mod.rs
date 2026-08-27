@@ -180,24 +180,10 @@ fn take_text_stops(
     request: &mut TokenIdsRequest,
 ) -> Result<Option<StopStringMatcher>, FrontendError> {
     let params = &mut request.options.sampling_params;
-    if params.min_new_tokens > 0 {
-        return Err(invalid(
-            "min_tokens is not supported by a token-only SGLang engine",
-        ));
-    }
-    if !params.stop_regex_strs.is_empty() {
-        return Err(invalid(
-            "stop_regex is not supported by a token-only SGLang engine",
-        ));
-    }
-
     let matcher =
         StopStringMatcher::new(std::mem::take(&mut params.stop_strs), params.no_stop_trim);
     params.stop = None;
-    params.stop_regex = None;
-    params.stop_regex_strs.clear();
     params.stop_str_max_len = 0;
-    params.stop_regex_max_len = 0;
     Ok(matcher)
 }
 
@@ -227,11 +213,16 @@ impl StopStringMatcher {
 
     fn push(&mut self, text: &str) -> StopMatch {
         self.pending.push_str(text);
-        if let Some((position, stop)) = self.stops.iter().find_map(|stop| {
-            self.pending
-                .find(stop)
-                .map(|position| (position, stop.clone()))
-        }) {
+        if let Some((position, stop)) = self
+            .stops
+            .iter()
+            .filter_map(|stop| {
+                self.pending
+                    .find(stop)
+                    .map(|position| (position, stop.clone()))
+            })
+            .min_by_key(|(position, _)| *position)
+        {
             let end = if self.include_stop {
                 position + stop.len()
             } else {
@@ -772,6 +763,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            metadata: Default::default(),
         }
     }
 
@@ -790,6 +782,23 @@ mod tests {
     }
 
     #[test]
+    fn regex_stops_and_min_tokens_reach_the_engine() {
+        let mut request = request(vec!["END"]);
+        request.options.sampling_params.stop_regex_strs = vec!["[0-9]{3}".into()];
+        request.options.sampling_params.stop_regex_max_len = 3;
+        request.options.sampling_params.min_new_tokens = 4;
+
+        take_text_stops(&mut request).unwrap();
+
+        assert_eq!(
+            request.options.sampling_params.stop_regex_strs,
+            ["[0-9]{3}"]
+        );
+        assert_eq!(request.options.sampling_params.stop_regex_max_len, 3);
+        assert_eq!(request.options.sampling_params.min_new_tokens, 4);
+    }
+
+    #[test]
     fn decoded_stop_matcher_handles_cross_frame_matches_and_order() {
         let mut matcher = StopStringMatcher::new(vec!["END".into(), "ND".into()], false).unwrap();
 
@@ -800,6 +809,17 @@ mod tests {
         let second = matcher.push("ND trailing");
         assert_eq!(second.text, "");
         assert_eq!(second.matched.as_deref(), Some("END"));
+    }
+
+    #[test]
+    fn decoded_stop_matcher_uses_the_earliest_match() {
+        let mut matcher =
+            StopStringMatcher::new(vec!["later".into(), "first".into()], false).unwrap();
+
+        let matched = matcher.push("first then later");
+
+        assert_eq!(matched.text, "");
+        assert_eq!(matched.matched.as_deref(), Some("first"));
     }
 
     #[test]
@@ -1059,6 +1079,7 @@ mod tests {
                 return_text_in_logprobs: Some(true),
                 ..Default::default()
             },
+            metadata: Default::default(),
         };
         let mut events = client.generate(request).await.unwrap();
         let output = match events.next().await.unwrap().unwrap() {
@@ -1103,6 +1124,7 @@ mod tests {
                 rid: "incremental".into(),
                 input_ids: vec![65],
                 options: GenerationOptions::default(),
+                metadata: Default::default(),
             })
             .await
             .unwrap();
@@ -1172,6 +1194,7 @@ mod tests {
             rid: "cancel-me".into(),
             input_ids: vec![65],
             options: GenerationOptions::default(),
+            metadata: Default::default(),
         };
         let mut events = client.generate(request).await.unwrap();
         assert!(events.next().await.is_some());

@@ -7,8 +7,8 @@ use dynamo_protocols::types::{
 };
 
 use crate::{
-    ChatRequest, GenerationOptions, OneOrMany, RendererConfig, RendererError, SamplingDefaults,
-    SamplingParams, TextRequest, TokenIds,
+    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
+    RendererError, SamplingDefaults, SamplingParams, TextRequest, TokenIds,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -38,7 +38,7 @@ pub(crate) fn lower_chat_request_with_template_args(
     )?;
     Ok(ChatRequest {
         rid: response_id.to_owned(),
-        model: request.model,
+        model: request.model.clone(),
         messages: request.messages,
         tools: request.tools,
         tool_choice: request.tool_choice,
@@ -52,6 +52,10 @@ pub(crate) fn lower_chat_request_with_template_args(
         return_logprob: request.logprobs.unwrap_or(false),
         top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+        metadata: GenerateRequestMetadata {
+            model: Some(request.model),
+            ..Default::default()
+        },
     })
 }
 
@@ -219,6 +223,10 @@ pub(crate) fn lower_completion_request(
         .ok_or_else(|| {
             format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}")
         })?;
+    let metadata = GenerateRequestMetadata {
+        model: Some(request.model.clone()),
+        ..Default::default()
+    };
 
     let mut requests = Vec::with_capacity(choice_count);
     for (prompt_index, prompt) in prompt_specs.into_iter().enumerate() {
@@ -238,12 +246,15 @@ pub(crate) fn lower_completion_request(
                 ..Default::default()
             };
             let rid = format!("{response_id}-{index}");
-            requests.push(match &prompt {
-                PromptSpec::Text(text) => TextRequest::text(rid, text.clone(), true, options),
-                PromptSpec::TokenIds(input_ids) => {
-                    TextRequest::token_ids(rid, input_ids.clone(), false, options)
+            requests.push(
+                match &prompt {
+                    PromptSpec::Text(text) => TextRequest::text(rid, text.clone(), true, options),
+                    PromptSpec::TokenIds(input_ids) => {
+                        TextRequest::token_ids(rid, input_ids.clone(), false, options)
+                    }
                 }
-            });
+                .with_metadata(metadata.clone()),
+            );
         }
     }
     Ok(requests)

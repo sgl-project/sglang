@@ -7,6 +7,8 @@ use dynamo_renderer::{kimi_k3_formatter_for, native_formatter_for};
 use futures::future::{BoxFuture, try_join_all};
 
 #[cfg(any(feature = "http", test))]
+use crate::GenerateRequestMetadata;
+#[cfg(any(feature = "http", test))]
 use crate::protocol::openai::lower_chat_request_with_template_args;
 use crate::protocol::openai::{lower_chat_request, lower_completion_request};
 use crate::template::load_chat_formatter;
@@ -120,13 +122,17 @@ impl RendererService {
         response_id: &str,
         chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
         continue_final_message: bool,
+        sampling_overrides: crate::SamplingParamsOverrides,
+        metadata: GenerateRequestMetadata,
     ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
-        let chat = self.lowerer.lower_chat_with_template_args(
+        let mut chat = self.lowerer.lower_chat_with_template_args(
             request,
             response_id,
             chat_template_args,
             continue_final_message,
         )?;
+        sampling_overrides.apply(&mut chat.sampling_params);
+        chat.metadata = metadata;
         let lowered = self.chat_preprocessor.preprocess(chat)?;
         self.prepare_many(lowered.text_requests).await
     }
@@ -151,13 +157,18 @@ impl RendererService {
         response_id: &str,
         chat_template_args: Option<std::collections::HashMap<String, serde_json::Value>>,
         continue_final_message: bool,
+        sampling_overrides: crate::SamplingParamsOverrides,
+        metadata: GenerateRequestMetadata,
     ) -> Result<ChatRequest, RendererError> {
-        self.lowerer.lower_chat_with_template_args(
+        let mut chat = self.lowerer.lower_chat_with_template_args(
             request,
             response_id,
             chat_template_args,
             continue_final_message,
-        )
+        )?;
+        sampling_overrides.apply(&mut chat.sampling_params);
+        chat.metadata = metadata;
+        Ok(chat)
     }
 
     /// Apply chat templates, tools, and parser setup, then lower to text.
@@ -171,6 +182,24 @@ impl RendererService {
         response_id: &str,
     ) -> Result<Vec<TextRequest>, RendererError> {
         self.lowerer.lower_completions(request, response_id)
+    }
+
+    #[cfg(any(feature = "http", test))]
+    pub(crate) fn lower_completions_with_metadata(
+        &self,
+        request: CreateCompletionRequest,
+        response_id: &str,
+        sampling_overrides: crate::SamplingParamsOverrides,
+        metadata: GenerateRequestMetadata,
+    ) -> Result<Vec<TextRequest>, RendererError> {
+        let mut requests = self.lowerer.lower_completions(request, response_id)?;
+        for request in &mut requests {
+            sampling_overrides
+                .clone()
+                .apply(&mut request.options.sampling_params);
+            request.metadata = metadata.clone();
+        }
+        Ok(requests)
     }
 
     pub async fn prepare_text_request(
@@ -206,6 +235,23 @@ impl RendererService {
         self.prepare_many(requests).await
     }
 
+    #[cfg(any(feature = "http", test))]
+    pub(crate) async fn prepare_completions_with_metadata(
+        &self,
+        request: CreateCompletionRequest,
+        response_id: &str,
+        sampling_overrides: crate::SamplingParamsOverrides,
+        metadata: GenerateRequestMetadata,
+    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
+        let requests = self.lower_completions_with_metadata(
+            request,
+            response_id,
+            sampling_overrides,
+            metadata,
+        )?;
+        self.prepare_many(requests).await
+    }
+
     async fn prepare_many(
         &self,
         requests: Vec<TextRequest>,
@@ -237,6 +283,7 @@ impl RendererService {
                 rid: request.rid,
                 input_ids,
                 options: request.options,
+                metadata: request.metadata,
             },
         };
         check_total_tokens(&mut request, &self.lowerer.config.limits)?;
@@ -391,6 +438,8 @@ mod tests {
                     serde_json::Value::Bool(false),
                 )])),
                 false,
+                crate::SamplingParamsOverrides::default(),
+                GenerateRequestMetadata::default(),
             )
             .unwrap();
         assert_eq!(

@@ -7,6 +7,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::{SamplingParams, TokenIds};
 
+/// Request-scoped metadata that must survive protocol lowering and prompt
+/// tokenization before the request is submitted to SGLang `/generate`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GenerateRequestMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_salt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_port: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_room: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_dp_rank: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disagg_prefill_dp_rank: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default)]
 /// Generation options shared by text and token-ID inputs.
 pub struct GenerationOptions {
@@ -38,6 +62,7 @@ pub struct TextRequest {
     pub prompt: TextPrompt,
     pub add_special_tokens: bool,
     pub options: GenerationOptions,
+    pub metadata: GenerateRequestMetadata,
 }
 
 impl TextRequest {
@@ -52,6 +77,7 @@ impl TextRequest {
             prompt: TextPrompt::Text(text.into()),
             add_special_tokens,
             options,
+            metadata: GenerateRequestMetadata::default(),
         }
     }
 
@@ -66,6 +92,7 @@ impl TextRequest {
             prompt: TextPrompt::TokenIds(input_ids),
             add_special_tokens,
             options,
+            metadata: GenerateRequestMetadata::default(),
         }
     }
 
@@ -80,7 +107,13 @@ impl TextRequest {
             prompt: TextPrompt::Rendered(prompt),
             add_special_tokens,
             options,
+            metadata: GenerateRequestMetadata::default(),
         }
+    }
+
+    pub fn with_metadata(mut self, metadata: GenerateRequestMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -90,16 +123,15 @@ pub struct TokenIdsRequest {
     pub rid: String,
     pub input_ids: TokenIds,
     pub options: GenerationOptions,
+    pub metadata: GenerateRequestMetadata,
 }
 
-/// Prototype text token-in request accepted by SGLang's `/generate` endpoint.
-///
-/// This is a transport DTO rather than an in-process engine type. It is not yet
-/// a field-complete compatibility contract for multimodal or disaggregated
-/// serving.
+/// Text token-in request accepted by SGLang's `/generate` endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedGenerateRequest {
     pub rid: String,
+    #[serde(flatten)]
+    pub metadata: GenerateRequestMetadata,
     pub input_ids: TokenIds,
     pub sampling_params: PreparedSamplingParams,
     pub stream: bool,
@@ -118,6 +150,7 @@ impl From<TokenIdsRequest> for PreparedGenerateRequest {
         let options = request.options;
         Self {
             rid: request.rid,
+            metadata: request.metadata,
             input_ids: request.input_ids,
             sampling_params: options.sampling_params.into(),
             stream: options.stream,

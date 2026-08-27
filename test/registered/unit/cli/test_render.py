@@ -2,6 +2,9 @@ import json
 import unittest
 
 from sglang.cli.render import extract_engine_url, write_renderer_config
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestStandaloneRendererCli(unittest.TestCase):

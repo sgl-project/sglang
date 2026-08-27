@@ -12,13 +12,13 @@ use dynamo_protocols::types::{
     ChatCompletionToolChoiceOption, ReasoningEffort, ResponseFormat,
 };
 use dynamo_renderer::{
-    OAIChatLikeRequest, RenderedPrompt, RenderedSegment, TextInput, may_be_fix_tool_schema,
+    OAIChatLikeRequest, RenderedPrompt, RenderedSegment, may_be_fix_tool_schema,
 };
 use minijinja::Value;
 
 use crate::{
-    ChatFormatter, ChatResponseProcessor, GenerationOptions, OneOrMany, RendererConfig,
-    RendererError, SamplingParams, TextRequest,
+    ChatFormatter, ChatResponseProcessor, GenerateRequestMetadata, GenerationOptions, OneOrMany,
+    RendererConfig, RendererError, SamplingParams, TextRequest,
 };
 
 /// Structured chat request shared by protocol adapters.
@@ -43,6 +43,7 @@ pub struct ChatRequest {
     pub return_logprob: bool,
     pub top_logprobs_num: i64,
     pub parallel_tool_calls: bool,
+    pub metadata: GenerateRequestMetadata,
 }
 
 impl OAIChatLikeRequest for ChatRequest {
@@ -84,10 +85,6 @@ impl OAIChatLikeRequest for ChatRequest {
 
     fn chat_template_args(&self) -> Option<&HashMap<String, serde_json::Value>> {
         self.chat_template_args.as_ref()
-    }
-
-    fn extract_text(&self) -> Option<TextInput> {
-        Some(TextInput::Single(String::new()))
     }
 }
 
@@ -143,20 +140,23 @@ impl ChatPreprocessor {
 
         let mut text_requests = Vec::with_capacity(request.choice_count);
         for index in 0..request.choice_count {
-            text_requests.push(TextRequest::rendered(
-                format!("{}-{index}", request.rid),
-                prompt.clone(),
-                false,
-                GenerationOptions {
-                    sampling_params: request.sampling_params.clone(),
-                    stream: request.stream,
-                    return_logprob: request.return_logprob,
-                    logprob_start_len: -1,
-                    top_logprobs_num: request.top_logprobs_num,
-                    return_text_in_logprobs: request.return_logprob.then_some(true),
-                    ..Default::default()
-                },
-            ));
+            text_requests.push(
+                TextRequest::rendered(
+                    format!("{}-{index}", request.rid),
+                    prompt.clone(),
+                    false,
+                    GenerationOptions {
+                        sampling_params: request.sampling_params.clone(),
+                        stream: request.stream,
+                        return_logprob: request.return_logprob,
+                        logprob_start_len: -1,
+                        top_logprobs_num: request.top_logprobs_num,
+                        return_text_in_logprobs: request.return_logprob.then_some(true),
+                        ..Default::default()
+                    },
+                )
+                .with_metadata(request.metadata.clone()),
+            );
         }
 
         let response_processor = ChatResponseProcessor::new(
@@ -187,7 +187,8 @@ impl ChatPreprocessor {
                 sampling_params: request.sampling_params,
                 ..Default::default()
             },
-        ))
+        )
+        .with_metadata(request.metadata))
     }
 
     fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt, RendererError> {

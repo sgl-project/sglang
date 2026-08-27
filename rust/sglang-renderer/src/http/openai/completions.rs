@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
-    OpenAIHttpFrontend,
+    CompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
     submission::{collect_output, merge_indexed, submit_inputs},
 };
@@ -24,9 +24,7 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CreateCompletionRequest, CreateCompletionResponse, Logprobs,
-};
+use dynamo_protocols::types::{Choice, CompletionFinishReason, CreateCompletionResponse, Logprobs};
 use futures::StreamExt;
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
@@ -49,15 +47,22 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<OpenAIHttpFrontend>>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let extended = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
+    if let Err(error) = extended.extensions.validate() {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
+    let (request, sampling_overrides, extensions) = extended.into_parts();
+    let response_id = extensions
+        .rid
+        .clone()
+        .unwrap_or_else(|| format!("cmpl-{}", uuid::Uuid::new_v4().simple()));
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -75,7 +80,13 @@ async fn completions(
         .as_ref()
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
-    let text_requests = match state.renderer.lower_completions(request, &response_id) {
+    let metadata = extensions.metadata(model.clone());
+    let text_requests = match state.renderer.lower_completions_with_metadata(
+        request,
+        &response_id,
+        sampling_overrides,
+        metadata,
+    ) {
         Ok(requests) => requests,
         Err(error) => {
             let status = renderer_status(&error);

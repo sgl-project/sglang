@@ -401,6 +401,7 @@ pub fn tokenize_text_request(
         prompt,
         add_special_tokens,
         mut options,
+        metadata,
     } = request;
     resolve_stop_token_window(&mut options.sampling_params, tokenizer);
     let input_ids = match prompt {
@@ -419,6 +420,7 @@ pub fn tokenize_text_request(
         rid,
         input_ids,
         options,
+        metadata,
     })
 }
 
@@ -452,6 +454,7 @@ pub fn prepare_direct_request(
             rid: request.rid,
             input_ids,
             options: request.options,
+            metadata: request.metadata,
         },
     };
     check_total_tokens(&mut request, limits)?;

@@ -154,6 +154,7 @@ impl TokenizeChatRequest {
             return_logprob: false,
             top_logprobs_num: 0,
             parallel_tool_calls: true,
+            metadata: crate::GenerateRequestMetadata::default(),
         })
     }
 }

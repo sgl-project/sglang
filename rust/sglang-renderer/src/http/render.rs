@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::RendererService;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -9,12 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo_protocols::types::CreateCompletionRequest;
-
-use crate::RendererService;
 
 use super::{
-    ExtendedChatCompletionRequest,
+    ChatCompletionRequest, CompletionRequest,
     error::{openai_error, renderer_status},
 };
 
@@ -37,7 +35,7 @@ async fn health() -> StatusCode {
 
 async fn render_chat(
     State(state): State<RenderState>,
-    body: Result<Json<ExtendedChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let extended = match body {
         Ok(Json(request)) => request,
@@ -45,11 +43,20 @@ async fn render_chat(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    let ExtendedChatCompletionRequest {
+    if let Err(error) = extended.extensions.validate() {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
+    let parts = match extended.into_parts() {
+        Ok(parts) => parts,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+    };
+    let crate::http::ChatRequestParts {
         request,
         chat_template_kwargs,
         continue_final_message,
-    } = extended;
+        sampling_overrides,
+        extensions,
+    } = parts;
     if request.n.is_some_and(|n| n > 1) {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -57,7 +64,12 @@ async fn render_chat(
             false,
         );
     }
-    let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let model = request.model.clone();
+    let response_id = extensions
+        .rid
+        .clone()
+        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
+    let metadata = extensions.metadata(model);
     match state
         .renderer
         .prepare_chat_with_template_args(
@@ -65,6 +77,8 @@ async fn render_chat(
             &response_id,
             chat_template_kwargs,
             continue_final_message,
+            sampling_overrides,
+            metadata,
         )
         .await
     {
@@ -80,18 +94,27 @@ async fn render_chat(
 
 async fn render_completions(
     State(state): State<RenderState>,
-    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
+    body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let request = match body {
+    let extended = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
+    if let Err(error) = extended.extensions.validate() {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
+    let (request, sampling_overrides, extensions) = extended.into_parts();
+    let model = request.model.clone();
+    let response_id = extensions
+        .rid
+        .clone()
+        .unwrap_or_else(|| format!("cmpl-{}", uuid::Uuid::new_v4().simple()));
+    let metadata = extensions.metadata(model);
     match state
         .renderer
-        .prepare_completions(request, &response_id)
+        .prepare_completions_with_metadata(request, &response_id, sampling_overrides, metadata)
         .await
     {
         Ok(prepared_requests) => Json(prepared_requests).into_response(),
@@ -134,6 +157,7 @@ mod tests {
                         }
                     },
                     options: request.options,
+                    metadata: request.metadata,
                 })
             })
         }
@@ -179,7 +203,20 @@ mod tests {
                         serde_json::json!({
                             "model": "model",
                             "prompt": ["one two", "three"],
-                            "max_tokens": 5
+                            "max_tokens": 5,
+                            "top_k": 17,
+                            "min_p": 0.2,
+                            "min_tokens": 3,
+                            "stop_regex": "END[0-9]",
+                            "rid": "request-id",
+                            "cache_salt": "tenant-a",
+                            "extra_key": "interactive",
+                            "priority": 7,
+                            "bootstrap_host": "prefill",
+                            "bootstrap_port": 8998,
+                            "bootstrap_room": 42,
+                            "routed_dp_rank": 2,
+                            "disagg_prefill_dp_rank": 1
                         })
                         .to_string(),
                     ))
@@ -193,6 +230,24 @@ mod tests {
                 .unwrap();
         assert_eq!(body[0]["input_ids"], serde_json::json!([7, 7]));
         assert_eq!(body[1]["input_ids"], serde_json::json!([7]));
+        assert_eq!(body[0]["sampling_params"]["top_k"], 17);
+        assert_eq!(body[0]["sampling_params"]["min_p"], 0.2);
+        assert_eq!(body[0]["sampling_params"]["min_new_tokens"], 3);
+        assert_eq!(
+            body[0]["sampling_params"]["stop_regex"],
+            serde_json::json!(["END[0-9]"])
+        );
+        assert_eq!(body[0]["rid"], "request-id-0");
+        assert_eq!(body[0]["model"], "model");
+        assert_eq!(body[0]["cache_salt"], "tenant-a");
+        assert_eq!(body[0]["extra_key"], "interactive");
+        assert_eq!(body[0]["priority"], 7);
+        assert_eq!(body[0]["bootstrap_host"], "prefill");
+        assert_eq!(body[0]["bootstrap_port"], 8998);
+        assert_eq!(body[0]["bootstrap_room"], 42);
+        assert_eq!(body[0]["routed_dp_rank"], 2);
+        assert_eq!(body[0]["disagg_prefill_dp_rank"], 1);
+        assert_eq!(body[1]["cache_salt"], "tenant-a");
     }
 
     #[tokio::test]
@@ -215,6 +270,30 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn render_rejects_unimplemented_stateful_fields() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions/render")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "model",
+                            "prompt": "hello",
+                            "session_id": "session"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

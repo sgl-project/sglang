@@ -198,6 +198,78 @@ pub struct SamplingParams {
     pub is_normalized: bool,
 }
 
+/// SGLang-owned sampling fields that extend the OpenAI chat and completion
+/// request schemas. Keeping these outside Dynamo's DTO prevents dependency
+/// omissions from silently changing SGLang request behavior.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct SamplingParamsOverrides {
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
+    pub min_tokens: Option<i64>,
+    #[serde(default)]
+    pub regex: Option<String>,
+    #[serde(default)]
+    pub ebnf: Option<String>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
+    #[serde(default)]
+    pub stop_token_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    pub stop_regex: Option<OneOrMany<String>>,
+    #[serde(default)]
+    pub no_stop_trim: Option<bool>,
+    #[serde(default)]
+    pub ignore_eos: Option<bool>,
+    #[serde(default)]
+    pub skip_special_tokens: Option<bool>,
+    #[serde(default)]
+    pub custom_params: Option<serde_json::Value>,
+}
+
+impl SamplingParamsOverrides {
+    pub fn apply(self, params: &mut SamplingParams) {
+        if let Some(value) = self.top_k {
+            params.top_k = value;
+        }
+        if let Some(value) = self.min_p {
+            params.min_p = value;
+        }
+        if let Some(value) = self.min_tokens {
+            params.min_new_tokens = value;
+        }
+        if let Some(value) = self.regex {
+            params.regex = Some(value);
+        }
+        if let Some(value) = self.ebnf {
+            params.ebnf = Some(value);
+        }
+        if let Some(value) = self.repetition_penalty {
+            params.repetition_penalty = value;
+        }
+        if let Some(value) = self.stop_token_ids {
+            params.stop_token_ids = Some(value);
+        }
+        if let Some(value) = self.stop_regex {
+            params.stop_regex = Some(value);
+        }
+        if let Some(value) = self.no_stop_trim {
+            params.no_stop_trim = value;
+        }
+        if let Some(value) = self.ignore_eos {
+            params.ignore_eos = value;
+        }
+        if let Some(value) = self.skip_special_tokens {
+            params.skip_special_tokens = value;
+        }
+        if let Some(value) = self.custom_params {
+            params.custom_params = Some(value);
+        }
+    }
+}
+
 /// The `/generate` body's `sampling_params`: one object (broadcast to every
 /// prompt) or a list of them (one per prompt), fanned out by `GenerateBody::into_requests`.
 ///
@@ -527,6 +599,43 @@ mod tests {
     /// this is just a value large enough to stay out of the way.
     const TEST_VOCAB: u64 = 1000;
 
+    #[test]
+    fn openai_extensions_override_internal_sampling_params() {
+        let overrides: SamplingParamsOverrides = serde_json::from_value(serde_json::json!({
+            "top_k": 17,
+            "min_p": 0.2,
+            "min_tokens": 3,
+            "repetition_penalty": 1.1,
+            "stop_token_ids": [41, 42],
+            "stop_regex": ["END", "STOP"],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "skip_special_tokens": false,
+            "custom_params": {"tenant": "a"}
+        }))
+        .unwrap();
+        let mut params = SamplingParams::default();
+
+        overrides.apply(&mut params);
+
+        assert_eq!(params.top_k, 17);
+        assert_eq!(params.min_p, 0.2);
+        assert_eq!(params.min_new_tokens, 3);
+        assert_eq!(params.repetition_penalty, 1.1);
+        assert_eq!(params.stop_token_ids, Some(vec![41, 42]));
+        assert_eq!(
+            params.stop_regex,
+            Some(OneOrMany::Many(vec!["END".into(), "STOP".into()]))
+        );
+        assert!(params.no_stop_trim);
+        assert!(params.ignore_eos);
+        assert!(!params.skip_special_tokens);
+        assert_eq!(
+            params.custom_params,
+            Some(serde_json::json!({"tenant": "a"}))
+        );
+    }
+
     /// End to end through the path `/generate` takes: a bounded `stop_regex`
     /// reaches the wire with its real length, and a malformed one is a 400.
     #[test]
@@ -574,6 +683,22 @@ mod tests {
             norm(r#"{"top_k": -1, "temperature": 0.7}"#).top_k,
             TOP_K_ALL
         );
+    }
+
+    #[test]
+    fn absent_openai_extensions_do_not_override_sampling_defaults() {
+        let mut params = SamplingParams {
+            no_stop_trim: true,
+            ignore_eos: true,
+            skip_special_tokens: true,
+            ..Default::default()
+        };
+
+        SamplingParamsOverrides::default().apply(&mut params);
+
+        assert!(params.no_stop_trim);
+        assert!(params.ignore_eos);
+        assert!(params.skip_special_tokens);
     }
 
     #[test]

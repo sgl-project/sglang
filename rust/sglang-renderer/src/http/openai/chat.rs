@@ -30,7 +30,7 @@ use futures::StreamExt;
 
 use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
-    ExtendedChatCompletionRequest, OpenAIHttpFrontend,
+    ChatCompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
     submission::{collect_output, merge_indexed, submit_inputs},
 };
@@ -50,7 +50,7 @@ struct ChatStreamWireContext {
 
 async fn chat_completions(
     State(state): State<Arc<OpenAIHttpFrontend>>,
-    body: Result<Json<ExtendedChatCompletionRequest>, JsonRejection>,
+    body: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let extended = match body {
         Ok(Json(request)) => request,
@@ -58,12 +58,24 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    let ExtendedChatCompletionRequest {
+    if let Err(error) = extended.extensions.validate() {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
+    let parts = match extended.into_parts() {
+        Ok(parts) => parts,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+    };
+    let crate::http::ChatRequestParts {
         request,
         chat_template_kwargs,
         continue_final_message,
-    } = extended;
-    let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+        sampling_overrides,
+        extensions,
+    } = parts;
+    let response_id = extensions
+        .rid
+        .clone()
+        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
     let stream = request.stream.unwrap_or(false);
     let model = request.model.clone();
     let want_logprobs = request.logprobs.unwrap_or(false);
@@ -81,6 +93,8 @@ async fn chat_completions(
         &response_id,
         chat_template_kwargs,
         continue_final_message,
+        sampling_overrides,
+        extensions.metadata(model.clone()),
     ) {
         Ok(chat) => chat,
         Err(error) => {
