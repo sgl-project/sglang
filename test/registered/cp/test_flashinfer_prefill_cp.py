@@ -274,7 +274,6 @@ def _run_flashinfer_case(
             local_value,
             layer,
             forward_batch,
-            save_kv_cache=True,
         )
 
     torch.testing.assert_close(
