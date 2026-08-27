@@ -62,10 +62,10 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.utils import is_sm120_supported, is_sm121
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
-    is_sm120_supported,
     round_up,
     set_weight_attrs,
 )
@@ -2121,6 +2121,73 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _nvfp4_smallm_load_eligible(
+    *,
+    enable_flashinfer_cutlass_moe: bool,
+    kernel_supported: bool,
+    kernel_enabled: bool,
+    use_per_token_activation: bool,
+    is_gated: bool,
+    activation: str,
+    hidden_size: int,
+    intermediate_size: int,
+    num_local_experts: int,
+    num_fused_shared_experts: int,
+    moe_ep_rank: int,
+    moe_ep_size: int,
+    expert_storage_rank: int,
+    num_global_routed_experts: int,
+    top_k: Optional[int],
+) -> bool:
+    local_routed_experts = num_local_experts - num_fused_shared_experts
+    return (
+        enable_flashinfer_cutlass_moe
+        and kernel_supported
+        and kernel_enabled
+        and not use_per_token_activation
+        and is_gated
+        and activation in ("silu", "swiglu")
+        and hidden_size % 256 == 0
+        and intermediate_size % 64 == 0
+        and num_local_experts <= 512
+        and local_routed_experts > 0
+        and 0 <= moe_ep_rank < moe_ep_size
+        and moe_ep_size == 1
+        and expert_storage_rank == moe_ep_rank
+        and num_global_routed_experts == local_routed_experts * moe_ep_size
+        and top_k is not None
+    )
+
+
+def _prepare_nvfp4_smallm_workspace(
+    *,
+    layer: torch.nn.Module,
+    max_tokens: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    device: torch.device,
+) -> None:
+    from sglang.kernels.ops.moe.nvfp4_moe_sm120 import prepare_nvfp4_moe_sm120
+
+    try:
+        layer.nvfp4_smallm_workspace = prepare_nvfp4_moe_sm120(
+            max_tokens=max_tokens,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            device=device,
+        )
+    except Exception as error:
+        layer.nvfp4_smallm_workspace = None
+        error_text = str(error).strip()
+        detail = error_text.splitlines()[0] if error_text else "no detail"
+        logger.warning_once(
+            "SM120 NVFP4 small-row MoE JIT preparation failed; using CUTLASS: "
+            f"{type(error).__name__}: {detail}"
+        )
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2594,11 +2661,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_weight = layer.w13_weight
             intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
             if intermediate_size_pad:
-                # padding gated activations will require to split w1 and w3
-                # and pad them individually
                 assert not layer.moe_runner_config.is_gated, (
-                    "The intermediate size required padding, "
-                    "but padding is also implemented for gated activations"
+                    "The intermediate size required padding, but padding is not "
+                    "implemented for gated activations"
                 )
 
                 copy_or_rebind_param(
@@ -2612,14 +2677,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer,
                     "w2_weight",
                     torch.nn.functional.pad(
-                        layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
+                        layer.w2_weight,
+                        (0, intermediate_size_pad // 2, 0, 0),
                     ),
                 )
                 copy_or_rebind_param(
                     layer,
                     "w2_weight_scale",
                     torch.nn.functional.pad(
-                        layer.w2_weight_scale, (0, intermediate_size_pad // 16)
+                        layer.w2_weight_scale,
+                        (0, intermediate_size_pad // 16),
                     ),
                 )
 
@@ -2677,6 +2744,45 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
+
+        hidden_size = layer.w13_weight.shape[2] * 2
+        intermediate_size = layer.w2_weight.shape[2] * 2
+        top_k = layer.moe_runner_config.top_k
+        from sglang.kernels.ops.moe.nvfp4_moe_sm120 import (
+            NVFP4_MOE_SM120_MAX_TOKENS,
+            nvfp4_moe_sm120_enabled,
+        )
+
+        layer.nvfp4_smallm_workspace = None
+        use_smallm = _nvfp4_smallm_load_eligible(
+            enable_flashinfer_cutlass_moe=self.enable_flashinfer_cutlass_moe,
+            kernel_supported=is_sm120_supported() and not is_sm121(),
+            kernel_enabled=nvfp4_moe_sm120_enabled(),
+            use_per_token_activation=self.quant_config.use_per_token_activation,
+            is_gated=layer.moe_runner_config.is_gated,
+            activation=layer.moe_runner_config.activation,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_local_experts=layer.num_local_experts,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            moe_ep_rank=layer.moe_ep_rank,
+            moe_ep_size=layer.moe_ep_size,
+            expert_storage_rank=getattr(
+                layer, "_expert_storage_rank", layer.moe_ep_rank
+            ),
+            num_global_routed_experts=layer.num_global_routed_experts,
+            top_k=top_k,
+        )
+        if use_smallm:
+            assert top_k is not None
+            _prepare_nvfp4_smallm_workspace(
+                layer=layer,
+                max_tokens=NVFP4_MOE_SM120_MAX_TOKENS,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=layer.w13_weight.device,
+            )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -2881,6 +2987,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
+                g1_alpha_up=layer.g1_alphas_up,
+                smallm_workspace=getattr(layer, "nvfp4_smallm_workspace", None),
+                smallm_global_routed_experts=layer.num_global_routed_experts,
+                smallm_local_routed_experts=(
+                    layer.num_local_experts - layer.num_fused_shared_experts
+                ),
+                smallm_local_expert_start=(
+                    layer.moe_ep_rank
+                    * (layer.num_local_experts - layer.num_fused_shared_experts)
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
 

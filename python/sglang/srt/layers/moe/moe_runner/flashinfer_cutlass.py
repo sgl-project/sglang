@@ -8,12 +8,15 @@ Quantization methods prepare a small quant_info payload and route through
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -25,10 +28,16 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    _is_stream_capturing,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    from sglang.kernels.ops.moe.nvfp4_moe_sm120 import Nvfp4MoeWorkspace
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
         FlashinferDispatchOutput,
@@ -59,6 +68,11 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    g1_alpha_up: Optional[torch.Tensor] = None
+    smallm_workspace: Optional[Nvfp4MoeWorkspace] = None
+    smallm_global_routed_experts: Optional[int] = None
+    smallm_local_routed_experts: Optional[int] = None
+    smallm_local_expert_start: Optional[int] = None
 
 
 @dataclass
@@ -175,6 +189,118 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
+_logged_smallm_decisions: set[str] = set()
+
+
+def _log_smallm_decision(message: str) -> None:
+    if message in _logged_smallm_decisions:
+        return
+    _logged_smallm_decisions.add(message)
+    logger.info("SM120 NVFP4 small-row MoE: %s", message)
+
+
+def _smallm_ineligibility_reason(
+    *,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    workspace: Optional[Nvfp4MoeWorkspace],
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output_dtype: torch.dtype,
+    quant_scales: Optional[list[torch.Tensor]],
+    runner_config: MoeRunnerConfig,
+    output_supplied: bool,
+    enable_alltoall: bool,
+    capturing: Optional[bool] = None,
+) -> Optional[str]:
+    if quant_info.quant_type != "fp4":
+        return "quantization is not NVFP4"
+    if workspace is None:
+        return "workspace is disabled or the layer shape is unsupported"
+    if quant_info.g1_alpha_up is None:
+        return "the up-projection alpha is unavailable"
+    if any(
+        value is None
+        for value in (
+            quant_info.smallm_global_routed_experts,
+            quant_info.smallm_local_routed_experts,
+            quant_info.smallm_local_expert_start,
+        )
+    ):
+        return "expert topology is unavailable"
+    if output_supplied or enable_alltoall:
+        return "the all-to-all output contract requires CUTLASS"
+    if x_sf is not None:
+        return "the input is already quantized"
+    if capturing is None:
+        capturing = torch.cuda.is_available() and _is_stream_capturing(
+            torch.cuda.current_stream(x.device)
+        )
+    if capturing and workspace.graph_capture_supported is not True:
+        return "cooperative graph capture is unavailable"
+    if not 0 < x.shape[0] <= workspace.max_tokens:
+        return "token count is outside the small-row range"
+    if (
+        x.dtype != torch.bfloat16
+        or topk_ids.dtype != torch.int32
+        or topk_weights.dtype != torch.float32
+    ):
+        return "input or routing dtypes are unsupported"
+    if not (
+        x.is_contiguous() and topk_ids.is_contiguous() and topk_weights.is_contiguous()
+    ):
+        return "input or routing tensors are not contiguous"
+    if (
+        x.dim() != 2
+        or topk_ids.dim() != 2
+        or topk_weights.shape != topk_ids.shape
+        or topk_ids.shape[0] != x.shape[0]
+        or x.shape[1] != workspace.hidden_size
+        or topk_ids.shape[1] != workspace.top_k
+    ):
+        return "input or routing shapes do not match the workspace"
+    if not runner_config.is_gated or runner_config.activation not in (
+        "silu",
+        "swiglu",
+    ):
+        return "the activation is unsupported"
+    if any(
+        value is not None
+        for value in (
+            runner_config.gemm1_alpha,
+            runner_config.gemm1_beta,
+            runner_config.gemm1_clamp_limit,
+            runner_config.swiglu_limit,
+        )
+    ):
+        return "the activation modifiers are unsupported"
+    if output_dtype != torch.bfloat16:
+        return "the output dtype is unsupported"
+    if quant_scales is None or len(quant_scales) != 6:
+        return "the NVFP4 scale set is incomplete"
+    if quant_info.moe_tp_size < 1 or quant_info.moe_ep_size < 1:
+        return "the MoE parallel topology is invalid"
+
+    global_routed = quant_info.smallm_global_routed_experts
+    local_routed = quant_info.smallm_local_routed_experts
+    local_start = quant_info.smallm_local_expert_start
+    if (
+        global_routed is None
+        or local_routed is None
+        or local_start is None
+        or global_routed <= 0
+        or local_routed <= 0
+        or local_start < 0
+        or not 0 <= quant_info.moe_ep_rank < quant_info.moe_ep_size
+        or global_routed != local_routed * quant_info.moe_ep_size
+        or local_start != quant_info.moe_ep_rank * local_routed
+        or local_routed > quant_info.w13_weight.shape[0]
+    ):
+        return "the expert topology is not a uniform contiguous EP shard"
+    return None
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -192,6 +318,33 @@ def _run_flashinfer_cutlass(
         dispatch_output, quant_info, runner_config
     )
 
+    workspace = quant_info.smallm_workspace
+    quant_scales = quant_info.quant_scales
+    capturing = False
+    if workspace is not None and quant_info.quant_type == "fp4":
+        capturing = torch.cuda.is_available() and _is_stream_capturing(
+            torch.cuda.current_stream(x.device)
+        )
+    smallm_reason = None
+    if workspace is not None:
+        smallm_reason = _smallm_ineligibility_reason(
+            quant_info=quant_info,
+            workspace=workspace,
+            x=x,
+            x_sf=x_sf,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output_dtype=output_dtype,
+            quant_scales=quant_scales,
+            runner_config=runner_config,
+            output_supplied=output is not None,
+            enable_alltoall=enable_alltoall,
+            capturing=capturing,
+        )
+    use_smallm = workspace is not None and smallm_reason is None
+    if not use_smallm and workspace is not None and quant_info.quant_type == "fp4":
+        _log_smallm_decision(f"using CUTLASS because {smallm_reason}")
+
     if output is None:
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -203,13 +356,63 @@ def _run_flashinfer_cutlass(
                 device=x.device,
             )
 
+    if use_smallm:
+        launch_error = None
+        try:
+            launched = get_kernel("moe.nvfp4_fused_experts", KernelBackend.JIT)(
+                x=x,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                w13_weight=quant_info.w13_weight,
+                w2_weight=quant_info.w2_weight,
+                w13_scale=quant_scales[1],
+                w2_scale=quant_scales[4],
+                input_scale_1=quant_scales[0],
+                input_scale_2=quant_scales[3],
+                g1_alpha=quant_scales[2],
+                g1_alpha_up=quant_info.g1_alpha_up,
+                g2_alpha=quant_scales[5],
+                global_routed_experts=quant_info.smallm_global_routed_experts,
+                local_routed_experts=quant_info.smallm_local_routed_experts,
+                local_expert_start=quant_info.smallm_local_expert_start,
+                output=output,
+                workspace=workspace,
+            )
+        except Exception as error:
+            if capturing:
+                raise RuntimeError(
+                    "SM120 NVFP4 cooperative launch failed during CUDA graph capture"
+                ) from error
+            launched = False
+            launch_error = error
+            error_text = str(error).strip()
+            detail = error_text.splitlines()[0] if error_text else "no detail"
+            _log_smallm_decision(
+                "using CUTLASS because the SM120 JIT launch failed: "
+                f"{type(error).__name__}: {detail}"
+            )
+        if launched:
+            _log_smallm_decision("selected")
+            return output
+        if launch_error is None:
+            if capturing:
+                raise RuntimeError(
+                    "SM120 NVFP4 cooperative launch failed during CUDA graph capture"
+                )
+            _log_smallm_decision(
+                "using CUTLASS because the SM120 launch is unavailable"
+            )
+
+    if output is None:
+        raise RuntimeError("FlashInfer CUTLASS MoE output allocation failed")
+
     w13_weight = quant_info.w13_weight
     w2_weight = quant_info.w2_weight
-    quant_scales = quant_info.quant_scales
     if quant_info.quant_type == "fp4":
         w13_weight = w13_weight.view(torch.long)
         w2_weight = w2_weight.view(torch.long)
-        assert quant_scales is not None and len(quant_scales) == 6
+        if quant_scales is None or len(quant_scales) != 6:
+            raise ValueError("NVFP4 CUTLASS MoE requires six quantization scales")
         quant_scales = [
             quant_scales[0],
             quant_scales[1].view(torch.int32),

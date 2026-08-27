@@ -18,6 +18,25 @@ if TYPE_CHECKING:
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _HIP = frozenset({CapabilityRequirement.HIP})
+_SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
+
+register_kernel(
+    KernelSpec(
+        op="moe.nvfp4_fused_experts",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.nvfp4_moe_sm120:nvfp4_moe_sm120",
+        capabilities=_SM120,
+        format_signature=FormatSignature(
+            in_place=True,
+            supported_dtypes=("bfloat16", "uint8", "float8_e4m3fn"),
+            description=(
+                "small-row routed NVFP4 MoE into caller-owned output; returns whether "
+                "the cooperative launch was accepted"
+            ),
+        ),
+        description="Cooperative-grid W4A4 NVFP4 MoE for SM120.",
+    )
+)
 
 register_kernel(
     KernelSpec(
