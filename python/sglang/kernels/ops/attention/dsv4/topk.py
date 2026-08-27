@@ -60,7 +60,7 @@ def topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     elif is_xpu():
-        torch.ops.sgl_kernel.topk_transform_512(
+        torch.ops.sgl_kernel.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
@@ -117,7 +117,7 @@ def topk_transform_ragged_v2(
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
     if is_xpu():
-        torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
+        torch.ops.sgl_kernel.topk_transform_ragged(
             scores,
             seq_lens,
             out_indices,
@@ -158,7 +158,7 @@ def topk_transform_512_v2(
     the output is all -1.
     """
     if is_xpu():
-        torch.ops.sgl_kernel.topk_transform_512_v2(
+        torch.ops.sgl_kernel.topk_transform_paged(
             scores,
             seq_lens,
             page_tables,
