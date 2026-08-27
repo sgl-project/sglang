@@ -3271,6 +3271,10 @@ class UnifiedRadixCacheSuite:
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
     ):
+        if _selected_tree_core_test_backend() == "rust":
+            # TODO(Jialin): Enable these tests after porting the buffer-only
+            # TreeCore integration from #34798 and #35769 to Rust.
+            self.skipTest("buffer_only is not yet supported by the Rust TreeCore")
         if self.cfg.has_mamba:
             self.skipTest(
                 "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "
@@ -4238,20 +4242,20 @@ class UnifiedRadixCacheSuite:
         # each evict() attempts the drop fallback on the parent.
         with mock.patch.object(cache.cache_controller, "write", return_value=None):
             # Pinned subtree root: drop declines, chain stays intact.
-            cache.inc_host_lock_ref(parent)
+            parent_lock_params = cache.inc_host_lock_ref(parent).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
-            cache.dec_host_lock_ref(parent)
+            cache.dec_host_lock_ref(parent, parent_lock_params)
 
             # Pinned host-only descendant: drop declines as well.
-            cache.inc_host_lock_ref(child)
+            child_lock_params = cache.inc_host_lock_ref(child).to_dec_params()
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
             self.assertEqual(result.num_tokens_evicted, 0)
             m = cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", parent_seq)))
             )
             self.assertEqual(len(m.device_indices), len(parent_seq))
-            cache.dec_host_lock_ref(child)
+            cache.dec_host_lock_ref(child, child_lock_params)
 
             # Unpinned: the subtree drops and the child's host slots return.
             result = cache.evict(EvictParams(num_tokens=len(parent_seq)))
@@ -4728,7 +4732,7 @@ class UnifiedRadixCacheSuite:
         value = self._alloc(allocator, len(seq))
         result = cache.insert(
             InsertParams(
-                key=RadixKey(seq),
+                key=RadixKey(array("q", seq)),
                 value=value,
                 swa_evicted_seqlen=ps,
             )
