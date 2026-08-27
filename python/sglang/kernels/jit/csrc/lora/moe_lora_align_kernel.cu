@@ -16,6 +16,17 @@
 #include <algorithm>
 #include <bit>
 
+#ifdef USE_ROCM
+// The JIT build does not run hipify, so this file maps the CUDA spellings it
+// uses onto HIP itself. Deliberately local rather than in utils.cuh: that
+// header sits in nearly every kernel's dependency closure, which the build
+// cache is keyed on, so editing it rebuilds every JIT module.
+namespace cub = hipcub;
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#endif
+
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
@@ -25,11 +36,6 @@
 namespace sglang {
 
 namespace moe {
-
-#ifdef USE_ROCM
-// The JIT build does not run hipify, so map this file's cub:: uses explicitly.
-namespace cub = hipcub;
-#endif
 
 template <typename scalar_t>
 SGL_DEVICE void _moe_align_block_size(
