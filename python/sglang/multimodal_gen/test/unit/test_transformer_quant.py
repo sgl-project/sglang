@@ -107,6 +107,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
+from sglang.multimodal_gen.runtime.pipelines.flux_2_nvfp4 import (
+    _resolve_nvfp4_transformer_weights_path,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
@@ -791,6 +794,27 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertEqual(resolved, [mixed])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.pipelines.flux_2_nvfp4.resolve_transformer_safetensors_to_load"
+    )
+    def test_flux2_nvfp4_resolves_override_before_preload_inventory(
+        self, mock_resolve_override
+    ):
+        with tempfile.TemporaryDirectory() as cached_dir:
+            mixed = os.path.join(cached_dir, "flux2-dev-nvfp4-mixed.safetensors")
+            open(mixed, "a").close()
+            mock_resolve_override.return_value = [mixed]
+            repo_id = "black-forest-labs/FLUX.2-dev-NVFP4"
+            server_args = SimpleNamespace(transformer_weights_path=repo_id)
+
+            resolved = _resolve_nvfp4_transformer_weights_path(
+                server_args,
+                "/unused/model/path",
+            )
+
+        self.assertEqual(resolved, mixed)
+        mock_resolve_override.assert_called_once_with(server_args, "/unused/model/path")
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.snapshot_download",
