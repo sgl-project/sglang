@@ -61,7 +61,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
         self.clear()
         self._kvcache.register_mapping(
@@ -167,7 +167,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         # disable free group mechanism for device buffer free
-        self.hisparse_attn_allocator.is_not_in_free_group = True
+        self.hisparse_attn_allocator.in_free_group = False
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
@@ -246,7 +246,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
 
     def free_group_begin(self):
@@ -258,7 +258,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
+        if not self.in_free_group:
             self.logical_attn_allocator.free(free_index)
             self.free_hisparse(free_index)
         else:
@@ -321,7 +321,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.need_sort = logical_attn_allocator.need_sort
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
         self.clear()
 
@@ -444,7 +444,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 surplus_pages = torch.unique(surplus // self.hisparse_page_size)
                 pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
                 if pure_surplus.numel() > 0:
-                    self.hisparse_attn_allocator.is_not_in_free_group = True
+                    self.hisparse_attn_allocator.in_free_group = False
                     self.hisparse_attn_allocator.free(
                         pure_surplus * self.hisparse_page_size
                     )
@@ -474,7 +474,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.is_not_in_free_group = True
+        self.hisparse_attn_allocator.in_free_group = False
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
@@ -575,14 +575,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.clear()
 
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
-        if self.is_not_in_free_group:
+        if not self.in_free_group:
             self.logical_attn_allocator.free(free_index)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))

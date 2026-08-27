@@ -44,7 +44,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
 
     @property
@@ -61,11 +61,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def free_group_begin(self):
-        self.is_not_in_free_group = False
+        self.in_free_group = True
         self.free_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         if self.free_group:
             self.free(torch.cat(self.free_group))
 

@@ -93,7 +93,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.need_sort = need_sort
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
         self.swa_free_group = []
 
@@ -321,7 +321,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        if self.is_not_in_free_group:
+        if not self.in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
         else:
@@ -349,7 +349,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if not self.is_not_in_free_group:
+        if self.in_free_group:
             self.swa_free_group.append(self._copy_for_free_group(free_index))
             return
 
@@ -400,7 +400,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
         self.swa_free_group = []
 
@@ -452,7 +452,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
 
         self._kvcache = kvcache
@@ -497,7 +497,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
+        if not self.in_free_group:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
@@ -506,22 +506,22 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
+        if not self.in_free_group:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
     def free_group_begin(self):
-        self.is_not_in_free_group = False
+        self.in_free_group = True
         self.free_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         if self.free_group:
             self.free(torch.cat(self.free_group))
         self.free_group = []
 
     def clear(self):
         self.swa_attn_allocator.clear()
-        self.is_not_in_free_group = True
+        self.in_free_group = False
         self.free_group = []
