@@ -153,6 +153,10 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 # cp313 and no sdist, so pip has no candidate at all for srt_hip on 3.14.
 FROM $BASE_IMAGE_ROCM10RC4 AS rocm10rc4-base
 
+# Re-declare the global selector inside this stage so each matrix build installs
+# only the device payload for its target image (gfx942 or gfx950).
+ARG GPU_ARCH
+
 # ROCM_TRITON_VERSION rather than TRITON_VERSION: the final stage declares a
 # TRITON_VERSION of its own for the ROCm 7.2 wheel, and a --build-arg would
 # otherwise land on both.
@@ -183,28 +187,44 @@ RUN python3 -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 
-# Both arches' device wheels go into the shared base; GPU_ARCH_LIST still
-# narrows what AITER and sgl-kernel actually compile for per stage. The device
-# wheels are named as their own specs rather than as extras, because several
-# device extras in one spec (torch[device-gfx942,device-gfx950]) silently
-# installs only the first and the missing arch then fails at runtime with
-# hipErrorInvalidImage.
-RUN python3 -m pip install --no-cache-dir \
+# The two release jobs invoke separate Docker builds. Derive the device target
+# from GPU_ARCH so the MI300 image carries only gfx942 wheels and the MI350
+# image carries only gfx950 wheels. Keeping the packages as explicit specs also
+# avoids the RC4 resolver issue where a multi-device extras expression installs
+# only its first device payload.
+RUN set -eux; \
+    ROCM_DEVICE_ARCH="${GPU_ARCH%%-*}"; \
+    case "${ROCM_DEVICE_ARCH}" in \
+      gfx942) OTHER_ROCM_DEVICE_ARCH="gfx950" ;; \
+      gfx950) OTHER_ROCM_DEVICE_ARCH="gfx942" ;; \
+      *) echo "Unsupported ROCm 10 RC4 GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
+    esac; \
+    python3 -m pip install --no-cache-dir \
         --pre \
         --index-url ${ROCM_INDEX_URL} \
         "rocm-sdk-core==${ROCM_SDK_VERSION}" \
         "rocm-sdk-libraries==${ROCM_SDK_VERSION}" \
         "rocm-sdk-devel==${ROCM_SDK_VERSION}" \
-        "rocm-sdk-device-gfx942==${ROCM_SDK_VERSION}" \
-        "rocm-sdk-device-gfx950==${ROCM_SDK_VERSION}" \
+        "rocm-sdk-device-${ROCM_DEVICE_ARCH}==${ROCM_SDK_VERSION}" \
         "torch==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "torchvision==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
         "torchaudio==${ROCM_TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" \
-        "amd-torch-device-gfx942==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
-        "amd-torch-device-gfx950==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
-        "amd-torchvision-device-gfx942==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
-        "amd-torchvision-device-gfx950==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
-        "triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"
+        "amd-torch-device-${ROCM_DEVICE_ARCH}==${ROCM_TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "amd-torchvision-device-${ROCM_DEVICE_ARCH}==${ROCM_TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
+        "triton==${ROCM_TRITON_VERSION}.rocm${ROCM_SDK_VERSION}"; \
+    python3 -m pip show \
+        "rocm-sdk-device-${ROCM_DEVICE_ARCH}" \
+        "amd-torch-device-${ROCM_DEVICE_ARCH}" \
+        "amd-torchvision-device-${ROCM_DEVICE_ARCH}" >/dev/null; \
+    for package in \
+        "rocm-sdk-device-${OTHER_ROCM_DEVICE_ARCH}" \
+        "amd-torch-device-${OTHER_ROCM_DEVICE_ARCH}" \
+        "amd-torchvision-device-${OTHER_ROCM_DEVICE_ARCH}"; do \
+      if python3 -m pip show "${package}" >/dev/null 2>&1; then \
+        echo "Unexpected non-target ROCm device package: ${package}"; \
+        exit 1; \
+      fi; \
+    done
 
 RUN rocm-sdk init && rocm-sdk targets
 
