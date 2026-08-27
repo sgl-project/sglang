@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
     ResidencyState,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
+    ComponentWeightSource,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -56,6 +59,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     _normalize_ltx2_two_stage_device_mode,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
 
@@ -655,6 +659,46 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 self._ltx2_residency.strategy
             )
 
+    def additional_component_weight_sources(
+        self, server_args: ServerArgs
+    ) -> list[ComponentWeightSource]:
+        server_args.component_paths = _resolve_ltx2_two_stage_component_paths(
+            self.model_path, server_args.component_paths
+        )
+        sources = []
+        for component_name in ("spatial_upsampler", "distilled_lora"):
+            component_path = server_args.component_paths.get(component_name)
+            if component_path:
+                sources.append(
+                    ComponentWeightSource(
+                        component_name=component_name,
+                        component_model_path=component_path,
+                        target_element_size=(
+                            resolve_component_precision(server_args, component_name)
+                            or resolve_component_precision(server_args, "transformer")
+                        ).itemsize,
+                    )
+                )
+
+        if (
+            server_args.ltx2_two_stage_device_mode == "resident"
+            and self._should_merge_stage2_distilled_lora(server_args)
+            and server_args.lora_path is None
+        ):
+            sources.append(
+                ComponentWeightSource(
+                    component_name="transformer_2",
+                    component_model_path=self._resolve_component_path(
+                        server_args, "transformer", "transformer"
+                    ),
+                    target_element_size=resolve_component_precision(
+                        server_args, "transformer_2"
+                    ).itemsize,
+                    supports_fsdp_loading=True,
+                )
+            )
+        return sources
+
     @staticmethod
     def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
         return is_ltx23_native_variant(
@@ -754,8 +798,8 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             and self._should_merge_stage2_distilled_lora(server_args)
             and self._stage1_lora_path is None
             and float(self.STAGE_1_DISTILLED_LORA_STRENGTH) != 0.0
-            and not bool(getattr(server_args, "use_fsdp_inference", False))
-            and getattr(server_args, "quantization", None) is None
+            and not server_args.should_use_fsdp_for_component("transformer")
+            and server_args.quantization is None
         )
 
     def _maybe_merge_stage1_distilled_into_base(self, server_args: ServerArgs) -> None:

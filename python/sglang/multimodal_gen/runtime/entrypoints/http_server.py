@@ -36,7 +36,9 @@ from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_clien
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import (
     maybe_apply_auto_residency,
+    maybe_apply_pre_warmup_auto_residency,
     run_async_client_warmup,
+    should_apply_pre_warmup_auto_residency,
     should_run_synthetic_server_warmup,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -84,21 +86,31 @@ async def _run_server_warmup_after_http_live(
     server_args: ServerArgs, warmup_done: asyncio.Event
 ) -> None:
     try:
-        if not should_run_synthetic_server_warmup(server_args):
+        run_static_planner = should_apply_pre_warmup_auto_residency(server_args)
+        run_warmup = should_run_synthetic_server_warmup(server_args)
+        if not run_static_planner and not run_warmup:
             warmup_done.set()
             return
 
         await _wait_until_http_live(server_args)
 
-        await run_async_client_warmup(
-            server_args,
-            async_scheduler_client.forward,
-            fail_open=server_args.warmup_resolutions is None,
-        )
-        # Freeze the auto residency decision before the server reports ready.
-        # Raises only when a rollback failed, which aborts startup below.
-        await maybe_apply_auto_residency(server_args, async_scheduler_client.forward)
-        logger.info("The server is fired up and ready to roll!")
+        if run_static_planner:
+            await maybe_apply_pre_warmup_auto_residency(
+                server_args, async_scheduler_client.forward
+            )
+
+        if run_warmup:
+            await run_async_client_warmup(
+                server_args,
+                async_scheduler_client.forward,
+                fail_open=server_args.warmup_resolutions is None,
+            )
+            # Freeze the auto residency decision before the server reports ready.
+            # Raises only when a rollback failed, which aborts startup below.
+            await maybe_apply_auto_residency(
+                server_args, async_scheduler_client.forward
+            )
+            logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:
         raise

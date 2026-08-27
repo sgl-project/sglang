@@ -641,6 +641,23 @@ def test_auto_layerwise_skips_unsupported_component(monkeypatch):
     assert server_args.residency_mode("text_encoder") == COMPONENT_OFFLOAD
 
 
+def test_initial_auto_resident_seed_skips_configured_layerwise_setup():
+    module = _NestedEncoderDummyModel()
+    server_args = _server_args(
+        layerwise_offload_components=["text_encoder"],
+        _auto_residency_modes={"text_encoder": RESIDENT},
+    )
+
+    configured = configure_layerwise_offload_modules(
+        {"text_encoder": module},
+        server_args,
+        component_names=["text_encoder"],
+    )
+
+    assert configured == []
+    assert not is_layerwise_offloaded_module(module)
+
+
 def test_canonical_selector_does_not_make_auto_layerwise_selection_strict(
     monkeypatch,
 ):

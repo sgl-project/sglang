@@ -1682,52 +1682,59 @@ class LayerwiseOffloadManager:
                 cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
                 yield name, cpu_buffer[offset : offset + numel].reshape(shape)
 
+    def prepare_layer_for_forward(self, layer_idx: int) -> None:
+        """Materialize one managed layer and schedule its successors.
+
+        Forward hooks normally own this lifecycle. Model-specific forwards that
+        intentionally call a block's internals instead of ``block(...)`` must
+        invoke this method explicitly, because PyTorch cannot run that block's
+        hooks when its ``__call__`` is bypassed.
+        """
+        if layer_idx == 0:
+            self._activate_residency()
+            self.prepare_for_next_req(non_blocking=False)
+        if layer_idx not in self._gpu_layers:
+            # LTX audio VAE traverses decoder.up in reverse order.
+            self.prefetch_layer(layer_idx, non_blocking=False)
+        if layer_idx in self._prefetch_events and self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_event(
+                self._prefetch_events[layer_idx]
+            )
+
+        if self.residency_policy == RESIDENCY_POLICY_STRIDED:
+            # Top up the stream at every layer rather than in bursts of
+            # prefetch_size. Under `strided` the next streamed layer can be
+            # several layers away, so index-based bursts would issue it late.
+            for layer_to_prefetch in self._next_streamed(
+                after=layer_idx, count=self.prefetch_size
+            ):
+                self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+        elif self.prefetch_size and layer_idx % self.prefetch_size == 0:
+            for index in range(
+                layer_idx + self.prefetch_size,
+                layer_idx + 2 * self.prefetch_size,
+            ):
+                self.prefetch_layer(index % self.num_layers, non_blocking=True)
+
+    def finish_layer_forward(self, layer_idx: int) -> None:
+        """Release a streamed layer after its forward completes."""
+        self.release_layer(layer_idx)
+
     def register_forward_hooks(self) -> None:
         if not self.enabled:
             return
 
         layers = dict(self.model.named_modules())[self.layers_attr_str]
 
-        def make_pre_hook(i):
+        def make_pre_hook(layer_idx):
             def hook(module, input):
-                if i == 0:
-                    self._activate_residency()
-                    self.prepare_for_next_req(non_blocking=False)
-                if i not in self._gpu_layers:
-                    # LTX audio VAE traverses decoder.up in reverse order
-                    self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events and self.copy_stream is not None:
-                    torch.get_device_module().current_stream().wait_event(
-                        self._prefetch_events[i]
-                    )
-
-                if self.residency_policy == RESIDENCY_POLICY_STRIDED:
-                    # Top up the stream at every layer rather than in bursts of
-                    # prefetch_size. Under `strided` the next streamed layer can
-                    # be several layers away, so a burst schedule keyed on index
-                    # arithmetic would either skip it or issue it late; asking
-                    # for "the next N streamed layers" is the same request every
-                    # layer and prefetch_layer is idempotent, so the repeats are
-                    # free. This is what buys the wider hiding window: the
-                    # transfer is issued as soon as the previous streamed layer
-                    # is done with, not one layer before it is needed.
-                    for layer_to_prefetch in self._next_streamed(
-                        after=i, count=self.prefetch_size
-                    ):
-                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
-                # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                elif self.prefetch_size and i % self.prefetch_size == 0:
-                    for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
-                        layer_to_prefetch = j % self.num_layers
-                        self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+                self.prepare_layer_for_forward(layer_idx)
 
             return hook
 
-        def make_post_hook(i):
+        def make_post_hook(layer_idx):
             def hook(module, input, output):
-                # previous, we wait here, until the copy stream for next layer is finished,
-                # now with any prefetch_size, only wait for the copy stream, when the copy stream is for the next layer
-                self.release_layer(i)
+                self.finish_layer_forward(layer_idx)
 
             return hook
 
@@ -2453,6 +2460,16 @@ def configure_layerwise_offload_modules(
                 normalized_component_names,
             )
         )
+        # Startup auto residency may replace the configured layerwise baseline
+        # with a reversible resident seed before this post-load setup runs.
+        # Configure only components whose effective placement is still
+        # layerwise; warmup can create managers lazily if it later demotes one.
+        selected_pipeline_component_names = [
+            component_name
+            for component_name in selected_pipeline_component_names
+            if server_args.auto_residency_mode(component_name) is None
+            or server_args.residency_mode(component_name) == LAYERWISE_OFFLOAD
+        ]
 
     if (
         warn_missing

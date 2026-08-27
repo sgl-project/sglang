@@ -51,16 +51,18 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     GIB_BYTES,
-    MAX_LATENCY_EQUIVALENCE_NS,
+    MIN_POST_ADJUSTMENT_REGRESSION_NS,
     PLACEMENT_STATUS_ADJUSTED,
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
     PLACEMENT_STATUS_SKIPPED,
     POST_ADJUSTMENT_REGRESSION_FRACTION,
     AppliedResidencyChange,
+    AutoResidencyPlan,
     AutoResidencyRollbackError,
     DefaultWorkload,
     RankResidencyReport,
+    ResidencyTarget,
     WarmupMemoryRecord,
     apply_residency_changes,
     collect_residency_targets,
@@ -75,6 +77,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     format_plan_summary,
     layerwise_host_pin_capacity_bytes,
     layerwise_pinned_host_bytes,
+    measured_failed_workload_phase_peaks,
     plan_auto_residency,
     plan_summary_payload,
     rank_candidates_by_h2d_savings,
@@ -85,15 +88,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     peek_global_component_residency_manager,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    RESIDENT,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
     host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    is_dit_component_name,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
@@ -207,10 +210,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._auto_residency_applied: list[AppliedResidencyChange] = []
         self._auto_residency_round_sizes: list[int] = []
+        self._auto_residency_budget_correction_bytes = 0
+        self._auto_residency_last_applied_plan: AutoResidencyPlan | None = None
         # Keep every round on one serving objective. Re-warm measurements
         # validate and refine memory constraints, but placement-dependent
         # latency must not rewrite the utility function and cause oscillation.
         self._auto_residency_reference_request_duration_ns: int | None = None
+        self._auto_residency_reference_stage_duration_ns: dict[str, int] = {}
+        self._auto_residency_reference_component_stages: dict[str, tuple[str, ...]] = {}
         # default workload resolved once for the per-request residency hint
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
@@ -411,8 +418,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
 
-        remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
+        # Use the same process-visible capacity as auto residency. Physical
+        # card memory can be larger than this worker's allocator cap or can be
+        # partly occupied by another process; either case would make a hint
+        # based on total device memory unsafe.
+        remaining_gpu_mem_gb = max(
+            0.0,
+            self._auto_residency_budget_bytes() / GIB_BYTES - peak_reserved_gb,
         )
         try:
             can_stay_resident = self.get_can_stay_resident_components(
@@ -757,6 +769,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             phase_used_components["request:untracked"] = ()
             phase_full_weight_transition_components["request:untracked"] = ()
         metrics = req.metrics
+        stage_duration_ms = {}
+        if metrics is not None:
+            profile_to_component_stage = {
+                stage._active_profile_stage_name(): stage._component_stage_name()
+                for stage in self.pipeline.stages
+            }
+            stage_duration_ms = {
+                profile_to_component_stage.get(stage_name, stage_name): duration_ms
+                for stage_name, duration_ms in metrics.stages.items()
+            }
         width, height, num_frames, num_inference_steps = workload
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
@@ -776,7 +798,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 total_duration_ms=(
                     float(metrics.total_duration_ms) if metrics is not None else 0.0
                 ),
-                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
+                stage_duration_ms=stage_duration_ms,
                 step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
             )
         )
@@ -1198,12 +1220,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         strategy because user residency flags cannot control them, and it
         applies no reserve or activation margin.
         """
-        if not self.pipeline or not self.pipeline.modules:
+        if not self.pipeline:
             return []
 
+        modules = self._auto_residency_modules()
+        if not modules:
+            return []
         workload = self._default_workload_for_hint()
         candidates = collect_residency_targets(
-            modules=self.pipeline.modules,
+            modules=modules,
             residency_mode_of=self.server_args.residency_mode,
             # The hint also covers explicitly offloaded components: the user
             # chose offload and should learn when the headroom no longer
@@ -1232,7 +1257,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 remaining_gpu_mem_gb -= usage_gb
         return can_stay_resident
 
-    def apply_auto_residency(self) -> OutputBatch:
+    def apply_auto_residency(self, *, pre_warmup: bool = False) -> OutputBatch:
         """Apply one warmup-calibrated residency adjustment round.
 
         Every rank executes this handler at the same queue position; the plan
@@ -1255,8 +1280,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         try:
             workload = resolve_default_workload(self.server_args)
             workload = resolve_measured_default_workload(workload, records)
-            local_report = self._build_auto_residency_report(
-                workload=workload, records=records
+            local_report = (
+                self._build_pre_warmup_auto_residency_report(workload=workload)
+                if pre_warmup
+                else self._build_auto_residency_report(
+                    workload=workload, records=records
+                )
             )
         except Exception as e:
             logger.warning(
@@ -1276,13 +1305,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 skip_reason=describe_error(e),
             )
         reports = self._auto_residency_all_gather(local_report)
-        if self._auto_residency_round_sizes:
+        recovering_from_oom = any(report.warmup_oom for report in reports)
+        if (
+            not pre_warmup
+            and self._auto_residency_round_sizes
+            and not recovering_from_oom
+        ):
             regressions = []
             for report in reports:
                 reference_ns = report.estimated_request_duration_ns
                 measured_ns = report.measured_request_duration_ns
                 tolerance_ns = max(
-                    MAX_LATENCY_EQUIVALENCE_NS,
+                    MIN_POST_ADJUSTMENT_REGRESSION_NS,
                     int(reference_ns * POST_ADJUSTMENT_REGRESSION_FRACTION),
                 )
                 if reference_ns > 0 and measured_ns > reference_ns + tolerance_ns:
@@ -1304,9 +1338,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         plan = plan_auto_residency(reports=reports)
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if (
-            self._auto_residency_round_sizes
+            not pre_warmup
+            and self._auto_residency_round_sizes
+            and not recovering_from_oom
             and plan.current_placement_reserve_shortfall_bytes > 0
         ):
+            self._record_auto_residency_budget_correction(
+                plan.current_placement_reserve_shortfall_bytes
+            )
             shortfall_gib = plan.current_placement_reserve_shortfall_bytes / GIB_BYTES
             if self.is_output_rank:
                 logger.warning(
@@ -1318,6 +1357,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
                 already_failed=False,
                 latest_round_only=True,
+                retryable=True,
             )
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
@@ -1335,13 +1375,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         try:
             newly_applied = apply_residency_changes(
                 plan=plan,
-                modules=self.pipeline.modules,
+                modules=self._auto_residency_modules(),
                 server_args=self.server_args,
             )
             if not newly_applied:
                 raise RuntimeError("placement plan applied no residency changes")
             self._auto_residency_applied.extend(newly_applied)
             self._auto_residency_round_sizes[-1] = len(newly_applied)
+            self._auto_residency_last_applied_plan = plan
         except AutoResidencyRollbackError as e:
             logger.error(
                 "Auto residency adjustment failed on rank %d and the rank "
@@ -1393,6 +1434,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         cause: str | None,
         already_failed: bool,
         latest_round_only: bool = False,
+        retryable: bool = False,
     ) -> OutputBatch:
         """Roll this rank back and gather the replica-wide outcome.
 
@@ -1429,7 +1471,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 error=(
                     f"auto residency adjustment failed; {restored} restored: {cause}"
                 ),
-                output={"status": PLACEMENT_STATUS_ROLLED_BACK},
+                output={
+                    "status": PLACEMENT_STATUS_ROLLED_BACK,
+                    "retryable": retryable,
+                },
             )
         if self.is_output_rank:
             if self._auto_residency_applied:
@@ -1445,6 +1490,142 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
         return OutputBatch(output={"status": PLACEMENT_STATUS_ROLLED_BACK})
 
+    def _record_auto_residency_budget_correction(self, shortfall_bytes: int) -> None:
+        """Exclude a layout whose calibrated peak exceeded its VRAM model."""
+        previous_plan = self._auto_residency_last_applied_plan
+        if previous_plan is None:
+            return
+        runtime_resources = [
+            resource_name
+            for resource_name in previous_plan.resource_budget_bytes
+            if resource_name.startswith("gpu:")
+            and not resource_name.endswith(":placement-transition")
+        ]
+        if not runtime_resources:
+            return
+        minimum_slack = min(
+            previous_plan.resource_budget_bytes[resource_name]
+            - previous_plan.resource_delta_bytes.get(resource_name, 0)
+            for resource_name in runtime_resources
+        )
+        correction = max(
+            shortfall_bytes,
+            max(0, minimum_slack) + 64 * 1024**2,
+        )
+        self._auto_residency_budget_correction_bytes += correction
+
+    def _auto_residency_budget_bytes(self) -> int:
+        # Free VRAM plus this process's reserved allocator pool excludes memory
+        # held by unrelated processes while preserving reusable local capacity.
+        free_bytes, _ = torch.get_device_module().mem_get_info()
+        budget_bytes = int(free_bytes) + int(
+            torch.get_device_module().memory_reserved()
+        )
+        test_cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
+        if test_cap_gib is not None:
+            budget_bytes = min(budget_bytes, int(test_cap_gib * GIB_BYTES))
+        return budget_bytes
+
+    def _collect_auto_residency_targets(
+        self, workload: DefaultWorkload
+    ) -> list[ResidencyTarget]:
+        assert self.pipeline is not None
+        modules = self._auto_residency_modules()
+        return collect_residency_targets(
+            modules=modules,
+            residency_mode_of=self.server_args.residency_mode,
+            baseline_residency_mode_of=(self.server_args.configured_residency_mode),
+            explicit_residency_mode_of=self.server_args.explicit_residency_mode,
+            custom_strategy_names=self.pipeline.component_residency_strategies,
+            num_inference_steps=workload.num_inference_steps,
+            allow_host_pin_reallocation=True,
+            mixed_dtype_components=self._mixed_dtype_residency_components(),
+            required_resident_components={
+                name
+                for name in modules
+                if self.server_args.component_residency_requirement(name) is not None
+            },
+            layerwise_tuning_of=lambda name, dit_group: (
+                self.server_args.layerwise_tuning_for(name, dit_group=dit_group)
+            ),
+            pin_cpu_memory=self.server_args.pin_cpu_memory,
+        )
+
+    def _build_pre_warmup_auto_residency_report(
+        self, *, workload: DefaultWorkload
+    ) -> RankResidencyReport:
+        """Build exact weight lower bounds before the first serving forward."""
+        if self.pipeline is None:
+            return RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=0,
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason="pipeline not initialized",
+            )
+
+        candidates = self._collect_auto_residency_targets(workload)
+        if not candidates:
+            return RankResidencyReport(
+                rank=self.rank,
+                budget_bytes=self._auto_residency_budget_bytes(),
+                estimated_peak_bytes=None,
+                candidates=[],
+                skip_reason="no eligible residency alternatives",
+            )
+        modules = self._auto_residency_modules()
+        active_weights = component_runtime_weight_bytes(modules)
+        current_device_weights = component_current_device_weight_bytes(modules)
+        permanent_components = {
+            candidate.component_name
+            for candidate in candidates
+            if candidate.current_placement and candidate.permanent_residency
+        }
+        baseline_allocated = int(torch.get_device_module().memory_allocated())
+        phase_peaks = {}
+        phase_active = {}
+        phase_used = {}
+        for component_name in sorted({c.component_name for c in candidates}):
+            phase_name = f"static:{component_name}"
+            phase_peaks[phase_name] = baseline_allocated + (
+                0
+                if component_name in permanent_components
+                else active_weights.get(component_name, 0)
+            )
+            phase_active[phase_name] = tuple(
+                sorted(permanent_components | {component_name})
+            )
+            phase_used[phase_name] = (component_name,)
+
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
+        )
+        pin_budget = self.server_args.host_pin_budget()
+        return RankResidencyReport(
+            rank=self.rank,
+            budget_bytes=self._auto_residency_budget_bytes(),
+            estimated_peak_bytes=max(phase_peaks.values()),
+            estimated_peak_bytes_by_phase=phase_peaks,
+            active_components_by_phase=phase_active,
+            used_components_by_phase=phase_used,
+            current_device_weight_bytes_by_component=current_device_weights,
+            current_active_weight_bytes_by_component=active_weights,
+            node_rank=self.server_args.node_rank,
+            pinned_host_bytes=layerwise_pinned_host_bytes(
+                modules, pin_budget=pin_budget
+            ),
+            host_pin_capacity_bytes=layerwise_host_pin_capacity_bytes(
+                modules, pin_budget=pin_budget
+            ),
+            host_transition_headroom_bytes=max(
+                0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+            )
+            // local_worker_count,
+            device_transition_allocated_bytes=baseline_allocated,
+            candidates=candidates,
+            require_feasible_placement=True,
+        )
+
     def _build_auto_residency_report(
         self, *, workload: DefaultWorkload, records: List[WarmupMemoryRecord]
     ) -> RankResidencyReport:
@@ -1455,23 +1636,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             skip_reason = "no server warmup measurements"
         elif workload.workload_units() is None:
             skip_reason = "default workload resolution unknown"
-        if skip_reason is None:
-            # A probe that failed at or below the target is a measurement, not
-            # missing data: the card cannot hold the default workload as it is
-            # already configured, and increasing residency would only add to it.
-            blocking = [
-                record
-                for record in records
-                if not record.succeeded
-                and record.workload_units() <= workload.workload_units()
-            ]
-            if blocking:
-                smallest = min(blocking, key=lambda record: record.workload_units())
-                skip_reason = (
-                    f"warmup failed at {smallest.width}x{smallest.height}"
-                    f"x{smallest.num_frames}f, which the default workload "
-                    f"{workload.describe()} meets or exceeds"
-                )
         if skip_reason is not None:
             return RankResidencyReport(
                 rank=self.rank,
@@ -1480,82 +1644,119 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 candidates=[],
                 skip_reason=skip_reason,
             )
+        modules = self._auto_residency_modules()
         target_units = workload.workload_units()
         assert target_units is not None
-        runtime_weights_by_component = component_runtime_weight_bytes(
-            self.pipeline.modules
+        warmup_oom = any(
+            not record.succeeded and record.workload_units() <= target_units
+            for record in records
         )
-        estimated_peak_bytes = estimate_default_workload_peak_bytes(
-            records=records,
-            target_units=target_units,
-            constant_weight_bytes=max(runtime_weights_by_component.values(), default=0),
-        )
+        runtime_weights_by_component = component_runtime_weight_bytes(modules)
+        if warmup_oom:
+            (
+                estimated_peak_bytes,
+                estimated_phase_peaks,
+                active_components_by_phase,
+                used_components_by_phase,
+                full_weight_transition_components_by_phase,
+            ) = measured_failed_workload_phase_peaks(
+                records=records,
+                target_units=target_units,
+            )
+        else:
+            estimated_peak_bytes = estimate_default_workload_peak_bytes(
+                records=records,
+                target_units=target_units,
+                constant_weight_bytes=max(
+                    runtime_weights_by_component.values(), default=0
+                ),
+            )
+            (
+                estimated_phase_peaks,
+                active_components_by_phase,
+                used_components_by_phase,
+                full_weight_transition_components_by_phase,
+            ) = estimate_workload_phase_peaks(
+                records=records,
+                target_units=target_units,
+                component_weight_bytes=runtime_weights_by_component,
+            )
+        budget_bytes = self._auto_residency_budget_bytes()
+        candidates = self._collect_auto_residency_targets(workload)
+        if warmup_oom:
+            logger.debug(
+                "Auto residency OOM report on rank %d: phase_peaks_gib=%s, "
+                "active=%s, used=%s, candidate_deltas_mib=%s",
+                self.rank,
+                {
+                    phase: round(peak / GIB_BYTES, 3)
+                    for phase, peak in estimated_phase_peaks.items()
+                },
+                active_components_by_phase,
+                used_components_by_phase,
+                [
+                    (
+                        candidate.option_key(),
+                        round(candidate.active_device_delta_bytes / 1024**2),
+                        round(candidate.inactive_device_delta_bytes / 1024**2),
+                        round(candidate.device_transition_delta_bytes / 1024**2),
+                        candidate.current_placement,
+                    )
+                    for candidate in candidates
+                    if is_dit_component_name(candidate.component_name)
+                ],
+            )
         (
-            estimated_phase_peaks,
-            active_components_by_phase,
-            used_components_by_phase,
-            full_weight_transition_components_by_phase,
-        ) = estimate_workload_phase_peaks(
-            records=records,
-            target_units=target_units,
-            component_weight_bytes=runtime_weights_by_component,
-        )
-        # What this process may still grow into: free VRAM plus what its
-        # allocator already reserved. Unlike the raw device total, this
-        # excludes memory held by other processes on a shared GPU.
-        free_bytes, _ = torch.get_device_module().mem_get_info()
-        budget_bytes = int(free_bytes) + int(
-            torch.get_device_module().memory_reserved()
-        )
-        test_cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
-        if test_cap_gib is not None:
-            budget_bytes = min(budget_bytes, int(test_cap_gib * GIB_BYTES))
-        candidates = collect_residency_targets(
-            modules=self.pipeline.modules,
-            residency_mode_of=self.server_args.residency_mode,
-            baseline_residency_mode_of=(self.server_args.configured_residency_mode),
-            explicit_residency_mode_of=self.server_args.explicit_residency_mode,
-            custom_strategy_names=self.pipeline.component_residency_strategies,
-            num_inference_steps=workload.num_inference_steps,
-            allow_host_pin_reallocation=True,
-            mixed_dtype_components=self._mixed_dtype_residency_components(),
-            auto_resident_components={
-                name
-                for name in self.pipeline.modules
-                if self.server_args.auto_residency_mode(name) == RESIDENT
-            },
-            layerwise_tuning_of=lambda name, dit_group: (
-                self.server_args.layerwise_tuning_for(name, dit_group=dit_group)
-            ),
-            pin_cpu_memory=self.server_args.pin_cpu_memory,
-        )
-        measured_request_duration_ns, _, _ = estimate_default_workload_timing(
+            measured_request_duration_ns,
+            measured_stage_duration_ns,
+            measured_component_stages,
+        ) = estimate_default_workload_timing(
             records=records,
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
         )
-        reference_request_duration_ns = self.__dict__.get(
-            "_auto_residency_reference_request_duration_ns"
+        reference_request_duration_ns = (
+            self._auto_residency_reference_request_duration_ns
         )
-        if reference_request_duration_ns is None and measured_request_duration_ns > 0:
+        if (
+            not warmup_oom
+            and reference_request_duration_ns is None
+            and measured_request_duration_ns > 0
+        ):
             reference_request_duration_ns = measured_request_duration_ns
             self._auto_residency_reference_request_duration_ns = (
                 reference_request_duration_ns
             )
+            self._auto_residency_reference_stage_duration_ns = (
+                measured_stage_duration_ns
+            )
+            self._auto_residency_reference_component_stages = measured_component_stages
         estimated_request_duration_ns = (
             reference_request_duration_ns or measured_request_duration_ns
         )
         candidate_latency_savings_ns = estimate_candidate_latency_savings_ns(
             candidates=candidates,
             request_duration_ns=estimated_request_duration_ns,
+            stage_duration_ns=(
+                self._auto_residency_reference_stage_duration_ns
+                or measured_stage_duration_ns
+            ),
+            component_stages=(
+                self._auto_residency_reference_component_stages
+                or measured_component_stages
+            ),
         )
         local_worker_count = max(
             1, self.server_args.num_gpus // self.server_args.nnodes
         )
+        pin_budget = self.server_args.host_pin_budget()
         return RankResidencyReport(
             rank=self.rank,
             budget_bytes=budget_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
+            planning_headroom_correction_bytes=(
+                self._auto_residency_budget_correction_bytes
+            ),
             target_workload_measured=any(
                 record.succeeded and record.workload_units() >= target_units
                 for record in records
@@ -1567,12 +1768,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 full_weight_transition_components_by_phase
             ),
             current_device_weight_bytes_by_component=(
-                component_current_device_weight_bytes(self.pipeline.modules)
+                component_current_device_weight_bytes(modules)
             ),
+            current_active_weight_bytes_by_component=runtime_weights_by_component,
             node_rank=self.server_args.node_rank,
-            pinned_host_bytes=layerwise_pinned_host_bytes(self.pipeline.modules),
+            pinned_host_bytes=layerwise_pinned_host_bytes(
+                modules, pin_budget=pin_budget
+            ),
             host_pin_capacity_bytes=layerwise_host_pin_capacity_bytes(
-                self.pipeline.modules
+                modules, pin_budget=pin_budget
             ),
             host_transition_headroom_bytes=max(
                 0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
@@ -1585,6 +1789,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             measured_request_duration_ns=measured_request_duration_ns,
             candidate_latency_savings_ns=candidate_latency_savings_ns,
             candidates=candidates,
+            warmup_oom=warmup_oom,
             skip_reason=skip_reason,
         )
 
@@ -1604,6 +1809,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if manager is None:
             return set()
         return manager.components_with_mixed_use_dtypes()
+
+    def _auto_residency_modules(self) -> dict[str, object]:
+        assert self.pipeline is not None
+        manager = peek_global_component_residency_manager()
+        if manager is None:
+            return dict(self.pipeline.modules)
+        return manager.placement_modules()
 
     def _rollback_applied_residency_changes(
         self, *, latest_round_only: bool = False
@@ -1626,7 +1838,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         try:
             rollback_residency_changes(
                 applied=applied,
-                modules=self.pipeline.modules,
+                modules=self._auto_residency_modules(),
                 server_args=self.server_args,
             )
         except Exception as e:

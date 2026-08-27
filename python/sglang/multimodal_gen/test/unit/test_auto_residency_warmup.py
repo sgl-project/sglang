@@ -27,6 +27,156 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class TestAutoResidencyWarmup(unittest.TestCase):
+    def test_residency_hint_uses_effective_device_budget(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker._auto_residency_budget_bytes = mock.Mock(return_value=12 * GIB_BYTES)
+        worker.get_can_stay_resident_components = mock.Mock(return_value=[])
+        output = SimpleNamespace(metrics=None)
+        snapshot = SimpleNamespace(
+            peak_reserved_mb=11 * 1024,
+            peak_allocated_mb=10 * 1024,
+        )
+
+        with mock.patch.object(
+            gpu_worker_module, "capture_memory_snapshot", return_value=snapshot
+        ):
+            worker.do_mem_analysis(output)
+
+        worker.get_can_stay_resident_components.assert_called_once_with(1.0)
+        self.assertEqual(output.peak_memory_mb, 11 * 1024)
+
+    def test_sync_startup_uses_shared_auto_residency_sequence(self):
+        server_args = SimpleNamespace()
+        forward = mock.Mock()
+
+        with (
+            mock.patch.object(
+                server_warmup, "maybe_apply_pre_warmup_auto_residency"
+            ) as apply_static,
+            mock.patch.object(server_warmup, "run_async_client_warmup") as warmup,
+            mock.patch.object(server_warmup, "maybe_apply_auto_residency") as refine,
+            mock.patch.object(
+                server_warmup,
+                "should_run_synthetic_server_warmup",
+                return_value=True,
+            ),
+        ):
+            server_warmup.run_sync_startup_warmup(server_args, forward)
+
+        apply_static.assert_awaited_once()
+        warmup.assert_awaited_once()
+        refine.assert_awaited_once()
+        self.assertIs(apply_static.await_args.args[0], server_args)
+        self.assertIs(warmup.await_args.args[0], server_args)
+        self.assertIs(refine.await_args.args[0], server_args)
+        self.assertTrue(warmup.await_args.kwargs["fail_open"])
+        self.assertIs(apply_static.await_args.args[1], warmup.await_args.args[1])
+        self.assertIs(apply_static.await_args.args[1], refine.await_args.args[1])
+
+    def test_sync_startup_static_planning_does_not_require_warmup(self):
+        with (
+            mock.patch.object(
+                server_warmup, "maybe_apply_pre_warmup_auto_residency"
+            ) as apply_static,
+            mock.patch.object(
+                server_warmup,
+                "should_run_synthetic_server_warmup",
+                return_value=False,
+            ),
+            mock.patch.object(server_warmup, "run_async_client_warmup") as warmup,
+            mock.patch.object(server_warmup, "maybe_apply_auto_residency") as refine,
+        ):
+            server_warmup.run_sync_startup_warmup(SimpleNamespace(), mock.Mock())
+
+        apply_static.assert_awaited_once()
+        warmup.assert_not_awaited()
+        refine.assert_not_awaited()
+
+    def test_pre_warmup_planner_uses_static_action(self):
+        actions = []
+
+        async def forward(req):
+            actions.append(req.action)
+            return OutputBatch(output={"status": PLACEMENT_STATUS_SKIPPED})
+
+        with mock.patch.object(
+            server_warmup,
+            "should_apply_pre_warmup_auto_residency",
+            return_value=True,
+        ):
+            asyncio.run(
+                server_warmup.maybe_apply_pre_warmup_auto_residency(
+                    SimpleNamespace(), forward
+                )
+            )
+
+        self.assertEqual(actions, ["apply_static"])
+
+    def test_auto_residency_uses_first_oom_without_degrading_probe(self):
+        req = SimpleNamespace()
+        forward = mock.AsyncMock(return_value=OutputBatch(error="CUDA out of memory"))
+
+        with (
+            mock.patch.object(
+                server_warmup, "auto_residency_skip_reason", return_value=None
+            ),
+            mock.patch.object(
+                server_warmup,
+                "should_include_warmup_image",
+                return_value=False,
+            ),
+            mock.patch.object(
+                server_warmup, "build_client_warmup_reqs", return_value=[req]
+            ),
+            mock.patch.object(server_warmup, "_degrade_after_oom") as degrade,
+        ):
+            asyncio.run(
+                server_warmup.run_async_client_warmup(
+                    SimpleNamespace(), forward, fail_open=True
+                )
+            )
+
+        forward.assert_awaited_once_with(req)
+        degrade.assert_not_called()
+
+    def test_non_auto_warmup_keeps_oom_probe_degradation(self):
+        req = SimpleNamespace()
+        lighter = SimpleNamespace()
+        forward = mock.AsyncMock(
+            side_effect=[
+                OutputBatch(error="CUDA out of memory"),
+                OutputBatch(),
+            ]
+        )
+
+        with (
+            mock.patch.object(
+                server_warmup,
+                "auto_residency_skip_reason",
+                return_value="not auto",
+            ),
+            mock.patch.object(
+                server_warmup,
+                "should_include_warmup_image",
+                return_value=False,
+            ),
+            mock.patch.object(
+                server_warmup, "build_client_warmup_reqs", return_value=[req]
+            ),
+            mock.patch.object(
+                server_warmup, "_degrade_after_oom", return_value=lighter
+            ) as degrade,
+        ):
+            asyncio.run(
+                server_warmup.run_async_client_warmup(SimpleNamespace(), forward)
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in forward.await_args_list],
+            [req, lighter],
+        )
+        degrade.assert_called_once_with(mock.ANY, req)
+
     def test_worker_rolls_back_a_materially_slower_calibrated_round(self):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
@@ -49,14 +199,17 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         )
         worker._rollback_everywhere = mock.Mock(return_value=rolled_back)
 
-        with mock.patch.object(
-            gpu_worker_module,
-            "resolve_default_workload",
-            return_value=SimpleNamespace(),
-        ), mock.patch.object(
-            gpu_worker_module,
-            "resolve_measured_default_workload",
-            return_value=SimpleNamespace(),
+        with (
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_measured_default_workload",
+                return_value=SimpleNamespace(),
+            ),
         ):
             response = worker.apply_auto_residency()
 
@@ -75,6 +228,11 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker.server_args = SimpleNamespace()
         worker._auto_residency_warmup_records = []
         worker._auto_residency_round_sizes = [1]
+        worker._auto_residency_budget_correction_bytes = 0
+        worker._auto_residency_last_applied_plan = AutoResidencyPlan(
+            resource_budget_bytes={"gpu:rank0:denoise": 8 * GIB_BYTES},
+            resource_delta_bytes={"gpu:rank0:denoise": 7 * GIB_BYTES},
+        )
         worker._build_auto_residency_report = mock.Mock(
             return_value=RankResidencyReport(
                 rank=0,
@@ -110,6 +268,11 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             cause="VRAM reserve exceeded by 2.0 GiB",
             already_failed=False,
             latest_round_only=True,
+            retryable=True,
+        )
+        self.assertEqual(
+            worker._auto_residency_budget_correction_bytes,
+            2 * GIB_BYTES,
         )
 
     def test_worker_rollback_response_rewarms_the_restored_layout(self):
@@ -144,18 +307,22 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             rewarm=True,
         )
 
-    def test_replans_until_the_calibrated_layout_reaches_a_fixed_point(self):
+    def test_retryable_rollback_rewarms_and_replans(self):
         responses = iter(
             [
-                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
-                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
+                OutputBatch(
+                    error="VRAM reserve exceeded",
+                    output={
+                        "status": PLACEMENT_STATUS_ROLLED_BACK,
+                        "retryable": True,
+                    },
+                ),
                 OutputBatch(output={"status": PLACEMENT_STATUS_SKIPPED}),
             ]
         )
         actions = []
 
         async def forward(req):
-            self.assertIsInstance(req, AutoResidencyReq)
             actions.append(req.action)
             return next(responses)
 
@@ -172,8 +339,76 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
-        self.assertEqual(actions, ["apply", "apply", "apply"])
-        self.assertEqual(rewarm.await_count, 2)
+        self.assertEqual(actions, ["apply", "apply"])
+        rewarm.assert_awaited_once_with(
+            server_args,
+            forward,
+            fail_open=True,
+            rewarm=True,
+        )
+
+    def test_oom_recovery_keeps_demotion_and_replans(self):
+        responses = iter(
+            [
+                OutputBatch(
+                    output={
+                        "status": PLACEMENT_STATUS_ADJUSTED,
+                        "recovering_from_oom": True,
+                    }
+                ),
+                OutputBatch(output={"status": PLACEMENT_STATUS_SKIPPED}),
+            ]
+        )
+        actions = []
+
+        async def forward(req):
+            actions.append(req.action)
+            return next(responses)
+
+        rewarm = mock.AsyncMock(side_effect=RuntimeError("CUDA out of memory"))
+        server_args = SimpleNamespace(
+            performance_mode="auto",
+            warmup_resolutions=None,
+        )
+        with (
+            mock.patch.object(
+                server_warmup, "auto_residency_skip_reason", return_value=None
+            ),
+            mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
+        ):
+            asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
+
+        self.assertEqual(actions, ["apply", "apply"])
+        rewarm.assert_awaited_once_with(
+            server_args,
+            forward,
+            fail_open=False,
+            rewarm=True,
+        )
+
+    def test_stops_after_one_successful_calibrated_adjustment(self):
+        actions = []
+
+        async def forward(req):
+            self.assertIsInstance(req, AutoResidencyReq)
+            actions.append(req.action)
+            return OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED})
+
+        rewarm = mock.AsyncMock()
+        server_args = SimpleNamespace(
+            performance_mode="auto",
+            warmup_resolutions=None,
+        )
+        with (
+            mock.patch.object(
+                server_warmup, "auto_residency_skip_reason", return_value=None
+            ),
+            mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
+        ):
+            asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
+
+        self.assertEqual(actions, ["apply"])
+        rewarm.assert_awaited_once()
 
     def test_failed_first_calibration_rolls_back_and_rewarms(self):
         actions = []
@@ -228,22 +463,13 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
-    def test_apply_rpc_failure_after_calibration_aborts_without_rollback(self):
+    def test_successful_calibration_does_not_start_another_apply_round(self):
         actions = []
-        responses = iter(
-            [
-                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
-                RuntimeError("rpc failed"),
-            ]
-        )
 
         async def forward(req):
             self.assertIsInstance(req, AutoResidencyReq)
             actions.append(req.action)
-            response = next(responses)
-            if isinstance(response, Exception):
-                raise response
-            return response
+            return OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED})
 
         rewarm = mock.AsyncMock()
         server_args = SimpleNamespace(
@@ -255,14 +481,10 @@ class TestAutoResidencyWarmup(unittest.TestCase):
                 server_warmup, "auto_residency_skip_reason", return_value=None
             ),
             mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "auto residency apply failed after a calibrated adjustment",
-            ),
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
-        self.assertEqual(actions, ["apply", "apply"])
+        self.assertEqual(actions, ["apply"])
         self.assertEqual(rewarm.await_count, 1)
 
     def test_failed_later_round_keeps_earlier_calibrated_promotions(self):

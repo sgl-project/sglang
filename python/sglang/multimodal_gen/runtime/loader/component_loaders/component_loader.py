@@ -133,6 +133,7 @@ class ComponentLoader(ABC):
     # Gates only --component-quantizations.<name>. Quantization declared by a
     # checkpoint is discovered and admitted by the component's normal loader.
     supports_online_quantization_override = False
+    supports_fsdp_loading = False
 
     _loaders_registered = False
 
@@ -639,6 +640,19 @@ class PipelineComponentLoader:
     """
     Utility class for loading the components in a pipeline.
     """
+
+    @staticmethod
+    def supports_fsdp_loading(
+        component_name: str,
+        transformers_or_diffusers: str,
+        component_architecture: str | None = None,
+    ) -> bool:
+        loader = ComponentLoader.for_component_type(
+            component_name,
+            transformers_or_diffusers,
+            component_architecture,
+        )
+        return loader.supports_fsdp_loading
 
     @staticmethod
     def load_component(

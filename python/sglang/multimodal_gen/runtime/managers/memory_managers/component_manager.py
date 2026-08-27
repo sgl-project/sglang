@@ -143,6 +143,8 @@ class ComponentResidencyManager:
         self._warmup_phase_used_components: tuple[str, ...] = ()
         self._warmup_phase_full_weight_transition_components: tuple[str, ...] = ()
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
+        self._warmup_phase_occurrences: dict[str, int] = {}
+        self._failed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
@@ -232,6 +234,8 @@ class ComponentResidencyManager:
         self._warmup_phase_used_components = ()
         self._warmup_phase_full_weight_transition_components = ()
         self._warmup_phase_peaks = {}
+        self._warmup_phase_occurrences = {}
+        self._failed_warmup_phase_peaks = {}
         self._completed_warmup_phase_peaks = {}
         if self._track_warmup_memory:
             # GPUWorker reset the request peak before entering the pipeline.
@@ -298,6 +302,7 @@ class ComponentResidencyManager:
                     components=components,
                     used_components=used_components,
                     full_weight_transition_components=transitions,
+                    new_occurrence=False,
                 )
 
     def begin_stage(self) -> None:
@@ -657,10 +662,15 @@ class ComponentResidencyManager:
         components: tuple[str, ...],
         used_components: tuple[str, ...],
         full_weight_transition_components: tuple[str, ...] = (),
+        new_occurrence: bool = True,
     ) -> None:
         if not self._track_warmup_memory:
             return
         self._record_warmup_phase_peak()
+        if new_occurrence:
+            occurrence = self._warmup_phase_occurrences.get(key, 0)
+            self._warmup_phase_occurrences[key] = occurrence + 1
+            key = key if occurrence == 0 else f"{key}:occurrence:{occurrence}"
         self._warmup_phase_key = key
         self._warmup_phase_components = tuple(sorted(set(components)))
         self._warmup_phase_used_components = tuple(sorted(set(used_components)))
@@ -762,9 +772,18 @@ class ComponentResidencyManager:
         self,
     ) -> dict[str, WarmupPhasePeak]:
         """Return and clear the most recently completed warmup phase peaks."""
-        peaks = self._completed_warmup_phase_peaks
+        peaks = dict(self._failed_warmup_phase_peaks)
+        peaks.update(self._completed_warmup_phase_peaks)
+        self._failed_warmup_phase_peaks = {}
         self._completed_warmup_phase_peaks = {}
         return peaks
+
+    def capture_failed_warmup_phase(self) -> None:
+        """Preserve failure attribution before request cleanup changes phase."""
+        if not self._track_warmup_memory:
+            return
+        self._record_warmup_phase_peak()
+        self._failed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
 
     def current_device_components(self) -> tuple[str, ...]:
         """Components whose complete module is currently on the device.
@@ -774,6 +793,19 @@ class ComponentResidencyManager:
         the managed phase timeline instead.
         """
         return self._warmup_active_components()
+
+    def placement_modules(self) -> dict[str, object]:
+        """Return every module available to post-request placement planning.
+
+        Some stages materialize request-dependent components lazily, so those
+        modules are absent from ``pipeline.modules`` until they are first used.
+        ``_modules_seen`` retains the concrete module passed through the
+        residency manager for the current request. Pipeline-owned modules win
+        if a component was replaced after it was observed.
+        """
+        modules = dict(self._modules_seen)
+        modules.update(self.pipeline.modules)
+        return modules
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)

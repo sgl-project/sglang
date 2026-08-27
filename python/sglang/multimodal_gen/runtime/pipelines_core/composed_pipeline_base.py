@@ -30,6 +30,17 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
+    ComponentWeightEstimate,
+    ComponentWeightSource,
+    estimate_component_weight_inventory,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    is_image_encoder_component_name,
+    is_legacy_dit_offload_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -57,6 +68,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
 
@@ -142,6 +154,24 @@ class ComposedPipelineBase(ABC):
 
         # [module_name, gpu memory usage]
         self.memory_usages: dict[str, float] = {}
+        self.component_weight_inventory: list[ComponentWeightEstimate] = []
+        if loaded_modules is None and os.path.isfile(self.model_path):
+            # Registered single-file pipelines contain a standalone DiT and
+            # bypass the normal model-index component loop.
+            target_dtype = resolve_component_precision(server_args, "transformer")
+            self.prepare_component_weight_inventory(
+                server_args,
+                [
+                    ComponentWeightSource(
+                        "transformer",
+                        self.model_path,
+                        target_element_size=(
+                            target_dtype.itemsize if target_dtype is not None else None
+                        ),
+                        supports_fsdp_loading=True,
+                    )
+                ],
+            )
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
@@ -360,6 +390,83 @@ class ComposedPipelineBase(ABC):
         logger.debug("Resolved component path: %s", component_model_path)
         return component_model_path
 
+    def additional_component_weight_sources(
+        self, server_args: ServerArgs
+    ) -> list[ComponentWeightSource]:
+        """Selected weight sources loaded outside the base component loop."""
+        return []
+
+    @staticmethod
+    def _component_target_element_size(
+        component_name: str, server_args: ServerArgs
+    ) -> int | None:
+        target_dtype = resolve_component_precision(server_args, component_name)
+        if target_dtype is None:
+            fallback_component = None
+            if is_legacy_dit_offload_component_name(component_name):
+                fallback_component = "transformer"
+            elif is_vae_component_name(component_name):
+                fallback_component = "vae"
+            elif is_image_encoder_component_name(component_name):
+                fallback_component = "image_encoder"
+            elif is_text_encoder_component_name(component_name):
+                fallback_component = "text_encoder"
+            if fallback_component is not None:
+                target_dtype = resolve_component_precision(
+                    server_args, fallback_component
+                )
+        return target_dtype.itemsize if target_dtype is not None else None
+
+    @staticmethod
+    def _component_weight_source(
+        spec: ComponentLoadSpec, server_args: ServerArgs
+    ) -> ComponentWeightSource:
+        weights_path = server_args.component_weights_paths.get(spec.load_module_name)
+        if (
+            weights_path is None
+            and spec.load_module_name == "transformer"
+            and server_args.transformer_weights_path is not None
+        ):
+            weights_path = server_args.transformer_weights_path
+        return ComponentWeightSource(
+            component_name=spec.module_name,
+            component_model_path=weights_path or spec.component_model_path,
+            target_element_size=ComposedPipelineBase._component_target_element_size(
+                spec.load_module_name, server_args
+            ),
+            supports_fsdp_loading=PipelineComponentLoader.supports_fsdp_loading(
+                spec.module_name,
+                spec.transformers_or_diffusers,
+                spec.architecture,
+            ),
+        )
+
+    def prepare_component_weight_inventory(
+        self, server_args: ServerArgs, sources: list[ComponentWeightSource]
+    ) -> None:
+        """Resolve selected checkpoint weights before component loading."""
+        self.component_weight_inventory = estimate_component_weight_inventory(sources)
+        known = {
+            item.component_name: round(item.checkpoint_bytes / 1024**3, 2)
+            for item in self.component_weight_inventory
+            if item.checkpoint_bytes is not None and item.checkpoint_bytes > 0
+        }
+        unknown = [
+            item.component_name
+            for item in self.component_weight_inventory
+            if item.checkpoint_bytes is None
+        ]
+        logger.debug(
+            "Pre-load component weights (GiB): known=%s unknown=%s",
+            known,
+            unknown,
+        )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.initial_residency import (
+            maybe_seed_initial_residency,
+        )
+
+        maybe_seed_initial_residency(server_args, self.component_weight_inventory)
+
     def load_modules(
         self,
         server_args: ServerArgs,
@@ -528,10 +635,17 @@ class ComposedPipelineBase(ABC):
                 )
             )
 
-        # reorder loading order to avoid OOM
-        component_load_specs: ComponentLoadSpec = order_component_load_specs(
-            component_load_specs
+        self.prepare_component_weight_inventory(
+            server_args,
+            [
+                self._component_weight_source(spec, server_args)
+                for spec in component_load_specs
+            ]
+            + self.additional_component_weight_sources(server_args),
         )
+
+        # reorder loading order to avoid OOM
+        component_load_specs = order_component_load_specs(component_load_specs)
         logger.info(
             "Memory-aware component load order: %s",
             [spec.module_name for spec in component_load_specs],

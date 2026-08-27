@@ -16,10 +16,11 @@ default frames, batch=1). Larger shapes, batches, or multi-image inputs need
 explicit ``--component-residency``.
 
 Loading and serving are deliberately separate placement states. The existing
-auto policy provides the initial state; when that state can complete loading
-and calibration, this module optimizes the long-lived serving state and
-validates the transition with a post-placement warmup. It does not force a
-single placement to serve two different lifecycle objectives.
+auto policy provides the initial state. This module then optimizes the
+long-lived serving state and validates the transition with a post-placement
+warmup. A failed default-workload probe can demote that initial state and retry;
+successful probes may promote or rebalance it. It does not force a single
+placement to serve two different lifecycle objectives.
 """
 
 from __future__ import annotations
@@ -80,23 +81,29 @@ ACTIVATION_EXTRAPOLATION_MARGIN = 1.2
 MEASURED_VRAM_RESERVE_FRACTION = 0.05
 EXTRAPOLATED_VRAM_RESERVE_FRACTION = 0.10
 MIN_VRAM_RESERVE_BYTES = 4 * GIB_BYTES
+# A failed or not-yet-run target workload still needs a useful activation
+# allowance on small cards. Three GiB covered the measured image-model decode
+# and denoise gap without applying the datacenter-card 4 GiB floor verbatim.
+MIN_UNCALIBRATED_VRAM_RESERVE_BYTES = 3 * GIB_BYTES
 # The absolute floor is sized for datacenter cards, where either fraction can
 # dominate. On a 12 GiB card a flat 4 GiB would fence off a third of the device,
 # so cap the floor as a share of what is actually there.
 MAX_VRAM_RESERVE_FRACTION = 0.20
+MAX_MEASURED_VRAM_RESERVE_FRACTION = 0.10
 
-# A feasible placement is not automatically useful. Predictions inside this
-# interval are treated as latency-equivalent, then the joint optimizer chooses
-# the option with the lowest additional VRAM and HostPin use. The raw estimate
-# is already an upper bound: transfer time is capped by the measured request.
+# The transfer model ranks feasible placements; the post-adjustment warmup is
+# the authority on whether a selected placement actually helped. Do not apply
+# a request-duration-relative utility tolerance here: on long video requests it
+# can hide an entire encoder transfer and leave useful VRAM idle.
 ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
-MIN_LATENCY_EQUIVALENCE_NS = 50_000_000
-MAX_LATENCY_EQUIVALENCE_NS = 100_000_000
-LATENCY_EQUIVALENCE_FRACTION = 0.01
-# The transfer model ranks feasible placements; the mandatory warmup is the
-# authority on whether a selected placement actually helped. Allow normal
-# measurement noise, but undo a round whose calibrated request is materially
-# slower than the original layout.
+# Pageable CUDA copies first stage through an internal pinned buffer and do not
+# overlap layer compute like the explicit pinned path. H200 measurements put
+# their effective layer-streaming cost near 3x the pinned path.
+PAGEABLE_H2D_COST_MULTIPLIER = 3
+AUTO_PLACEMENT_LATENCY_TOLERANCE_NS = 0
+# Allow normal measurement noise, but undo a round whose calibrated request is
+# materially slower than the original layout.
+MIN_POST_ADJUSTMENT_REGRESSION_NS = 100_000_000
 POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
 
 PLACEMENT_STATUS_SKIPPED = "skipped"
@@ -232,12 +239,17 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     rank: int
     budget_bytes: int
     estimated_peak_bytes: int | None
+    # Conservative margin learned from a failed candidate. It constrains only
+    # future growth: the current placement was measured against the physical
+    # budget and must not become retroactively infeasible after a rollback.
+    planning_headroom_correction_bytes: int = 0
     target_workload_measured: bool = False
     estimated_peak_bytes_by_phase: dict[str, int] = {}
     active_components_by_phase: dict[str, tuple[str, ...]] = {}
     used_components_by_phase: dict[str, tuple[str, ...]] = {}
     full_weight_transition_components_by_phase: dict[str, tuple[str, ...]] = {}
     current_device_weight_bytes_by_component: dict[str, int] = {}
+    current_active_weight_bytes_by_component: dict[str, int] = {}
     node_rank: int = 0
     pinned_host_bytes: int = 0
     host_pin_capacity_bytes: int = 0
@@ -247,6 +259,12 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     measured_request_duration_ns: int = 0
     candidate_latency_savings_ns: dict[str, int] = {}
     candidates: list[ResidencyTarget] = []
+    # The current placement could not execute the default workload. Its phase
+    # budgets are intentionally allowed to be negative so the joint solver
+    # must select a lower-memory complete target state instead of treating the
+    # measured zero-delta placement as feasible.
+    warmup_oom: bool = False
+    require_feasible_placement: bool = False
     skip_reason: str | None = None
 
 
@@ -257,7 +275,9 @@ class AutoResidencyPlan(msgspec.Struct, frozen=True):
     reserve_bytes: int = 0
     budget_bytes: int = 0
     resource_budget_bytes: dict[str, int] = {}
+    resource_delta_bytes: dict[str, int] = {}
     changes: list[ResidencyTarget] = []
+    recovering_from_oom: bool = False
     skip_reason: str | None = None
     current_placement_reserve_shortfall_bytes: int = 0
 
@@ -368,7 +388,11 @@ def estimate_default_workload_timing(
     )
     for phase_name, components in phase_components.items():
         fields = phase_name.split(":", 2)
-        if len(fields) < 2 or not fields[0].isdigit():
+        if (
+            len(fields) < 3
+            or not fields[0].isdigit()
+            or not fields[2].startswith("use:")
+        ):
             continue
         stage_name = fields[1]
         if stage_name not in representative.stage_duration_ms:
@@ -435,25 +459,89 @@ def estimate_candidate_latency_savings_ns(
     *,
     candidates: Iterable[ResidencyTarget],
     request_duration_ns: int,
+    stage_duration_ns: Mapping[str, int] | None = None,
+    component_stages: Mapping[str, tuple[str, ...]] | None = None,
 ) -> dict[str, int]:
-    """Upper-bound H2D time removed by each complete placement option.
+    """Estimate latency removed by each complete placement option.
 
-    An async prefetch can consume copy-engine and memory bandwidth outside the
-    component's own stage, so that stage is not a sound cap. The complete
-    request duration is the only generally valid upper bound.
+    Transfer work remains the ordering signal within one component frontier.
+    Across components, cap the frontier's total benefit by the stages where
+    that component is used. Otherwise two large DiTs in different stages both
+    saturate at the full request duration and the solver cannot distinguish
+    which stage dominates latency. Scaling the intermediate options against
+    the frontier maximum preserves their ordering without claiming that every
+    byte of asynchronous transfer stalls the critical path.
     """
+    candidates = list(candidates)
+    stage_duration_ns = stage_duration_ns or {}
+    component_stages = component_stages or {}
+    maximum_h2d_bytes: dict[str, int] = {}
+    for candidate in candidates:
+        maximum_h2d_bytes[candidate.component_name] = max(
+            maximum_h2d_bytes.get(candidate.component_name, 0),
+            candidate.h2d_bytes_per_request,
+        )
+
     estimates: dict[str, int] = {}
     for candidate in candidates:
-        transfer_ns = int(
-            candidate.h2d_bytes_per_request
+        component_maximum_bytes = maximum_h2d_bytes[candidate.component_name]
+        if component_maximum_bytes <= 0:
+            estimates[candidate.option_key()] = int(
+                candidate.h2d_bytes_per_request
+                / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+                * 1_000_000_000
+            )
+            continue
+
+        transfer_upper_bound_ns = int(
+            component_maximum_bytes
             / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
             * 1_000_000_000
         )
-        estimates[candidate.option_key()] = (
-            min(transfer_ns, request_duration_ns)
-            if transfer_ns > 0 and request_duration_ns > 0
-            else transfer_ns
+        component_stage_duration_ns = sum(
+            stage_duration_ns.get(stage_name, 0)
+            for stage_name in component_stages.get(candidate.component_name, ())
         )
+        # Stage profiling is intentionally asynchronous by default. That is a
+        # useful low-overhead measurement for one-shot encoder/decoder work,
+        # but it records mostly CPU launch time for a repeatedly streamed DiT
+        # and can understate layerwise H2D stalls by orders of magnitude. The
+        # transfer model is already an upper bound, so constrain DiT savings by
+        # the synchronized request wall time instead.
+        latency_upper_bound_ns = (
+            request_duration_ns
+            if is_dit_component_name(candidate.component_name)
+            else component_stage_duration_ns or request_duration_ns
+        )
+        if latency_upper_bound_ns > 0:
+            transfer_upper_bound_ns = min(
+                transfer_upper_bound_ns, latency_upper_bound_ns
+            )
+        if is_dit_component_name(candidate.component_name):
+            # Model the remaining layer traffic, not a linearly scaled share
+            # of the worst placement. When an all-pageable frontier exceeds
+            # the request wall time, linear scaling compresses every marginal
+            # resident/pinned-layer gain and can discard hundreds of
+            # milliseconds of useful HostPin placement.
+            remaining_transfer_bytes = max(
+                0, component_maximum_bytes - candidate.h2d_bytes_per_request
+            )
+            remaining_transfer_ns = int(
+                remaining_transfer_bytes
+                / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+                * 1_000_000_000
+            )
+            estimates[candidate.option_key()] = max(
+                0,
+                transfer_upper_bound_ns
+                - min(remaining_transfer_ns, transfer_upper_bound_ns),
+            )
+        else:
+            estimates[candidate.option_key()] = int(
+                transfer_upper_bound_ns
+                * candidate.h2d_bytes_per_request
+                / component_maximum_bytes
+            )
     return estimates
 
 
@@ -646,6 +734,80 @@ def estimate_workload_phase_peaks(
     )
 
 
+def measured_failed_workload_phase_peaks(
+    *,
+    records: Iterable[WarmupMemoryRecord],
+    target_units: int,
+) -> tuple[
+    int | None,
+    dict[str, int],
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
+]:
+    """Preserve the binding phases reached before a target-workload OOM.
+
+    OOM records cannot support activation extrapolation, but their allocated
+    peaks and component ownership still identify which complete target states
+    release memory. Repeated phase names with different layouts remain
+    separate constraints, matching the successful-measurement path.
+    """
+    failed = [
+        record
+        for record in records
+        if not record.succeeded and record.workload_units() <= target_units
+    ]
+    if not failed:
+        return None, {}, {}, {}, {}
+
+    grouped: dict[
+        tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], int
+    ] = {}
+    for record in failed:
+        used_by_phase = record.phase_used_components or record.phase_active_components
+        phases = record.phase_peak_allocated_bytes or {
+            "request:failed": record.peak_allocated_bytes
+        }
+        for phase_name, phase_peak in phases.items():
+            active = tuple(sorted(record.phase_active_components.get(phase_name, ())))
+            used = tuple(sorted(used_by_phase.get(phase_name, ())))
+            transitions = tuple(
+                sorted(
+                    record.phase_full_weight_transition_components.get(phase_name, ())
+                )
+            )
+            key = (phase_name, active, used, transitions)
+            grouped[key] = max(grouped.get(key, 0), phase_peak)
+
+    layout_counts: dict[str, int] = {}
+    for phase_name, _, _, _ in grouped:
+        layout_counts[phase_name] = layout_counts.get(phase_name, 0) + 1
+
+    peaks: dict[str, int] = {}
+    active_components: dict[str, tuple[str, ...]] = {}
+    used_components: dict[str, tuple[str, ...]] = {}
+    transition_components: dict[str, tuple[str, ...]] = {}
+    layout_indices: dict[str, int] = {}
+    for (phase_name, active, used, transitions), phase_peak in sorted(grouped.items()):
+        output_name = phase_name
+        if layout_counts[phase_name] > 1:
+            index = layout_indices.get(phase_name, 0)
+            layout_indices[phase_name] = index + 1
+            output_name = f"{phase_name}:layout:{index}"
+        peaks[output_name] = phase_peak
+        active_components[output_name] = active
+        used_components[output_name] = used
+        transition_components[output_name] = transitions
+
+    return (
+        max(record.peak_allocated_bytes for record in failed),
+        peaks,
+        active_components,
+        used_components,
+        transition_components,
+    )
+
+
 def _module_weight_bytes(module: nn.Module) -> int:
     """Full weight+buffer footprint, reading through layerwise CPU buffers."""
     return tensor_storage_bytes(
@@ -696,7 +858,9 @@ def component_current_device_weight_bytes(
     return result
 
 
-def layerwise_pinned_host_bytes(modules: Mapping[str, object]) -> int:
+def layerwise_pinned_host_bytes(
+    modules: Mapping[str, object], *, pin_budget=None
+) -> int:
     """Pinned layer-store bytes in this process, without alias double counts."""
     seen_managers: set[int] = set()
     total = 0
@@ -709,10 +873,14 @@ def layerwise_pinned_host_bytes(modules: Mapping[str, object]) -> int:
                 continue
             seen_managers.add(manager_id)
             total += manager.pinned_host_weight_bytes()
+    if pin_budget is not None:
+        total = max(total, pin_budget.committed_bytes)
     return total
 
 
-def layerwise_host_pin_capacity_bytes(modules: Mapping[str, object]) -> int:
+def layerwise_host_pin_capacity_bytes(
+    modules: Mapping[str, object], *, pin_budget=None
+) -> int:
     """This process's non-overlapping HostPin allowance."""
     seen_budgets: set[int] = set()
     total = 0
@@ -726,6 +894,8 @@ def layerwise_host_pin_capacity_bytes(modules: Mapping[str, object]) -> int:
                 continue
             seen_budgets.add(budget_id)
             total += max(0, budget.available_bytes - budget.reserve_bytes)
+    if pin_budget is not None and id(pin_budget) not in seen_budgets:
+        total += max(0, pin_budget.available_bytes - pin_budget.reserve_bytes)
     return total
 
 
@@ -773,7 +943,9 @@ def _layerwise_transfer_work_bytes(
         pinned = set(pinned_indices)
         for layer_idx, weight_bytes in manager.layer_weight_bytes().items():
             uses = uses_per_streamed_layer if layer_idx in streamed else 1
-            transfer_multiplier = 1 if layer_idx in pinned else 2
+            transfer_multiplier = (
+                1 if layer_idx in pinned else PAGEABLE_H2D_COST_MULTIPLIER
+            )
             total += uses * transfer_multiplier * weight_bytes
     return total
 
@@ -963,6 +1135,7 @@ def _unconfigured_layerwise_targets(
     prefetch_value: float,
     residency_policy: str,
     pin_cpu_memory: bool,
+    allow_host_pin_reallocation: bool,
 ) -> tuple[list[ResidencyTarget], int]:
     """Virtual layerwise frontier for a component still using coarse offload.
 
@@ -998,9 +1171,6 @@ def _unconfigured_layerwise_targets(
     coarse_savings = max(0, maximum_transfer_work - coarse_transfer_work)
     current_resident = current_mode == RESIDENT
     current_inactive_bytes = full_weight_bytes if current_resident else 0
-    initial_managed_bytes = sum(
-        manager.peak_managed_device_weight_bytes(0) for manager in managers
-    )
     host_materialize_scratch = max(
         (
             weight_bytes
@@ -1019,46 +1189,69 @@ def _unconfigured_layerwise_targets(
             manager.peak_managed_device_weight_bytes(count)
             for manager, count in zip(managers, resident_layers)
         )
-        transfer_work = _layerwise_transfer_work_bytes(
-            managers=managers,
-            resident_layers=resident_layers,
-            pinned_layers=empty_pins,
-            uses_per_streamed_layer=uses_per_request,
-        )
-        targets.append(
-            ResidencyTarget(
-                component_name=component_name,
-                residency_mode=COMPONENT_OFFLOAD,
-                target_residency_mode=LAYERWISE_OFFLOAD,
-                target_resident_weight_bytes=resident_bytes,
-                # This strategy has not run yet, so transfer bytes cannot
-                # establish that it beats the calibrated coarse path. It may
-                # tie that path as a memory alternative; only a subsequent
-                # calibration may justify further layerwise tuning.
-                h2d_bytes_per_request=min(
-                    coarse_savings,
-                    max(0, maximum_transfer_work - transfer_work),
-                ),
-                target_layerwise_resident_layers=resident_layers,
-                target_layerwise_pinned_layers=empty_pins,
-                host_materialize_scratch_bytes=host_materialize_scratch,
-                device_transition_delta_bytes=(
-                    unmanaged_weight_bytes
-                    + initial_managed_bytes
-                    - current_inactive_bytes
-                ),
-                active_device_delta_bytes=(
-                    unmanaged_weight_bytes + active_managed_bytes - full_weight_bytes
-                ),
-                present_device_delta_bytes=(
-                    unmanaged_weight_bytes + active_managed_bytes - full_weight_bytes
-                ),
-                inactive_device_delta_bytes=(
-                    unmanaged_weight_bytes - current_inactive_bytes
-                ),
-                target_device_weight_bytes=unmanaged_weight_bytes + resident_bytes,
+        pin_targets = (
+            _layerwise_pin_targets(
+                managers=managers,
+                resident_layers=resident_layers,
+                current_pinned_layers=empty_pins,
+                uses_per_streamed_layer=uses_per_request,
             )
+            if allow_host_pin_reallocation
+            else [empty_pins]
         )
+        for pinned_layers in pin_targets:
+            pinned_bytes = sum(
+                sum(
+                    manager.layer_host_store_bytes().get(layer_idx, 0)
+                    for layer_idx in pinned_indices
+                )
+                for manager, pinned_indices in zip(managers, pinned_layers)
+            )
+            transfer_work = _layerwise_transfer_work_bytes(
+                managers=managers,
+                resident_layers=resident_layers,
+                pinned_layers=pinned_layers,
+                uses_per_streamed_layer=uses_per_request,
+            )
+            targets.append(
+                ResidencyTarget(
+                    component_name=component_name,
+                    residency_mode=current_mode,
+                    target_residency_mode=LAYERWISE_OFFLOAD,
+                    target_resident_weight_bytes=resident_bytes,
+                    # This strategy has not run yet, so transfer bytes cannot
+                    # establish that it beats the calibrated coarse path. It may
+                    # tie that path as a memory alternative; only a subsequent
+                    # calibration may justify further layerwise tuning.
+                    h2d_bytes_per_request=min(
+                        coarse_savings,
+                        max(0, maximum_transfer_work - transfer_work),
+                    ),
+                    target_layerwise_resident_layers=resident_layers,
+                    target_layerwise_pinned_layers=pinned_layers,
+                    pinned_host_delta_bytes=pinned_bytes,
+                    host_pin_scratch_bytes=pinned_bytes,
+                    host_materialize_scratch_bytes=host_materialize_scratch,
+                    device_transition_delta_bytes=(
+                        unmanaged_weight_bytes - current_inactive_bytes
+                    ),
+                    active_device_delta_bytes=(
+                        unmanaged_weight_bytes
+                        + active_managed_bytes
+                        - full_weight_bytes
+                    ),
+                    present_device_delta_bytes=(
+                        unmanaged_weight_bytes
+                        + active_managed_bytes
+                        - full_weight_bytes
+                    ),
+                    inactive_device_delta_bytes=(
+                        unmanaged_weight_bytes - current_inactive_bytes
+                    ),
+                    target_device_weight_bytes=unmanaged_weight_bytes + resident_bytes,
+                    target_pinned_host_bytes=pinned_bytes,
+                )
+            )
     return targets, maximum_transfer_work
 
 
@@ -1092,7 +1285,7 @@ def collect_residency_targets(
     num_inference_steps: int,
     allow_host_pin_reallocation: bool = True,
     mixed_dtype_components: Iterable[str] = (),
-    auto_resident_components: Iterable[str] = (),
+    required_resident_components: Iterable[str] = (),
     layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str]] | None = None,
     pin_cpu_memory: bool = True,
 ) -> list[ResidencyTarget]:
@@ -1105,7 +1298,7 @@ def collect_residency_targets(
     """
     custom_names = set(custom_strategy_names)
     mixed_dtype_names = set(mixed_dtype_components)
-    auto_resident_names = set(auto_resident_components)
+    required_resident_names = set(required_resident_components)
     if baseline_residency_mode_of is None:
         baseline_residency_mode_of = residency_mode_of
     candidates = []
@@ -1116,15 +1309,16 @@ def collect_residency_targets(
         if name in custom_names:
             continue
         baseline_mode = baseline_residency_mode_of(name)
-        if baseline_mode not in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
+        if baseline_mode not in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD, RESIDENT):
             continue
         if explicit_residency_mode_of(name) is not None:
             continue
         if is_fsdp_managed_module(module):
             continue
         current_mode = residency_mode_of(name)
-        if current_mode == RESIDENT and name not in auto_resident_names:
-            # A loader or another runtime feature owns this hard requirement.
+        if current_mode == RESIDENT and name in required_resident_names:
+            # A runtime feature owns this hard requirement. Unset startup
+            # residency is only an initial placement and remains tunable.
             continue
 
         has_layerwise_managers = isinstance(
@@ -1135,7 +1329,14 @@ def collect_residency_targets(
             # serving placement. Only an effective layerwise mode proves that
             # these managers form the current serving frontier.
             continue
-        frontier_mode = LAYERWISE_OFFLOAD if has_layerwise_managers else baseline_mode
+        # A configured manager exposes its measured layerwise frontier. Without
+        # managers, the module is still in its ordinary current placement even
+        # when the baseline policy requested layerwise offload. Build a virtual
+        # frontier from that real state so an initial resident seed can still
+        # be demoted after an OOM.
+        frontier_mode = (
+            LAYERWISE_OFFLOAD if has_layerwise_managers else COMPONENT_OFFLOAD
+        )
 
         if frontier_mode == COMPONENT_OFFLOAD:
             if current_mode not in (COMPONENT_OFFLOAD, RESIDENT):
@@ -1168,6 +1369,7 @@ def collect_residency_targets(
                         prefetch_value=prefetch_value,
                         residency_policy=residency_policy,
                         pin_cpu_memory=pin_cpu_memory,
+                        allow_host_pin_reallocation=allow_host_pin_reallocation,
                     )
                 )
             uses_per_request = (
@@ -1182,7 +1384,7 @@ def collect_residency_targets(
                 [
                     ResidencyTarget(
                         component_name=name,
-                        residency_mode=baseline_mode,
+                        residency_mode=current_mode,
                         target_residency_mode=COMPONENT_OFFLOAD,
                         target_resident_weight_bytes=0,
                         h2d_bytes_per_request=max(
@@ -1205,7 +1407,7 @@ def collect_residency_targets(
                     ),
                     ResidencyTarget(
                         component_name=name,
-                        residency_mode=baseline_mode,
+                        residency_mode=current_mode,
                         target_residency_mode=RESIDENT,
                         target_resident_weight_bytes=weight_bytes,
                         h2d_bytes_per_request=(maximum_transfer_work or weight_bytes),
@@ -1473,9 +1675,13 @@ def rank_candidates_by_h2d_savings(
 
 
 def _skip_plan(
-    reason: str, *, current_placement_reserve_shortfall_bytes: int = 0
+    reason: str,
+    *,
+    recovering_from_oom: bool = False,
+    current_placement_reserve_shortfall_bytes: int = 0,
 ) -> AutoResidencyPlan:
     return AutoResidencyPlan(
+        recovering_from_oom=recovering_from_oom,
         skip_reason=reason,
         current_placement_reserve_shortfall_bytes=(
             current_placement_reserve_shortfall_bytes
@@ -1489,13 +1695,23 @@ def _vram_reserve_bytes(budget_bytes: int, *, target_workload_measured: bool) ->
         if target_workload_measured
         else EXTRAPOLATED_VRAM_RESERVE_FRACTION
     )
-    return max(
-        int(budget_bytes * reserve_fraction),
-        min(
-            MIN_VRAM_RESERVE_BYTES,
-            int(budget_bytes * MAX_VRAM_RESERVE_FRACTION),
+    floor_fraction = (
+        MAX_MEASURED_VRAM_RESERVE_FRACTION
+        if target_workload_measured
+        else MAX_VRAM_RESERVE_FRACTION
+    )
+    minimum_floor = (
+        0 if target_workload_measured else MIN_UNCALIBRATED_VRAM_RESERVE_BYTES
+    )
+    capped_floor = min(
+        MIN_VRAM_RESERVE_BYTES,
+        budget_bytes,
+        max(
+            minimum_floor,
+            int(budget_bytes * floor_fraction),
         ),
     )
+    return max(int(budget_bytes * reserve_fraction), capped_floor)
 
 
 def _binding_phase_constraints(
@@ -1535,6 +1751,7 @@ def _binding_phase_constraints(
         else max(phase_peaks.values())
     )
     current_device_bytes = dict(report.current_device_weight_bytes_by_component)
+    current_active_bytes = dict(report.current_active_weight_bytes_by_component)
     for candidate in report.candidates:
         if (
             candidate.current_placement
@@ -1544,11 +1761,17 @@ def _binding_phase_constraints(
                 candidate.target_device_weight_bytes
             )
     steady_state_components = {
+        candidate.component_name
+        for candidate in report.candidates
+        if candidate.current_placement and candidate.permanent_residency
+    }
+    steady_state_components.update(
         component_name
         for phase_name, components in report.active_components_by_phase.items()
         if phase_name == "idle" or phase_name.startswith("idle:layout:")
         for component_name in components
-    }
+        if component_name not in candidate_component_names
+    )
 
     binding: dict[
         tuple[
@@ -1559,20 +1782,9 @@ def _binding_phase_constraints(
         ],
         tuple[str, int],
     ] = {}
+    attributed_baselines = []
     for phase_name, phase_peak in phase_peaks.items():
         measured_components = set(report.active_components_by_phase.get(phase_name, ()))
-        carried_components = steady_state_components - measured_components
-        phase_peak += sum(
-            current_device_bytes.get(component_name, 0)
-            for component_name in carried_components
-        )
-        present = tuple(
-            sorted(
-                (measured_components | steady_state_components)
-                & candidate_component_names
-            )
-        )
-        measured = tuple(sorted(measured_components & candidate_component_names))
         used = tuple(sorted(report.used_components_by_phase.get(phase_name, ())))
         full_weight_transitions = tuple(
             sorted(
@@ -1584,6 +1796,38 @@ def _binding_phase_constraints(
                 & candidate_component_names
             )
         )
+        carried_components = steady_state_components - measured_components
+        phase_peak += sum(
+            current_device_bytes.get(component_name, 0)
+            for component_name in carried_components
+        )
+        attributed_baselines.append(
+            max(
+                0,
+                phase_peak
+                - sum(
+                    current_active_bytes.get(component_name, 0)
+                    for component_name in (
+                        (measured_components - steady_state_components)
+                        | set(used)
+                        | set(full_weight_transitions)
+                    )
+                ),
+            )
+        )
+        # An OOM can unwind before the component manager publishes its phase
+        # snapshot. The resulting request:untracked peak is useful as a
+        # conservative baseline for the synthetic component phases below, but
+        # no placement can release an empty-layout constraint directly.
+        if report.warmup_oom and not used and not full_weight_transitions:
+            continue
+        present = tuple(
+            sorted(
+                (measured_components | steady_state_components)
+                & candidate_component_names
+            )
+        )
+        measured = tuple(sorted(measured_components & candidate_component_names))
         layout = (present, measured, used, full_weight_transitions)
         current = binding.get(layout)
         if current is None or (phase_peak, phase_name) > (current[1], current[0]):
@@ -1593,20 +1837,43 @@ def _binding_phase_constraints(
         for (_, _, used, full_weight_transitions) in binding
         for component_name in set(used) | set(full_weight_transitions)
     }
-    steady_request_peak = max(
-        request_peak,
-        *(phase_peak for _, phase_peak in binding.values()),
+    # Separate the stable/request activation baseline from transient component
+    # weights before constructing phases that a short failed probe did not
+    # reach. Reusing the largest component-prefetch peak verbatim would charge
+    # those weights to every later component and can make every lower-memory
+    # target look infeasible. The post-placement warmup remains the authority
+    # for previously unobserved activation memory.
+    synthetic_base_peak = (
+        max(attributed_baselines) if attributed_baselines else request_peak
     )
-    for component_name in sorted(candidate_component_names - observed_components):
+    synthetic_components = (
+        candidate_component_names
+        if report.warmup_oom or report.require_feasible_placement
+        else candidate_component_names - observed_components
+    )
+    for component_name in sorted(synthetic_components):
         present = tuple(
             sorted(
                 (steady_state_components | {component_name}) & candidate_component_names
             )
         )
-        binding[(present, (), (component_name,), ())] = (
-            f"unobserved:{component_name}",
-            steady_request_peak,
+        layout = (present, (), (component_name,), ())
+        synthetic = (
+            (
+                f"lower-bound:{component_name}"
+                if component_name in observed_components
+                else f"unobserved:{component_name}"
+            ),
+            synthetic_base_peak
+            + (
+                0
+                if component_name in steady_state_components
+                else current_active_bytes.get(component_name, 0)
+            ),
         )
+        current = binding.get(layout)
+        if current is None or synthetic[1] > current[1]:
+            binding[layout] = synthetic
     return [
         (
             f"gpu:rank{report.rank}:{phase_name}",
@@ -1726,18 +1993,25 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     """Turn gathered rank reports into one deterministic placement plan."""
     if not reports:
         return _skip_plan("no rank reports")
+    recovering_from_oom = any(report.warmup_oom for report in reports)
     for report in reports:
         if report.skip_reason is not None:
-            return _skip_plan(f"rank {report.rank}: {report.skip_reason}")
+            return _skip_plan(
+                f"rank {report.rank}: {report.skip_reason}",
+                recovering_from_oom=recovering_from_oom,
+            )
         if report.estimated_peak_bytes is None:
-            return _skip_plan(f"rank {report.rank}: no usable warmup measurement")
+            return _skip_plan(
+                f"rank {report.rank}: no usable warmup measurement",
+                recovering_from_oom=recovering_from_oom,
+            )
 
     estimated_peak = max(report.estimated_peak_bytes for report in reports)
     budget = min(report.budget_bytes for report in reports)
     # The warmup request is executed collectively. Some non-output ranks may
     # not retain the effective request shape in their local Req, but one rank's
     # covering measurement proves that the replica executed the target shape.
-    target_workload_measured = any(
+    target_workload_measured = not recovering_from_oom and any(
         report.target_workload_measured for report in reports
     )
     reserves_by_rank = {
@@ -1767,6 +2041,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     if not candidates:
         return _skip_plan(
             "no eligible residency alternatives",
+            recovering_from_oom=recovering_from_oom,
             current_placement_reserve_shortfall_bytes=(
                 current_placement_reserve_shortfall
             ),
@@ -1799,9 +2074,21 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
             # The measured placement has already completed warmup. A negative
             # reserve headroom therefore means "do not grow this phase", not
             # that the current zero-delta placement is infeasible.
-            resource_budgets[resource_name] = max(
-                0,
-                report.budget_bytes - phase_peak - reserves_by_rank[report.rank],
+            available = (
+                report.budget_bytes
+                - phase_peak
+                - reserves_by_rank[report.rank]
+                - report.planning_headroom_correction_bytes
+            )
+            # A successful measured placement remains a feasible zero-delta
+            # baseline even when it consumed the reserve. An OOM placement is
+            # different: preserving the negative shortfall forces the complete
+            # target-state solve to release enough memory before retrying.
+            enforce_rank_feasibility = (
+                report.warmup_oom or report.require_feasible_placement
+            )
+            resource_budgets[resource_name] = (
+                available if enforce_rank_feasibility else max(0, available)
             )
     has_device_transition_options = any(
         candidate.device_transition_delta_bytes != 0 for candidate in candidates
@@ -1875,22 +2162,6 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         and report.candidate_latency_savings_ns
     ]
     use_latency_utility = bool(timed_reports)
-    latency_equivalence_ns = (
-        max(
-            MIN_LATENCY_EQUIVALENCE_NS,
-            min(
-                MAX_LATENCY_EQUIVALENCE_NS,
-                int(
-                    max(
-                        report.estimated_request_duration_ns for report in timed_reports
-                    )
-                    * LATENCY_EQUIVALENCE_FRACTION
-                ),
-            ),
-        )
-        if use_latency_utility
-        else 0
-    )
     options = []
     for candidate in candidates:
         resource_deltas: dict[str, int] = {}
@@ -1978,24 +2249,30 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 resource_deltas[f"hostram:{prefix}:materialize"] = (
                     rank_candidate.host_materialize_scratch_bytes
                 )
+        estimated_latency_savings = (
+            min(
+                report.candidate_latency_savings_ns.get(candidate.option_key(), 0)
+                for report in timed_reports
+            )
+            if use_latency_utility
+            else candidate.h2d_bytes_per_request
+        )
         options.append(
             PlacementOption(
                 group_key=candidate.component_name,
                 option_key=candidate.option_key(),
                 resource_delta_bytes=resource_deltas,
-                estimated_latency_savings=(
-                    min(
-                        report.candidate_latency_savings_ns.get(
-                            candidate.option_key(), 0
-                        )
-                        for report in timed_reports
-                    )
-                    if use_latency_utility
-                    else candidate.h2d_bytes_per_request
-                ),
-                placement_cost_bytes=(
+                estimated_latency_savings=estimated_latency_savings,
+                preference_cost=(
+                    (
+                        0
+                        if candidate.current_placement
+                        or candidate.target_residency_mode == candidate.residency_mode
+                        else 1
+                    ),
                     candidate.target_device_weight_bytes
                     or max(0, candidate.target_resident_weight_bytes),
+                    -estimated_latency_savings,
                     candidate.target_pinned_host_bytes
                     or max(0, candidate.pinned_host_delta_bytes),
                 ),
@@ -2015,14 +2292,37 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         placement = optimize_placement(
             options,
             resource_budget_bytes=resource_budgets,
-            estimated_latency_tolerance=(
-                latency_equivalence_ns if use_latency_utility else 0
-            ),
+            estimated_latency_tolerance=AUTO_PLACEMENT_LATENCY_TOLERANCE_NS,
             require_selection_from_every_group=complete_state_frontier,
         )
     except NoFeasiblePlacementError as error:
+        diagnostic_options = [
+            option
+            for option in options
+            if candidate_by_key[option.option_key].current_placement
+            or (
+                is_dit_component_name(
+                    candidate_by_key[option.option_key].component_name
+                )
+                and candidate_by_key[option.option_key].target_layerwise_resident_layers
+                == (0,)
+            )
+        ]
+        logger.debug(
+            "Auto residency infeasible budgets_mib=%s diagnostic_options=%s",
+            {name: round(value / 1024**2) for name, value in resource_budgets.items()},
+            {
+                option.option_key: {
+                    name: round(value / 1024**2)
+                    for name, value in option.resource_delta_bytes.items()
+                    if value
+                }
+                for option in diagnostic_options
+            },
+        )
         return _skip_plan(
             str(error),
+            recovering_from_oom=recovering_from_oom,
             current_placement_reserve_shortfall_bytes=(
                 current_placement_reserve_shortfall
             ),
@@ -2039,7 +2339,9 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         reserve_bytes=reserve,
         budget_bytes=budget,
         resource_budget_bytes=resource_budgets,
+        resource_delta_bytes=placement.resource_delta_bytes,
         changes=changes,
+        recovering_from_oom=recovering_from_oom,
         current_placement_reserve_shortfall_bytes=(current_placement_reserve_shortfall),
     )
 
@@ -2442,7 +2744,8 @@ def format_plan_summary(
 ) -> str:
     """One-line decision summary for the startup log."""
     if plan.skip_reason is not None:
-        return f"Auto residency: skipped ({plan.skip_reason})"
+        action = "recovery stopped" if plan.recovering_from_oom else "skipped"
+        return f"Auto residency: {action} ({plan.skip_reason})"
     changes = (
         ", ".join(_format_candidate_summary(candidate) for candidate in plan.changes)
         or "none"
@@ -2454,8 +2757,9 @@ def format_plan_summary(
         if record.succeeded
     )
     measured_part = f"measured_allocated=[{measured}], " if measured else ""
+    prefix = "Auto residency recovery" if plan.recovering_from_oom else "Auto residency"
     return (
-        f"Auto residency: target={workload.describe()} "
+        f"{prefix}: target={workload.describe()} "
         f"steps={workload.num_inference_steps}, "
         f"{measured_part}"
         f"estimated_peak={plan.estimated_peak_bytes / GIB_BYTES:.1f} GiB, "
@@ -2536,4 +2840,5 @@ def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
     return {
         "status": status,
         "changed": [candidate.component_name for candidate in plan.changes],
+        "recovering_from_oom": plan.recovering_from_oom,
     }

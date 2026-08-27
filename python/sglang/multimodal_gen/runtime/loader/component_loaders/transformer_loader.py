@@ -154,6 +154,7 @@ class TransformerLoader(ComponentLoader):
 
     allow_global_attention_backend_fallback = False
     supports_online_quantization_override = True
+    supports_fsdp_loading = True
 
     component_names = [
         "transformer",

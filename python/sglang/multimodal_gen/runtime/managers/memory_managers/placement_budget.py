@@ -36,13 +36,13 @@ class PlacementOption(msgspec.Struct, frozen=True):
     estimated_latency_savings: int
     # Lexicographic soft cost used only after latency-equivalent placements
     # have been identified. Resource budgets remain the hard safety limits.
-    placement_cost_bytes: tuple[int, ...] = ()
+    preference_cost: tuple[int, ...] = ()
 
 
 class PlacementPlan(msgspec.Struct, frozen=True):
     resource_delta_bytes: dict[str, int] = {}
     estimated_latency_savings: int = 0
-    placement_cost_bytes: tuple[int, ...] = ()
+    preference_cost: tuple[int, ...] = ()
     selections: list[PlacementOption] = []
 
 
@@ -166,15 +166,15 @@ def optimize_placement(
         raise ValueError("estimated_latency_tolerance must be non-negative")
 
     options = list(options)
-    placement_cost_dimensions = max(
-        (len(option.placement_cost_bytes) for option in options), default=0
+    preference_dimensions = max(
+        (len(option.preference_cost) for option in options), default=0
     )
     for option in options:
-        if option.placement_cost_bytes and (
-            len(option.placement_cost_bytes) != placement_cost_dimensions
+        if option.preference_cost and (
+            len(option.preference_cost) != preference_dimensions
         ):
             raise ValueError(
-                "all non-empty placement costs must have the same dimensions"
+                "all non-empty preference costs must have the same dimensions"
             )
 
     grouped: dict[str, list[PlacementOption]] = {}
@@ -236,7 +236,7 @@ def optimize_placement(
                 (
                     (0,) * len(resource_names),
                     0,
-                    (0,) * placement_cost_dimensions,
+                    (0,) * preference_dimensions,
                     (),
                 )
             )
@@ -247,7 +247,7 @@ def optimize_placement(
                     for resource_name in resource_names
                 ),
                 option.estimated_latency_savings,
-                option.placement_cost_bytes or (0,) * placement_cost_dimensions,
+                option.preference_cost or (0,) * preference_dimensions,
                 (option,),
             )
             for option in group_options
@@ -257,9 +257,7 @@ def optimize_placement(
     def _suffix_bounds(groups):
         minimum_resources = [(0,) * len(resource_names) for _ in range(len(groups) + 1)]
         maximum_utility = [0] * (len(groups) + 1)
-        minimum_cost = [
-            (0,) * placement_cost_dimensions for _ in range(len(groups) + 1)
-        ]
+        minimum_cost = [(0,) * preference_dimensions for _ in range(len(groups) + 1)]
         for group_index in range(len(groups) - 1, -1, -1):
             group = groups[group_index]
             minimum_resources[group_index] = tuple(
@@ -393,7 +391,7 @@ def optimize_placement(
         0,
         (0,) * len(resource_names),
         0,
-        (0,) * placement_cost_dimensions,
+        (0,) * preference_dimensions,
         (),
     )
     assert best is not None
@@ -406,6 +404,6 @@ def optimize_placement(
     return PlacementPlan(
         resource_delta_bytes=full_resource_deltas,
         estimated_latency_savings=best[1],
-        placement_cost_bytes=best[2],
+        preference_cost=best[2],
         selections=list(best[3]),
     )

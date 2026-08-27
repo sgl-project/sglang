@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import os
 import tempfile
 from typing import Any, Awaitable, Callable
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     auto_residency_args_skip_reason,
+    auto_residency_static_skip_reason,
 )
 from sglang.multimodal_gen.runtime.utils.image_io import save_base64_image_to_path
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -115,10 +117,40 @@ def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
+def should_apply_pre_warmup_auto_residency(server_args: ServerArgs) -> bool:
+    return auto_residency_static_skip_reason(server_args) is None
+
+
 def _auto_residency_status(response: OutputBatch) -> str | None:
     if isinstance(response.output, dict):
         return response.output.get("status")
     return None
+
+
+async def maybe_apply_pre_warmup_auto_residency(
+    server_args: ServerArgs,
+    forward: Callable[[Req], Awaitable[OutputBatch]],
+) -> None:
+    """Choose a weight-feasible placement before the first serving forward."""
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+        AutoResidencyReq,
+    )
+    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+        PLACEMENT_STATUS_ROLLBACK_FAILED,
+    )
+
+    if not should_apply_pre_warmup_auto_residency(server_args):
+        return
+    response = await forward(AutoResidencyReq(action="apply_static"))
+    status = _auto_residency_status(response)
+    if status == PLACEMENT_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {response.error}")
+    if response.error is not None:
+        logger.warning(
+            "Pre-warmup residency placement was not applied; calibrating the "
+            "original placement: %s",
+            response.error,
+        )
 
 
 async def maybe_apply_auto_residency(
@@ -157,6 +189,7 @@ async def maybe_apply_auto_residency(
     # never abort startup, explicit --warmup-resolutions ones must succeed.
     fail_open = server_args.warmup_resolutions is None
     adjusted_any = False
+    recovering_from_oom = False
 
     async def rollback_and_rewarm(error: Exception) -> None:
         logger.warning(
@@ -199,13 +232,26 @@ async def maybe_apply_auto_residency(
             )
             return
         status = _auto_residency_status(response)
+        response_recovering_from_oom = bool(
+            isinstance(response.output, dict)
+            and response.output.get("recovering_from_oom")
+        )
         if status == PLACEMENT_STATUS_ROLLBACK_FAILED:
             raise RuntimeError(f"auto residency rollback failed: {response.error}")
         if response.error is not None:
+            retryable = bool(
+                isinstance(response.output, dict) and response.output.get("retryable")
+            )
             if status == PLACEMENT_STATUS_ROLLED_BACK:
                 await run_async_client_warmup(
                     server_args, forward, fail_open=fail_open, rewarm=True
                 )
+                if retryable:
+                    logger.warning(
+                        "Auto residency calibration corrected its VRAM model; "
+                        "retrying with the restored placement."
+                    )
+                    continue
             retained = (
                 "the last calibrated placement"
                 if adjusted_any
@@ -218,9 +264,15 @@ async def maybe_apply_auto_residency(
             )
             return
         if status != PLACEMENT_STATUS_ADJUSTED:
+            if response_recovering_from_oom:
+                raise RuntimeError(
+                    "default workload exceeds the VRAM budget and auto "
+                    "residency found no feasible placement"
+                )
             return
 
         adjusted_any = True
+        recovering_from_oom = response_recovering_from_oom
         # This pass physically realizes the selected placement and measures
         # phases that overlap under it. The next round can then use that new
         # evidence instead of permanently charging components twice.
@@ -229,21 +281,35 @@ async def maybe_apply_auto_residency(
                 server_args, forward, fail_open=False, rewarm=True
             )
         except Exception as e:
+            if recovering_from_oom and _is_out_of_memory(e):
+                logger.warning(
+                    "Default workload still exceeds the VRAM budget after an "
+                    "auto-residency recovery step; keeping the lower-memory "
+                    "placement and replanning."
+                )
+                continue
             await rollback_and_rewarm(e)
             return
+        return
 
-    logger.warning(
-        "Auto residency stopped after %d adjustment rounds; keeping the last "
-        "successfully calibrated placement.",
-        MAX_AUTO_RESIDENCY_ROUNDS,
-    )
+    if recovering_from_oom:
+        raise RuntimeError(
+            "default workload still exceeds the VRAM budget after "
+            f"{MAX_AUTO_RESIDENCY_ROUNDS} auto-residency corrections"
+        )
+    else:
+        logger.warning(
+            "Auto residency stopped after %d adjustment rounds; keeping the "
+            "last successfully calibrated placement.",
+            MAX_AUTO_RESIDENCY_ROUNDS,
+        )
 
 
 # Enough to clear a probe that overshot the card, few enough that a failure
 # which is not about probe size gives up quickly instead of walking the
 # workload down to nothing.
 MAX_WARMUP_DEGRADE_ATTEMPTS = 3
-MAX_AUTO_RESIDENCY_ROUNDS = 8
+MAX_AUTO_RESIDENCY_ROUNDS = 2
 
 
 def _is_out_of_memory(error: Any) -> bool:
@@ -331,6 +397,7 @@ async def run_async_client_warmup(
     rewarm: bool = False,
 ) -> None:
     try:
+        auto_residency_handles_oom = auto_residency_skip_reason(server_args) is None
         warmup_input_path = None
         if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = prepare_warmup_image_path(server_args)
@@ -341,6 +408,12 @@ async def run_async_client_warmup(
             response = await forward(req)
             for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
                 if response.error is None or not _is_out_of_memory(response.error):
+                    break
+                # The residency planner needs the first failed target-shape
+                # measurement. Retrying smaller requests cannot fix a weight-
+                # dominated OOM and can retain failed-forward allocations that
+                # contaminate the phase model used by the planner.
+                if auto_residency_handles_oom:
                     break
                 lighter = _degrade_after_oom(server_args, req)
                 if lighter is None:
@@ -380,6 +453,31 @@ def run_sync_client_warmup(
             response = forward(req)
         if response.error is not None:
             raise RuntimeError(response.error)
+
+
+def run_sync_startup_warmup(
+    server_args: ServerArgs,
+    forward: Callable[[Req], OutputBatch],
+) -> None:
+    """Run the server-style startup sequence through a synchronous client.
+
+    Offline ``DiffGenerator`` launches the same scheduler and workers as the
+    HTTP entrypoint, but its client API is synchronous. Adapting that call into
+    the shared async orchestration keeps static placement, one warmup probe,
+    and measured refinement identical across both entrypoints.
+    """
+
+    async def async_forward(req: Req) -> OutputBatch:
+        return forward(req)
+
+    async def run() -> None:
+        await maybe_apply_pre_warmup_auto_residency(server_args, async_forward)
+        if not should_run_synthetic_server_warmup(server_args):
+            return
+        await run_async_client_warmup(server_args, async_forward, fail_open=True)
+        await maybe_apply_auto_residency(server_args, async_forward)
+
+    asyncio.run(run())
 
 
 def prepare_warmup_image_path(server_args: ServerArgs) -> str:

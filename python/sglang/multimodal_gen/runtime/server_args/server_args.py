@@ -891,6 +891,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 configured,
             )
 
+        if mode == "resident":
+            # This structural mode owns both DiTs and is excluded from the
+            # generic residency planner. Keep the ordinary component flags in
+            # agreement so loading does not take an offload path that no later
+            # planner can correct.
+            self.dit_cpu_offload = False
+            self.dit_layerwise_offload = False
+
         self.ltx2_two_stage_device_mode = mode
 
     def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
