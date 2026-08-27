@@ -45,7 +45,10 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+_is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
@@ -214,6 +217,7 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
+        verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -221,7 +225,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
 
     def run_non_compact(
@@ -243,6 +247,7 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -251,9 +256,9 @@ class TargetVerifyExecutor:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         result = self._forward_prepared_verify(
             batch=batch,
@@ -289,7 +294,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
@@ -355,6 +360,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=layout,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu

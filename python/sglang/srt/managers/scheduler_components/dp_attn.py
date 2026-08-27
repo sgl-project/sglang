@@ -27,7 +27,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -91,7 +90,7 @@ class MLPSyncBatchInfo:
     local_forward_mode: int
 
     # some gathered elements
-    tp0_info: torch.Tensor = None
+    tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -137,10 +136,14 @@ class MLPSyncBatchInfo:
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
-        # Inactive max_world_size slots must decode as IDLE.
-        global_info_tensor = fallback_tensor.expand(
-            self.dp_size, self.tp_size * self.cp_size, info_width
-        ).contiguous()
+        # Inactive max_world_size slots must decode as IDLE. repeat() (not
+        # expand().contiguous()) so the buffer never aliases fallback_tensor:
+        # at world size 1 the expanded view is already contiguous, contiguous()
+        # is a no-op, and the masked fallback writes below would then read and
+        # write the same storage.
+        global_info_tensor = fallback_tensor.repeat(
+            self.dp_size, self.tp_size * self.cp_size, 1
+        )
 
         if use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
@@ -179,17 +182,21 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        tp0_info = global_info_tensor[:, 0, :]
-        self.tp0_info = tp0_info
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
-        self.global_num_tokens = cpu_data[:, 0].tolist()
-        self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())
+        # One D2H for every field: each `.item()` / `.tolist()` on a device
+        # tensor is its own stream sync. Copy the whole tensor, not the
+        # `[:, 0, :]` slice -- that slice is non-contiguous once
+        # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
+        tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
+        self.tp0_info_cpu = tp0_info_cpu
+        self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
+        self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
+        self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
+        self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                tp0_info_cpu[:, 5].tolist()
+            )
 
 
 def _update_gather_batch(
@@ -213,8 +220,8 @@ def _update_gather_batch(
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
-    batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
-    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
 def prepare_mlp_sync_batch_raw(
@@ -263,14 +270,15 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    coordinated_prefill = check_cuda_graph_backend(
+        Phase.PREFILL, Backend.BREAKABLE
+    ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
     prefill_graph_runner = (
-        model_runner.prefill_cuda_graph_runner if breakable_prefill else None
+        model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
     )
     can_run_prefill_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
-        # Breakable Cuda Graph Backend Check.
         or (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
             and (
@@ -279,7 +287,7 @@ def prepare_mlp_sync_batch_raw(
                     batch_size=local_batch.batch_size(),
                     num_tokens=local_batch.extend_num_tokens,
                     input_embeds=local_batch.input_embeds,
-                    replace_embeds=None,
+                    replace_embeds=local_batch.replace_embeds,
                     prefix_lens=local_batch.prefix_lens,
                     is_target_verify=local_batch.forward_mode.is_target_verify(),
                     capture_hidden_mode=None,
@@ -287,7 +295,7 @@ def prepare_mlp_sync_batch_raw(
                     lora_ineligible=prefill_graph_runner.enable_lora,
                 )
             )
-            and breakable_prefill
+            and coordinated_prefill
         )
     )
 
@@ -344,7 +352,7 @@ def prepare_mlp_sync_batch_raw(
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info[:, 4:6],
+                mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
 
@@ -373,7 +381,7 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is not None and not skip_all_gather:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
-                mlp_sync_info.tp0_info[:, 5].tolist()
+                mlp_sync_info.tp0_info_cpu[:, 5].tolist()
             )
         )
 
@@ -392,7 +400,6 @@ class SchedulerDPAttnAdapter:
     tree_cache: BasePrefixCache
     offload_tags: set[str]
     ps: ParallelState
-    server_args: ServerArgs
     model_config: ModelConfig
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -402,16 +409,16 @@ class SchedulerDPAttnAdapter:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
-            dp_size=get_parallel().dp_size,
+            dp_size=get_parallel().config.dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
-            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
-            dwdp=get_parallel().dwdp_size > 1,
+            dwdp=get_parallel().config.dwdp_size > 1,
         )
 
     def maybe_prepare_mlp_sync_batch(

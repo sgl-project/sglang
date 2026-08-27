@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -38,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
+    ACTION_MODE_POLICY,
     ACTION_MODES,
     EMBODIMENT_TO_DOMAIN_ID,
     build_action_prompt,
@@ -53,6 +57,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+    RolloutDenoisingMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+    prepare_rollout_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -79,6 +89,35 @@ COSMOS3_I2V_FLOW_SHIFT = 10.0
 COSMOS3_T2V_FLOW_SHIFT = 10.0
 COSMOS3_V2V_FLOW_SHIFT = 10.0
 COSMOS3_ACTION_FLOW_SHIFT = 10.0
+# Edge uses a single low flow-shift for every video mode (t2v/i2v/v2v).
+COSMOS3_EDGE_VIDEO_FLOW_SHIFT = 3.0
+
+
+def _inject_caption_metadata(
+    prompt: str, num_frames: int, fps: float, height: int, width: int
+) -> str | None:
+    """Add the generation metadata that Cosmos3's structured captions carry.
+
+    Training captions always ship ``resolution``, plus ``duration``/``fps`` for
+    video, so a JSON caption without them is out of distribution. Returns
+    ``None`` when the prompt is not a JSON object; those prompts carry the same
+    metadata as trailing prose via the duration template instead.
+    """
+    try:
+        caption = json.loads(prompt)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(caption, dict):
+        return None
+
+    caption["resolution"] = {"H": int(height), "W": int(width)}
+    if num_frames > 1:
+        caption["duration"] = f"{int(num_frames / fps) if fps > 0 else 0}s"
+        caption["fps"] = float(fps)
+    else:
+        caption.pop("duration", None)
+        caption.pop("fps", None)
+    return json.dumps(caption)
 
 
 def _resize_crop_pil(
@@ -103,7 +142,9 @@ def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
 class Cosmos3ImagePreprocessStage(PipelineStage):
     """Load, aspect-resize, and center-crop the conditioning input.
 
-    For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``.
+    For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``. Batched
+    policy requests write ``[B, 3, H, W]``; regular visual generation remains
+    single-image conditioned.
     For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
     No-op for T2V / T2I.
     """
@@ -115,9 +156,14 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         image_path = batch.image_path
-        if isinstance(image_path, list):
-            image_path = image_path[0] if image_path else None
         video_path = batch.video_path
+        is_action_policy = (
+            batch.data_type == DataType.ACTION
+            and getattr(batch.sampling_params, "action_mode", None)
+            == ACTION_MODE_POLICY
+        )
+        if isinstance(image_path, list) and not is_action_policy:
+            image_path = image_path[0] if image_path else None
         if isinstance(video_path, list):
             video_path = video_path[0] if video_path else None
 
@@ -130,10 +176,23 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         target_h, target_w = batch.height, batch.width
 
         if image_path is not None:
-            image = load_image(image_path)
-            image = _resize_crop_pil(image, target_w, target_h)
-            batch.preprocessed_image = _pil_to_normalized_tensor(image).unsqueeze(0)
-            self.log_info(f"Preprocessed conditioning image to {target_w}x{target_h}")
+            image_sources = (
+                list(image_path)
+                if isinstance(image_path, (list, tuple))
+                else [image_path]
+            )
+            if not image_sources:
+                raise ValueError("Cosmos3 I2V image list is empty")
+            tensors: list[torch.Tensor] = []
+            for src in image_sources:
+                image = load_image(src)
+                image = _resize_crop_pil(image, target_w, target_h)
+                tensors.append(_pil_to_normalized_tensor(image))
+            batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
+            self.log_info(
+                f"Preprocessed {len(tensors)} conditioning image(s) to "
+                f"{target_w}x{target_h}"
+            )
             return batch
 
         if isinstance(video_path, str) and video_path:
@@ -227,7 +286,7 @@ class Cosmos3TokenizationStage(PipelineStage):
 
     def _tokenize_prompt(
         self,
-        text: str,
+        text: str | list[str],
         max_sequence_length: int,
         device: torch.device,
         use_system_prompt: bool = False,
@@ -235,58 +294,72 @@ class Cosmos3TokenizationStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """Tokenize a prompt using Qwen2 chat template.
 
-        Returns (input_ids, attention_mask, seq_len) as [1, S] tensors.
+        Returns (input_ids, attention_mask, seq_len) as [B, S] tensors.
         """
-        conversations = []
-        if use_system_prompt:
-            conversations.append(
-                {
-                    "role": "system",
-                    "content": system_prompt or COSMOS3_VIDEO_SYSTEM_PROMPT,
-                }
-            )
-        conversations.append({"role": "user", "content": text})
-
-        result = self.tokenizer.apply_chat_template(
-            conversations,
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-
-        # Handle different return types from apply_chat_template
-        # Fast tokenizer returns BatchEncoding, slow tokenizer returns list[int]
-        if hasattr(result, "input_ids"):
-            # BatchEncoding from fast tokenizer
-            token_ids = list(result.input_ids)
-        elif isinstance(result, list):
-            # Already a list from slow tokenizer
-            token_ids = list(result)
-        else:
-            raise TypeError(
-                f"Unexpected return type from apply_chat_template: {type(result)}"
-            )
-
-        # Reserve room for the two special tokens (EOS + vision_start) so the
-        # final length cannot exceed ``max_sequence_length``.
-        token_ids = token_ids[: max_sequence_length - 2]
-
-        # Add EOS and vision_start tokens
-        token_ids.append(self.tokenizer.eos_token_id)
-        vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
-        if vision_start_id is not None:
-            token_ids.append(vision_start_id)
-
-        seq_len = len(token_ids)
-
-        # Pad to max_sequence_length
-        pad_len = max_sequence_length - seq_len
-        attention_mask = [1] * seq_len + [0] * pad_len
+        texts = text if isinstance(text, (list, tuple)) else [text]
+        if not texts:
+            raise ValueError("Cosmos3 prompt batch must not be empty")
+        input_id_lists: list[list[int]] = []
+        attention_mask_lists: list[list[int]] = []
+        seq_lens: list[int] = []
         pad_token_id = self.tokenizer.pad_token_id or 0
-        token_ids = token_ids + [pad_token_id] * pad_len
+        vision_start_id = self.tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        for text_item in texts:
+            conversations = []
+            if use_system_prompt:
+                conversations.append(
+                    {
+                        "role": "system",
+                        "content": system_prompt or COSMOS3_VIDEO_SYSTEM_PROMPT,
+                    }
+                )
+            conversations.append({"role": "user", "content": text_item})
 
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-        attention_mask = torch.tensor([attention_mask], dtype=torch.long, device=device)
-        return input_ids, attention_mask, seq_len
+            result = self.tokenizer.apply_chat_template(
+                conversations,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            # Handle different return types from apply_chat_template
+            # Fast tokenizer returns BatchEncoding, slow tokenizer returns list[int]
+            if hasattr(result, "input_ids"):
+                # BatchEncoding from fast tokenizer
+                token_ids = list(result.input_ids)
+            elif isinstance(result, list):
+                # Already a list from slow tokenizer
+                token_ids = list(result)
+            else:
+                raise TypeError(
+                    f"Unexpected return type from apply_chat_template: {type(result)}"
+                )
+
+            # Reserve room for the two special tokens (EOS + vision_start) so the
+            # final length cannot exceed ``max_sequence_length``.
+            token_ids = token_ids[: max_sequence_length - 2]
+            # Add EOS and vision_start tokens
+            token_ids.append(self.tokenizer.eos_token_id)
+            if vision_start_id is not None:
+                token_ids.append(vision_start_id)
+
+            seq_len = len(token_ids)
+            pad_len = max_sequence_length - seq_len
+            attention_mask = [1] * seq_len + [0] * pad_len
+            token_ids = token_ids + [pad_token_id] * pad_len
+            input_id_lists.append(token_ids)
+            attention_mask_lists.append(attention_mask)
+            seq_lens.append(seq_len)
+
+        if len(set(seq_lens)) != 1:
+            raise ValueError(
+                "Cosmos3 batched prompts must tokenize to the same length because "
+                "GEN cross-attention does not mask padded text K/V; split prompts "
+                f"into equal-length batches instead (lengths={seq_lens})"
+            )
+        input_ids = torch.tensor(input_id_lists, dtype=torch.long, device=device)
+        attention_mask = torch.tensor(
+            attention_mask_lists, dtype=torch.long, device=device
+        )
+        return input_ids, attention_mask, seq_lens[0]
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Tokenize prompt and negative prompt."""
@@ -327,6 +400,15 @@ class Cosmos3TokenizationStage(PipelineStage):
             use_system_prompt = False
             use_duration_template = False
             self.log_info(f"Action prompt: {prompt}")
+        else:
+            structured_caption = _inject_caption_metadata(
+                prompt, num_frames, fps, batch.height, batch.width
+            )
+            if structured_caption is not None:
+                # The metadata is already in the caption; appending the prose
+                # template too would state the duration twice.
+                prompt = structured_caption
+                use_duration_template = False
 
         # Apply duration template if enabled (no temporal concept for T2I).
         if use_duration_template and not is_image_gen and num_frames > 1:
@@ -336,6 +418,9 @@ class Cosmos3TokenizationStage(PipelineStage):
             self.log_info(f"Prompt with duration: '{prompt}'")
 
         # Tokenize prompts
+        if isinstance(prompt, list) and not isinstance(negative_prompt, list):
+            negative_prompt = [negative_prompt] * len(prompt)
+
         cond_ids, cond_mask, cond_seq_len = self._tokenize_prompt(
             prompt, max_sequence_length, device, use_system_prompt, system_prompt
         )
@@ -426,8 +511,13 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         height_latent = batch.height // vae_scale_factor_spatial
         width_latent = batch.width // vae_scale_factor_spatial
 
+        if batch.preprocessed_image is not None:
+            batch_dim = int(batch.preprocessed_image.shape[0])
+        else:
+            batch_dim = 1
+
         shape = (
-            1,
+            batch_dim,
             num_channels_latents,
             num_latent_frames,
             height_latent,
@@ -437,6 +527,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(batch.seed)
+            # The rollout SDE step draws its variance noise from this generator.
+            batch.generator = generator
 
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
@@ -460,8 +552,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 )
                 cond_indexes = [0]
 
-            with torch.no_grad():
-                cond_latent = self._vae_encode(pixel_input).to(dtype)
+            with self.use_declared_component(component_name="vae", module=self.vae):
+                with torch.no_grad():
+                    cond_latent = self._vae_encode(pixel_input).to(dtype)
 
             max_idx = max(cond_indexes)
             if max_idx >= num_latent_frames:
@@ -473,7 +566,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
             condition_latents = torch.zeros_like(noise)
             condition_mask = torch.zeros(
-                1, 1, num_latent_frames, 1, 1, device=device, dtype=dtype
+                batch_dim, 1, num_latent_frames, 1, 1, device=device, dtype=dtype
             )
             for idx in cond_indexes:
                 src = min(idx, cond_latent.shape[2] - 1)
@@ -526,6 +619,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 )
             self._prepare_action_latents(batch, generator, device, dtype)
         return batch
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [ComponentUse(self._component_stage_name(stage_name), "vae")]
 
     @staticmethod
     def _resolve_domain_id(batch: Req) -> int:
@@ -582,6 +680,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         action_offset = 1 if action_chunk_size == num_frames - 1 else 0
 
         domain_id = self._resolve_domain_id(batch)
+        batch_dim = (
+            int(batch.raw_latent_shape[0])
+            if getattr(batch, "raw_latent_shape", None)
+            else 1
+        )
         raw_action_dim = getattr(sp, "raw_action_dim", None)
         if raw_action_dim is None:
             embodiment = getattr(sp, "domain_name", None)
@@ -623,7 +726,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             if raw_action_dim is None:
                 raise ValueError(f"action_mode={mode!r} requires --raw-action-dim.")
             clean_action = torch.zeros(
-                1, action_chunk_size, action_dim, device=device, dtype=dtype
+                batch_dim, action_chunk_size, action_dim, device=device, dtype=dtype
             )
 
         raw_action_dim = int(raw_action_dim)
@@ -635,13 +738,13 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         # condition_mask marks clean (given) action tokens. forward_dynamics
         # conditions on the whole action sequence; the others denoise it fully.
         condition_mask = torch.zeros(
-            1, action_chunk_size, 1, device=device, dtype=dtype
+            batch_dim, action_chunk_size, 1, device=device, dtype=dtype
         )
         if mode == ACTION_MODE_FORWARD_DYNAMICS:
             condition_mask[:] = 1.0
 
         noise = torch.randn(
-            1,
+            batch_dim,
             action_chunk_size,
             action_dim,
             generator=generator,
@@ -654,7 +757,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         batch.action_latents = action_latents
         batch.extra["action_domain_ids"] = torch.tensor(
-            [domain_id], dtype=torch.long, device=device
+            [domain_id] * batch_dim, dtype=torch.long, device=device
         )
         batch.extra["action_velocity_mask"] = 1.0 - condition_mask
         batch.extra["action_condition_latents"] = clean_action
@@ -680,15 +783,14 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         super().__init__()
         self.scheduler = scheduler
 
-    def _default_flow_shift_for_mode(self, batch: Req) -> float | None:
-        """Resolve the per-mode default flow_shift for the request.
-
-        Matches cosmos-framework's built-in per-mode sample defaults.
-        """
+    def _default_flow_shift_for_mode(self, batch: Req, is_edge: bool) -> float | None:
+        """Resolve the per-mode default flow_shift for the request."""
         if getattr(batch.sampling_params, "action_mode", None) is not None:
             return COSMOS3_ACTION_FLOW_SHIFT
         if batch.data_type == DataType.IMAGE:
             return COSMOS3_T2I_FLOW_SHIFT
+        if is_edge:
+            return COSMOS3_EDGE_VIDEO_FLOW_SHIFT
         if batch.preprocessed_image is not None:
             return COSMOS3_I2V_FLOW_SHIFT
         if batch.preprocessed_video is not None:
@@ -698,17 +800,47 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Prepare scheduler timesteps."""
         device = get_local_torch_device()
+
+        pipeline_config = server_args.pipeline_config
+        distilled_sigmas = pipeline_config.distilled_sigmas
+        if distilled_sigmas is not None:
+            # Distilled checkpoints carry an explicit fixed-step sigma schedule
+            # with the shift already baked in; drive the scheduler from it
+            # directly (step count == len(sigmas), num_inference_steps ignored).
+            # Reset shift so set_timesteps does not re-shift the baked-in sigmas.
+            if hasattr(self.scheduler, "set_shift"):
+                self.scheduler.set_shift(1.0)
+            self.scheduler.set_timesteps(sigmas=distilled_sigmas, device=device)
+            batch.timesteps = self.scheduler.timesteps
+            self.log_info(
+                f"Prepared {len(batch.timesteps)} distilled timesteps "
+                f"(sigmas={distilled_sigmas})"
+            )
+            return batch
+
         num_inference_steps = batch.num_inference_steps
-        flow_shift = getattr(batch, "flow_shift", None)
+        explicit_flow_shift = getattr(batch, "flow_shift", None)
+        if explicit_flow_shift is None:
+            explicit_flow_shift = pipeline_config.flow_shift
+        flow_shift = explicit_flow_shift
         if flow_shift is None:
-            flow_shift = server_args.pipeline_config.flow_shift
-        if flow_shift is None:
-            flow_shift = self._default_flow_shift_for_mode(batch)
+            flow_shift = self._default_flow_shift_for_mode(
+                batch, bool(pipeline_config.is_edge)
+            )
         if flow_shift is not None and hasattr(self.scheduler, "set_shift"):
             self.scheduler.set_shift(float(flow_shift))
 
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         batch.timesteps = self.scheduler.timesteps
+
+        if batch.rollout:
+            prepare_rollout_request_scheduler(
+                batch,
+                self.scheduler,
+                explicit_shift=explicit_flow_shift,
+                num_inference_steps=num_inference_steps,
+                device=device,
+            )
 
         self.log_info(
             f"Prepared {len(batch.timesteps)} timesteps (flow_shift={flow_shift})"
@@ -716,7 +848,7 @@ class Cosmos3TimestepPreparationStage(PipelineStage):
         return batch
 
 
-class Cosmos3DenoisingStage(PipelineStage):
+class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """Cosmos3 denoise loop, including CFG and the parallelism modes.
 
     The UND pathway runs once and its K/V is cached per cache_key (``cond`` /
@@ -742,6 +874,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         self.scheduler = scheduler
         self.server_args = server_args
         self._logged_parallel_config = False
+        self._logged_cfg_split = False
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -803,6 +936,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 len(gen_layers),
                 compile_kwargs,
             )
+            transformer._gen_layers_torch_compiled = True
             for i, layer in enumerate(gen_layers):
                 gen_layers[i] = torch.compile(layer, **compile_kwargs)
         else:
@@ -872,21 +1006,6 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
             )
 
-    def _manage_device_placement(self, server_args: ServerArgs):
-        """Move transformer to GPU if CPU offload is enabled."""
-        if not server_args.dit_cpu_offload:
-            return
-
-        # FSDP manages offloading internally
-        if server_args.use_fsdp_inference:
-            return
-
-        device = get_local_torch_device()
-        # Load the model to GPU if it's on CPU
-        if next(self.transformer.parameters()).device.type == "cpu":
-            self.log_info("Moving transformer to GPU for inference")
-            self.transformer.to(device)
-
     @staticmethod
     def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
@@ -903,8 +1022,6 @@ class Cosmos3DenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the denoising loop with CFG and optional I2V conditioning."""
-        self._manage_device_placement(server_args)
-
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)
@@ -917,6 +1034,13 @@ class Cosmos3DenoisingStage(PipelineStage):
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
+        # Seed the scheduler's stochastic (SDE) noise from the request seed so it
+        # is identical on every sequence-parallel rank; otherwise each rank draws
+        # its own noise and the sharded latents diverge at the shard boundary.
+        generator = batch.generator
+        if generator is None and batch.seed is not None:
+            generator = torch.Generator(device=latents.device).manual_seed(batch.seed)
+
         cond_text_ids = batch.extra["cond_text_ids"]
         cond_text_mask = batch.extra["cond_text_mask"]
         uncond_text_ids = batch.extra["uncond_text_ids"]
@@ -926,6 +1050,37 @@ class Cosmos3DenoisingStage(PipelineStage):
         velocity_mask = batch.extra.get("velocity_mask")
         condition_latents = batch.extra.get("condition_latents")
         guidance_interval = getattr(batch.sampling_params, "guidance_interval", None)
+
+        # Rollout requests carry a per-request scheduler bound by the timestep stage.
+        scheduler = batch.scheduler if batch.scheduler is not None else self.scheduler
+        if batch.rollout:
+            if velocity_mask is not None or condition_latents is not None:
+                raise ValueError(
+                    "Cosmos3 rollout supports T2V/T2I only; I2V/V2V "
+                    "conditioned-frame re-blending breaks the Gaussian "
+                    "transition assumption of the SDE log-prob math."
+                )
+            if action_latents is not None or sound_latents is not None:
+                raise ValueError(
+                    "Cosmos3 rollout does not support action/sound modalities."
+                )
+            self._maybe_prepare_rollout(batch)
+            self._maybe_init_denoising_env_collection(
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs={},
+                pos_cond_kwargs={
+                    "text_ids": cond_text_ids,
+                    "text_mask": cond_text_mask,
+                    "fps": fps,
+                },
+                neg_cond_kwargs={
+                    "text_ids": uncond_text_ids,
+                    "text_mask": uncond_text_mask,
+                    "fps": fps,
+                },
+                guidance=None,
+            )
 
         do_cfg = guidance_scale > 1.0
 
@@ -985,7 +1140,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         )
 
         for i, t in progress_bar:
-            timestep = t.unsqueeze(0) if t.dim() == 0 else t
+            batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
+            timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,
             # which reduces CFG to the cond branch (cfg-parallel safe).
             effective_scale = (
@@ -1036,7 +1192,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         action_start_frame_offset=action_start_frame_offset,
                     )
                 else:
-                    noise_pred = self._predict_noise_cfg_batched(
+                    noise_pred = self._predict_noise_cfg(
                         latents=latents,
                         timestep=timestep,
                         cond_text_ids=cond_text_ids,
@@ -1047,10 +1203,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         guidance_scale=effective_scale,
                         noisy_frame_mask=velocity_mask,
-                        max_text_seq_len=max(
-                            batch.extra["cond_text_seq_len"],
-                            batch.extra["uncond_text_seq_len"],
-                        ),
+                        cond_text_seq_len=batch.extra["cond_text_seq_len"],
+                        uncond_text_seq_len=batch.extra["uncond_text_seq_len"],
                         current_timestep=i,
                         sound_latents=sound_latents,
                         action_latents=action_latents,
@@ -1098,12 +1252,31 @@ class Cosmos3DenoisingStage(PipelineStage):
             if velocity_mask is not None:
                 noise_pred = noise_pred * velocity_mask
 
-            latents = self.scheduler.step(
-                noise_pred,
-                t,
-                latents,
-                return_dict=False,
-            )[0]
+            if batch.rollout:
+                # Capture the pre-step x_{t_i} before the scheduler advances it.
+                batch._rollout_loop_step_index = i
+                self._maybe_append_dit_trajectory_step(
+                    batch=batch,
+                    latents=latents,
+                    timestep_value=t,
+                    step_index=i,
+                )
+                latents = scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    generator=batch.generator,
+                    batch=batch,
+                    return_dict=False,
+                )[0]
+            else:
+                latents = scheduler.step(
+                    noise_pred,
+                    t,
+                    latents,
+                    generator=generator,
+                    return_dict=False,
+                )[0]
 
             if action_noise_pred is not None:
                 # Zero the velocity at conditioned (clean) action tokens and at
@@ -1147,6 +1320,15 @@ class Cosmos3DenoisingStage(PipelineStage):
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
 
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=latents,
+                num_inference_steps=len(timesteps),
+                final_timestep=timesteps.new_zeros(()).cpu(),
+                server_args=server_args,
+            )
+
         batch.latents = latents
         if action_latents is not None:
             batch.action_latents = action_latents
@@ -1154,6 +1336,87 @@ class Cosmos3DenoisingStage(PipelineStage):
             batch.audio_latents = sound_latents
         self.log_info("Denoising complete")
         return batch
+
+    def _predict_noise_cfg(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        cond_text_ids: torch.Tensor,
+        cond_text_mask: torch.Tensor,
+        uncond_text_ids: torch.Tensor,
+        uncond_text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float,
+        guidance_scale: float,
+        cond_text_seq_len: int,
+        uncond_text_seq_len: int,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run CFG, batching the two branches only when that is lossless.
+
+        A batched forward needs one shared text length, so the shorter prompt
+        gets right-padded. Those pad positions carry all-zero UND K/V, and the
+        GEN cross-attention runs unmasked over the full text K/V — a zero key
+        scores logit 0 and still takes softmax mass while contributing nothing,
+        which weakens the padded branch's conditioning. Fall back to one
+        forward per branch, each trimmed to its own length, whenever the
+        prompts differ in length.
+        """
+        if cond_text_seq_len == uncond_text_seq_len:
+            return self._predict_noise_cfg_batched(
+                latents=latents,
+                timestep=timestep,
+                cond_text_ids=cond_text_ids,
+                cond_text_mask=cond_text_mask,
+                uncond_text_ids=uncond_text_ids,
+                uncond_text_mask=uncond_text_mask,
+                video_shape=video_shape,
+                fps=fps,
+                guidance_scale=guidance_scale,
+                max_text_seq_len=cond_text_seq_len,
+                **kwargs,
+            )
+
+        if not self._logged_cfg_split and not self._current_batch_is_warmup:
+            self._logged_cfg_split = True
+            self.log_info(
+                "Prompt and negative prompt tokenize to different lengths "
+                f"({cond_text_seq_len} vs {uncond_text_seq_len}); running the "
+                "CFG branches in separate forwards to keep padding out of the "
+                "cross-attention"
+            )
+
+        cond = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=cond_text_ids,
+            text_mask=cond_text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key="cond",
+            max_text_seq_len=cond_text_seq_len,
+            **kwargs,
+        )
+        uncond = self._run_transformer(
+            latents=latents,
+            timestep=timestep,
+            text_ids=uncond_text_ids,
+            text_mask=uncond_text_mask,
+            video_shape=video_shape,
+            fps=fps,
+            cache_key="uncond",
+            max_text_seq_len=uncond_text_seq_len,
+            **kwargs,
+        )
+
+        def _cfg_combine(
+            cond_pred: torch.Tensor, uncond_pred: torch.Tensor
+        ) -> torch.Tensor:
+            return uncond_pred + guidance_scale * (cond_pred - uncond_pred)
+
+        if isinstance(cond, tuple):
+            return tuple(_cfg_combine(c, u) for c, u in zip(cond, uncond, strict=True))
+        return _cfg_combine(cond, uncond)
 
     def _predict_noise_cfg_batched(
         self,
@@ -1185,7 +1448,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         latents_batched = torch.cat([latents, latents], dim=0)
         text_ids_batched = torch.cat([uncond_text_ids, cond_text_ids], dim=0)
         text_mask_batched = torch.cat([uncond_text_mask, cond_text_mask], dim=0)
-        timestep_batched = timestep.expand(2)
+        timestep_batched = torch.cat([timestep, timestep], dim=0)
         mask_batched = (
             torch.cat([noisy_frame_mask, noisy_frame_mask], dim=0)
             if noisy_frame_mask is not None
@@ -1304,6 +1567,18 @@ class Cosmos3DenoisingStage(PipelineStage):
             return tuple(cfg_model_parallel_all_reduce(coeff * p) for p in out)
         return cfg_model_parallel_all_reduce(coeff * out)
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "transformer",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
+
 
 class Cosmos3DecodingStage(PipelineStage):
     """
@@ -1419,9 +1694,12 @@ class Cosmos3DecodingStage(PipelineStage):
         if batch.data_type == DataType.ACTION:
             if action_pred is None:
                 raise RuntimeError("Cosmos3 action request produced no action tensor")
+            payload_actions = (
+                action_pred[0] if action_pred.shape[0] == 1 else action_pred
+            )
             payload = {
                 "request_id": batch.request_id,
-                "actions": action_pred[0].numpy(),
+                "actions": payload_actions.numpy(),
                 "action_mode": action_metadata["action_mode"],
                 "domain_id": action_metadata["action_domain_id"],
                 "raw_action_dim": action_metadata["action_raw_action_dim"],
@@ -1445,16 +1723,11 @@ class Cosmos3DecodingStage(PipelineStage):
         )
 
         device = batch.latents.device
-        if server_args.vae_cpu_offload:
-            self.vae.to(device)
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            with torch.no_grad():
+                decoded = self._decode_latents(batch.latents)
 
-        with torch.no_grad():
-            decoded = self._decode_latents(batch.latents)
-
-        if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-            self.vae.to("cpu", non_blocking=True)
-
-        self.log_info(f"Decoded tensor shape: {decoded.shape}")
+        self.log_debug("Decoded tensor shape: %s", decoded.shape)
         output = self._postprocess_tensor(decoded)
 
         if self._guardrails and batch.use_guardrails is not False:
@@ -1469,23 +1742,25 @@ class Cosmos3DecodingStage(PipelineStage):
             else:
                 output = check_video_safety(output)
         elif not is_image_gen:
-            self.log_info(f"Postprocessed video tensor shape: {output.shape}")
+            self.log_debug("Postprocessed video tensor shape: %s", output.shape)
 
         audio = None
         audio_sample_rate = None
         if self.sound_tokenizer is not None and batch.audio_latents is not None:
-            if server_args.vae_cpu_offload:
-                self.sound_tokenizer.to(device)
-            with torch.no_grad():
-                decoded_audio = self.sound_tokenizer.decode(
-                    batch.audio_latents.to(device)
-                )
+            with self.use_declared_component(
+                component_name="sound_tokenizer", module=self.sound_tokenizer
+            ) as sound_tokenizer:
+                assert sound_tokenizer is not None
+                with torch.no_grad():
+                    decoded_audio = sound_tokenizer.decode(
+                        batch.audio_latents.to(device)
+                    )
             audio = decoded_audio.float().cpu()
-            audio_sample_rate = self.sound_tokenizer.sample_rate
-            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-                self.sound_tokenizer.to("cpu", non_blocking=True)
-            self.log_info(
-                f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
+            audio_sample_rate = sound_tokenizer.sample_rate
+            self.log_debug(
+                "Decoded audio tensor shape: %s @ %s Hz",
+                tuple(audio.shape),
+                audio_sample_rate,
             )
 
         return OutputBatch(
@@ -1494,5 +1769,15 @@ class Cosmos3DecodingStage(PipelineStage):
             audio_sample_rate=audio_sample_rate,
             action_pred=action_pred,
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
+            rollout_trajectory_data=batch.rollout_trajectory_data,
             **action_metadata,
         )
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = [ComponentUse(stage_name, "vae", keep_ready_after_warmup=True)]
+        if self.sound_tokenizer is not None:
+            uses.append(ComponentUse(stage_name, "sound_tokenizer"))
+        return uses

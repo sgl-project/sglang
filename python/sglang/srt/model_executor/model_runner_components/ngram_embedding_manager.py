@@ -11,7 +11,7 @@ from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -32,7 +32,6 @@ class NgramEmbeddingManager:
         model: torch.nn.Module,
         model_config: ModelConfig,
         req_to_token_pool: ReqToTokenPool,
-        server_args: ServerArgs,
         max_running_requests: int,
         device: str,
     ):
@@ -50,7 +49,7 @@ class NgramEmbeddingManager:
                 dtype=torch.int32,
                 device=device,
             )
-            chunked_prefill_size = server_args.chunked_prefill_size
+            chunked_prefill_size = get_schedule().chunked_prefill_size
             assert (
                 chunked_prefill_size is not None and chunked_prefill_size > 0
             ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"

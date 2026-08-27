@@ -75,7 +75,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
         from sglang.srt.runtime_context import get_context
 
         runner = object.__new__(ModelRunner)
-        runner.server_args = SimpleNamespace()
+        runner.server_args = SimpleNamespace(speculative_draft_kv_cache_dtype=None)
         runner.draft_attention_backend = None
         # The runner reads the requested dtype off the model bag, so the double
         # publishes it rather than carrying it on a stand-in config.

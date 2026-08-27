@@ -80,7 +80,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     quant_config=quant_config,
                     org_num_embeddings=config.vocab_size,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -117,6 +117,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layers_to_capture is None:
+            raise ValueError(
+                "DFLASH requires explicit layer ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture(layers_to_capture)
 
     @torch.no_grad()
     def forward(

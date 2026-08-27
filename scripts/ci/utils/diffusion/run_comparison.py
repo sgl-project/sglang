@@ -362,6 +362,16 @@ def _build_sglang_payload(case: dict) -> dict:
     ):
         if key in case:
             payload[key] = case[key]
+
+    # Model-specific request fields outside the common schema -- MiniMax-H3
+    # derives its shape from `target` and rejects an explicit num_frames, so a
+    # case needs to both add keys and drop common ones. A null value removes
+    # the key rather than sending null.
+    for key, value in (case.get("sglang_request_extra") or {}).items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
     return payload
 
 
@@ -802,9 +812,9 @@ def run_single(
         wait_for_health(base_url, framework)
 
         # No client-side warmup: each framework relies on its own server-side
-        # warmup before traffic. sglang's serve_args pass --warmup, which `serve`
-        # resolves to server-based (synthetic) warmup that primes kernels at
-        # startup, before the health check passes. This goes through the internal
+        # warmup before traffic. sglang's serve_args pass --warmup-mode server,
+        # which primes kernels with a synthetic request at startup, before the
+        # health check passes. This goes through the internal
         # warmup path that bypasses sampling-param preset validation (e.g.
         # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
         # special-casing is needed here.
@@ -858,6 +868,20 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
     return True
 
 
+def _get_checkout_commit_sha() -> str:
+    fallback = os.environ.get("GITHUB_SHA", "unknown")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return fallback
+    return result.stdout.strip() or fallback
+
+
 def run_comparison(
     config: dict,
     case_ids: list[str] | None = None,
@@ -872,7 +896,7 @@ def run_comparison(
     Each non-sglang framework is installed right before its cases run.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    commit_sha = os.environ.get("GITHUB_SHA", "unknown")
+    commit_sha = _get_checkout_commit_sha()
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
 
     log_dir = Path("comparison-logs")

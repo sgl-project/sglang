@@ -73,7 +73,6 @@ runtime_common = [
   "compressed-tensors",
   "outlines==0.1.11",
   "timm==1.0.16",
-  "torchao==0.9.0",
   "xgrammar==0.2.1",
 ]
 
@@ -108,6 +107,10 @@ tracing = [
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
+#
+# srt_hip_rocm724 below is the torch 2.11 variant of this list and differs only
+# in its compressed-tensors and torch pins. A dependency added here has to be
+# added there too; nothing enforces that.
 srt_hip = [
   # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
   # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
@@ -116,6 +119,17 @@ srt_hip = [
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch",
+  "wave-lang==3.8.2",
+]
+
+# Kept in step with srt_hip above by hand; only the two pins below differ.
+srt_hip_rocm724 = [
+  # ROCm 7.2.4 uses torch 2.11. compressed-tensors 0.15.0 requires
+  # torch<2.11, while 0.16.0 supports torch>=2.10.
+  "compressed-tensors==0.16.0",
+  "petit_kernel==0.0.2",
+  "sglang[runtime_common]",
+  "torch==2.11.0",
   "wave-lang==3.8.2",
 ]
 
@@ -153,15 +167,15 @@ diffusion_musa = [
   "vsa==0.0.4",
 ]
 
-# https://docs.sglang.io/platforms/mps.md
+# https://docs.sglang.io/hardware-platforms/apple_metal
 srt_mps = [
-    "mlx",
+    "mlx>=0.32.0",
     "mlx-lm",
     "sglang[runtime_common]",
-    "torch==2.11.0",
-    "torchao==0.9.0",
+    "torch==2.13.0",
     "torchaudio==2.11.0",
-    "torchvision",
+    "torchcodec==0.15.0",
+    "torchvision==0.28.0",
 ]
 
 diffusion_mps = [
@@ -191,11 +205,13 @@ test = [
 ]
 
 all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
+all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
+dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
@@ -247,6 +263,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
