@@ -307,8 +307,8 @@ def _batch_encode_per_image_misses(
     device: torch.device,
 ) -> Dict[Tuple[Optional[int], int], torch.Tensor]:
     """
-    Collect cache misses across ALL per-image requests, deduplicate by hash,
-    encode in a single ViT call, and populate the cache.
+    Collect cache misses across ALL per-image requests, deduplicate by hash and
+    expected token count, encode in a single ViT call, and populate the cache.
 
     Returns:
         hash_to_embedding: mapping from (item.hash, token_count) to its full
