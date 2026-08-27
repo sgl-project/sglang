@@ -84,7 +84,11 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
         ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        # free_segment() instead of free(): the latter dedups pages with
+        # torch.unique, whose data-dependent output shape syncs the device.
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices, start_pos=req.cache_protected_len
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -135,6 +139,42 @@ class SWAChunkCache(ChunkCache):
         ), "sliding_window_size must be set for SWAChunkCache"
         return True
 
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
+        allocator = self.token_to_kv_pool_allocator
+        # An aliased-pool allocator (PureSWATokenToKVPoolAllocator sets
+        # full_attn_allocator = swa_attn_allocator) must not take the split path:
+        # it would push the same slots onto the free list twice. It has its own
+        # cache subclass, but allocator and cache are chosen by separate
+        # conditions, so check the aliasing here instead of trusting that.
+        if not hasattr(allocator, "free_swa_segment") or (
+            allocator.full_attn_allocator is allocator.swa_attn_allocator
+        ):
+            super().cache_finished_req(
+                req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+            )
+            return
+
+        # Free the two pools separately: the full pool owns
+        # [cache_protected_len, kv_len_to_handle), while the SWA pool only still
+        # holds [swa_evicted_seqlen, kv_len_to_handle) -- window eviction already
+        # released what came before. Naming both ranges lets the allocator pick
+        # the pages positionally instead of reading the mapping back, which
+        # would sync the device behind the in-flight forward.
+        row = self.req_to_token_pool.req_to_token[req.req_pool_idx]
+        protected_len = req.cache_protected_len
+        allocator.free_full_segment(
+            row[protected_len:kv_len_to_handle], start_pos=protected_len
+        )
+        swa_start = protected_len
+        if req.kv is not None:
+            swa_start = max(swa_start, req.kv.swa_evicted_seqlen)
+        if swa_start < kv_len_to_handle:
+            allocator.free_swa_segment(
+                row[swa_start:kv_len_to_handle], start_pos=swa_start
+            )
+
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
 
@@ -165,14 +205,17 @@ class PureSWAChunkCache(SWAChunkCache):
         evict_floor = req.swa_evict_floor
         evicted_seqlen = req.kv.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:
-            parts = []
+            # Ranges are disjoint and ascending, so free_segments() can dedup a
+            # shared boundary page positionally -- no device-syncing unique().
+            segments = []
             if evict_floor > protected_len:
-                parts.append(kv_indices[protected_len:evict_floor])
+                segments.append((kv_indices[protected_len:evict_floor], protected_len))
             if evicted_seqlen < kv_committed_len:
-                parts.append(
-                    kv_indices[max(evicted_seqlen, protected_len) : kv_committed_len]
-                )
-            if parts:
-                self.token_to_kv_pool_allocator.free(torch.cat(parts))
+                start = max(evicted_seqlen, protected_len)
+                segments.append((kv_indices[start:kv_committed_len], start))
+            if segments:
+                self.token_to_kv_pool_allocator.free_segments(segments)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[protected_len:])
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices[protected_len:], start_pos=protected_len
+            )

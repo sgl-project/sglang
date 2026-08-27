@@ -24,6 +24,22 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+def pinned_int64_pair(values, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the (cpu, device) int64 tensor pair the alloc_* APIs expect.
+
+    ``torch.tensor(..., device=cuda)`` copies from pageable memory, which aten
+    implements as cudaMemcpyAsync + cudaStreamSynchronize; on the scheduler
+    stream that stalls the host until the in-flight forward drains. Staging
+    through pinned memory keeps the copy asynchronous, and it stays ordered
+    before the kernel that reads it on the same stream.
+    """
+    if torch.device(device).type == "cpu":
+        host = torch.tensor(values, dtype=torch.int64)
+        return host, host
+    host = torch.tensor(values, dtype=torch.int64, pin_memory=True)
+    return host, host.to(device, non_blocking=True)
+
+
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def __init__(
