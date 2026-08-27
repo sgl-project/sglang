@@ -145,16 +145,20 @@ K3_DBG_PREFILL_ONLY = False  # per-layer [KIMI-K3-DBG] prints: PREFILL only (ski
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
-_k3_dump_hidden = get_bool_env_var("SGLANG_K3_DUMP_HIDDEN")
-_k3_dump_hidden_layers = frozenset(
-    int(layer.strip())
-    for layer in os.getenv(
-        "SGLANG_K3_DUMP_HIDDEN_LAYERS", "0,23,47,59,92"
-    ).split(",")
-    if layer.strip()
-)
-_k3_dump_hidden_dir = os.getenv(
-    "SGLANG_K3_DUMP_HIDDEN_DIR", "/tmp/sglang-k3-hidden"
+# Default ON. Unset / "1" / "true" dumps; set "0" / "false" to disable.
+_k3_dump_hidden = get_bool_env_var("SGLANG_K3_DUMP_HIDDEN", "1")
+# None = dump every layer on this PP stage. A comma list still filters.
+_k3_dump_hidden_layers_raw = os.getenv("SGLANG_K3_DUMP_HIDDEN_LAYERS")
+if _k3_dump_hidden_layers_raw is None or not _k3_dump_hidden_layers_raw.strip():
+    _k3_dump_hidden_layers = None
+else:
+    _k3_dump_hidden_layers = frozenset(
+        int(layer.strip())
+        for layer in _k3_dump_hidden_layers_raw.split(",")
+        if layer.strip()
+    )
+_k3_dump_hidden_dir = os.getenv("SGLANG_K3_DUMP_HIDDEN_DIR") or os.getenv(
+    "SGLANG_K3_DUMP_DIR", "/tmp/sglang-k3-hidden"
 )
 
 
@@ -270,10 +274,17 @@ def _maybe_dump_k3_hidden(
     sp_sharded: bool,
     forward_batch: ForwardBatch,
 ) -> None:
-    """Debug-only dump of complete, unpadded prefill hidden-state rows."""
+    """Debug-only dump of complete, unpadded prefill hidden-state rows.
+
+    When SP-sharded, every rank takes the debug all-gather first (so the
+    saved tensor is the full token axis). Only TP rank 0 then writes.
+    """
     if (
         not _k3_dump_hidden
-        or layer_idx not in _k3_dump_hidden_layers
+        or (
+            _k3_dump_hidden_layers is not None
+            and layer_idx not in _k3_dump_hidden_layers
+        )
         or not forward_batch.forward_mode.is_extend_without_speculative()
     ):
         return
