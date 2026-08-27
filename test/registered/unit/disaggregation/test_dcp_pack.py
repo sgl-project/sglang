@@ -9,10 +9,42 @@ from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     try_pack_dcp_src,
 )
+from sglang.srt.disaggregation.common.utils import (
+    build_dcp_token_transfer_plan,
+    group_concurrent_contiguous,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestPackedDcpGrouping(CustomTestCase):
+    def test_packed_groups_collapse_cyclic_src(self):
+        page_size = 64
+        dcp_size = 4
+        src_pages = np.arange(4, dtype=np.int32)
+        dst_pages = np.array([7], dtype=np.int32)
+        plan = build_dcp_token_transfer_plan(
+            src_pages,
+            dst_pages,
+            physical_page_size=page_size,
+            dcp_size=dcp_size,
+            dcp_rank=0,
+            num_kv_tokens=256,
+        )
+        raw_src, _ = group_concurrent_contiguous(
+            plan.src_token_indices, plan.dst_token_indices
+        )
+        self.assertEqual(len(raw_src), 64)
+        self.assertTrue(all(len(group) == 1 for group in raw_src))
+
+        packed_src = np.arange(plan.dst_token_indices.size, dtype=np.int64)
+        packed_groups, _ = group_concurrent_contiguous(
+            packed_src, plan.dst_token_indices
+        )
+        self.assertEqual(len(packed_groups), 1)
+        self.assertEqual(len(packed_groups[0]), 64)
 
 
 class TestDcpPackBufferBytes(CustomTestCase):
@@ -27,8 +59,10 @@ class TestDcpPackBufferBytes(CustomTestCase):
             4 * 3 * (16 + 16),
         )
 
-    def test_rejects_non_page_aligned_item_lens(self):
-        with self.assertRaises(ValueError):
+    def test_rejects_invalid_item_lens(self):
+        with self.assertRaisesRegex(ValueError, "at least one page"):
+            dcp_pack_buffer_bytes([0], page_size=64, max_tokens=8)
+        with self.assertRaisesRegex(ValueError, "page-aligned"):
             dcp_pack_buffer_bytes([100], page_size=64, max_tokens=8)
 
 
