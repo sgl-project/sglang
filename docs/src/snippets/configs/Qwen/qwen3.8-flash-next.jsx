@@ -181,11 +181,11 @@ export const config = {
   // Every cell below is a verified recipe. Ordering: the first cell seeds the
   // Deploy panel's default selection.
   //
-  // `--linear-attn-{prefill,decode}-backend flashinfer` is pinned explicitly
-  // rather than left to the GDN default, which differs by GPU generation
-  // (Triton on SM90, and the flashinfer decode default is gated on
-  // `--mamba-ssm-dtype bfloat16`). The H200 low-latency cells use Triton for
-  // MTP verify because the SM90 FlashInfer verify path requires fp32 SSM state.
+  // Within a quantization the NVIDIA cells are identical across
+  // H200/B200/B300/GB300, and `--linear-attn-{prefill,decode}-backend flashinfer` is
+  // pinned explicitly rather than left to the GDN default, which differs by GPU
+  // generation (Triton on SM90, and the flashinfer decode default is gated on
+  // `--mamba-ssm-dtype bfloat16`). Pinning both makes one recipe portable.
   cells: [
     // ==== BF16 ====
     // Low latency: MTP on, concurrency capped at 96. Without an explicit
