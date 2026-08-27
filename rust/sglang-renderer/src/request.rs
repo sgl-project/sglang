@@ -28,7 +28,11 @@ impl RendererRequest {
     }
 }
 
-/// Stable token-in request accepted by SGLang's `/generate` endpoint.
+/// Prototype text token-in request accepted by SGLang's `/generate` endpoint.
+///
+/// This is a transport DTO rather than an in-process engine type. It is not yet
+/// a field-complete compatibility contract for multimodal or disaggregated
+/// serving.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedGenerateRequest {
     pub rid: String,

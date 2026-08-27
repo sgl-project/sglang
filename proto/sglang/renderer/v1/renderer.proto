@@ -1,9 +1,10 @@
 syntax = "proto3";
 package sglang.renderer.v1;
 
-// Contract for a future gRPC adapter over sglang-renderer. The prototype
-// generates these bindings and tests the DTO mapping, but does not register
-// this service in the inference gRPC runtime.
+// Render-only contract for a future gRPC adapter over sglang-renderer. This is
+// distinct from a native inference adapter over the shared frontend handle. The
+// prototype generates these bindings and tests the DTO mapping, but does not
+// register this service in the legacy Python-bridge gRPC runtime.
 service RendererService {
   rpc RenderChat(OpenAIRequest) returns (PreparedGenerateRequest);
   rpc RenderCompletions(OpenAIRequest) returns (PreparedGenerateRequests);
