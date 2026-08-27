@@ -13,6 +13,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,7 +47,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         page_size = 128
         fill_len = 574
         physical_tokens_per_req = 5 * page_size
-        physical_available = 18 * page_size
+        full_available = 18 * page_size
+        swa_available = 4 * page_size
 
         reqs = [
             SimpleNamespace(
@@ -62,7 +66,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
-        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.token_to_kv_pool_allocator = MagicMock(
+            spec=UnifiedSWATokenToKVPoolAllocator
+        )
+        queue.token_to_kv_pool_allocator.page_size = page_size
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
@@ -70,16 +77,21 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
-            return_value=(physical_available, physical_available)
+            return_value=(full_available, swa_available)
         )
         queue._swa_tail_allocatable_token_budget = MagicMock(
-            side_effect=lambda **_: physical_available
+            side_effect=lambda **_: swa_available
         )
+        queue._unified_swa_reservation_fits = MagicMock(
+            side_effect=lambda full_tokens, _swa_tokens, *, full_allocatable_tokens, **_: full_tokens
+            <= full_allocatable_tokens
+        )
+        queue._reclaim_swa_tail_capacity = MagicMock(return_value=None)
 
         def pre_alloc(_req):
-            nonlocal physical_available
-            self.assertGreaterEqual(physical_available, physical_tokens_per_req)
-            physical_available -= physical_tokens_per_req
+            nonlocal full_available
+            self.assertGreaterEqual(full_available, physical_tokens_per_req)
+            full_available -= physical_tokens_per_req
 
         queue._pre_alloc = MagicMock(side_effect=pre_alloc)
 
@@ -87,8 +99,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertEqual(resumed, reqs[:3])
         self.assertEqual(queue.retracted_queue, reqs[3:])
-        self.assertEqual(physical_available, 3 * page_size)
+        self.assertEqual(full_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
+        self.assertTrue(
+            all(
+                call.args[1] > call.kwargs["swa_allocatable_tokens"]
+                for call in queue._unified_swa_reservation_fits.call_args_list
+            )
+        )
 
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
@@ -212,6 +230,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
         queue._pre_alloc = MagicMock()
+        queue.token_to_kv_pool_allocator = MagicMock()
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()

@@ -84,6 +84,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         return []
 
+    @property
+    def current_full_capacity(self) -> int:
+        """Capacity represented by full_available_size plus live allocations."""
+        return self.size_full
+
+    @property
+    def current_swa_capacity(self) -> int:
+        """SWA counterpart of current_full_capacity for hybrid allocators."""
+        return self.size_swa
+
     def debug_print(self) -> str:
         return ""
 

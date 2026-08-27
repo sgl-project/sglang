@@ -83,6 +83,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_unified_memory=False,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -148,6 +149,7 @@ def _make_model_runner(
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        enable_unified_memory=enable_unified_memory,
         enable_hisparse=False,
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
@@ -297,7 +299,14 @@ class TestDefaultConfigurator(CustomTestCase):
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 
-    def _make_swa_runner(self, full_layers=16, swa_layers=16, ratio=0.5, page_size=1):
+    def _make_swa_runner(
+        self,
+        full_layers=16,
+        swa_layers=16,
+        ratio=0.5,
+        page_size=1,
+        enable_unified_memory=False,
+    ):
         return _make_model_runner(
             self,
             is_hybrid_swa=True,
@@ -306,6 +315,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             swa_num_kv_heads=4,
             page_size=page_size,
             swa_full_tokens_ratio=ratio,
+            enable_unified_memory=enable_unified_memory,
         )
 
     def _run(self, available_bytes, **kwargs):
@@ -324,6 +334,14 @@ class TestHybridSWAConfigurator(CustomTestCase):
         available = 10_000_000
         mr, _, config = self._run(available)
         used = _actual_memory_used(mr, config)
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
+    def test_unified_memory_records_exact_target_bytes(self):
+        available = 10_000_000
+        mr, _, config = self._run(available, enable_unified_memory=True)
+        used = _actual_memory_used(mr, config)
+        self.assertEqual(config.unified_memory_pool_bytes, used)
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 

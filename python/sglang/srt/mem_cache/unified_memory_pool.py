@@ -1665,8 +1665,8 @@ def init_unified_swa_pools(
     end_layer: int,
     swa_attention_layer_ids: List[int],
     full_attention_layer_ids: List[int],
-    full_max_total_num_tokens: int,
-    swa_max_total_num_tokens: int,
+    full_max_total_num_tokens: Optional[int] = None,
+    swa_max_total_num_tokens: Optional[int] = None,
     enable_memory_saver: bool,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
@@ -1710,15 +1710,24 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
+    legacy_allocator_capacities = {}
     if unified_total_bytes is not None:
         # PROFILED byte budget, sized from directly: the re-sum's floor losses
         # stay out of the buffer, and the token counts remain boot labels.
         total_bytes = unified_total_bytes
     else:
+        if full_max_total_num_tokens is None or swa_max_total_num_tokens is None:
+            raise ValueError(
+                "unified_total_bytes or both legacy full/SWA capacities must be provided"
+            )
         total_bytes = (
             full_max_total_num_tokens * full_spec.entry_bytes()
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
         )
+        legacy_allocator_capacities = {
+            "full_max_total_num_tokens": full_max_total_num_tokens,
+            "swa_max_total_num_tokens": swa_max_total_num_tokens,
+        }
     if model_context_len is not None:
         # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
         # page-granular walk) + the slot-0 sink. The full side is not charged
@@ -1737,6 +1746,8 @@ def init_unified_swa_pools(
             ],
             factory="init_unified_swa_pools",
         )
+    if total_bytes <= 0:
+        raise ValueError(f"total_bytes must be positive, got {total_bytes}")
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
@@ -1757,12 +1768,11 @@ def init_unified_swa_pools(
         unified_buffer=shared_pool,
         kvcache=token_to_kv_pool,
         device=device,
-        full_max_total_num_tokens=full_max_total_num_tokens,
-        swa_max_total_num_tokens=swa_max_total_num_tokens,
         page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        **legacy_allocator_capacities,
     )
 
     logger.info(
@@ -1793,12 +1803,12 @@ def init_unified_swa_pools(
         page_size,
     )
     logger.info(
-        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), full_max_total_num_tokens=%d, "
-        "swa_max_total_num_tokens=%d, joint_available=%d slots",
+        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), "
+        "full_capacity=%d, swa_capacity=%d, joint_available=%d slots",
         total_bytes,
         total_bytes / GB,
-        full_max_total_num_tokens,
-        swa_max_total_num_tokens,
+        allocator.size_full,
+        allocator.size_swa,
         allocator.available_size(),
     )
     logger.info(

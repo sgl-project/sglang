@@ -11,10 +11,6 @@ from typing import (
     Tuple,
 )
 
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
-
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -288,25 +284,15 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        # `*_num_used` is `static_cap - (available + evictable)`, so the
-        # available term must match the static cap's denomination: the conserve
-        # view, never the byte-coordinated one (see
-        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
         allocator = self.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
-            full_available_size = allocator.conserve_full_available_size()
-            swa_available_size = allocator.conserve_swa_available_size()
-        else:
-            full_available_size = allocator.full_available_size()
-            swa_available_size = allocator.swa_available_size()
+        full_capacity = allocator.current_full_capacity
+        swa_capacity = allocator.current_swa_capacity
+        full_available_size = allocator.full_available_size()
+        swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
+        swa_num_used = swa_capacity - (swa_available_size + swa_evictable_size)
         # FIXME(hisparse): host-backup transiently over-releases the device pool
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
@@ -314,13 +300,18 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        if not self.full_tokens_per_layer:
+        if not full_capacity:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+            full_token_usage = full_num_used / full_capacity
+        if not swa_capacity:
+            swa_num_used = 0
+            swa_available_size = 0
+            swa_token_usage = 0.0
+        else:
+            swa_token_usage = swa_num_used / swa_capacity
 
         return PoolStats(
             is_hybrid_swa=True,

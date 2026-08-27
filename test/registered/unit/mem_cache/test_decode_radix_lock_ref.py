@@ -38,6 +38,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.utils.common import Range
 
@@ -150,6 +153,15 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         params = queue.tree_cache.evict_for_alloc.call_args.args[0]
         self.assertEqual(params.num_tokens, 0)
         self.assertEqual(params.swa_num_tokens, 128)
+
+        unified_allocator = MagicMock(spec=UnifiedSWATokenToKVPoolAllocator)
+        unified_allocator.page_size = 64
+        unified_allocator.ensure_capacity.return_value = True
+        queue.token_to_kv_pool_allocator = unified_allocator
+        queue.tree_cache = MagicMock()
+
+        self.assertIsNone(queue._reclaim_swa_tail_capacity(129, "unified", full_len=65))
+        unified_allocator.ensure_capacity.assert_called_once_with(128, 192)
 
     def test_reclaim_swa_tail_capacity_fails_before_allocation(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -449,7 +461,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
-        queue._swa_tail_len.assert_called_once_with(8)
+        queue._swa_tail_len.assert_called_with(8)
         queue._allocatable_token_budgets.assert_called_once()
 
     def test_repeated_incremental_no_leak(self):
