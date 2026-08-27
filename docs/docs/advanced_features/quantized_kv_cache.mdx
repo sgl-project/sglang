@@ -94,7 +94,7 @@ python3 -m sglang.launch_server \
 The native recipe avoids allocating the FP8 dequantization workspace and its token-linear scale copy. The mixed recipe retains both the token-linear scales needed by FlashInfer prefill and the physical TRT-LLM scale layout needed by native decode. In both recipes, KV data remains stored as packed FP4.
 
 <Note>
-Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
+Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. Speculative decoding, PD disaggregation, hierarchical KV cache, and LMCache are not currently supported by the SM100 native NVFP4 path. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
 </Note>
 
 ### Scaling Factors

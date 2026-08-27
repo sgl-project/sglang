@@ -658,6 +658,95 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             handle_mamba_backend(server_args)
 
 
+class TestKV4Compatibility(unittest.TestCase):
+    @staticmethod
+    def _make_nvfp4_args(**overrides):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="nvfp4",
+            attention_backend="trtllm_mha",
+            **overrides,
+        )
+        args.use_mla_backend = lambda: False
+        return args
+
+    def test_sm100_native_nvfp4_rejects_speculative_decoding(self):
+        for prefill_backend, decode_backend in (
+            (None, None),
+            ("flashinfer", "trtllm_mha"),
+        ):
+            with self.subTest(
+                prefill_backend=prefill_backend,
+                decode_backend=decode_backend,
+            ):
+                args = self._make_nvfp4_args(
+                    prefill_attention_backend=prefill_backend,
+                    decode_attention_backend=decode_backend,
+                    speculative_algorithm="EAGLE",
+                )
+                with (
+                    patch("sglang.srt.server_args.is_cuda", return_value=True),
+                    patch(
+                        "sglang.srt.server_args.is_sm100_supported",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.server_args.is_sm120_supported",
+                        return_value=False,
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError, "SM100 native NVFP4.*speculative decoding"
+                    ),
+                ):
+                    args._handle_kv4_compatibility()
+
+    def test_sm120_xqa_keeps_existing_speculative_support(self):
+        args = self._make_nvfp4_args(speculative_algorithm="EAGLE")
+        with (
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch("sglang.srt.server_args.is_sm100_supported", return_value=False),
+            patch("sglang.srt.server_args.is_sm120_supported", return_value=True),
+        ):
+            args._handle_kv4_compatibility()
+
+    def test_sm100_native_nvfp4_allows_monolithic_non_speculative_inference(self):
+        args = self._make_nvfp4_args()
+        with (
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch("sglang.srt.server_args.is_sm100_supported", return_value=True),
+            patch("sglang.srt.server_args.is_sm120_supported", return_value=False),
+        ):
+            args._handle_kv4_compatibility()
+
+    def test_sm100_native_nvfp4_rejects_host_tiered_cache(self):
+        for option in ("enable_hierarchical_cache", "enable_lmcache"):
+            with self.subTest(option=option):
+                args = self._make_nvfp4_args(**{option: True})
+                with (
+                    patch("sglang.srt.server_args.is_cuda", return_value=True),
+                    patch(
+                        "sglang.srt.server_args.is_sm100_supported",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.server_args.is_sm120_supported",
+                        return_value=False,
+                    ),
+                    self.assertRaisesRegex(ValueError, "host pools"),
+                ):
+                    args._handle_kv4_compatibility()
+
+    def test_sm100_native_nvfp4_rejects_pd_disaggregation(self):
+        args = self._make_nvfp4_args(disaggregation_mode="decode")
+        with (
+            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch("sglang.srt.server_args.is_sm100_supported", return_value=True),
+            patch("sglang.srt.server_args.is_sm120_supported", return_value=False),
+            self.assertRaisesRegex(ValueError, "PD disaggregation"),
+        ):
+            args._handle_kv4_compatibility()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)

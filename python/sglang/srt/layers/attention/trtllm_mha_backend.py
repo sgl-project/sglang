@@ -200,13 +200,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     prefill_limit = self.max_context_len
             decode_limit = 0
             if self.decode_uses_native_fp4:
-                decode_limit = model_runner.max_running_requests * max(
-                    1, get_spec().speculative_num_draft_tokens or 1
-                )
+                # SM100 native NVFP4 rejects speculative decoding at argument
+                # validation, so decode contributes one query token per request.
+                decode_limit = model_runner.max_running_requests
             max_native_tokens = max(prefill_limit, decode_limit)
             num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
             self._nvfp4_fp8_output = get_buffer(
-                f"trtllm_mha_nvfp4_output_{num_q_heads}_{config.head_dim}",
+                f"trtllm_mha_nvfp4_output_{max_native_tokens}_"
+                f"{num_q_heads}_{config.head_dim}",
                 lambda: torch.empty(
                     (max_native_tokens, num_q_heads, config.head_dim),
                     dtype=torch.float8_e4m3fn,
@@ -1204,9 +1205,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else (out.dtype if out is not None else self.q_data_type)
         )
 
-        def run_group(
-            group_query, group_block_tables, group_seq_lens, group_out=None
-        ):
+        def run_group(group_query, group_block_tables, group_seq_lens, group_out=None):
             kwargs = {}
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
