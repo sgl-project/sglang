@@ -52,7 +52,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
         )
         return index_k_bytes // compress_ratio * num_layers
 
-
     def __init__(
         self,
         *,

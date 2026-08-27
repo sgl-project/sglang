@@ -40,9 +40,7 @@ def qsa_fast_topk(
 
         from sgl_kernel import top_k as top_k_module
 
-        supported_topk = getattr(
-            top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,)
-        )
+        supported_topk = getattr(top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,))
         if topk in supported_topk:
             return top_k_module.fast_topk_v2(
                 logits, lengths, topk=topk, row_starts=starts
@@ -196,9 +194,7 @@ def _expand_qsa_block_indices_kernel(
         ).to(tl.int32),
         axis=0,
     )
-    valid_token_count = tl.minimum(
-        valid_block_count * COMPRESS_RATIO, TOKEN_TOPK
-    )
+    valid_token_count = tl.minimum(valid_block_count * COMPRESS_RATIO, TOKEN_TOPK)
 
     query_position = tl.load(query_positions + row)
     visible_tokens = query_position + 1
