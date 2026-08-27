@@ -6718,20 +6718,19 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache = mock.MagicMock()
         component = mock.MagicMock()
         cache.components = {ComponentType.SWA: component}
-        action = SWARebuild(node_id=5, source_value=torch.tensor([3, 4]))
+        action = SWARebuild(node_id=5, swa_value=torch.tensor([3, 4]))
         UnifiedRadixCache._apply_cache_action(cache, action)
         component.apply_component_action.assert_called_once_with(action)
 
     def test_apply_component_action_swa_rebuild(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
-        source_value = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        swa_value = torch.tensor([3, 4], dtype=torch.int64)
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
-            SWARebuild(node_id=5, source_value=source_value),
+            SWARebuild(node_id=5, swa_value=swa_value),
         )
-        # translate the source full to SWA and store it on the node (no free)
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(source_value)
+        # the SWA slots were resolved at emit time; apply only stores them
+        alloc.translate_loc_from_full_to_swa.assert_not_called()
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
@@ -6745,6 +6744,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             node_id=5,
             kept_full=torch.tensor([1, 2]),
             incoming_full=torch.tensor([3, 4]),
+            swa_value=torch.tensor([5, 6]),
         )
         UnifiedRadixCache._apply_cache_action(cache, action)
         component.apply_component_action.assert_called_once_with(action)
@@ -6754,16 +6754,17 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc = cache.token_to_kv_pool_allocator
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = alloc.translate_loc_from_full_to_swa.return_value
+        swa_value = torch.tensor([5, 6], dtype=torch.int64)
         _component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
                 kept_full=kept_full,
                 incoming_full=incoming_full,
+                swa_value=swa_value,
             ),
         )
-        # keep the locked full, remap it onto the incoming full's SWA translation
-        alloc.translate_loc_from_full_to_swa.assert_called_once_with(incoming_full)
+        # keep the locked full, remap it onto the SWA slots resolved at emit time
+        alloc.translate_loc_from_full_to_swa.assert_not_called()
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
