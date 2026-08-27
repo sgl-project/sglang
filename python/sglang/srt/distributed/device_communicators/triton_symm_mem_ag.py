@@ -423,19 +423,19 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
     chunk. Returns ``floor`` if server args are unavailable."""
     try:
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_schedule, get_spec
 
-        sa = get_server_args()
+        def g(value) -> int:
+            return value if isinstance(value, int) and value > 0 else 0
 
-        def g(name: str) -> int:
-            v = getattr(sa, name, 0)
-            return v if isinstance(v, int) and v > 0 else 0
-
-        tokens = g("max_running_requests") * max(
-            g("speculative_num_draft_tokens"), g("speculative_eagle_topk"), 1
+        schedule, spec = get_schedule(), get_spec()
+        tokens = g(schedule.max_running_requests) * max(
+            g(spec.speculative_num_draft_tokens), g(spec.speculative_eagle_topk), 1
         )
         if include_prefill:
-            tokens = max(tokens, g("chunked_prefill_size"), g("max_prefill_tokens"))
+            tokens = max(
+                tokens, g(schedule.chunked_prefill_size), g(schedule.max_prefill_tokens)
+            )
         return max(tokens, floor)
     except Exception:
         return floor
@@ -477,7 +477,7 @@ class MultimemAllGatherer:
             # EP/mooncake setups, and keep multimem enabled.
             if (
                 tp_group.world_size > 1
-                and get_parallel().nnodes > 1
+                and get_parallel().config.nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
             ):
                 logger.warning(

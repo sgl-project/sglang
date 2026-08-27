@@ -1,7 +1,11 @@
 import unittest
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -9,13 +13,14 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    kill_process_tree,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # RadixAttention server integration tests
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=405, suite="base-c-test-cpu")
 
 
 class TestRadixCacheFCFS(CustomTestCase):
@@ -39,7 +44,7 @@ class TestRadixCacheFCFS(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)

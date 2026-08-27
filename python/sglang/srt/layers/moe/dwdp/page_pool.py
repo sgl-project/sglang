@@ -12,7 +12,7 @@ except ImportError:
     # For non-cuda platform.
     cuda = None
 
-from sglang.srt.cuda_vmm_utils import (
+from sglang.srt.utils.cuda_vmm_utils import (
     VmmReservation,
     align_up,
     check_drv,
