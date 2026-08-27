@@ -6,9 +6,11 @@ from typing import Any
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models import (  # noqa: F401
     sensenova_u1 as _sensenova_u1,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
@@ -34,5 +36,7 @@ def load_model_and_tokenizer(
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
     model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
-    model = model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    device = get_local_torch_device()
+    current_platform.set_device(device)
+    model = model.to(device)
     return {"model": model, "tokenizer": tokenizer}

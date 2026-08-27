@@ -124,6 +124,15 @@ def optimized_scale(positive_flat, negative_flat):
     return st_star
 
 
+def _randn_with_seed(shape, *, device, dtype, seed: int) -> torch.Tensor:
+    try:
+        generator = torch.Generator(device).manual_seed(seed)
+        return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+    except (RuntimeError, TypeError):
+        torch.manual_seed(seed)
+        return torch.randn(shape, device=device, dtype=dtype)
+
+
 def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
     """
     Compute patch coordinates (x, y)
@@ -2097,12 +2106,11 @@ class NEOChatModel(PreTrainedModel):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        generator = torch.Generator(device).manual_seed(seed)
-        image_prediction = noise_scale * torch.randn(
+        image_prediction = noise_scale * _randn_with_seed(
             (batch_size, 3, image_size[1], image_size[0]),
             device=device,
             dtype=dtype,
-            generator=generator,
+            seed=seed,
         )
 
         attention_mask_condition = {"full_attention": None}
@@ -2431,12 +2439,11 @@ class NEOChatModel(PreTrainedModel):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        generator = torch.Generator(device).manual_seed(seed)
-        image_prediction = noise_scale * torch.randn(
+        image_prediction = noise_scale * _randn_with_seed(
             (batch_size, 3, image_size[1], image_size[0]),
             device=device,
             dtype=dtype,
-            generator=generator,
+            seed=seed,
         )
 
         attention_mask_condition = {"full_attention": None}
