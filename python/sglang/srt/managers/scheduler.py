@@ -2488,7 +2488,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
-                kv_router_hint=recv_req.kv_router_hint,
+                kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2811,7 +2811,7 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
-                    router_hint=req.kv_router_hint,
+                    router_hint=req.kv_hints,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

@@ -46,7 +46,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.storage.kvcr.router_hint import ROUTER_HINT_KEY
+from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    ROUTER_HINT_KEY,
+    SOURCE_LOCATIONS_ACTION_TYPE,
+    SOURCE_LOCATIONS_ACTION_VERSION,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -143,12 +147,27 @@ def _store(
 
 
 def _hint_extra_info(endpoint: str) -> HiCacheStorageExtraInfo:
-    """An extra_info carrying one router hint, as the controller threads it."""
+    """An extra_info carrying one router hint, as the controller threads it.
+
+    Shaped as the v0.1 KV-hint envelope so these tests exercise the same outer
+    layer the router actually sends, not just the inner payload.
+    """
     return HiCacheStorageExtraInfo(
         extra_info={
             ROUTER_HINT_KEY: {
-                "source_control_endpoint": endpoint,
-                "block_hashes": ["0123456789abcdef"],
+                "protocol_version": "0.1",
+                "message_id": "test-envelope",
+                "actions": [
+                    {
+                        "action_id": "src-0",
+                        "action_type": SOURCE_LOCATIONS_ACTION_TYPE,
+                        "action_version": SOURCE_LOCATIONS_ACTION_VERSION,
+                        "payload": {
+                            "source_control_endpoint": endpoint,
+                            "block_hashes": ["0123456789abcdef"],
+                        },
+                    }
+                ],
             }
         }
     )

@@ -1,4 +1,4 @@
-"""Wire-schema conformance for the dynamo router hint.
+"""Wire-schema conformance for the KV hint the dynamo router sends.
 
 The dynamo router and SGLang name the same KV block two different ways, and the
 seam between them is unforgiving: a mismatch does not raise, it silently makes
@@ -11,6 +11,10 @@ router indexes that value as ``ExternalSequenceBlockHash(u64)`` and echoes it
 back in the hint as a bare JSON number. So the round trip
 ``page hash -> event int64 -> u64 -> hint -> page key`` must land back on the
 same 16 hex chars the store compares against.
+
+The hint travels inside the v0.1 KV-hint envelope (dynamo #13134, SGLang RFC
+#36224) as a ``kv.source_locations@1.0`` action; ``EnvelopeTest`` covers that
+outer layer, everything else covers the payload.
 
 Unlike ``test_kvcr_router_hint_e2e.py``, this needs no ``kvcr`` wheel: it is the
 pure parse/normalize layer.
@@ -25,6 +29,8 @@ from types import SimpleNamespace
 
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     ROUTER_HINT_KEY,
+    SOURCE_LOCATIONS_ACTION_TYPE,
+    SOURCE_LOCATIONS_ACTION_VERSION,
     RouterHint,
     normalize_block_hash,
     page_hash_key,
@@ -41,8 +47,30 @@ _PAGE_HASH = "f" * 16 + "0123456789abcdef" * 3
 _SMALL_PAGE_HASH = "0123456789abcdef" * 4
 
 
+def _envelope(payload, *, action_type=None, action_version=None):
+    """Wrap a kv.source_locations payload in the v0.1 KV-hint envelope."""
+    return {
+        "protocol_version": "0.1",
+        "message_id": "2f82414c-0ab8-4b9e-a806-168d3ad8a1fd",
+        "actions": [
+            {
+                "action_id": "src-0",
+                "action_type": action_type or SOURCE_LOCATIONS_ACTION_TYPE,
+                "action_version": action_version or SOURCE_LOCATIONS_ACTION_VERSION,
+                "payload": payload,
+            }
+        ],
+    }
+
+
 def _extra_info(payload):
-    return SimpleNamespace(extra_info={ROUTER_HINT_KEY: payload})
+    """extra_info carrying `payload` as the envelope's one source-locations action."""
+    return SimpleNamespace(extra_info={ROUTER_HINT_KEY: _envelope(payload)})
+
+
+def _extra_info_raw(value):
+    """extra_info carrying `value` verbatim, with no envelope wrapping."""
+    return SimpleNamespace(extra_info={ROUTER_HINT_KEY: value})
 
 
 class RoundTripTest(unittest.TestCase):
@@ -177,6 +205,73 @@ class ParseTest(unittest.TestCase):
         self.assertIsNone(
             RouterHint.maybe_from_extra_info(SimpleNamespace(extra_info={}))
         )
+
+
+class EnvelopeTest(unittest.TestCase):
+    """The v0.1 envelope layer: which actions are read, which are stepped over."""
+
+    _PAYLOAD = {
+        "source_control_endpoint": "tcp://peer:25000",
+        "block_hashes": [_PAGE_HASH],
+    }
+
+    def test_a_bare_payload_is_still_accepted(self):
+        """Pre-envelope shape (dynamo #11695) must keep working until it retires."""
+        hint = RouterHint.maybe_from_extra_info(_extra_info_raw(self._PAYLOAD))
+        self.assertIsNotNone(hint)
+        self.assertTrue(hint.covers(_PAGE_HASH))
+
+    def test_an_unimplemented_action_does_not_suppress_ours(self):
+        """Actions are independent: one we ignore must not hide one we implement.
+
+        An envelope is a list, and a router is free to add actions for other
+        consumers. Scanning only the first entry would make our fetch depend on
+        the router's action ordering.
+        """
+        envelope = _envelope(self._PAYLOAD)
+        envelope["actions"].insert(
+            0,
+            {
+                "action_id": "demote-0",
+                "action_type": "kv.demote",
+                "action_version": "1.0",
+                "payload": {"session_id": "agent-42"},
+            },
+        )
+        hint = RouterHint.maybe_from_extra_info(_extra_info_raw(envelope))
+        self.assertIsNotNone(hint)
+        self.assertTrue(hint.covers(_PAGE_HASH))
+
+    def test_a_newer_action_version_is_skipped_not_misparsed(self):
+        """A future payload shape read against this schema would misread it."""
+        self.assertIsNone(
+            RouterHint.maybe_from_extra_info(
+                _extra_info_raw(_envelope(self._PAYLOAD, action_version="2.0"))
+            )
+        )
+
+    def test_an_unknown_envelope_version_still_yields_the_action(self):
+        """Actions carry their own version, so the envelope's does not gate them."""
+        envelope = _envelope(self._PAYLOAD)
+        envelope["protocol_version"] = "0.2"
+        hint = RouterHint.maybe_from_extra_info(_extra_info_raw(envelope))
+        self.assertIsNotNone(hint)
+        self.assertTrue(hint.covers(_PAGE_HASH))
+
+    def test_malformed_envelopes_yield_no_hint(self):
+        """Fail-closed at the envelope layer too."""
+        for envelope in (
+            {"protocol_version": "0.1", "actions": "not-a-list"},
+            {"protocol_version": "0.1", "actions": ["not-a-dict"]},
+            {"protocol_version": "0.1", "actions": [{}]},
+            _envelope(self._PAYLOAD, action_type="kv.deref"),
+            _envelope(None),
+            _envelope("not-a-dict"),
+        ):
+            with self.subTest(envelope=envelope):
+                self.assertIsNone(
+                    RouterHint.maybe_from_extra_info(_extra_info_raw(envelope))
+                )
 
 
 class ExtraInfoKeyAgreementTest(unittest.TestCase):

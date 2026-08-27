@@ -324,7 +324,7 @@ sizing issue below, and *not* `local_dram_bytes`.
 | `kvcr_config.py` | `--hicache-storage-backend-extra-config` schema and timeouts |
 
 Outside this directory the change is small — 13 files, ~190 lines, mostly
-threading `kv_router_hint` from the request through the scheduler down to
+threading `kv_hints` from the request through the scheduler down to
 `batch_exists`/`batch_get`. Note SGLang has **two** prefetch controller stacks
 (`HiCacheController` and `HybridCacheController`); both had to be threaded or
 the untouched one raises `TypeError`.

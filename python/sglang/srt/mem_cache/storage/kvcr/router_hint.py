@@ -11,12 +11,24 @@ per-request routing metadata (`source_control_endpoint` + which block hashes).
 The carrier we plan to use is `HiCacheStorageExtraInfo.extra_info`, a free-form
 dict already threaded from the controller into every v2 call.
 
-It mirrors the wire shape from dynamo (`oandreeva/router_hints`, PR #11695 --
-"Add compact router hints for remote KV reuse", still open at head
-`b4c9823b81`) and a parser that tolerates its absence, so the store has a stable
-seam to code against. The schema is now the compact 2-field form on that PR; if
-the PR shifts before merge, this struct and `RFC_kvcr_hicache_backend.md` are
-the two places to update in lockstep.
+The wire form is the versioned KV-hint envelope from dynamo PR #13134 ("define
+typed KV hint contract"), which SGLang RFC #36224 proposes to make a first-class
+request field:
+
+    {"protocol_version": "0.1", "message_id": ..., "actions": [
+        {"action_id": ..., "action_type": "kv.source_locations",
+         "action_version": "1.0",
+         "payload": {"source_control_endpoint": ..., "block_hashes": [...]}}]}
+
+This backend reads exactly one action type, ``kv.source_locations``, and ignores
+every other action in the envelope -- an envelope carrying actions nobody here
+implements must still deliver the one that is implemented. The bare payload is
+accepted unwrapped as well, which is what dynamo PR #11695 sends today; that
+path retires once #13134 lands on both sides.
+
+Until RFC #36224 lands a typed ``KvHints`` struct in SGLang core, the envelope
+arrives as a plain dict and is parsed here. The migration is then a field type
+change, not a wire change: this parser is deleted, not rewritten.
 """
 
 from __future__ import annotations
@@ -33,9 +45,16 @@ else:
     # is what lets the schema tests run on the CPU CI tier.
     BlockKey = bytes
 
-# Key under which the controller is expected to stash the hint inside
-# HiCacheStorageExtraInfo.extra_info. Placeholder name.
-ROUTER_HINT_KEY = "kvcr_router_hint"
+# Key under which the controller stashes the envelope inside
+# HiCacheStorageExtraInfo.extra_info. Matches the request field name proposed by
+# SGLang RFC #36224, so the eventual typed field needs no rename here.
+ROUTER_HINT_KEY = "kv_hints"
+
+# The one action type this backend implements, and the envelope version it was
+# specified against. Both are matched leniently: an unknown envelope version
+# still has its actions read, since an action carries its own version.
+SOURCE_LOCATIONS_ACTION_TYPE = "kv.source_locations"
+SOURCE_LOCATIONS_ACTION_VERSION = "1.0"
 
 # Width of the canonical block-hash key, in hex chars. See page_hash_key().
 _BLOCK_HASH_HEX_WIDTH = 16
@@ -147,6 +166,37 @@ class RouterHint(msgspec.Struct, kw_only=True):
         return cls(source_control_endpoint=endpoint, block_hashes=tuple(normalized))
 
     @classmethod
+    def maybe_from_envelope(cls, envelope) -> Optional[RouterHint]:
+        """Pull the ``kv.source_locations`` payload out of a v0.1 KV-hint envelope.
+
+        A bare payload (no ``actions`` list) is accepted unwrapped, which is the
+        pre-envelope shape dynamo PR #11695 sends. Actions of other types are
+        skipped rather than rejected: an envelope is a list of independent
+        actions, so one this backend does not implement must not suppress one it
+        does. The first well-formed match wins.
+        """
+        if not isinstance(envelope, dict):
+            return None
+        actions = envelope.get("actions")
+        if actions is None:
+            return cls.maybe_from_payload(envelope)
+        if not isinstance(actions, (list, tuple)):
+            return None
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if action.get("action_type") != SOURCE_LOCATIONS_ACTION_TYPE:
+                continue
+            # A newer action version may reshape the payload, so parsing it
+            # against this schema would silently misread it. Skip instead.
+            if action.get("action_version") != SOURCE_LOCATIONS_ACTION_VERSION:
+                continue
+            hint = cls.maybe_from_payload(action.get("payload"))
+            if hint is not None:
+                return hint
+        return None
+
+    @classmethod
     def maybe_from_extra_info(cls, extra_info) -> Optional[RouterHint]:
         """Best-effort extraction from a HiCacheStorageExtraInfo.
 
@@ -160,7 +210,7 @@ class RouterHint(msgspec.Struct, kw_only=True):
         raw = extra_info.extra_info
         if not isinstance(raw, dict):
             return None
-        return cls.maybe_from_payload(raw.get(ROUTER_HINT_KEY))
+        return cls.maybe_from_envelope(raw.get(ROUTER_HINT_KEY))
 
     def covers(self, key: str) -> bool:
         """Is this SGLang page key (or one of its segment keys) in the hint?
