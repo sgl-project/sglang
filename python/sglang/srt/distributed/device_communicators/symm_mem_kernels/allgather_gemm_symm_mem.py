@@ -478,8 +478,7 @@ def allgather_gemm_op_symm_mem(
 def maybe_fused_ag_shared_experts(
     hidden_states: torch.Tensor,
     shared_experts_is_fp8: bool,
-    w_fp8: Optional[torch.Tensor],
-    w_scale: Optional[torch.Tensor],
+    gate_up_proj,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused AG + fp8-quant + gate_up gemm. Returns (None, None) to fall back.
 
@@ -495,10 +494,16 @@ def maybe_fused_ag_shared_experts(
         return None, None
     if not shared_experts_is_fp8:
         return None, None
-    if w_fp8 is None or w_scale is None:
+    if gate_up_proj is None:
         return None, None
-    _, K = hidden_states.shape
 
+    w_fp8 = gate_up_proj.weight
+    # Block-wise FP8 has weight_scale_inv (2D); per-tensor has weight_scale (scalar).
+    w_scale = getattr(gate_up_proj, "weight_scale_inv", None)
+    if w_scale is None:
+        return None, None
+
+    _, K = hidden_states.shape
     ctx = comm.get_or_create_ag_gemm_ctx(K=K)
     if ctx is None:
         return None, None

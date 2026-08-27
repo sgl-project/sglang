@@ -1508,12 +1508,7 @@ class DeepseekV2MoE(nn.Module):
             ag_out, gate_up_local = maybe_fused_ag_shared_experts(
                 hidden_states,
                 getattr(self, "shared_experts_is_fp8", False),
-                shared.gate_up_proj.weight if shared is not None else None,
-                (
-                    shared.gate_up_proj.weight_scale_inv
-                    if shared is not None and self.shared_experts_is_fp8
-                    else None
-                ),
+                shared.gate_up_proj if shared is not None else None,
             )
             if ag_out is not None:
                 if gate_up_local is not None:
