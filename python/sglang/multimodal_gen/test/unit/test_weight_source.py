@@ -4,10 +4,23 @@ from unittest.mock import patch
 import pytest
 
 from sglang.multimodal_gen.runtime.weights.source import (
+    is_explicit_weight_file_reference,
+    materialize_weight,
     parse_weight_source,
     resolve_weight,
     resolve_weight_inventory,
 )
+
+
+def test_explicit_weight_file_reference_does_not_claim_directories(tmp_path):
+    component = tmp_path / "component.safetensors"
+    component.mkdir()
+
+    assert not is_explicit_weight_file_reference(str(component))
+    assert is_explicit_weight_file_reference("owner/repo/model.safetensors")
+    assert is_explicit_weight_file_reference(
+        "https://huggingface.co/owner/repo/resolve/main/model.gguf?download=true"
+    )
 
 
 def test_parse_weight_source_accepts_repo_subfolder_and_exact_url():
@@ -80,3 +93,10 @@ def test_weight_source_rejects_ambiguous_files(tmp_path):
 
     with pytest.raises(ValueError, match="multiple independent weight files"):
         resolve_weight(str(tmp_path))
+
+
+def test_materialize_local_weight_returns_selected_file(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"fixture")
+
+    assert materialize_weight(resolve_weight(str(checkpoint))) == str(checkpoint)
