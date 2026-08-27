@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     _topk_from_pooled_history_logits_unfused,
+    topk_from_pooled_history_logits,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -96,6 +97,99 @@ class TestKPoolMqaBackend(CustomTestCase):
             result,
             torch.tensor([[2, 3, 4, 5]], dtype=torch.int32),
         )
+
+    def test_rocm_uses_fused_kpool_topk_for_supported_group_count(self):
+        logits = MagicMock()
+        logits.ndim = 2
+        logits.shape = (1, 512)
+        logits.is_cuda = True
+        logits.dtype = torch.float32
+        group_lengths = torch.tensor([256], dtype=torch.int32)
+        marker = MagicMock()
+        marker.shape = (1, 2048)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.kpool_fp8_index.is_hip",
+                return_value=True,
+            ),
+            patch(
+                "sglang.kernels.ops.moe.kpool_topk_transform.fast_kpool_topk_transform_fused",
+                return_value=marker,
+            ) as fused,
+            patch(
+                "sglang.srt.layers.attention.dsa.kpool_fp8_index._topk_from_pooled_history_logits_unfused"
+            ) as unfused,
+        ):
+            result = topk_from_pooled_history_logits(
+                logits=logits,
+                group_lengths=group_lengths,
+                pool_size=4,
+                topk=2048,
+            )
+
+        self.assertIs(result, marker)
+        fused.assert_called_once()
+        unfused.assert_not_called()
+
+    def test_rocm_keeps_2048_group_topk_on_unfused_path(self):
+        logits = MagicMock()
+        logits.ndim = 2
+        logits.shape = (1, 2048)
+        logits.is_cuda = True
+        logits.dtype = torch.float32
+        group_lengths = torch.tensor([2048], dtype=torch.int32)
+        marker = object()
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.kpool_fp8_index.is_hip",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.kpool_fp8_index._topk_from_pooled_history_logits_unfused",
+                return_value=marker,
+            ) as unfused,
+        ):
+            result = topk_from_pooled_history_logits(
+                logits=logits,
+                group_lengths=group_lengths,
+                pool_size=4,
+                topk=8192,
+            )
+
+        self.assertIs(result, marker)
+        unfused.assert_called_once()
+
+    def test_cuda_keeps_supported_group_count_on_fused_path(self):
+        logits = MagicMock()
+        logits.ndim = 2
+        logits.shape = (1, 512)
+        logits.is_cuda = True
+        logits.dtype = torch.float32
+        group_lengths = torch.tensor([256], dtype=torch.int32)
+        marker = MagicMock()
+        marker.shape = (1, 2048)
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa.kpool_fp8_index.is_hip",
+                return_value=False,
+            ),
+            patch(
+                "sglang.kernels.ops.moe.kpool_topk_transform.fast_kpool_topk_transform_fused",
+                return_value=marker,
+            ) as fused,
+        ):
+            result = topk_from_pooled_history_logits(
+                logits=logits,
+                group_lengths=group_lengths,
+                pool_size=4,
+                topk=2048,
+            )
+
+        self.assertIs(result, marker)
+        fused.assert_called_once()
 
 
 if __name__ == "__main__":

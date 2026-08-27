@@ -636,7 +636,10 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    if is_hip():
+    # The JIT fused path supports the dedicated 128..512 group-topk kernels on
+    # both CUDA and HIP. Keep the legacy HIP fallback only for the separate
+    # 2048-group AOT path, which is not covered by the JIT implementation.
+    if is_hip() and group_topk == 2048:
         return _topk_from_pooled_history_logits_unfused(
             logits=logits,
             group_lengths=group_lengths,

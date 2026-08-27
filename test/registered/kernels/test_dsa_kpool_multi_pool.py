@@ -11,11 +11,13 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.dsa import kpool_fp8_index
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
+    _topk_from_pooled_history_logits_unfused,
     gather_index_k_scale_prefix_into,
     kpool_assemble_softmax_rotate_write_cache,
     kpool_max_closed_pools,
     kpool_softmax_rotate_write_cache,
     kpool_write_tail_and_maybe_compress,
+    topk_from_pooled_history_logits,
     update_kpool_write_plan_cuda_graph,
 )
 from sglang.srt.layers.attention.dsa.kpool_plan import (
@@ -53,6 +55,47 @@ class TestDsaKpoolMultiPool(CustomTestCase):
     def _empty_cache(self) -> torch.Tensor:
         page_nbytes = self.SLOTS_PER_PAGE * INDEX_HEAD_DIM + self.SLOTS_PER_PAGE * 4
         return torch.zeros((1, page_nbytes), dtype=torch.uint8, device="cuda")
+
+    def test_fused_topk_matches_unfused_physical_token_sets(self):
+        torch.manual_seed(45)
+        batch_size = 2
+        score_cols = 4096
+        pool_size = self.POOL_SIZE
+        topk = 2048
+        logits = torch.randn(batch_size, score_cols, dtype=torch.float32, device="cuda")
+        group_lengths = torch.tensor([256, 511], dtype=torch.int32, device="cuda")
+        seq_lens = group_lengths * pool_size + torch.tensor(
+            [0, 3], dtype=torch.int32, device="cuda"
+        )
+        page_table = torch.arange(
+            batch_size * score_cols * pool_size,
+            dtype=torch.int32,
+            device="cuda",
+        ).view(batch_size, score_cols * pool_size)
+
+        actual = topk_from_pooled_history_logits(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=pool_size,
+            topk=topk,
+            page_table=page_table,
+            seq_lens=seq_lens,
+        )
+        expected = _topk_from_pooled_history_logits_unfused(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=pool_size,
+            topk=topk,
+            page_table=page_table,
+            seq_lens=seq_lens,
+        )
+
+        torch.testing.assert_close(
+            torch.sort(actual, dim=1).values,
+            torch.sort(expected, dim=1).values,
+            atol=0,
+            rtol=0,
+        )
 
     def test_write_plan_records_every_candidate_pool(self):
         batch_size = 2
