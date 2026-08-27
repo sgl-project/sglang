@@ -335,7 +335,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
         parallel = SimpleNamespace(
             tp_size=1,
             moe_ep_size=1,
-            enable_dp_lm_head=False,
+            config=SimpleNamespace(enable_dp_lm_head=False),
         )
         with (
             unittest.mock.patch.object(
