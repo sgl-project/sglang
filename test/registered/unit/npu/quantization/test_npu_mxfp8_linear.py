@@ -53,7 +53,8 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
 
         self.assertEqual(layer.weight.shape, (64, 128))
         torch.testing.assert_close(
-            layer.weight.data.T.contiguous().view(torch.uint8), original_weight
+            layer.weight.data.T.contiguous().view(torch.uint8),
+            original_weight.view(torch.uint8),
         )
         self.assertEqual(layer.weight_scale_inv.shape, (1, 128, 2))
         self.assertTrue(
