@@ -515,19 +515,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
-                banded_depths = 0
-                if (
-                    model_config.hf_config.architectures[0]
-                    == "InklingForConditionalGeneration"
-                ):
-                    banded_depths = len(
-                        [
-                            i
-                            for i in model_config.hf_text_config.mtp_local_layer_ids
-                            if i < draft_layers
-                        ]
+                mtp_local_layer_ids = getattr(
+                    getattr(model_config, "hf_text_config", None),
+                    "mtp_local_layer_ids",
+                    None,
+                )
+                if mtp_local_layer_ids is not None:
+                    local_layer_ids = set(mtp_local_layer_ids)
+                    self._draft_swa_full_layers_num = sum(
+                        layer_id in local_layer_ids for layer_id in range(draft_layers)
                     )
-                    self._draft_swa_full_layers_num = banded_depths
                 else:
                     draft_swa_layers = kvc.spec_aux_config.eagle_draft_swa_num_layers
                     if draft_swa_layers is not None:
