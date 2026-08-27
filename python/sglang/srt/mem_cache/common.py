@@ -35,6 +35,8 @@ class RetractionBackup(NamedTuple):
     cpu_tensors: Any = None
     host_indices: Optional[torch.Tensor] = None
     pool_transfers: Optional[list[PoolTransfer]] = None
+    # Set when the KV pool leaves the recurrent state to the caller.
+    mamba_cpu: Any = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -128,14 +130,16 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
+            tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
         if available_size < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+            tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_tokens - available_size)
+            )
 
 
 def retraction_backup(
@@ -144,17 +148,20 @@ def retraction_backup(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
-) -> None:
+) -> bool:
+    """Returns False when the host pool cannot hold the backup; the caller
+    aborts the request since its KV cannot be preserved."""
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
-        return
+        return True
     if backend != "host_pool":
         raise ValueError(f"Unknown retraction backup backend: {backend}")
     if req.seqlen <= 1:
-        return
+        return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     req.retraction_backup = unified_cache.retraction_backup(req)
+    return req.retraction_backup is not None
 
 
 def retraction_restore(

@@ -5,7 +5,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.backend.lmhead_mixing import LoRABackendLmHeadMixing
-from sglang.srt.lora.utils import LoRABatchInfo, MoELoRABatchInfo
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    MoELoRABatchInfo,
+    get_batch_token_counts,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -296,16 +300,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             adapter_enabled = None
             token_lora_mapping = None
 
-        num_tokens = (
-            sum(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.forward_mode.is_extend()
-            else forward_batch.batch_size
-        )
-        max_len = (
-            max(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.forward_mode.is_extend()
-            else 1
-        )
+        num_tokens, max_len = get_batch_token_counts(forward_batch)
 
         if (
             batch_info.req_seg_indptr is not None

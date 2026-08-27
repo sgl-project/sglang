@@ -269,7 +269,7 @@ class AttnTpContext:
     def init_context(self, q_lora_rank, is_dsa):
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
-            get_parallel().enable_attn_tp_input_scattered
+            get_parallel().config.enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_dsa
@@ -280,7 +280,7 @@ class AttnTpContext:
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_spec().speculative_algorithm != "EAGLE3"
         )
-        if get_parallel().enable_attn_tp_input_scattered:
+        if get_parallel().config.enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:
                 logging.info(
                     "attn_tp_input_scattered is not enabled while other conditions are not met"
@@ -438,11 +438,11 @@ class LayerScatterModes:
 
 
 def enable_moe_dense_fully_dp():
-    return get_parallel().moe_dense_tp_size == 1
+    return get_parallel().config.moe_dense_tp_size == 1
 
 
 def enable_dwdp():
-    return get_parallel().dwdp_size > 1
+    return get_parallel().config.dwdp_size > 1
 
 
 class LayerCommunicator:
