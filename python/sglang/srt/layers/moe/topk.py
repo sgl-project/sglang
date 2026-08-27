@@ -2079,11 +2079,9 @@ def capture_routed_experts_if_allowed(
     Routing all backends through here keeps the draft-side opt-out from being
     bypassed by an inlined capturer call.
 
-    Rows at or past ``num_token_non_padded`` still hold whatever the router left
-    there; ``_post_process_topk_ids`` masks them only further down, and on ROCm it
-    masks them to 0, a valid expert id. Capture runs ahead of both, so mask a copy
-    here: replay consumers skip -1 rows, and treating a padded row as a real
-    selection makes a whole padded region replay one stale routing row.
+    Capture runs ahead of every padded-region mask in ``_post_process_topk_ids``
+    (and ROCm's masks to 0, a valid expert id), so mask a copy here: replay skips
+    -1 rows but reads a padded one as a real selection.
     """
     if not topk_config.allow_routed_experts_capture:
         return

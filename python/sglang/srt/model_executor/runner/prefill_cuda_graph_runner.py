@@ -1882,6 +1882,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
+            # Stride of the dp-gathered buffer for this replay; surfaced through
+            # ModelRunnerOutput.graph_num_tokens.
+            self.last_replay_num_tokens = static_num_tokens
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.

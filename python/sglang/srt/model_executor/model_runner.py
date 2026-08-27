@@ -274,6 +274,9 @@ def _prefill_cuda_graph_allows_context_parallel(
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    # Per-rank padded size of the graph this forward replayed (None for eager);
+    # the dp-gathered buffer is strided by it.
+    graph_num_tokens: Optional[int] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -1713,10 +1716,9 @@ class ModelRunner:
         # pass the actual number of tokens per DP rank in CUDA graph, not the batch
         # size — the width is captured_req_width.
 
-        cuda_graph_num_tokens = None
-        runner = self.decode_cuda_graph_runner
-        if getattr(runner, "bs", None):
-            cuda_graph_num_tokens = runner.bs * runner.captured_req_width
+        # From the runner that ran this forward: the decode runner's own bs is
+        # another graph's stride once a prefill graph replays.
+        cuda_graph_num_tokens = output.graph_num_tokens
 
         if (
             not self.is_draft_worker
@@ -1831,13 +1833,20 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            graph_num_tokens = None
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    graph_num_tokens=self.decode_cuda_graph_runner.bs
+                    * self.decode_cuda_graph_runner.captured_req_width,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -1886,6 +1895,7 @@ class ModelRunner:
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
+                graph_num_tokens = self.prefill_cuda_graph_runner.last_replay_num_tokens
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
                 ret = self.eager_runner.execute(
@@ -1898,7 +1908,11 @@ class ModelRunner:
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                graph_num_tokens=graph_num_tokens,
+            )
 
     def _preprocess_logits(
         self,
