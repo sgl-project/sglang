@@ -14,6 +14,7 @@
 """Process-wide CUDA graph memory pool shared across the prefill and
 decode graph backends. The two phases never replay concurrently, so
 sharing one pool reserves only the larger phase's capture footprint.
+Serial capture passes also share one stream to reuse allocator scratch.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import Any, Iterator, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import get_resources, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.cuda_vmm_utils import BumpArenaStub
 
@@ -37,6 +38,8 @@ _borrow_disabled_reason: Optional[str] = None
 _borrow_static_runs: Optional[list[tuple[int, int]]] = None
 _borrow_extents_total = 0
 _largest_logged_graph_pool_borrow = 0
+
+_CAPTURE_STREAM_NAME = "cuda_graph_capture"
 
 
 def disable_graph_pool_borrow(reason: str) -> None:
@@ -79,6 +82,15 @@ def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
     if resources.graph_memory_pool is None:
         resources.graph_memory_pool = device_module.graph_pool_handle()
     return resources.graph_memory_pool
+
+
+def get_or_create_global_graph_capture_stream() -> Any:
+    """Return the shared graph capture stream, creating it on first use so every
+    capture pass reserves the pool's scratch once instead of per stream.
+
+    CUDA only — the NPU / XPU / CPU graph runners keep their own streams.
+    """
+    return get_stream(_CAPTURE_STREAM_NAME)
 
 
 def graph_pool_borrow_enabled() -> bool:

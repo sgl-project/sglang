@@ -65,7 +65,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(enable_metrics=False),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
@@ -78,6 +77,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
+        beam_coordinator=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
     )
 
