@@ -1,21 +1,20 @@
-//! HTTP adapter from renderer-owned generation requests to SGLang `/generate`.
+//! HTTP client from renderer-owned generation requests to SGLang `/generate`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_stream::stream;
 use futures::StreamExt;
-use futures::future::BoxFuture;
 use serde::Deserialize;
 
 use crate::{
     DynamoTokenizer, FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
-    GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
-    PreparedGenerateRequest, TextTokenizer, TokenIds, TokenIdsRequest,
+    GenerationOutputExtras, GenerationStream, MatchedStop, PreparedGenerateRequest, TextTokenizer,
+    TokenIds, TokenIdsRequest,
 };
 
 #[derive(Clone)]
-pub struct HttpInferenceBackend {
+pub struct HttpGenerateClient {
     client: reqwest::Client,
     generate_url: Arc<str>,
     tokenizer: dynamo_tokenizers::Tokenizer,
@@ -23,7 +22,7 @@ pub struct HttpInferenceBackend {
     auto_specials: Arc<[i32]>,
 }
 
-impl HttpInferenceBackend {
+impl HttpGenerateClient {
     pub fn new(
         engine_url: impl AsRef<str>,
         tokenizer: dynamo_tokenizers::Tokenizer,
@@ -47,148 +46,121 @@ impl HttpInferenceBackend {
             auto_specials,
         })
     }
-}
-
-pub struct HttpInferenceSession {
-    backend: HttpInferenceBackend,
-}
-
-impl InferenceBackend for HttpInferenceBackend {
-    type Session = HttpInferenceSession;
-
-    fn begin_session(&self) -> Self::Session {
-        HttpInferenceSession {
-            backend: self.clone(),
-        }
-    }
-}
-
-impl InferenceSession for HttpInferenceSession {
-    fn submit(
-        &mut self,
+    pub async fn generate(
+        &self,
         mut request: TokenIdsRequest,
-        _stream: bool,
-    ) -> BoxFuture<'_, Result<GenerationSubmission, FrontendError>> {
-        Box::pin(async move {
-            translate_text_stops(
-                &mut request,
-                self.backend.stop_tokenizer.as_ref(),
-                &self.backend.auto_specials,
-            )?;
+    ) -> Result<GenerationStream, FrontendError> {
+        translate_text_stops(
+            &mut request,
+            self.stop_tokenizer.as_ref(),
+            &self.auto_specials,
+        )?;
 
-            let prompt_ids = request
-                .input_ids
-                .iter()
-                .map(|&id| u32::try_from(id))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| invalid("input_ids must be non-negative"))?;
-            let skip_special_tokens = request.options.sampling_params.skip_special_tokens;
-            let decode_logprob_text = request.options.return_text_in_logprobs.unwrap_or(false);
-            let id = request.rid.clone();
-            let mut wire = PreparedGenerateRequest::from(request);
-            // The renderer needs token deltas even for a unary OpenAI request. It
-            // collects them locally and dropping this response stream propagates
-            // client cancellation to `/generate`.
-            wire.stream = true;
-            // The token-only engine cannot fill text columns. Decode them below.
-            wire.return_text_in_logprobs = Some(false);
+        let prompt_ids = request
+            .input_ids
+            .iter()
+            .map(|&id| u32::try_from(id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid("input_ids must be non-negative"))?;
+        let skip_special_tokens = request.options.sampling_params.skip_special_tokens;
+        let decode_logprob_text = request.options.return_text_in_logprobs.unwrap_or(false);
+        let mut wire = PreparedGenerateRequest::from(request);
+        // The renderer needs token deltas even for a unary OpenAI request. It
+        // collects them locally and dropping this response stream propagates
+        // client cancellation to `/generate`.
+        wire.stream = true;
+        // The token-only engine cannot fill text columns. Decode them below.
+        wire.return_text_in_logprobs = Some(false);
 
-            let response = self
-                .backend
-                .client
-                .post(self.backend.generate_url.as_ref())
-                .json(&wire)
-                .send()
-                .await
-                .map_err(|error| unavailable(format!("engine request failed: {error}")))?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(FrontendError {
-                    status_code: status.as_u16(),
-                    message: engine_error_message(&body)
-                        .unwrap_or_else(|| format!("engine returned HTTP {status}")),
-                });
-            }
+        let response = self
+            .client
+            .post(self.generate_url.as_ref())
+            .json(&wire)
+            .send()
+            .await
+            .map_err(|error| unavailable(format!("engine request failed: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(FrontendError {
+                status_code: status.as_u16(),
+                message: engine_error_message(&body)
+                    .unwrap_or_else(|| format!("engine returned HTTP {status}")),
+            });
+        }
 
-            let tokenizer = self.backend.tokenizer.clone();
-            let logprob_tokenizer = tokenizer.clone();
-            let mut decoder = tokenizer.decode_stream(&prompt_ids, skip_special_tokens);
-            let mut chunks = response.bytes_stream();
-            let events = stream! {
-                let mut parser = SseParser::default();
-                let mut terminal = false;
-                let mut emitted_tokens = 0;
-                while let Some(chunk) = chunks.next().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
+        let tokenizer = self.tokenizer.clone();
+        let logprob_tokenizer = tokenizer.clone();
+        let mut decoder = tokenizer.decode_stream(&prompt_ids, skip_special_tokens);
+        let mut chunks = response.bytes_stream();
+        let events = stream! {
+            let mut parser = SseParser::default();
+            let mut terminal = false;
+            let mut emitted_tokens = 0;
+            while let Some(chunk) = chunks.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        yield Err(unavailable(format!("engine stream failed: {error}")));
+                        return;
+                    }
+                };
+                for payload in parser.push(&chunk) {
+                    if payload == "[DONE]" {
+                        if !terminal {
+                            yield Err(internal("engine stream ended before a terminal frame"));
+                        }
+                        return;
+                    }
+                    let mut output = match parse_engine_frame(&payload) {
+                        Ok(output) => output,
                         Err(error) => {
-                            yield Err(unavailable(format!("engine stream failed: {error}")));
-                            return;
-                        }
-                    };
-                    for payload in parser.push(&chunk) {
-                        if payload == "[DONE]" {
-                            if !terminal {
-                                yield Err(internal("engine stream ended before a terminal frame"));
-                            }
-                            return;
-                        }
-                        let mut output = match parse_engine_frame(&payload) {
-                            Ok(output) => output,
-                            Err(error) => {
-                                yield Err(error);
-                                return;
-                            }
-                        };
-                        if let Err(error) = normalize_engine_output(&mut output, &mut emitted_tokens) {
                             yield Err(error);
                             return;
                         }
-                        output.text = match decode_ids(&mut decoder, &output.token_ids) {
-                            Ok(text) => text,
-                            Err(error) => {
-                                yield Err(error);
-                                return;
-                            }
-                        };
-                        if decode_logprob_text {
-                            fill_logprob_text(&logprob_tokenizer, output.extras.as_deref_mut());
+                    };
+                    if let Err(error) = normalize_engine_output(&mut output, &mut emitted_tokens) {
+                        yield Err(error);
+                        return;
+                    }
+                    output.text = match decode_ids(&mut decoder, &output.token_ids) {
+                        Ok(text) => text,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
                         }
-                        terminal = output.finish_reason.is_some();
-                        if terminal {
-                            yield Ok(GenerationEvent::Done(output));
-                        } else {
-                            yield Ok(GenerationEvent::Frame(output));
-                        }
+                    };
+                    if decode_logprob_text {
+                        fill_logprob_text(&logprob_tokenizer, output.extras.as_deref_mut());
+                    }
+                    terminal = output.finish_reason.is_some();
+                    if terminal {
+                        yield Ok(GenerationEvent::Done(output));
+                    } else {
+                        yield Ok(GenerationEvent::Frame(output));
                     }
                 }
-                if !terminal {
-                    yield Err(internal("engine response closed before [DONE]"));
-                }
             }
-            .boxed();
+            if !terminal {
+                yield Err(internal("engine response closed before [DONE]"));
+            }
+        }
+        .boxed();
 
-            Ok(GenerationSubmission { id, events })
-        })
+        Ok(events)
     }
 
-    fn detokenize(&mut self, token_ids: TokenIds) -> BoxFuture<'_, Result<String, FrontendError>> {
-        Box::pin(async move {
-            let ids = token_ids
-                .into_iter()
-                .map(u32::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| invalid("token IDs must be non-negative"))?;
-            self.backend
-                .tokenizer
-                .decode(&ids, true)
-                .map(String::from)
-                .map_err(|error| invalid(format!("detokenizing prompt failed: {error}")))
-        })
+    pub fn detokenize(&self, token_ids: TokenIds) -> Result<String, FrontendError> {
+        let ids = token_ids
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid("token IDs must be non-negative"))?;
+        self.tokenizer
+            .decode(&ids, true)
+            .map(String::from)
+            .map_err(|error| invalid(format!("detokenizing prompt failed: {error}")))
     }
-
-    fn complete(&mut self, _submission_id: &str) {}
 }
 
 fn translate_text_stops(
@@ -839,9 +811,8 @@ mod tests {
             .into_future(),
         );
 
-        let backend =
-            HttpInferenceBackend::new(format!("http://{address}"), tokenizer.clone()).unwrap();
-        let mut session = backend.begin_session();
+        let client =
+            HttpGenerateClient::new(format!("http://{address}"), tokenizer.clone()).unwrap();
         let request = TokenIdsRequest {
             rid: "client-request".into(),
             input_ids: vec![65],
@@ -850,8 +821,8 @@ mod tests {
                 ..Default::default()
             },
         };
-        let mut submission = session.submit(request, false).await.unwrap();
-        let output = match submission.events.next().await.unwrap().unwrap() {
+        let mut events = client.generate(request).await.unwrap();
+        let output = match events.next().await.unwrap().unwrap() {
             GenerationEvent::Done(output) => output,
             GenerationEvent::Frame(_) => panic!("mock engine returned a terminal frame"),
         };
@@ -915,17 +886,16 @@ mod tests {
             )
             .into_future(),
         );
-        let backend =
-            HttpInferenceBackend::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
-        let mut session = backend.begin_session();
+        let client =
+            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
         let request = TokenIdsRequest {
             rid: "cancel-me".into(),
             input_ids: vec![65],
             options: GenerationOptions::default(),
         };
-        let mut submission = session.submit(request, true).await.unwrap();
-        assert!(submission.events.next().await.is_some());
-        drop(submission.events);
+        let mut events = client.generate(request).await.unwrap();
+        assert!(events.next().await.is_some());
+        drop(events);
         tokio::time::timeout(Duration::from_secs(2), notice_rx)
             .await
             .expect("engine response stream was not dropped")

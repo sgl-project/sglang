@@ -10,7 +10,7 @@ use crate::{
     TextTokenizer, load_tokenizer,
 };
 
-use super::{HttpInferenceBackend, OpenAIHttpFrontend, standalone_routes};
+use super::{HttpGenerateClient, OpenAIHttpFrontend, standalone_routes};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RendererRuntimeConfig {
@@ -47,14 +47,14 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
         OpenAIRequestLowerer::new(config.renderer),
         tokenizer_backend,
     ));
-    let inference = HttpInferenceBackend::new(config.engine_url, tokenizer)?;
+    let generate_client = HttpGenerateClient::new(config.engine_url, tokenizer)?;
     let listener = tokio::net::TcpListener::bind(config.http_addr)
         .await
         .map_err(|error| format!("binding renderer on {} failed: {error}", config.http_addr))?;
     tracing::info!(address = %config.http_addr, "standalone renderer listening");
     axum::serve(
         listener,
-        standalone_routes(OpenAIHttpFrontend::new(renderer, inference)).into_make_service(),
+        standalone_routes(OpenAIHttpFrontend::new(renderer, generate_client)).into_make_service(),
     )
     .with_graceful_shutdown(async {
         if let Err(error) = tokio::signal::ctrl_c().await {

@@ -6,8 +6,7 @@ use std::sync::Arc;
 use crate::{
     ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
     ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent, GenerationEvent,
-    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationSubmission,
-    InferenceBackend, InferenceSession,
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
 };
 use axum::{
     Json, Router,
@@ -35,7 +34,7 @@ use super::{
     submit_generation, unix_seconds_u32,
 };
 
-pub(super) fn routes<B: InferenceBackend>() -> Router<Arc<OpenAIHttpFrontend<B>>> {
+pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
@@ -48,8 +47,8 @@ struct ChatStreamWireContext {
     service_tier: Option<ChatServiceTier>,
 }
 
-async fn chat_completions<B: InferenceBackend>(
-    State(state): State<Arc<OpenAIHttpFrontend<B>>>,
+async fn chat_completions(
+    State(state): State<Arc<OpenAIHttpFrontend>>,
     body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -81,7 +80,6 @@ async fn chat_completions<B: InferenceBackend>(
     let generation_inputs = lowered.generation_inputs;
     let response_processor = lowered.response_processor;
     let created = unix_seconds_u32();
-    let mut session = state.backend.begin_session();
     let mut submitted = Vec::with_capacity(generation_inputs.len());
 
     for (index, generation_input) in generation_inputs.into_iter().enumerate() {
@@ -95,7 +93,7 @@ async fn chat_completions<B: InferenceBackend>(
                 return openai_error(renderer_status(error.kind()), error.to_string(), false);
             }
         };
-        let submission = match submit_generation(&mut session, prepared, stream).await {
+        let submission = match submit_generation(&state.generate_client, prepared, stream).await {
             Ok(submission) => submission,
             Err(response) => return response,
         };
@@ -104,7 +102,6 @@ async fn chat_completions<B: InferenceBackend>(
     if stream {
         let event_stream = chat_event_stream(
             submitted,
-            session,
             response_processor,
             ChatStreamWireContext {
                 response_id,
@@ -120,7 +117,6 @@ async fn chat_completions<B: InferenceBackend>(
     } else {
         unary_chat(
             submitted,
-            session,
             response_processor,
             response_id,
             model,
@@ -133,9 +129,8 @@ async fn chat_completions<B: InferenceBackend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn unary_chat<S: InferenceSession>(
-    submitted: Vec<(usize, GenerationSubmission)>,
-    mut session: S,
+pub(super) async fn unary_chat(
+    submitted: Vec<(usize, GenerationStream)>,
     mut response_processor: ChatResponseProcessor,
     response_id: String,
     model: String,
@@ -148,7 +143,7 @@ pub(super) async fn unary_chat<S: InferenceSession>(
     let mut completion_tokens = 0u64;
 
     for (index, submission) in submitted {
-        let output = match collect_output(&mut session, submission).await {
+        let output = match collect_output(submission).await {
             Ok(output) => output,
             Err(error) => {
                 let status = StatusCode::from_u16(error.status_code)
@@ -221,17 +216,11 @@ pub(super) async fn unary_chat<S: InferenceSession>(
 }
 
 fn chat_event_stream(
-    submitted: Vec<(usize, GenerationSubmission)>,
-    session: impl InferenceSession,
+    submitted: Vec<(usize, GenerationStream)>,
     response_processor: ChatResponseProcessor,
     context: ChatStreamWireContext,
 ) -> impl futures::Stream<Item = String> {
-    let parsed = semantic_chat_stream(
-        submitted,
-        session,
-        response_processor,
-        context.want_logprobs,
-    );
+    let parsed = semantic_chat_stream(submitted, response_processor, context.want_logprobs);
 
     async_stream::stream! {
         futures::pin_mut!(parsed);
@@ -306,25 +295,21 @@ fn chat_event_stream(
     }
 }
 
-fn semantic_chat_stream<S: InferenceSession>(
-    submitted: Vec<(usize, GenerationSubmission)>,
-    mut session: S,
+fn semantic_chat_stream(
+    submitted: Vec<(usize, GenerationStream)>,
     response_processor: ChatResponseProcessor,
     want_logprobs: bool,
 ) -> impl futures::Stream<Item = ChatResponseItem> {
     let raw = async_stream::stream! {
         let mut streams = Vec::with_capacity(submitted.len());
-        for (index, submission) in submitted {
-            let id = submission.id;
-            streams.push(submission.events.map(move |event| (index, id.clone(), event)).boxed());
+        for (index, events) in submitted {
+            streams.push(events.map(move |event| (index, event)).boxed());
         }
         let mut events = futures::stream::select_all(streams);
-        while let Some((index, id, item)) = events.next().await {
-            let (output, terminal) = match item {
-                Ok(GenerationEvent::Frame(output)) => (output, false),
-                Ok(GenerationEvent::Done(output)) => (output, true),
+        while let Some((index, item)) = events.next().await {
+            let output = match item {
+                Ok(GenerationEvent::Frame(output) | GenerationEvent::Done(output)) => output,
                 Err(error) => {
-                    session.complete(&id);
                     yield ChatResponseInput::Error(ChatResponseError {
                         status_code: error.status_code,
                         message: error.message,
@@ -332,9 +317,6 @@ fn semantic_chat_stream<S: InferenceSession>(
                     continue;
                 }
             };
-            if terminal {
-                session.complete(&id);
-            }
             let finish_reason = chat_finish_reason(&output);
             let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
             yield ChatResponseInput::Decoded(DecodedChatEvent {
@@ -495,7 +477,7 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{TestSession, chat_submitted, chunk};
+    use super::super::test_utils::{chat_submitted, chunk};
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
     use crate::{
@@ -646,14 +628,13 @@ mod tests {
 
     #[tokio::test]
     async fn unary_chat_fans_in_choices_and_usage() {
-        let (choice0, tx0) = chat_submitted(0, "r0");
-        let (choice1, tx1) = chat_submitted(1, "r1");
-        tx0.send(chunk("r0", "Paris", true)).await.unwrap();
-        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
+        let (choice0, tx0) = chat_submitted(0);
+        let (choice1, tx1) = chat_submitted(1);
+        tx0.send(chunk("Paris", true)).await.unwrap();
+        tx1.send(chunk("Paris", true)).await.unwrap();
 
         let response = unary_chat(
             vec![choice0, choice1],
-            TestSession,
             response_processor(None, 2).await,
             "chatcmpl-test".into(),
             "model".into(),
@@ -676,18 +657,13 @@ mod tests {
 
     #[tokio::test]
     async fn unary_chat_separates_reasoning_content_with_parser_configured() {
-        let (choice, tx) = chat_submitted(0, "r0");
-        tx.send(chunk(
-            "r0",
-            "<think>because Paris is famous</think>Paris",
-            true,
-        ))
-        .await
-        .unwrap();
+        let (choice, tx) = chat_submitted(0);
+        tx.send(chunk("<think>because Paris is famous</think>Paris", true))
+            .await
+            .unwrap();
 
         let response = unary_chat(
             vec![choice],
-            TestSession,
             response_processor(Some("deepseek-r1"), 1).await,
             "chatcmpl-test".into(),
             "model".into(),
@@ -711,18 +687,15 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_chat_separates_reasoning_into_own_deltas() {
-        let (choice, tx) = chat_submitted(0, "r0");
+        let (choice, tx) = chat_submitted(0);
         // Force mode starts in reasoning, so the opener is stripped and the first
         // reasoning fragment streams immediately.
-        tx.send(chunk("r0", "<think>be", false)).await.unwrap();
-        tx.send(chunk("r0", "cause</think>Par", false))
-            .await
-            .unwrap();
-        tx.send(chunk("r0", "is", true)).await.unwrap();
+        tx.send(chunk("<think>be", false)).await.unwrap();
+        tx.send(chunk("cause</think>Par", false)).await.unwrap();
+        tx.send(chunk("is", true)).await.unwrap();
 
         let stream = chat_event_stream(
             vec![choice],
-            TestSession,
             response_processor(Some("deepseek-r1"), 1).await,
             wire_context(true),
         );
@@ -752,13 +725,12 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_chat_emits_role_deltas_usage_and_done() {
-        let (choice, tx) = chat_submitted(0, "r0");
-        tx.send(chunk("r0", "Par", false)).await.unwrap();
-        tx.send(chunk("r0", "is", true)).await.unwrap();
+        let (choice, tx) = chat_submitted(0);
+        tx.send(chunk("Par", false)).await.unwrap();
+        tx.send(chunk("is", true)).await.unwrap();
 
         let stream = chat_event_stream(
             vec![choice],
-            TestSession,
             response_processor(None, 1).await,
             wire_context(true),
         );

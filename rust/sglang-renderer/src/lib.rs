@@ -2,14 +2,14 @@
 //!
 //! This crate owns OpenAI protocol lowering, chat templating, tokenization,
 //! response interpretation, and the prepared token-in contract. Its optional
-//! HTTP frontend is parameterized by an engine-neutral inference backend, so
-//! the crate has no PyO3, scheduler, or GPU runtime dependency.
+//! HTTP frontend sends prepared token requests to SGLang's `/generate`
+//! endpoint, so the crate has no PyO3, scheduler, or GPU runtime dependency.
 
 pub mod config;
 pub mod error;
+pub mod generation;
 #[cfg(feature = "http")]
 pub mod http;
-pub mod inference;
 pub mod openai;
 pub mod output;
 pub mod request;
@@ -23,9 +23,9 @@ mod regex;
 
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
-pub use inference::{
+pub use generation::{
     FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
-    GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
+    GenerationOutputExtras, GenerationStream, MatchedStop,
 };
 pub use openai::LoweredChat;
 pub use output::{

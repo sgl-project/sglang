@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     GenerationEvent, GenerationFinishReason, GenerationInput, GenerationOutput,
-    GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
+    GenerationOutputExtras, GenerationStream, MatchedStop,
 };
 use axum::{
     Json, Router,
@@ -28,7 +28,7 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 
-pub(super) fn routes<B: InferenceBackend>() -> Router<Arc<OpenAIHttpFrontend<B>>> {
+pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/completions", post(completions))
 }
 
@@ -36,7 +36,7 @@ pub(super) struct SubmittedChoice {
     pub(super) index: usize,
     pub(super) prompt_index: usize,
     pub(super) echo: String,
-    pub(super) submission: GenerationSubmission,
+    pub(super) events: GenerationStream,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
@@ -46,8 +46,8 @@ pub(super) struct ChoiceExtensions {
     finish_reason_override: Option<String>,
 }
 
-async fn completions<B: InferenceBackend>(
-    State(state): State<Arc<OpenAIHttpFrontend<B>>>,
+async fn completions(
+    State(state): State<Arc<OpenAIHttpFrontend>>,
     body: Result<Json<CreateCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -82,7 +82,6 @@ async fn completions<B: InferenceBackend>(
         }
     };
     let created = unix_seconds_u32();
-    let mut session = state.backend.begin_session();
     let mut submitted = Vec::with_capacity(generation_inputs.len());
     let mut prompt_echo = String::new();
 
@@ -95,9 +94,16 @@ async fn completions<B: InferenceBackend>(
             } else if let GenerationInput::Text(request) = &generation_input {
                 request.text.clone()
             } else if let GenerationInput::TokenIds(request) = &generation_input {
-                match decode_prompt_echo(&mut session, request.input_ids.clone()).await {
+                match state.generate_client.detokenize(request.input_ids.clone()) {
                     Ok(echo) => echo,
-                    Err(response) => return response,
+                    Err(error) => {
+                        return openai_error(
+                            StatusCode::from_u16(error.status_code)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                            error.message,
+                            false,
+                        );
+                    }
                 }
             } else {
                 unreachable!("processed completion request has a prompt")
@@ -113,22 +119,21 @@ async fn completions<B: InferenceBackend>(
                 return openai_error(renderer_status(error.kind()), error.to_string(), false);
             }
         };
-        let submission = match submit_generation(&mut session, prepared, stream).await {
-            Ok(submission) => submission,
+        let events = match submit_generation(&state.generate_client, prepared, stream).await {
+            Ok(events) => events,
             Err(response) => return response,
         };
         submitted.push(SubmittedChoice {
             index,
             prompt_index,
             echo: prompt_echo.clone(),
-            submission,
+            events,
         });
     }
 
     if stream {
         let s = completion_event_stream(
             submitted,
-            session,
             response_id,
             model,
             created,
@@ -140,39 +145,12 @@ async fn completions<B: InferenceBackend>(
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
-        unary_completion(
-            submitted,
-            session,
-            response_id,
-            model,
-            created,
-            echo,
-            want_logprobs,
-        )
-        .await
+        unary_completion(submitted, response_id, model, created, echo, want_logprobs).await
     }
 }
 
-/// Decode a token-id prompt back to text for `echo=true`, via a
-/// `RequestKind::Detokenize` request through the regular submit path — the
-/// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
-/// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
-async fn decode_prompt_echo<S: InferenceSession>(
-    session: &mut S,
-    token_ids: crate::TokenIds,
-) -> Result<String, Response> {
-    session.detokenize(token_ids).await.map_err(|error| {
-        openai_error(
-            StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            error.message,
-            false,
-        )
-    })
-}
-
-pub(super) async fn unary_completion<S: InferenceSession>(
+pub(super) async fn unary_completion(
     submitted: Vec<SubmittedChoice>,
-    mut session: S,
     response_id: String,
     model: String,
     created: u32,
@@ -188,7 +166,7 @@ pub(super) async fn unary_completion<S: InferenceSession>(
     let mut completion_tokens = 0u64;
 
     for choice in submitted {
-        let output = match collect_output(&mut session, choice.submission).await {
+        let output = match collect_output(choice.events).await {
             Ok(output) => output,
             Err(error) => {
                 let status = StatusCode::from_u16(error.status_code)
@@ -337,7 +315,6 @@ pub(super) fn completion_response_value(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn completion_event_stream(
     submitted: Vec<SubmittedChoice>,
-    mut session: impl InferenceSession,
     response_id: String,
     model: String,
     created: u32,
@@ -359,20 +336,14 @@ pub(super) fn completion_event_stream(
             let index = choice.index;
             prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
-            let id = choice.submission.id;
-            streams.push(choice.submission.events.map(move |event| (index, id.clone(), event)).boxed());
+            streams.push(choice.events.map(move |event| (index, event)).boxed());
         }
         let mut events = futures::stream::select_all(streams);
 
-        while let Some((index, id, item)) = events.next().await {
+        while let Some((index, item)) = events.next().await {
             let output = match item {
-                Ok(GenerationEvent::Frame(output)) => output,
-                Ok(GenerationEvent::Done(output)) => {
-                    session.complete(&id);
-                    output
-                }
+                Ok(GenerationEvent::Frame(output) | GenerationEvent::Done(output)) => output,
                 Err(error) => {
-                    session.complete(&id);
                     yield error_payload(StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.message).to_string();
                     continue;
                 }
@@ -544,7 +515,7 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{TestSession, chunk, submitted};
+    use super::super::test_utils::{chunk, submitted};
     use super::{
         ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
         unary_completion,
@@ -631,16 +602,15 @@ mod tests {
 
     #[tokio::test]
     async fn unary_fold_orders_choices_and_counts_each_prompt_once() {
-        let (choice0, tx0) = submitted(0, 0, "r0");
-        let (choice1, tx1) = submitted(1, 0, "r1");
-        tx0.send(chunk("r0", "a", false)).await.unwrap();
-        tx0.send(chunk("r0", "b", true)).await.unwrap();
-        tx1.send(chunk("r1", "x", false)).await.unwrap();
-        tx1.send(chunk("r1", "y", true)).await.unwrap();
+        let (choice0, tx0) = submitted(0, 0);
+        let (choice1, tx1) = submitted(1, 0);
+        tx0.send(chunk("a", false)).await.unwrap();
+        tx0.send(chunk("b", true)).await.unwrap();
+        tx1.send(chunk("x", false)).await.unwrap();
+        tx1.send(chunk("y", true)).await.unwrap();
 
         let response = unary_completion(
             vec![choice0, choice1],
-            TestSession,
             "cmpl-test".into(),
             "model".into(),
             1,
@@ -662,13 +632,12 @@ mod tests {
 
     #[tokio::test]
     async fn stream_uses_deltas_then_usage_and_done() {
-        let (choice, tx) = submitted(0, 0, "r0");
-        tx.send(chunk("r0", "a", false)).await.unwrap();
-        tx.send(chunk("r0", "b", true)).await.unwrap();
+        let (choice, tx) = submitted(0, 0);
+        tx.send(chunk("a", false)).await.unwrap();
+        tx.send(chunk("b", true)).await.unwrap();
 
         let stream = completion_event_stream(
             vec![choice],
-            TestSession,
             "cmpl-test".into(),
             "model".into(),
             1,

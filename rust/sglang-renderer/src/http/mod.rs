@@ -13,37 +13,36 @@ use axum::{
 use futures::StreamExt;
 
 use crate::{
-    FrontendError, GenerationEvent, GenerationOutput, GenerationSubmission, InferenceBackend,
-    InferenceSession, RendererErrorKind,
+    FrontendError, GenerationEvent, GenerationOutput, GenerationStream, RendererErrorKind,
 };
 
 mod chat;
 mod completions;
-mod engine;
+mod generate_client;
 mod render;
 mod runtime;
 mod tokenize;
 
-pub use engine::HttpInferenceBackend;
+pub use generate_client::HttpGenerateClient;
 pub use runtime::{RendererRuntimeConfig, serve};
 #[cfg(test)]
 mod test_utils;
 
-pub struct OpenAIHttpFrontend<B> {
+pub struct OpenAIHttpFrontend {
     pub(crate) renderer: Arc<crate::RendererService>,
-    pub(crate) backend: B,
+    pub(crate) generate_client: HttpGenerateClient,
 }
 
-impl<B> OpenAIHttpFrontend<B> {
-    pub fn new(renderer: Arc<crate::RendererService>, backend: B) -> Self {
-        Self { renderer, backend }
+impl OpenAIHttpFrontend {
+    pub fn new(renderer: Arc<crate::RendererService>, generate_client: HttpGenerateClient) -> Self {
+        Self {
+            renderer,
+            generate_client,
+        }
     }
 }
 
-pub fn inference_routes<B>(frontend: OpenAIHttpFrontend<B>) -> Router<()>
-where
-    B: InferenceBackend,
-{
+pub fn inference_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
     Router::new()
         .merge(chat::routes())
@@ -56,10 +55,7 @@ pub fn render_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
     render::routes(renderer.clone()).merge(tokenize::routes(renderer))
 }
 
-pub fn standalone_routes<B>(frontend: OpenAIHttpFrontend<B>) -> Router<()>
-where
-    B: InferenceBackend,
-{
+pub fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
     inference_routes(frontend).merge(render::routes(renderer))
 }
@@ -107,12 +103,12 @@ pub(crate) fn renderer_status(kind: RendererErrorKind) -> StatusCode {
     }
 }
 
-pub(crate) async fn submit_generation<S: InferenceSession>(
-    session: &mut S,
+pub(crate) async fn submit_generation(
+    client: &HttpGenerateClient,
     request: crate::TokenIdsRequest,
     stream: bool,
-) -> Result<GenerationSubmission, Response> {
-    session.submit(request, stream).await.map_err(|error| {
+) -> Result<GenerationStream, Response> {
+    client.generate(request).await.map_err(|error| {
         openai_error(
             StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             error.message,
@@ -121,17 +117,15 @@ pub(crate) async fn submit_generation<S: InferenceSession>(
     })
 }
 
-pub(crate) async fn collect_output<S: InferenceSession>(
-    session: &mut S,
-    mut submission: GenerationSubmission,
+pub(crate) async fn collect_output(
+    mut events: GenerationStream,
 ) -> Result<GenerationOutput, FrontendError> {
     let mut collected = GenerationOutput::default();
-    while let Some(item) = submission.events.next().await {
+    while let Some(item) = events.next().await {
         match item? {
             GenerationEvent::Frame(output) => fold_output(&mut collected, output),
             GenerationEvent::Done(output) => {
                 fold_output(&mut collected, output);
-                session.complete(&submission.id);
                 return Ok(collected);
             }
         }

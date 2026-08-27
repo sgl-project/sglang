@@ -1,36 +1,15 @@
 use futures::StreamExt;
-use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
 use crate::{
-    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationSubmission,
-    InferenceSession, MatchedStop, TokenIds, TokenIdsRequest,
+    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationStream,
+    MatchedStop,
 };
 
 use super::completions::SubmittedChoice;
 
-pub(super) struct TestSession;
-
-impl InferenceSession for TestSession {
-    fn submit(
-        &mut self,
-        _request: TokenIdsRequest,
-        _stream: bool,
-    ) -> BoxFuture<'_, Result<GenerationSubmission, FrontendError>> {
-        Box::pin(async { unreachable!("tests inject submissions directly") })
-    }
-
-    fn detokenize(&mut self, _token_ids: TokenIds) -> BoxFuture<'_, Result<String, FrontendError>> {
-        Box::pin(async { unreachable!("tests do not detokenize") })
-    }
-
-    fn complete(&mut self, _submission_id: &str) {}
-}
-
-fn submission(
-    id: &str,
-) -> (
-    GenerationSubmission,
+fn submission() -> (
+    GenerationStream,
     mpsc::Sender<Result<GenerationEvent, FrontendError>>,
 ) {
     let (tx, rx) = mpsc::channel(8);
@@ -44,47 +23,39 @@ fn submission(
         })
     })
     .boxed();
+    (events, tx)
+}
+
+pub(super) fn chat_submitted(
+    index: usize,
+) -> (
+    (usize, GenerationStream),
+    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
+) {
+    let (events, tx) = submission();
+    ((index, events), tx)
+}
+
+pub(super) fn submitted(
+    index: usize,
+    prompt_index: usize,
+) -> (
+    SubmittedChoice,
+    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
+) {
+    let (events, tx) = submission();
     (
-        GenerationSubmission {
-            id: id.to_owned(),
+        SubmittedChoice {
+            index,
+            prompt_index,
+            echo: String::new(),
             events,
         },
         tx,
     )
 }
 
-pub(super) fn chat_submitted(
-    index: usize,
-    id: &str,
-) -> (
-    (usize, GenerationSubmission),
-    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
-) {
-    let (submission, tx) = submission(id);
-    ((index, submission), tx)
-}
-
-pub(super) fn submitted(
-    index: usize,
-    prompt_index: usize,
-    id: &str,
-) -> (
-    SubmittedChoice,
-    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
-) {
-    let (submission, tx) = submission(id);
-    (
-        SubmittedChoice {
-            index,
-            prompt_index,
-            echo: String::new(),
-            submission,
-        },
-        tx,
-    )
-}
-
-pub(super) fn chunk(_id: &str, text: &str, done: bool) -> Result<GenerationEvent, FrontendError> {
+pub(super) fn chunk(text: &str, done: bool) -> Result<GenerationEvent, FrontendError> {
     let output = GenerationOutput {
         text: text.to_owned(),
         token_ids: vec![1],
