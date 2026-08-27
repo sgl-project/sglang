@@ -99,14 +99,13 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_parallel,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
@@ -353,10 +352,6 @@ def xpu_has_xmx_support():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
     return False
-
-
-def use_intel_xpu_backend():
-    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
 
 
 @lru_cache(maxsize=1)
@@ -2220,14 +2215,17 @@ def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
     skip_pid: int = None,
-    wait_timeout: Optional[float] = None,
+    wait_timeout: Optional[float] = 60,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
-    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    raises `RuntimeError` on timeout. SIGKILL only queues the teardown, so
+    returning without waiting leaves the GPU context, the pinned host memory
+    and the ports held for seconds; pass `None` only where blocking is
+    unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
+    calls `sys.exit(0)` and cannot wait for itself -- use
+    `include_parent=False` if child reap must finish first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2240,10 +2238,10 @@ def kill_process_tree(
 
     try:
         itself = psutil.Process(parent_pid)
+        children = itself.children(recursive=True)
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
     killed = []
     for child in children:
         if child.pid == skip_pid:
@@ -3720,7 +3718,7 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather(server_args: ServerArgs):
+def require_mlp_tp_gather():
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
@@ -3758,13 +3756,13 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > configured_tp_size() // get_parallel().dp_size
+                > get_parallel().tp_size // get_parallel().dp_size
             )
     else:
         return False
 
 
-def require_attn_tp_gather(server_args: ServerArgs):
+def require_attn_tp_gather():
     """
     Check if the input of attention is scattered.
     """
@@ -3784,40 +3782,40 @@ def require_attn_tp_gather(server_args: ServerArgs):
         or get_parallel().moe_dense_tp_size is not None
     ):
         if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < configured_tp_size()
+            return get_parallel().dp_size < get_parallel().tp_size
         else:
             return True
     else:
         return False
 
 
-def require_gathered_buffer(server_args: ServerArgs):
-    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+def require_gathered_buffer():
+    return require_mlp_tp_gather() or require_attn_tp_gather()
 
 
-def require_mlp_sync(server_args: ServerArgs):
+def require_mlp_sync():
     from sglang.srt.runtime_context import get_parallel
 
-    return get_parallel().enable_dp_attention or require_gathered_buffer(server_args)
+    return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
+def get_cuda_graph_batch_size_alignment() -> int:
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer(server_args):
+    if require_gathered_buffer():
         alignment *= get_parallel().attn_tp_size
     if alignment % get_parallel().attn_cp_size != 0:
         alignment *= get_parallel().attn_cp_size
     return alignment
 
 
-def get_cuda_graph_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
-    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment(server_args))
+def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())
 
 
-def get_eager_max_batch_size(server_args: ServerArgs, max_batch_size: int) -> int:
-    if not require_mlp_sync(server_args):
+def get_eager_max_batch_size(max_batch_size: int) -> int:
+    if not require_mlp_sync():
         return max_batch_size
 
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
@@ -4624,11 +4622,15 @@ def cached_triton_kernel(key_fn=None):
     return decorator
 
 
-def reserve_rope_cache_for_long_sequences(
-    model, server_args, model_config, logger=None
-):
-    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
     from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
@@ -4636,7 +4638,7 @@ def reserve_rope_cache_for_long_sequences(
 
     # 1) Estimate base context upper bound
     base_ctx = (
-        getattr(server_args, "context_length", None)
+        get_model().context_length
         or getattr(model_config, "context_len", None)
         or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
@@ -4644,8 +4646,8 @@ def reserve_rope_cache_for_long_sequences(
     )
 
     # 2) Speculative decoding expansion
-    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
-    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
     reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
 
     # 3) Align to reduce reallocation frequency
