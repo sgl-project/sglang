@@ -27,8 +27,7 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
 )
-from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.configs.model_config import AttentionArch, is_minimax_sparse
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -547,47 +546,26 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def _validate_prefill_cp_configuration(self, model_runner: ModelRunner) -> None:
         server_args = model_runner.server_args
-        unsupported_reason = None
-        if not enable_cp_v2():
-            unsupported_reason = "CP-v2 must be enabled"
-        elif server_args.cp_strategy != "zigzag":
-            unsupported_reason = "only --cp-strategy zigzag is supported"
-        elif server_args.moe_dense_tp_size != 1:
-            unsupported_reason = (
-                "dense MLP weights must be replicated with --moe-dense-tp-size 1"
-            )
-        elif model_runner.model_config.attention_arch != AttentionArch.MHA:
-            unsupported_reason = "only dense MHA/GQA models are supported"
-        elif mambaish_config(model_runner.model_config) is not None:
-            unsupported_reason = "hybrid linear/state-space models are not supported"
-        elif is_minimax_sparse(model_runner.model_config.hf_config):
-            unsupported_reason = "hybrid sparse-attention models are not supported"
-        elif self.enable_mis:
-            unsupported_reason = "multi-item scoring is not supported"
-        elif self.prefill_uses_dequant_workspace or self.is_nvfp4_kvcache:
-            unsupported_reason = "FP4/dequant prefill is not supported"
-        elif model_runner.kv_cache_dtype_str == "mxfp8":
-            unsupported_reason = "MXFP8 KV cache is not supported"
-        elif model_runner.sliding_window_size is not None:
-            unsupported_reason = "sliding-window attention is not supported"
-        elif model_runner.model_config.is_encoder_decoder:
-            unsupported_reason = "encoder-decoder attention is not supported"
-        elif model_runner.model_config.head_dim != model_runner.model_config.v_head_dim:
-            unsupported_reason = "asymmetric QK/V head dimensions are not supported"
-        elif server_args.cuda_graph_config.prefill.backend != Backend.DISABLED:
-            unsupported_reason = "prefill CUDA graphs must be disabled"
-        elif self.token_to_kv_pool.kv_cache_layout != "nhd":
-            unsupported_reason = "only the NHD KV-cache layout is supported"
-
-        if unsupported_reason is not None:
+        model_config = model_runner.model_config
+        if not (
+            enable_cp_v2()
+            and server_args.cp_strategy == "zigzag"
+            and server_args.moe_dense_tp_size == 1
+            and model_config.attention_arch == AttentionArch.MHA
+            and model_runner.sliding_window_size is None
+            and not model_config.is_encoder_decoder
+            and model_config.head_dim == model_config.v_head_dim
+            and server_args.cuda_graph_config.prefill.backend == Backend.DISABLED
+            and self.token_to_kv_pool.kv_cache_layout == "nhd"
+            and not self.prefill_uses_dequant_workspace
+        ):
             raise ValueError(
-                "FlashInfer prefill context parallelism requires eager CP-v2 "
-                f"dense causal self-attention: {unsupported_reason}."
+                "FlashInfer prefill context parallelism requires eager CP-v2 zigzag "
+                "with replicated dense MLP weights and direct NHD dense causal MHA/GQA."
             )
 
     def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
         cp_metadata = forward_batch.attn_cp_metadata
-        assert forward_batch.forward_mode == ForwardMode.EXTEND
         req_pool_indices = forward_batch.req_pool_indices
 
         q_lens_cpu = (
@@ -612,14 +590,13 @@ class FlashInferAttnBackend(AttentionBackend):
             sum(kv_lens_cpu), dtype=torch.int32, device=device
         )
         kv_start_idx = torch.zeros_like(kv_lens)
-        create_flashinfer_kv_indices_triton[(virtual_bs,)](
-            self.req_to_token_pool.req_to_token,
-            virtual_req_pool_indices,
-            kv_lens,
-            paged_kv_indptr,
-            kv_start_idx,
-            paged_kv_indices,
-            self.req_to_token_pool.req_to_token.shape[1],
+        self.kv_index_translator.fill_packed_read_stream(
+            req_pool_indices=virtual_req_pool_indices,
+            seq_lens=kv_lens,
+            indptr=paged_kv_indptr,
+            total_tokens=sum(kv_lens_cpu),
+            out=paged_kv_indices,
+            kv_start_idx=kv_start_idx,
         )
         paged_kv_last_page_len = torch.ones(
             virtual_bs, dtype=torch.int32, device=device
@@ -1421,9 +1398,7 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         cp_wrapper = self.forward_metadata.cp_wrapper
         if cp_wrapper is not None:
-            assert save_kv_cache and k is not None and v is not None
             cp_strategy = get_cp_strategy()
-            assert cp_strategy is not None
             cp_strategy.materialize_full_kv(forward_batch, layer, k, v)
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
