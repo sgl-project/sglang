@@ -160,7 +160,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().config.enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
         ):
             ctx = draft_tp_context(get_parallel().attn_tp_group)
@@ -186,7 +186,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
+            draft_tp_context
+            if get_parallel().config.enable_dp_attention
+            else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
@@ -416,10 +418,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4HipRadixBackend,
             )
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
 
-            supports_hip_draft_extend_graph = isinstance(
-                self.draft_attn_backend, AiterMultiStepDraftBackend
-            ) or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+            supports_hip_draft_extend_graph = (
+                isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
+                or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+                or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
+            )
 
         graph_supported_backend_types = [
             TritonAttnBackend,
