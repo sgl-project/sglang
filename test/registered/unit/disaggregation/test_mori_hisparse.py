@@ -49,6 +49,8 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
                 devices,
                 attn_dp_size=8,
                 attn_dp_rank=5,
+                system_dp_size=1,
+                system_dp_rank=0,
                 attn_tp_rank=0,
             ),
             "ionic_5",
@@ -58,6 +60,19 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
                 devices,
                 attn_dp_size=1,
                 attn_dp_rank=0,
+                system_dp_size=8,
+                system_dp_rank=6,
+                attn_tp_rank=0,
+            ),
+            "ionic_6",
+        )
+        self.assertEqual(
+            _select_rank_local_ib_device(
+                devices,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                system_dp_size=1,
+                system_dp_rank=0,
                 attn_tp_rank=9,
             ),
             "ionic_1",
