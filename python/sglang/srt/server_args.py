@@ -303,9 +303,19 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "deepep_v2",
     "pplx",
     "ascend_tp",
 ]
+
+# These architectures take the A2A MoE path and skip post-expert all-reduce.
+_DEEPEP_V2_VALIDATED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV3ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Qwen3MoeForCausalLM",
+    }
+)
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
@@ -2443,6 +2453,8 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "deepep_v2",
+            "ascend_tp",
             "pplx",
         ],
         Arg(
@@ -2459,6 +2471,15 @@ class ServerArgs:
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
+    deepep_v2_mode: A[
+        Literal["direct", "hybrid"],
+        "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
+        "`direct` (single-node NVLink) or `hybrid` (multi-node scale-out). "
+        "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
+        "inference phase, independent of this knob; not equivalent to DeepEP v1 "
+        "normal/low_latency.",
+        NS("exec.moe"),
+    ] = "direct"
     moe_runner_backend: A[
         str,
         Arg(
@@ -4019,6 +4040,10 @@ class ServerArgs:
         # Model-capability adjustments that legacy code applied at model-load
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
+
+        # Validate after all batch-size declarations are visible.
+        self._validate_deepep_v2_speculative_draft()
+        self._validate_deepep_v2_dispatch_token_budget()
 
         self._resolution_finished = True
 
@@ -7415,6 +7440,93 @@ class ServerArgs:
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
 
+    def _validate_deepep_v2_dispatch_token_budget(self) -> None:
+        """Check the configured prefill and decode-graph buffer bounds."""
+        view = resolved_view(self)
+        if view.moe_a2a_backend != "deepep_v2":
+            return
+
+        capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+        if view.disaggregation_mode != "decode":
+            prefill_tokens = self.max_prefill_buffer_tokens() or (
+                view.max_prefill_tokens or 0
+            )
+            if prefill_tokens > capacity:
+                raise ValueError(
+                    "DeepEP v2 per-rank prefill budget exceeds "
+                    "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
+                    f"required={prefill_tokens}, capacity={capacity}. Raise the "
+                    "environment value or lower --chunked-prefill-size/"
+                    "--max-prefill-tokens."
+                )
+
+        if view.disaggregation_mode == "prefill":
+            return
+        decode_config = getattr(view.cuda_graph_config, "decode", None)
+        if decode_config is None or decode_config.backend == Backend.DISABLED:
+            return
+
+        graph_bs = decode_config.max_bs or 0
+        if view.max_running_requests is not None:
+            attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+            per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
+            graph_bs = min(graph_bs, per_rank_pool_bs)
+        tokens_per_req = (
+            self.max_speculative_num_draft_tokens or 1
+            if view.speculative_algorithm
+            else 1
+        )
+        graph_tokens = graph_bs * tokens_per_req
+        if graph_tokens > capacity:
+            raise ValueError(
+                "DeepEP v2 per-rank decode CUDA graph exceeds "
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
+                f"required={graph_tokens}, capacity={capacity} "
+                f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
+                "the environment value or lower --cuda-graph-max-bs."
+            )
+
+    def _validate_deepep_v2_model_architecture(self) -> None:
+        """Allow DeepEP v2 only where its model workflow is validated."""
+        if (
+            parse_connector_type(resolved_view(self).model_path)
+            == ConnectorType.INSTANCE
+        ):
+            raise ValueError(
+                "DeepEP v2 MoE cannot validate a model loaded through an instance "
+                "connector. Load it from a model path or use "
+                "--moe-a2a-backend deepep."
+            )
+
+        architectures = (
+            getattr(self.get_model_config().hf_config, "architectures", None) or []
+        )
+
+        architecture = architectures[0] if architectures else None
+        if architecture not in _DEEPEP_V2_VALIDATED_ARCHITECTURES:
+            raise ValueError(
+                f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
+                f"architectures are {sorted(_DEEPEP_V2_VALIDATED_ARCHITECTURES)}. "
+                "Other model workflows may require an all-reduce after A2A "
+                "combine. Use --moe-a2a-backend deepep."
+            )
+
+    def _validate_deepep_v2_speculative_draft(self) -> None:
+        """Reject an explicit or inherited DeepEP v2 draft backend."""
+        view = resolved_view(self)
+        draft_backend = view.speculative_moe_a2a_backend
+        if draft_backend is None and view.speculative_algorithm:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
+            if not algorithm.is_ngram():
+                draft_backend = view.moe_a2a_backend
+        if draft_backend == "deepep_v2":
+            raise ValueError(
+                "DeepEP v2 MoE is not validated as a speculative draft backend. "
+                "Select another --speculative-moe-a2a-backend."
+            )
+
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
         # the resolution pipeline (arg_groups/overrides.py:
@@ -7465,6 +7577,60 @@ class ServerArgs:
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 cfg.cuda_graph_config.decode.backend = Backend.DISABLED
                 cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+        if a2a_backend == "deepep_v2":
+            self._validate_deepep_v2_model_architecture()
+            if resolved_view(self).enable_deterministic_inference:
+                raise ValueError(
+                    "DeepEP v2 does not forward deterministic=True to "
+                    "ElasticBuffer, so deterministic sorting remains disabled. "
+                    "Disable --enable-deterministic-inference or use "
+                    "--moe-a2a-backend deepep."
+                )
+            # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
+            os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+            # Respect model-level runner declarations before resolving auto.
+            resolved_runner = resolved_view(self).moe_runner_backend
+            if resolved_runner == "auto":
+                self._declare("_handle_a2a_moe", moe_runner_backend="deep_gemm")
+                logger.warning(
+                    "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
+                )
+            elif resolved_runner != "deep_gemm":
+                raise ValueError(
+                    "DeepEP v2 MoE currently supports only "
+                    f"--moe-runner-backend deep_gemm. Got {resolved_runner!r}. "
+                    "Add a runner adapter before enabling DeepEP v2 with other "
+                    "MoE runners."
+                )
+            if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+                raise ValueError(
+                    "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
+                    "Disable --enable-two-batch-overlap and "
+                    "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
+                )
+            if cfg.enforce_shared_experts_fusion:
+                raise ValueError(
+                    "DeepEP v2 MoE has not validated fused shared experts yet. "
+                    "Remove --enforce-shared-experts-fusion when using "
+                    "--moe-a2a-backend deepep_v2."
+                )
+            # Prefill reads host counts and is not graph-capturable.
+            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
+            )
+            logger.warning(
+                "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
+                "ElasticBuffer direct/hybrid mode and is independent from "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
+                "decode CUDA graph on the masked decode path (any comm mode) "
+                "and disables shared expert fusion. "
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
+                "per-rank communication buffer capacity, not a model limit; "
+                "increase it for large prefill/chunked-prefill workloads.",
+                cfg.deepep_v2_mode,
+            )
 
         # The resolving view, not the field: `_a2a_backend_overrides` may have
         # moved this already (waterfill forces `deepep`).
