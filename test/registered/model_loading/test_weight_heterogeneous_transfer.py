@@ -24,18 +24,22 @@ from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
     WeightHeterogeneousTransferError,
     WeightParallelLayout,
     _initialize_weight_transfer_engine,
-    _resolve_active_moe_runner_backend,
     fetch_source_weights_manifest,
     transfer_weights_from_source_daemons,
     validate_weight_heterogeneous_transfer_configuration,
+)
+from sglang.srt.weight_cache.weight_load_recorder import (
+    WeightLoadRecorder,
+    WeightLoadRecordingError,
+    capture_weight_load_plan,
+    record_target_weight_load_plan,
 )
 from sglang.srt.weight_cache.weight_manifest_server import WeightManifestServer
 from sglang.srt.weight_cache.weight_runtime_manifest import (
     IMMUTABLE_WEIGHT_GENERATION,
     ImmutableWeightRuntimeManifestBuilder,
-    LogicalTensorView,
+    WeightManifestError,
     WeightParallelTopology,
-    create_weight_runtime_manifest_builder,
     model_identity_from_config,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -73,6 +77,51 @@ def _daemon_server_args(**overrides):
 
 
 class TestWeightHeterogeneousTransfer(unittest.TestCase):
+    def test_source_capture_isolated_to_daemon_loader_instance(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+                self.postprocessed = False
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight)
+
+        class Loader:
+            @staticmethod
+            def load_weights_and_postprocess(model, weights, target_device):
+                del target_device
+                model.load_weights(weights)
+                model.postprocessed = True
+
+            def load_model(self):
+                model = Model()
+                self.load_weights_and_postprocess(
+                    model,
+                    (("weight", torch.ones(2, 2)),),
+                    torch.device("cpu"),
+                )
+                return model
+
+        loader = Loader()
+        unrelated_loader = Loader()
+        native_load_and_postprocess = Loader.load_weights_and_postprocess
+
+        with capture_weight_load_plan(loader) as capture:
+            self.assertIs(
+                unrelated_loader.load_weights_and_postprocess,
+                native_load_and_postprocess,
+            )
+            model = loader.load_model()
+
+        self.assertTrue(model.postprocessed)
+        self.assertTrue(torch.equal(model.weight, torch.ones(2, 2)))
+        self.assertNotIn("load_weights", vars(model))
+        self.assertNotIn("load_weights_and_postprocess", vars(loader))
+        self.assertIs(loader.load_weights_and_postprocess, native_load_and_postprocess)
+        self.assertEqual(capture.plan.views[0].tensor_id, "weight")
+
     def test_model_identity_ignores_local_path_and_runtime_metadata(self):
         class Config:
             def __init__(self, path, hidden_size=128):
@@ -129,29 +178,25 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         )
 
     def test_daemon_manifest_adapts_to_immutable_runtime_binding(self):
-        class FullTensorAdapter:
-            @staticmethod
-            def describe_parameter(*, names, parameter, topology):
-                del topology
-                shape = tuple(parameter.shape)
-                return (
-                    LogicalTensorView(
-                        tensor_id=names[0],
-                        global_shape=shape,
-                        global_offset=(0,) * len(shape),
-                        local_shape=shape,
-                        partition_dim=None,
-                        byte_offset=0,
-                        layer_id=None,
-                        expert_id=None,
-                        layout_fingerprint="contiguous",
-                    ),
-                )
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(2, 2))
 
-        model = torch.nn.Linear(2, 2, bias=False)
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight)
+
+        model = Model()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            model,
+            (("weight", torch.arange(4).reshape(2, 2).float()),),
+            execute_writes=True,
+        )
         manifest = ImmutableWeightRuntimeManifestBuilder(
             model=model,
-            adapter=FullTensorAdapter(),
+            load_plan=recorder.build_plan(),
             topology=WeightParallelTopology(),
             allowed_devices=("cpu",),
         ).build(
@@ -175,16 +220,330 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         self.assertEqual(bindings[0].placement_id, placement.placement_id)
         self.assertEqual(bindings[0].lease_id, "immutable:worker")
 
-    def test_active_moe_runner_backend_overrides_auto_config(self):
-        backend = SimpleNamespace(value="triton")
-        quant_method = SimpleNamespace(
-            runner=SimpleNamespace(runner_backend=backend),
-            _aiter_runner=None,
+    def test_recorder_replays_column_and_row_parallel_native_loaders(self):
+        class ShardedModel(torch.nn.Module):
+            def __init__(self, *, dim, rank, size):
+                super().__init__()
+                self.dim = dim
+                self.rank = rank
+                self.size = size
+                shape = [4, 6]
+                shape[dim] //= size
+                self.weight = torch.nn.Parameter(torch.full(shape, -1.0))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    shard = loaded_weight.shape[self.dim] // self.size
+                    loaded_weight = loaded_weight.narrow(
+                        self.dim, self.rank * shard, shard
+                    )
+                    self.weight.data.copy_(loaded_weight)
+
+        for dim, expected_offset in ((0, (2, 0)), (1, (0, 3))):
+            source = ShardedModel(dim=dim, rank=0, size=1)
+            source_recorder = WeightLoadRecorder()
+            source_recorder.record_model_load(
+                source,
+                (("projection.weight", torch.arange(24).reshape(4, 6).float()),),
+                execute_writes=True,
+            )
+            target = ShardedModel(dim=dim, rank=1, size=2)
+            before = target.weight.detach().clone()
+            target_plan = record_target_weight_load_plan(
+                target, source_recorder.build_plan().logical_weights
+            )
+            self.assertTrue(torch.equal(target.weight, before))
+            self.assertEqual(target_plan.views[0].global_offset, expected_offset)
+            self.assertEqual(
+                target_plan.views[0].local_shape,
+                tuple(target.weight.shape),
+            )
+
+    def test_recorder_tracks_fused_split_and_grouped_loaders(self):
+        class FusedModel(torch.nn.Module):
+            def __init__(self, *, rank=0, size=1):
+                super().__init__()
+                self.rank = rank
+                self.size = size
+                self.weight = torch.nn.Parameter(torch.empty(6 // size, 2))
+
+            def load_weights(self, weights):
+                for name, loaded_weight in weights:
+                    shard = loaded_weight.shape[0] // self.size
+                    source = loaded_weight.narrow(0, self.rank * shard, shard)
+                    cursor = 0 if name.startswith("q_a_proj") else 2 // self.size
+                    destination = self.weight.data.narrow(0, cursor, shard)
+                    destination.copy_(source)
+
+        source = FusedModel()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            source,
+            (
+                ("q_a_proj.weight", torch.ones(2, 2)),
+                ("kv_a_proj_with_mqa.weight", torch.ones(4, 2)),
+            ),
+            execute_writes=True,
         )
-        model = SimpleNamespace(
-            modules=lambda: (SimpleNamespace(quant_method=quant_method),)
+        target = FusedModel(rank=1, size=2)
+        plan = record_target_weight_load_plan(
+            target, recorder.build_plan().logical_weights
         )
-        self.assertEqual(_resolve_active_moe_runner_backend(model, "auto"), "triton")
+        self.assertEqual(
+            tuple(
+                (view.tensor_id, view.global_offset, view.byte_offset)
+                for view in plan.views
+            ),
+            (
+                ("q_a_proj.weight", (1, 0), 0),
+                ("kv_a_proj_with_mqa.weight", (2, 0), 8),
+            ),
+        )
+
+        class GroupedModel(torch.nn.Module):
+            def __init__(self, rank):
+                super().__init__()
+                self.rank = rank
+                self.weight = torch.nn.Parameter(torch.empty(6, 2))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(
+                        loaded_weight.narrow(0, self.rank * 6, 6)
+                    )
+
+        grouped = GroupedModel(rank=1)
+        grouped_recorder = WeightLoadRecorder()
+        grouped_recorder.record_model_load(
+            grouped,
+            (("in_proj_qkvz.weight", torch.empty(12, 2)),),
+            execute_writes=False,
+        )
+        grouped_view = grouped_recorder.build_plan().views[0]
+        self.assertEqual(grouped_view.global_offset, (6, 0))
+        self.assertEqual(grouped_view.local_shape, (6, 2))
+
+    def test_recorder_tracks_concat_then_shard_in_threaded_loader(self):
+        import concurrent.futures
+
+        class ConcatenatedModel(torch.nn.Module):
+            def __init__(self, *, rank, size):
+                super().__init__()
+                self.rank = rank
+                self.size = size
+                self.weight = torch.nn.Parameter(torch.empty(6 // size, 2))
+
+                def weight_loader(param, loaded_weight):
+                    shard = loaded_weight.shape[0] // self.size
+                    param.data.copy_(
+                        loaded_weight.narrow(0, self.rank * shard, shard)
+                    )
+
+                self.weight.weight_loader = weight_loader
+
+            def load_weights(self, weights):
+                parts = {name: tensor for name, tensor in weights}
+                fused = torch.cat((parts["q.weight"], parts["kv.weight"]), dim=0)
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    executor.submit(
+                        self.weight.weight_loader,
+                        self.weight,
+                        fused,
+                    ).result()
+
+        source = ConcatenatedModel(rank=0, size=1)
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            source,
+            (
+                ("q.weight", torch.empty(4, 2)),
+                ("kv.weight", torch.empty(2, 2)),
+            ),
+            execute_writes=True,
+        )
+        target = ConcatenatedModel(rank=1, size=2)
+        before = target.weight.detach().clone()
+        plan = record_target_weight_load_plan(
+            target, recorder.build_plan().logical_weights
+        )
+
+        self.assertTrue(torch.equal(target.weight, before))
+        self.assertEqual(
+            tuple(
+                (
+                    view.tensor_id,
+                    view.global_offset,
+                    view.local_shape,
+                    view.byte_offset,
+                )
+                for view in plan.views
+            ),
+            (
+                ("q.weight", (3, 0), (1, 2), 0),
+                ("kv.weight", (0, 0), (2, 2), 8),
+            ),
+        )
+        manifest = ImmutableWeightRuntimeManifestBuilder(
+            model=target,
+            load_plan=plan,
+            topology=WeightParallelTopology(tp_rank=1, tp_size=2),
+            allowed_devices=("cpu",),
+        ).build(
+            model_id="model",
+            revision="revision",
+            instance_id="worker",
+            worker_id="worker",
+            endpoint="127.0.0.1:1",
+        )
+        self.assertEqual(sum(tensor.nbytes for tensor in manifest.tensors), 24)
+
+    def test_recorder_tracks_default_loader_in_thread_pool(self):
+        import concurrent.futures
+
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+        class ThreadedModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+
+            def load_weights(self, weights):
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [
+                        executor.submit(
+                            default_weight_loader,
+                            self.weight,
+                            loaded_weight,
+                        )
+                        for _, loaded_weight in weights
+                    ]
+                    for future in futures:
+                        future.result()
+
+        native_submit = concurrent.futures.ThreadPoolExecutor.submit
+        source = ThreadedModel()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            source,
+            (("weight", torch.ones(2, 2)),),
+            execute_writes=True,
+        )
+
+        self.assertIs(concurrent.futures.ThreadPoolExecutor.submit, native_submit)
+        self.assertTrue(torch.equal(source.weight, torch.ones(2, 2)))
+        self.assertEqual(recorder.build_plan().views[0].tensor_id, "weight")
+
+        target = ThreadedModel()
+        before = target.weight.detach().clone()
+        target_plan = record_target_weight_load_plan(
+            target, recorder.build_plan().logical_weights
+        )
+
+        self.assertIs(concurrent.futures.ThreadPoolExecutor.submit, native_submit)
+        self.assertTrue(torch.equal(target.weight, before))
+        self.assertEqual(target_plan.views[0].tensor_id, "weight")
+
+    def test_recorder_tracks_transposed_moe_expert_storage(self):
+        class ExpertModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w13_weight = torch.nn.Parameter(torch.empty(2, 3, 2))
+
+                def weight_loader(
+                    param,
+                    loaded_weight,
+                    weight_name,
+                    *,
+                    shard_id,
+                    expert_id,
+                ):
+                    del weight_name, shard_id
+                    param.data[expert_id].copy_(loaded_weight.transpose(0, 1))
+
+                self.w13_weight.weight_loader = weight_loader
+
+            def load_weights(self, weights):
+                for name, loaded_weight in weights:
+                    expert_id = int(name.split(".experts.")[1].split(".")[0])
+                    self.w13_weight.weight_loader(
+                        self.w13_weight,
+                        loaded_weight,
+                        name,
+                        shard_id="w1",
+                        expert_id=expert_id,
+                    )
+
+        model = ExpertModel()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            model,
+            (
+                ("layers.0.experts.0.gate_proj.weight", torch.empty(2, 3)),
+                ("layers.0.experts.1.gate_proj.weight", torch.empty(2, 3)),
+            ),
+            execute_writes=False,
+        )
+        plan = recorder.build_plan()
+        self.assertEqual(tuple(view.expert_id for view in plan.views), (0, 1))
+        self.assertTrue(all(view.global_shape == (3, 2) for view in plan.views))
+        self.assertTrue(
+            all("permute(1,0)" in view.layout_fingerprint for view in plan.views)
+        )
+
+    def test_recorder_rejects_value_transform(self):
+        class ValueTransformModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(2, 2))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight + 1)
+
+        with self.assertRaisesRegex(
+            WeightLoadRecordingError, "unsupported loader operation"
+        ):
+            recorder = WeightLoadRecorder()
+            recorder.record_model_load(
+                ValueTransformModel(),
+                (("weight", torch.empty(2, 2)),),
+                execute_writes=False,
+            )
+
+    def test_manifest_rejects_parameter_not_covered_by_native_loader(self):
+        class IncompleteModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(2, 2))
+                self.unused = torch.nn.Parameter(torch.empty(2, 2))
+
+            def load_weights(self, weights):
+                for _, loaded_weight in weights:
+                    self.weight.data.copy_(loaded_weight)
+
+        model = IncompleteModel()
+        recorder = WeightLoadRecorder()
+        recorder.record_model_load(
+            model,
+            (("weight", torch.empty(2, 2)),),
+            execute_writes=True,
+        )
+        with self.assertRaisesRegex(
+            WeightManifestError,
+            "native weight-load recorder did not cover parameter: unused",
+        ):
+            ImmutableWeightRuntimeManifestBuilder(
+                model=model,
+                load_plan=recorder.build_plan(),
+                topology=WeightParallelTopology(),
+                allowed_devices=("cpu",),
+            ).build(
+                model_id="model",
+                revision="revision",
+                instance_id="worker",
+                worker_id="worker",
+                endpoint="127.0.0.1:1",
+            )
 
     def test_weight_parallel_layout_supports_attention_dp_pp_and_ep(self):
         validate_weight_heterogeneous_transfer_configuration(
@@ -266,54 +625,67 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             (ReplicatedAxis("tp"),),
         )
 
-    def test_qwen3_dp_attention_uses_attention_tp_for_embedding(self):
-        config = SimpleNamespace(
-            model_type="qwen3",
-            vocab_size=32,
-            hidden_size=8,
-            tie_word_embeddings=False,
-        )
-        topology = WeightParallelTopology(
-            tp_rank=1,
-            tp_size=2,
-            attention_tp_rank=0,
-            attention_tp_size=1,
-        )
-        builder = create_weight_runtime_manifest_builder(
-            model=SimpleNamespace(modules=lambda: ()),
-            config=config,
-            topology=topology,
-            dp_attention_enabled=True,
-        )
-        embed_view = builder._adapter.describe_parameter(
-            names=("model.embed_tokens.weight",),
-            parameter=torch.empty(32, 8),
-            topology=topology,
-        )[0]
-        lm_head_view = builder._adapter.describe_parameter(
-            names=("lm_head.weight",),
-            parameter=torch.empty(16, 8),
-            topology=topology,
-        )[0]
+    def test_internal_fragments_replicated_by_dp_attention_are_not_tp_shards(self):
+        from mooncake.reshard.weight import ReplicatedAxis
 
-        self.assertEqual(embed_view.global_offset, (0, 0))
-        self.assertEqual(embed_view.local_shape, (32, 8))
-        self.assertEqual(lm_head_view.global_offset, (16, 0))
-        self.assertEqual(lm_head_view.local_shape, (16, 8))
-        source_builder = create_weight_runtime_manifest_builder(
-            model=SimpleNamespace(modules=lambda: ()),
-            config=config,
-            topology=WeightParallelTopology(),
+        inventories = []
+        for tp_rank in range(2):
+            tensors = []
+            storage_address = 100_000 + tp_rank * 1_000
+            for part in range(3):
+                tensors.append(
+                    {
+                        "fragment_id": f"rank{tp_rank}:part{part}",
+                        "tensor_id": "model.layers.0.linear_attn.conv1d.weight",
+                        "runtime_name": "runtime.conv1d.weight",
+                        "global_shape": (6, 1, 4),
+                        "global_offset": (part * 2, 0, 0),
+                        "local_shape": (2, 1, 4),
+                        "dtype": "bfloat16",
+                        "itemsize": 2,
+                        "shard_dims": (0,),
+                        "layer_id": 0,
+                        "expert_id": None,
+                        "layout_fingerprint": "recorded-slices",
+                        "address": storage_address + part * 16,
+                        "nbytes": 16,
+                        "byte_offset": part * 16,
+                        "stride": (4, 4, 1),
+                        "storage_offset": part * 8,
+                        "device": f"cuda:{tp_rank}",
+                        "worker_id": f"worker-{tp_rank}",
+                        "endpoint": f"127.0.0.1:{1000 + tp_rank}",
+                        "rank": {"dp": 0, "tp": tp_rank, "pp": 0, "ep": 0},
+                    }
+                )
+            inventories.append(
+                {
+                    "model_id": "model",
+                    "revision": "revision",
+                    "instance_id": f"worker-{tp_rank}",
+                    "generation": IMMUTABLE_WEIGHT_GENERATION,
+                    "tensors": tensors,
+                }
+            )
+
+        placement, _ = build_mooncake_weight_manifests(
+            inventories,
+            placement_set_id="target",
+            tp_size=2,
+            pp_size=1,
+            ep_size=1,
         )
-        source_embed_view = source_builder._adapter.describe_parameter(
-            names=("model.embed_tokens.weight",),
-            parameter=torch.empty(32, 8),
-            topology=WeightParallelTopology(),
-        )[0]
-        self.assertEqual(
-            source_embed_view.layout_fingerprint,
-            embed_view.layout_fingerprint,
-        )
+
+        descriptors = {
+            tensor.tensor_id: tensor
+            for part in placement.parts
+            for tensor in part.tensors
+        }
+        descriptor = descriptors[
+            "model.layers.0.linear_attn.conv1d.weight"
+        ]
+        self.assertEqual(descriptor.parallel_axes, (ReplicatedAxis("tp"),))
+        self.assertEqual(descriptor.shard_dims, ())
 
     def test_manifest_server_aggregates_source_ranks(self):
         server = object.__new__(WeightManifestServer)

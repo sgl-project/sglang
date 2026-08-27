@@ -91,9 +91,9 @@ def rebuild_transferred_weight_state(model: Any) -> None:
     """
     post_load_weights = getattr(model, "post_load_weights", None)
     if callable(post_load_weights):
-        # DeepSeek MLA derives w_kc/w_vc from kv_b_proj here. This is the
-        # model-specific hook also used by checkpoint-engine weight updates;
-        # it does not re-run generic quantization transforms.
+        # Rebuild model-owned derived tensors using the same public hook as
+        # checkpoint-engine weight updates. This does not re-run generic
+        # quantization transforms.
         post_load_weights()
 
     from sglang.srt.model_loader.loader import PreshardedModelLoader
@@ -396,31 +396,6 @@ def validate_weight_heterogeneous_transfer_configuration(
         raise WeightHeterogeneousTransferError(str(error)) from error
 
 
-def _resolve_active_moe_runner_backend(model: Any, configured: str) -> str:
-    """Return the backend that owns the model's in-memory MoE weight layout.
-
-    ``auto`` remains in the published config even after an unquantized
-    FusedMoE layer has selected its concrete runner.  The manifest adapter
-    needs that concrete value because runner-specific layouts are not
-    interchangeable.
-    """
-    active = set()
-    for module in model.modules():
-        quant_method = getattr(module, "quant_method", None)
-        for runner_name in ("runner", "_aiter_runner"):
-            runner = getattr(quant_method, runner_name, None)
-            backend = getattr(runner, "runner_backend", None)
-            backend = getattr(backend, "value", backend)
-            if backend and backend != "auto":
-                active.add(str(backend))
-    if len(active) > 1:
-        raise WeightHeterogeneousTransferError(
-            "weight manifest requires one concrete MoE runner backend; "
-            f"model has {sorted(active)}"
-        )
-    return next(iter(active), configured)
-
-
 def _build_weight_runtime_inventory(
     *,
     model: Any,
@@ -437,6 +412,7 @@ def _build_weight_runtime_inventory(
     transfer_endpoint: str,
     model_id: str,
     revision: str,
+    load_plan: Any,
 ):
     from sglang.srt.distributed.parallel_state import (
         get_attn_tensor_model_parallel_rank,
@@ -450,7 +426,7 @@ def _build_weight_runtime_inventory(
         get_tensor_model_parallel_rank,
         get_tensor_model_parallel_world_size,
     )
-    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
     # Mooncake DP means a complete model replica. Attention DP is only a
@@ -487,15 +463,8 @@ def _build_weight_runtime_inventory(
         )
     manifest_builder = create_weight_runtime_manifest_builder(
         model=model,
-        config=model_config.hf_config,
+        load_plan=load_plan,
         topology=parallel_topology,
-        is_multimodal=model_config.is_multimodal,
-        moe_runner_backend=_resolve_active_moe_runner_backend(
-            model, get_exec().moe.moe_runner_backend
-        ),
-        dp_attention_enabled=dp_attention_enabled,
-        dp_lm_head_enabled=dp_lm_head_enabled,
-        embed_replication_enabled=envs.SGLANG_ENABLE_EMBED_REPLICATION.get(),
     )
     worker_id = (
         f"weight-cache:{os.getpid()}:gpu{gpu_id}:pp{pp_rank}:tp{tp_rank}:"
@@ -547,10 +516,12 @@ def _initialize_weight_transfer_engine():
 @dataclass
 class WeightsManifestState:
     transfer_engine: Any
-    runtime_inventory: Any
+    transfer_endpoint: str
+    runtime_inventory: Any | None
     parallel_layout: WeightParallelLayout
     registered_memory_ranges: tuple[tuple[int, int], ...]
     source_content_checksums: tuple[dict[str, Any], ...]
+    inventory_context: dict[str, Any]
 
     @classmethod
     def create(
@@ -569,12 +540,12 @@ class WeightsManifestState:
         gpu_id: int,
         revision: str,
         is_source_daemon: bool,
+        load_plan: Any | None,
     ) -> WeightsManifestState:
         transfer_engine, transfer_endpoint = _initialize_weight_transfer_engine()
         registered_memory_ranges: list[tuple[int, int]] = []
         try:
-            runtime_inventory = _build_weight_runtime_inventory(
-                model=model,
+            inventory_context = dict(
                 model_config=model_config,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
@@ -589,14 +560,30 @@ class WeightsManifestState:
                 model_id=model_identity_from_config(model_config.hf_config),
                 revision=revision,
             )
-            registered_memory_ranges.extend(
-                _register_weight_fragment_allocations(
-                    transfer_engine,
-                    runtime_inventory.tensors,
+            runtime_inventory = None
+            source_content_checksums: tuple[dict[str, Any], ...] = ()
+            if is_source_daemon:
+                if load_plan is None:
+                    raise WeightHeterogeneousTransferError(
+                        "source daemon has no recorded native weight-load plan"
+                    )
+                runtime_inventory = _build_weight_runtime_inventory(
+                    model=model,
+                    load_plan=load_plan,
+                    **inventory_context,
                 )
-            )
+                registered_memory_ranges.extend(
+                    _register_weight_fragment_allocations(
+                        transfer_engine,
+                        runtime_inventory.tensors,
+                    )
+                )
+                source_content_checksums = _compute_weight_content_checksums(
+                    model, runtime_inventory
+                )
             return cls(
                 transfer_engine=transfer_engine,
+                transfer_endpoint=transfer_endpoint,
                 runtime_inventory=runtime_inventory,
                 parallel_layout=WeightParallelLayout(
                     tp_size=tp_size,
@@ -605,11 +592,8 @@ class WeightsManifestState:
                     ep_size=ep_size,
                 ),
                 registered_memory_ranges=tuple(registered_memory_ranges),
-                source_content_checksums=(
-                    _compute_weight_content_checksums(model, runtime_inventory)
-                    if is_source_daemon
-                    else ()
-                ),
+                source_content_checksums=source_content_checksums,
+                inventory_context=inventory_context,
             )
         except BaseException:
             for address, _ in reversed(registered_memory_ranges):
@@ -621,7 +605,48 @@ class WeightsManifestState:
                     )
             raise
 
+    def prepare_target(
+        self,
+        *,
+        model: Any,
+        source_runtime_inventories: Sequence[Any],
+    ) -> None:
+        if self.runtime_inventory is not None:
+            raise WeightHeterogeneousTransferError(
+                "target runtime inventory was prepared more than once"
+            )
+        from .weight_load_recorder import (
+            WeightLoadRecordingError,
+            logical_weight_metadata_from_runtime_inventories,
+            record_target_weight_load_plan,
+        )
+
+        try:
+            logical_weights = logical_weight_metadata_from_runtime_inventories(
+                source_runtime_inventories
+            )
+            load_plan = record_target_weight_load_plan(model, logical_weights)
+            runtime_inventory = _build_weight_runtime_inventory(
+                model=model,
+                load_plan=load_plan,
+                **self.inventory_context,
+            )
+            registered = _register_weight_fragment_allocations(
+                self.transfer_engine,
+                runtime_inventory.tensors,
+            )
+        except WeightLoadRecordingError as error:
+            raise WeightHeterogeneousTransferError(
+                f"target native weight loader is outside recorder support: {error}"
+            ) from error
+        self.runtime_inventory = runtime_inventory
+        self.registered_memory_ranges = registered
+
     def runtime_inventory_for_wire(self) -> Any:
+        if self.runtime_inventory is None:
+            raise WeightHeterogeneousTransferError(
+                "target runtime inventory has not been prepared"
+            )
         return msgspec.to_builtins(self.runtime_inventory)
 
     def close(self) -> None:
@@ -996,6 +1021,11 @@ def transfer_weights_from_source_daemons(
                 "source and target GPU ranks must not overlap on the same node; "
                 f"overlapping ranks: {overlap}"
             )
+
+    target_manifest_state.prepare_target(
+        model=model,
+        source_runtime_inventories=source_weights_manifest.runtime_inventories,
+    )
 
     target_runtime_inventories: list[Any] = [None] * dist.get_world_size()
     dist.all_gather_object(

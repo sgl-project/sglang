@@ -75,12 +75,56 @@ def immutable_weight_allocation_guards(
     }
 
 
+def _infer_tp_replicated_tensor_ids(
+    inventories: Sequence[dict[str, Any]], *, tp_size: int
+) -> frozenset[str]:
+    """Find logical tensors with identical fragment geometry on every TP rank.
+
+    A native loader may split one checkpoint tensor into several writes even
+    when every rank owns a complete replica.  Per-fragment ``shard_dims``
+    cannot distinguish those internal writes from an actual TP partition, so
+    make that decision only after all rank inventories are available.
+    """
+
+    if tp_size <= 1:
+        return frozenset()
+
+    geometry_by_tensor: dict[
+        str, dict[int, set[tuple[tuple[int, ...], tuple[int, ...]]]]
+    ] = {}
+    for inventory in inventories:
+        for tensor in inventory["tensors"]:
+            tensor_id = tensor["tensor_id"]
+            tp_rank = int(tensor["rank"]["tp"])
+            geometry_by_tensor.setdefault(tensor_id, {}).setdefault(
+                tp_rank, set()
+            ).add(
+                (
+                    tuple(tensor["global_offset"]),
+                    tuple(tensor["local_shape"]),
+                )
+            )
+
+    expected_ranks = set(range(tp_size))
+    replicated = set()
+    for tensor_id, geometry_by_rank in geometry_by_tensor.items():
+        if set(geometry_by_rank) != expected_ranks:
+            continue
+        signatures = {
+            tuple(sorted(geometry)) for geometry in geometry_by_rank.values()
+        }
+        if len(signatures) == 1:
+            replicated.add(tensor_id)
+    return frozenset(replicated)
+
+
 def _parallel_axes(
     tensor: dict[str, Any],
     *,
     tp_size: int,
     pp_size: int,
     ep_size: int,
+    tp_replicated: bool = False,
 ) -> tuple[Any, ...]:
     from mooncake.reshard.weight import (
         OwnershipAxis,
@@ -111,7 +155,11 @@ def _parallel_axes(
         if ep_size > 1:
             axes.append(SplitAxis("ep", dim=ep_dim))
 
-    tp_dims = tuple(dim for dim in shard_dims if dim != ep_dim)
+    tp_dims = (
+        ()
+        if tp_replicated
+        else tuple(dim for dim in shard_dims if dim != ep_dim)
+    )
     if tp_dims:
         if len(tp_dims) != 1:
             raise WeightManifestError(
@@ -148,6 +196,9 @@ def build_mooncake_weight_manifests(
     inventories = tuple(msgspec.to_builtins(item) for item in runtime_inventories)
     if not inventories:
         raise WeightManifestError("runtime inventory set must not be empty")
+    tp_replicated_tensor_ids = _infer_tp_replicated_tensor_ids(
+        inventories, tp_size=tp_size
+    )
 
     local_parts = []
     identity = None
@@ -216,6 +267,7 @@ def build_mooncake_weight_manifests(
                 tp_size=tp_size,
                 pp_size=pp_size,
                 ep_size=ep_size,
+                tp_replicated=tensor["tensor_id"] in tp_replicated_tensor_ids,
             )
             descriptor = TensorDescriptor(
                 tensor_id=tensor["tensor_id"],

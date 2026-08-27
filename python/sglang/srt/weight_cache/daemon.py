@@ -342,7 +342,7 @@ class WeightCacheDaemon:
             moe_data_model_parallel_size=self.moe_dp_size,
         )
 
-        # Initialize DP attention state (required by some models like Qwen3 MoE)
+        # Initialize DP attention state before model construction.
         from sglang.srt.layers.dp_attention import initialize_dp_attention
 
         initialize_dp_attention(server_args, model_config)
@@ -493,10 +493,22 @@ class WeightCacheDaemon:
 
         # Load model using DefaultModelLoader (includes TP sharding + quant post-process)
         loader = get_model_loader(load_config=load_config, model_config=model_config)
-        self.model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(current_platform.device_type, self.gpu_id),
-        )
+        source_load_capture = None
+        if self.enable_weight_heterogeneous_copy:
+            from .weight_load_recorder import capture_weight_load_plan
+
+            with capture_weight_load_plan(loader) as source_load_capture:
+                self.model = loader.load_model(
+                    model_config=model_config,
+                    device_config=DeviceConfig(
+                        current_platform.device_type, self.gpu_id
+                    ),
+                )
+        else:
+            self.model = loader.load_model(
+                model_config=model_config,
+                device_config=DeviceConfig(current_platform.device_type, self.gpu_id),
+            )
 
         elapsed = time.perf_counter() - tic
         if self.weight_heterogeneous_copy:
@@ -536,6 +548,11 @@ class WeightCacheDaemon:
                     or "local"
                 ),
                 is_source_daemon=self.enable_weight_heterogeneous_copy,
+                load_plan=(
+                    source_load_capture.plan
+                    if source_load_capture is not None
+                    else None
+                ),
             )
 
         if self.enable_weight_heterogeneous_copy:

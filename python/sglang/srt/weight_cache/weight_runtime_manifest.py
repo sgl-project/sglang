@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from math import prod
-from typing import Any, Protocol, Sequence
+from typing import Any, Sequence
 
 import msgspec
 
@@ -106,27 +106,26 @@ class RuntimeWeightTensor(msgspec.Struct, frozen=True, kw_only=True):
     rank: WeightParallelRank
 
 
+class WeightLoadTensorMetadata(msgspec.Struct, frozen=True, kw_only=True):
+    tensor_id: str
+    shape: tuple[int, ...]
+    dtype: str
+    itemsize: int
+
+
 class WeightRuntimeManifest(msgspec.Struct, frozen=True, kw_only=True):
     model_id: str
     revision: str
     instance_id: str
     generation: int
+    load_tensors: tuple[WeightLoadTensorMetadata, ...]
     tensors: tuple[RuntimeWeightTensor, ...]
-
-
-class WeightSemanticsAdapter(Protocol):
-    def describe_parameter(
-        self,
-        *,
-        names: tuple[str, ...],
-        parameter: Any,
-        topology: WeightParallelTopology,
-    ) -> tuple[LogicalTensorView, ...]: ...
 
 
 class _PhysicalParameter(msgspec.Struct, frozen=True, kw_only=True):
     names: tuple[str, ...]
     parameter: Any
+    parameters: tuple[Any, ...]
     address: int
     nbytes: int
     shape: tuple[int, ...]
@@ -197,6 +196,7 @@ def _inspect_parameter(
     *,
     names: tuple[str, ...],
     parameter: Any,
+    parameters: tuple[Any, ...],
     allowed_devices: frozenset[str],
 ) -> _PhysicalParameter:
     runtime_name = names[0]
@@ -228,6 +228,7 @@ def _inspect_parameter(
     return _PhysicalParameter(
         names=names,
         parameter=parameter,
+        parameters=parameters,
         address=address,
         nbytes=nbytes,
         shape=shape,
@@ -324,12 +325,12 @@ class ImmutableWeightRuntimeManifestBuilder:
         self,
         *,
         model: Any,
-        adapter: WeightSemanticsAdapter,
+        load_plan: Any,
         topology: WeightParallelTopology,
         allowed_devices: Sequence[str] = ("cuda",),
     ) -> None:
         self._model = model
-        self._adapter = adapter
+        self._load_plan = load_plan
         self._topology = topology
         self._allowed_devices = frozenset(allowed_devices)
 
@@ -358,24 +359,35 @@ class ImmutableWeightRuntimeManifestBuilder:
             revision=revision,
             instance_id=instance_id,
             generation=IMMUTABLE_WEIGHT_GENERATION,
+            load_tensors=tuple(
+                WeightLoadTensorMetadata(
+                    tensor_id=item.tensor_id,
+                    shape=item.shape,
+                    dtype=item.dtype,
+                    itemsize=item.itemsize,
+                )
+                for item in self._load_plan.logical_weights
+            ),
             tensors=tensors,
         )
 
     def _collect_physical_parameters(self) -> tuple[_PhysicalParameter, ...]:
-        grouped: dict[tuple, tuple[Any, list[str]]] = {}
+        grouped: dict[tuple, tuple[Any, list[Any], list[str]]] = {}
         for name, parameter in self._model.named_parameters(remove_duplicate=False):
             key = _storage_key(parameter)
             if key not in grouped:
-                grouped[key] = (parameter, [])
-            grouped[key][1].append(name)
+                grouped[key] = (parameter, [], [])
+            grouped[key][1].append(parameter)
+            grouped[key][2].append(name)
 
         physical = [
             _inspect_parameter(
                 names=tuple(sorted(names)),
                 parameter=parameter,
+                parameters=tuple(parameters),
                 allowed_devices=self._allowed_devices,
             )
-            for parameter, names in grouped.values()
+            for parameter, parameters, names in grouped.values()
         ]
         return tuple(sorted(physical, key=lambda item: item.names))
 
@@ -391,14 +403,50 @@ class ImmutableWeightRuntimeManifestBuilder:
         tensors = []
         logical_keys = set()
         for item in physical:
-            views = self._adapter.describe_parameter(
-                names=item.names,
-                parameter=item.parameter,
-                topology=self._topology,
+            recorded_views = self._load_plan.views_for_parameters(item.parameters)
+            views = tuple(
+                LogicalTensorView(
+                    tensor_id=view.tensor_id,
+                    global_shape=view.global_shape,
+                    global_offset=view.global_offset,
+                    local_shape=view.local_shape,
+                    partition_dim=(
+                        view.shard_dims[0] if len(view.shard_dims) == 1 else None
+                    ),
+                    byte_offset=view.byte_offset,
+                    layer_id=None,
+                    expert_id=view.expert_id,
+                    layout_fingerprint=view.layout_fingerprint,
+                    shard_dims=view.shard_dims,
+                )
+                for view in recorded_views
             )
             if not views:
                 raise WeightManifestError(
-                    f"adapter returned no views for {item.names[0]}"
+                    "native weight-load recorder did not cover parameter: "
+                    f"{item.names[0]}"
+                )
+            intervals = sorted(
+                (
+                    view.byte_offset,
+                    view.byte_offset + prod(view.local_shape) * item.itemsize,
+                    view.tensor_id,
+                )
+                for view in views
+            )
+            cursor = 0
+            for begin, end, tensor_id in intervals:
+                if begin != cursor:
+                    relation = "overlaps" if begin < cursor else "leaves a gap in"
+                    raise WeightManifestError(
+                        f"recorded tensor {tensor_id} {relation} parameter "
+                        f"{item.names[0]} at byte {begin}; expected {cursor}"
+                    )
+                cursor = end
+            if cursor != item.nbytes:
+                raise WeightManifestError(
+                    "native weight-load recorder did not cover complete parameter: "
+                    f"{item.names[0]}: covered={cursor}, nbytes={item.nbytes}"
                 )
             for view in views:
                 nbytes = _validate_view(view, item)
@@ -461,169 +509,13 @@ class ImmutableWeightRuntimeManifestBuilder:
 def create_weight_runtime_manifest_builder(
     *,
     model: Any,
-    config: Any,
+    load_plan: Any,
     topology: WeightParallelTopology,
-    is_multimodal: bool = False,
-    moe_runner_backend: str | None = None,
-    dp_attention_enabled: bool = False,
-    dp_lm_head_enabled: bool = False,
-    embed_replication_enabled: bool = False,
+    allowed_devices: Sequence[str] = ("cuda",),
 ):
-    model_type = getattr(config, "model_type", None)
-    text_model_types = (
-        "qwen3",
-        "qwen3_moe",
-        "qwen3_5_text",
-        "qwen3_5_moe_text",
-        "qwen3_next",
-        "deepseek_v2",
-        "deepseek_v3",
-        "deepseek_v32",
-        "deepseek_v4",
-    )
-    deepseek_model_types = (
-        "deepseek_v2",
-        "deepseek_v3",
-        "deepseek_v32",
-        "deepseek_v4",
-    )
-    multimodal_model_types = ("qwen3_5", "qwen3_5_moe")
-    if is_multimodal and model_type not in multimodal_model_types:
-        raise WeightManifestError(
-            f"unsupported multimodal model type for weight manifests: {model_type}"
-        )
-    if not is_multimodal and model_type not in text_model_types:
-        raise WeightManifestError(
-            f"unsupported model type for weight manifests: {model_type}"
-        )
-    if model_type == "qwen3_next" and moe_runner_backend != "triton":
-        raise WeightManifestError(
-            "Qwen3-Next weight manifests require the canonical triton MoE "
-            f"runner backend; got {moe_runner_backend!r}"
-        )
-    if model_type in deepseek_model_types:
-        if int(getattr(config, "n_routed_experts", 0) or 0) > 0 and (
-            moe_runner_backend != "triton"
-        ):
-            raise WeightManifestError(
-                "DeepSeek MoE weight manifests require the canonical triton MoE "
-                f"runner backend; got {moe_runner_backend!r}"
-            )
-
-    from .weight_semantics.qwen3_5 import (
-        Qwen35MultimodalWeightSemanticsAdapter,
-        Qwen35WeightSemanticsAdapter,
-    )
-    from .weight_semantics.qwen3 import (
-        Qwen3WeightSemanticsAdapter,
-    )
-    from .weight_semantics.qwen3_next import (
-        Qwen3NextWeightSemanticsAdapter,
-    )
-
-    up_first_w13_parameters = set()
-    modules = getattr(model, "modules", None)
-    if modules is not None:
-        for module in modules():
-            parameter = getattr(module, "w13_weight", None)
-            if parameter is None:
-                continue
-            quant_method = getattr(module, "quant_method", None)
-            if bool(getattr(module, "use_flashinfer_trtllm_moe", False)) or bool(
-                getattr(quant_method, "load_up_proj_weight_first", False)
-            ):
-                up_first_w13_parameters.add(id(parameter))
-
-    def vocab_parallel_groups(
-        vocab_config: Any, *, dp_embed_group: str
-    ) -> tuple[str, str]:
-        if not dp_attention_enabled:
-            return "tp", "tp"
-        embed_group = dp_embed_group
-        if bool(getattr(vocab_config, "tie_word_embeddings", False)):
-            return embed_group, embed_group
-        lm_head_group = "attn_tp" if dp_lm_head_enabled else "tp"
-        return embed_group, lm_head_group
-
-    if is_multimodal:
-        text_config = getattr(config, "text_config", None)
-        vision_config = getattr(config, "vision_config", None)
-        if text_config is None or vision_config is None:
-            raise WeightManifestError(
-                "Qwen3.5 multimodal config is missing text_config or vision_config"
-            )
-        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
-            config,
-            dp_embed_group="replicated",
-        )
-        adapter = Qwen35MultimodalWeightSemanticsAdapter(
-            text_config=text_config,
-            vision_config=vision_config,
-            up_first_w13_parameter_ids=up_first_w13_parameters,
-            embed_vocab_group=embed_vocab_group,
-            lm_head_vocab_group=lm_head_vocab_group,
-        )
-    elif model_type == "qwen3_next":
-        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
-            config,
-            dp_embed_group="attn_tp",
-        )
-        adapter = Qwen3NextWeightSemanticsAdapter(
-            config=config,
-            up_first_w13_parameter_ids=up_first_w13_parameters,
-            num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
-            embed_vocab_group=embed_vocab_group,
-            lm_head_vocab_group=lm_head_vocab_group,
-        )
-    elif model_type in deepseek_model_types:
-        from .weight_semantics.deepseek_v2 import (
-            DeepseekV2WeightSemanticsAdapter,
-        )
-        from .weight_semantics.deepseek_v4 import (
-            DeepseekV4WeightSemanticsAdapter,
-        )
-
-        adapter_class = (
-            DeepseekV4WeightSemanticsAdapter
-            if model_type == "deepseek_v4"
-            else DeepseekV2WeightSemanticsAdapter
-        )
-        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
-            config,
-            dp_embed_group=("replicated" if embed_replication_enabled else "attn_tp"),
-        )
-        adapter = adapter_class(
-            config=config,
-            up_first_w13_parameter_ids=up_first_w13_parameters,
-            num_fused_shared_experts=int(getattr(model, "num_fused_shared_experts", 0)),
-            embed_vocab_group=embed_vocab_group,
-            lm_head_vocab_group=lm_head_vocab_group,
-        )
-    elif model_type in ("qwen3", "qwen3_moe"):
-        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
-            config,
-            dp_embed_group="attn_tp",
-        )
-        adapter = Qwen3WeightSemanticsAdapter(
-            config=config,
-            up_first_w13_parameter_ids=up_first_w13_parameters,
-            embed_vocab_group=embed_vocab_group,
-            lm_head_vocab_group=lm_head_vocab_group,
-        )
-    else:
-        embed_vocab_group, lm_head_vocab_group = vocab_parallel_groups(
-            config,
-            dp_embed_group="replicated",
-        )
-        adapter = Qwen35WeightSemanticsAdapter(
-            config=config,
-            up_first_w13_parameter_ids=up_first_w13_parameters,
-            embed_vocab_group=embed_vocab_group,
-            lm_head_vocab_group=lm_head_vocab_group,
-        )
-
     return ImmutableWeightRuntimeManifestBuilder(
         model=model,
-        adapter=adapter,
+        load_plan=load_plan,
         topology=topology,
+        allowed_devices=allowed_devices,
     )
