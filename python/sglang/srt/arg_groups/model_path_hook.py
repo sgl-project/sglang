@@ -11,6 +11,8 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
+from sglang.srt.utils.common import is_remote_url
+from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -151,4 +153,133 @@ def handle_modelscope_paths(server_args: Any):
                 cfg.speculative_draft_model_path,
                 revision=cfg.speculative_draft_model_revision or "main",
             ),
+        )
+
+
+def handle_load_format(server_args: Any):
+    # The quantization side of the gguf coupling moved to the pipeline
+    # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
+    # genuine config (runtime user updates write it) and stays imperative.
+    cfg = resolving_view(server_args)
+    from sglang.srt.arg_groups.overrides import (
+        _gguf_quantization,
+        run_post_process_pass,
+    )
+
+    run_post_process_pass(server_args, _gguf_quantization)
+    if (cfg.load_format == "auto" or cfg.load_format == "gguf") and check_gguf_file(
+        cfg.model_path
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            load_format="gguf",
+        )
+
+    if cfg.load_format == "auto" and server_args._is_mistral_native_format():
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            load_format="mistral",
+        )
+        logger.info(
+            "Detected Mistral native format checkpoint, setting load_format='mistral'"
+        )
+
+    if is_runai_obj_uri(cfg.model_path):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            load_format="runai_streamer",
+        )
+    elif is_remote_url(cfg.model_path):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            load_format="remote",
+        )
+
+    if (
+        cfg.speculative_draft_model_path is not None
+        and is_runai_obj_uri(cfg.speculative_draft_model_path)
+        and cfg.speculative_draft_load_format is None
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            speculative_draft_load_format="runai_streamer",
+        )
+
+    if cfg.custom_weight_loader is None:
+        declare_resolution(server_args, "_handle_load_format", custom_weight_loader=[])
+
+    if cfg.load_format == "remote_instance":
+        if cfg.remote_instance_weight_loader_backend != "modelexpress" and (
+            cfg.remote_instance_weight_loader_seed_instance_ip is None
+            or cfg.remote_instance_weight_loader_seed_instance_service_port is None
+        ):
+            logger.warning(
+                "Fallback load_format to 'auto' due to incomplete remote instance weight loader settings."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_load_format",
+                load_format="auto",
+            )
+        elif (
+            cfg.remote_instance_weight_loader_send_weights_group_ports is None
+            and cfg.remote_instance_weight_loader_backend == "nccl"
+        ):
+            logger.warning(
+                "Fallback load_format to 'auto' due to incomplete remote instance weight loader NCCL group ports settings."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_load_format",
+                load_format="auto",
+            )
+        elif (
+            cfg.remote_instance_weight_loader_backend == "transfer_engine"
+            and not server_args.validate_transfer_engine()
+        ):
+            logger.warning(
+                "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_load_format",
+                load_format="auto",
+            )
+
+    # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        declare_resolution(
+            server_args,
+            "_handle_load_format",
+            remote_instance_weight_loader_start_seed_via_transfer_engine=server_args.validate_transfer_engine(),
+        )
+
+    # "ipc_cache" is an internal-only load format: ModelRunner sets it
+    # automatically when the weight cache is enabled, and it is not a public
+    # --load-format choice. Setting it directly is always wrong (no daemon is
+    # launched, and fallback_load_format inherits a nonsensical format), so
+    # reject it and point at the knob (defense-in-depth; the CLI already
+    # rejects it via LOAD_FORMAT_CHOICES).
+    if cfg.load_format == "ipc_cache":
+        raise ValueError(
+            "load_format='ipc_cache' is an internal-only format and must not "
+            "be set directly. Enable the weight cache via --weight-cache-mode "
+            "client (connect to an existing daemon) or daemon (launch one); "
+            "that selects IPC loading automatically."
+        )
+
+    # Speculative decoding loads an extra draft model whose weights the
+    # daemon does not export, so refuse the combination up front instead of
+    # failing deep inside draft-worker load (draft-model daemon TBD).
+    if cfg.weight_cache_mode != "off" and cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--weight-cache-mode is not supported together with speculative "
+            "decoding (--speculative-algorithm): the weight cache daemon does "
+            "not export the draft model's weights. Disable one of them "
+            "(--weight-cache-mode off) for this configuration."
         )

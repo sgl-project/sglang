@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
@@ -11,13 +12,17 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.utils.common import (
     is_cuda,
+    is_hip,
     is_sm90_supported,
+    is_sm100_or_sm110_supported,
     is_sm100_supported,
     is_sm120_supported,
+    parse_connector_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -489,3 +494,134 @@ def handle_multi_item_scoring(server_args: Any):
         f"Please set --attention-backend flashinfer when using --enable-mis. "
         f"Current backends: prefill={prefill_backend}, decode={decode_backend}"
     )
+
+
+def handle_deterministic_inference(server_args: Any):
+    from sglang.srt.server_args import (
+        RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
+    )
+
+    cfg = resolving_view(server_args)
+    if cfg.rl_on_policy_target is not None:
+        logger.warning("Enable deterministic inference because of rl_on_policy_target.")
+        declare_resolution(
+            server_args,
+            "_handle_deterministic_inference",
+            enable_deterministic_inference=True,
+        )
+
+        # For VLM
+        envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
+        # TODO remove this environment variable as a whole
+        envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(True)
+
+    if cfg.enable_deterministic_inference:
+        if cfg.enable_aiter_allreduce_fusion:
+            logger.warning(
+                "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_deterministic_inference",
+                enable_aiter_allreduce_fusion=False,
+            )
+
+        # Moved to the resolution pipeline (arg_groups/overrides.py:
+        # _deterministic_allreduce_fusion_disable), invoked here at its
+        # legacy slot.
+        from sglang.srt.arg_groups.overrides import (
+            _deterministic_allreduce_fusion_disable,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(server_args, _deterministic_allreduce_fusion_disable)
+
+        # The forced-pytorch sampling write and the attention backend
+        # fill/validation moved to the resolution pipeline
+        # (arg_groups/overrides.py), invoked at their legacy slots.
+        from sglang.srt.arg_groups.overrides import (
+            _deterministic_attention_backend,
+            _deterministic_sampling_backend,
+            run_post_process_pass,
+        )
+
+        run_post_process_pass(server_args, _deterministic_sampling_backend)
+        is_deepseek_model = False
+        if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
+            try:
+                hf_config = server_args.get_model_config().hf_config
+                model_arch = hf_config.architectures[0]
+                is_deepseek_model = model_arch in [
+                    "DeepseekV2ForCausalLM",
+                    "DeepseekV3ForCausalLM",
+                    "DeepseekV32ForCausalLM",
+                    "MistralLarge3ForCausalLM",
+                    "PixtralForConditionalGeneration",
+                    "GlmMoeDsaForCausalLM",
+                    "Glm4MoeLiteForCausalLM",
+                ]
+            except Exception:
+                pass
+
+        # Check attention backend
+        run_post_process_pass(server_args, _deterministic_attention_backend)
+
+        attention_backend = resolved_view(server_args).attention_backend
+        if is_deepseek_model:
+            if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+                raise ValueError(
+                    f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
+                )
+            if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
+                raise ValueError(
+                    "Deterministic inference with absorbed-MLA models on the fa4 "
+                    "attention backend requires SM100/SM110: it runs "
+                    "absorbed MLA, whose qv argument flash_attn.cute only "
+                    "implements on those archs."
+                )
+
+        if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+            # Currently, only certain backends support radix cache. Support for other backends is in progress
+            declare_resolution(
+                server_args,
+                "_handle_deterministic_inference",
+                disable_radix_cache=True,
+            )
+            logger.warning(
+                f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
+            )
+
+        # Check TP size
+        if cfg.tp_size > 1:
+            if is_hip():
+                # AMD: use 1-stage all-reduce kernel which is inherently deterministic
+                # (each GPU reads all data from all GPUs, reduces locally in fixed order)
+                logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")
+            else:
+                # CUDA: use NCCL tree algorithm
+                os.environ["NCCL_ALGO"] = "allreduce:tree"
+                # Not declared: set_default_server_args() writes this field
+                # too, through its `args` parameter, so a declaration here
+                # would be a second source for one field.
+                declare_resolution(
+                    server_args,
+                    "_handle_deterministic_inference",
+                    disable_custom_all_reduce=True,
+                )
+                # should_torch_symm_mem_allreduce() takes the
+                # symmetric-memory path only below a byte threshold, so
+                # which reduce runs would follow the token count.
+                declare_resolution(
+                    server_args,
+                    "_handle_deterministic_inference",
+                    enable_torch_symm_mem=False,
+                )
+                # Each channel carries a differently shaped tree and the
+                # channel count is picked from the message size, so a
+                # token's reduction order would follow the token count.
+                nchannels = str(envs.SGLANG_DETERMINISTIC_NCCL_NCHANNELS.get())
+                os.environ["NCCL_MIN_NCHANNELS"] = nchannels
+                os.environ["NCCL_MAX_NCHANNELS"] = nchannels
+                logger.warning(
+                    "NCCL_ALGO is set to 'allreduce:tree', the NCCL channel count is pinned, and custom and symmetric-memory all reduce are disabled for deterministic inference when TP size > 1."
+                )

@@ -37,6 +37,20 @@ _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 # has to be looked at.
 _STALE_IN_THE_MODEL_CONFIG = frozenset({"speculative_algorithm"})
 
+# Behind the expert-pack build. `expert_pack_hook.handle_expert_pack` builds a
+# model configuration, and it always did -- the walk stopped at the record's
+# file and never saw it, so these three read as decided before the first build.
+# The call sits behind `load_format != "expert_pack": return`, so it is the
+# first build only on an expert-pack launch. Pre-existing; named rather than
+# fixed, because fixing it means moving the build or the hook.
+_STALE_BEHIND_THE_EXPERT_PACK_BUILD = frozenset(
+    {
+        "_speculative_draft_quantization_explicitly_set",
+        "model_path",
+        "speculative_draft_model_quantization",
+    }
+)
+
 # The same staleness through the registries: `_handle_model_specific_adjustments`
 # builds the model configuration and *then* collects the override declarations,
 # both inside one handler body. Named rather than fixed (that means moving the
@@ -98,13 +112,27 @@ def _registry_collection_is_after_the_build():
     collection above this handler's own `get_model_config()` call does not move
     it above the configuration another handler already cached.
     """
-    tree = _parsed(_SRT / "server_args.py")
-    handler = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "_handle_model_specific_adjustments"
-    )
+    handler = None
+    for source, wanted in (
+        (_SRT / "server_args.py", "_handle_model_specific_adjustments"),
+        *(
+            (path, "handle_model_specific_adjustments")
+            for path in sorted((_SRT / "arg_groups").glob("*.py"))
+        ),
+    ):
+        for node in ast.walk(_parsed(source)):
+            if isinstance(node, ast.FunctionDef) and node.name == wanted:
+                if any(
+                    isinstance(child, ast.Call)
+                    and getattr(child.func, "attr", getattr(child.func, "id", None))
+                    == "collect_model_override_declarations"
+                    for child in ast.walk(node)
+                ):
+                    handler = node
+                    break
+        if handler is not None:
+            break
+    assert handler is not None, "the model-specific handler was not found"
     build = collect = None
     for node in ast.walk(handler):
         if not isinstance(node, ast.Call):
@@ -310,7 +338,27 @@ def _pipeline():
         node.name: node for node in record.body if isinstance(node, ast.FunctionDef)
     }
     hooks = _hook_functions()
-    methods.update({name: node for name, node in hooks.items() if name not in methods})
+    # Follow exactly one edge: the slot's own `from arg_groups.X import f` /
+    # `f(self)`. Merging every hook function by bare name would let the walk
+    # wander into families the slot never calls.
+    slot_target = {}
+    for name, node in methods.items():
+        imported = {
+            alias.asname or alias.name
+            for child in ast.walk(node)
+            if isinstance(child, ast.ImportFrom)
+            and child.module
+            and child.module.startswith("sglang.srt.arg_groups")
+            for alias in child.names
+        }
+        called = {
+            child.func.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+        for target in sorted(imported & called & set(hooks)):
+            slot_target.setdefault(name, target)
+    methods.update({name: hooks[name] for name in slot_target.values()})
     dispatch = methods["_run_resolution_pipeline"]
     steps = [
         name
@@ -339,8 +387,9 @@ def _pipeline():
                 and node.func.attr in methods
             ):
                 reaches(node.func.attr, seen)
-            elif isinstance(node.func, ast.Name) and node.func.id in hooks:
-                reaches(node.func.id, seen)
+        target = slot_target.get(name)
+        if target is not None:
+            reaches(target, seen)
         return seen
 
     step_lines = {}
@@ -532,6 +581,7 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             _READ_BEFORE_RESOLUTION
             | _STALE_IN_THE_MODEL_CONFIG
             | _STALE_FROM_THE_REGISTRIES
+            | _STALE_BEHIND_THE_EXPERT_PACK_BUILD
         )
         late = sorted(
             field
