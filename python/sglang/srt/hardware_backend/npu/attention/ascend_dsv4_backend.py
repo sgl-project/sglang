@@ -17,7 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -30,18 +30,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _is_atlas_a5() -> bool:
-    """Whether the current NPU supports the Atlas A5 DSV4 kernels."""
-    return has_npu_a5_support()
+def _is_npu_arch35() -> bool:
+    return is_npu_arch35()
 
 
-_A5_KV_TILE_SIZE = 64
-_A5_KV_ROPE_HEAD_DIM = 64
+_NPU_ARCH35_KV_TILE_SIZE = 64
+_NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 
 
 def _sparse_attn_ops():
     """Return the metadata and attention ops for the active DSV4 KV layout."""
-    if _is_atlas_a5():
+    if _is_npu_arch35():
         return (
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
@@ -53,12 +52,12 @@ def _sparse_attn_ops():
 
 
 def _sparse_attn_kv_quant_kwargs() -> dict:
-    if not _is_atlas_a5():
+    if not _is_npu_arch35():
         return {}
     return {
         "kv_quant_mode": 1,
-        "tile_size": _A5_KV_TILE_SIZE,
-        "rope_head_dim": _A5_KV_ROPE_HEAD_DIM,
+        "tile_size": _NPU_ARCH35_KV_TILE_SIZE,
+        "rope_head_dim": _NPU_ARCH35_KV_ROPE_HEAD_DIM,
     }
 
 
@@ -179,7 +178,7 @@ class CompressorAscendBackendMixin:
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if _is_atlas_a5()
+            if _is_npu_arch35()
             else None
         )
         is_decode = forward_batch.forward_mode.is_decode()
@@ -426,7 +425,7 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             # A5 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
             # the A3 explicit [B, width] table here would be an ABI violation.
@@ -461,7 +460,9 @@ class CompressorAscendBackendMixin:
 
         # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
         compressor_op = (
-            torch.ops.custom.compressor if _is_atlas_a5() else torch.ops.npu.compressor
+            torch.ops.custom.compressor
+            if _is_npu_arch35()
+            else torch.ops.npu.compressor
         )
         cmp_kv = compressor_op(
             x,
@@ -771,7 +772,6 @@ class C4IndexerAscendBackendMixin:
         return torch.cat(topk_idxs, dim=0).to(dtype=torch.int32)
 
     def _ensure_npu_c4_indexer(self, c4_indexer, device: torch.device) -> None:
-        c4_indexer.compressor.li_kv_dtype = "float8" if _is_atlas_a5() else "int8"
         if getattr(c4_indexer, "hadamard_matrix", None) is None:
             H = _walsh_hadamard_matrix(c4_indexer.head_dim, torch.float32, device)
             c4_indexer.register_buffer("hadamard_matrix", H, persistent=False)
@@ -1115,7 +1115,7 @@ class DeepseekV4AscendAttnBackend(
         metadata.dsv4_max_input_capacity = tokens_per_req
         metadata.dsv4_cycle_state_block_table = (
             torch.zeros(bs, dtype=torch.int32, device=device)
-            if _is_atlas_a5()
+            if _is_npu_arch35()
             else None
         )
         metadata.dsv4_explicit_state_block_tables = {
@@ -1497,7 +1497,7 @@ class DeepseekV4AscendAttnBackend(
     def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
-        if _is_atlas_a5():
+        if _is_npu_arch35():
             ctx.fm.dsv4_cycle_state_block_table.copy_(
                 ctx.forward_batch.req_pool_indices[: ctx.bs]
             )
