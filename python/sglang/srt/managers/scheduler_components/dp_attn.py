@@ -27,7 +27,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -401,7 +400,6 @@ class SchedulerDPAttnAdapter:
     tree_cache: BasePrefixCache
     offload_tags: set[str]
     ps: ParallelState
-    server_args: ServerArgs
     model_config: ModelConfig
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -417,7 +415,7 @@ class SchedulerDPAttnAdapter:
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
-            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().config.dwdp_size > 1,

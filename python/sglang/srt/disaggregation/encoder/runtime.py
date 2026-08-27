@@ -53,6 +53,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
     get_serving,
+    publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
@@ -1473,6 +1474,7 @@ def launch_dp_worker(
     dispatch_path: str,
     result_path: str,
 ):
+    publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
@@ -1570,10 +1572,10 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     HTTP uses this entry point today.  gRPC can reuse it later without
     importing HTTP application state or Uvicorn.
     """
-    if get_parallel().config.dp_size <= 1 or server_args.tp_size != 1:
+    if get_parallel().config.dp_size <= 1 or get_parallel().config.tp_size != 1:
         raise ValueError(
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
-            f"dp_size={get_parallel().config.dp_size}, tp_size={server_args.tp_size}."
+            f"dp_size={get_parallel().config.dp_size}, tp_size={get_parallel().config.tp_size}."
         )
     dp_size = get_parallel().config.dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")

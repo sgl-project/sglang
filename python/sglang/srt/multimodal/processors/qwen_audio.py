@@ -167,7 +167,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         self._warn_if_audio_exceeds_window(base_output.audios)
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

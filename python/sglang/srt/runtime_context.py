@@ -24,9 +24,10 @@ getters. The resolved parallel **configuration** is the same object's ``config``
 hop (``get_parallel().config.tp_size``), which reads the published ``parallel``
 bag: bare is the live group, ``config`` is what was configured.
 
-``get_server_args()`` returns the process-wide ``ServerArgs``. This is the pristine / resolved-at-startup **read-only** record kept
-for debug and reproduction; business code reads resolved config from the
-namespace bags below, not from this object. The context owns the storage:
+``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
+user's raw input, kept **read-only** for debug and reproduction; what
+resolution decided lives in the declarations (``resolution_result``) and, for
+business code, in the namespace bags below -- never on this object's fields. The context owns the storage:
 publishing goes through ``RuntimeContext.set_server_args`` (the legacy
 ``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
 shims over this slot).
@@ -440,8 +441,8 @@ class DpFlags(_FlagGroupBase):
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
-    Resolved configuration lives on ``server_args`` fields (materialized at
-    the end of ``__post_init__``) — this tier only carries genuine runtime
+    Resolved configuration lives in the config bags below (projected from the
+    declarations at publish) — this tier only carries genuine runtime
     state whose value is not a function of the configuration alone, grouped
     by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
     """
@@ -700,8 +701,7 @@ def _build_config_bags(server_args: Any) -> dict:
     """Snapshot the resolution result into the namespace bag tree, driven by
     the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
     ``resolution_result`` -- the declaration if resolution made one, else what
-    the caller supplied -- rather than from the field, which carries the same
-    value only while declarations still materialize. Returns
+    the caller supplied. Returns
     ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
     Only dataclass fields carry ``NS`` markers, so derived properties/methods are
     naturally excluded (they stay on the bag). A name used as both a leaf and a
@@ -783,7 +783,13 @@ class RuntimeContext:
         if stream is None:
             import torch
 
-            device = self._server_args.device if self._server_args else "cuda"
+            from sglang.srt.arg_groups.overrides import resolution_result
+
+            device = (
+                resolution_result(self._server_args, "device")
+                if self._server_args
+                else "cuda"
+            )
             stream = torch.get_device_module(device).Stream()
             self.resources.streams[name] = stream
         return stream
@@ -819,8 +825,8 @@ class RuntimeContext:
         Overwrite-allowed: a re-publish replaces the slot (test kits re-publish
         per test; production ordering discipline lives at the call-sites, e.g.
         the draft-worker guard in ``ModelRunner.__init__``). The published
-        object already carries the resolved configuration (declarations
-        materialize at the end of ``__post_init__``).
+        object is the raw input; the resolution it carries is its declaration
+        stash, which is what the bags are projected from.
         """
         # Seed the capture tier for the new lifecycle (defaults for sentinel
         # and mock publishes, which carry no config).
@@ -969,11 +975,12 @@ class RuntimeContext:
         in a readback: HiCache attach/detach, the generated forward-pass-metrics
         endpoint, tunables set via ``/set_internal_state``.
 
-        ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
-        ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first. Override leaves are flat
-        ``ServerArgs`` field names, so overlaying them onto the top level of
-        either base is exact.
+        ``base`` defaults to ``server_args.resolved_dict()`` -- the record's
+        fields as resolution decided them, nested dataclasses expanded. (It used
+        to be ``dict(vars(server_args))``, which carried the private resolution
+        bookkeeping and the ``model_config`` memo into the readback.) Override
+        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
+        top level of the base is exact.
 
         The log is per process: it carries what *this* process overrode. A
         weight reload records ``model_path`` and ``load_format`` from the
@@ -984,7 +991,7 @@ class RuntimeContext:
         The top-level ``/server_info`` fields are the startup record, not this
         dump.
         """
-        d = dict(vars(self.server_args)) if base is None else dict(base)
+        d = self.server_args.resolved_dict() if base is None else dict(base)
         for _source, fields in self._overrides_log:
             d.update(fields)
         return d
@@ -1077,10 +1084,11 @@ class _ServerArgsOverride:
         }
         if declared:
             declare_late_resolution(server_args, "override_server_args", **declared)
-        _apply_fields(
-            server_args,
-            {name: value for name, value in self._fields.items() if name[0] == "_"},
-        )
+        # This hook stands in for a launch: the caller's values are both what
+        # the operator passed and what resolution decided, so they go on the
+        # record as well as into the stash. Production late resolution declares
+        # only -- there the record stays the operator's input.
+        _apply_fields(server_args, self._fields)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1257,9 +1265,12 @@ _RECORD_DUMP_REGISTERED = False
 def _is_compiling() -> bool:
     # Recording has Python side effects (set mutation, file I/O, atexit) that
     # must never run under tracing; torch.compiler.is_compiling() is dynamo's
-    # sanctioned probe. The lazy lookup keeps this module import-light.
-    torch = sys.modules.get("torch")
-    return torch is not None and torch.compiler.is_compiling()
+    # sanctioned probe. The function-level import keeps this module
+    # import-light; a sys.modules lookup here breaks fullgraph tracing (dynamo
+    # enumerates the dict, which other imports mutate mid-trace).
+    import torch
+
+    return torch.compiler.is_compiling()
 
 
 def _ensure_record_dump_registered() -> None:
@@ -1374,29 +1385,38 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     return _CONTEXT
 
 
-def ensure_published(server_args, *, role: str) -> RuntimeContext:
-    """Publish unless this exact record is already published under this role.
+def assert_published(server_args, *, role: str) -> RuntimeContext:
+    """This record, under this role, is already published -- or fail loud.
 
-    Three constructors publish defensively, because each can be built with
-    nothing published before it -- `ModelRunner` (a benchmark harness, the
-    manual runner tests), `TokenizerManager`, and `MMEncoder` (spawned encoder
-    workers). Inside a process that already published the same record,
-    publishing again re-projects the bags: every `override()` taken between the
-    two calls is discarded, and the provenance log with it.
+    Publishing is the process entry's job: `run_scheduler_process`,
+    `init_multi_tokenizer`, a spawned encoder worker, the benchmark work
+    functions. A constructor arriving here unpublished means one of those
+    entries is missing.
 
-    No override sits in one of those windows today, so this removes a hazard
-    rather than a live bug. It is worth removing anyway: the drop is silent, it
-    depends on where a constructor happens to sit relative to the overrides
-    around it, and `publish` now says what a re-projection discarded so the
-    next one is loud.
-
-    So these callers ask for the end state -- this record, this role, published
-    -- and get a no-op when that already holds. An engine rebuild still calls
-    `publish` directly, because there the reset is the point.
+    A `publish` at this point re-projects the bags over a live process,
+    discarding every `override()` taken since and the provenance log with it,
+    so this raises.
     """
     if _CONTEXT._server_args is server_args and _CONTEXT._publish_role == role:
         return _CONTEXT
-    return publish(server_args, role=role)
+    if _CONTEXT._server_args is None:
+        detail = "nothing is published in this process"
+    elif _CONTEXT._server_args is not server_args:
+        detail = (
+            "a different record is published "
+            f"(role={_CONTEXT._publish_role!r}); this constructor was handed "
+            "one the process never published"
+        )
+    else:
+        detail = (
+            f"this record is published under role "
+            f"{_CONTEXT._publish_role!r}, not {role!r}"
+        )
+    raise RuntimeError(
+        f"config not published for role {role!r}: {detail}. The process entry "
+        "publishes -- add publish(server_args, role=...) there rather than "
+        "publishing from a constructor."
+    )
 
 
 def publish_role() -> str | None:
