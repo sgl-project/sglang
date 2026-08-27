@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,24 @@ pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
+
+
+def _use_deep_gemm_hc_prenorm() -> bool:
+    if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        return False
+
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+    return ENABLE_JIT_DEEPGEMM
+
+
+def _use_tilelang_mhc_pre() -> bool:
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() and not is_hip()
+
+
+def _use_tilelang_mhc_post() -> bool:
+    return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
+
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -835,7 +854,7 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    if _use_deep_gemm_hc_prenorm():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1447,7 +1466,7 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if _use_deep_gemm_hc_prenorm():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(
@@ -1659,7 +1678,7 @@ def _mhc_pre_dispatch(
     Returns (post_mix=(s,n,1), comb_mix=(s,n,n), layer_input=(s,h), norm_fused).
     """
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+    if not _use_tilelang_mhc_pre():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1698,7 +1717,7 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
-    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+    if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 

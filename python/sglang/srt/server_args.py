@@ -84,6 +84,7 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_host_cpu_arm64,
@@ -1898,7 +1899,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. On non-gfx95 ROCm GPUs, 'sgl-kernel' falls back to the portable 'torch' backend with fused top-k disabled. The 'torch' backend otherwise requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
@@ -5655,6 +5656,23 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_split_backend_resolution)
 
+    def _handle_rocm_dsa_topk_compatibility(self) -> None:
+        if not is_hip() or is_gfx95_supported():
+            return
+
+        cfg = resolving_view(self)
+        if cfg.dsa_topk_backend != "sgl-kernel":
+            return
+
+        # The fused SGL transform requires gfx95 on ROCm. Torch returns raw
+        # indices, so it must use the unfused PAGED/RAGGED transform path.
+        envs.SGLANG_DSA_FUSE_TOPK.set(False)
+        self._declare("_handle_rocm_dsa_topk_compatibility", dsa_topk_backend="torch")
+        logger.warning(
+            "Use the portable Torch DSA top-k backend with fused top-k disabled "
+            "on non-gfx95 ROCm GPUs."
+        )
+
     def _validate_hisparse_dsa_backend(self, attr: str, label: str):
         from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_dsa_backend
 
@@ -5919,6 +5937,7 @@ class ServerArgs:
                     # here for the rest of the DSA family (DeepSeek-V3.2 /
                     # GLM-5.x) that shares the same decode top-k path.
                     envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                    self._handle_rocm_dsa_topk_compatibility()
                 if not self._resolved().enable_dp_attention and cfg.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
