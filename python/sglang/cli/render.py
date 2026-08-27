@@ -81,9 +81,7 @@ def render(args, extra_argv):
         },
     }
 
-    binary = os.environ.get("SGLANG_RENDERER_BIN") or shutil.which(
-        "sglang-renderer"
-    )
+    binary = os.environ.get("SGLANG_RENDERER_BIN") or shutil.which("sglang-renderer")
     if binary is None:
         raise RuntimeError(
             "sglang-renderer executable was not found; install a wheel built "
