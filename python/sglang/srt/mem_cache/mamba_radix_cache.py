@@ -43,14 +43,16 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -102,6 +104,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -437,7 +441,7 @@ class LRUList:
                 raise Exception(msg)
 
 
-class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert (
             isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
@@ -450,14 +454,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
 
         self.page_size = params.page_size
         self.disable = params.disable
-        self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -493,7 +498,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -546,7 +551,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
@@ -573,7 +578,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 cache_len = 0
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
+                self.token_to_kv_pool_allocator.free_segment(
+                    kv_indices[cache_end_idx:], start_pos=cache_end_idx
+                )
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
 
@@ -625,7 +632,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=RadixKey(
+                        token_ids[:page_aligned_len],
+                        req.extra_key,
+                        cache_salt=req.cache_salt,
+                    ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
@@ -636,7 +647,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices[req.cache_protected_len :],
+                start_pos=req.cache_protected_len,
+            )
             mamba_exist = True
 
         if mamba_exist:
@@ -732,7 +746,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
@@ -745,7 +763,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -796,8 +820,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
-        self._record_remove_event(x)
-        self.token_to_kv_pool_allocator.free(x.value)
+        self.kv_events.record_remove(x)
+        # Tree values are page-aligned copies of a kv row: page-exact segment.
+        self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
         self._free_mamba_value(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
@@ -1206,6 +1231,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         # insert the new node and child into the full lru list, insert
         # parent first so that parent is after child in the lru list
@@ -1244,7 +1272,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if prev_prefix_len < total_prefix_length + prefix_len:
                 start = max(0, prev_prefix_len - total_prefix_length)
-                self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                # value sits at offset total_prefix_length of the kv row; match()
+                # rounds prefix_len to page multiples, so frees never share a page.
+                self.token_to_kv_pool_allocator.free_segment(
+                    value[start:prefix_len],
+                    start_pos=total_prefix_length + start,
+                )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1269,7 +1302,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1298,8 +1331,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
-            self.token_to_kv_pool_allocator.free(node.parent.value)
+            self.kv_events.record_remove(node.parent)
+            self.token_to_kv_pool_allocator.free_segment(node.parent.value, start_pos=0)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)

@@ -18,6 +18,16 @@ class _FakeAllocator:
         self.freed.append(free_index.clone())
 
 
+class _FakeReqToTokenPool:
+    def __init__(self, req_to_token):
+        self.req_to_token = req_to_token
+        self.free_slots = []
+
+    def free(self, req):
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
+
+
 class _FakeInnerCache:
     def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
@@ -25,6 +35,7 @@ class _FakeInnerCache:
         self.page_size = page_size
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
+        self.dec_lock_ref_params = []
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
@@ -36,6 +47,7 @@ class _FakeInnerCache:
 
     def dec_lock_ref(self, node, *args, **kwargs):
         self.dec_lock_ref_calls.append(node)
+        self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
 
     def supports_mamba(self):
         return False
@@ -64,9 +76,11 @@ class _FakeReq:
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
+        self.cache_salt = None
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
+        self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -81,7 +95,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(
         req_to_token_pool,
@@ -129,7 +143,7 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     slot is created from req state and nuked via release_session."""
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -155,7 +169,7 @@ def test_nth_mid_abort_nukes_session_slot():
     in req_nodes for next turn's re-prefill."""
     page_size = 1
     req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
     tree_cache = StreamingSession(inner)
@@ -185,6 +199,37 @@ def test_nth_mid_abort_nukes_session_slot():
     assert req.req_pool_idx is None
 
 
+def test_release_session_threads_mamba_skip_ids():
+    """release_session must forward the slot's skip_lock_node_ids to
+    dec_lock_ref. The first req's last_node may be full-only-locked (mamba
+    skipped at inc), so without the skip set the release would drop a mamba
+    lock the session never took -- another request's, on a shared node."""
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = StreamingSession(inner)
+
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        last_node=lock_node,
+        cache_protected_len=0,
+        skip_lock_node_ids={ComponentType.MAMBA: {42}},
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [lock_node]
+    params = inner.dec_lock_ref_params[0]
+    assert params is not None
+    assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
+
+
 # Shrink tests removed: streaming sessions are append-only after the
 # rollback fix in session_controller (rollback_aborted_req).  The shrink
 # code path in cache_finished_req no longer exists.
@@ -200,7 +245,7 @@ def test_trim_overshoot_postcondition():
     """
     page_size = 1
     req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
     allocator = _FakeAllocator()
     tree_cache = StreamingSession(
         _FakeInnerCache(req_to_token_pool, allocator, page_size)

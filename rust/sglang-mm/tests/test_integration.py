@@ -6,10 +6,13 @@ import numpy as np
 import torch
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bench"))
 from bench_parity import make_photo_like
 
-import sglang.srt.multimodal.inkling.image_processing as ip
+from sglang.srt.multimodal.inkling.image_processing import InklingImageProcessor
+from sglang.srt.multimodal.inkling.image_processing_rust import (
+    InklingRustImageProcessor,
+)
 
 
 def encode(arr, fmt):
@@ -21,17 +24,14 @@ def encode(arr, fmt):
 
 
 def run(images, use_rs: bool, rescale: bool):
-    ip._rs_module = None
-    os.environ["SGLANG_RS_MM_PREPROCESS"] = "1" if use_rs else "0"
     kwargs = (
         {}
         if rescale
         else {"rescale_image_frac": None, "rescale_image_max_upscaled_long_edge": None}
     )
-    proc = ip.InklingImageProcessor(patch_size=40, **kwargs)
-    out = proc.preprocess(images)
-    assert (ip._rs_module is not False) == use_rs, "rust module gating mismatch"
-    return out
+    cls = InklingRustImageProcessor if use_rs else InklingImageProcessor
+    proc = cls(patch_size=40, **kwargs)
+    return proc.preprocess(images)
 
 
 def compare(tag, images, expect_exact, rescale=False):
@@ -59,7 +59,7 @@ arr1 = make_photo_like(1080, 1920, seed=1)
 arr2 = make_photo_like(720, 1280, seed=2)
 arr3 = make_photo_like(480, 640, seed=3)
 
-print("=== integration: InklingImageProcessor env-gated rust path ===")
+print("=== integration: Inkling rust vs python processor parity ===")
 compare("single PNG", [encode(arr1, "PNG")], expect_exact=True)
 compare("single JPEG", [encode(arr1, "JPEG")], expect_exact=False)
 compare(

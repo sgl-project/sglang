@@ -69,6 +69,13 @@ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
         buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
 
 
+def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
+    """Zero outputs when an idle DP rank skips attention work."""
+    for buf in bufs:
+        if buf is not None:
+            buf.zero_()
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -128,6 +135,13 @@ class RadixAttention(nn.Module):
         self.v_scale = None
         self.k_scale_float = None
         self.v_scale_float = None
+        # MiniMax-M3 fp8 attention-GEMM scales (fp8 attn-GEMM mode): main q and
+        # lightning-indexer q/k/v. No checkpoint loader populates them yet;
+        # None means unit scale.
+        self.q_scale_float = None
+        self.idx_q_scale_float = None
+        self.idx_k_scale_float = None
+        self.idx_v_scale_float = None
         self.quant_method = None
 
         if quant_config is not None:
@@ -195,14 +209,14 @@ class RadixAttention(nn.Module):
                     idx_v=idx_v,
                 )
                 return idx_out, attn_out
-            # FP8 q (e.g. mxfp8 KV-cache attention) still produces a bf16
-            # attention output; sizing the buffer off q's dtype would silently
-            # cast-copy the result to fp8.
-            out_dtype = (
-                torch.bfloat16
-                if q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                else q.dtype
-            )
+            # Output dtype follows v (the model dtype) when available: qk-norm
+            # may emit q in a different dtype without changing the dtype the
+            # backend writes. FP8 q/v (e.g. mxfp8 KV-cache attention) still
+            # produce a bf16 attention output; sizing the buffer off an fp8
+            # dtype would silently cast-copy the result to fp8.
+            out_dtype = v.dtype if v is not None else q.dtype
+            if out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                out_dtype = torch.bfloat16
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty(
                     (q.shape[0], self.tp_q_head_num * self.v_head_dim),
@@ -312,6 +326,18 @@ def _unified_attention_with_output_impl(
     if key_value_num_tokens is None:
         key_value_num_tokens = real_query_num_tokens
 
+    if real_query_num_tokens == 0:
+        _zero_skipped_attn_outputs(output)
+        if return_lse:
+            # unified_attention_with_output_and_lse asserts a tensor comes back.
+            # Match _unified_attention_with_output_and_lse_fake's meta shape and
+            # the padded LSE the normal path returns below (padded row count,
+            # i.e. query before narrowing).
+            return query.new_zeros(
+                (query.shape[0], query.shape[1]), dtype=torch.float32
+            )
+        return None
+
     query = query[:real_query_num_tokens]
     if key is not None:
         key = key[:key_value_num_tokens]
@@ -344,9 +370,12 @@ def _unified_attention_with_output_impl(
         kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
+    original_positions = forward_batch.positions
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_query_num_tokens]
+    if original_positions is not None:
+        forward_batch.positions = original_positions[:real_query_num_tokens]
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_query_num_tokens to match the narrowed query shape —
@@ -363,6 +392,7 @@ def _unified_attention_with_output_impl(
         **kwargs,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
+    forward_batch.positions = original_positions
 
     lse = None
     if return_lse:
@@ -499,6 +529,10 @@ def unified_sparse_attention_with_output(
     attention_layer = context.attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
+    if real_num_tokens == 0:
+        _zero_skipped_attn_outputs(attn_out, idx_out)
+        return
+
     query = query[:real_num_tokens]
     if key is not None:
         key = key[:real_num_tokens]
@@ -565,6 +599,10 @@ def attention_with_output_extra_kwargs(
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        _zero_skipped_attn_outputs(output)
+        return
 
     query = query[:real_num_tokens]
     if key is not None:

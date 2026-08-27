@@ -68,6 +68,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils.common import get_compiler_backend
@@ -971,9 +974,9 @@ class MOVADecodingStage(PipelineStage):
                 batch.latents, self.video_vae
             )
 
-            with torch.autocast(
-                device_type=current_platform.device_type,
+            with precision_autocast_context(
                 dtype=vae_dtype,
+                disable_autocast=server_args.disable_autocast,
                 enabled=vae_autocast_enabled,
             ):
                 if server_args.pipeline_config.vae_tiling:

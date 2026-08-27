@@ -70,6 +70,7 @@ def _make_req(rid, req_pool_idx, token_ids, tree):
         origin_input_ids=token_ids,
         output_ids=[],
         extra_key=None,
+        cache_salt=None,
         last_node=tree.root_node,
         cache_protected_len=0,
         priority=0,

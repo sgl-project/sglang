@@ -15,6 +15,7 @@ Usage:
     python -m pytest test_base_grammar_backend.py -v
 """
 
+import json
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
     register_grammar_backend,
 )
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -231,18 +233,39 @@ class TestCreateGrammarBackend(unittest.TestCase):
         GRAMMAR_BACKEND_REGISTRY.clear()
         GRAMMAR_BACKEND_REGISTRY.update(self._saved)
 
+    def _publish(self, **fields):
+        """Set the config the factory reads.
+
+        The factory takes every config value off the published bags, so a test
+        that sets one on the handed object would be setting something the
+        factory does not read -- which is how a mismatch between the two used
+        to stay invisible here.
+        """
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
     def _make_server_args(
-        self, backend="none", reasoning_parser=None, enable_strict_thinking=False
+        self,
+        backend="none",
+        reasoning_parser=None,
+        enable_strict_thinking=False,
+        **fields,
     ):
+        published = {
+            "grammar_backend": backend,
+            "reasoning_parser": reasoning_parser,
+            "enable_strict_thinking": enable_strict_thinking,
+            "constrained_json_whitespace_pattern": None,
+            "constrained_json_disable_any_whitespace": False,
+        }
+        published.update(fields)
+        self._publish(**published)
+        # Handed on to plugin-registered backends; not a config source.
         args = MagicMock()
         args.override = lambda source, **updates: [
             setattr(args, key, value) for key, value in updates.items()
         ]
-        args.grammar_backend = backend
-        args.reasoning_parser = reasoning_parser
-        args.enable_strict_thinking = enable_strict_thinking
-        args.constrained_json_whitespace_pattern = None
-        args.constrained_json_disable_any_whitespace = False
         return args
 
     def test_none_backend_returns_none(self):
@@ -293,8 +316,9 @@ class TestCreateGrammarBackend(unittest.TestCase):
     def test_outlines_backend(self, mock_outlines_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args("outlines")
-        args.constrained_json_whitespace_pattern = r"\s*"
+        args = self._make_server_args(
+            "outlines", constrained_json_whitespace_pattern=r"\s*"
+        )
 
         result = create_grammar_backend(args, "tok", 32000)
         mock_outlines_cls.assert_called_once_with("tok", whitespace_pattern=r"\s*")
@@ -304,8 +328,9 @@ class TestCreateGrammarBackend(unittest.TestCase):
     def test_xgrammar_backend(self, mock_xgrammar_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_xgrammar_cls.return_value = mock_backend
-        args = self._make_server_args("xgrammar")
-        args.constrained_json_disable_any_whitespace = True
+        args = self._make_server_args(
+            "xgrammar", constrained_json_disable_any_whitespace=True
+        )
 
         result = create_grammar_backend(args, "tok", 32000, {1, 2})
         mock_xgrammar_cls.assert_called_once_with(
@@ -316,23 +341,31 @@ class TestCreateGrammarBackend(unittest.TestCase):
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_unsupported_tokenizer_falls_back_to_none(self, mock_xgrammar_cls):
         from sglang.srt.constrained.xgrammar_backend import TokenizerNotSupportedError
+        from sglang.srt.runtime_context import get_context, get_exec
 
         mock_xgrammar_cls.side_effect = TokenizerNotSupportedError(
             "unsupported tokenizer"
         )
-        args = self._make_server_args("xgrammar")
+        override = get_context().override_server_args(grammar_backend="xgrammar")
+        server_args = override.install()
+        self.addCleanup(override.restore)
 
-        result = create_grammar_backend(args, "tok", 32000, {1})
-        self.assertIsNone(result)
-        self.assertEqual(args.grammar_backend, "none")
+        self.assertIsNone(create_grammar_backend(server_args, "tok", 32000, {1}))
+        self.assertEqual(get_exec().kernel.grammar_backend, "none")
+        self.assertEqual(
+            get_context().resolved_server_args_dict()["grammar_backend"], "none"
+        )
+        self.assertEqual(server_args.grammar_backend, "xgrammar")
 
     @patch("sglang.srt.constrained.llguidance_backend.GuidanceBackend")
     def test_llguidance_backend(self, mock_guidance_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_guidance_cls.return_value = mock_backend
-        args = self._make_server_args("llguidance")
-        args.constrained_json_disable_any_whitespace = False
-        args.constrained_json_whitespace_pattern = r"\s+"
+        args = self._make_server_args(
+            "llguidance",
+            constrained_json_disable_any_whitespace=False,
+            constrained_json_whitespace_pattern=r"\s+",
+        )
 
         result = create_grammar_backend(args, "tok", 32000, {1, 2})
         mock_guidance_cls.assert_called_once_with(
@@ -359,30 +392,28 @@ class TestCreateGrammarBackend(unittest.TestCase):
         # encode must return a single-token list for think_start/end tokens
         tokenizer.encode.return_value = [42]
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
         self.assertIsInstance(result, ReasonerGrammarBackend)
         self.assertIs(result.grammar_backend, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
-    def test_no_reasoner_wrapping_without_think_end_id(self, mock_outlines_cls):
-        """Without think_end_id passed in, no reasoner wrapping."""
+    def test_no_reasoner_wrapping_without_think_end_ids(self, mock_outlines_cls):
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
-        tokenizer = MagicMock(spec=[])  # No think_end_id attribute
+        tokenizer = MagicMock(spec=[])
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=None)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=None)
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
     def test_no_reasoner_wrapping_without_reasoning_parser(self, mock_outlines_cls):
-        """Without reasoning_parser, no reasoner wrapping even with think_end_id."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
         args = self._make_server_args("outlines", reasoning_parser=None)
         tokenizer = MagicMock()
 
-        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
@@ -434,6 +465,63 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
         )
         result = backend.dispatch_structural_tag(key)
         self.assertNotIsInstance(result, InvalidGrammarObject)
+
+
+class TestNulByteGrammarRejection(unittest.TestCase):
+    def setUp(self):
+        self.backend = BaseGrammarBackend()
+
+    def tearDown(self):
+        self.backend.executor.shutdown(wait=True)
+
+    def test_nul_payload_never_reaches_backend(self):
+        cases = [
+            ("regex", "\x00\x01\x02\x1f"),
+            ("regex", "\x00"),
+            # a non-leading NUL truncates the pattern instead of crashing; pinned
+            # so the guard cannot be narrowed to startswith()
+            ("regex", "a\x00b"),
+            ("ebnf", "root ::= \x00"),
+            ("structural_tag", '{"triggers": ["\x00"]}'),
+            # escaped forms: no raw NUL byte anywhere in the key string
+            ("json", '{"type":"string","pattern":"\\u0000"}'),
+            (
+                "json",
+                '{"type":"object","properties":'
+                '{"f":{"type":"string","pattern":"\\u0000x"}}}',
+            ),
+            ("structural_tag", '{"format":{"pattern":"\\u0000"}}'),
+        ]
+        for key_type, key_string in cases:
+            with self.subTest(key_type=key_type, key_string=repr(key_string)):
+                dispatch = MagicMock()
+                setattr(self.backend, f"dispatch_{key_type}", dispatch)
+
+                result = self.backend._init_value_dispatch(
+                    (key_type, key_string), False
+                )
+
+                self.assertIsInstance(result, InvalidGrammarObject)
+                dispatch.assert_not_called()
+
+    def test_nul_free_payload_still_dispatches(self):
+        cases = [
+            ("regex", "[0-9]+"),
+            ("regex", r"\x00"),  # escaped in the pattern text, not a raw NUL byte
+            ("regex", "\x01\x02\x1f"),  # other control bytes are not the trigger
+            ("json", json.dumps({"type": "string", "pattern": "[0-9]+"})),
+            # malformed json must reach the backend and get its normal error,
+            # not be swallowed by the NUL scan's decode failure
+            ("json", "{not valid json"),
+        ]
+        for key_type, key_string in cases:
+            with self.subTest(key_type=key_type, key_string=repr(key_string)):
+                dispatch = MagicMock(return_value=BaseGrammarObject())
+                setattr(self.backend, f"dispatch_{key_type}", dispatch)
+
+                self.backend._init_value_dispatch((key_type, key_string), False)
+
+                dispatch.assert_called_once_with(key_string)
 
 
 if __name__ == "__main__":

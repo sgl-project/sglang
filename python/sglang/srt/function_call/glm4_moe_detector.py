@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 import re
@@ -12,7 +11,10 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import infer_type_from_json_schema
+from sglang.srt.function_call.utils import (
+    infer_type_from_json_schema,
+    safe_literal_eval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,9 +118,21 @@ def parse_arguments(
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
+    # Strategy 2.5: string-typed values that are not valid JSON (S1/S2 failed) —
+    # strip the wrapping quotes and keep the raw bytes, backslashes included.
+    # Avoids ast.literal_eval so invalid escapes neither warn nor get reinterpreted.
+    if arg_type == "string":
+        if (
+            len(json_value) >= 2
+            and json_value[0] == json_value[-1]
+            and json_value[0] in {'"', "'"}
+        ):
+            return json_value[1:-1], True
+        return json_value, True
+
     # Strategy 3: ast.literal_eval
     try:
-        parsed_value = ast.literal_eval(json_value)
+        parsed_value = safe_literal_eval(json_value)
         return parsed_value, True
     except (ValueError, SyntaxError):
         pass
@@ -147,6 +161,10 @@ class Glm4MoeDetector(BaseFormatDetector):
 
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
+
+    _STREAMING_PARTIAL_PATTERN = re.compile(
+        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+    )
 
     def __init__(self):
         super().__init__()
@@ -460,11 +478,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
-                string=current_text,
-                flags=re.DOTALL,
-            )
+            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)
@@ -511,7 +525,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
+
+                # The name and final tool-call marker can arrive in the same
+                # parse call, so continue into argument/finalization handling.
+                if self.current_tool_name_sent:
                     # Process XML to JSON streaming
                     current_raw_length = len(func_args_raw)
 
@@ -552,6 +569,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += empty_object
                         elif not self._last_arguments.endswith("}"):
                             closing_brace = "}"
                             calls.append(

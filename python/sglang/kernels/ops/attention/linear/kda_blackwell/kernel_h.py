@@ -698,7 +698,19 @@ def kda_h_cutedsl(
     ``h0``/``ht`` may be the full state pool; ``state_indices`` [N] int32 maps
     each sequence to its row, so state gather/scatter fuses into the kernel's
     TMA load/store (no per-call state intermediates).
+
+    Envelope-strided pools (unified memory / page-major, slot stride(0) !=
+    Hv*V*K) are supported natively: the compile-time fake tensors carry
+    dynamic int64 strides (``make_fake_tensor``), so the TMA descriptors pick
+    the real slot pitch up at launch. The fakes assume 16-element stride
+    divisibility (TMA also needs 16-byte global strides); guard it loudly
+    rather than corrupt state.
     """
+    for name, t in (("h0", h0), ("ht", ht)):
+        assert t.stride(-1) == 1 and all(s % 16 == 0 for s in t.stride()[:-1]), (
+            f"kda_h_cutedsl: {name} strides {tuple(t.stride())} violate the "
+            "16-element divisibility the kernel was compiled with"
+        )
     _, Hv, K_dim = kg.shape
     _, _, V_dim = V.shape
     h_dtype = {torch.bfloat16: BFloat16, torch.float32: Float32}[h0.dtype]

@@ -45,8 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -60,7 +59,7 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
+    __slots__ = ("token_ids", "extra_key", "cache_salt", "is_bigram", "limit")
 
     def __init__(
         self,
@@ -68,11 +67,17 @@ class RadixKey:
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
         limit: Optional[int] = None,
+        cache_salt: Optional[str] = None,
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # extra key (e.g. lora_id, cache_salt)
+        # Extra key for caller-defined cache classification.
         self.extra_key = extra_key
+        # Cache salt is kept distinct so it cannot collide with extra_key.
+        # It namespaces the in-process radix tree and external KV events;
+        # external L3/remote storage keys remain token-only and are outside
+        # this contract.
+        self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
         # Optional cap on raw tokens: behave as if token_ids were sliced to
@@ -126,12 +131,21 @@ class RadixKey:
             # bigrams [start, stop) span raw tokens [start, stop + 1);
             # empty slice -> empty raw tokens (not a dangling boundary token).
             raw = self.token_ids[start : stop + 1] if stop > start else array("q")
-            return RadixKey(raw, self.extra_key, is_bigram=True)
-        return RadixKey(self.token_ids[start:stop], self.extra_key)
+            return RadixKey(
+                raw,
+                self.extra_key,
+                is_bigram=True,
+                cache_salt=self.cache_salt,
+            )
+        return RadixKey(
+            self.token_ids[start:stop],
+            self.extra_key,
+            cache_salt=self.cache_salt,
+        )
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
+        return f"RadixKey(extra_key={self.extra_key!r}, cache_salt={self.cache_salt!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
     def page_aligned(self, page_size: int) -> RadixKey:
         if page_size == 1:
@@ -157,6 +171,11 @@ class RadixKey:
             raise ValueError(
                 f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
+            )
+        if self.cache_salt != other.cache_salt:
+            raise ValueError(
+                f"RadixKey operations require matching cache_salt, but got "
+                f"{self.cache_salt=} != {other.cache_salt=}"
             )
 
     def match(self, other: RadixKey, page_size: int = 1) -> int:
@@ -205,6 +224,8 @@ class RadixKey:
                 plain = tuple((t[j], t[j + 1]) for j in range(page_size))
         else:
             plain = t[0] if page_size == 1 else tuple(t[:page_size])
+        if self.cache_salt is not None:
+            return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
@@ -236,6 +257,8 @@ class TreeNode:
         self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
 
@@ -277,19 +300,19 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
+class RadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.enable_session_radix_cache = params.enable_session_radix_cache
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -339,7 +362,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
-        self._reset_session_radix_state()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -350,7 +372,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             last_host_node=self.root_node,
             best_match_node=self.root_node,
         )
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -447,7 +469,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.cache_protected_len : kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.cache_protected_len
+            )
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -456,7 +480,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
@@ -467,21 +494,20 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            session_leaf = result.last_device_node
-            # Free the duplicates that were already in the tree
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
-            )
+            freed_end = result.prefix_len
         else:
-            session_leaf = None
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
-            )
+            freed_end = key_len
 
-        # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
-
-        self._tag_session_leaf(req, radix_key, node=session_leaf)
+        # duplicates / uninserted range, then the unaligned tail
+        self.token_to_kv_pool_allocator.free_segments(
+            [
+                (
+                    kv_indices[req.cache_protected_len : freed_end],
+                    req.cache_protected_len,
+                ),
+                (kv_indices[key_len:], key_len),
+            ]
+        )
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
@@ -498,7 +524,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
@@ -513,8 +542,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices[req.cache_protected_len : new_prefix_len],
+            start_pos=req.cache_protected_len,
         )
 
         # The prefix indices could be updated, reuse it
@@ -553,8 +583,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
 
         req.last_node = new_last_node
 
-        self._tag_session_leaf(req, radix_key, node=new_last_node)
-
     def pretty_print(self):
         self._print_helper(self.root_node, 0)
         print(f"#tokens: {self.total_size()}")
@@ -578,7 +606,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Tree values are page-aligned copies of a kv row: page-exact segment.
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -586,7 +615,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-            self._record_remove_event(x)
+            self.kv_events.record_remove(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -692,6 +721,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         return new_node
 
@@ -754,7 +786,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
             node = new_node
         return total_prefix_length, node
 
@@ -781,7 +813,6 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
-        self._discard_session_leaf(node)
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)

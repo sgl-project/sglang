@@ -5,6 +5,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
 
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 _FP8_INFO = torch.finfo(_FP8_DTYPE)
@@ -156,6 +160,7 @@ def _triton_fused_store_indexer_kernel(
     BYTES_PER_PAGE_F32: tl.constexpr,
     SCALE_PAGE_OFFSET_F32: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
@@ -179,7 +184,20 @@ def _triton_fused_store_indexer_kernel(
         cache_fp8_ptr.dtype.element_ty
     )
 
-    fp8_offset = page * BYTES_PER_PAGE + slot * HEAD_DIM + lane
+    if PRESHUFFLE_TILE:
+        token_tile_id = slot // PRESHUFFLE_TILE
+        token_in_tile = slot % PRESHUFFLE_TILE
+        col_tile_id = lane // PRESHUFFLE_TILE
+        col_in_tile = lane % PRESHUFFLE_TILE
+        fp8_offset = (
+            page * BYTES_PER_PAGE
+            + token_tile_id * (PRESHUFFLE_TILE * HEAD_DIM)
+            + col_tile_id * (PRESHUFFLE_TILE * PRESHUFFLE_TILE)
+            + token_in_tile * PRESHUFFLE_TILE
+            + col_in_tile
+        )
+    else:
+        fp8_offset = page * BYTES_PER_PAGE + slot * HEAD_DIM + lane
     tl.store(cache_fp8_ptr + fp8_offset, x_fp8)
 
     f32_offset = page * BYTES_PER_PAGE_F32 + SCALE_PAGE_OFFSET_F32 + slot
@@ -216,6 +234,11 @@ def triton_fused_store_indexer(
         BYTES_PER_PAGE_F32=bytes_per_page_f32,
         SCALE_PAGE_OFFSET_F32=scale_page_offset_f32,
         HEAD_DIM=_INDEXER_HEAD_DIM,
+        PRESHUFFLE_TILE=(
+            INDEXER_K_CACHE_PRESHUFFLE_TILE
+            if aiter_can_use_preshuffle_paged_mqa()
+            else 0
+        ),
         FP8_MIN=_FP8_INFO.min,
         FP8_MAX=_FP8_INFO.max,
         EPS=1e-8,

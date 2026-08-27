@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.constrained.base_grammar_backend import (
+    BaseGrammarObject,
+    GrammarMask,
+    GrammarRow,
+)
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -15,6 +20,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
 logger = logging.getLogger(__name__)
@@ -44,11 +50,10 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
-    grammars: Optional[List] = None
+    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
-    vocab_mask: Optional[torch.Tensor] = None
-    apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
+    grammar_mask: Optional[GrammarMask] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
@@ -81,8 +86,7 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args = get_server_args()
-        enable_deterministic = global_server_args.enable_deterministic_inference
+        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -138,7 +142,7 @@ class SamplingBatchInfo:
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
-            global_server_args.enable_custom_logit_processor
+            get_exec().features.enable_custom_logit_processor
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
@@ -235,30 +239,30 @@ class SamplingBatchInfo:
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
-            self.vocab_mask = None
-            self.apply_mask_func = None
+            self.grammar_mask = None
             return
 
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
 
-        # TODO(lianmin): Maybe we can reuse the existing mask?
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
+        vocab_mask = first_grammar.allocate_vocab_mask(
             vocab_size=self.vocab_size,
             batch_size=len(self.temperatures),
             device=self.device,
         )
-        self.apply_mask_func = (
-            first_grammar.apply_vocab_mask
-        )  # force to use static method
 
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+        # Rows omitted here (finished / terminated / non-grammar requests) retain
+        # the freshly allocated buffer's unconstrained value.
+        entries = [
+            GrammarRow(row=row, grammar=grammar)
+            for row, grammar in enumerate(self.grammars)
+            if grammar and not grammar.finished and not grammar.is_terminated()
+        ]
+        first_grammar.fill_vocab_mask_batched(entries, vocab_mask)
 
         # Move the mask to the device if needed
-        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
+        vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
+        self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
@@ -277,7 +281,7 @@ class SamplingBatchInfo:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
 
-    def apply_logits_bias(self, logits: torch.Tensor):
+    def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.acc_additive_penalties is not None:
             # Used in the overlap mode
             logits.add_(self.acc_additive_penalties)
@@ -290,11 +294,32 @@ class SamplingBatchInfo:
             # Used in the non-overlap mode
             self.penalizer_orchestrator.apply(logits)
 
-        if self.vocab_mask is not None:
-            self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
-
+    def _apply_post_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.logit_bias is not None:
             logits.add_(self.logit_bias)
+
+    def apply_logits_bias(self, logits: torch.Tensor):
+        self._apply_pre_grammar_logits_transforms(logits)
+
+        if self.grammar_mask is not None:
+            self.grammar_mask.apply(logits)
+
+        self._apply_post_grammar_logits_transforms(logits)
+
+    def apply_logits_bias_with_observer(
+        self,
+        logits: torch.Tensor,
+        observer: SamplingObserver,
+    ) -> Any:
+        self._apply_pre_grammar_logits_transforms(logits)
+        observer_state = observer.before_grammar(logits, self)
+
+        if self.grammar_mask is not None:
+            self.grammar_mask.apply(logits)
+
+        self._apply_post_grammar_logits_transforms(logits)
+
+        return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)

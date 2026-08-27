@@ -5,7 +5,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
+from sglang.srt.layers.attention.dsa.utils import (
+    INDEXER_K_CACHE_PRESHUFFLE_TILE,
+    aiter_can_use_preshuffle_paged_mqa,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
@@ -341,6 +344,7 @@ def _set_k_and_s_triton(
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
         NUM_K_ELEMS_PER_TOKEN=index_head_dim,
         S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+        PRESHUFFLE_TILE=INDEXER_K_CACHE_PRESHUFFLE_TILE if _use_aiter_preshuffle else 0,
     )
 
 
@@ -356,6 +360,7 @@ def _set_k_and_s_triton_kernel(
     BUF_NUMEL_PER_PAGE: tl.constexpr,
     NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
 ):
     token_id = tl.program_id(0)
 
@@ -370,11 +375,26 @@ def _set_k_and_s_triton_kernel(
     loc_page_index = loc // PAGE_SIZE
     loc_token_offset_in_page = loc % PAGE_SIZE
 
-    out_k_offsets = (
-        loc_page_index * BUF_NUMEL_PER_PAGE
-        + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
-        + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-    )
+    k_range = tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    if PRESHUFFLE_TILE:
+        tile = PRESHUFFLE_TILE
+        token_tile_id = loc_token_offset_in_page // tile
+        token_in_tile = loc_token_offset_in_page % tile
+        col_tile_id = k_range // tile
+        col_in_tile = k_range % tile
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + token_tile_id * (tile * NUM_K_ELEMS_PER_TOKEN)
+            + col_tile_id * (tile * tile)
+            + token_in_tile * tile
+            + col_in_tile
+        )
+    else:
+        out_k_offsets = (
+            loc_page_index * BUF_NUMEL_PER_PAGE
+            + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
+            + k_range
+        )
 
     # "//4" b/c it is fp32 instead of uint8
     out_s_offset = (

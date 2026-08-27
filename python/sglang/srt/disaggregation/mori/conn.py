@@ -1417,6 +1417,7 @@ class MoriKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
@@ -1424,12 +1425,17 @@ class MoriKVSender(CommonKVSender):
         if should_skip:
             return
 
+        transfer_state_indices = (
+            None
+            if self.kv_mgr._should_skip_cp_replicated_state_transfer()
+            else state_indices
+        )
         normalized_state = (
-            _normalize_state_indices_per_component(state_indices)
+            _normalize_state_indices_per_component(transfer_state_indices)
             if is_last_chunk
             else None
         )
-        self._record_transfer_indices(kv_indices, state_indices)
+        self._record_transfer_indices(kv_indices, transfer_state_indices)
         wait_event = getattr(self, "_early_send_wait_event", None)
         self._early_send_wait_event = None
         self.kv_mgr.enqueue_transfer(
@@ -1658,9 +1664,9 @@ class MoriKVReceiver(CommonKVReceiver):
             return
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
 
-    def _register_kv_args(self):
+    def _register_kv_args(self) -> bool:
         if self.bootstrap_infos is None:
-            return
+            return False
         engine_desc_blob = self.kv_mgr.engine_desc.pack()
         packed_kv_descs = _pack_mem_desc_list(self.kv_mgr.kv_mem_descs)
         packed_aux_descs = _pack_mem_desc_list(self.kv_mgr.aux_mem_descs)
@@ -1677,26 +1683,36 @@ class MoriKVReceiver(CommonKVReceiver):
         )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        MORI_GUARD,
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        engine_desc_blob,
-                        packed_kv_descs,
-                        packed_aux_descs,
-                        packed_state_descs,
-                        gpu_id,
-                        decode_tp_size,
-                        decode_tp_rank,
-                        kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                    ]
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            MORI_GUARD,
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            engine_desc_blob,
+                            packed_kv_descs,
+                            packed_aux_descs,
+                            packed_state_descs,
+                            gpu_id,
+                            decode_tp_size,
+                            decode_tp_rank,
+                            kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
+        return True
 
     def send_metadata(
         self,
@@ -1721,27 +1737,37 @@ class MoriKVReceiver(CommonKVReceiver):
         )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info.get("is_dummy", False)
             if not is_dummy and normalized_state is not None:
                 state_bytes = _pack_state_indices(normalized_state)
             else:
                 state_bytes = b""
-            with lock:
-                sock.send_multipart(
-                    [
-                        MORI_GUARD,
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.engine_desc.key.encode("ascii"),
-                        kv_indices_bytes if not is_dummy else b"",
-                        aux_bytes if not is_dummy else b"",
-                        state_bytes,
-                        str(self.required_dst_info_num).encode("ascii"),
-                        decode_prefix_bytes,
-                    ]
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            MORI_GUARD,
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.kv_mgr.engine_desc.key.encode("ascii"),
+                            kv_indices_bytes if not is_dummy else b"",
+                            aux_bytes if not is_dummy else b"",
+                            state_bytes,
+                            str(self.required_dst_info_num).encode("ascii"),
+                            decode_prefix_bytes,
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.invalidate_cached_bootstrap_infos()
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

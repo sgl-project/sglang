@@ -29,8 +29,8 @@ from sglang.srt.utils.common import is_xpu
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.vlm_utils import (
     DEFAULT_URL_FOR_TEST,
-    kill_process_tree,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 MODEL = "google/gemma-4-E2B-it"
@@ -98,7 +98,7 @@ class TestGemma4E2BXPU(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         _empty_xpu_cache()
 
     def test_simple_qa(self):
