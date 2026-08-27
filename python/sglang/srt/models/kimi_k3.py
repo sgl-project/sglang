@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -138,12 +139,23 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 
 # ===== K3-DBG toggles (hard-coded; flip True/False as needed) =====
-K3_DBG_ENABLED = True   # master switch for all K3-DBG prints in this file
-K3_DBG_LAYER2  = True   # binary-search 4 control points (A/B/C/D) on layer 2
-K3_DBG_PREFILL_ONLY = True  # per-layer [KIMI-K3-DBG] prints: PREFILL only (skip DECODE)
+K3_DBG_ENABLED = False  # master switch for all K3-DBG prints in this file
+K3_DBG_LAYER2  = False  # binary-search 4 control points (A/B/C/D) on layer 2
+K3_DBG_PREFILL_ONLY = False  # per-layer [KIMI-K3-DBG] prints: PREFILL only (skip DECODE)
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
+_k3_dump_hidden = get_bool_env_var("SGLANG_K3_DUMP_HIDDEN")
+_k3_dump_hidden_layers = frozenset(
+    int(layer.strip())
+    for layer in os.getenv(
+        "SGLANG_K3_DUMP_HIDDEN_LAYERS", "0,23,47,59,92"
+    ).split(",")
+    if layer.strip()
+)
+_k3_dump_hidden_dir = os.getenv(
+    "SGLANG_K3_DUMP_HIDDEN_DIR", "/tmp/sglang-k3-hidden"
+)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -250,6 +262,45 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     group = get_parallel().attn_tp_group
     lo = group.rank_in_group * hidden_states.shape[0]
     return slice(lo, lo + hidden_states.shape[0])
+
+
+def _maybe_dump_k3_hidden(
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    sp_sharded: bool,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Debug-only dump of complete, unpadded prefill hidden-state rows."""
+    if (
+        not _k3_dump_hidden
+        or layer_idx not in _k3_dump_hidden_layers
+        or not forward_batch.forward_mode.is_extend_without_speculative()
+    ):
+        return
+
+    # Every rank must enter this collective. Keep the gathered tensor separate
+    # so the model's hidden_states and sp_sharded state remain unchanged.
+    dump_hidden = (
+        _sp_all_gather_rows(hidden_states) if sp_sharded else hidden_states
+    )
+    if get_tensor_model_parallel_rank() != 0:
+        return
+
+    num_real_tokens = dump_hidden.shape[0]
+    if forward_batch.extend_seq_lens_cpu is not None:
+        num_real_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
+    num_real_tokens = min(num_real_tokens, dump_hidden.shape[0])
+    dump_tensor = dump_hidden[:num_real_tokens].detach().float().cpu()
+
+    os.makedirs(_k3_dump_hidden_dir, exist_ok=True)
+    pp_rank = get_pp_group().rank_in_group
+    filename = (
+        f"layer{layer_idx:03d}_pp{pp_rank:02d}_tokens{num_real_tokens}.pt"
+    )
+    output_path = os.path.join(_k3_dump_hidden_dir, filename)
+    temporary_path = f"{output_path}.tmp-{os.getpid()}"
+    torch.save(dump_tensor, temporary_path)
+    os.replace(temporary_path, output_path)
 
 
 class KimiK3MLP(nn.Module):
@@ -2720,9 +2771,8 @@ class KimiK3LinearModel(nn.Module):
         # i.e. after PP0->PP1 boundary), and layer 92 (last layer of PP3,
         # after PP2->PP3 boundary) so we can compare the exact hidden state
         # at each PP stage boundary.
-        # Global debug switch: flip _DBG_ENABLED to False to disable ALL
-        # hidden-state norm printing below (back to no-debug behavior).
-        _DBG_ENABLED = True #-- set False to disable debug printing
+        # Keep per-layer hidden-state prints under the file-level master switch.
+        _DBG_ENABLED = K3_DBG_ENABLED
         _DBG_LAYERS = {0, 1, 2, 3, 4, 5}
         # PREFILL-only: only print on prefill/extension phases, not decode,
         # so a single-request prefill shows layer 1/23 norm without decode spam.
@@ -2737,9 +2787,7 @@ class KimiK3LinearModel(nn.Module):
             # causal_conv1d downstream (garbage seqlens -> 3244 GiB alloc).
             # Activations are replicated across TP ranks, so the local norm
             # is already the full-hidden norm on every rank.
-            # Whole block can be toggled off via SGLANG_K3_DBG=0.
-            # if _DBG_ENABLED and i in _DBG_LAYERS
-            if _DBG_ENABLED: # print all layers for now.
+            if _DBG_ENABLED:
                 try:
                     _fm = forward_batch.forward_mode.name
                 except Exception:
@@ -2826,6 +2874,7 @@ class KimiK3LinearModel(nn.Module):
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
                 )
+            _maybe_dump_k3_hidden(i, hidden_states, sp_sharded, forward_batch)
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
