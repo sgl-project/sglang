@@ -1,31 +1,21 @@
-from typing import List, Optional
+from typing import List
 
 import torch
 from torch.nn import Module
 
-from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_dequant,
-    ceil_to_ue8m0,
-)
-
 _NPU_ARCH35_MXFP8_BLOCK_SIZE = 32
-_FP8_E4M3FN_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
 def process_npu_arch35_mxfp8_linear_weights(
-    layer: Module, weight_block_size: List[int], scale_fmt: Optional[str] = None
+    layer: Module, weight_block_size: List[int], scale_fmt: str
 ) -> None:
-    """Convert block-FP8 weights to the NPU arch35 MXFP8 layout.
-
-    UE8M0 checkpoints already use power-of-two scales, so they only need a
-    layout conversion. Other block-FP8 checkpoints retain the original
-    dequantize/requantize fallback.
-    """
-    if scale_fmt == "ue8m0":
-        _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
-        return
-
-    _requantize_npu_arch35_mxfp8_weights(layer, weight_block_size)
+    """Convert UE8M0 block-FP8 weights to the NPU arch35 MXFP8 layout."""
+    if scale_fmt != "ue8m0":
+        raise ValueError(
+            "NPU arch35 MXFP8 weight loading requires scale_fmt='ue8m0', "
+            f"got {scale_fmt!r}."
+        )
+    _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
 
 
 def _layout_npu_arch35_ue8m0_weights(
@@ -80,44 +70,6 @@ def _layout_npu_arch35_ue8m0_weights(
     layer.weight.data = layer.weight.data.transpose(0, 1)
     layer.weight_scale_inv.data = scale_u8.reshape(
         n_dim, k_dim // (2 * group_size), 2
-    ).transpose(0, 1)
-    layer.weight_scale_inv.format_ue8m0 = True
-
-    if getattr(layer, "_dsv4_npu_arch35_mxfp8_wo_a", False):
-        batch_npu_arch35_wo_a_weights(layer)
-
-
-def _requantize_npu_arch35_mxfp8_weights(
-    layer: Module, weight_block_size: List[int]
-) -> None:
-    """Fallback conversion for block-FP8 checkpoints with arbitrary scales."""
-    weight = block_quant_dequant(
-        layer.weight.data,
-        layer.weight_scale_inv.data,
-        weight_block_size,
-        torch.bfloat16,
-    )
-    n_dim, k_dim = weight.shape
-    if k_dim % (2 * _NPU_ARCH35_MXFP8_BLOCK_SIZE) != 0:
-        raise ValueError(
-            "NPU arch35 MXFP8 linear requires K to be divisible by "
-            f"{2 * _NPU_ARCH35_MXFP8_BLOCK_SIZE}, got {k_dim}."
-        )
-
-    weight_groups = weight.float().reshape(
-        n_dim,
-        k_dim // _NPU_ARCH35_MXFP8_BLOCK_SIZE,
-        _NPU_ARCH35_MXFP8_BLOCK_SIZE,
-    )
-    scale = ceil_to_ue8m0(
-        weight_groups.abs().amax(dim=-1, keepdim=True) / _FP8_E4M3FN_MAX
-    )
-    qweight = (weight_groups / scale).to(torch.float8_e4m3fn).reshape(n_dim, k_dim)
-    scale_u8 = (scale.squeeze(-1).view(torch.int32) >> 23).to(torch.uint8)
-
-    layer.weight.data = qweight.transpose(0, 1)
-    layer.weight_scale_inv.data = scale_u8.reshape(
-        n_dim, k_dim // (2 * _NPU_ARCH35_MXFP8_BLOCK_SIZE), 2
     ).transpose(0, 1)
     layer.weight_scale_inv.format_ue8m0 = True
 
