@@ -100,6 +100,44 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
 
+    # ============ Content preservation when no tool call is produced ============
+    # Regression tests: without <|python_tag|>, a leading "{" is only a guess that
+    # a tool call follows. When the guess yields no calls the text must survive
+    # unchanged instead of being silently consumed.
+
+    def test_empty_json_object_is_not_dropped(self):
+        text = "{}"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_leading_json_object_is_not_dropped(self):
+        text = '{"a": 1} is a dict'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_json_naming_undefined_tool_is_not_dropped(self):
+        text = '{"name": "not_a_registered_tool", "arguments": {}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_json_only_message_is_not_dropped(self):
+        text = '{"status": "ok", "count": 3}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_valid_tool_call_still_consumes_json(self):
+        # Guard against over-correcting: a real call must still be extracted and
+        # must not leak its JSON back into the content.
+        text = '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.normal_text, "")
+
     def test_tool_call_with_multiple_arguments(self):
         text = '<|python_tag|>{"name": "get_weather", "arguments": {"city": "London", "unit": "celsius"}}'
         result = self.detector.detect_and_parse(text, self.tools)

@@ -57,8 +57,10 @@ class Llama32Detector(BaseFormatDetector):
 
         if "<|python_tag|>" in text:
             normal_text, action_text = text.split("<|python_tag|>", maxsplit=1)
+            has_bot_token = True
         else:
             normal_text, action_text = "", text
+            has_bot_token = False
 
         decoder = json.JSONDecoder()
         idx = 0
@@ -104,6 +106,16 @@ class Llama32Detector(BaseFormatDetector):
 
         # Only process if we found valid JSON objects
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
+
+        # Without the <|python_tag|> marker, a leading "{" is only a heuristic
+        # guess that the model emitted a tool call. When that guess yields no
+        # calls (e.g. the JSON has no "name", or names an undefined tool, so
+        # parse_base_json skips it) the text is ordinary content and must be
+        # returned untouched. Otherwise the consumed objects are silently
+        # dropped: '{}' became '' and '{"a": 1} is a dict' became 'is a dict'.
+        if not calls and not has_bot_token:
+            return StreamingParseResult(normal_text=text, calls=[])
+
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
             action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
