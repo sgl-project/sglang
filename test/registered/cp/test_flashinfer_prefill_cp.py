@@ -76,7 +76,7 @@ def _build_case_fixture(
         (seq_len + allocator_page_size - 1) // allocator_page_size
         for seq_len in seq_lens
     ]
-    num_pages = sum(page_counts) + sum(page_count - 1 for page_count in page_counts) + 2
+    num_pages = sum(page_counts) + 2
     pool = MHATokenToKVPool(
         size=num_pages * allocator_page_size,
         page_size=allocator_page_size,
@@ -109,13 +109,10 @@ def _build_case_fixture(
     prefix_value_parts = []
     for req_id, (prefix_len, extend_len) in enumerate(zip(prefix_lens, extend_lens)):
         allocated_pages = []
-        for page_id in range(page_counts[req_id]):
+        for _ in range(page_counts[req_id]):
             page = allocator.alloc(allocator_page_size)
             assert page is not None
             allocated_pages.append(page)
-            if page_id + 1 < page_counts[req_id]:
-                gap_page = allocator.alloc(allocator_page_size)
-                assert gap_page is not None
         slots = torch.cat(allocated_pages)[: seq_lens[req_id]]
         req_to_token[req_id, : seq_lens[req_id]] = slots
 
