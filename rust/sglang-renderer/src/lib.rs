@@ -1,8 +1,9 @@
 //! Engine-free OpenAI request rendering for SGLang.
 //!
-//! This crate owns OpenAI protocol lowering, chat templating, tokenization and the
-//! prepared token-in contract. It deliberately has no HTTP, gRPC, PyO3,
-//! scheduler or GPU runtime dependency.
+//! This crate owns OpenAI protocol lowering, chat templating, tokenization,
+//! response interpretation, and the prepared token-in contract. Its optional
+//! HTTP frontend is parameterized by an engine-neutral inference backend, so
+//! the crate has no PyO3, scheduler, or GPU runtime dependency.
 
 pub mod config;
 pub mod error;

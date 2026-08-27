@@ -2,8 +2,9 @@
 //!
 //! The processor owns parser selection and mutable reasoning/tool state. Its
 //! input is decoded engine output; its output is typed chat semantics.
-//! Submission, cancellation, scheduler transport, JSON/SSE serialization, and
-//! gRPC framing remain host responsibilities.
+//! Submission, cancellation, and scheduler transport remain host
+//! responsibilities. HTTP and future gRPC adapters consume these semantic
+//! events without reimplementing parser behavior.
 
 use std::pin::Pin;
 
@@ -183,7 +184,7 @@ impl ChatResponseProcessor {
     /// OpenAI-shaped values are used only as a private adapter to Dynamo's
     /// stateful tool-call jail. They are removed before events leave this
     /// crate, so response identity, model metadata, usage policy, and wire
-    /// framing remain outside the renderer.
+    /// framing remain outside this semantic processor.
     pub fn process_stream<S>(
         mut self,
         input: S,

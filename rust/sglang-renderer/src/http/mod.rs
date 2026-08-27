@@ -147,13 +147,6 @@ fn fold_output(collected: &mut GenerationOutput, output: GenerationOutput) {
         collected
             .output_logprob_text
             .extend(output.output_logprob_text);
-        collected.input_logprobs.extend(output.input_logprobs);
-        collected
-            .input_logprob_token_ids
-            .extend(output.input_logprob_token_ids);
-        collected
-            .input_logprob_text
-            .extend(output.input_logprob_text);
         collected
             .output_top_logprobs
             .extend(output.output_top_logprobs);
@@ -166,17 +159,45 @@ fn fold_output(collected: &mut GenerationOutput, output: GenerationOutput) {
         collected
             .output_top_logprob_text
             .extend(output.output_top_logprob_text);
-        collected
-            .input_top_logprobs
-            .extend(output.input_top_logprobs);
-        collected
-            .input_top_logprob_token_ids
-            .extend(output.input_top_logprob_token_ids);
-        collected
-            .input_top_logprob_lengths
-            .extend(output.input_top_logprob_lengths);
-        collected
-            .input_top_logprob_text
-            .extend(output.input_top_logprob_text);
+        if !output.input_logprobs.is_empty() {
+            collected.input_logprobs = output.input_logprobs;
+            collected.input_logprob_token_ids = output.input_logprob_token_ids;
+            collected.input_logprob_text = output.input_logprob_text;
+        }
+        if !output.input_top_logprob_lengths.is_empty() {
+            collected.input_top_logprobs = output.input_top_logprobs;
+            collected.input_top_logprob_token_ids = output.input_top_logprob_token_ids;
+            collected.input_top_logprob_lengths = output.input_top_logprob_lengths;
+            collected.input_top_logprob_text = output.input_top_logprob_text;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fold_output;
+    use crate::{GenerationOutput, GenerationOutputExtras};
+
+    #[test]
+    fn unary_output_appends_generated_logprobs_and_replaces_prompt_logprobs() {
+        let mut collected = GenerationOutput::default();
+        for (output_token, input_token) in [(1, 10), (2, 20)] {
+            fold_output(
+                &mut collected,
+                GenerationOutput {
+                    extras: Some(Box::new(GenerationOutputExtras {
+                        output_logprobs: vec![-0.1],
+                        output_logprob_token_ids: vec![output_token],
+                        input_logprobs: vec![-0.2],
+                        input_logprob_token_ids: vec![input_token],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            );
+        }
+        let extras = collected.extras.unwrap();
+        assert_eq!(extras.output_logprob_token_ids, [1, 2]);
+        assert_eq!(extras.input_logprob_token_ids, [20]);
     }
 }
