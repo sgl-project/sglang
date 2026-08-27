@@ -148,6 +148,7 @@ def _require_fp4_dtype():
 if _use_aiter or _use_hip_int4:
     from aiter.ops.shuffle import (
         moe_shuffle_scale,
+        moe_shuffle_weight,
         shuffle_scale,
         shuffle_weight,
     )
@@ -1534,7 +1535,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_w13_scale = scale_name == "w13_weight_scale_inv"
                 if _is_gfx1250_supported:
                     scale.data = moe_shuffle_scale(
-                        scale.contiguous(), experts_cnt=num_experts
+                        scale.contiguous(),
+                        experts_cnt=num_experts,
+                        is_guinterleave=gu_intv,
+                        gate_up=is_w13_scale,
                     )
                 else:
                     scale_2d = scale.reshape(-1, scale.shape[-1])
@@ -1545,19 +1549,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
             layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-            is_shuffled = _is_shuffle_moe_mxfp4 or _use_aiter_a8w4
-            if is_shuffled:
-                shuffle_gu_intv = gu_intv and not _use_aiter_a8w4
-                layer.w13_weight.data = shuffle_weight(
+            if _is_gfx1250_supported:
+                is_shuffled = True
+                layer.w13_weight.data = moe_shuffle_weight(
                     layer.w13_weight,
-                    is_guinterleave=shuffle_gu_intv,
+                    is_guinterleave=gu_intv,
                     gate_up=True,
                 )
-                layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.data = moe_shuffle_weight(
                     layer.w2_weight,
-                    is_guinterleave=shuffle_gu_intv,
+                    is_guinterleave=gu_intv,
                     gate_up=False,
                 )
+            else:
+                is_shuffled = _is_shuffle_moe_mxfp4 or _use_aiter_a8w4
+                if is_shuffled:
+                    shuffle_gu_intv = gu_intv and not _use_aiter_a8w4
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight,
+                        is_guinterleave=shuffle_gu_intv,
+                        gate_up=True,
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight,
+                        is_guinterleave=shuffle_gu_intv,
+                        gate_up=False,
+                    )
             layer.w13_weight.is_shuffled = is_shuffled
             layer.w2_weight.is_shuffled = is_shuffled
             return
