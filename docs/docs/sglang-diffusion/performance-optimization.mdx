@@ -42,6 +42,11 @@ These settings should preserve model behavior while changing residency, parallel
       <td style={{padding: "9px 12px"}}><a href="./deployment_cookbook">Deployment and Performance Modes</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}>Breakable CUDA graph</td>
+      <td style={{padding: "9px 12px"}}>A supported pipeline serves a fixed set of shapes and eager execution is launch-bound.</td>
+      <td style={{padding: "9px 12px"}}><a href="./api/cli">CLI reference</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Offload, FSDP, CFG parallelism</td>
       <td style={{padding: "9px 12px"}}>GPU memory, multi-GPU residency, or CFG branch splitting is the main bottleneck.</td>
       <td style={{padding: "9px 12px"}}><a href="./deployment_cookbook">Deployment and Performance Modes</a></td>
@@ -119,9 +124,10 @@ These techniques can change the denoising path, numerical representation, or gen
 
 1. Establish a baseline with the target model, resolution, frame count, step count, and GPU type.
 2. Select `--performance-mode` and explicit residency or parallelism flags.
-3. Tune attention backend and batching for the deployment pattern.
-4. Profile if the bottleneck is unclear.
-5. Add caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
+3. Compare breakable CUDA graph against eager execution for supported fixed-shape pipelines. Pass every served resolution to `--warmup-resolutions` and confirm capture in the server log.
+4. Tune attention backend and batching for the deployment pattern.
+5. Profile if the bottleneck is unclear.
+6. Add caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
 
 ## Diagnostics
 
