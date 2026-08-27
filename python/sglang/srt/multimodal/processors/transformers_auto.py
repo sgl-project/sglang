@@ -199,7 +199,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             )
             if base_output is None:
                 return None
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
                 base_output, self.mm_tokens
             )
             ret = MultimodalProcessorOutput(
@@ -238,7 +238,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             else "token_type_ids"
         )
         if token_type_key in processor_output:
-            ret.token_type_ids = processor_output[token_type_key].flatten().tolist()
+            ret.token_type_ids = processor_output[token_type_key].flatten()
 
         if self.mm_tokens.image_token_id is not None:
             ret.im_token_id = self.mm_tokens.image_token_id

@@ -32,6 +32,7 @@ lacks, and replace the EXAMPLE cells with verified recipes. DeepSeek-V4 is a pop
 - [references/mintlify-authoring.md](references/mintlify-authoring.md) — MDX rules (forbidden syntax, JSX tables, labeled fences) + invocation-example patterns. Read before writing §1–§3 prose.
 - [references/engine-axis.md](references/engine-axis.md) — adding a new Playground feature axis (rare engine work).
 - [references/vendor-logo.md](references/vendor-logo.md) — new-vendor card logo: ask the user for the brand logo, then generate the icon-only 940×525 RGBA PNG (spec + Pillow recipe + `git add -f`).
+- [references/diffusion-authoring.md](references/diffusion-authoring.md) — required opening, tag, command-picker, and feature-overlay contract for diffusion model pages. Read before editing any `docs/cookbook/diffusion/<Vendor>/<Model>.mdx` page.
 
 ## Architecture at a glance
 
@@ -68,9 +69,12 @@ playground reads it), the **`sglang-deploy-sel` custom event** (deploy dispatche
 every change; playground listens — `replaceState` doesn't fire `hashchange`), and the
 shared **`sglang-deploy-env` localStorage key** (HOST/PORT placeholders).
 
-> The template is **autoregressive**. Diffusion / omni pages follow their own category
-> structure — don't force the config-driven template on them; still obey the Mintlify /
-> NEW-tag / docs.json / category-card / validation rules below.
+> The main template is **autoregressive**. Diffusion pages use
+> `templates/diffusion-page.mdx.tmpl` plus
+> [references/diffusion-authoring.md](references/diffusion-authoring.md); do not force the
+> autoregressive deployment matrix on them. Omni pages follow their own category structure.
+> All categories still obey the Mintlify / NEW-tag / docs.json / category-card / validation
+> rules below.
 
 ---
 
@@ -130,6 +134,15 @@ this table (RTX PRO 6000, GH200, future chips) goes in the model's own `config.h
   `--ep` unless benchmarked. (The template's AMD example cell shows these.)
 
 ## Phase 2 — Instantiate the template
+
+For a diffusion model, instantiate `templates/diffusion-page.mdx.tmpl` and keep the
+shared `DiffusionModelTags` component, plus `templates/diffusion-config.jsx.tmpl` for the
+opt-in scoped command builder. Put the compact install command and builder in §1 Quick
+start. The first two paragraphs in §2 Model capabilities are not generic filler: they must
+state the model's capability range, strongest differentiator, when to choose it, and at
+least one real deployment or capability boundary. Put orthogonal runtime features in
+`scope: "serve"` or `scope: "request"`, not in the base recipe; use the schema from
+`references/diffusion-authoring.md`.
 
 1. **Copy** the three template files to their target paths (above). Note the two
    vendor-folder conventions: under `configs/` the folder is the **HuggingFace org**
@@ -205,6 +218,10 @@ user notes: §1 Model Introduction (description, links, params, license, variant
 §2 Configuration Tips (hw-specific tuning, caveats), §3 Advanced Usage (Reasoning /
 Tool-Calling / HiCache — keep only what applies; match the reasoning example to the
 parser's output shape; each runnable block gets an `**Output Example:**`).
+
+For diffusion pages, follow the category-specific Quick start and capability contract in
+`references/diffusion-authoring.md`. Run `node docs/scripts/check_cookbook_configs.mjs` to
+verify the tag widget and introduction structure before rendering the page.
 
 ## Phase 6 — Review
 

@@ -104,9 +104,6 @@ class DeepEPMoE(FusedMoE):
             and quant_config.get_name() == "humming"
         )
         if get_moe_a2a_backend().is_deepep_v2():
-            # deepep_v2 runs on the base FusedMoE forward via its own
-            # DeepEPv2Dispatcher, so always delegate (never use DeepEPMoE's
-            # v1-specific dispatch/run_moe_core path).
             self.deprecate_flag = True
         elif is_humming:
             self.deprecate_flag = True

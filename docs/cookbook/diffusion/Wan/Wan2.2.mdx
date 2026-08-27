@@ -7,20 +7,13 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { Wan22Deployment } from '/src/snippets/diffusion/wan22-deployment.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "TI2V", "MoE"]} />
+<DiffusionModelTags tags={["video", "T2V / I2V / TI2V", "MoE", "720p @ 24 fps", "cinematic motion"]} />
 
 ## 1. Model Introduction
 
-[Wan2.2 series](https://github.com/Wan-Video/Wan2.2) are the most popular and open and advanced large-scale video generative models.
+[Wan2.2](https://github.com/Wan-Video/Wan2.2) extends the Wan family with timestep-specialized Mixture-of-Experts models and a unified 5B TI2V checkpoint. It targets cinematic composition, lighting, and complex motion while supporting text-to-video, image-to-video, and hybrid text/image conditioning.
 
-This generation delivers comprehensive upgrades across the board:
-
-- **Effective MoE Architecture**: Introduces a Mixture-of-Experts (MoE) architecture into video diffusion models. By separating the denoising process cross timesteps with specialized powerful expert models, this enlarges the overall model capacity while maintaining the same computational cost.
-- **Cinematic-level Aesthetics**: Incorporates meticulously curated aesthetic data, complete with detailed labels for lighting, composition, contrast, color tone, and more. This allows for more precise and controllable cinematic style generation, facilitating the creation of videos with customizable aesthetic preferences.
-- **Complex Motion Generation**: Trained on a significantly larger data, with +65.6% more images and +83.2% more videos. This expansion notably enhances the model's generalization across multiple dimensions such as motions, semantics, and aesthetics, achieving TOP performance among all open-sourced and closed-sourced models.
-- **Efficient High-Definition Hybrid TI2V**: Open-sources a 5B model built with our advanced Wan2.2-VAE that achieves a compression ratio of 16×16×4. This model supports both text-to-video and image-to-video generation at 720P resolution with 24fps and can also run on consumer-grade graphics cards like 4090. It is one of the fastest 720P@24fps models currently available, capable of serving both the industrial and academic sectors simultaneously.
-
-For more details, please refer to the [official Wan2.2 GitHub Repository](https://github.com/Wan-Video/Wan2.2).
+Choose the A14B MoE checkpoints for maximum T2V or I2V capacity and the 5B TI2V model for a smaller unified 720p-at-24-fps path. MoE reduces active compute relative to total capacity but does not remove the memory cost of loading expert weights, so hardware selection still matters.
 
 ## 2. SGLang-diffusion Installation
 

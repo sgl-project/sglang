@@ -30,7 +30,6 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     print_info_once,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
@@ -1266,7 +1265,7 @@ class VisionAttention(nn.Module):
         elif _is_cpu and _is_cpu_amx_available:
             backend = "amx_attn"
         elif _is_xpu:
-            backend = "triton_attn" if not use_intel_xpu_backend() else "xpu_attn"
+            backend = "xpu_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():
