@@ -126,6 +126,9 @@ class TestComponentOffloadKeepsCheckpointMapping(unittest.TestCase):
         from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
             ComponentOffloadStrategy,
         )
+        from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+            HostPinBudget,
+        )
 
         module = nn.Linear(16, 16, bias=True)
         with TemporaryDirectory() as root:
@@ -139,7 +142,9 @@ class TestComponentOffloadKeepsCheckpointMapping(unittest.TestCase):
                 "precondition: assign=True must leave the weight file-backed",
             )
 
-            strategy = ComponentOffloadStrategy()
+            strategy = ComponentOffloadStrategy(
+                component_name="vae", pin_budget=HostPinBudget()
+            )
             use = ComponentUse(stage_name="DecodingStage", component_name="vae")
             state = ResidencyState()
 

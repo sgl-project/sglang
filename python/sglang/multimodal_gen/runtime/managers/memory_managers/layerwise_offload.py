@@ -43,6 +43,18 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def wrap_for_target(target: torch.Tensor, local_tensor: torch.Tensor) -> torch.Tensor:
+    if isinstance(target, DTensor):
+        return DTensor.from_local(local_tensor, target.device_mesh, target.placements)
+    return local_tensor
+
+
 def compute_streamed_layers(
     *, num_layers: int, resident_layers: int, policy: str
 ) -> tuple[int, ...]:
@@ -496,20 +508,8 @@ class LayerwiseOffloadManager:
             self._offload_placeholders[dtype] = placeholder
         return placeholder
 
-    @staticmethod
-    def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-        if isinstance(tensor, DTensor):
-            return tensor.to_local()
-        return tensor
-
-    def _wrap_for_target(
-        self, target: torch.Tensor, local_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        if isinstance(target, DTensor):
-            return DTensor.from_local(
-                local_tensor, target.device_mesh, target.placements
-            )
-        return local_tensor
+    _to_local_tensor = staticmethod(to_local_tensor)
+    _wrap_for_target = staticmethod(wrap_for_target)
 
     def _get_shared_empty_tensor_for_target(
         self, target: torch.Tensor, dtype: torch.dtype
