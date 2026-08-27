@@ -88,7 +88,7 @@ The deployment recipes use the checkpoint's generation configuration. Override s
 
 ### Choose a strategy
 
-Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm NEXTN`, so generated commands use that flag value.
+Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE`, so generated commands use that flag value.
 
 Strategy labels describe the workload goal. Both strategies stay available on NVIDIA GPUs; the AMD ROCm recipes expose only High Throughput until MTP speculative decoding is validated there.
 
@@ -168,7 +168,7 @@ sglang serve \
   --max-prefill-tokens 8192 \
   --disable-shared-experts-fusion \
   --disable-prefill-cuda-graph \
-  --speculative-algorithm NEXTN \
+  --speculative-algorithm EAGLE \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
