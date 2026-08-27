@@ -1768,6 +1768,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -1806,6 +1807,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
+        "BailingMoeV3ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
@@ -2816,7 +2818,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
-    fusion enabled; FlashInfer A2A requires it disabled."""
+    fusion enabled; FlashInfer and DeepEP v2 A2A require it disabled."""
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
@@ -2829,6 +2831,9 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
+    if view.moe_a2a_backend == "deepep_v2":
+        # Fused shared experts are not validated with DeepEP v2.
+        return {"disable_shared_experts_fusion": True}
     return {}
 
 
@@ -2837,6 +2842,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
         "deepep",
+        "deepep_v2",
         "mooncake",
         "nixl",
         "ascend_fuseep",
