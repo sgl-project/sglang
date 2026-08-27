@@ -738,6 +738,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 for stage_id in range(self.num_stages)
             ]
         )
+        self._main_proj_nz_weight: Optional[torch.Tensor] = None
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
             markov_rank=int(dspark_config.markov_rank),
@@ -788,11 +789,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         # main_proj weight in FRACTAL_NZ rather than the temporary ND tensor.
         self.prepare_main_proj_weight()
         stage0 = self.stages[0]
-        projected, _ = stage0.main_proj(main_hidden)
+        if self._main_proj_nz_weight is None:
+            projected, _ = stage0.main_proj(main_hidden)
+        else:
+            projected = F.linear(main_hidden, self._main_proj_nz_weight)
         return stage0.main_norm(projected)
 
     def prepare_main_proj_weight(self) -> None:
         if not (_is_npu and envs.SGLANG_NPU_DSPARK_MAIN_PROJ_NZ.get()):
+            return
+        if self._main_proj_nz_weight is not None:
             return
         weight = self.stages[0].main_proj.weight
         if weight.ndim != 2 or weight.dtype not in (torch.float16, torch.bfloat16):
@@ -804,13 +810,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return
         import torch_npu
 
-        # ACL format 29 is FRACTAL_NZ.  Checking the live tensor (rather than a
-        # Python ready flag) also handles loaders that replace weight.data after
-        # the early worker initialization hook.
-        if int(torch_npu.get_npu_format(weight)) == 29:
+        # Keep the packed tensor explicitly: assigning it through Parameter.data
+        # lets F.linear rebuild an ND view on this torch_npu stack.  The first
+        # project call is graph warmup after loading, so this copy contains the
+        # final checkpoint weight and is then captured as a stable graph input.
+        packed = npu_format_cast(weight.detach())
+        packed_format = int(torch_npu.get_npu_format(packed))
+        if packed_format != 29:
+            logger.warning(
+                "DSpark main_proj requested FRACTAL_NZ but got ACL format %d.",
+                packed_format,
+            )
             return
-        weight.data = npu_format_cast(weight.data)
-        logger.info("Packed DSpark main_proj weight into NPU FRACTAL_NZ format.")
+        self._main_proj_nz_weight = packed
+        logger.info("Cached DSpark main_proj in NPU FRACTAL_NZ format.")
 
     def write_target_hidden_kv(
         self,

@@ -138,11 +138,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
-        prepare_main_proj_weight = getattr(
-            self.draft_model, "prepare_main_proj_weight", None
-        )
-        if prepare_main_proj_weight is not None:
-            prepare_main_proj_weight()
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
