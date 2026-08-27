@@ -1573,9 +1573,17 @@ def biased_grouped_topk_gpu(
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        # Don't re-downcast an fp32 correction bias: an offset bias loses too many
+        # levels in bf16 and reorders top-k. A bf16 bias keeps the original path.
+        if correction_bias.dtype == torch.float32:
+            aiter_gating_output = gating_output.to(torch.float32)
+            aiter_correction_bias = correction_bias
+        else:
+            aiter_gating_output = gating_output
+            aiter_correction_bias = correction_bias.to(dtype=gating_output.dtype)
         aiter_biased_grouped_topk(
-            gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            aiter_gating_output,
+            aiter_correction_bias,
             topk_weights,
             topk_ids,
             num_expert_group,
