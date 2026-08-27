@@ -691,7 +691,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.12.post1"
+    MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
     # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
     source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"

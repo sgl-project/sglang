@@ -32,7 +32,11 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
@@ -89,15 +93,15 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.device_module = torch.get_device_module(self.device)
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.tp_size = self.model_runner.ps.tp_size
         self.attn_dp_size = self.model_runner.ps.attn_dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = get_parallel().config.pp_size
         self.speculative_num_steps = get_spec().speculative_num_steps
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        self.topk = get_spec().speculative_eagle_topk
         self.draft_attn_backend = frozen_kv_mtp_worker.draft_attn_backend
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -233,7 +237,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             else cuda_graph_bs <= self.max_bs
         )
         if self.require_mlp_sync:
-            is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+            is_bs_supported = (
+                is_bs_supported and forward_batch.can_run_decode_cuda_graph
+            )
         return is_bs_supported
 
     def capture_one_shape(

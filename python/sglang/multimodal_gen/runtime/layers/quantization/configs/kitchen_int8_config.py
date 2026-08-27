@@ -155,3 +155,14 @@ class KitchenInt8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+    def supports_input_partition(
+        self, prefix: str, input_size_per_partition: int
+    ) -> bool:
+        group_size = self.group_size
+        if self.layer_markers is not None:
+            marker_group_size = self._serialized_group_sizes.get(prefix)
+            if marker_group_size is None:
+                return True
+            group_size = marker_group_size
+        return input_size_per_partition % group_size == 0
