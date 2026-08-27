@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # Sub-ranges of the pool, keyed by the attribute they end up backing. The
@@ -32,6 +34,11 @@ class MoonEPWeightPool:
         group,
         specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ):
+        # Checked before the import, because on upstream MoonEP the symbol is
+        # simply absent and an ImportError naming it says nothing about which
+        # build to install.
+        _require_moonep_local_first()
+
         from moonep.buffer import create_nvl_dist_tensor, local_first_chunk_index
 
         self.num_layers = num_layers
@@ -116,6 +123,39 @@ class MoonEPWeightPool:
             + self.num_local_experts
         )
         return self.ranges[kind][start : start + self.num_prefetch_slots]
+
+
+# The branch carrying the local-first mapping until it lands upstream.
+_MOONEP_LOCAL_FIRST_BRANCH = (
+    "https://github.com/bytedance-iaas/MoonEP/tree/"
+    "jxp/update_prefetch_api_and_support_local_first"
+)
+
+
+def _require_moonep_local_first() -> None:
+    """Refuse the pool unless the installed MoonEP maps local-first.
+
+    ``create_nvl_dist_tensor(local_first=...)`` and
+    ``local_first_chunk_index()`` are an in-flight MoonEP change, not in
+    ``MoonshotAI/MoonEP``. They cannot be worked around from sglang: the
+    rotation happens while the memory handles are mapped, so a tensor the
+    published mapper has already returned cannot be re-ordered. Without it the
+    range's base address is rank 0's memory on every rank, which is the device
+    DeepGEMM's tvm_ffi bindings infer.
+
+    Declared by the operator rather than probed, so a MoonEP that grows the
+    keyword without the semantics cannot silently opt itself in.
+    """
+    if envs.SGLANG_ENABLE_MOONEP_LOCAL_FIRST.get():
+        return
+    raise RuntimeError(
+        "MoonEP with quantized experts needs a local-first symmetric mapping "
+        "-- create_nvl_dist_tensor(local_first=...) and "
+        "local_first_chunk_index() -- which upstream MoonEP does not carry "
+        f"yet. Install a MoonEP built from {_MOONEP_LOCAL_FIRST_BRANCH} and "
+        "set SGLANG_ENABLE_MOONEP_LOCAL_FIRST=1. BF16 experts are stored on "
+        "every rank instead of pooled, and need none of this."
+    )
 
 
 def _check_prefetch_tiling(
