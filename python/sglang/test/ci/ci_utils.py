@@ -234,7 +234,7 @@ def run_unittest_files(
                 reader_thread.start()
                 process.wait()
                 # Bounded wait for the reader to finish.
-                reader_thread.join(timeout=10)
+                reader_thread.join(timeout=60)
             else:
                 process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
