@@ -244,9 +244,36 @@ export const benchmarks = [
   { match: { hw: "mi325x", strategy: "high-throughput" } },
   {
     match: { hw: "mi355x", strategy: "high-throughput" },
-    sglang_version: "9e692c9216",
+    sglang_version: "9d20876939",
+    latencyPercentile: "Median",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 1024,
+          max_concurrency: 1,
+          num_prompts: 10,
+        },
+        ttft_ms: 84.8435,
+        tpot_ms: 6.8675,
+        tokens_per_sec_per_gpu: 35.9812,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 1024,
+          max_concurrency: 32,
+          num_prompts: 320,
+        },
+        ttft_ms: 514.8845,
+        tpot_ms: 10.6696,
+        tokens_per_sec_per_gpu: 716.4206,
+      },
+    ],
     accuracy: { gsm8k_pct: 97.65 },
     notes:
-      "Accuracy-only validation on 8x MI355X (gfx950, TP8) with zai-org/GLM-5.3-Flash revision 3f1971b7b5f7a528c9c4ef6212c8785298a8c24a, SGLang PR #36607 head 9e692c9216c3b5e5c443fecf6b995700eb68d2e4 (validated source manifest 2c240e0e01d5fdf04acc485ebfa25f8a1793ba45fb07f165eecedfba7ec1db80), and lmsysorg/sglang:v0.5.18-rocm720-mi35x with the PR source mounted over the image tree. Full GSM8K scored 1,288/1,319 with a 100% stop rate and zero request errors, empty generations, or truncations. No throughput or latency benchmark was run.",
+      "Speed was measured on 8x MI355X (gfx950, TP8/EP1) with SGLang PR #36607 head 9d2087693988 and AITER PR #5060 head 95565e33c828. FP8 KV, AITER MoE, TileLang DSA, AITER mHC dispatch, shared-expert fusion, the HIP fused k-pool path, and full decode graphs for batch sizes 1 and 32 were enabled; prefill graphs and radix caching were disabled. With random seed 42, ignored EOS, and exact 1,024-token inputs and outputs, all 10/10 and 320/320 requests completed with empty errors. Aggregate total throughput was 287.8493 and 5,731.3649 tok/s; median interactivity was 145.6126 and 93.7246 tok/s/user at concurrency 1 and 32. The 97.65% accuracy row is from the separate full 1,319-sample GSM8K validation on the earlier PR #36607 head 9e692c9216; it completed with a 100% stop rate and zero request errors, empty generations, or truncations.",
   },
 ];
