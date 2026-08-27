@@ -362,17 +362,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+        swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if not self.is_not_in_free_group:
             # Resolve ownership now. A cache action later in this group may
-            # install a new mapping for the same full index. Queued unfiltered:
-            # the mask is data-dependent, so free_group_end drops the unmapped
-            # zeros once instead of synchronizing on every call.
+            # install a new mapping for the same full index.
             self.swa_free_group.append(swa_indices)
             return
 
-        self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+        self.swa_attn_allocator.free(swa_indices)
 
     def free_group_begin(self):
         super().free_group_begin()
@@ -390,8 +389,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            swa_indices = torch.cat(swa_free_group)
-            self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+            self.swa_attn_allocator.free(torch.cat(swa_free_group))
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
