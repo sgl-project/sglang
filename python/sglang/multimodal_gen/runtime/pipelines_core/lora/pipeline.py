@@ -297,10 +297,11 @@ class LoRAPipeline(ComposedPipelineBase):
                 and is_layerwise_offloaded_module(module)
             )
         ]
+        # Record every target, including coarse component offload. The current
+        # coarse path can already materialize the full component here, and the
+        # planner must preserve that phase if it later chooses layerwise mode.
         residency_transition = (
-            self.component_residency_manager.full_weight_transition(
-                offloaded_module_names
-            )
+            self.component_residency_manager.full_weight_transition(module_names)
             if self.component_residency_manager is not None
             else nullcontext()
         )

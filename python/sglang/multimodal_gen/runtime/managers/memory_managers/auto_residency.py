@@ -1826,15 +1826,6 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         {candidate.option_key(): candidate for candidate in report.candidates}
         for report in reports
     ]
-    current_report_candidates = [
-        {
-            candidate.component_name: candidate
-            for candidate in report.candidates
-            if candidate.current_placement
-        }
-        for report in reports
-    ]
-
     # Request timing is produced by the output rank. Other SPMD ranks still
     # contribute their VRAM and HostPin constraints, but their empty metrics
     # must not discard the replica's measured latency utility and fall back to
@@ -1865,13 +1856,8 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     options = []
     for candidate in candidates:
         resource_deltas: dict[str, int] = {}
-        for report, rank_candidates, current_rank_candidates in zip(
-            reports, report_candidates, current_report_candidates
-        ):
+        for report, rank_candidates in zip(reports, report_candidates):
             rank_candidate = rank_candidates[candidate.option_key()]
-            current_rank_candidate = current_rank_candidates.get(
-                candidate.component_name
-            )
             for (
                 resource_name,
                 _,
@@ -1881,22 +1867,8 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
             ) in phase_constraints[report.rank]:
                 if candidate.component_name in full_weight_transition_components:
                     # The measured phase already contains the component's full
-                    # temporary materialization. Partial layerwise residency
-                    # remains live alongside that temporary copy (notably
-                    # while LoRA switches own full-weight snapshots), so only
-                    # its resident-layer delta is additional. Coarse offload
-                    # and permanent residency replace the measured temporary
-                    # materialization and therefore add no phase cost.
-                    phase_cost = (
-                        rank_candidate.target_resident_weight_bytes
-                        - (
-                            current_rank_candidate.target_resident_weight_bytes
-                            if current_rank_candidate is not None
-                            else 0
-                        )
-                        if rank_candidate.target_mode() == LAYERWISE_OFFLOAD
-                        else 0
-                    )
+                    # temporary materialization under every target mode.
+                    phase_cost = 0
                 elif candidate.component_name in used_components:
                     phase_cost = rank_candidate.active_device_delta_bytes
                 elif candidate.component_name in present_components:

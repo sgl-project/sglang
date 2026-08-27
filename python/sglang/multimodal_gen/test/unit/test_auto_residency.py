@@ -992,47 +992,6 @@ class TestPlanAutoResidency:
             LAYERWISE_OFFLOAD
         ]
 
-    def test_full_materialization_phase_accounts_for_partial_resident_layers(self):
-        component_offload = ResidencyTarget(
-            component_name="transformer",
-            residency_mode=COMPONENT_OFFLOAD,
-            target_residency_mode=COMPONENT_OFFLOAD,
-            target_resident_weight_bytes=0,
-            h2d_bytes_per_request=0,
-            current_placement=True,
-        )
-        layerwise = ResidencyTarget(
-            component_name="transformer",
-            residency_mode=COMPONENT_OFFLOAD,
-            target_residency_mode=LAYERWISE_OFFLOAD,
-            target_resident_weight_bytes=GIB_BYTES,
-            h2d_bytes_per_request=100 * GIB_BYTES,
-            target_layerwise_resident_layers=(1,),
-            target_layerwise_pinned_layers=((),),
-            active_device_delta_bytes=GIB_BYTES,
-            inactive_device_delta_bytes=GIB_BYTES,
-        )
-
-        plan = plan_auto_residency(
-            reports=[
-                _report(
-                    budget_gib=54,
-                    estimated_gib=50,
-                    target_workload_measured=True,
-                    phase_peaks_gib={"lora_switch": 50},
-                    phase_full_weight_transition_components={
-                        "lora_switch": ("transformer",)
-                    },
-                    candidates=[component_offload, layerwise],
-                )
-            ]
-        )
-
-        # The measured full-weight transition plus the 4 GiB reserve already
-        # consumes the budget. A partial resident layer remains live alongside
-        # that transition and must not be selected into the missing headroom.
-        assert plan.changes == []
-
     def test_reports_reserve_shortfall_for_a_newly_calibrated_placement(self):
         plan = plan_auto_residency(
             reports=[
