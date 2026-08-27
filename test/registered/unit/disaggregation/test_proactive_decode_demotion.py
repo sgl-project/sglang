@@ -65,8 +65,8 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         args.resolve_once()
         self.assertFalse(args.enable_proactive_decode_promotion)
         self.assertEqual(args.proactive_decode_demotion_output_len_threthold, 8)
-        self.assertEqual(args.proactive_decode_demotion_cache_usage, 0.9)
-        self.assertEqual(args.proactive_decode_safe_cache_usage, 0.85)
+        self.assertEqual(args.proactive_decode_demotion_cache_usage, 0.95)
+        self.assertEqual(args.proactive_decode_safe_cache_usage, 0.75)
         self.assertEqual(args.candidate_demotion_output_len_threthold, 2.0)
         self.assertEqual(args.proactive_demotion_recovery_duration, 180.0)
 
@@ -119,19 +119,72 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         self.assertFalse(req.is_demoted)
         restore.assert_called_once()
 
-    def test_proactive_demotion_filters_and_repeats_to_safe_usage(self):
-        def make_req(rid, seqlen, output_len):
-            return SimpleNamespace(
-                rid=rid,
-                seqlen=seqlen,
-                output_ids=[0] * output_len,
-                origin_input_ids=[0] * (seqlen - output_len),
-                is_retracted=False,
-                is_demoted=False,
-                finished=lambda: False,
-                sampling_params=SimpleNamespace(max_new_tokens=128),
-                time_stats=SimpleNamespace(set_retract_time=MagicMock()),
+    def _make_retract_check_scheduler(self, demotion_queue):
+        return SimpleNamespace(
+            decode_metric_collector=SimpleNamespace(maybe_update=lambda: None),
+            if_output_len_imbalance=True,
+            disagg_decode_prealloc_queue=SimpleNamespace(
+                demotion_queue=demotion_queue
+            ),
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_max_pool_usage=lambda: 0.96
+                )
+            ),
+            server_args=SimpleNamespace(
+                proactive_decode_demotion_output_len_threthold=8,
+                proactive_decode_demotion_cache_usage=0.95,
+            ),
+        )
+
+    def test_no_new_demotion_wave_while_queue_nonempty(self):
+        """Demotion freed GPU KV that new admissions consumed, so each wave
+        demoted further requests and the CPU backup grew without bound; a
+        non-empty demotion queue must block the next wave."""
+        busy = self._make_retract_check_scheduler(demotion_queue=[MagicMock()])
+        self.assertFalse(
+            SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request(
+                busy
             )
+        )
+        idle = self._make_retract_check_scheduler(demotion_queue=[])
+        self.assertTrue(
+            SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request(
+                idle
+            )
+        )
+
+    def test_empty_window_clears_stale_imbalance_flag(self):
+        """An early return on an empty quantile window left a stale
+        if_output_len_imbalance=True driving demotion waves forever."""
+        scheduler = self._make_retract_check_scheduler(demotion_queue=[])
+        scheduler.decode_metric_collector = SimpleNamespace(
+            maybe_update=lambda: (None, None)
+        )
+        self.assertFalse(
+            SchedulerDisaggregationDecodeMixin.need_to_proactive_retract_request(
+                scheduler
+            )
+        )
+        self.assertFalse(scheduler.if_output_len_imbalance)
+
+    @staticmethod
+    def _make_demotion_candidate(rid, seqlen, output_len):
+        return SimpleNamespace(
+            rid=rid,
+            seqlen=seqlen,
+            output_ids=[0] * output_len,
+            origin_input_ids=[0] * (seqlen - output_len),
+            is_retracted=False,
+            is_demoted=False,
+            is_demoted_recovered=False,
+            finished=lambda: False,
+            sampling_params=SimpleNamespace(max_new_tokens=128),
+            time_stats=SimpleNamespace(set_retract_time=MagicMock()),
+        )
+
+    def test_proactive_demotion_filters_and_repeats_to_safe_usage(self):
+        make_req = self._make_demotion_candidate
 
         short = make_req("short", 10, 5)
         medium = make_req("medium", 20, 11)
@@ -166,12 +219,15 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         usages = iter((0.95, 0.88, 0.84))
         scheduler = SimpleNamespace(
             running_batch=Batch(),
+            waiting_queue=[],
             enable_overlap=False,
             server_args=SimpleNamespace(
                 candidate_demotion_output_len_threthold=1.0,
                 proactive_decode_safe_cache_usage=0.85,
             ),
-            decode_metric_collector=SimpleNamespace(p50_output_len=10),
+            decode_metric_collector=SimpleNamespace(
+                p50_output_len=10, get_output_len=lambda: (10, 32)
+            ),
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
                     get_max_pool_usage=lambda: next(usages)
@@ -207,6 +263,83 @@ class TestProactiveDecodeDemotion(CustomTestCase):
             num_demoted_input_tokens=9,
             num_demoted_output_tokens=41,
         )
+
+    def test_demote_recovered_waiting_victim_without_batch_lookup(self):
+        """A demoted-recovered candidate lives in the waiting queue, not the
+        running batch; looking it up via batch.reqs.index() raised ValueError
+        and crashed the scheduler."""
+        running = self._make_demotion_candidate("running", 20, 15)
+        recovered = self._make_demotion_candidate("recovered", 40, 35)
+        recovered.is_demoted_recovered = True
+
+        batch_release_calls = []
+
+        class Batch:
+            reqs = [running]
+            batch_is_full = True
+
+            def is_empty(self):
+                return not self.reqs
+
+            def batch_size(self):
+                return len(self.reqs)
+
+            def release_req(self, index, _, __, *, is_demoted=False):
+                batch_release_calls.append((self.reqs[index].rid, is_demoted))
+                return True
+
+            def filter_batch(self, keep_indices):
+                self.reqs = [self.reqs[i] for i in keep_indices]
+
+        demotion_queue = MagicMock()
+        usages = iter((0.95, 0.84))
+        scheduler = SimpleNamespace(
+            running_batch=Batch(),
+            waiting_queue=[recovered],
+            enable_overlap=False,
+            server_args=SimpleNamespace(
+                candidate_demotion_output_len_threthold=1.0,
+                proactive_decode_safe_cache_usage=0.85,
+            ),
+            decode_metric_collector=SimpleNamespace(
+                p50_output_len=10, get_output_len=lambda: (10, 32)
+            ),
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_max_pool_usage=lambda: next(usages)
+                )
+            ),
+            disagg_decode_prealloc_queue=demotion_queue,
+            new_token_ratio_tracker=SimpleNamespace(current=0.0),
+            metrics_reporter=SimpleNamespace(
+                num_demoted_reqs=0,
+                enable_metrics=False,
+                metrics_collector=MagicMock(),
+            ),
+            req_to_token_pool=MagicMock(),
+            token_to_kv_pool_allocator=MagicMock(),
+            tree_cache=MagicMock(),
+            hisparse_coordinator=None,
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.release_req", return_value=True
+        ) as module_release:
+            self.assertTrue(
+                SchedulerDisaggregationDecodeMixin.proactively_demote_longest_request(
+                    scheduler
+                )
+            )
+
+        # The waiting-queue victim goes through the module-level release path;
+        # the running batch is untouched by it.
+        module_release.assert_called_once()
+        self.assertIs(module_release.call_args.kwargs["req"], recovered)
+        self.assertTrue(module_release.call_args.kwargs["is_demoted"])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(batch_release_calls, [])
+        self.assertEqual(scheduler.running_batch.reqs, [running])
+        demotion_queue.add_demoted_req.assert_called_once_with(recovered)
 
 
 if __name__ == "__main__":

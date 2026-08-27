@@ -1707,7 +1707,7 @@ class Req(ReqDllmMixin):
         if self.is_demoted_recovered:
             self.is_demoted_recovered = False
             logger.warning(
-                "req %s: demoted-recovered request is being demoted again; "
+                "req %s: demoted-recovered request is being demoted again", self.rid
             )
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None

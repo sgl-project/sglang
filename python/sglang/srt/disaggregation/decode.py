@@ -67,6 +67,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     ReqKvInfo,
     ScheduleBatch,
+    release_req,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -2837,6 +2838,10 @@ class SchedulerDisaggregationDecodeMixin:
                 p95_output_len,
             )
 
+        # Note: Demote too much may case OOM.
+        if self.disagg_decode_prealloc_queue.demotion_queue:
+            return False
+
         if not self.if_output_len_imbalance:
             return False
 
@@ -2883,13 +2888,28 @@ class SchedulerDisaggregationDecodeMixin:
                 break
 
             victim = candidates.pop(0)
-            victim_index = batch.reqs.index(victim)
-            backup_saved = batch.release_req(
-                victim_index,
-                max(0, batch.batch_size() - 1),
-                self.server_args,
-                is_demoted=True,
+            victim_index = next(
+                (i for i, r in enumerate(batch.reqs) if r is victim), None
             )
+            if victim_index is not None:
+                backup_saved = batch.release_req(
+                    victim_index,
+                    max(0, batch.batch_size() - 1),
+                    self.server_args,
+                    is_demoted=True,
+                )
+            else:
+                self.waiting_queue = [r for r in self.waiting_queue if r is not victim]
+                backup_saved = release_req(
+                    req=victim,
+                    remaing_req_count=batch.batch_size(),
+                    server_args=self.server_args,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    tree_cache=self.tree_cache,
+                    hisparse_coordinator=self.hisparse_coordinator,
+                    is_demoted=True,
+                )
             if backup_saved:
                 victim.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.add_demoted_req(victim)
@@ -2905,19 +2925,20 @@ class SchedulerDisaggregationDecodeMixin:
                     victim,
                 )
 
-            batch.filter_batch(
-                keep_indices=[
-                    index
-                    for index, _ in enumerate(batch.reqs)
-                    if index != victim_index
-                ]
-            )
-            batch.batch_is_full = False
-            self.new_token_ratio_tracker.current = (
-                NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
-                    batch.reqs
+            if victim_index is not None:
+                batch.filter_batch(
+                    keep_indices=[
+                        index
+                        for index, _ in enumerate(batch.reqs)
+                        if index != victim_index
+                    ]
                 )
-            )
+                batch.batch_is_full = False
+                self.new_token_ratio_tracker.current = (
+                    NewTokenRatioTracker.estimate_new_token_ratio_after_retract(
+                        batch.reqs
+                    )
+                )
             logger.warning(
                 "Proactive decode demotion: req=%s seqlen=%s output_len=%s",
                 victim.rid,
