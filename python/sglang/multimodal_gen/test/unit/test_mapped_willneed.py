@@ -27,6 +27,7 @@ class _RecordingLibc:
 def libc(monkeypatch):
     fake = _RecordingLibc()
     monkeypatch.setattr(lo, "_libc", fake)
+    monkeypatch.setattr(lo, "_willneed_headroom_ok", lambda need: True)
     return fake
 
 
@@ -63,3 +64,30 @@ def test_empty_and_broken_tensors_are_skipped(libc):
 
     assert lo.advise_willneed([Broken(), torch.empty(0)]) == 0
     assert libc.calls == []
+
+
+def test_no_headroom_withholds_the_advice(monkeypatch):
+    fake = _RecordingLibc()
+    monkeypatch.setattr(lo, "_libc", fake)
+    monkeypatch.setattr(lo, "_willneed_headroom_ok", lambda need: False)
+    assert lo.advise_willneed([torch.zeros(1024)]) == 0
+    assert fake.calls == []
+
+
+def test_headroom_reads_memavailable(monkeypatch, tmp_path):
+    meminfo = tmp_path / "meminfo"
+
+    real_open = open
+
+    def fake_open(path, *a, **k):
+        if path == "/proc/meminfo":
+            return real_open(meminfo, *a, **k)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    meminfo.write_text("MemTotal: 32 kB\nMemAvailable: 16777216 kB\n")  # 16 GiB
+    assert lo._willneed_headroom_ok(1 << 30)
+
+    meminfo.write_text("MemTotal: 32 kB\nMemAvailable: 524288 kB\n")  # 0.5 GiB
+    assert not lo._willneed_headroom_ok(1 << 30)
