@@ -42,12 +42,10 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         self.w13_kernel = NPUW4A8Int8MoEMethod(
             is_per_channel_weight=self.is_per_channel_weight,
             activation_use_clip=self.activation_use_clip,
-            is_compressed_tensors=True,
         )
         self.w2_kernel = NPUW4A8Int8MoEMethod(
             is_per_channel_weight=self.is_per_channel_weight,
             activation_use_clip=self.activation_use_clip,
-            is_compressed_tensors=True,
         )
 
     def create_weights(
@@ -67,8 +65,8 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         )
 
         # >> weight
-        w13_output_size = 2 * intermediate_size_per_partition
-        w2_output_size = hidden_size
+        w13_output_size = intermediate_size_per_partition
+        w2_output_size = hidden_size // 2
         w13_weight = torch.nn.Parameter(
             torch.empty(num_experts, w13_output_size, hidden_size, dtype=torch.int8),
             requires_grad=False,
@@ -189,11 +187,11 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
         extra_weight_attrs: dict,
     ) -> None:
         """
-        Initializes secondary parameters for grouped quantization.
+        Initializes additional scaling, offset, and bias parameters for quantization schemes without activation clipping.
 
-        Scale biases are derived from the loaded compressed-tensors weights and
-        scales during post-load processing. Grouped quantization additionally
-        registers:
+        This method registers the following parameters:
+        1. Scale Biases: `w13_scale_bias` and `w2_scale_bias`.
+        2. Secondary Quantization Params (initialized only for grouped quantization):
             `w13_weight_scale_second`, `w13_weight_offset_second`,
             `w2_weight_scale_second`, and `w2_weight_offset_second`.
         """
@@ -247,6 +245,24 @@ class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             )
             layer.register_parameter("w2_weight_offset_second", w2_weight_offset_second)
             set_weight_attrs(w2_weight_offset_second, extra_weight_attrs)
+
+        w13_scale_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scale_bias", w13_scale_bias)
+        set_weight_attrs(w13_scale_bias, extra_weight_attrs)
+
+        w2_scale_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, 16 // self.tp_size, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scale_bias", w2_scale_bias)
+        set_weight_attrs(w2_scale_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.w13_kernel.process_weights_after_loading(layer, "w13")

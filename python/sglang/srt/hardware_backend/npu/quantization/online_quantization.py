@@ -26,12 +26,6 @@ _ONLINE_INTEGER_QUANT_SPECS = {
         activation_dtype=torch.int8,
         dispatcher_output_dtype="int8",
     ),
-    "w4a8_int8": NPUOnlineIntegerQuantSpec(
-        mode="w4a8_int8",
-        weight_dtype=torch.quint4x2,
-        activation_dtype=torch.int8,
-        dispatcher_output_dtype="int8",
-    ),
     "w4a4_int4": NPUOnlineIntegerQuantSpec(
         mode="w4a4_int4",
         weight_dtype=torch.quint4x2,
@@ -166,14 +160,7 @@ def _encode_online_int4_scale(scale: torch.Tensor) -> torch.Tensor:
 def npu_format_online_dense_scale(
     scale: torch.Tensor, spec: NPUOnlineIntegerQuantSpec
 ) -> torch.Tensor:
-    scale = scale.flatten()
-    if spec.mode != "w4a8_int8":
-        return scale
-
-    # Match torch_npu.npu_trans_quant_param for FP16 output. QuantMatmul's
-    # INT64 carrier includes output-dequant metadata; GMM uses the raw carrier.
-    encoded = scale.contiguous().view(torch.int32).to(torch.int64)
-    return (encoded & 0xFFFFE000) | (1 << 46)
+    return scale.flatten()
 
 
 def npu_format_online_moe_scale(

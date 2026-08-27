@@ -628,7 +628,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel.process_weights_after_loading(layer, "w2")
             if layer.w13_kernel._quant_mode in {
                 "w8a8_int8",
-                "w4a8_int8",
                 "w4a4_int4",
             }:
                 torch.npu.empty_cache()

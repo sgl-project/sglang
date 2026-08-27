@@ -130,10 +130,6 @@ class _NPUOnlineIntegerLinearMethod(_NPULinearMethodBase):
             "weight",
             npu_format_online_dense_weight(quantized_weight, self.spec),
         )
-        if self.spec.mode == "w4a8_int8":
-            copy_or_rebind_param(
-                layer, "weight_offset", torch.zeros_like(weight_scale.flatten())
-            )
         copy_or_rebind_param(
             layer,
             "weight_scale",
@@ -172,12 +168,6 @@ class NPUOnlineW8A8Int8LinearMethod(_NPUOnlineIntegerLinearMethod):
     quant_mode = "w8a8_int8"
 
 
-class NPUOnlineW4A8Int8LinearMethod(_NPUOnlineIntegerLinearMethod):
-    """Online W4A8 INT8 method for unquantized dense NPU linear layers."""
-
-    quant_mode = "w4a8_int8"
-
-
 class NPUOnlineW4A4Int4LinearMethod(_NPUOnlineIntegerLinearMethod):
     """Online W4A4 INT4 method for unquantized dense NPU linear layers."""
 
@@ -190,7 +180,6 @@ def get_npu_online_linear_method() -> Optional[LinearMethodBase]:
         return None
     return {
         "w8a8_int8": NPUOnlineW8A8Int8LinearMethod,
-        "w4a8_int8": NPUOnlineW4A8Int8LinearMethod,
         "w4a4_int4": NPUOnlineW4A4Int4LinearMethod,
     }[spec.mode]()
 

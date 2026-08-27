@@ -183,7 +183,6 @@ QUANTIZATION_CHOICES = [
 # Ascend online quantization for full-precision checkpoints.
 ONLINE_QUANTIZATION_CHOICES = [
     "w8a8_int8",
-    "w4a8_int8",
     "w4a4_int4",
 ]
 
