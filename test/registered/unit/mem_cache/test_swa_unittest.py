@@ -387,48 +387,36 @@ class TestSWA(unittest.TestCase):
         allocator.free_group_end()
 
     def test_free_group_owns_mapping_at_enqueue_time(self):
-        allocator, old_full, new_full, old_swa, new_swa = self._build_two_mapped_slots()
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                allocator, old_full, new_full, old_swa, new_swa = (
+                    self._build_two_mapped_slots(page_size=page_size)
+                )
+                available_before = allocator.swa_available_size()
 
-        self._run_remap_during_free_group(allocator, old_full, new_full, new_swa)
+                self._run_remap_during_free_group(
+                    allocator, old_full, new_full, new_swa
+                )
 
-        self.assertTrue(
-            self._swa_slot_is_free(allocator, old_swa),
-            "the SWA slot owned at enqueue time leaked",
-        )
-        self.assertFalse(
-            self._swa_slot_is_free(allocator, new_swa),
-            "the replacement SWA slot was freed while still mapped",
-        )
-
-    def test_free_group_owns_mapping_at_enqueue_time_paged(self):
-        page_size = 4
-        allocator, old_full, new_full, old_swa, new_swa = self._build_two_mapped_slots(
-            page_size=page_size
-        )
-
-        self._run_remap_during_free_group(allocator, old_full, new_full, new_swa)
-
-        self.assertTrue(
-            self._swa_slot_is_free(allocator, old_swa),
-            "the SWA page owned at enqueue time leaked",
-        )
-        self.assertFalse(
-            self._swa_slot_is_free(allocator, new_swa),
-            "the replacement SWA page was freed while still mapped",
-        )
-
-    def test_free_group_conserves_swa_slots(self):
-        allocator, old_full, new_full, _, new_swa = self._build_two_mapped_slots()
-        swa_available_before = allocator.swa_available_size()
-
-        self._run_remap_during_free_group(allocator, old_full, new_full, new_swa)
-
-        # Every slot the pool counts as in use must stay reachable via the mapping.
-        self.assertEqual(allocator.swa_available_size(), swa_available_before + 1)
-        mapped = allocator.full_to_swa_index_mapping[:-1]
-        num_mapped = int((mapped > 0).sum().item())
-        num_in_use = allocator.swa_attn_allocator.size - allocator.swa_available_size()
-        self.assertEqual(num_mapped, num_in_use)
+                self.assertTrue(
+                    self._swa_slot_is_free(allocator, old_swa),
+                    "the SWA slot owned at enqueue time leaked",
+                )
+                self.assertFalse(
+                    self._swa_slot_is_free(allocator, new_swa),
+                    "the replacement SWA slot was freed while still mapped",
+                )
+                # And the count moved by exactly one slot: everything the pool
+                # still counts as in use stays reachable through the mapping.
+                self.assertEqual(
+                    allocator.swa_available_size(), available_before + page_size
+                )
+                mapped = allocator.full_to_swa_index_mapping[:-1]
+                num_mapped = int((mapped > 0).sum().item())
+                num_in_use = (
+                    allocator.swa_attn_allocator.size - allocator.swa_available_size()
+                )
+                self.assertEqual(num_mapped, num_in_use)
 
     def test_free_group_owns_tombstoned_indices(self):
         """free_swa then free of the same full slot must free the SWA slot once."""
