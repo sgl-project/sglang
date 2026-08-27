@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import shutil
+import time
 import uuid
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -156,7 +157,14 @@ def load_jit(
         # meant to be a shared mount, where two machines can hold the same pid.
         staging = scope / f".staging-{uuid.uuid4().hex}"
         try:
+            logger.info("JIT-compiling %s (cold cache) -> %s", spec.module_name, scope)
+            build_start = time.monotonic()
             library = ninja.build(spec=spec, build_dir=staging, build_file=build_file)
+            logger.info(
+                "JIT-compiled %s in %.1fs",
+                spec.module_name,
+                time.monotonic() - build_start,
+            )
             # Loaded before publishing, so a broken artifact never becomes a
             # leaf that later runs have to discover and discard.
             module = _load(library)
