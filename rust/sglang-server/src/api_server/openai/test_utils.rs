@@ -27,7 +27,8 @@ use crate::renderer::{PreprocessJob, new_renderer_service};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::to_scheduler::Limits;
 use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
-use crate::tokenizer_manager::wiring::Senders;
+use crate::tokenizer_manager::wiring::{Senders, TmEvent};
+use crate::utils::error::Error;
 
 pub(super) fn senders() -> Senders {
     Senders {
@@ -246,6 +247,46 @@ async fn completions_handler_validates_before_submit() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// OpenAI inference lowers protocol fields before submission, but the request
+/// must still enter the shared FSM as text. The FSM, rather than the renderer's
+/// prepare-only backend, owns inference tokenization.
+#[tokio::test]
+async fn completions_enter_the_fsm_before_tokenization() {
+    let (tm_tx, tm_rx) = flume::unbounded();
+    let mut frontend_senders = senders();
+    frontend_senders.tok_manager_tx = tm_tx;
+    let app = routes().with_state(app_state(frontend_senders));
+
+    let response = tokio::spawn(post_json(
+        app,
+        "/v1/completions",
+        json!({"model": "model", "prompt": "two words"}),
+    ));
+    let TmEvent::Intake(request) = tm_rx.recv_async().await.unwrap() else {
+        panic!("OpenAI request must enter through the FSM intake lane")
+    };
+    let crate::message::request::RequestKind::Generate(generate) = &request.kind else {
+        panic!("completion must lower to a generate request")
+    };
+    assert_eq!(generate.text.as_deref(), Some("two words"));
+    assert!(
+        generate.input_ids.is_none(),
+        "full inference must leave tokenization to the shared FSM"
+    );
+    assert!(
+        !generate.sampling_params.is_normalized,
+        "the shared FSM must own sampling normalization"
+    );
+
+    request
+        .sink
+        .try_send(ResponseItem::Error(Error::Validation(
+            "test terminal".into(),
+        )))
+        .unwrap();
+    assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

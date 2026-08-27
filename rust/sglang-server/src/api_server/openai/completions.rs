@@ -65,11 +65,7 @@ async fn completions(
         }
     };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let native_requests = match state
-        .renderer
-        .prepare_completions(&request, &response_id)
-        .await
-    {
+    let native_requests = match state.renderer.lower_completions(&request, &response_id) {
         Ok(requests) => requests,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))

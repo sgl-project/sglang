@@ -348,9 +348,6 @@ pub fn chat_sampling(
         tools,
         parallel_tool_calls,
     )?;
-    sampling
-        .normalize(config.skip_tokenizer_init, config.vocab_size)
-        .map_err(|error| error.to_string())?;
     Ok(sampling)
 }
 
@@ -496,10 +493,7 @@ pub fn lower_completion_requests(
         return Err("n must be at least 1".into());
     }
     let prompt_specs = completion_prompt_specs(&request.prompt)?;
-    let mut sampling = completion_sampling_params(request)?;
-    sampling
-        .normalize(config.skip_tokenizer_init, config.vocab_size)
-        .map_err(|error| error.to_string())?;
+    let sampling = completion_sampling_params(request)?;
     let n = request.n.unwrap_or(1) as usize;
     let choice_count = prompt_specs
         .len()

@@ -44,7 +44,9 @@ pub struct ChatResponsePlan {
     pub service_tier: Option<ChatServiceTier>,
 }
 
-pub struct PreparedChat {
+/// One lowered OpenAI chat request and the response context retained by the
+/// frontend. `requests` are tokenized only when returned by `prepare_chat`.
+pub struct ChatRequestBatch {
     pub requests: Vec<RendererRequest>,
     pub response: ChatResponsePlan,
 }
@@ -63,11 +65,11 @@ impl RendererService {
         &self.config
     }
 
-    pub async fn prepare_chat(
+    pub async fn lower_chat(
         &self,
         request: &mut CreateChatCompletionRequest,
         response_id: &str,
-    ) -> Result<PreparedChat, RendererError> {
+    ) -> Result<ChatRequestBatch, RendererError> {
         let lowered = lower_chat_requests(
             &self.config,
             self.chat_formatter.clone(),
@@ -97,10 +99,28 @@ impl RendererService {
             parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
             service_tier: request.service_tier.clone(),
         };
-        Ok(PreparedChat {
-            requests: self.prepare_many(lowered.requests).await?,
+        Ok(ChatRequestBatch {
+            requests: lowered.requests,
             response,
         })
+    }
+
+    pub async fn prepare_chat(
+        &self,
+        request: &mut CreateChatCompletionRequest,
+        response_id: &str,
+    ) -> Result<ChatRequestBatch, RendererError> {
+        let mut batch = self.lower_chat(request, response_id).await?;
+        batch.requests = self.prepare_many(batch.requests).await?;
+        Ok(batch)
+    }
+
+    pub fn lower_completions(
+        &self,
+        request: &CreateCompletionRequest,
+        response_id: &str,
+    ) -> Result<Vec<RendererRequest>, RendererError> {
+        lower_completion_requests(&self.config, request, response_id)
     }
 
     pub async fn prepare_completions(
@@ -108,7 +128,7 @@ impl RendererService {
         request: &CreateCompletionRequest,
         response_id: &str,
     ) -> Result<Vec<RendererRequest>, RendererError> {
-        let requests = lower_completion_requests(&self.config, request, response_id)?;
+        let requests = self.lower_completions(request, response_id)?;
         self.prepare_many(requests).await
     }
 

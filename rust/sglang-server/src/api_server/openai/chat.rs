@@ -53,11 +53,7 @@ async fn chat_completions(
         }
     };
     let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let prepared = match state
-        .renderer
-        .prepare_chat(&mut request, &response_id)
-        .await
-    {
+    let prepared = match state.renderer.lower_chat(&mut request, &response_id).await {
         Ok(prepared) => prepared,
         Err(error) => {
             let status = StatusCode::from_u16(render_http_status(&error))

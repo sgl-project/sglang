@@ -20,7 +20,7 @@ pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
 pub use request::{PreparedGenerateRequest, PreparedSamplingParams, RendererRequest};
 pub use sampling::SamplingParams;
-pub use service::{ChatResponsePlan, PreparedChat, PreprocessBackend, RendererService};
+pub use service::{ChatRequestBatch, ChatResponsePlan, PreprocessBackend, RendererService};
 pub use template::ChatFormatter;
 pub use tokenizer::{
     DynamoTokenizer, TextTokenizer, check_total_tokens, load_tokenizer, prepare_direct_request,
