@@ -210,6 +210,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "the mooncake transfer backend; got "
             f"{cfg.disaggregation_transfer_backend!r}."
         )
+        assert not (
+            cfg.disaggregation_transfer_backend == "mooncake"
+            and cfg.speculative_algorithm is not None
+        ), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "speculative decoding with the Mooncake transfer backend."
+        )
         assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
             "--enable-unified-memory with PD disaggregation requires lazy "
             "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
