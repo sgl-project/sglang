@@ -77,7 +77,7 @@ class RayDataParallelController(DataParallelController):
         sockets = []
         dp_port_args_list = []
 
-        for dp_rank in range(get_parallel().config.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -88,7 +88,7 @@ class RayDataParallelController(DataParallelController):
             dp_port_args_list.append(tmp_port_args)
 
             # Create ZMQ PUSH socket for this DP rank (controller → scheduler)
-            if get_parallel().config.node_rank == 0:
+            if get_parallel().node_rank == 0:
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
                     zmq.PUSH,
@@ -101,7 +101,7 @@ class RayDataParallelController(DataParallelController):
             sock.close()
 
         # Create actors for each DP rank sequentially
-        for dp_rank in range(get_parallel().config.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             self._launch_ray_tp_group(server_args, dp_port_args_list[dp_rank], dp_rank)
 
     def launch_dp_attention_schedulers(
@@ -112,7 +112,7 @@ class RayDataParallelController(DataParallelController):
         # rank-0 node IP instead of tcp://* to avoid exposing unauthenticated
         # ZMQ sockets (CVE-2026-3060).
         worker_ports = []
-        for dp_rank in range(get_parallel().config.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             worker_port, worker_socket = get_zmq_socket_on_host(
                 self.context, zmq.PUSH, host=self.rank0_node_ip
             )
@@ -139,7 +139,7 @@ class RayDataParallelController(DataParallelController):
             dp_rank: DP rank for regular DP; None for DP attention (derived from tp_rank).
             worker_ports: Pre-allocated ports for DP attention; None for regular DP.
         """
-        nnodes = get_parallel().config.nnodes
+        nnodes = get_parallel().nnodes
         batch_start_idx = len(self.scheduler_actors)
 
         if not self.is_custom_pg:
@@ -233,12 +233,12 @@ class RayDataParallelController(DataParallelController):
 
                 bundle_idx = bundle_indices[global_rank]
 
-                if get_parallel().config.enable_dp_attention:
+                if get_parallel().enable_dp_attention:
                     _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
-                        get_parallel().config.enable_dp_attention,
+                        get_parallel().enable_dp_attention,
                         tp_rank,
                         get_parallel().config.tp_size,
-                        get_parallel().config.dp_size,
+                        get_parallel().dp_size,
                         get_parallel().config.attn_cp_size,
                     )
                     rank_port_args = PortArgs.init_new(
