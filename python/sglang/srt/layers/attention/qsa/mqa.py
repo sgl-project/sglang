@@ -5,10 +5,16 @@ kernels: the per-head weight input and all unrelated feature branches are
 removed. Torch implementations are kept as the only fallback and reference.
 """
 
+import logging
 import math
+import threading
 from typing import Optional
 
 import torch
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -24,6 +30,75 @@ except ImportError:
     tilelang = None
     T = None
     HAS_TILELANG = False
+
+
+_TILELANG_BACKEND_VALUES = {"auto", "tilelang", "torch"}
+_tilelang_backend_available: Optional[bool] = None
+_tilelang_backend_lock = threading.Lock()
+_torch_backend_logged = False
+
+
+def _configured_tilelang_backend() -> str:
+    backend = envs.SGLANG_QSA_MQA_BACKEND.get().strip().lower()
+    if backend not in _TILELANG_BACKEND_VALUES:
+        raise ValueError(
+            "SGLANG_QSA_MQA_BACKEND must be one of auto, tilelang, or torch; "
+            f"got {backend!r}"
+        )
+    return backend
+
+
+def _disable_tilelang_qsa(exc: BaseException) -> None:
+    global _tilelang_backend_available
+    if _tilelang_backend_available is not False:
+        logger.warning(
+            "TileLang QSA MQA failed; falling back to the torch implementation "
+            "for the rest of this process: %s",
+            exc,
+        )
+    _tilelang_backend_available = False
+
+
+def _run_tilelang_or_torch(q: torch.Tensor, tilelang_call, torch_call):
+    """Run one compile probe and permanently fall back after any failure."""
+
+    global _tilelang_backend_available, _torch_backend_logged
+    backend = _configured_tilelang_backend()
+    if not q.is_cuda:
+        return torch_call()
+    if backend == "torch":
+        if not _torch_backend_logged:
+            logger.info(
+                "SGLANG_QSA_MQA_BACKEND=torch; using the torch QSA MQA "
+                "implementation for this process"
+            )
+            _torch_backend_logged = True
+        return torch_call()
+    if not HAS_TILELANG or _tilelang_backend_available is False:
+        return torch_call()
+
+    if _tilelang_backend_available is None:
+        # Serialize the first lazy JIT invocation. This is both the capability
+        # probe and protection against two graph-capture workers racing the
+        # same TileLang compilation.
+        with _tilelang_backend_lock:
+            if _tilelang_backend_available is None:
+                try:
+                    result = tilelang_call()
+                except Exception as exc:
+                    _disable_tilelang_qsa(exc)
+                    return torch_call()
+                _tilelang_backend_available = True
+                logger.info("TileLang QSA MQA compile probe succeeded")
+                return result
+
+    try:
+        return tilelang_call()
+    except Exception as exc:
+        # New shapes may trigger additional lazy specializations, so a later
+        # compile can still fail after the initial probe.
+        _disable_tilelang_qsa(exc)
+        return torch_call()
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -393,9 +468,13 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
-    return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+    return _run_tilelang_or_torch(
+        q,
+        lambda: tilelang_qsa_mqa_prefill(
+            q, k, row_starts, row_ends, score_scale
+        ),
+        lambda: torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale),
+    )
 
 
 def qsa_mqa_decode(
@@ -406,12 +485,14 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_decode(
+    return _run_tilelang_or_torch(
+        q,
+        lambda: tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
-        )
-    return torch_qsa_mqa_decode(
-        q, k_cache, page_table, context_lens, max_model_len, score_scale
+        ),
+        lambda: torch_qsa_mqa_decode(
+            q, k_cache, page_table, context_lens, max_model_len, score_scale
+        ),
     )
 
 

@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import time
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -61,7 +62,7 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.utils import is_sm120_supported, logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -737,7 +738,7 @@ def _gather_ple_embedding_from_pinned_kernel(
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     values = tl.load(
         weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
+        mask=mask & in_range,
         other=0.0,
     ).to(tl.bfloat16)
     tl.store(
@@ -1617,6 +1618,76 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+
+    @staticmethod
+    def _prewarm_cuda_graph_jit_kernels(
+        model: nn.Module, *, quantization: Optional[str]
+    ) -> None:
+        from sglang.kernels.ops.attention import qsa_indexer
+        from sglang.kernels.ops.elementwise import fast_topk, hc_combine
+        from sglang.kernels.ops.layernorm import grouped_gemma_rmsnorm
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+        for module in model.modules():
+            if isinstance(module, QSAIndexer):
+                if module.block_topk in (512, 2048):
+                    fast_topk._jit_fast_topk_module(module.block_topk)
+                qsa_dtype = module.q_layernorm.weight.dtype
+                rotary_emb = module.rotary_emb
+                if (
+                    qsa_dtype in (torch.bfloat16, torch.float16)
+                    and module.index_head_dim in (64, 128, 256)
+                    and rotary_emb.rotary_dim % 2 == 0
+                    and not getattr(rotary_emb, "mrope_interleaved_glm", False)
+                    and len(getattr(rotary_emb, "mrope_section", None) or ()) in (0, 3)
+                    and getattr(rotary_emb, "cos_sin_cache", None) is not None
+                ):
+                    qsa_indexer._jit_qsa_indexer_module(
+                        qsa_dtype,
+                        module.index_head_dim,
+                        rotary_emb.is_neox_style,
+                    )
+            elif isinstance(module, GatedResidual) and getattr(
+                module, "_jit_combine_ok", False
+            ):
+                hc_combine._jit_hc_combine_module(
+                    module.hc_count,
+                    module.hidden_size,
+                    module.block_inject_weight.weight.dtype,
+                )
+            elif isinstance(module, Qwen4ExpPLEGroupedNorm):
+                group_size = module._jit_group_size
+                if group_size is not None and module.weight.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ):
+                    grouped_gemma_rmsnorm._jit_grouped_gemma_rmsnorm_module(
+                        group_size, module.weight.dtype
+                    )
+
+        if quantization == "fp8":
+            from sglang.kernels.ops.gemm.fp8_blockwise_gemm import (
+                _jit_fp8_blockwise_module,
+            )
+
+            _jit_fp8_blockwise_module()
+
+    def prewarm_cuda_graphs(
+        self, model_runner, *, capture_decode_cuda_graph: bool
+    ) -> None:
+        # These local JIT paths were added for SM120. SM100 uses its existing
+        # CuTe/FlashInfer routes and does not instantiate these modules.
+        if not is_sm120_supported():
+            return
+        tic = time.perf_counter()
+        self._prewarm_cuda_graph_jit_kernels(
+            self,
+            quantization=model_runner.model_config.quantization,
+        )
+        logger.info(
+            "Prewarmed Qwen4-Exp SM120 JIT kernels in %.2f seconds",
+            time.perf_counter() - tic,
+        )
 
     def forward(
         self,

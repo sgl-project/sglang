@@ -42,13 +42,53 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_sm120_supported,
+    is_sm121,
+    log_info_on_rank0,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _prewarm_model_cuda_graphs(
+    model_runner: ModelRunner, *, capture_decode_cuda_graph: bool
+) -> None:
+    """Let the language model prepare resources needed by graph capture."""
+    if model_runner.device != "cuda":
+        return
+    if not is_sm120_supported() or is_sm121():
+        return
+    graph_config = model_runner.server_args.cuda_graph_config
+    prefill_enabled = graph_config.prefill.backend != Backend.DISABLED
+    decode_enabled = (
+        capture_decode_cuda_graph and graph_config.decode.backend != Backend.DISABLED
+    )
+    if not (prefill_enabled or decode_enabled):
+        return
+
+    language_model = resolve_language_model(model_runner.model)
+    prewarm = getattr(language_model, "prewarm_cuda_graphs", None)
+    hf_text_config = getattr(
+        getattr(model_runner, "model_config", None), "hf_text_config", None
+    )
+    ple_offload_enabled = bool(getattr(hf_text_config, "ple_offload_embedding", False))
+    if prewarm is None:
+        if ple_offload_enabled:
+            raise RuntimeError(
+                "PLE offload requires the resolved language model to expose "
+                "prewarm_cuda_graphs before CUDA graph capture"
+            )
+        return
+    prewarm(
+        model_runner,
+        capture_decode_cuda_graph=capture_decode_cuda_graph,
+    )
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -108,6 +148,9 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner)
+    _prewarm_model_cuda_graphs(
+        model_runner, capture_decode_cuda_graph=capture_decode_cuda_graph
+    )
 
     if model_runner.is_draft_worker:
         moe_runner_backend = (

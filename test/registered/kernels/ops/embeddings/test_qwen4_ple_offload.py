@@ -12,6 +12,7 @@ from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
+    _gather_ple_embedding_from_pinned_kernel,
 )
 from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -72,6 +73,7 @@ def _make_source_embedding(
         shard_indices=shard_indices,
         embedding_dim=embedding_dim,
         quant_method=UnquantizedEmbeddingMethod(),
+        weight_scale=torch.ones(1, dtype=torch.bfloat16, device="cuda"),
         num_embeddings_per_partition=local_rows,
         num_org_embeddings_per_partition=local_rows,
         num_added_embeddings_per_partition=0,
@@ -137,6 +139,29 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
 
     assert actual.data_ptr() == output.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_qwen4_ple_pinned_gather_does_not_read_a_zero_row_shard():
+    embedding_dim = 13
+    ids = torch.tensor([[-1, 0, 3], [4, 8, 100]], device="cuda")
+    output = torch.full(
+        (*ids.shape, embedding_dim),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+        0,
+        ids,
+        output,
+        embedding_dim=embedding_dim,
+        tp_vocab_start=4,
+        tp_vocab_end=4,
+        is_fp8=False,
+        BLOCK_D=16,
+    )
+
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
 
 
 def test_qwen4_ple_pinned_gather_empty_input():
