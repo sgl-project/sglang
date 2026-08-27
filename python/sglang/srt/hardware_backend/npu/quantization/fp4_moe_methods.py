@@ -268,7 +268,7 @@ def npu_fused_experts_w4a4_mxfp(
     )
     valid_mask_2d = (row_ids < expert_tokens[-1]).unsqueeze(1)
 
-    hidden_states = w4a4_mxfp_gmm_npu(
+    hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
         weight=w13,
@@ -279,7 +279,7 @@ def npu_fused_experts_w4a4_mxfp(
     )
     _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a4_mxfp_gmm_npu(
+    hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
         weight=w2,
@@ -336,7 +336,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
         )
     )
     expert_tokens = expert_tokens.to(torch.int64)
-    hidden_states = w4a4_mxfp_gmm_npu(
+    hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
         weight=w13,
@@ -347,7 +347,7 @@ def npu_fused_experts_w4a4_mxfp_decode(
     )
     _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a4_mxfp_gmm_npu(
+    hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
         weight=w2,
@@ -445,7 +445,7 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
     group_list,
     output_dtype,
 ):
-    hidden_states = w4a4_mxfp_gmm_npu(
+    hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=hidden_states_scale,
         weight=layer.w13_weight,
@@ -456,7 +456,7 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
     )
     _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    return w4a4_mxfp_gmm_npu(
+    return w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
         weight=layer.w2_weight,
@@ -476,30 +476,7 @@ def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
 
 
-def w4a4_mxfp_gmm_npu(
-    input: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_list_type: int,
-    group_list: torch.Tensor,
-    output_dtype=torch.bfloat16,
-    scale_alg=None,
-) -> torch.Tensor:
-    """W4A8 MXFP grouped matmul used by the DeepSeek-V4 checkpoint."""
-    return _w4a8_mxfp_gmm(
-        input=input,
-        input_scale=input_scale,
-        weight=weight,
-        weight_scale=weight_scale,
-        group_list_type=group_list_type,
-        group_list=group_list.to(torch.int64),
-        output_dtype=output_dtype,
-        scale_alg=scale_alg,
-    )
-
-
-def _w4a8_mxfp_gmm(
+def w4a8_mxfp_gmm(
     *,
     input: torch.Tensor,
     input_scale: Optional[torch.Tensor],
@@ -517,6 +494,7 @@ def _w4a8_mxfp_gmm(
     with ``scale=None`` — the ``scale=`` + ``scale_dtype=`` form belongs to
     W4A4_MXFP4 and dequantizes differently.
     """
+    group_list = group_list.to(torch.int64)
     if input_scale is None:
         x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
             input,
