@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     get_hash_str,
@@ -300,18 +300,19 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(KVCacheEventMixin, BasePrefixCache):
+class RadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
-        self.enable_kv_cache_events = params.enable_kv_cache_events
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -371,7 +372,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=self.root_node,
             best_match_node=self.root_node,
         )
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -614,7 +615,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-            self._record_remove_event(x)
+            self.kv_events.record_remove(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -785,7 +786,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
-            self._record_store_event(new_node)
+            self.kv_events.record_store(new_node)
             node = new_node
         return total_prefix_length, node
 

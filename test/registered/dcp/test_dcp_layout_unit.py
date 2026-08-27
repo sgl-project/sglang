@@ -22,7 +22,10 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import (
+    filter_dcp_local_chunk_kv_indices,
+    get_dcp_lens,
+)
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -45,6 +48,97 @@ def _owner_count(length: int, n: int, rank: int, start: int) -> int:
 def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
     """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
     return (length - rank - 1) // n + 1
+
+
+class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
+    PAGE = 64
+
+    def _build_chunk(self, starts, lens, dcp_size, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        widened = self.PAGE * dcp_size
+        runs = []
+        for start, length in zip(starts, lens):
+            if length == 0:
+                runs.append(torch.empty(0, dtype=torch.int64))
+                continue
+            pos = torch.arange(start, start + length)
+            page_of = pos // widened
+            bases = (
+                torch.randint(0, 64, (int(page_of.max()) + 1,), generator=g) * widened
+            )
+            runs.append(bases[page_of] + pos % widened)
+        return torch.cat(runs) if runs else torch.empty(0, dtype=torch.int64)
+
+    def _owner_rule(self, kv, dcp_size, dcp_rank):
+        return kv[kv % dcp_size == dcp_rank] // dcp_size
+
+    def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
+        kv = self._build_chunk(starts, lens, dcp_size, seed)
+        with rc.get_parallel().override(
+            dcp_enabled=dcp_size > 1, dcp_size=dcp_size, dcp_rank=dcp_rank
+        ):
+            got = filter_dcp_local_chunk_kv_indices(
+                kv, torch.tensor(starts), torch.tensor(lens)
+            )
+        return kv, got
+
+    def test_matches_owner_rule_on_unaligned_runs(self):
+        cases = [
+            ([0], [1]),
+            ([0, 0], [2048, 2048]),
+            ([8192], [3]),
+            ([5, 13, 31], [7, 0, 19]),
+            ([1365, 1365, 1365], [1365, 1365, 1365]),
+            ([43690, 43690], [43690, 17]),
+            ([7, 7, 7, 7, 7], [11, 13, 0, 1, 40]),
+        ]
+        for dcp_size in [2, 3, 4, 8]:
+            for dcp_rank in range(dcp_size):
+                for i, (starts, lens) in enumerate(cases):
+                    kv, got = self._run(starts, lens, dcp_size, dcp_rank, seed=i)
+                    torch.testing.assert_close(
+                        got,
+                        self._owner_rule(kv, dcp_size, dcp_rank),
+                        msg=f"size={dcp_size} rank={dcp_rank} "
+                        f"starts={starts} lens={lens}",
+                    )
+
+    def test_row_count_matches_get_dcp_lens(self):
+        starts, lens = [1365, 2730, 0], [1365, 900, 37]
+        for dcp_size in [2, 3, 4, 8]:
+            for dcp_rank in range(dcp_size):
+                _, got = self._run(starts, lens, dcp_size, dcp_rank)
+                expected = get_dcp_lens(
+                    torch.tensor(lens), dcp_size, dcp_rank, start=torch.tensor(starts)
+                )
+                self.assertEqual(
+                    got.numel(),
+                    int(expected.sum()),
+                    f"size={dcp_size} rank={dcp_rank}",
+                )
+
+    def test_second_chunk_at_batch_three(self):
+        starts, lens = [2730, 2730, 2730], [1365, 1365, 1365]
+        for dcp_rank in range(8):
+            kv, got = self._run(starts, lens, 8, dcp_rank)
+            torch.testing.assert_close(got, self._owner_rule(kv, 8, dcp_rank))
+            naive = kv[dcp_rank::8] // 8
+            self.assertNotEqual(
+                got.numel(),
+                naive.numel(),
+                f"rank={dcp_rank}: phase-free stride happens to match here, "
+                f"so this case no longer guards the phase term",
+            )
+
+    def test_identity_without_dcp(self):
+        kv = torch.arange(37)
+        with rc.get_parallel().override(dcp_enabled=False, dcp_size=1, dcp_rank=0):
+            self.assertIs(
+                filter_dcp_local_chunk_kv_indices(
+                    kv, torch.tensor([0]), torch.tensor([37])
+                ),
+                kv,
+            )
 
 
 class TestGetDcpLens(CustomTestCase):

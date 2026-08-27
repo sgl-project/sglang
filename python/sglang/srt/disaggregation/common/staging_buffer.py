@@ -13,7 +13,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import List, Optional, Tuple
 
@@ -21,11 +20,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
-_USE_TRITON_STAGING = not bool(os.environ.get("SGLANG_STAGING_USE_TORCH", ""))
+_USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
 
 
 @triton.jit
@@ -255,10 +256,6 @@ class StagingAllocator:
     def get_offset(self, alloc_id: int) -> int:
         offset, _, _ = self.allocations[alloc_id]
         return offset
-
-    def get_round(self, alloc_id: int) -> int:
-        _, _, rnd = self.allocations[alloc_id]
-        return rnd
 
     def get_base_ptr(self) -> int:
         return self.base_ptr

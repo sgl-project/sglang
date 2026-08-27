@@ -9,7 +9,7 @@ scheduler/test_scheduler_control.py.
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,7 +28,10 @@ class _FakeReq:
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
         self.to_finish = None
+        self.beam_group = None
         self._finished = is_finished
+        self.output_ids = []
+        self.weight_version_events = []
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -50,10 +53,19 @@ def _scheduler(waiting_queue):
     s.waiting_queue = waiting_queue
     s.enable_hicache_storage = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+    s.beam_coordinator = MagicMock()
     return s
 
 
 class TestWaitingTimeout(CustomTestCase):
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_drops_only_reqs_past_the_deadline(self):
         now = time.perf_counter()
         stale = _req("stale", wait_entry=now - 10)
