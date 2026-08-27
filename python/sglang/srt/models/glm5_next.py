@@ -135,6 +135,7 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+_GLM_AITER_FUSED_MHC_LOGGED = False
 
 
 @torch.compile
@@ -759,6 +760,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                hc_attn_to_mlp=(self.hc_attn_to_mlp if _use_aiter_gfx95 else None),
             )
             if self.dsa_enable_prefill_cp:
                 self.layer_communicator = MHCHybridDSACPLayerCommunicator(
@@ -823,6 +825,58 @@ class Glm5NextDecoderLayer(nn.Module):
             h_post=h_post,
             h_res=h_res,
             hc_mult=self.config.hc_mult,
+        )
+
+    def hc_attn_to_mlp(
+        self,
+        hidden_states,
+        residual,
+        h_res,
+        h_post,
+        out_norm_weight,
+        out_norm_eps,
+    ):
+        """Fuse attention mHC post with FFN mHC pre on AITER gfx95."""
+        global _GLM_AITER_FUSED_MHC_LOGGED
+
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+            apply_mhc_post_pre_boundary,
+        )
+
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return None
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            layer_input=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post=h_post.view(num_tokens, hc_mult),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult),
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=2.0,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            fn_transpose=True,
+        )
+        if fused is None:
+            return None
+        if not _GLM_AITER_FUSED_MHC_LOGGED:
+            logger.info("Using fused AITER mHC attention-to-FFN boundary")
+            _GLM_AITER_FUSED_MHC_LOGGED = True
+
+        next_residual, layer_input, next_h_post, next_h_res, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.view(num_tokens, -1),
+            next_h_res.reshape(num_tokens, hc_mult * hc_mult),
+            next_h_post.reshape(num_tokens, hc_mult),
+            norm_fused,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
