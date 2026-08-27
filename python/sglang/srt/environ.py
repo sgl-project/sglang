@@ -316,6 +316,11 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Spread the offloaded Qwen4-Exp PLE table over all NUMA nodes instead of
+    # letting it land entirely on the node local to the GPU. The GPU reads the
+    # table over PCIe, so node locality buys nothing while a node-local table
+    # can exhaust a small node. Set to 0 to keep the plain node-local pinning.
+    SGLANG_PLE_OFFLOAD_NUMA_INTERLEAVE = EnvBool(True)
     # Select the QSA sparse decode backend. Auto uses Triton on SM120 and the
     # flash-attention fallback on other architectures.
     SGLANG_QSA_DECODE_BACKEND = EnvStr("auto")

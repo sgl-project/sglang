@@ -71,9 +71,16 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
+    ple_pinned_mapping,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, is_sm120_supported, logger
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_hip,
+    is_sm120_supported,
+    is_sm121,
+    logger,
+)
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -98,6 +105,10 @@ def _ple_table_is_fp8(
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         return quant_config.resolve_quant_algo(prefix) == "FP8"
     return False
+
+
+def _should_interleave_ple_table() -> bool:
+    return is_sm120_supported() and not is_sm121()
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -849,7 +860,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"rows{self.shard_indices.org_vocab_start_index}"
                 f"-{self.shard_indices.org_vocab_end_index}"
             ),
+            interleave=_should_interleave_ple_table(),
         )
+        # A pinned table spread over the NUMA nodes keeps its mapping here; the
+        # tensor points into it, so it has to outlive this module.
+        self._pinned_buffer = ple_pinned_mapping(host_table)
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
