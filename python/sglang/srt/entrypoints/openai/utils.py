@@ -1,12 +1,5 @@
 import logging
-from typing import (
-    Any,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Union,
-)
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 
