@@ -5,19 +5,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyAssertionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
 
 use crate::components::{ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
-use crate::node::NodeId;
+use crate::node::{NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, InsertParams, InsertResult,
-    InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer,
-    PoolTransferResult, Req, UnifiedTreeCore,
+    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
+    EvictionStepResult, InsertParams, InsertResult, InsertStepResult, MatchPrefixParams,
+    MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
@@ -50,6 +50,23 @@ fn parse_component_type(component_type: u8) -> PyResult<ComponentType> {
             "unknown component type: {other}"
         ))),
     }
+}
+
+/// Map the Python EvictLayer IntFlag value onto the Rust enum.
+fn parse_evict_layer(target: u8) -> PyResult<EvictLayer> {
+    match target {
+        1 => Ok(EvictLayer::Device),
+        2 => Ok(EvictLayer::Host),
+        3 => Ok(EvictLayer::All),
+        other => Err(PyValueError::new_err(format!(
+            "unknown eviction layer: {other}"
+        ))),
+    }
+}
+
+/// Convert an expected tree-core contract failure without unwinding through PyO3.
+fn tree_core_runtime_error(error: TreeCoreRuntimeError) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
 }
 
 /// Map the Rust enum back onto the Python ComponentType value.
@@ -242,6 +259,31 @@ type TransferArgs = (
     Option<Vec<String>>,
     String,
 );
+
+/// Strongly typed, attribute-based input view of a Python MatchResult.
+/// Cache actions are intentionally omitted: component finalizers only update
+/// match metadata, while the test adapter preserves the original actions.
+#[derive(FromPyObject)]
+struct InspectionMatchResultInput {
+    #[pyo3(attribute)]
+    device_indices: PyTensor,
+    #[pyo3(attribute)]
+    last_device_node: NodeId,
+    #[pyo3(attribute)]
+    last_host_node: NodeId,
+    #[pyo3(attribute)]
+    best_match_node: NodeId,
+    #[pyo3(attribute)]
+    host_hit_length: usize,
+    #[pyo3(attribute)]
+    swa_host_hit_length: usize,
+    #[pyo3(attribute)]
+    mamba_host_hit_length: usize,
+    #[pyo3(attribute)]
+    mamba_branching_seqlen: Option<usize>,
+    #[pyo3(attribute)]
+    full_kv_hit_length: usize,
+}
 
 /// Map a python CacheTransferPhase value onto the Rust enum.
 fn parse_transfer_phase(phase: &str) -> PyResult<CacheTransferPhase> {
@@ -694,6 +736,16 @@ pub struct HostEvictionResultBinding {
     new_host_frees: Py<PyDict>,
 }
 
+impl HostEvictionResultBinding {
+    fn from_eviction_step(py: Python<'_>, result: EvictionStepResult) -> PyResult<Self> {
+        Ok(Self {
+            tracker: tracker_to_py(result.tracker),
+            new_device_frees: frees_to_py(py, result.device_frees)?,
+            new_host_frees: frees_to_py(py, result.host_frees)?,
+        })
+    }
+}
+
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
 struct TreeCoreBinding<K: ChildKeyType> {
@@ -825,7 +877,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             chunked: params.chunked,
             priority: params.priority,
         };
-        let result = py.allow_threads(move || self.core().insert(&params));
+        let result = py
+            .allow_threads(move || self.core().try_insert(&params))
+            .map_err(tree_core_runtime_error)?;
         InsertResultBinding::from_insert_result(py, result)
     }
 
@@ -854,13 +908,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             chunked: params.chunked,
             priority: params.priority,
         };
-        let step = py.allow_threads(move || self.core().begin_insert(&params));
+        let step = py
+            .allow_threads(move || self.core().try_begin_insert(&params))
+            .map_err(tree_core_runtime_error)?;
         InsertStepResultBinding::from_insert_step(py, step)
     }
 
     /// Continue the suspended insert after its step actions were applied.
     fn resume_insert(&self, py: Python<'_>) -> PyResult<InsertStepResultBinding> {
-        let step = py.allow_threads(|| self.core().resume_insert());
+        let step = py
+            .allow_threads(|| self.core().try_resume_insert())
+            .map_err(tree_core_runtime_error)?;
         InsertStepResultBinding::from_insert_step(py, step)
     }
 
@@ -1561,6 +1619,363 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(py.allow_threads(|| self.core().component_has_host_value_only(node_id, ct)))
     }
 
+    // ==== Test-only inspection surface ====
+
+    fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
+        py.allow_threads(|| self.core().inspect_contains_node(node_id))
+    }
+
+    fn inspect_get_parent_node_id(&self, py: Python<'_>, node_id: NodeId) -> Option<NodeId> {
+        py.allow_threads(|| self.core().inspect_get_parent_node_id(node_id))
+    }
+
+    fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<NodeId> {
+        py.allow_threads(|| self.core().inspect_get_child_node_ids(node_id))
+    }
+
+    fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> usize {
+        py.allow_threads(|| self.core().inspect_get_node_key_length(node_id))
+    }
+
+    fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<i64> {
+        py.allow_threads(|| self.core().inspect_get_node_token_ids(node_id))
+    }
+
+    fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> bool {
+        py.allow_threads(|| self.core().inspect_is_node_key_bigram(node_id))
+    }
+
+    fn inspect_get_component_host_value(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<Option<PyTensor>> {
+        let component_type = parse_component_type(component_type)?;
+        Ok(py
+            .allow_threads(|| {
+                self.core()
+                    .inspect_get_component_host_value(node_id, component_type)
+            })
+            .map(PyTensor))
+    }
+
+    fn inspect_get_component_device_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<u32> {
+        let component_type = parse_component_type(component_type)?;
+        Ok(py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_device_lock_ref(node_id, component_type)
+        }))
+    }
+
+    fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> i64 {
+        py.allow_threads(|| self.core().inspect_get_node_hit_count(node_id))
+    }
+
+    fn inspect_get_write_through_pending_id(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> Option<usize> {
+        py.allow_threads(|| self.core().inspect_get_write_through_pending_id(node_id))
+    }
+
+    fn inspect_is_node_in_device_lru(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<bool> {
+        let component_type = parse_component_type(component_type)?;
+        Ok(py.allow_threads(|| {
+            self.core()
+                .inspect_is_node_in_device_lru(node_id, component_type)
+        }))
+    }
+
+    fn inspect_is_node_in_host_lru(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<bool> {
+        let component_type = parse_component_type(component_type)?;
+        Ok(py.allow_threads(|| {
+            self.core()
+                .inspect_is_node_in_host_lru(node_id, component_type)
+        }))
+    }
+
+    fn inspect_get_component_device_lru_node_ids(
+        &self,
+        py: Python<'_>,
+        component_type: u8,
+    ) -> PyResult<Vec<NodeId>> {
+        let component_type = parse_component_type(component_type)?;
+        Ok(py.allow_threads(|| {
+            self.core()
+                .inspect_get_component_device_lru_node_ids(component_type)
+        }))
+    }
+
+    fn inspect_is_device_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+        py.allow_threads(|| self.core().inspect_is_device_evictable_leaf(node_id))
+    }
+
+    fn inspect_is_host_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+        py.allow_threads(|| self.core().inspect_is_host_evictable_leaf(node_id))
+    }
+
+    fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+        py.allow_threads(|| self.core().inspect_is_device_leaf(node_id))
+    }
+
+    fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
+        py.allow_threads(|| self.core().inspect_get_all_node_ids())
+    }
+
+    fn inspect_component_protected_size(
+        &self,
+        py: Python<'_>,
+        component_type: u8,
+    ) -> PyResult<usize> {
+        let component_type = parse_component_type(component_type)?;
+        Ok(py.allow_threads(|| self.core().inspect_component_protected_size(component_type)))
+    }
+
+    fn inspect_set_node_hash_values(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        hash_values: Option<Vec<String>>,
+    ) {
+        py.allow_threads(move || {
+            self.core()
+                .inspect_set_node_hash_values(node_id, hash_values)
+        });
+    }
+
+    fn inspect_set_component_device_value_raw(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        value: Option<PyTensor>,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        let value = value.map(|value| value.0);
+        py.allow_threads(move || {
+            self.core()
+                .inspect_set_component_device_value_raw(node_id, component_type, value)
+        });
+        Ok(())
+    }
+
+    fn inspect_set_component_host_value_raw(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        value: Option<PyTensor>,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        let value = value.map(|value| value.0);
+        py.allow_threads(move || {
+            self.core()
+                .inspect_set_component_host_value_raw(node_id, component_type, value)
+        });
+        Ok(())
+    }
+
+    fn inspect_set_component_device_lock_ref(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        lock_ref: u32,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_set_component_device_lock_ref(node_id, component_type, lock_ref)
+        });
+        Ok(())
+    }
+
+    fn inspect_remove_node_from_device_lru(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_remove_node_from_device_lru(node_id, component_type)
+        });
+        Ok(())
+    }
+
+    fn inspect_insert_node_into_host_lru(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_insert_node_into_host_lru(node_id, component_type)
+        });
+        Ok(())
+    }
+
+    fn inspect_set_component_evictable_size(
+        &self,
+        py: Python<'_>,
+        component_type: u8,
+        value: usize,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_set_component_evictable_size(component_type, value)
+        });
+        Ok(())
+    }
+
+    fn inspect_set_component_protected_size(
+        &self,
+        py: Python<'_>,
+        component_type: u8,
+        value: usize,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_set_component_protected_size(component_type, value)
+        });
+        Ok(())
+    }
+
+    fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) {
+        py.allow_threads(|| self.core().inspect_update_duplicate_tracking(node_id));
+    }
+
+    fn inspect_evict_component(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        target: u8,
+    ) -> PyResult<HostEvictionResultBinding> {
+        let component_type = parse_component_type(component_type)?;
+        let target = parse_evict_layer(target)?;
+        let result = py.allow_threads(|| {
+            self.core()
+                .inspect_evict_component(node_id, component_type, target)
+        });
+        HostEvictionResultBinding::from_eviction_step(py, result)
+    }
+
+    fn inspect_validate_cascade_evict(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        component_type: u8,
+        target: u8,
+    ) -> PyResult<()> {
+        let component_type = parse_component_type(component_type)?;
+        let target = parse_evict_layer(target)?;
+        py.allow_threads(|| {
+            self.core()
+                .inspect_validate_cascade_evict(node_id, component_type, target)
+        })
+        .map_err(PyAssertionError::new_err)
+    }
+
+    fn inspect_cleanup_tombstone_ancestors(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<HostEvictionResultBinding> {
+        let result = py.allow_threads(|| self.core().inspect_cleanup_tombstone_ancestors(node_id));
+        HostEvictionResultBinding::from_eviction_step(py, result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_finalize_component_match_result(
+        &self,
+        py: Python<'_>,
+        component_type: u8,
+        result: InspectionMatchResultInput,
+        key: &Bound<'_, PyAny>,
+        extra_key: Option<String>,
+        value_chunks: Vec<PyTensor>,
+        best_value_len: usize,
+    ) -> PyResult<MatchResultBinding> {
+        let component_type = parse_component_type(component_type)?;
+        let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
+        let InspectionMatchResultInput {
+            device_indices,
+            last_device_node: last_device_node_id,
+            last_host_node: last_host_node_id,
+            best_match_node: best_match_node_id,
+            host_hit_length,
+            swa_host_hit_length,
+            mamba_host_hit_length,
+            mamba_branching_seqlen,
+            full_kv_hit_length,
+        } = result;
+        let result = MatchResult {
+            device_indices: device_indices.0,
+            last_device_node_id,
+            last_host_node_id,
+            best_match_node_id,
+            host_hit_length,
+            swa_host_hit_length,
+            mamba_host_hit_length,
+            mamba_branching_seqlen,
+            full_kv_hit_length,
+            cache_actions: Vec::new(),
+        };
+        let value_chunks = value_chunks
+            .into_iter()
+            .map(|value| value.0)
+            .collect::<Vec<_>>();
+        let result = py.allow_threads(move || {
+            let params = MatchPrefixParams {
+                key: &key,
+                extra_key: extra_key.as_deref(),
+            };
+            self.core().inspect_finalize_component_match_result(
+                component_type,
+                result,
+                &params,
+                &value_chunks,
+                best_value_len,
+            )
+        });
+        MatchResultBinding::from_match_result(py, result)
+    }
+
+    fn inspect_build_backup_node_ids(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        write_back: bool,
+    ) -> Vec<NodeId> {
+        py.allow_threads(|| {
+            self.core()
+                .inspect_build_backup_node_ids(node_id, write_back)
+        })
+    }
+
     /// Print the tree structure for debugging.
     fn pretty_print(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().pretty_print());
@@ -2088,6 +2503,302 @@ macro_rules! tree_core_binding {
             ) -> PyResult<bool> {
                 self.inner
                     .component_has_host_value_only(py, node_id, component_type)
+            }
+
+            // ==== Test-only inspection surface ====
+
+            fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                self.inner.inspect_contains_node(py, node_id)
+            }
+
+            fn inspect_get_parent_node_id(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> Option<NodeId> {
+                self.inner.inspect_get_parent_node_id(py, node_id)
+            }
+
+            fn inspect_get_child_node_ids(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> Vec<NodeId> {
+                self.inner.inspect_get_child_node_ids(py, node_id)
+            }
+
+            fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> usize {
+                self.inner.inspect_get_node_key_length(py, node_id)
+            }
+
+            fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<i64> {
+                self.inner.inspect_get_node_token_ids(py, node_id)
+            }
+
+            fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                self.inner.inspect_is_node_key_bigram(py, node_id)
+            }
+
+            fn inspect_get_component_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<PyTensor>> {
+                self.inner
+                    .inspect_get_component_host_value(py, node_id, component_type)
+            }
+
+            fn inspect_get_component_device_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<u32> {
+                self.inner
+                    .inspect_get_component_device_lock_ref(py, node_id, component_type)
+            }
+
+            fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> i64 {
+                self.inner.inspect_get_node_hit_count(py, node_id)
+            }
+
+            fn inspect_get_write_through_pending_id(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> Option<usize> {
+                self.inner
+                    .inspect_get_write_through_pending_id(py, node_id)
+            }
+
+            fn inspect_is_node_in_device_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<bool> {
+                self.inner
+                    .inspect_is_node_in_device_lru(py, node_id, component_type)
+            }
+
+            fn inspect_is_node_in_host_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<bool> {
+                self.inner
+                    .inspect_is_node_in_host_lru(py, node_id, component_type)
+            }
+
+            fn inspect_get_component_device_lru_node_ids(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+            ) -> PyResult<Vec<NodeId>> {
+                self.inner
+                    .inspect_get_component_device_lru_node_ids(py, component_type)
+            }
+
+            fn inspect_is_device_evictable_leaf(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> bool {
+                self.inner.inspect_is_device_evictable_leaf(py, node_id)
+            }
+
+            fn inspect_is_host_evictable_leaf(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> bool {
+                self.inner.inspect_is_host_evictable_leaf(py, node_id)
+            }
+
+            fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                self.inner.inspect_is_device_leaf(py, node_id)
+            }
+
+            fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
+                self.inner.inspect_get_all_node_ids(py)
+            }
+
+            fn inspect_component_protected_size(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+            ) -> PyResult<usize> {
+                self.inner
+                    .inspect_component_protected_size(py, component_type)
+            }
+
+            #[pyo3(signature = (node_id, hash_values = None))]
+            fn inspect_set_node_hash_values(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                hash_values: Option<Vec<String>>,
+            ) {
+                self.inner
+                    .inspect_set_node_hash_values(py, node_id, hash_values)
+            }
+
+            #[pyo3(signature = (node_id, component_type, value = None))]
+            fn inspect_set_component_device_value_raw(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                value: Option<PyTensor>,
+            ) -> PyResult<()> {
+                self.inner.inspect_set_component_device_value_raw(
+                    py,
+                    node_id,
+                    component_type,
+                    value,
+                )
+            }
+
+            #[pyo3(signature = (node_id, component_type, value = None))]
+            fn inspect_set_component_host_value_raw(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                value: Option<PyTensor>,
+            ) -> PyResult<()> {
+                self.inner.inspect_set_component_host_value_raw(
+                    py,
+                    node_id,
+                    component_type,
+                    value,
+                )
+            }
+
+            fn inspect_set_component_device_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                lock_ref: u32,
+            ) -> PyResult<()> {
+                self.inner.inspect_set_component_device_lock_ref(
+                    py,
+                    node_id,
+                    component_type,
+                    lock_ref,
+                )
+            }
+
+            fn inspect_remove_node_from_device_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<()> {
+                self.inner
+                    .inspect_remove_node_from_device_lru(py, node_id, component_type)
+            }
+
+            fn inspect_insert_node_into_host_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<()> {
+                self.inner
+                    .inspect_insert_node_into_host_lru(py, node_id, component_type)
+            }
+
+            fn inspect_set_component_evictable_size(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                value: usize,
+            ) -> PyResult<()> {
+                self.inner
+                    .inspect_set_component_evictable_size(py, component_type, value)
+            }
+
+            fn inspect_set_component_protected_size(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                value: usize,
+            ) -> PyResult<()> {
+                self.inner
+                    .inspect_set_component_protected_size(py, component_type, value)
+            }
+
+            fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) {
+                self.inner.inspect_update_duplicate_tracking(py, node_id)
+            }
+
+            fn inspect_evict_component(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                target: u8,
+            ) -> PyResult<HostEvictionResultBinding> {
+                self.inner
+                    .inspect_evict_component(py, node_id, component_type, target)
+            }
+
+            fn inspect_validate_cascade_evict(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                target: u8,
+            ) -> PyResult<()> {
+                self.inner
+                    .inspect_validate_cascade_evict(py, node_id, component_type, target)
+            }
+
+            fn inspect_cleanup_tombstone_ancestors(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<HostEvictionResultBinding> {
+                self.inner
+                    .inspect_cleanup_tombstone_ancestors(py, node_id)
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            #[pyo3(signature = (component_type, result, key, extra_key, value_chunks, best_value_len))]
+            fn inspect_finalize_component_match_result(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                result: InspectionMatchResultInput,
+                key: &Bound<'_, PyAny>,
+                extra_key: Option<String>,
+                value_chunks: Vec<PyTensor>,
+                best_value_len: usize,
+            ) -> PyResult<MatchResultBinding> {
+                self.inner.inspect_finalize_component_match_result(
+                    py,
+                    component_type,
+                    result,
+                    key,
+                    extra_key,
+                    value_chunks,
+                    best_value_len,
+                )
+            }
+
+            #[pyo3(signature = (node_id, write_back = false))]
+            fn inspect_build_backup_node_ids(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                write_back: bool,
+            ) -> Vec<NodeId> {
+                self.inner
+                    .inspect_build_backup_node_ids(py, node_id, write_back)
             }
 
             /// Print the tree structure for debugging.

@@ -8,6 +8,7 @@ from array import array
 
 import pytest
 import torch
+from unified_tree_core_inspection_interface import UnifiedTreeCoreInspectionInterface
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -52,6 +53,7 @@ def _pump_insert(core, params):
 def test_registry_resolves_the_rust_backend_lazily():
     core = _tree_core()
     assert type(core).__name__ == "RustUnifiedTreeCore"
+    assert not isinstance(core, UnifiedTreeCoreInspectionInterface)
 
 
 def test_insert_then_match_round_trips():

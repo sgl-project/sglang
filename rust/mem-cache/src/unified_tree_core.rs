@@ -15,7 +15,7 @@ use crate::node::ChildKeyType;
 use crate::node::EvictableNodeSet;
 use crate::node::Node;
 use crate::node::NodeArena;
-use crate::node::{NUM_VALUE_SLOTS, NodeId, NodeIdx_, ValueSlotIdx};
+use crate::node::{NUM_VALUE_SLOTS, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_lru_list::UnifiedLRUList;
 use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strategy};
 
@@ -1151,27 +1151,44 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Insert device values to the tree per the provided key.
     pub fn insert(&mut self, params: &InsertParams<'_, K>) -> InsertResult {
+        self.try_insert(params)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`Self::insert`].
+    pub fn try_insert(
+        &mut self,
+        params: &InsertParams<'_, K>,
+    ) -> Result<InsertResult, TreeCoreRuntimeError> {
         // Single-shot pump over the resumable walk: run every step inline and
         // fold the step actions into the result for the caller to apply.
         let mut actions = Vec::new();
-        let mut step = self.begin_insert(params);
+        let mut step = self.try_begin_insert(params)?;
         loop {
             actions.append(&mut step.actions);
             if let Some(mut result) = step.result {
                 result.cache_actions = actions;
-                return result;
+                return Ok(result);
             }
-            step = self.resume_insert();
+            step = self.try_resume_insert()?;
         }
     }
 
     /// Start the insert, running to its first barrier or completion.
     pub fn begin_insert(&mut self, params: &InsertParams<'_, K>) -> InsertStepResult {
+        self.try_begin_insert(params)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`Self::begin_insert`].
+    pub fn try_begin_insert(
+        &mut self,
+        params: &InsertParams<'_, K>,
+    ) -> Result<InsertStepResult, TreeCoreRuntimeError> {
         // Insert walks are single-flight; a live walk means re-entrancy.
-        assert!(
-            self.ongoing_insert_walk_state.is_none(),
-            "concurrent insert walks"
-        );
+        if self.ongoing_insert_walk_state.is_some() {
+            return Err(TreeCoreRuntimeError::ConcurrentInsertWalk);
+        }
         // Bigram view conversion happens at the boundary; the key arrives typed.
         let aligned_key_len = params.key.atom_len() / self.page_size * self.page_size;
         if aligned_key_len == 0 {
@@ -1182,7 +1199,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 let node = self.arena.node_mut(root_id);
                 node.priority = node.priority.max(params.priority);
             }
-            return InsertStepResult {
+            return Ok(InsertStepResult {
                 actions: Vec::new(),
                 result: Some(InsertResult {
                     prefix_len: 0,
@@ -1191,7 +1208,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     mamba_exist: true,
                     cache_actions: Vec::new(),
                 }),
-            };
+            });
         }
         let root_id = self.arena.root();
         self.touch_node_(root_id);
@@ -1218,16 +1235,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             result: None,
             pending_actions: Vec::new(),
         });
-        self.advance_insert_()
+        Ok(self.advance_insert_())
     }
 
     /// Continue the suspended insert after its step actions were executed.
     pub fn resume_insert(&mut self) -> InsertStepResult {
-        assert!(
-            self.ongoing_insert_walk_state.is_some(),
-            "no in-flight insert"
-        );
-        self.advance_insert_()
+        self.try_resume_insert()
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`Self::resume_insert`].
+    pub fn try_resume_insert(&mut self) -> Result<InsertStepResult, TreeCoreRuntimeError> {
+        if self.ongoing_insert_walk_state.is_none() {
+            return Err(TreeCoreRuntimeError::NoInFlightInsert);
+        }
+        Ok(self.advance_insert_())
     }
 
     /// Whether an insert walk is suspended at a barrier.
@@ -2115,48 +2137,26 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
 
         let trigger_component = self.component_by_type_(trigger_component_type);
-        let trigger_component_priority = trigger_component.eviction_priority(is_leaf);
-        let trigger_component_internal_priority =
+        let trigger_priority = trigger_component.eviction_priority(is_leaf);
+        let trigger_internal_priority =
             trigger_component.eviction_priority(/* is_leaf = */ false);
 
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
             let ct = component.component_type();
-            if component.eviction_priority(is_leaf) > trigger_component_priority
-                || ct == trigger_component_type
-                || !components::node_has_component_data(&self.arena, node_id, ct, target)
-            {
+            let should_evict = self
+                .should_cascade_evict_component_(
+                    node_id,
+                    trigger_component_type,
+                    component.as_ref(),
+                    target,
+                    is_leaf,
+                    trigger_priority,
+                    trigger_internal_priority,
+                )
+                .unwrap_or_else(|message| panic!("{message}"));
+            if !should_evict {
                 continue;
-            }
-            let node = self.arena.node(node_id);
-            let lock_ref = node.values[ct.idx()].lock_ref;
-            let host_lock_ref = node.host_lock_ref(ct);
-            // A comp whose TRUE internal priority outranks the trigger
-            // is only in this loop because leaf-collapse flattened
-            // priorities; a lock on it is a legit pin and must be
-            // spared. A lock on a strictly-lower-priority tier is a
-            // real strand — fall through to the assert below.
-            if component.eviction_priority(/* is_leaf = */ false)
-                >= trigger_component_internal_priority
-            {
-                if target == EvictLayer::Device && lock_ref != 0 {
-                    continue;
-                }
-                if target == EvictLayer::Host && host_lock_ref != 0 {
-                    continue;
-                }
-            }
-            if target == EvictLayer::Device {
-                assert!(
-                    lock_ref == 0,
-                    "cascade_evict_: a {ct:?} device lock strands node {node_id}"
-                );
-            }
-            if target == EvictLayer::Host {
-                assert!(
-                    host_lock_ref == 0,
-                    "cascade_evict_: a {ct:?} host lock strands node {node_id}"
-                );
             }
             self.evict_component_and_detach_lru_(
                 node_id,
@@ -2176,6 +2176,63 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         self.update_evictable_leaf_sets_(node_id);
+    }
+
+    /// Decide whether one component participates in a cascade eviction.
+    ///
+    /// Lock violations are returned instead of panicking so the inspection
+    /// binding can translate them to Python ``AssertionError``. Production
+    /// cascade eviction converts the same error back into its existing panic.
+    fn should_cascade_evict_component_(
+        &self,
+        node_id: NodeIdx_,
+        trigger_component_type: ComponentType,
+        component: &dyn TreeComponent<K>,
+        target: EvictLayer,
+        is_leaf: bool,
+        trigger_priority: i64,
+        trigger_internal_priority: i64,
+    ) -> Result<bool, String> {
+        let component_type = component.component_type();
+        if component.eviction_priority(is_leaf) > trigger_priority
+            || component_type == trigger_component_type
+        {
+            return Ok(false);
+        }
+
+        let node = self.arena.node(node_id);
+        let has_target_data = match target {
+            EvictLayer::Device => node.has_device_value(component_type),
+            EvictLayer::Host | EvictLayer::All => node.has_host_value(component_type),
+        };
+        if !has_target_data {
+            return Ok(false);
+        }
+
+        let lock_ref = node.device_lock_ref(component_type);
+        let host_lock_ref = node.host_lock_ref(component_type);
+        // A component whose true internal priority outranks the trigger is
+        // present only because leaf-collapse flattened priorities. Its lock is
+        // a legitimate pin; a lower-priority component's lock is a strand.
+        if component.eviction_priority(/* is_leaf = */ false) >= trigger_internal_priority {
+            if target.contains(EvictLayer::Device) && lock_ref != 0 {
+                return Ok(false);
+            }
+            if target.contains(EvictLayer::Host) && host_lock_ref != 0 {
+                return Ok(false);
+            }
+        }
+        if target.contains(EvictLayer::Device) && lock_ref != 0 {
+            return Err(format!(
+                "cascade_evict_: a {component_type:?} device lock strands node {node_id}"
+            ));
+        }
+        if target.contains(EvictLayer::Host) && host_lock_ref != 0 {
+            return Err(format!(
+                "cascade_evict_: a {component_type:?} host lock strands node {node_id}"
+            ));
+        }
+        Ok(true)
     }
 
     /// Unlink a leaf from its parent.
@@ -3479,6 +3536,360 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             stack.extend(self.arena.node(node_id).children.values().copied());
         }
         nodes
+    }
+
+    // ==== Test-only inspection support ====
+    //
+    // These methods expose owned snapshots or deliberate white-box operations
+    // for the backend-neutral Python test suite. They add no persistent state
+    // and are not used by the production TreeCore interface.
+
+    /// Whether the external node handle is currently live.
+    pub fn inspect_contains_node(&self, node_id: NodeId) -> bool {
+        self.arena.try_resolve(node_id).is_some()
+    }
+
+    /// The parent node's external handle, or None for the root.
+    pub fn inspect_get_parent_node_id(&self, node_id: NodeId) -> Option<NodeId> {
+        let node_id = self.arena.resolve(node_id);
+        self.arena
+            .node(node_id)
+            .try_parent()
+            .map(|parent_id| self.arena.node(parent_id).id)
+    }
+
+    /// A materialized snapshot of the node's child handles.
+    pub fn inspect_get_child_node_ids(&self, node_id: NodeId) -> Vec<NodeId> {
+        let node_id = self.arena.resolve(node_id);
+        self.arena
+            .node(node_id)
+            .children
+            .values()
+            .map(|&child_id| self.arena.node(child_id).id)
+            .collect()
+    }
+
+    /// Logical radix-key length in key atoms.
+    pub fn inspect_get_node_key_length(&self, node_id: NodeId) -> usize {
+        self.arena.node(self.arena.resolve(node_id)).key.atom_len()
+    }
+
+    /// Materialized raw token ids spanned by the node key.
+    pub fn inspect_get_node_token_ids(&self, node_id: NodeId) -> Vec<i64> {
+        K::raw_token_ids(self.arena.node(self.arena.resolve(node_id)).key.as_ref()).into_owned()
+    }
+
+    /// Whether this core's key representation uses overlapping bigrams.
+    pub fn inspect_is_node_key_bigram(&self, node_id: NodeId) -> bool {
+        let node = self.arena.node(self.arena.resolve(node_id));
+        !node.is_root() && K::IS_BIGRAM
+    }
+
+    /// A shallow tensor snapshot of a component's host value.
+    pub fn inspect_get_component_host_value(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> Option<Tensor> {
+        self.assert_component_enabled_(component_type);
+        self.arena
+            .node(self.arena.resolve(node_id))
+            .try_host_value(component_type)
+            .map(Tensor::shallow_clone)
+    }
+
+    /// A component's device lock count on a node.
+    pub fn inspect_get_component_device_lock_ref(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> u32 {
+        self.assert_component_enabled_(component_type);
+        self.arena
+            .node(self.arena.resolve(node_id))
+            .device_lock_ref(component_type)
+    }
+
+    /// A node's accumulated match count.
+    pub fn inspect_get_node_hit_count(&self, node_id: NodeId) -> i64 {
+        self.arena.node(self.arena.resolve(node_id)).hit_count
+    }
+
+    /// A node's in-flight write-through acknowledgement id.
+    pub fn inspect_get_write_through_pending_id(&self, node_id: NodeId) -> Option<usize> {
+        self.arena
+            .node(self.arena.resolve(node_id))
+            .write_through_pending_id
+    }
+
+    /// Whether a node is in a component's device LRU.
+    pub fn inspect_is_node_in_device_lru(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> bool {
+        if self.try_component_by_type_(component_type).is_none() {
+            return false;
+        }
+        self.device_lru_list(component_type)
+            .in_list(Some(self.arena.resolve(node_id)))
+    }
+
+    /// Whether a node is in a component's host LRU.
+    pub fn inspect_is_node_in_host_lru(
+        &self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) -> bool {
+        if self.try_component_by_type_(component_type).is_none() {
+            return false;
+        }
+        self.host_lru_list(component_type)
+            .in_list(Some(self.arena.resolve(node_id)))
+    }
+
+    /// Materialize a component's device LRU from most to least recent.
+    pub fn inspect_get_component_device_lru_node_ids(
+        &self,
+        component_type: ComponentType,
+    ) -> Vec<NodeId> {
+        if self.try_component_by_type_(component_type).is_none() {
+            return Vec::new();
+        }
+        self.device_lru_list(component_type)
+            .snapshot_node_ids()
+            .into_iter()
+            .map(|node_id| self.arena.node(node_id).id)
+            .collect()
+    }
+
+    /// Whether a live node belongs to the device-evictable leaf set.
+    pub fn inspect_is_device_evictable_leaf(&self, node_id: NodeId) -> bool {
+        self.arena
+            .try_resolve(node_id)
+            .is_some_and(|node_id| self.evictable_device_leaves.contains(node_id))
+    }
+
+    /// Whether a live node belongs to the host-evictable leaf set.
+    pub fn inspect_is_host_evictable_leaf(&self, node_id: NodeId) -> bool {
+        self.arena
+            .try_resolve(node_id)
+            .is_some_and(|node_id| self.evictable_host_leaves.contains(node_id))
+    }
+
+    /// Whether the node is currently eligible as a Full device leaf.
+    pub fn inspect_is_device_leaf(&self, node_id: NodeId) -> bool {
+        let node_id = self.arena.resolve(node_id);
+        let node = self.arena.node(node_id);
+        if node.is_root() || node.evicted() || node.is_device_locked() {
+            return false;
+        }
+        !node
+            .children
+            .values()
+            .any(|&child_id| self.arena.has_device_value(child_id, FULL))
+    }
+
+    /// Materialize every live tree node handle.
+    pub fn inspect_get_all_node_ids(&self) -> Vec<NodeId> {
+        self.collect_all_nodes_()
+            .into_iter()
+            .map(|node_id| self.arena.node(node_id).id)
+            .collect()
+    }
+
+    /// Protected token count for one component.
+    pub fn inspect_component_protected_size(&self, component_type: ComponentType) -> usize {
+        self.component_protected_size(component_type)
+    }
+
+    /// Replace a node's hash chain without updating other bookkeeping.
+    pub fn inspect_set_node_hash_values(
+        &mut self,
+        node_id: NodeId,
+        hash_values: Option<Vec<String>>,
+    ) {
+        let node_id = self.arena.resolve(node_id);
+        self.arena.node_mut(node_id).hash_value = hash_values;
+    }
+
+    /// Replace a component's device value without updating bookkeeping.
+    pub fn inspect_set_component_device_value_raw(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        value: Option<Tensor>,
+    ) {
+        self.assert_component_enabled_(component_type);
+        let node_id = self.arena.resolve(node_id);
+        self.arena
+            .node_mut(node_id)
+            .state_mut_(ValueSlotIdx::device(component_type))
+            .value = value;
+    }
+
+    /// Replace a component's host value without updating bookkeeping.
+    pub fn inspect_set_component_host_value_raw(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        value: Option<Tensor>,
+    ) {
+        self.assert_component_enabled_(component_type);
+        let node_id = self.arena.resolve(node_id);
+        self.arena
+            .node_mut(node_id)
+            .state_mut_(ValueSlotIdx::host(component_type))
+            .value = value;
+    }
+
+    /// Replace a component's device lock count without updating bookkeeping.
+    pub fn inspect_set_component_device_lock_ref(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        lock_ref: u32,
+    ) {
+        self.assert_component_enabled_(component_type);
+        let node_id = self.arena.resolve(node_id);
+        self.arena
+            .node_mut(node_id)
+            .set_lock_ref_(ValueSlotIdx::device(component_type), lock_ref);
+    }
+
+    /// Remove a node from a component's device LRU.
+    pub fn inspect_remove_node_from_device_lru(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) {
+        self.assert_component_enabled_(component_type);
+        let node_id = self.arena.resolve(node_id);
+        self.device_lru_list_mut(component_type)
+            .remove_node(node_id);
+    }
+
+    /// Insert a node as a component's most-recent host-LRU entry.
+    pub fn inspect_insert_node_into_host_lru(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+    ) {
+        self.assert_component_enabled_(component_type);
+        let node_id = self.arena.resolve(node_id);
+        self.host_lru_list_mut(component_type).insert_mru(node_id);
+    }
+
+    /// Replace a component's evictable-device token count.
+    pub fn inspect_set_component_evictable_size(
+        &mut self,
+        component_type: ComponentType,
+        value: usize,
+    ) {
+        self.assert_component_enabled_(component_type);
+        self.component_state_mut(component_type).evictable_size = value;
+    }
+
+    /// Replace a component's protected-device token count.
+    pub fn inspect_set_component_protected_size(
+        &mut self,
+        component_type: ComponentType,
+        value: usize,
+    ) {
+        self.assert_component_enabled_(component_type);
+        self.component_state_mut(component_type).protected_size = value;
+    }
+
+    /// Refresh Full device/host duplicate tracking for a node.
+    pub fn inspect_update_duplicate_tracking(&mut self, node_id: NodeId) {
+        let node_id = self.arena.resolve(node_id);
+        self.update_full_coexisting_host_tracking_(node_id);
+    }
+
+    /// Evict one component layer and detach the corresponding LRU entry.
+    pub fn inspect_evict_component(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        target: EvictLayer,
+    ) -> EvictionStepResult {
+        self.assert_component_enabled_(component_type);
+        let node_id = self.arena.resolve(node_id);
+        let mut result = EvictionStepResult::default();
+        self.evict_component_and_detach_lru_(
+            node_id,
+            component_type,
+            &mut result.device_frees,
+            &mut result.host_frees,
+            target,
+            Some(&mut result.tracker),
+        );
+        result
+    }
+
+    /// Validate component locks for a cascade without mutating the tree.
+    pub fn inspect_validate_cascade_evict(
+        &self,
+        node_id: NodeId,
+        trigger_component_type: ComponentType,
+        target: EvictLayer,
+    ) -> Result<(), String> {
+        self.assert_component_enabled_(trigger_component_type);
+        let node_id = self.arena.resolve(node_id);
+        let is_leaf = match target {
+            EvictLayer::Device => self.evictable_device_leaves.contains(node_id),
+            EvictLayer::Host => self.evictable_host_leaves.contains(node_id),
+            EvictLayer::All => false,
+        };
+        let trigger_component = self.component_by_type_(trigger_component_type);
+        let trigger_priority = trigger_component.eviction_priority(is_leaf);
+        let trigger_internal_priority =
+            trigger_component.eviction_priority(/* is_leaf = */ false);
+        for component in &self.components {
+            self.should_cascade_evict_component_(
+                node_id,
+                trigger_component_type,
+                component.as_ref(),
+                target,
+                is_leaf,
+                trigger_priority,
+                trigger_internal_priority,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Delete childless tombstone ancestors starting at `node_id`.
+    pub fn inspect_cleanup_tombstone_ancestors(&mut self, node_id: NodeId) -> EvictionStepResult {
+        let node_id = self.arena.resolve(node_id);
+        let mut result = EvictionStepResult::default();
+        self.iteratively_delete_tombstone_leaf_(
+            node_id,
+            &mut result.tracker,
+            &mut result.device_frees,
+            &mut result.host_frees,
+        );
+        result
+    }
+
+    /// Run one component's real match-result finalizer.
+    pub fn inspect_finalize_component_match_result(
+        &self,
+        component_type: ComponentType,
+        result: MatchResult,
+        params: &MatchPrefixParams<'_, K>,
+        value_chunks: &[Tensor],
+        best_value_len: usize,
+    ) -> MatchResult {
+        self.component_by_type_(component_type)
+            .finalize_match_result_in_tree_core(self, result, params, value_chunks, best_value_len)
+    }
+
+    /// Build the ordered device-to-host backup node list.
+    pub fn inspect_build_backup_node_ids(&self, node_id: NodeId, write_back: bool) -> Vec<NodeId> {
+        let node_id = self.arena.resolve(node_id);
+        self.build_backup_kv_action_(self.arena.node(node_id), write_back)
+            .node_ids
     }
 
     /// Print the tree structure for debugging.

@@ -272,6 +272,20 @@ impl UnifiedLRUList {
         self.len
     }
 
+    /// Materialize the current members from most to least recent.
+    ///
+    /// Inspection callers need an owned snapshot across the Python boundary;
+    /// the linked-list iterator itself never escapes the Rust core.
+    pub(crate) fn snapshot_node_ids(&self) -> Vec<NodeIdx_> {
+        let mut node_ids = Vec::with_capacity(self.len);
+        let mut cell = self.cell_(HEAD).next;
+        while cell != TAIL {
+            node_ids.push(Self::node_of_(cell));
+            cell = self.cell_(cell).next;
+        }
+        node_ids
+    }
+
     // ==== Test-only conveniences ====
 
     /// The members, MRU to LRU.

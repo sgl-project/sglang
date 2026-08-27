@@ -863,7 +863,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
         # Insert walks are single-flight; a live walk means re-entrancy.
-        assert self._ongoing_insert_walk_state is None, "concurrent insert walks"
+        if self._ongoing_insert_walk_state is not None:
+            raise RuntimeError("concurrent insert walks")
         key = params.key
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
@@ -900,7 +901,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""
-        assert self._ongoing_insert_walk_state is not None, "no in-flight insert"
+        if self._ongoing_insert_walk_state is None:
+            raise RuntimeError("no in-flight insert")
         return self._advance_insert()
 
     def has_ongoing_insert(self) -> bool:

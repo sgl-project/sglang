@@ -1,6 +1,6 @@
 //! Rust radix tree core for SGLang's KV cache, exposed to Python as `mem_cache`.
-// Panics mirror the Python tree-core invariants.
-// TODO: Convert boundary panics to PyErr and remove the related lint allowances.
+// TODO(Jialin): Replace recoverable panics with explicit Rust errors and map
+// them to PyErr at the Python boundary.
 #![allow(
     dead_code,
     unsafe_op_in_unsafe_fn,

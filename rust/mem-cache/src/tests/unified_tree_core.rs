@@ -6656,18 +6656,26 @@ fn walk_backup_crossing_suspends_then_resume_completes() {
 }
 
 #[test]
-#[should_panic(expected = "concurrent insert walks")]
-fn begin_insert_rejects_a_concurrent_walk() {
+fn try_begin_insert_rejects_a_concurrent_walk() {
     let (mut tc, _, step) = suspended_walk_core();
     assert!(step.result.is_none());
-    let _ = tc.begin_insert(&insert_params(&vec![9], &[90]));
+    assert!(matches!(
+        tc.try_begin_insert(&insert_params(&vec![9], &[90])),
+        Err(TreeCoreRuntimeError::ConcurrentInsertWalk)
+    ));
+    assert!(matches!(
+        tc.try_insert(&insert_params(&vec![9], &[90])),
+        Err(TreeCoreRuntimeError::ConcurrentInsertWalk)
+    ));
 }
 
 #[test]
-#[should_panic(expected = "no in-flight insert")]
-fn resume_insert_without_a_walk_panics() {
+fn try_resume_insert_rejects_a_missing_walk() {
     let mut tc = core();
-    let _ = tc.resume_insert();
+    assert!(matches!(
+        tc.try_resume_insert(),
+        Err(TreeCoreRuntimeError::NoInFlightInsert)
+    ));
 }
 
 #[test]

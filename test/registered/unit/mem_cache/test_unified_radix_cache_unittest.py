@@ -100,6 +100,15 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
 
+# A dedicated test entry point overrides this without changing the process-wide
+# production backend selection. Direct Python-core tests in this module remain
+# Python-only; every fixture-backed cache test is shared by both inspectors.
+_TREE_CORE_TEST_BACKEND: Optional[str] = None
+
+
+def _selected_tree_core_test_backend() -> str:
+    return _TREE_CORE_TEST_BACKEND or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+
 
 @dataclass(frozen=True)
 class CacheConfig:
@@ -555,15 +564,25 @@ def build_fixture(
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
     )
-    selected_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+    selected_backend = _selected_tree_core_test_backend()
     if selected_backend == "python":
-        with mock.patch.dict(
-            _TREE_CORE_REGISTRY,
-            {
-                "python": lambda params, components: UnifiedTreeCoreInspector(
-                    params, components
-                )
-            },
+
+        def inspector_factory(params, components):
+            return UnifiedTreeCoreInspector(params, components)
+
+    elif selected_backend == "rust":
+        from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+
+        def inspector_factory(params, _components):
+            return RustUnifiedTreeCoreInspector(params)
+
+    else:
+        inspector_factory = None
+
+    if inspector_factory is not None:
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(selected_backend),
+            mock.patch.dict(_TREE_CORE_REGISTRY, {selected_backend: inspector_factory}),
         ):
             cache = UnifiedRadixCache(params=cache_init_params)
     else:
@@ -4941,15 +4960,17 @@ class UnifiedRadixCacheSuite:
         # device present -> CoW source is the device value (host backup irrelevant)
         cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, dev)
         cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, None)
-        self.assertIs(
-            cache.tree_core.get_component_device_value(node, ComponentType.MAMBA),
-            dev,
+        device_value = cache.tree_core.get_component_device_value(
+            node, ComponentType.MAMBA
         )
+        self.assertIsNotNone(device_value)
+        self.assertTrue(torch.equal(device_value, dev))
         cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, host)
-        self.assertIs(
-            cache.tree_core.get_component_device_value(node, ComponentType.MAMBA),
-            dev,
+        device_value = cache.tree_core.get_component_device_value(
+            node, ComponentType.MAMBA
         )
+        self.assertIsNotNone(device_value)
+        self.assertTrue(torch.equal(device_value, dev))
         # device evicted -> nothing to CoW from
         cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
         self.assertIsNone(
@@ -5825,6 +5846,8 @@ class UnifiedRadixCacheSuite:
                     last_host_node=leaf,
                     best_match_node=leaf,
                     host_hit_length=0,
+                    cache_protected_len=7,
+                    cache_actions=(FreeDeviceKV(indices=[]),),
                 )
                 result = cache.tree_core.finalize_component_match_result(
                     ComponentType.SWA,
@@ -5837,6 +5860,8 @@ class UnifiedRadixCacheSuite:
                 )
                 self.assertEqual(result.host_hit_length, 0)
                 self.assertEqual(result.swa_host_hit_length, expected)
+                self.assertEqual(result.cache_protected_len, 7)
+                self.assertEqual(result.cache_actions, (FreeDeviceKV(indices=[]),))
 
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
         """LOAD_BACK commit must:
@@ -7112,13 +7137,23 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         )
         step = cache.tree_core.begin_insert(params)
         self.assertIsNone(step.result)
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(RuntimeError, "concurrent insert walks"):
             cache.tree_core.begin_insert(params)
         cache.tree_core.end_insert()
+
+    def test_resume_insert_rejects_missing_walk(self):
+        cache, _, _ = build_fixture(self.cfg)
+        with self.assertRaisesRegex(RuntimeError, "no in-flight insert"):
+            cache.tree_core.resume_insert()
 
     def test_insert_abort_drains_pending_deferred_frees(self):
         """A mid-insert failure after a deferred dup-free accumulated must still
         return those slots to the allocator via the end_insert drain."""
+        if _selected_tree_core_test_backend() == "rust":
+            # TODO(Jialin): Remove this skip in a later commit in this PR once
+            # the Rust backend can exercise the same insert-abort path.
+            self.skipTest("patches the Python Full component implementation")
+
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
 

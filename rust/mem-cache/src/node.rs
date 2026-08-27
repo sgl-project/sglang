@@ -556,6 +556,12 @@ pub struct ValueState {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum TreeCoreRuntimeError {
+    /// `begin_insert`/`insert` called while a resumable insert is suspended.
+    #[error("concurrent insert walks")]
+    ConcurrentInsertWalk,
+    /// `resume_insert` called without a suspended insert.
+    #[error("no in-flight insert")]
+    NoInFlightInsert,
     /// A `NodeIdx_` beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]
@@ -593,6 +599,10 @@ pub trait ChildKeyType:
     + From<Vec<Self::Atom>>
 {
     type Atom: Copy + Eq + Hash + Send + Sync;
+
+    /// Whether this key represents overlapping token bigrams rather than
+    /// individual tokens. This is type metadata, not per-node state.
+    const IS_BIGRAM: bool;
 
     /// The key over the boundary's raw token ids; ownership passes straight
     /// through, so the unigram key never copies.
@@ -684,6 +694,7 @@ fn hash_word(token_id: i64) -> u32 {
 
 impl ChildKeyType for Vec<i64> {
     type Atom = i64;
+    const IS_BIGRAM: bool = false;
 
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
         token_ids
@@ -700,6 +711,7 @@ impl ChildKeyType for Vec<i64> {
 
 impl ChildKeyType for Vec<(i64, i64)> {
     type Atom = (i64, i64);
+    const IS_BIGRAM: bool = true;
 
     /// N+1 raw token ids become N overlapping (t_i, t_{i+1}) bigram atoms.
     fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
