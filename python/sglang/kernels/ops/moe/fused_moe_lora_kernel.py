@@ -8,10 +8,12 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.utils.common import is_blackwell_supported, is_sm90_supported
+from sglang.srt.utils.common import is_blackwell_supported, is_hip, is_sm90_supported
 
 # Import SGLang's standard PDL support detection
 
+
+_IS_HIP = is_hip()
 
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -206,6 +208,18 @@ def _fused_moe_lora_kernel(
         tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
 
 
+def _pipelined_num_stages(num_stages: int, dtype: torch.dtype) -> int:
+    # On gfx950 the Triton pipeliner rewrites this loop's operand loads into
+    # direct-to-LDS async copies, and the backend then fails to legalize them
+    # for 32-bit operands: the LoRA weight base pointer is loaded from the
+    # runtime pointer table, so it carries no divisibility information and the
+    # copy vectorizes to one element, which is too narrow to write LDS
+    # coalesced. Running those unpipelined keeps the loop compilable.
+    if _IS_HIP and dtype.itemsize == 4:
+        return 1
+    return num_stages
+
+
 @torch.inference_mode()
 def _fused_moe_lora_shrink(
     a_intermediate_cache1: torch.Tensor,
@@ -249,7 +263,7 @@ def _fused_moe_lora_shrink(
         "BLOCK_SIZE_K": block_size_k,
         "GROUP_SIZE_M": group_size_m,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_stages": _pipelined_num_stages(num_stages, qcurr_hidden_states.dtype),
         "SPLIT_K": split_k,
         "USE_GDC": use_gdc,
         "launch_pdl": use_gdc,  # triton kernel metadata
@@ -358,7 +372,7 @@ def _fused_moe_lora_expand(
         "BLOCK_SIZE_K": block_size_k,
         "GROUP_SIZE_M": group_size_m,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_stages": _pipelined_num_stages(num_stages, a_intermediate_cache1.dtype),
         "SPLIT_K": split_k,  # Set split_k = 1 for expand calls
         "USE_GDC": use_gdc,
         "launch_pdl": use_gdc,  # triton kernel metadata
