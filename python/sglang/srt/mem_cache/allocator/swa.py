@@ -319,9 +319,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
+        # Resolve the SWA side first, even when the full side is deferred: the
+        # SWA slot this full index maps to right now is the one this call owns.
+        # A cache action later in the same group may re-point the full index at
+        # a different SWA slot (see free_swa).
+        self.free_swa(free_index)
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
         assert (
@@ -360,27 +364,41 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if not self.is_not_in_free_group:
             # Resolve ownership now. A cache action later in this group may
-            # install a new mapping for the same full index.
+            # install a new mapping for the same full index. The unmapped
+            # entries are dropped once for the whole group in free_group_end:
+            # the mask is data-dependent, so filtering per call would sync.
             self.swa_free_group.append(swa_indices)
             return
 
-        self.swa_attn_allocator.free(swa_indices)
+        self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
 
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
 
     def free_group_end(self):
-        super().free_group_end()
+        # Both sides were resolved at enqueue time, so the flush only returns
+        # physical slots. This deliberately does not call the base
+        # implementation, which would route the batched full indices back
+        # through free() and re-read a mapping that no longer describes them.
+        self.is_not_in_free_group = True
+        if self.free_group:
+            free_group = self.free_group
+            self.free_group = []
+            self.full_attn_allocator.free(torch.cat(free_group))
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            self.swa_attn_allocator.free(torch.cat(swa_free_group))
+            swa_indices = torch.cat(swa_free_group)
+            self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
@@ -483,6 +501,21 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return kv_indices
 
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        # There is no second pool to point at: the mapping is the identity, and
+        # attention reads it through `register_mapping`. Editing it would make a
+        # slot resolve to the padding row for the rest of the process.
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator has no full->SWA mapping to rewrite"
+        )
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator has no full->SWA mapping to clear"
+        )
+
     def alloc(self, need_size: int):
         assert self.page_size == 1
         return self.swa_attn_allocator.alloc(need_size)
@@ -520,8 +553,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.free_group.append(self._copy_for_free_group(free_index))
 
     def free_group_begin(self):
-        self.is_not_in_free_group = False
-        self.free_group = []
+        super().free_group_begin()
 
     def free_group_end(self):
         self.is_not_in_free_group = True
