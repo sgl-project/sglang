@@ -319,10 +319,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        # Resolve the SWA side first, even when the full side is deferred: the
-        # SWA slot this full index maps to right now is the one this call owns.
-        # A cache action later in the same group may re-point the full index at
-        # a different SWA slot (see free_swa).
+        # This call owns the SWA slot the full index maps to right now:
+        # a cache action later in the same group may re-point it (see free_swa).
         self.free_swa(free_index)
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
@@ -368,9 +366,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if not self.is_not_in_free_group:
             # Resolve ownership now. A cache action later in this group may
-            # install a new mapping for the same full index. The unmapped
-            # entries are dropped once for the whole group in free_group_end:
-            # the mask is data-dependent, so filtering per call would sync.
+            # install a new mapping for the same full index. Unmapped entries
+            # are dropped in free_group_end: the mask is data-dependent, so
+            # filtering per call would synchronize.
             self.swa_free_group.append(swa_indices)
             return
 
@@ -382,9 +380,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_group_end(self):
         # Both sides were resolved at enqueue time, so the flush only returns
-        # physical slots. This deliberately does not call the base
-        # implementation, which would route the batched full indices back
-        # through free() and re-read a mapping that no longer describes them.
+        # physical slots; routing the batch back through free() would re-read a
+        # mapping that no longer describes it.
         self.is_not_in_free_group = True
         if self.free_group:
             free_group = self.free_group
@@ -504,9 +501,8 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        # There is no second pool to point at: the mapping is the identity, and
-        # attention reads it through `register_mapping`. Editing it would make a
-        # slot resolve to the padding row for the rest of the process.
+        # The identity mapping is registered with the KV pool and read by the
+        # attention kernels; editing it resolves a slot to the padding row.
         raise NotImplementedError(
             "PureSWATokenToKVPoolAllocator has no full->SWA mapping to rewrite"
         )

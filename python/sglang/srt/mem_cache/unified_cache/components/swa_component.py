@@ -1171,8 +1171,7 @@ class SWAComponent(TreeComponent):
                 alloc.set_full_to_swa_mapping(full, swa)
             return
         if isinstance(action, RecoverSWAWithLockedFull):
-            # Keep the locked full; remap it onto the SWA slots this action took
-            # ownership of when it was emitted, freeing only the incoming full.
+            # Keep the locked full, free only the incoming full.
             alloc.set_full_to_swa_mapping(action.kept_full, action.swa_value)
             alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.full_attn_allocator.free(action.incoming_full)

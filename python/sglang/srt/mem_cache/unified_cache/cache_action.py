@@ -85,9 +85,8 @@ class RecoverSWAWithLockedFull(ComponentAction, frozen=True):
     """Recover an SWA tombstone whose full is locked: keep the locked full, remap it
     onto the incoming full's SWA translation, and free only the incoming full.
 
-    ``swa_value`` is resolved when the action is emitted, not when it is applied:
-    ownership of those SWA slots transfers to this action at emit time, and a
-    later action in the same barrier may clear the incoming full's mapping.
+    ``swa_value`` is resolved at emit time: a later action in the same barrier
+    may clear the incoming full's mapping.
     """
 
     node_id: NodeId

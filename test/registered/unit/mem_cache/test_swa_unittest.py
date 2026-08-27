@@ -358,7 +358,6 @@ class TestSWA(unittest.TestCase):
         )
 
     def _build_two_mapped_slots(self, page_size=1):
-        """Two allocated full slots, each with its own SWA peer."""
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
             page_size=page_size,
@@ -425,8 +424,7 @@ class TestSWA(unittest.TestCase):
 
         self._run_remap_during_free_group(allocator, old_full, new_full, new_swa)
 
-        # Exactly one SWA slot changed hands, and every slot the pool still
-        # counts as in use must remain reachable through the mapping.
+        # Every slot the pool counts as in use must stay reachable via the mapping.
         self.assertEqual(allocator.swa_available_size(), swa_available_before + 1)
         mapped = allocator.full_to_swa_index_mapping[:-1]
         num_mapped = int((mapped > 0).sum().item())
@@ -488,8 +486,6 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(allocator.available_size(), available_before + 2)
 
     def test_pure_swa_rejects_mapping_edits(self):
-        # The identity mapping is registered with the KV pool and read by the
-        # attention kernels; editing it would resolve slots to the padding row.
         allocator = _build_pure_swa_allocator()
         indices = allocator.alloc(2)
         with self.assertRaises(NotImplementedError):

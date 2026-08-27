@@ -249,10 +249,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    # Free grouping is a batching optimization; this allocator opts out because
-    # `free_hisparse` must return the device-buffer slots before the HiSparse
-    # coordinator observes the mapping again. Both hooks are no-ops so `free`
-    # below can stay unconditional.
+    # This allocator does not participate in free groups; both hooks are no-ops.
     def free_group_begin(self):
         return
 
