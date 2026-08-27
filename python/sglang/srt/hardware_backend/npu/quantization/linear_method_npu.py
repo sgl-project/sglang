@@ -182,14 +182,20 @@ class NPUOnlineW4A4Int4LinearMethod(_NPUOnlineIntegerLinearMethod):
         return _apply_w4a4_dynamic_linear(layer=layer, x=x, bias=bias)
 
 
-def get_npu_online_linear_method() -> Optional[LinearMethodBase]:
+_W4A4_LINEAR_PROJECTIONS = frozenset({"gate_proj", "up_proj", "gate_up_proj"})
+
+
+def get_npu_online_linear_method(prefix: str = "") -> Optional[LinearMethodBase]:
     spec = get_npu_online_integer_quant_spec()
     if spec is None:
         return None
-    return {
-        "w8a8_int8": NPUOnlineW8A8Int8LinearMethod,
-        "w4a4_int4": NPUOnlineW4A4Int4LinearMethod,
-    }[spec.mode]()
+
+    projection = prefix.rsplit(".", 1)[-1]
+    if projection == "lm_head":
+        return None
+    if spec.mode == "w4a4_int4" and projection in _W4A4_LINEAR_PROJECTIONS:
+        return NPUOnlineW4A4Int4LinearMethod()
+    return NPUOnlineW8A8Int8LinearMethod()
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):

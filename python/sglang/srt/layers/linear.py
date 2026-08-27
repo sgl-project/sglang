@@ -190,7 +190,7 @@ class LinearBase(torch.nn.Module):
                     get_npu_online_linear_method,
                 )
 
-                self.quant_method = get_npu_online_linear_method()
+                self.quant_method = get_npu_online_linear_method(prefix=prefix)
             if self.quant_method is None:
                 from sglang.srt.layers.quantization.unquant import (
                     UnquantizedLinearMethod,
