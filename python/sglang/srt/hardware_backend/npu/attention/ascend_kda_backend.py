@@ -181,6 +181,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
+        # setting activation_mode to 1 means using SiLU activation after conv.
         qkv = torch.ops.npu.causal_conv1d(
             mixed_qkv.contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
