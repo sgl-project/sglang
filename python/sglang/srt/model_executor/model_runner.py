@@ -824,7 +824,7 @@ class ModelRunner:
 
     @property
     def preloaded_weights_bytes(self) -> int:
-        value = getattr(self.loader, "preloaded_weights_bytes", 0)
+        value = self.loader.preloaded_weights_bytes
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(
                 "ModelLoader.preloaded_weights_bytes must be a non-negative int, "
