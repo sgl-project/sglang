@@ -281,6 +281,7 @@ class ReqToTokenPool:
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -303,33 +304,74 @@ class ReqToTokenPool:
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
-        need_size = len(reqs) - len(reusing)
-        if need_size > len(self.free_slots):
+        select_index = self.alloc_rows(len(reqs) - len(reusing))
+        if select_index is None:
             return None
-        if need_size > 0:
-            # Pop from the tail: O(need_size), unlike a prefix pop which is
-            # O(len(free_slots)).
-            select_index = self.free_slots[-need_size:]
-            del self.free_slots[-need_size:]
-        else:
-            # Handled separately: free_slots[-0:] is the entire list, not [].
-            select_index = []
         offset = 0
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def alloc_rows(self, need_size: int) -> Optional[List[int]]:
+        """Take need_size rows and bump their generation, with no Req bound to
+        them. alloc() layers Req binding on top; beam member rows have no Req."""
+        if need_size > len(self.free_slots):
+            return None
+        if need_size == 0:
+            # Handled separately: free_slots[-0:] is the entire list, not [].
+            return []
+        # Pop from the tail: O(need_size), unlike a prefix pop which is
+        # O(len(free_slots)).
+        select_index = self.free_slots[-need_size:]
+        del self.free_slots[-need_size:]
+        self.req_generation[select_index] += 1
+        return select_index
+
+    def free_rows(self, indices: List[int]) -> None:
+        # Per-row, so beam member rows release their aux entries too: they reach
+        # alloc_aux_to_lengths via the decode batch's req_pool_indices_cpu.
+        if self._aux_cache is not None:
+            for index in indices:
+                self._aux_cache.free(index)
+        self.free_slots.extend(indices)
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
+        self.free_rows([req.req_pool_idx])
         req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        if self._aux_cache is not None:
+            self._aux_cache.clear()
+
+    def attach_aux_cache(self, aux_cache: Any) -> None:
+        assert self._aux_cache is None
+        self._aux_cache = aux_cache
+
+    def reset_aux_cache_allocator(self) -> None:
+        if self._aux_cache is not None:
+            self._aux_cache.reset_allocator()
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        if self._aux_cache is None:
+            return physical_capacity
+        return self._aux_cache.dense_capacity
+
+    def alloc_aux_to_lengths(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        target_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        if self._aux_cache is not None:
+            self._aux_cache.alloc_to_lengths(
+                req_pool_indices_cpu=req_pool_indices_cpu,
+                target_seq_lens_cpu=target_seq_lens_cpu,
+            )
 
 
 class MambaPool:
@@ -1628,6 +1670,9 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
+    # state lives on the request pool instead, and the caller has to move it.
+    cpu_copy_carries_mamba: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -3653,6 +3698,8 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
 
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
+
+    cpu_copy_carries_mamba = True
 
     def __init__(
         self,

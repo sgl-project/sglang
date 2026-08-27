@@ -26,6 +26,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
+from sglang.srt.runtime_context import (
+    get_parallel,
+)
 from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 
@@ -143,10 +146,10 @@ async def get_loads(
         "version": __version__,
         "accelerator": _accelerator_name(),
         "num_accelerators": _num_accelerators_per_dp_rank(
-            tokenizer_manager.server_args.tp_size,
-            tokenizer_manager.server_args.pp_size,
-            tokenizer_manager.server_args.dp_size,
-            tokenizer_manager.server_args.enable_dp_attention,
+            get_parallel().config.tp_size,
+            get_parallel().config.pp_size,
+            get_parallel().config.dp_size,
+            get_parallel().config.enable_dp_attention,
         ),
         "loads": loads,
     }

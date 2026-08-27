@@ -1,0 +1,104 @@
+name: Release Docker Images Nightly (CUDA 13.4 Rubin)
+#
+# Builds and publishes nightly CUDA 13.4 / Rubin (sm_107) images from
+# docker/Dockerfile.cu134, aarch64 only:
+#   - lmsysorg/sglang:nightly-cu134-{date}-{sha}
+#   - lmsysorg/sglang:nightly-cu134
+#
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
+      docker_target:
+        description: "Dockerfile stage to build and publish."
+        required: false
+        default: "runtime"
+      build_only:
+        description: "Build and validate without logging in or pushing."
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Offset from the other nightly docker builds; this one runs long.
+    - cron: "0 10 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-arm64:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: arm-docker-build-node
+    environment: ${{ (github.event_name == 'schedule' || !inputs.build_only) && 'prod' || null }}
+    # Cold builds recompile three CUDA wheels from source.
+    timeout-minutes: 360
+
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          date_tag="$(date +%Y%m%d)"
+          commit_hash="$(git rev-parse --short=7 HEAD)"
+          image_repo="${{ inputs.image_repo || 'lmsysorg/sglang' }}"
+          echo "image_repo=${image_repo}"                                  >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-cu134-${date_tag}-${commit_hash}"              >> "$GITHUB_OUTPUT"
+          echo "tag_rolling=nightly-cu134"                                 >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'schedule' || !inputs.build_only
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --builder default \
+            --progress=plain \
+            --platform linux/arm64 \
+            --target "${{ inputs.docker_target || 'runtime' }}" \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg BUILD_TYPE=all \
+            --build-arg BUILD_JOBS="$(nproc)" \
+            -f docker/Dockerfile.cu134 \
+            -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
+            -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" \
+            .
+
+      - name: Push image
+        if: github.event_name == 'schedule' || !inputs.build_only
+        run: |
+          set -euo pipefail
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in 30s"
+              sleep 30
+            done
+            return 1
+          }
+          push_with_retry "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}"
+          push_with_retry "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}"
+
+      - name: Cleanup local images
+        if: always()
+        run: |
+          docker rmi -f "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" || true
+          docker rmi -f "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" || true
