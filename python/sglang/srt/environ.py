@@ -886,6 +886,8 @@ class Envs:
     SGLANG_NPU_FUSED_COLLECTIVE_MATMUL = EnvBool(False)
     # Hide K3 shared-expert reduce-scatter under the routed latent tail.
     SGLANG_NPU_OVERLAP_SHARED_RS = EnvBool(False)
+    # Collapse the two bf16 K3 expert-tail adds into one NPU kernel.
+    SGLANG_NPU_FUSED_ADD3 = EnvBool(False)
     # Fuse K3 latent RMSNorm with the dynamic-int8 quantization for up-proj.
     SGLANG_NPU_FUSED_RMS_QUANT = EnvBool(False)
     # Overlap the K3 router gate/top-k with the quantized latent down projection.

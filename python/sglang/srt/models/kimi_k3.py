@@ -420,6 +420,11 @@ def _add3(
     True when their producers are at least two kernels back."""
     if c is None:
         return a + b
+    if _is_npu and envs.SGLANG_NPU_FUSED_ADD3.get():
+        from sgl_kernel_npu.moe.add3 import add3_bf16, add3_bf16_covered
+
+        if add3_bf16_covered(a, b, c):
+            return add3_bf16(a, b, c)
     from sglang.kernels.ops.elementwise import add3
 
     if not add3.covered(a, b, c):
