@@ -6778,10 +6778,17 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import (
             _moe_runner_backend_quant_constraints,
             _moe_runner_fusion_disable,
+            _routed_experts_capture_backend_guard,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _moe_runner_backend_quant_constraints)
+        # Must follow every moe_runner_backend resolution (arch overrides and
+        # the quant constraints above): routed-experts capture requires a
+        # topk-id-materializing runner, so a bypassing pick (e.g. the SM100
+        # flashinfer_trtllm default from _deepseek_moe_quant_resolution) is
+        # downgraded or rejected here.
+        run_post_process_pass(self, _routed_experts_capture_backend_guard)
 
         view = resolved_view(self)
         if view.moe_runner_backend == "flashinfer_cutlass":
