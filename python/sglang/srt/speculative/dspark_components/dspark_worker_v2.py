@@ -834,6 +834,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 commit_lens=accept.commit_lens,
                 bs=bs,
                 run_compact=run_compact,
+                hidden_is_projected=(
+                    run_compact
+                    and can_run_cuda_graph
+                    and epilogue is not None
+                    and epilogue.projects_hidden
+                ),
             )
         logits_output.hidden_states = None
 

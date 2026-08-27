@@ -42,6 +42,7 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor] = None,
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        hidden_is_projected: bool = False,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -80,18 +81,26 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+                hidden_is_projected=hidden_is_projected,
             )
             return
 
         with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
-                target_hidden=target_hidden,
+            kwargs = dict(
                 pool=pool,
                 positions=positions,
                 cache_loc=cache_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
             )
+            if hidden_is_projected:
+                self.draft_model.write_projected_target_hidden_kv(
+                    ctx_hidden=target_hidden, **kwargs
+                )
+            else:
+                self.draft_model.write_target_hidden_kv(
+                    target_hidden=target_hidden, **kwargs
+                )
 
     def _inject_mla(
         self,
@@ -104,6 +113,7 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        hidden_is_projected: bool = False,
     ) -> None:
         if is_unified_kv_triton():
             swa_loc = self._unified_inject_loc(
@@ -127,12 +137,20 @@ class TargetHiddenKvInjector:
                 )
 
         with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
-                main_hidden=target_hidden,
-                swa_loc=swa_loc,
-                positions=positions,
-                pool=pool,
-            )
+            if hidden_is_projected:
+                self.draft_model.write_projected_target_hidden_kv(
+                    main_x=target_hidden,
+                    swa_loc=swa_loc,
+                    positions=positions,
+                    pool=pool,
+                )
+            else:
+                self.draft_model.write_target_hidden_kv(
+                    main_hidden=target_hidden,
+                    swa_loc=swa_loc,
+                    positions=positions,
+                    pool=pool,
+                )
 
     def _unified_inject_loc(
         self,
@@ -179,6 +197,7 @@ class TargetHiddenKvInjector:
         hidden_strided: torch.Tensor,
         commit_lens: torch.Tensor,
         bs: int,
+        hidden_is_projected: bool = False,
     ) -> None:
         stride = self.verify_num_draft_tokens
         prefix_lens = batch.seq_lens
@@ -208,12 +227,20 @@ class TargetHiddenKvInjector:
                     stride=stride,
                 )
             with torch.inference_mode():
-                self.draft_model.write_target_hidden_kv(
-                    main_hidden=hidden.reshape(-1, hidden.shape[-1]),
-                    swa_loc=inject_layout.swa_loc,
-                    positions=inject_layout.positions,
-                    pool=pool,
-                )
+                if hidden_is_projected:
+                    self.draft_model.write_projected_target_hidden_kv(
+                        main_x=hidden.reshape(-1, hidden.shape[-1]),
+                        swa_loc=inject_layout.swa_loc,
+                        positions=inject_layout.positions,
+                        pool=pool,
+                    )
+                else:
+                    self.draft_model.write_target_hidden_kv(
+                        main_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                        swa_loc=inject_layout.swa_loc,
+                        positions=inject_layout.positions,
+                        pool=pool,
+                    )
             return
 
         positions_2d = prefix_lens.unsqueeze(1) + self._block_pos_offsets
@@ -233,4 +260,5 @@ class TargetHiddenKvInjector:
             cache_loc_2d=verify_cache_loc_2d,
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
+            hidden_is_projected=hidden_is_projected,
         )

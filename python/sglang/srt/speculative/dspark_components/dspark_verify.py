@@ -351,6 +351,7 @@ class TargetVerifyExecutor:
         commit_lens: torch.Tensor,
         bs: int,
         run_compact: bool,
+        hidden_is_projected: bool = False,
     ) -> None:
         if run_compact:
             self.kv_injector.inject_ragged(
@@ -359,6 +360,7 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
+                hidden_is_projected=hidden_is_projected,
             )
             return
         hidden = logits_output.hidden_states
@@ -570,11 +572,8 @@ class DsparkVerifyEpilogue:
             _is_npu
             and commit_ctx is not None
             and envs.SGLANG_NPU_DSPARK_EARLY_MAIN_PROJ.get()
+            and hasattr(commit_ctx.draft_model, "project_target_hidden")
             and hasattr(commit_ctx.draft_model, "write_projected_target_hidden_kv")
-            and hasattr(
-                commit_ctx.resolve_pool(),
-                "set_swa_key_buffer_radix_fused_norm_rope",
-            )
         )
         self._main_proj_stream = (
             torch.cuda.Stream() if self._early_main_proj else None
@@ -642,6 +641,10 @@ class DsparkVerifyEpilogue:
             return False
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")
+
+    @property
+    def projects_hidden(self) -> bool:
+        return self._early_main_proj
 
     def _ensure_out(
         self, buf: Optional[torch.Tensor], compact: torch.Tensor
