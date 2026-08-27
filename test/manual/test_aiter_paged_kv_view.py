@@ -67,5 +67,31 @@ class TestAiterPagedKVView(unittest.TestCase):
         self.assertEqual(last_page_len.tolist(), [64])
 
 
+class TestPagedPrefillAsmSupportsGqa(unittest.TestCase):
+    """The asm guard rejects a non-power-of-two GQA ratio, and a rejected call
+    raises rather than falling back, so the backend has to agree with it."""
+
+    def setUp(self):
+        from sglang.srt.layers.attention.aiter_backend import (
+            _paged_prefill_asm_supports_gqa,
+        )
+
+        self.supported = _paged_prefill_asm_supports_gqa
+
+    def test_power_of_two_ratios_are_supported(self):
+        for num_q_heads, num_kv_heads in [(1, 1), (4, 1), (8, 1), (16, 2), (32, 4)]:
+            with self.subTest(q=num_q_heads, kv=num_kv_heads):
+                self.assertTrue(self.supported(num_q_heads, num_kv_heads))
+
+    def test_non_power_of_two_ratios_are_rejected(self):
+        for num_q_heads, num_kv_heads in [(12, 2), (24, 4), (40, 8), (6, 1)]:
+            with self.subTest(q=num_q_heads, kv=num_kv_heads):
+                self.assertFalse(self.supported(num_q_heads, num_kv_heads))
+
+    def test_indivisible_and_degenerate_head_counts_are_rejected(self):
+        self.assertFalse(self.supported(8, 3))
+        self.assertFalse(self.supported(8, 0))  # must not raise ZeroDivisionError
+
+
 if __name__ == "__main__":
     unittest.main()

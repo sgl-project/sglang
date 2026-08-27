@@ -162,6 +162,14 @@ def _build_paged_kv_view(
     return page_indptr.to(device), page_ids, last_page_len.to(device)
 
 
+def _paged_prefill_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
+    """aiter's asm paged-varlen guard takes only a power-of-two GQA ratio."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return False
+    gqa = num_q_heads // num_kv_heads
+    return gqa & (gqa - 1) == 0
+
+
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
@@ -1410,9 +1418,13 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                 # Once per batch, not per layer: forward_extend only consumes it.
+                # The arch test is not redundant with the flag: the asm guard is
+                # gfx95-only, and elsewhere there is no kernel for this shape at
+                # all, so building a view we must not pass is wasted work.
                 paged_kv_view = None
                 if (
                     envs.SGLANG_AITER_PAGED_PREFILL_ASM.get()
+                    and is_gfx95_supported()
                     and self.page_size == 64
                     and not self.kv_cache_is_vectorized_5d
                     and not self.use_sliding_window_kv_pool
@@ -2540,10 +2552,14 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
+                and _paged_prefill_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
             ):
                 # These must match aiter's asm guard: there is no CK arm for 4D
                 # LINEAR page-64 fp8 hd256, so a shape the guard rejects raises
-                # rather than falling back.
+                # rather than falling back. The arch half of the guard is
+                # checked where paged_kv_view is built.
                 page_indptr, page_ids, last_page_len = (
                     self.forward_metadata.paged_kv_view
                 )
