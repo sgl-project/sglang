@@ -22,11 +22,10 @@ from sglang.srt.function_call.kimik3_format import (
     THINK_OPEN,
     TOOLS_CLOSE,
     TOOLS_OPEN,
-    _SpanTracker,
+    _strip_response_wrappers,
     partial_suffix_len,
     strip_partial_marker_suffix,
     strip_response_wrappers,
-    strip_response_wrappers_in_place,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
@@ -74,34 +73,27 @@ def _parse_attrs(attrs: str) -> dict:
 
 
 def _strip_template_markers(text: str) -> str:
-    return _strip_template_markers_spans(text)[0]
+    return _strip_template_markers_with_deletion(text)
 
 
-def _strip_template_markers_spans(text: str) -> tuple[str, list[tuple[int, int]]]:
-    tracker = _SpanTracker(text)
-    _strip_template_markers_in_place(tracker)
-    return tracker.result(collapse_blank=True)
-
-
-def _strip_template_markers_in_place(tracker: _SpanTracker) -> None:
-    text = tracker.text
+def _strip_template_markers_with_deletion(text: str, deleted: bool = False) -> str:
     # Cut markers first: their surviving half looks like plain text to the
     # regexes below. Two characters minimum keeps a reply ending in ``<``.
     holdback = partial_suffix_len(text, ALL_MARKERS, min_len=2)
     if holdback:
-        tracker.delete_suffix(len(text) - holdback)
-    tracker.delete_regex_matches(_CHANNEL_MARKER_RE)
-    tracker.delete_regex_matches(_SPECIAL_TOKEN_RE)
+        text = text[:-holdback]
+        deleted = True
+    if _CHANNEL_MARKER_RE.search(text):
+        text = _CHANNEL_MARKER_RE.sub("", text)
+        deleted = True
+    if _SPECIAL_TOKEN_RE.search(text):
+        text = _SPECIAL_TOKEN_RE.sub("", text)
+        deleted = True
+    return "" if deleted and not text.strip() else text
 
 
 def _strip_template_artifacts(text: str, reasoning_separated: bool = False) -> str:
-    return _strip_template_artifacts_spans(text, reasoning_separated)[0]
-
-
-def _strip_template_artifacts_spans(
-    text: str, reasoning_separated: bool = False
-) -> tuple[str, list[tuple[int, int]]]:
-    tracker = _SpanTracker(text)
+    deleted = False
     # An unparsed tool channel: everything from it on is call syntax, not a reply.
     call_match = _CALL_OPEN_RE.search(text)
     tool_starts = [
@@ -113,18 +105,22 @@ def _strip_template_artifacts_spans(
         if i != -1
     ]
     if tool_starts:
-        tracker.truncate_at(min(tool_starts))
+        text = text[: min(tool_starts)]
+        deleted = True
     if reasoning_separated:
-        tracker.delete_regex_matches(_THINK_CHANNEL_RE)
+        if _THINK_CHANNEL_RE.search(text):
+            text = _THINK_CHANNEL_RE.sub("", text)
+            deleted = True
         # A close without its prefilled open leaves the whole trace ahead of it.
-        close_idx = tracker.text.find(THINK_CLOSE)
+        close_idx = text.find(THINK_CLOSE)
         if close_idx != -1:
-            tracker.delete_prefix(close_idx + len(THINK_CLOSE))
+            text = text[close_idx + len(THINK_CLOSE) :]
+            deleted = True
         # Only safe once the trace is gone: otherwise this drops it along with
         # the wrappers, even though the caller wanted it inline.
-        strip_response_wrappers_in_place(tracker)
-    _strip_template_markers_in_place(tracker)
-    return tracker.result(collapse_blank=True)
+        text, wrappers_deleted = _strip_response_wrappers(text)
+        deleted = deleted or wrappers_deleted
+    return _strip_template_markers_with_deletion(text, deleted)
 
 
 class KimiK3Detector(BaseFormatDetector):
@@ -161,13 +157,6 @@ class KimiK3Detector(BaseFormatDetector):
     ) -> str:
         """Drop channel syntax the tool-call parser left in client-bound text."""
         return _strip_template_artifacts(text, reasoning_separated=reasoning_separated)
-
-    def strip_template_artifacts_spans(
-        self, text: str, reasoning_separated: bool = False
-    ) -> tuple[str, list[tuple[int, int]]]:
-        return _strip_template_artifacts_spans(
-            text, reasoning_separated=reasoning_separated
-        )
 
     def strip_template_markers(self, text: str) -> str:
         return _strip_template_markers(text)

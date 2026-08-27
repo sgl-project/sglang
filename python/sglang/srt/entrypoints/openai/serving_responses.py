@@ -68,10 +68,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import (
-    align_token_logprobs_to_text,
-    to_openai_style_logprobs,
-)
+from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -932,15 +929,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logger.error("Required tool JSON parse error: %s", e)
 
         if content:
-            cleaned, kept_spans = self._strip_template_artifacts_spans(
+            cleaned = self._strip_template_artifacts(
                 content, reasoning_separated=reasoning_content is not None
             )
-            # Only this cleanup is span deletion; text the other parsers reshaped
-            # cannot be realigned.
             if output_logprobs is not None and cleaned != content:
-                output_logprobs = align_token_logprobs_to_text(
-                    output_logprobs, content, cleaned, kept_spans
+                logger.debug(
+                    "Dropping response logprobs because template artifacts were "
+                    "stripped from the response text"
                 )
+                output_logprobs = None
             content = cleaned
             # Text that was nothing but template syntax still gets a message, so
             # a stop-finished response never comes back without any output item.

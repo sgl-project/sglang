@@ -6,7 +6,6 @@ from openai.types.responses.response_output_text import Logprob
 
 from sglang.srt.entrypoints.openai.protocol import Function, ResponsesRequest, Tool
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
-from sglang.srt.entrypoints.openai.utils import align_token_logprobs_to_text
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
@@ -266,35 +265,12 @@ def _strip(text: str, reasoning_separated: bool = True) -> str:
     return KimiK3Detector().strip_template_artifacts(text, reasoning_separated)
 
 
-def test_stripped_spans_reconstruct_cleaned_text() -> None:
-    detector = KimiK3Detector()
-    cases = [
-        ("plain response", False, "plain response"),
-        (f"{RESPONSE_OPEN}visible{RESPONSE_CLOSE}{MESSAGE_CLOSE}", False, "visible"),
-        (f"{THINK_OPEN}secret{THINK_CLOSE}visible", True, "visible"),
-        (f"visible{LEAKED_TOOLS_SECTION}", False, "visible"),
-        ("   ", False, "   "),
-    ]
-    for original, reasoning_separated, expected in cases:
-        cleaned, kept_spans = detector.strip_template_artifacts_spans(
-            original, reasoning_separated
-        )
-        assert cleaned == expected
-        assert "".join(original[start:end] for start, end in kept_spans) == cleaned
-
-
 def test_strip_template_artifacts_whitespace_behavior() -> None:
     detector = KimiK3Detector()
 
-    cleaned, kept_spans = detector.strip_template_artifacts_spans("   ")
-    assert cleaned == "   "
-    assert kept_spans == [(0, 3)]
     assert detector.strip_template_artifacts("   ") == "   "
 
     marker_only = f"{RESPONSE_OPEN}   {RESPONSE_CLOSE}"
-    cleaned, kept_spans = detector.strip_template_artifacts_spans(marker_only)
-    assert cleaned == ""
-    assert kept_spans == []
     assert detector.strip_template_artifacts(marker_only) == ""
 
 
@@ -438,16 +414,13 @@ def test_syntax_only_text_still_yields_a_message() -> None:
     assert items[0].content[0].text == ""
 
 
-def test_logprobs_drop_the_entries_of_removed_tokens() -> None:
+def test_logprobs_dropped_when_cleanup_changes_text() -> None:
     items = _output_items(
         f"trace{THINK_CLOSE}answer",
         output_logprobs=_logprobs("trace", THINK_CLOSE, "answer"),
     )
     assert items[0].content[0].text == "traceanswer"
-    assert [entry.token for entry in items[0].content[0].logprobs] == [
-        "trace",
-        "answer",
-    ]
+    assert items[0].content[0].logprobs is None
 
 
 def test_logprobs_kept_verbatim_when_cleanup_changes_nothing() -> None:
@@ -463,37 +436,6 @@ def test_logprobs_dropped_when_they_cannot_be_reconciled() -> None:
         f"trace{THINK_CLOSE}answer", output_logprobs=_logprobs("something", "else")
     )
     assert items[0].content[0].logprobs is None
-
-
-def test_alignment_drops_ambiguous_marker_inner_token() -> None:
-    original = f"{RESPONSE_OPEN}response visible"
-    entries = _logprobs("<|open|>", "response", "<|sep|>", "response", " visible")
-    cleaned, kept_spans = KimiK3Detector().strip_template_artifacts_spans(original)
-
-    aligned = align_token_logprobs_to_text(entries, original, cleaned, kept_spans)
-
-    assert cleaned == "response visible"
-    assert [entry.token for entry in aligned or []] == ["response", " visible"]
-
-
-def test_alignment_handles_reasoning_prefix() -> None:
-    strip_input = f"{THINK_CLOSE}visible"
-    entries = _logprobs("secret", THINK_CLOSE, "visible")
-    cleaned, kept_spans = KimiK3Detector().strip_template_artifacts_spans(
-        strip_input, reasoning_separated=True
-    )
-
-    aligned = align_token_logprobs_to_text(entries, strip_input, cleaned, kept_spans)
-
-    assert [entry.token for entry in aligned or []] == ["visible"]
-
-
-def test_alignment_returns_none_for_irreconcilable_input() -> None:
-    entries = _logprobs("prefix", "visible")
-
-    assert (
-        align_token_logprobs_to_text(entries, "expected", "expected", [(0, 8)]) is None
-    )
 
 
 if __name__ == "__main__":
