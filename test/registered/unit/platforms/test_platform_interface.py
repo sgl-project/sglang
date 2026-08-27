@@ -312,6 +312,19 @@ class TestXpuDeviceMixin(CustomTestCase):
 class TestNpuDeviceMixin(CustomTestCase):
     """Tests for NPU device operation defaults."""
 
+    def setUp(self):
+        # torch.device("npu", ...) requires the "npu" device type, which
+        # torch_npu registers via the privateuse1 backend rename; CPU-only
+        # builds lack it. Register it per-test so only this suite carries
+        # the process-wide side effect.
+        try:
+            torch.utils.rename_privateuse1_backend("npu")
+        except Exception:
+            # Re-registration with a different name raises on some versions;
+            # real NPU machines may have already renamed the backend.
+            pass
+        super().setUp()
+
     def test_default_get_device_returns_npu_device(self):
         base = NpuSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("npu", 2))
