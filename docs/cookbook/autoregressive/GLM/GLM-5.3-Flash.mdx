@@ -35,6 +35,10 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmar
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
+</Note>
+
 ## Playground
 
 Use the Playground for lower-level tuning such as attention parallelism, MoE communication, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
