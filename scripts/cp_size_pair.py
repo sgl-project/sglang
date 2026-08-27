@@ -84,6 +84,18 @@ MFTRAPLAYOUT_RE = re.compile(
     r"\[mf-trap\] layout name=(?P<name>\S+) lo=(?P<lo>0x[0-9a-f]+) "
     r"hi=(?P<hi>0x[0-9a-f]+)"
 )
+# §24.59 endscan: shutdown-time full-r2t dirty-predicate verdict line
+# (scheduler graceful-exit path; kills open world (c) "dirt exists only at
+# sampling time"). Detail line follows when dirty>0.
+MFTRAPENDSCAN_RE = re.compile(
+    r"\[mf-trap\] endscan dirty=(?P<dirty>\d+) shape=(?P<rows>\d+)x(?P<cols>\d+) "
+    r"war_barrier=(?P<war>\S+)"
+)
+MFTRAPENDSCANDETAIL_RE = re.compile(
+    r"\[mf-trap\] endscan-detail first row=(?P<row>\d+) col=(?P<col>\d+) "
+    r"val=(?P<val>-?\d+) fp32=(?P<fp>[-\w.]+) addr=(?P<addr>0x[0-9a-f]+) "
+    r"rows_dirty=(?P<rd>\d+)"
+)
 CPSIZE_RE = re.compile(
     r"\[cp-size\]\s+(?P<tag>\S+)\s+seq=(?P<seq>\d+)\s+rank=(?P<rank>\d+)/(?P<size>\d+)"
     r"\s+(?P<body>.*?)\s+ctx=(?P<ctx>\S+)"
@@ -171,6 +183,10 @@ def parse(files):
     mftrap_send = []
     mfscatter = []
     mflayout = []
+    mftrap_endscan = []
+    # Mixed-file logs interleave 16 ranks on one stream: pair each endscan
+    # detail line to its verdict line by rank prefix, not list order.
+    _endscan_pending = {}
     order = 0
     for path in files:
         with open(path, errors="replace") as fh:
@@ -377,14 +393,66 @@ def parse(files):
                         # §24.39 Run 23 liveness marker: gather-stream drain
                         # active at every pool snapshot.
                         census["mf-trap:gather-freeze"] += 1
+                    elif "war-barrier" in line:
+                        # §24.59 (Run 34 A/B) liveness marker: this run fences
+                        # schedule_stream behind forward_stream (env-gated
+                        # SGLANG_ENABLE_WAR_BARRIER=1 on NPU). Zero catches
+                        # WITH this marker = schedule-vs-forward WAR race
+                        # convicted; without it, the §24.39 gather verdict
+                        # applies instead.
+                        census["mf-trap:war-barrier"] += 1
                     elif "armed" in line:
                         # Liveness marker: trap hooks deployed & env reached.
                         # Its absence in a catchless log = the trap NEVER RAN
                         # (stale deploy / env miss), and every "silent" verdict
                         # below is void.
                         census["mf-trap:armed"] += 1
+                    elif "endscan dirty=" in line:
+                        # §24.59: shutdown full-r2t scan verdict. Once per rank.
+                        me = MFTRAPENDSCAN_RE.search(line)
+                        if me:
+                            ent = {
+                                "ts": pm.group("ts") if pm else "",
+                                "dp": int(pm.group("dp")) if pm else -1,
+                                "cp": int(pm.group("cp")) if pm else -1,
+                                "tp": int(pm.group("tp")) if pm else -1,
+                                **{
+                                    k: v
+                                    for k, v in me.groupdict().items()
+                                },
+                            }
+                            mftrap_endscan.append(ent)
+                            _endscan_pending[(ent["dp"], ent["cp"], ent["tp"])] = (
+                                ent
+                            )
+                            census["mf-trap:endscan"] += 1
+                    elif "endscan-detail" in line:
+                        md = MFTRAPENDSCANDETAIL_RE.search(line)
+                        ent = None
+                        if md:
+                            key = None
+                            if pm is not None and all(
+                                pm.group(g) is not None
+                                for g in ("dp", "cp", "tp")
+                            ):
+                                key = (
+                                    int(pm.group("dp")),
+                                    int(pm.group("cp")),
+                                    int(pm.group("tp")),
+                                )
+                            ent = (
+                                _endscan_pending.pop(key, None)
+                                if key
+                                else None
+                            )
+                            if ent is None and mftrap_endscan:
+                                # Fallback: single-rank file (order == pairing).
+                                ent = mftrap_endscan[-1]
+                        if md and ent is not None:
+                            ent["detail"] = md.groupdict()
+                            census["mf-trap:endscan:detail"] += 1
                 order += 1
-    return cp, mfraw, mftrans, census, torn, mfer, mffp_found, mfer_names, mftrap, mfreg_fail, mftrap_send, mfscatter, mflayout
+    return cp, mfraw, mftrans, census, torn, mfer, mffp_found, mfer_names, mftrap, mfreg_fail, mftrap_send, mfscatter, mflayout, mftrap_endscan
 
 
 def to_int(v):
@@ -443,8 +511,8 @@ def main():
     )
     args = ap.parse_args()
 
-    cp, mfraw, mftrans, census, torn, mfer, mffp_found, mfer_names, mftrap, mfreg_fail, mftrap_send, mfscatter, mflayout = parse(args.logs)
-    if not cp and not mfraw and not mfreg_fail and not mftrap_send:
+    cp, mfraw, mftrans, census, torn, mfer, mffp_found, mfer_names, mftrap, mfreg_fail, mftrap_send, mfscatter, mflayout, mftrap_endscan = parse(args.logs)
+    if not cp and not mfraw and not mfreg_fail and not mftrap_send and not mftrap_endscan and not census.get("mf-trap:armed", 0):
         print("nothing recognizable found (no [cp-size]/[mf-raw] lines)")
         return 1
 
@@ -1562,6 +1630,7 @@ def main():
     # glue_hits == [] (catches vanished with gather streams drained), which
     # would never print from inside.
     gather_freeze_on = census.get("mf-trap:gather-freeze", 0) > 0
+    war_barrier_on = census.get("mf-trap:war-barrier", 0) > 0
     if (
         gather_freeze_on
         and census.get("mf-trap:armed", 0) > 0
@@ -1570,17 +1639,153 @@ def main():
         print(
             "\n== [mf-trap] §24.39 gather-freeze verdict =="
         )
+        if war_barrier_on:
+            # §24.59 (Run 34): zero catches here can ALSO mean the WAR barrier
+            # fenced the schedule stream -- that arm convicts the
+            # schedule-vs-forward race, NOT the gather family. Both markers
+            # present = confounded run; rerun with one variable at a time.
+            print(
+                "  CONFOUNDED ARM: this log carries BOTH gather-freeze AND "
+                "war-barrier markers. Zero catches cannot convict either "
+                "family (§24.59). Rerun single-variable: "
+                "SGLANG_MF_FREEZE_GATHER alone, or "
+                "SGLANG_ENABLE_WAR_BARRIER alone."
+            )
+        else:
+            print(
+                "  ZERO glue catches with gather streams drained at every pool "
+                "snapshot (same workload without SGLANG_MF_FREEZE_GATHER, Run "
+                "22: 13 catches) -> KV-TRANSFER/GATHER-STREAM FAMILY CONVICTED: "
+                "the r2t writer rides the transfer worker threads' staging-"
+                "gather activity. Audit the transfer path: page_idx H2D on the "
+                "default stream issued from worker threads, staging ring "
+                "allocator reuse, NIXL/mooncake registered-memory interactions. "
+                "CAVEAT: also confirm the workload reproduced (compare run "
+                "duration / cp-size counts with Run 22; a too-short run also "
+                "yields zero catches)."
+            )
+
+    # ---- §24.59 (Run 34 A/B): WAR-barrier zero-catch verdict ---------------
+    # The A-arm ablation: SGLANG_ENABLE_WAR_BARRIER=1 fences schedule_stream
+    # behind forward_stream (scheduler.py:1729+, coarse wait_stream on NPU).
+    # Run 34: same workload, 13 catches -> 0 (cp-size 51840 > baseline 33912,
+    # so the workload reproduced longer, not shorter).
+    # VERDICT SCOPE (post-review, 2026-08-27): the barrier serializes ALL
+    # scheduler-side device work behind forward drain, so elimination
+    # establishes only OVERLAP-NECESSITY -- the dirt requires scheduler-side
+    # work concurrent with forward execution. It does NOT pin a
+    # schedule-stream direct writer: (i) every schedule-side direct r2t write
+    # carries int-valued indices whose fp32 bit-reading is denormal~0, which
+    # CONTRADICTS the fp32-family catch payloads; (ii) finalize()/move_logprobs
+    # write HOST memory only (state_capturer/base.py:53-59/:96-97,
+    # batch_result_processor.py:396-422) -- physically excluded. Open worlds:
+    # (a) scheduler-side state mutation (alloc/free/realloc/page tables) races
+    # forward kernels -> stale/corrupt index -> forward kernel OOB-writes
+    # fp32 values into r2t; (b) stale forward kernel writes land on rows the
+    # scheduler just freed+reallocated; (c) ephemeral-damage reading -- mid-
+    # run dirt cleaned by later legal row reuse before any snapshot drains.
+    # NOTE legal rewrites alone cannot produce predicate-dirty bytes, so a
+    # fired catch always implies real garbage was written; this pair's
+    # baseline had 0 [mf-raw] so send-side confirmation is weak and
+    # persistence is adjudicated by the endscan section below.
+    if (
+        war_barrier_on
+        and census.get("mf-trap:armed", 0) > 0
+        and not glue_hits
+        and not gather_freeze_on
+    ):
         print(
-            "  ZERO glue catches with gather streams drained at every pool "
-            "snapshot (same workload without SGLANG_MF_FREEZE_GATHER, Run "
-            "22: 13 catches) -> KV-TRANSFER/GATHER-STREAM FAMILY CONVICTED: "
-            "the r2t writer rides the transfer worker threads' staging-"
-            "gather activity. Audit the transfer path: page_idx H2D on the "
-            "default stream issued from worker threads, staging ring "
-            "allocator reuse, NIXL/mooncake registered-memory interactions. "
-            "CAVEAT: also confirm the workload reproduced (compare run "
-            "duration / cp-size counts with Run 22; a too-short run also "
-            "yields zero catches)."
+            "\n== [mf-trap] §24.59 war-barrier verdict =="
+        )
+        print(
+            "  ZERO glue catches with schedule_stream fenced behind "
+            "forward_stream (SGLANG_ENABLE_WAR_BARRIER=1) on the SAME "
+            "workload that caught 13x without it (Run 34: cp-size lines "
+            "exceed the no-barrier arm -> reproduction confirmed) -> "
+            "OVERLAP-NECESSITY ESTABLISHED: the dirt requires scheduler-"
+            "side device work concurrent with forward execution. NOTE the "
+            "scope: the coarse barrier straightens the whole pipeline, and "
+            "schedule-side direct r2t writes are int-valued (fp32-denormal "
+            "under bitcast -- CONTRADICTED by the fp32 catch payloads) "
+            "while finalize()/move_logprobs write HOST memory only -> no "
+            "schedule-stream DIRECT writer is indicated. Open worlds: "
+            "(a) scheduler state mutation (alloc/free/realloc) feeds stale "
+            "indices to forward kernels -> fp32-carrying kernel OOB-writes "
+            "r2t; (b) stale forward kernel writes hit rows just freed+"
+            "reallocated; (c) ephemeral-damage reading (dirt transient, "
+            "cleaned by later legal reuse -- catches stay REAL either way). "
+            "Next: (1) shutdown full-r2t endscan in each arm adjudicates "
+            "persistence only; mid-run harm rides on that arm's [mf-raw]/"
+            "send-split pre-counts; (2) then narrow-fence / host-metadata "
+            "switch to split (a)/(b); the barrier fix itself is valid for "
+            "(a)/(b) either way."
+        )
+
+    # ---- §24.59 endscan verdict: PERSISTENCE adjudication -------------------
+    # Shutdown full-r2t scan (graceful exit, one post-drain sync, zero
+    # mid-run perturbation). Semantics (corrected): legal r2t writers can
+    # never produce predicate-dirty bytes, so a catch is never a sampling
+    # artifact -- every catch is REAL garbage written by some kernel. The
+    # scan answers only whether that garbage SURVIVED to teardown:
+    #   dirty > 0 -> persistent damage evidence; worlds (a)/(b) stand.
+    #   dirty = 0 -> transient (cleaned by later legal row reuse) or none;
+    #                mid-run harm decided by THIS arm's [mf-raw]/send-split.
+    if mftrap_endscan:
+        print("\n== [mf-trap] §24.59 endscan verdict (persistence) ==")
+        any_dirty = False
+        for e in mftrap_endscan:
+            dirty = int(e["dirty"])
+            any_dirty = any_dirty or dirty > 0
+            print(
+                f"  {e['ts']} DP{e['dp']} CP{e['cp']} TP{e['tp']}: "
+                f"dirty={dirty} shape={e['rows']}x{e['cols']} "
+                f"war_barrier={e['war']}"
+            )
+            d = e.get("detail")
+            if d:
+                print(
+                    f"      first row={d['row']} col={d['col']} "
+                    f"val={d['val']} fp32={d['fp']} addr={d['addr']} "
+                    f"rows_dirty={d['rd']}"
+                )
+        war_on = any(e["war"].lower() == "true" for e in mftrap_endscan)
+        if any_dirty:
+            fired += sum(1 for e in mftrap_endscan if int(e["dirty"]) > 0)
+            print(
+                "  -> ENDSCAN DIRTY>0: garbage SURVIVED to teardown "
+                "(persistent damage on rows not yet reused). Worlds (a)/(b) "
+                "stand; next: narrow fence / forward-self-spill discriminator "
+                "(host sparse-metadata switch)."
+            )
+        else:
+            print(
+                "  -> ENDSCAN DIRTY=0: no garbage survived to teardown. This "
+                "does NOT weaken the catches: legal writers cannot write "
+                "predicate-dirty bytes, so every catch was REAL; dirty=0 "
+                "means the mid-run garbage was TRANSIENT (later legal row "
+                "reuse overwrote it) or no writer fired this run. Mid-run "
+                "harm is decided by THIS ARM's [mf-raw] / send-split "
+                "pre-counts, not by this line:"
+                "\n    - mf-raw>0 or send-pre>0 => real overlap harm "
+                "(bad pages reached or could reach decode) even though "
+                "teardown ended clean;"
+                "\n    - all zero => the writer did not fire in this arm "
+                "(consistent with WAR-barrier serialization preventing it)."
+                + (
+                    " NOTE: this arm ran WITH war_barrier=true -- zero-catch "
+                    "expected (Run 34 baseline behavior), endscan still "
+                    "validly confirms final-state cleanliness."
+                    if war_on
+                    else ""
+                )
+            )
+    elif census.get("mf-trap:armed", 0) > 0 and not census.get(
+        "mf-trap:endscan", 0
+    ):
+        print(
+            "\nNOTE: [mf-trap] armed but NO endscan line -- the run did not "
+            "reach graceful shutdown (killed / crashed) or the endscan hook "
+            "is not deployed; the world-(c) adjudication is VOID this run."
         )
 
     # ---- send-path split: pre- vs post-translate dirty of the same segment --

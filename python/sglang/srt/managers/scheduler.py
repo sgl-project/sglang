@@ -1723,6 +1723,18 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        if self._war_barrier_enabled and not is_cuda():
+            # §24.59 (Run 34 A/B) liveness marker, parser-detectable: this run
+            # fences schedule_stream behind forward_stream at every _apply_war_
+            # barrier call site (prefill overlap loop / decode / normal loop).
+            # A zero-catch log WITH this marker convicts the schedule-vs-forward
+            # WAR race; without it, zero catches read as the §24.39 gather
+            # verdict instead -- the two arms must stay distinguishable.
+            logger.info(
+                "[mf-trap] war-barrier on (§24.59 schedule_stream fenced "
+                "behind forward_stream; coarse=%s)",
+                bool(envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()),
+            )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -5137,6 +5149,23 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    # §24.59: launchers commonly answer Ctrl+C with Process.terminate()
+    # (SIGTERM), whose default action kills the process without running any
+    # Python teardown -- the endscan in the finally block below never runs.
+    # Convert both stop signals to SystemExit so unwinding reaches it; the
+    # handler only records intent, heavy work stays out of signal context.
+    _endscan_stop = {"signum": None}
+
+    def _endscan_graceful_stop(signum, frame):
+        _endscan_stop["signum"] = signum
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _endscan_graceful_stop)
+        signal.signal(signal.SIGTERM, _endscan_graceful_stop)
+    except Exception:
+        pass
+
     # Set up tracing
     if server_args.enable_trace:
         process_tracing_init(
@@ -5153,6 +5182,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    clean_teardown = False
     try:
         scheduler = Scheduler(
             server_args,
@@ -5172,6 +5202,22 @@ def run_scheduler_process(
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
+    except KeyboardInterrupt:
+        # Ctrl+C / SIGINT raises a BaseException subclass, bypassing the
+        # handler below, and never sets gracefully_exit -- treat it as a
+        # deliberate stop with a live device so the §24.59 endscan runs.
+        logger.info("Scheduler received SIGINT (Ctrl+C); treating as graceful")
+        clean_teardown = True
+
+    except SystemExit as e:
+        if _endscan_stop["signum"] is None:
+            # Unrelated sys.exit(): preserve its original semantics.
+            raise
+        logger.info(
+            "Scheduler received signal %s; treating as graceful", e.code
+        )
+        clean_teardown = True
+
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
@@ -5188,7 +5234,20 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-            # Graceful path only: on the exception path the GPU may be wedged
-            # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
-                scheduler.release_host_resources()
+            # Graceful path (ShutdownReq or Ctrl+C) only: on the exception
+            # path the GPU may be wedged and the synchronize() below could
+            # itself hang.
+            if scheduler.gracefully_exit or clean_teardown:
+                # §24.59 endscan: one post-drain full r2t dirty-predicate
+                # scan at shutdown, zero mid-run perturbation. Self-gated
+                # on SGLANG_MF_LAYER_TRAP; idempotent per process.
+                try:
+                    from sglang.srt.layers.cp.layer_trap import (
+                        endscan_full_r2t,
+                    )
+
+                    endscan_full_r2t(scheduler)
+                except Exception:
+                    pass
+                if scheduler.gracefully_exit:
+                    scheduler.release_host_resources()

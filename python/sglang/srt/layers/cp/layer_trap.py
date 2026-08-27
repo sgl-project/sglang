@@ -826,3 +826,92 @@ def glue_freeze_forward_stream(scheduler) -> None:
         ev.synchronize()
     except Exception:
         pass
+
+
+_ENDSCAN_DONE = False
+
+
+def endscan_full_r2t(scheduler) -> None:
+    """§24.59 preregistered step 1: adjudicate PERSISTENCE of the corruption.
+
+    Correction over the first draft: "sampling artifact" is not a possible
+    reading -- every legal r2t writer stores page ids in [0, pool_size),
+    which never satisfy the dirty predicate (<0 | >= 1<<30). Any fired catch
+    therefore proves some kernel wrote real garbage bytes. This scan answers
+    exactly one question: did any garbage SURVIVE to teardown?
+
+      dirty > 0 -> damage persisted past exit (rows not yet reused);
+                   worlds (a)/(b) stand; go narrow-fence.
+      dirty = 0 -> all garbage this run produced was transient (later legal
+                   row reuse overwrote it) or none fired. Mid-run harm is
+                   adjudicated SEPARATELY by this arm's [mf-raw] / send-split
+                   pre-counts, never by this line alone.
+
+    ONE full-device synchronize at graceful shutdown; zero mid-run
+    perturbation. Gated on SGLANG_MF_LAYER_TRAP; idempotent per process.
+    """
+    global _ENDSCAN_DONE
+    if _ENDSCAN_DONE or not _enabled():
+        return
+    _ENDSCAN_DONE = True
+    try:
+        pool = getattr(scheduler, "req_to_token_pool", None)
+        r2t = getattr(pool, "req_to_token", None)
+        if not torch.is_tensor(r2t):
+            return
+        shape0, shape1 = int(r2t.shape[0]), int(r2t.shape[1])
+        base = int(r2t.data_ptr())
+        elem = int(r2t.element_size())
+        dev = r2t.device
+        synced = False
+        try:
+            # Full-drain sync (shutdown path only; NOT mid-run).
+            torch.get_device_module(dev).synchronize(dev)
+            synced = True
+        except Exception:
+            synced = False
+        if synced:
+            vals = r2t.to(torch.int32)
+        else:
+            # Wedged device at teardown: take one D2H snapshot and finish
+            # the scan on HOST memory -- no further device ops are issued.
+            try:
+                vals = r2t.detach().cpu()
+                if vals.dtype != torch.int32:
+                    vals = vals.to(torch.int32)
+            except Exception:
+                logger.error(
+                    "[mf-trap] endscan aborted: sync and D2H both failed"
+                )
+                return
+        bad = (vals < 0) | (vals >= 1 << 30)
+        n_bad = int(bad.sum())
+        war = str(getattr(scheduler, "_war_barrier_enabled", "unknown")).lower()
+        # Line 1: verdict-line body (parser-detectable); line 2: details.
+        logger.error(
+            "[mf-trap] endscan dirty=%d shape=%dx%d war_barrier=%s",
+            n_bad,
+            shape0,
+            shape1,
+            war,
+        )
+        if n_bad:
+            coords = bad.nonzero()
+            r, c = coords[0].tolist()
+            val = int(vals[r, c])
+            raw = val & 0xFFFFFFFF
+            fp = struct.unpack("<f", struct.pack("<I", raw))[0]
+            stride = shape1
+            dirty_addr = r2t.data_ptr() + (r * stride + c) * r2t.element_size()
+            logger.error(
+                "[mf-trap] endscan-detail first row=%d col=%d val=%d "
+                "fp32=%g addr=%#x rows_dirty=%d",
+                r,
+                c,
+                val,
+                fp,
+                dirty_addr,
+                int(bad.any(dim=1).sum()),
+            )
+    except Exception:
+        pass
