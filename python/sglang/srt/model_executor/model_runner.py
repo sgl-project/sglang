@@ -294,11 +294,8 @@ def _supports_glm52_hisparse_mtp(server_args: ServerArgs) -> bool:
 def resolve_hisparse_for_runner(
     server_args: ServerArgs, *, is_draft_worker: bool
 ) -> bool:
-    """Keep the one-layer MTP draft KV resident for HiSparse verification."""
-    return bool(
-        server_args.enable_hisparse
-        and not (is_draft_worker and _supports_glm52_hisparse_mtp(server_args))
-    )
+    """Keep speculative draft KV resident; HiSparse belongs to the target."""
+    return bool(server_args.enable_hisparse and not is_draft_worker)
 
 
 def should_enable_hisparse_mtp_demand_buffer(

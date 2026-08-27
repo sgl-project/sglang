@@ -412,6 +412,10 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
         native.hisparse_config = None
         self.assertFalse(resolve(native, is_draft_worker=True))
 
+        unsupported_mtp = SimpleNamespace(**vars(server_args))
+        unsupported_mtp.speculative_num_steps = 2
+        self.assertFalse(resolve(unsupported_mtp, is_draft_worker=True))
+
     def test_hisparse_model_runner_rebinds_mapping_to_active_pool(self):
         from sglang.srt.model_executor import model_runner
 
