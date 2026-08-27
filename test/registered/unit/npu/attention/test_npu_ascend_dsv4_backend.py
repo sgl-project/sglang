@@ -56,6 +56,7 @@ sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculat
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+    C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
     DeepseekV4AscendAttnBackend,
     DeepseekV4AscendMultiStepDraftBackend,
@@ -66,6 +67,22 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
+
+
+class TestC4IndexerInitialization(unittest.TestCase):
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_indexer_uses_float8_kv(self, _):
+        indexer = torch.nn.Module()
+        indexer.head_dim = 8
+        indexer.compressor = SimpleNamespace()
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+
+        backend._ensure_npu_c4_indexer(indexer, torch.device("cpu"))
+
+        self.assertEqual(indexer.compressor.li_kv_dtype, "float8")
 
 
 class TestWalshHadamardMatrix(unittest.TestCase):
