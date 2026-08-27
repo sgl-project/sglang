@@ -49,7 +49,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
-    configured_moe_dp_size,
     get_exec,
     get_model,
     get_parallel,
@@ -212,7 +211,6 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -1891,9 +1889,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             "dp": _safe(lambda: parallel.moe_dp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
-            "moe_dense_tp_size": parallel.moe_dense_tp_size,
-            "moe_dp_size": configured_moe_dp_size(),
-            "enable_dp_lm_head": parallel.enable_dp_lm_head,
+            "moe_dense_tp_size": parallel.config.moe_dense_tp_size,
+            "moe_dp_size": get_parallel().config.moe_dp_size,
+            "enable_dp_lm_head": parallel.config.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,
             "model_dtype": str(model_config.dtype),

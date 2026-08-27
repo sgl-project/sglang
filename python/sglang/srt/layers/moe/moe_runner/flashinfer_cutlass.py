@@ -89,6 +89,10 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
 
+    # Bailing clamps after SiLU, which the kernel only implements in its
+    # SwigluStep variant.
+    use_swiglu_step: bool = False
+
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
     moe_tp_rank: int = 0
@@ -386,7 +390,11 @@ def fused_experts_none_to_flashinfer_mxfp4(
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=ActivationType.Swiglu,
+        activation_type=(
+            ActivationType.SwigluStep
+            if quant_info.use_swiglu_step
+            else ActivationType.Swiglu
+        ),
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
