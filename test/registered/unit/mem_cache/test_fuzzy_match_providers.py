@@ -154,9 +154,7 @@ class TestSemanticEmbeddingProvider(CustomTestCase):
             provider.match_on_prefix_miss(
                 prompt_token_ids=[1, 2, 3, 4],
                 already_matched_len=1,
-                request=SimpleNamespace(
-                    tokenizer=_JoinTokenizer(), cache_salt=None
-                ),
+                request=SimpleNamespace(tokenizer=_JoinTokenizer(), cache_salt=None),
                 extra_key="tenant-a",
             )
         call = adapters[-1].match_calls[-1]
