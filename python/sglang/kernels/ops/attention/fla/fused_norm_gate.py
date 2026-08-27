@@ -7,6 +7,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -44,7 +45,14 @@ def layer_norm_gated_fwd_kernel(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
+    # PDL: x is the producer's output (e.g. the fused KDA verify kernel, which
+    # triggers its dependents right after the o store), so every load sits
+    # behind the wait; the launch/prologue overlaps the producer's tail.
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
     i_t = tl.program_id(0)
 
     o_d = tl.arange(0, BD)
@@ -100,6 +108,8 @@ def layer_norm_gated_fwd_kernel(
     # Write output
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -214,6 +224,9 @@ def layer_norm_gated_fwd(
 
     if D <= 512:
         BT = 32
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        )
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,
@@ -236,6 +249,7 @@ def layer_norm_gated_fwd(
             HAS_WEIGHT=weight is not None,
             HAS_BIAS=bias is not None,
             num_warps=4,
+            **pdl_kwargs,
         )
     else:
         layer_norm_gated_fwd_kernel1[(T,)](
