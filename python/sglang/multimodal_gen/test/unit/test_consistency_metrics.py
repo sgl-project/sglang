@@ -60,6 +60,7 @@ def test_remote_file_exists_returns_false_for_definitive_404(monkeypatch):
 
 
 def test_remote_video_gt_candidates_survive_inconclusive_probe(monkeypatch):
+    monkeypatch.setenv(test_utils.CONSISTENCY_PLATFORM_ENV, "h100")
     monkeypatch.setattr(test_utils, "_remote_file_exists", lambda url: None)
 
     files = test_utils._find_remote_consistency_gt_files(
