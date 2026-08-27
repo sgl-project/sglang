@@ -115,7 +115,9 @@ def npu_quantize_w4a4_dense_weight(
     scale = scale.clamp_min(eps)
     quantized = torch.round(weight / scale.unsqueeze(-1))
     quantized = quantized.clamp_(-8, 7).to(torch.int32)
-    return quantized, scale
+    # aclnnQuantMatmulV5 requires dense A4W4 x2Scale to be FP32 on the target
+    # CANN/torch_npu runtime.
+    return quantized, scale.to(torch.float32)
 
 
 def npu_format_online_weight(
