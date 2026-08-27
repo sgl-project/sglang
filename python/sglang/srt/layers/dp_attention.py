@@ -63,6 +63,9 @@ def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
     global _ATTN_DP_SIZE, _ATTN_DP_RANK
     _ATTN_DP_SIZE = new_dp_size
     _ATTN_DP_RANK = new_dp_rank
+    # Elastic scaling moves this width away from what the launch derived, so
+    # the stamp moves with it.
+    get_parallel().stamp_derived_widths(attn_dp_size=new_dp_size)
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -360,6 +363,9 @@ def initialize_dp_attention(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
+    # The attention-DP width is the one derived size that dist init settles
+    # here rather than in `initialize_model_parallel`, so it is stamped here.
+    get_parallel().stamp_derived_widths(attn_dp_size=_ATTN_DP_SIZE)
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
         _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
@@ -393,13 +399,14 @@ def get_attention_dp_size() -> int:
 
 @contextmanager
 def disable_dp_size():
-    """Patch the tp group temporarily until this function ends.
+    """Run without DP attention until this scope ends.
 
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
+    This is for draft workers of speculative decoding, which run the draft model
+    at a different width from the target model's workers.
 
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
+    The scope replaces both the module global that ``get_attention_dp_size()``
+    reads and the derived width the runtime context answers with, so the two
+    spellings of the name cannot disagree inside it.
     """
     global _ATTN_DP_SIZE
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
@@ -407,7 +414,8 @@ def disable_dp_size():
     old_dp_size = _ATTN_DP_SIZE
     _ATTN_DP_SIZE = 1
     try:
-        yield
+        with get_parallel().override(attn_dp_size=1):
+            yield
     finally:
         _ATTN_DP_SIZE = old_dp_size
 
