@@ -1101,9 +1101,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     kv_chunk.staging_counted = True
 
                 if self.check_status(room) == KVPoll.Failed:
-                    self._staging_outstanding.pop(room, None)
+                    # This chunk was counted above but never posted. Remove only
+                    # its contribution so an earlier unresolved group remains
+                    # outstanding.
+                    self._staging_outstanding[room] -= 1
+                    if self._staging_outstanding[room] <= 0:
+                        self._staging_outstanding.pop(room, None)
                     if self.enable_deferred_decode_kv_release:
-                        # Skipped => nothing written for this aborted room; ack.
+                        # Ack only if this skipped chunk was the room's final
+                        # outstanding group.
                         self._maybe_ack_drained_abort(room)
                     continue
 
