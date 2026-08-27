@@ -47,6 +47,25 @@ def _chain_parents(*, bs, block_size):
     return parents.unsqueeze(0).expand(bs, block_size).contiguous()
 
 
+def _mask_scratch(*, prefix_lens, num_nodes):
+    """The buffers `build_tree_verify_input` writes the flat mask into.
+
+    Production passes the attention backend's own captured buffer so verify reads the
+    mask in place; a test only needs something at least as large, because the row
+    offsets are computed on device from `prefix_lens` either way.
+    """
+    return {
+        "mask_buffer": torch.zeros(
+            num_nodes * int((prefix_lens + num_nodes).sum()),
+            dtype=torch.bool,
+            device="cuda",
+        ),
+        "mask_indptr": torch.zeros(
+            prefix_lens.numel() + 1, dtype=torch.int64, device="cuda"
+        ),
+    }
+
+
 def _logits_from_predictions(target_predict):
     """One-hot logits, so `argmax` inside the accept returns `target_predict`."""
     bs, width = target_predict.shape
@@ -103,7 +122,7 @@ def test_width_one_tree_accept_matches_the_chain():
         block_size=BLOCK_SIZE,
         tree_width=1,
         prefix_lens=prefix_lens.cuda(),
-        prefix_lens_cpu=prefix_lens,
+        **_mask_scratch(prefix_lens=prefix_lens, num_nodes=BLOCK_SIZE),
     )
     accepted = accept_tree_greedy(
         verify_input=verify_input,
@@ -137,7 +156,7 @@ def test_width_one_accept_index_is_the_identity_chain():
         block_size=BLOCK_SIZE,
         tree_width=1,
         prefix_lens=prefix_lens.cuda(),
-        prefix_lens_cpu=prefix_lens,
+        **_mask_scratch(prefix_lens=prefix_lens, num_nodes=BLOCK_SIZE),
     )
     accepted = accept_tree_greedy(
         verify_input=verify_input,
@@ -170,7 +189,7 @@ def test_predict_stays_in_vocabulary_where_accept_index_pads():
         block_size=BLOCK_SIZE,
         tree_width=1,
         prefix_lens=prefix_lens.cuda(),
-        prefix_lens_cpu=prefix_lens,
+        **_mask_scratch(prefix_lens=prefix_lens, num_nodes=BLOCK_SIZE),
     )
     accepted = accept_tree_greedy(
         verify_input=verify_input, next_token_logits=logits, bs=bs
@@ -307,7 +326,7 @@ def test_tree_meta_links_match_the_beam_parents():
         block_size=BLOCK_SIZE,
         tree_width=TREE_WIDTH,
         prefix_lens=PREFIX_LENS.cuda(),
-        prefix_lens_cpu=PREFIX_LENS,
+        **_mask_scratch(prefix_lens=PREFIX_LENS, num_nodes=VERIFY_WIDTH),
     )
 
     recovered = [-1] * VERIFY_WIDTH

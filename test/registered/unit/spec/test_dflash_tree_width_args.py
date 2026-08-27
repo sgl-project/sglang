@@ -92,7 +92,6 @@ def _tree_args(*, tree_width=2, **overrides) -> ServerArgs:
         speculative_dflash_block_size=8,
         attention_backend="triton",
         page_size=1,
-        disable_decode_cuda_graph=True,
     )
     defaults.update(overrides)
     return _make_args(**defaults)
@@ -246,16 +245,15 @@ class TestDflashTreeAdmissionChecks(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "replayssm-spec"):
             _resolve(_tree_args(enable_linear_replayssm_spec=True))
 
-    def test_decode_cuda_graph_must_be_disabled(self):
-        with self.assertRaisesRegex(ValueError, "disable-decode-cuda-graph"):
-            _resolve(_tree_args(disable_decode_cuda_graph=False))
+    def test_decode_cuda_graph_is_allowed(self):
+        # The verify graph now captures with the tree mask enabled, so a wide tree no
+        # longer has to opt out of the decode graph. Re-adding a gate here would silently
+        # cost the ~2x the graph buys back.
+        args = _resolve(_tree_args(tree_width=4))
 
-    def test_disable_cuda_graph_also_satisfies_the_graph_gate(self):
-        args = _resolve(
-            _tree_args(disable_decode_cuda_graph=False, disable_cuda_graph=True)
-        )
-
-        self.assertEqual(args.speculative_eagle_topk, 2)
+        self.assertFalse(args.disable_decode_cuda_graph)
+        self.assertFalse(args.disable_cuda_graph)
+        self.assertEqual(args.speculative_eagle_topk, 4)
 
     def test_simulated_real_draft_tokens_rejected(self):
         with envs.SGLANG_SIMULATE_ACC_LEN.override(

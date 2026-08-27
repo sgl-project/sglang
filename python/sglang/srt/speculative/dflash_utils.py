@@ -194,6 +194,13 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    """Resolve the target's full-attention backend and whether verify needs a tree mask.
+
+    A chain draft is causal, so backends with a built-in causal verify path skip the mask.
+    A tree is not: siblings must not see each other, which only the mask can express. The
+    backend does not need re-checking here -- `_validate_dflash_tree_admission` already
+    rejected tree width > 1 on any target backend that cannot consume one.
+    """
     backend = attn_backend
     for _ in range(4):
         full_backend = getattr(backend, "full_attn_backend", None)
@@ -201,6 +208,8 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
             break
         backend = full_backend
     backend_name = type(backend).__name__
+    if dflash_tree_verify_active():
+        return backend_name, True
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 

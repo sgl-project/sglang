@@ -17,7 +17,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.attention.verify_mask import (
+    VerifyMask,
+    fill_verify_mask_indptr,
+    maybe_create_verify_mask,
+)
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
@@ -550,16 +554,22 @@ class TritonAttnBackend(AttentionBackend):
         custom_mask = (
             self._verify_mask.buffer if self._verify_mask is not None else None
         )
-        if (
-            spec_info is not None
-            and getattr(spec_info, "custom_mask", None) is not None
-        ):
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-        else:
+        live_mask = (
+            getattr(spec_info, "custom_mask", None) if spec_info is not None else None
+        )
+        if live_mask is None:
             custom_mask = None
-        seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
-        mask_indptr = self.mask_indptr[: bs + 1]
-        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+        elif live_mask.data_ptr() != custom_mask.data_ptr():
+            # A draft stage that owns no buffer built its mask elsewhere; stage it.
+            # One that wrote straight into this buffer (DFLASH tree, EAGLE with
+            # tree_mask_buf) would otherwise copy the buffer onto itself.
+            custom_mask[: live_mask.shape[0]] = live_mask
+        mask_indptr = fill_verify_mask_indptr(
+            mask_indptr=self.mask_indptr,
+            seq_lens=seq_lens,
+            num_draft_tokens=num_draft_tokens,
+            bs=bs,
+        )
         return (
             qo_indptr,
             kv_indptr,
@@ -898,12 +908,12 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = num_draft_tokens * (
-                forward_batch.seq_lens + num_draft_tokens
+            mask_indptr = fill_verify_mask_indptr(
+                mask_indptr=self.mask_indptr,
+                seq_lens=forward_batch.seq_lens,
+                num_draft_tokens=num_draft_tokens,
+                bs=bs,
             )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = num_draft_tokens
             num_kv_splits = None
             attn_logits = None

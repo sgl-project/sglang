@@ -865,14 +865,17 @@ def _beam_walk_torch(
 
         beam_index = torch.zeros((bs, width), dtype=torch.int64, device=device)
         candidate_index = torch.empty((bs, width), dtype=torch.int64, device=device)
-        # The spine: beam 0's own best child, parent pinned to beam 0. Reads the row
-        # rather than `flat` so it stays independent of the accumulated score, which
-        # is what keeps the spine chain equal to `sample_path`'s greedy walk.
+        # The spine: beam 0's own best child, parent pinned to beam 0 (`beam_index`
+        # keeps its zero init). Reads `transitions[:, 0]` where the kernel reads its
+        # `cum`-added row; the two argmaxes agree because `cum[:, 0]` is a constant
+        # across the row, and staying independent of the accumulated score is what
+        # keeps the spine chain equal to `sample_path`'s greedy walk.
         candidate_index[:, 0] = _first_max_index(transitions[:, 0, :])
 
         remaining = flat.clone()
         # Struck from the pool, so the width picks are distinct (beam, candidate)
-        # pairs -- which is what makes same-parent sibling tokens distinct.
+        # pairs -- which is what makes same-parent sibling tokens distinct. The
+        # spine's flat index is just its candidate index, since its beam is 0.
         remaining[rows, candidate_index[:, 0]] = float("-inf")
         for beam in range(1, width):
             picked = _first_max_index(remaining)

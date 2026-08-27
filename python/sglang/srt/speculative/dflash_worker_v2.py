@@ -20,6 +20,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.verify_mask import TreeMaskMode, tree_mask_numel
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -401,6 +402,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        # Tree verify only: scratch for the flat mask's per-request row offsets, and
+        # the mask itself for the case where the backend owns no captured buffer.
+        self._tree_mask_indptr: Optional[torch.Tensor] = None  # [cap_bs + 1]
+        self._tree_mask_buf: Optional[torch.Tensor] = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
@@ -494,6 +499,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         if capture_decode_cuda_graph:
             # Must run before capture so the draft graph folds the head in.
             self._draft_sampler = self._maybe_build_draft_sampler()
+            assert not (self._use_tree_verify and self._draft_sampler is not None), (
+                "DFLASH tree verify reads the selector's transition lattice, which the "
+                "folded draft head does not produce."
+            )
             if self._draft_sampler is not None:
                 self.draft_model_runner.capture_tail_hooks.append(
                     make_draft_sampler_capture_hook(self._draft_sampler)
@@ -510,6 +519,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
             return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
+        if self._use_tree_verify:
+            # The folded head samples one path; the beam needs the [bs, gamma, K, K]
+            # transition lattice, which only the eager selector returns.
+            return _eager("tree verify")
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
@@ -686,6 +699,65 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+        # Zeros, not empty: `fill_verify_mask_indptr` writes [1 : bs + 1] and relies on
+        # entry 0 already being the offset of request 0, which is always 0.
+        self._tree_mask_indptr = torch.zeros(
+            (new_cap + 1,), dtype=torch.int64, device=device
+        )
+
+    def _tree_mask_buffer(
+        self, *, bs: int, target_kv_bound: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Where this step's flat verify mask goes.
+
+        Preferably the target backend's own buffer, so verify reads the mask in place
+        and nothing is copied. Two conditions before we may write into it: it has to be
+        a FULL_MASK buffer (a QLEN_ONLY one is `N * N` per request while this writer
+        needs `N * (prefix + N)`) and it has to be sized for this batch at this verify
+        width. Both are checked because neither implies the other and neither raises on
+        its own -- the kernel would write past the buffer and corrupt what follows.
+        `FlashInferAttnBackend` allocates no such buffer at all, and
+        `FlashAttentionBackend` allocates a QLEN_ONLY one at topk 1, so this is a live
+        path rather than a rare fallback.
+
+        Otherwise keep our own and grow it. `target_kv_bound` must be a host-side upper
+        bound on the *committed target* lengths (None = use the context-length bound):
+        over-sizing is harmless, since the row offsets are computed exactly on device
+        and the tail is never read, but under-sizing is an out-of-bounds write. A
+        draft-local view of the lengths does not qualify -- under a compact draft cache
+        it is the window size, which does not dominate the target prefix.
+        """
+        width = int(self.verify_width)
+        model_runner = self._target_worker.model_runner
+        # The bound on any committed prefix, and therefore on the row width this writes.
+        # Read from the model rather than from `attn_backend.max_context_len` (which the
+        # hybrid wrapper leaves None when its child has none): what matters is what the
+        # prefixes can actually reach, not what the buffer was sized against.
+        max_context_len = int(model_runner.model_config.context_len)
+        verify_mask = model_runner.attn_backend.verify_mask
+        if (
+            verify_mask is not None
+            and verify_mask.mode == TreeMaskMode.FULL_MASK
+            and verify_mask.fits(bs)
+            and verify_mask.buffer.numel()
+            >= tree_mask_numel(TreeMaskMode.FULL_MASK, bs, width, max_context_len)
+        ):
+            return verify_mask.buffer
+
+        need = (
+            width * bs * (max_context_len + width)
+            if target_kv_bound is None
+            else width * int((target_kv_bound[:bs] + width).sum())
+        )
+        held = 0 if self._tree_mask_buf is None else self._tree_mask_buf.numel()
+        if held < need:
+            # Doubling, like the draft block buffers above: the bound grows by the accept
+            # length every step, so an exactly-sized allocation would reallocate a
+            # possibly-huge buffer on every step of the hot path.
+            self._tree_mask_buf = torch.empty(
+                (max(need, 2 * held),), dtype=torch.bool, device=self.device
+            )
+        return self._tree_mask_buf
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -2018,16 +2090,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         folded = self._draft_sampler is not None and draft_out.can_run_graph
         if self._use_tree_verify:
-            if folded:
-                # The in-graph selector emits one sampled path plus its candidate/q
-                # rows, not the [bs, gamma, K, K] transition lattice the beam walks.
-                raise RuntimeError(
-                    "DFLASH tree verify needs the eager selector to reach the "
-                    "transition lattice, but the draft sampler is folded into the "
-                    "draft cuda graph. "
-                    "Launch with --disable-decode-cuda-graph (required anyway for tree "
-                    "width > 1) or SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1."
-                )
             node_tokens, node_parents = self._propose_selector_tree(
                 draft_logits_output=draft_logits_output,
                 bs=bs,
@@ -2066,22 +2128,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         # --- 2) Target verify.
         if self._use_tree_verify:
             draft_tokens = node_tokens
-            # Committed lengths on both sides: the device copy becomes absolute
-            # positions, the host copy sets the mask's per-request row widths. Read
-            # before the verify-extended override further down.
+            # Committed lengths, device-side only: they become both the absolute
+            # positions and the mask's per-request row widths. Read before the
+            # verify-extended override further down.
             verify_input = build_tree_verify_input(
                 node_tokens=node_tokens,
                 node_parents=node_parents,
                 block_size=block_size,
                 tree_width=self.tree_width,
                 prefix_lens=prefix_lens,
-                prefix_lens_cpu=(
-                    batch.seq_lens_cpu
-                    if batch.seq_lens_cpu is not None
-                    # GPU-only backends keep no host copy; the tree path is eager, so
-                    # one sync per step here is cheaper than carrying a mirror buffer.
-                    else prefix_lens.to("cpu")
+                mask_buffer=self._tree_mask_buffer(
+                    bs=bs,
+                    # Sizing bound only, and it must dominate the committed target
+                    # lengths -- `seq_lens_cpu` above cannot be reused, since under a
+                    # compact draft cache it holds the draft-local window instead.
+                    target_kv_bound=(
+                        batch.seq_lens_cpu
+                        if batch.seq_lens_cpu is not None
+                        else draft_input.nxt_kv_lens_cpu
+                    ),
                 ),
+                mask_indptr=self._tree_mask_indptr[: bs + 1],
             )
             # Must stay ahead of the target verify launch below.
             grammar_tree = (

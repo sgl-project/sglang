@@ -352,7 +352,7 @@ def _selector_beam_walk_kernel(
     dependency stays inside one launch exactly like the single-path walk above.
 
     WIDTH is `next_power_of_2(width)` because `tl.arange` demands a power of two.
-    Padded lanes hold -inf and can never win a slot; that is the same mechanism that
+    Padded lanes hold -inf and can never win a beam; that is the same mechanism that
     folds the first depth (where only beam 0 is live) into the shared loop body.
     """
     row = tl.program_id(0)
@@ -388,10 +388,11 @@ def _selector_beam_walk_kernel(
         log_probs = shifted - tl.log(tl.sum(tl.exp(shifted), axis=1))[:, None]
         scored = tl.where(live[:, None], cum[:, None] + log_probs, neg_inf)
 
-        # The spine takes slot 0: beam 0's own best child, parent pinned to beam 0.
-        # Restricting to beam 0 rather than ranking the whole pool is what keeps the
-        # spine chain equal to the single-path greedy walk, hence the tree a superset
-        # of it. cum[0] is a constant across the row, so it cannot move the argmax.
+        # The depth's first node (`base`) is the spine: beam 0's own best child, with
+        # its parent pinned to beam 0. Restricting to beam 0 rather than ranking the
+        # whole pool is what keeps the spine chain equal to the single-path greedy
+        # walk, hence the tree a superset of it. cum[0] is a constant across the row,
+        # so it cannot move the argmax.
         spine_value, spine = _beam_first_max(
             tl.where(lanes[:, None] == 0, scored, neg_inf), flat_index, limit
         )
@@ -468,5 +469,86 @@ def selector_beam_walk_triton(
         num_warps=1,
     )
     return tokens, parents
+
+
+@triton.jit
+def _dflash_tree_full_mask_kernel(
+    ancestor_ptr,
+    mask_indptr_ptr,
+    seq_lens_ptr,
+    out_ptr,
+    nodes,
+    PREFIX_BLOCK: tl.constexpr,
+    NODES: tl.constexpr,
+):
+    """One program per (request, node): writes that node's whole attention row.
+
+    Row layout is `seq_len` prefix cells (a draft node sees the entire committed
+    prefix) followed by the node's `nodes`-wide ancestor closure. The prefix span
+    is why this cannot be a fixed-shape store: it is read from device memory, so
+    the host never learns the committed length.
+    """
+    request = tl.program_id(0)
+    node = tl.program_id(1)
+    prefix = tl.load(seq_lens_ptr + request).to(tl.int64)
+    base = tl.load(mask_indptr_ptr + request).to(tl.int64) + node * (prefix + nodes)
+
+    allow = tl.full((PREFIX_BLOCK,), 1, dtype=out_ptr.dtype.element_ty)
+    for start in range(0, prefix, PREFIX_BLOCK):
+        cols = start + tl.arange(0, PREFIX_BLOCK)
+        tl.store(out_ptr + base + cols, allow, mask=cols < prefix)
+
+    lanes = tl.arange(0, NODES)
+    lane_mask = lanes < nodes
+    closure = tl.load(
+        ancestor_ptr + (request * nodes + node) * nodes + lanes,
+        mask=lane_mask,
+        other=0,
+    )
+    tl.store(
+        out_ptr + base + prefix + lanes,
+        closure.to(out_ptr.dtype.element_ty),
+        mask=lane_mask,
+    )
+
+
+def write_dflash_tree_full_mask(
+    *,
+    ancestor_mask: torch.Tensor,
+    mask_indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Write the flat FULL_MASK for a DFLASH beam tree into `out`, in place.
+
+    `out` is normally the attention backend's own verify-mask buffer, so verify
+    reads the mask where the kernel left it and nothing is copied. `mask_indptr`
+    must come from `fill_verify_mask_indptr` -- the writer and the reader share
+    that one formula on purpose.
+
+    Every cell of every live row is written, prefix included: the buffer is reused
+    across steps and a request's rows move as its prefix grows, so last step's
+    closure bits land inside this step's prefix span. Returns `out` for the caller
+    to hand to `custom_mask`.
+    """
+    batch, nodes, nodes_again = ancestor_mask.shape
+    if nodes != nodes_again:
+        raise ValueError(
+            f"ancestor_mask must be [bs, N, N], got {tuple(ancestor_mask.shape)}."
+        )
+    if mask_indptr.shape[0] < batch:
+        raise ValueError(
+            f"mask_indptr holds {mask_indptr.shape[0]} entries for {batch} requests."
+        )
+    _dflash_tree_full_mask_kernel[(batch, nodes)](
+        ancestor_mask.contiguous(),
+        mask_indptr,
+        seq_lens,
+        out,
+        nodes=nodes,
+        PREFIX_BLOCK=1024,
+        NODES=triton.next_power_of_2(nodes),
+    )
+    return out
 
 
