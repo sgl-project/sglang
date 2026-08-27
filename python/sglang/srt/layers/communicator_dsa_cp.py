@@ -55,15 +55,22 @@ def maybe_prefetch_next_full_attention_kv(
 ) -> None:
     """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
 
-    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
+    Hybrid pools expose ``prefetch_full_attention_kv_buffer`` to translate the
+    model layer id to the compact full-attention pool id. Non-hybrid
+    layer-sharded pools expose ``prefetch_kv_buffer`` directly.
     """
     if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
         return
 
-    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+    token_to_kv_pool = get_token_to_kv_pool()
+    prefetch_full_attention_kv = getattr(
+        token_to_kv_pool, "prefetch_full_attention_kv_buffer", None
+    )
+    if prefetch_full_attention_kv is not None:
+        prefetch_full_attention_kv(next_full_attention_layer_id)
+        return
+
+    prefetch_kv_buffer = getattr(token_to_kv_pool, "prefetch_kv_buffer", None)
     if prefetch_kv_buffer is not None:
         prefetch_kv_buffer(next_full_attention_layer_id)
 
@@ -135,6 +142,15 @@ class DSACPLayerCommunicator(LayerCommunicator):
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
+        )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
         )
 
 
