@@ -234,7 +234,7 @@ def evict_from_tree_cache(
                     swa_evictable_tokens=swa_reclaim,
                 ),
             )
-        evicted = tree_cache.evict(
+        evicted = tree_cache.evict_for_alloc(
             EvictParams(
                 num_tokens=full_reclaim,
                 swa_num_tokens=swa_reclaim,

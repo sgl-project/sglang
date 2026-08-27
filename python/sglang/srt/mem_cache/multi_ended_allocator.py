@@ -3685,8 +3685,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedSWAAlloc.alloc"):
-            if not self.ensure_capacity(need_size, need_size):
-                return None
+            if need_size > self.available_size():
+                if not _relieve_for_alloc(self, need_size):
+                    return None
             # Snapshot the virtual PAGES full will consume, to bind them on swa too.
             num_pages = need_size // self.page_size
             fa = self.full_attn_allocator
@@ -3722,8 +3723,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 prefix_lens=prefix_lens_cpu,
             )
             need_tokens = num_new_pages * self.page_size
-            if not self.ensure_capacity(need_tokens, need_tokens):
-                return None
+            if need_tokens > self.available_size():
+                if not _relieve_for_alloc(self, need_tokens):
+                    return None
 
             # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
             # its view after the slice is consumed.
@@ -3760,8 +3762,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
             need_tokens = num_new_pages * self.page_size
-            if not self.ensure_capacity(need_tokens, need_tokens):
-                return None
+            if need_tokens > self.available_size():
+                if not _relieve_for_alloc(self, need_tokens):
+                    return None
 
             fa = self.full_attn_allocator
             new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()

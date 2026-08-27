@@ -1667,6 +1667,7 @@ def init_unified_swa_pools(
     full_attention_layer_ids: List[int],
     full_max_total_num_tokens: Optional[int] = None,
     swa_max_total_num_tokens: Optional[int] = None,
+    total_bytes: Optional[int] = None,
     enable_memory_saver: bool,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
@@ -1710,15 +1711,16 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    legacy_allocator_capacities = {}
-    if unified_total_bytes is not None:
-        # PROFILED byte budget, sized from directly: the re-sum's floor losses
-        # stay out of the buffer, and the token counts remain boot labels.
+    if total_bytes is not None and unified_total_bytes is not None:
+        raise ValueError("total_bytes and unified_total_bytes are mutually exclusive")
+    if total_bytes is None:
         total_bytes = unified_total_bytes
-    else:
+
+    legacy_allocator_capacities = {}
+    if total_bytes is None:
         if full_max_total_num_tokens is None or swa_max_total_num_tokens is None:
             raise ValueError(
-                "unified_total_bytes or both legacy full/SWA capacities must be provided"
+                "total_bytes or both legacy full/SWA capacities must be provided"
             )
         total_bytes = (
             full_max_total_num_tokens * full_spec.entry_bytes()
