@@ -211,7 +211,6 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
-        # Carry DSV4 expert layout into quant configs so downstream readers don't read env.
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
