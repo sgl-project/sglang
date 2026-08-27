@@ -16,8 +16,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 LRELU_SLOPE = 0.1
 
 
-# LTX-2 supports CPU inference paths (https://github.com/Lightricks/LTX-2/tree/main).
-# On CPU, autocast does not reliably retag module params/buffers to fp32 for this path.
+# This function is from https://github.com/Lightricks/LTX-2/blob/400fd31054597515f47125691032c04b1c3ee24e/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py#L20
 @contextlib.contextmanager
 def _module_in_fp32(module: nn.Module, *, enabled: bool) -> Iterator[None]:
     """Temporarily cast *module* to float32, restoring original dtype on exit."""
@@ -721,8 +720,11 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         if hasattr(self, "bwe_generator"):
             input_dtype = hidden_states.dtype
-            # Keep CUDA/XPU behavior on autocast; CPU uses _module_in_fp32 (https://github.com/Lightricks/LTX-2/blob/400fd31054597515f47125691032c04b1c3ee24e/packages/ltx-core/src/ltx_core/model/audio_vae/vocoder.py#L585-L609)
-            # to materialize module weights in fp32 during the forward region.
+            # On CPU, torch.autocast("cpu", dtype=torch.float32) emits a warning and silently disables autocast (enabled = False)
+            # CPU takes the non-CUDA branch in autocast.__init__. That branch defines a device_supported_dtypes list containing only bfloat16 and float16.
+            # Since float32 is not in the list, the code hits the "target dtype is not supported. Disabling autocast." branch, warns, and turns autocast off.
+            # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L297-L305
+            # https://github.com/pytorch/pytorch/blob/d7245544ad8fe2816425bfac5d2312b6f6f37386/torch/amp/autocast_mode.py#L248
             autocast_ctx = (
                 torch.autocast(
                     device_type=hidden_states.device.type, dtype=torch.float32
