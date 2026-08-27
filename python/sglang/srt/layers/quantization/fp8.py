@@ -124,6 +124,7 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _A5_MXFP8_BLOCK_SIZE = 32
+_FP8_E4M3FN_MAX = torch.finfo(torch.float8_e4m3fn).max
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -777,7 +778,9 @@ class Fp8LinearMethod(LinearMethodBase):
         weight_groups = weight.float().reshape(
             n_dim, k_dim // _A5_MXFP8_BLOCK_SIZE, _A5_MXFP8_BLOCK_SIZE
         )
-        scale = ceil_to_ue8m0(weight_groups.abs().amax(dim=-1, keepdim=True) / 448.0)
+        scale = ceil_to_ue8m0(
+            weight_groups.abs().amax(dim=-1, keepdim=True) / _FP8_E4M3FN_MAX
+        )
         qweight = (weight_groups / scale).to(torch.float8_e4m3fn).reshape(n_dim, k_dim)
         scale_u8 = (scale.squeeze(-1).view(torch.int32) >> 23).to(torch.uint8)
 

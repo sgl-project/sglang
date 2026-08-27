@@ -554,15 +554,6 @@ class MoEGate(nn.Module):
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
-            elif _is_npu and self.is_deepseek_v4:
-                # DSV4's non-hash layers route on near-degenerate logits, so the
-                # router GEMM must run in fp32 — the CUDA branch below uses
-                # linear_bf16_fp32 for the same reason. In bf16 the top-k
-                # boundary flips on layers whose selected experts are within
-                # ~1% of each other.
-                if self.weight_fp32 is None:
-                    self.weight_fp32 = self.weight.data.float()
-                logits = F.linear(hidden_states.float(), self.weight_fp32, None)
             elif not _is_cuda:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
