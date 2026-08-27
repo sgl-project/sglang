@@ -16,12 +16,18 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+class MambaFullCacheDonor(Protocol):
+    """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
+
+    def flush_deferred_full_frees(self) -> None: ...
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -73,6 +79,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Idle-time diagnostic: recompute byte/slot accounting and return
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
+
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
+        """Return the shared-pool donor capability, if this allocator has one."""
+        return None
 
     def debug_print(self) -> str:
         return ""

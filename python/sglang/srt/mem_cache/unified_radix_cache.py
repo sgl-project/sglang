@@ -577,11 +577,62 @@ class UnifiedRadixCache(BasePrefixCache):
 
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
-            ct: self._component_available_size(ct) + request_cnt
+            ct: (ct, self._component_available_size(ct) + request_cnt)
             for ct, request_cnt in request_by_type.items()
             if request_cnt > 0
         }
-        return self._evict(params, available_size_targets)
+        allocator = self.token_to_kv_pool_allocator
+        mamba_full_donor = allocator.mamba_full_cache_donor()
+        mamba_target = available_size_targets.get(ComponentType.MAMBA)
+        initial_params = params
+        if mamba_target is not None and mamba_full_donor is not None:
+            # Full KV can supply bytes but cannot recycle Mamba virtual IDs.
+            mamba_id_shortfall = max(
+                0,
+                mamba_target[1]
+                - self.req_to_token_pool.mamba_allocator.available_size(),
+            )
+            initial_params = EvictParams(
+                num_tokens=params.num_tokens,
+                swa_num_tokens=params.swa_num_tokens,
+                mamba_num=mamba_id_shortfall,
+            )
+        result = self._evict(initial_params, available_size_targets)
+
+        if mamba_target is not None and mamba_full_donor is not None:
+            mamba_full_donor.flush_deferred_full_frees()
+            mamba_free_ids = self.req_to_token_pool.mamba_allocator.available_size()
+            mamba_capacity = self._component_available_size(ComponentType.MAMBA)
+
+            if mamba_free_ids >= mamba_target[1] and mamba_capacity < mamba_target[1]:
+                full_evictable = self.full_evictable_size()
+                if full_evictable > 0:
+                    donor_result = self._evict(
+                        EvictParams(num_tokens=full_evictable),
+                        {ComponentType.FULL: mamba_target},
+                    )
+                    result.num_tokens_evicted += donor_result.num_tokens_evicted
+                    result.swa_num_tokens_evicted += donor_result.swa_num_tokens_evicted
+                    result.mamba_num_evicted += donor_result.mamba_num_evicted
+
+                # Preserve Mamba-victim recovery if Full cannot fund the target.
+                if (
+                    self._component_available_size(ComponentType.MAMBA)
+                    < mamba_target[1]
+                ):
+                    mamba_evictable = self.mamba_evictable_size()
+                    if mamba_evictable > 0:
+                        fallback_result = self._evict(
+                            EvictParams(mamba_num=mamba_evictable),
+                            {ComponentType.MAMBA: mamba_target},
+                        )
+                        result.num_tokens_evicted += fallback_result.num_tokens_evicted
+                        result.swa_num_tokens_evicted += (
+                            fallback_result.swa_num_tokens_evicted
+                        )
+                        result.mamba_num_evicted += fallback_result.mamba_num_evicted
+
+        return result
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
@@ -611,7 +662,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict(
         self,
         params: EvictParams,
-        available_size_targets: Optional[dict[ComponentType, int]] = None,
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -712,7 +765,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
-        available_size_targets: Optional[dict[ComponentType, int]] = None,
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -722,12 +777,18 @@ class UnifiedRadixCache(BasePrefixCache):
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)
-            # Do not compact on every eviction step. Shared allocators include
-            # drainable peer holes here and flush the peer once in alloc().
-            return (
-                target is not None
-                and self._component_available_size(component_type) >= target
-            )
+            if target is None:
+                return False
+            target_component, target_size = target
+            if (
+                component_type == ComponentType.FULL
+                and target_component == ComponentType.MAMBA
+            ):
+                donor = self.token_to_kv_pool_allocator.mamba_full_cache_donor()
+                assert donor is not None, "Mamba target requires a Full donor"
+                donor.flush_deferred_full_frees()
+            # Schedulable capacity includes donor holes that allocation can compact.
+            return self._component_available_size(target_component) >= target_size
 
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]

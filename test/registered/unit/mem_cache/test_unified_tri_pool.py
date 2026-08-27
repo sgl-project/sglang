@@ -370,6 +370,24 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         # Capacity fully recovered: the float parked, both ends rewound.
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
+    def test_mamba_donor_flushes_group_without_closing_it(self):
+        _, allocator = self._build_paged()
+        full_indices = allocator.alloc(8)
+        self.assertIsNotNone(full_indices)
+
+        allocator.free_group_begin()
+        allocator.free_segment(full_indices, start_pos=0)
+        self.assertTrue(allocator.free_page_reps_group)
+
+        donor = allocator.mamba_full_cache_donor()
+        self.assertIsNotNone(donor)
+        donor.flush_deferred_full_frees()
+
+        self.assertEqual(allocator.free_group, [])
+        self.assertEqual(allocator.free_page_reps_group, [])
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+        allocator.free_group_end()
+
     def test_ungrouped_segment_free_also_reaches_the_float(self):
         pool, allocator = self._build_paged()
         v = allocator.alloc(8)

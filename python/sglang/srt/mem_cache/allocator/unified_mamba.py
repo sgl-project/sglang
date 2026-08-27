@@ -23,6 +23,7 @@ import torch
 from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
     _chain_byte_accounting_violations,
@@ -145,6 +146,20 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
+
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
+        return self
+
+
+    def flush_deferred_full_frees(self) -> None:
+        """Expose grouped Full frees without ending the caller's free group."""
+        if self.free_group is None or (
+            not self.free_group and not self.free_page_reps_group
+        ):
+            return
+        self.free_group_end()
+        self.free_group_begin()
+
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the

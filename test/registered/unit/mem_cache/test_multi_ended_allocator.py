@@ -3032,6 +3032,29 @@ class TestDcpWidening(unittest.TestCase):
                     # The un-scaled cost -- the bug -- would not have covered it.
                     self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
 
+    def test_full_donor_flushes_paged_free_group_without_closing_it(self):
+        with self._dcp(2):
+            allocator = self._build_composite(page_size=2)
+            full_indices = allocator.alloc(8)
+            self.assertIsNotNone(full_indices)
+            allocated_before = allocator.full_attn_allocator.allocated_count()
+
+            allocator.free_group_begin()
+            allocator.free_segment(full_indices, start_pos=0)
+            self.assertTrue(allocator.free_page_reps_group)
+
+            donor = allocator.mamba_full_cache_donor()
+            self.assertIsNotNone(donor)
+            donor.flush_deferred_full_frees()
+
+            self.assertEqual(allocator.free_group, [])
+            self.assertEqual(allocator.free_page_reps_group, [])
+            self.assertLess(
+                allocator.full_attn_allocator.allocated_count(), allocated_before
+            )
+            self.assertEqual(allocator.verify_byte_accounting(), [])
+            allocator.free_group_end()
+
 
 if __name__ == "__main__":
     unittest.main()
