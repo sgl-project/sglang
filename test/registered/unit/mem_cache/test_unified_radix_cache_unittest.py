@@ -331,6 +331,34 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         self.assertTrue(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
         core._update_duplicate_tracking.assert_called_once_with(shared)
 
+    def test_auxiliary_load_does_not_reuse_full_pending_pin(self):
+        core, shared, anchor_a, anchor_b = self._build_core(is_write_back=True)
+        core.components_by_type[ComponentType.SWA] = mock.Mock()
+
+        self._commit_load_back(core, anchor_a, shared)
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+
+        kv_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1], dtype=torch.int64),
+            nodes_to_load=[anchor_b.id],
+        )
+        swa_transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.tensor([2], dtype=torch.int64),
+            nodes_to_load=[shared.id],
+        )
+        UnifiedTreeCore.commit_load_back(
+            core,
+            anchor_b.id,
+            torch.tensor([3], dtype=torch.int64),
+            kv_transfer,
+            {ComponentType.SWA: [swa_transfer]},
+        )
+
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+        self.assertEqual(anchor_b.load_back_pending_id, anchor_b.id)
+
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
     """Back up one node's KV D->H via the tree's build+execute primitives."""

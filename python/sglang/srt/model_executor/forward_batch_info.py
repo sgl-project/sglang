@@ -986,14 +986,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 pin_memory=is_pin_memory_available(batch.device),
             ).to(batch.device, non_blocking=True)
 
-    def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
+    def adjust_num_token_non_padded_for_attn_tp(self) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_parallel().attn_dp_rank
         assert self.global_num_tokens_cpu is not None
 
-        if require_mlp_tp_gather(server_args):
+        if require_mlp_tp_gather():
             num_tokens_per_dp = self.global_num_tokens_cpu[dp_rank]
         else:
             num_tokens_per_dp = self.global_num_tokens_cpu[0]
