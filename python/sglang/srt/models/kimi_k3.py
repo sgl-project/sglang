@@ -2917,6 +2917,7 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        self._dspark_pre_logits_hook = None
         self._dp_attention = is_dp_attention_enabled()
         self._trim_padded_attn = require_mlp_sync(get_server_args())
 
@@ -3039,6 +3040,18 @@ class KimiK3LinearModel(nn.Module):
         )
         sp_sharded = False
         aux_hidden_states = []
+        dspark_pre_logits_hook = (
+            self._dspark_pre_logits_hook
+            if self.dspark_layers_to_capture
+            and get_is_capture_mode()
+            and forward_batch.forward_mode.is_target_verify()
+            else None
+        )
+        last_dspark_capture = (
+            max(self.dspark_layers_to_capture)
+            if dspark_pre_logits_hook is not None
+            else None
+        )
         for i in range(self.start_layer, self.end_layer):
             if sp_sharded and not self.layers[i]._sp_moe:
                 hidden_states = _sp_all_gather_rows(hidden_states)
@@ -3061,6 +3074,11 @@ class KimiK3LinearModel(nn.Module):
                 aux_hidden_states.append(
                     self._dspark_capture_stream(i, hidden_states, residual, attn_res)
                 )
+                if i == last_dspark_capture:
+                    # The final selected feature precedes the model tail. Launch
+                    # the large DSpark projection here so later layers hide it.
+                    aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
+                    dspark_pre_logits_hook(aux_hidden_states)
 
         if not self.pp_group.is_last_rank:
             assert not sp_sharded
@@ -3210,6 +3228,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
     def set_dspark_pre_logits_hook(self, hook) -> None:
         self._dspark_pre_logits_hook = hook
+        self.model._dspark_pre_logits_hook = hook
 
     @torch.no_grad()
     def forward(
@@ -3233,6 +3252,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     self._dspark_pre_logits_hook is not None
                     and get_is_capture_mode()
                     and forward_batch.forward_mode.is_target_verify()
+                    and not isinstance(aux_hidden_states, torch.Tensor)
                 ):
                     aux_hidden_states = pack_aux_hidden_states(aux_hidden_states)
                     self._dspark_pre_logits_hook(aux_hidden_states)
