@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
-use crate::renderer::{PreprocessJob, RendererService};
+use crate::renderer::{PreprocessJob, new_renderer_service};
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -175,7 +175,7 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
                 .enable_all()
                 .build()
                 .expect("build render runtime");
-            let renderer = Arc::new(RendererService::new(cfg.server_args.clone(), render_tx));
+            let renderer = Arc::new(new_renderer_service(cfg.server_args.clone(), render_tx));
             runtime.block_on(api_server::app::serve_render(
                 listener,
                 cfg.server_args,
@@ -226,7 +226,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
-    let renderer = Arc::new(RendererService::new(
+    let renderer = Arc::new(new_renderer_service(
         cfg.server_args.clone(),
         tokenizer_tx.clone(),
     ));

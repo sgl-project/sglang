@@ -3,13 +3,14 @@
 use std::sync::Arc;
 
 use crate::message::request::{GenerateRequest, RequestKind};
-use crate::renderer::{PreprocessJob, prepare_direct_request};
+use crate::renderer::PreprocessJob;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::to_scheduler::Limits;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
 
-pub use sglang_renderer::{DynamoTokenizer, TextTokenizer, load_tokenizer, resolve_model_file};
+pub use sglang_renderer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+use sglang_renderer::{RendererLimits, prepare_direct_request};
 
 /// Remove one leading run of auto-added specials — exactly what an
 /// `add_special_tokens=false` encode would have produced, without a second
@@ -65,7 +66,7 @@ pub struct TokenizerWorker {
     tm: Option<flume::Sender<TmEvent>>,
     tokenizer: Arc<dyn TextTokenizer>,
     auto_specials: Vec<i32>,
-    limits: Limits,
+    renderer_limits: RendererLimits,
 }
 
 impl TokenizerWorker {
@@ -76,12 +77,20 @@ impl TokenizerWorker {
         limits: Limits,
     ) -> Self {
         let auto_specials = tokenizer.auto_specials();
+        let renderer_limits = RendererLimits {
+            skip_tokenizer_init: limits.skip_tokenizer_init,
+            vocab_size: limits.vocab_size,
+            context_len: limits.context_len,
+            num_reserved_tokens: limits.num_reserved_tokens,
+            allow_auto_truncate: limits.allow_auto_truncate,
+            enable_return_hidden_states: limits.enable_return_hidden_states,
+        };
         Self {
             rx,
             tm,
             tokenizer,
             auto_specials,
-            limits,
+            renderer_limits,
         }
     }
 }
@@ -123,7 +132,7 @@ impl Runnable for TokenizerWorker {
                         job.request,
                         self.tokenizer.as_ref(),
                         &self.auto_specials,
-                        &self.limits,
+                        &self.renderer_limits,
                     );
                     // The HTTP request may have been cancelled while preparing.
                     let _ = job.reply.send(result);

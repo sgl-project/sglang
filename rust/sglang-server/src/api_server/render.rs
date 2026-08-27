@@ -12,7 +12,9 @@ use axum::{
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 
 use super::openai::openai_error;
-use crate::renderer::{PreparedGenerateRequest, RenderServiceError, RendererService};
+use crate::renderer::{
+    PreparedGenerateRequest, RenderServiceError, RendererService, render_http_status,
+};
 
 #[derive(Clone)]
 pub(super) struct RenderState {
@@ -38,8 +40,8 @@ async fn health() -> StatusCode {
 }
 
 fn render_error(error: RenderServiceError) -> Response {
-    let status =
-        StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(render_http_status(&error))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     openai_error(status, error.to_string(), false)
 }
 
@@ -116,7 +118,7 @@ mod tests {
     use crate::message::config::{ModelConfig, ServerArgs};
     use crate::message::request::GenerateBody;
     use crate::message::types::TokenIds;
-    use crate::renderer::{PreprocessJob, RendererService};
+    use crate::renderer::{PreprocessJob, new_renderer_service};
     use crate::runtime::Runnable;
     use crate::tokenizer_manager::to_scheduler::Limits;
     use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
@@ -180,7 +182,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let renderer = Arc::new(RendererService::new(server_args, jobs));
+        let renderer = Arc::new(new_renderer_service(server_args, jobs));
         TestApp {
             router: Some(routes(RenderState::new(renderer))),
             workers,

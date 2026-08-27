@@ -16,7 +16,7 @@ use axum::{
 };
 use dynamo_protocols::types::{
     Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
+    CreateCompletionResponse, Logprobs,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -24,26 +24,19 @@ use tokio::sync::mpsc;
 use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, OpenAIRequestError, collect_output, error_payload,
-    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
+    AppState, collect_output, error_payload, indexed_decode_stream, openai_error,
+    submit_generation, unix_seconds_u32,
 };
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
-use crate::message::sampling::SamplingParams;
-use crate::message::types::{OneOrMany, TokenIds};
-use crate::renderer::RendererConfig;
+use crate::message::types::TokenIds;
+use crate::renderer::render_http_status;
 use crate::utils::error::Error;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PromptSpec {
-    Text(String),
-    TokenIds(TokenIds),
 }
 
 pub(super) struct SubmittedChoice {
@@ -59,74 +52,6 @@ pub(super) struct ChoiceExtensions {
     /// Dynamo's enum covers the standard values. Python additionally exposes
     /// `abort`, and native unknown finish types are preserved rather than lost.
     finish_reason_override: Option<String>,
-}
-
-/// Validate and lower one OpenAI completion request into the ordered native
-/// requests consumed by inference or standalone rendering.
-pub(crate) fn lower_completion_requests(
-    config: &RendererConfig,
-    request: &CreateCompletionRequest,
-    response_id: &str,
-) -> Result<Vec<GenerateRequest>, OpenAIRequestError> {
-    if request.model != config.served_model_name {
-        return Err(format!("The model `{}` does not exist", request.model).into());
-    }
-    if request.prompt_embeds.is_some() {
-        return Err("prompt_embeds is not supported by the Rust frontend".into());
-    }
-    if request.suffix.is_some() {
-        return Err("suffix is not supported by this model".into());
-    }
-    if request.best_of.is_some_and(|best_of| best_of != 1) {
-        return Err("best_of values greater than 1 are not supported".into());
-    }
-    if request.max_tokens == Some(0) {
-        return Err("max_tokens must be positive".into());
-    }
-    if request.n == Some(0) {
-        return Err("n must be at least 1".into());
-    }
-    let prompt_specs = completion_prompt_specs(&request.prompt)?;
-    let mut sampling = completion_sampling_params(request)?;
-    sampling
-        .normalize(config.skip_tokenizer_init, config.vocab_size)
-        .map_err(|error| error.to_string())?;
-    let n = request.n.unwrap_or(1) as usize;
-    let choice_count = prompt_specs
-        .len()
-        .checked_mul(n)
-        .filter(|&count| count <= MAX_OPENAI_CHOICES)
-        .ok_or_else(|| {
-            format!("prompt count times n exceeds the maximum of {MAX_OPENAI_CHOICES}")
-        })?;
-
-    let mut requests = Vec::with_capacity(choice_count);
-    for (prompt_index, prompt) in prompt_specs.into_iter().enumerate() {
-        let (text, input_ids) = match prompt {
-            PromptSpec::Text(text) => (Some(text), None),
-            PromptSpec::TokenIds(ids) => (None, Some(ids)),
-        };
-        for sample_index in 0..n {
-            let index = prompt_index * n + sample_index;
-            requests.push(GenerateRequest {
-                rid: Rid::from_client(&format!("{response_id}-{index}")),
-                text: text.clone(),
-                input_ids: input_ids.clone(),
-                sampling_params: sampling.clone(),
-                stream: request.stream.unwrap_or(false),
-                return_logprob: request.logprobs.is_some(),
-                logprob_start_len: if request.echo.unwrap_or(false) && request.logprobs.is_some() {
-                    0
-                } else {
-                    -1
-                },
-                top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
-                return_text_in_logprobs: request.logprobs.map(|_| true),
-                ..Default::default()
-            });
-        }
-    }
-    Ok(requests)
 }
 
 async fn completions(
@@ -147,7 +72,7 @@ async fn completions(
     {
         Ok(requests) => requests,
         Err(error) => {
-            let status = StatusCode::from_u16(error.http_status())
+            let status = StatusCode::from_u16(render_http_status(&error))
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return openai_error(status, error.to_string(), false);
         }
@@ -161,7 +86,8 @@ async fn completions(
     let n = request.n.unwrap_or(1) as usize;
     let mut prompt_echo = String::new();
 
-    for (index, native) in native_requests.into_iter().enumerate() {
+    for (index, rendered) in native_requests.into_iter().enumerate() {
+        let native = GenerateRequest::from(rendered);
         let prompt_index = index / n;
         let sample_index = index % n;
         if sample_index == 0 {
@@ -274,82 +200,6 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
             false,
         )),
     }
-}
-
-fn completion_prompt_specs(prompt: &Prompt) -> Result<Vec<PromptSpec>, String> {
-    match prompt {
-        Prompt::String(text) => {
-            if text.is_empty() {
-                return Err("Prompt cannot be empty".into());
-            }
-            Ok(vec![PromptSpec::Text(text.clone())])
-        }
-        Prompt::StringArray(texts) => {
-            if texts.is_empty() || texts.iter().any(String::is_empty) {
-                return Err("Prompt cannot be empty".into());
-            }
-            Ok(texts.iter().cloned().map(PromptSpec::Text).collect())
-        }
-        Prompt::IntegerArray(ids) => Ok(vec![token_prompt_spec(ids)?]),
-        Prompt::ArrayOfIntegerArray(prompts) => {
-            if prompts.is_empty() {
-                return Err("Prompt cannot be empty".into());
-            }
-            prompts.iter().map(|ids| token_prompt_spec(ids)).collect()
-        }
-    }
-}
-
-fn token_prompt_spec(ids: &[u32]) -> Result<PromptSpec, String> {
-    if ids.is_empty() {
-        return Err("Prompt cannot be empty".into());
-    }
-    let input_ids = ids
-        .iter()
-        .map(|&id| i32::try_from(id).map_err(|_| format!("Token ID {id} is out of range")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PromptSpec::TokenIds(input_ids))
-}
-
-fn completion_sampling_params(request: &CreateCompletionRequest) -> Result<SamplingParams, String> {
-    let mut stop = None;
-    let mut stop_token_ids = None;
-    match request.stop.as_ref() {
-        Some(Stop::String(value)) => stop = Some(OneOrMany::One(value.clone())),
-        Some(Stop::StringArray(values)) => stop = Some(OneOrMany::Many(values.clone())),
-        Some(Stop::TokenIdArray(values)) => {
-            stop_token_ids
-                .get_or_insert_with(Vec::new)
-                .extend(values.iter().map(|&id| id as i64));
-        }
-        None => {}
-    }
-
-    let mut logit_bias = BTreeMap::new();
-    if let Some(values) = request.logit_bias.as_ref() {
-        for (token, bias) in values {
-            let bias = bias
-                .as_f64()
-                .ok_or_else(|| format!("logit_bias[{token:?}] must be a number"))?;
-            logit_bias.insert(token.clone(), bias);
-        }
-    }
-
-    Ok(SamplingParams {
-        max_new_tokens: Some(request.max_tokens.unwrap_or(16) as i64),
-        stop,
-        stop_token_ids,
-        temperature: request.temperature.unwrap_or(1.0) as f64,
-        top_p: request.top_p.unwrap_or(1.0) as f64,
-        frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
-        presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
-        // OpenAI `n` is implemented by fan-out: every native request has one
-        // output, avoiding the native path's intentional `n > 1` rejection.
-        n: 1,
-        logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
-        sampling_seed: request.seed,
-        ..Default::default()
-    })
 }
 
 pub(super) async fn unary_completion(
@@ -732,8 +582,8 @@ fn append_top_logprobs(
 mod tests {
     use super::super::test_utils::{chunk, senders, submitted};
     use super::{
-        ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
+        unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::response::ChunkExtras;
@@ -742,6 +592,7 @@ mod tests {
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
     use futures::StreamExt;
+    use sglang_renderer::openai::{PromptSpec, completion_prompt_specs};
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {

@@ -23,7 +23,7 @@ use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::message::types::TokenIds;
-use crate::renderer::{PreprocessJob, RendererService};
+use crate::renderer::{PreprocessJob, new_renderer_service};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::to_scheduler::Limits;
 use crate::tokenizer_manager::tokenizer::{TextTokenizer, TokenizerWorker};
@@ -116,7 +116,7 @@ pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
     std::thread::spawn(move || {
         TokenizerWorker::new(worker_jobs, None, Arc::new(TestTokenizer), limits).run()
     });
-    let renderer = Arc::new(RendererService::new(server_args.clone(), jobs));
+    let renderer = Arc::new(new_renderer_service(server_args.clone(), jobs));
     Arc::new(super::AppState {
         senders,
         response_buf: 8,

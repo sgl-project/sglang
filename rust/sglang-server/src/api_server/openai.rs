@@ -4,11 +4,7 @@
 //! request and response primitives. Native [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
-use axum::{
-    Router,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -17,12 +13,7 @@ mod chat;
 mod completions;
 mod models;
 mod reasoning;
-mod template;
 mod tools;
-
-pub(crate) use chat::lower_chat_requests;
-pub(crate) use completions::lower_completion_requests;
-pub(crate) use template::ChatFormatter;
 
 use super::app::AppState;
 use super::frame::OutputAccumulator;
@@ -31,11 +22,7 @@ use super::submit::submit;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::renderer::RendererConfig;
-use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
-
-const MAX_OPENAI_CHOICES: usize = 4096;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -43,42 +30,6 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(models::routes())
         .merge(completions::routes())
         .merge(chat::routes())
-}
-
-/// Resolve the chat formatter, or `None` to disable the OpenAI chat-completions
-/// endpoint. Tokenization is the tokenizer pool's job (the api server never
-/// encodes); the formatter needs at most `tokenizer_config.json` — a built-in
-/// `--chat-template` name or a model-path-inferred legacy template resolve
-/// without it, so its absence must not disable chat.
-pub(crate) fn load_chat_support(config: &RendererConfig) -> Option<ChatFormatter> {
-    // Chat needs the tokenizer pool behind it: under `skip_tokenizer_init`
-    // there is none (text cannot be submitted), so chat is disabled.
-    if config.skip_tokenizer_init || config.tokenizer_path.is_empty() {
-        return None;
-    }
-    let config_file = tokenizer::resolve_model_file(
-        &config.tokenizer_path,
-        config.revision.as_deref(),
-        "tokenizer_config.json",
-    );
-
-    match template::load_chat_formatter(
-        config_file.as_deref(),
-        (!config.model_path.is_empty()).then_some(config.model_path.as_str()),
-        config.chat_template.as_deref(),
-    ) {
-        Ok(formatter) => {
-            tracing::info!(
-                config = ?config_file.as_deref().unwrap_or("<built-in / inferred>"),
-                "loaded OpenAI chat template"
-            );
-            Some(formatter)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            None
-        }
-    }
 }
 
 fn unix_seconds() -> u64 {
@@ -117,28 +68,6 @@ pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> ser
 /// streaming → 200 with one SSE error frame + `[DONE]`.
 pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
     error_response(code, error_payload(code, message), stream)
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub(crate) struct OpenAIRequestError(String);
-
-impl From<String> for OpenAIRequestError {
-    fn from(message: String) -> Self {
-        Self(message)
-    }
-}
-
-impl From<&str> for OpenAIRequestError {
-    fn from(message: &str) -> Self {
-        Self(message.to_owned())
-    }
-}
-
-impl IntoResponse for OpenAIRequestError {
-    fn into_response(self) -> Response {
-        openai_error(StatusCode::BAD_REQUEST, self.0, false)
-    }
 }
 
 /// Drain one submitted request to its terminal output: fold frames, disarm
@@ -225,21 +154,6 @@ fn indexed_decode_stream(
         }
     })
     .boxed()
-}
-
-fn contains_media(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values.iter().any(contains_media),
-        serde_json::Value::Object(object) => {
-            object.keys().any(|key| {
-                matches!(
-                    key.as_str(),
-                    "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
-                )
-            }) || object.values().any(contains_media)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
