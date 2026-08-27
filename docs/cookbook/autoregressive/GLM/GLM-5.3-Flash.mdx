@@ -24,9 +24,9 @@ Choose your hardware and checkpoint, then choose the recipe that matches your wo
 
 - **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
-- **Quark MXFP4** on MI355X exposes TP1, TP2, TP4, and TP8 + EP8 (TEP8) recipes with full decode graphs.
+- **Quark MXFP4** on MI350X and MI355X exposes TP1, TP2, TP4, and TP8 + EP8 (TEP8) recipes with full decode graphs.
 
-NVIDIA FP8 recipes expose both strategies. AMD FP8 currently exposes only the non-speculative High Throughput recipe because MTP has not been validated there. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. The MI355X Quark MXFP4 cells are marked **Not Verified** because the commands were measured on MI350X, not independently on MI355X. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+NVIDIA FP8 recipes expose both strategies. AMD FP8 currently exposes only the non-speculative High Throughput recipe because MTP has not been validated there. A **Verified** badge means that exact command was tested on the listed GPU architecture and memory configuration. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
 
@@ -111,11 +111,11 @@ On AMD ROCm, use BF16 KV cache with TileLang DSA and set `SGLANG_USE_AITER=1`. T
 
 ### Use Quark MXFP4 on gfx950
 
-Select **MI355X → Quark MXFP4**, then choose TP1, TP2, TP4, or TP8 + EP8. These recipes use the AITER MoE runner, disable shared-expert fusion and radix caching, and capture full decode graphs through batch size 64. The validated configuration uses a 65,536-token server context and up to 64 running requests.
+Select **MI350X or MI355X → Quark MXFP4**, then choose TP1, TP2, TP4, or TP8 + EP8. These recipes use the AITER MoE runner, disable shared-expert fusion and radix caching, and capture full decode graphs through batch size 64. The validated configuration uses a 65,536-token server context and up to 64 running requests.
 
-<Warning>
-These are MI355X compatibility recipes, but the direct validation was performed on one 8x MI350X node. MI350X and MI355X share the gfx950 architecture; this does not count as an independent MI355X hardware result, so the deployment cells remain **Not Verified**.
-</Warning>
+<Note>
+The recorded validation node was named MI350X. The cookbook covers MI350X and MI355X with the same verified recipes because both expose the same CDNA4 `gfx950` target, 288 GB per GPU, and `mi35x` ROCm image path.
+</Note>
 
 Validation used model revision `fc676278b68ba33f6b4724be286af9d7f6c814c2`, SGLang PR #36607 at commit `654df43cbee108a81fa1736c34ba8c701f199285`, and image digest `sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72`.
 

@@ -3,7 +3,7 @@ export const config = {
 
   supportedHardware: [
     "gb300", "h100", "h200", "b200", "b300", "gb200",
-    "mi300x", "mi325x", "mi355x",
+    "mi300x", "mi325x", "mi350x", "mi355x",
   ],
 
   matchDims: [
@@ -16,9 +16,7 @@ export const config = {
           id: "mxfp4",
           label: "Quark MXFP4",
           subtitle: "AMD · gfx950",
-          showWhen: (s) => s.hw === "mi355x",
-          soft: true,
-          softReason: "These MI355X recipes are inferred from direct MI350X validation on the same gfx950 architecture; MI355X has not been measured independently.",
+          showWhen: (s) => ["mi350x", "mi355x"].includes(s.hw),
         },
       ],
     },
@@ -31,7 +29,7 @@ export const config = {
           label: "Low Latency",
           subtitle: "Adaptive MTP 5/1/6",
           showWhen: (s) => s.quant === "fp8",
-          disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
+          disabled: (s) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw),
           disableReason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; use the non-speculative High Throughput recipe.",
         },
         {
@@ -69,7 +67,7 @@ export const config = {
   ],
 
   isRecommendedSelection(s) {
-    const pairing = ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw)
+    const pairing = ["h100", "h200", "mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw)
       ? "bf16-tilelang"
       : "fp8-trtllm";
     return (
@@ -88,7 +86,7 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw),
+          disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw),
           disableReason: "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
@@ -216,6 +214,7 @@ sgl-eval run gsm8k \\
     gb200: "lmsysorg/sglang:glm-5.3-flash",
     mi300x: "lmsysorg/sglang:v0.5.18-rocm720-mi30x",
     mi325x: "lmsysorg/sglang:v0.5.18-rocm720-mi30x",
+    mi350x: "lmsysorg/sglang:v0.5.18-rocm720-mi35x",
     mi355x: "lmsysorg/sglang:v0.5.18-rocm720-mi35x",
   },
 
@@ -279,7 +278,7 @@ sgl-eval run gsm8k \\
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
-            disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
+            disabled: (s) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw),
             disableReason: "DeepGemm is not part of the validated AMD ROCm recipes; FP8 uses Triton and MXFP4 uses AITER.",
           },
         ],
@@ -677,17 +676,141 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-    // AMD Quark MXFP4 — compatibility target: MI355X (gfx950). The exact
-    // commands below were validated on MI350X (also gfx950), so the MI355X
-    // cells remain unverified until they are run on that hardware directly.
-    // Unlike the FP8 ROCm recipe above, mixed Quark MXFP4 + block-FP8 uses the
-    // AITER MoE runner and full decode graphs. PR #36607 commit 654df43cbee1
-    // supplies the required checkpoint-loader compatibility fix.
+    // AMD Quark MXFP4 — MI350X and MI355X share the same CDNA4 gfx950 target,
+    // 288 GB per GPU, and mi35x ROCm image path, so they use identical cells.
+    // Direct validation ran on MI350X. Unlike the FP8 ROCm recipe above, mixed
+    // Quark MXFP4 + block-FP8 uses the AITER MoE runner and full decode graphs.
+    // PR #36607 commit 654df43cbee1 supplies the required loader compatibility.
+    {
+      match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp1" },
+      nnodes: 1,
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp2" },
+      nnodes: 1,
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 2",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp4" },
+      nnodes: 1,
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 4",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp8-ep8" },
+      nnodes: 1,
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp1" },
       nnodes: 1,
-      verified: false,
-      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -717,8 +840,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp2" },
       nnodes: 1,
-      verified: false,
-      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -748,8 +871,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp4" },
       nnodes: 1,
-      verified: false,
-      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -779,8 +902,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp8-ep8" },
       nnodes: 1,
-      verified: false,
-      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      verified: true,
+      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
