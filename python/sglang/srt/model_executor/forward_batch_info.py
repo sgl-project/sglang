@@ -57,7 +57,6 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -76,7 +75,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
-_is_cpu = is_cpu()
 
 
 class ForwardMode(IntEnum):
@@ -1127,7 +1125,7 @@ def compute_position(
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
 ):
-    if support_triton(attn_backend) and not _is_cpu:
+    if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
             extend_seq_lens,
