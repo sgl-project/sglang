@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
@@ -55,6 +56,9 @@ class DsparkDraftSampler:
         self.sample_from_anchor = bool(model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         max_bs = int(max_bs)
+        # Resolved once: this sampler runs inside cuda-graph capture, so the
+        # branch below is baked into the captured graph anyway.
+        self._fused_greedy = envs.SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV.get()
         if out is not None:
             assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
             self.out = out
@@ -119,18 +123,47 @@ class DsparkDraftSampler:
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.query_token_num)[:, 0]
 
-        if self.folded_sampling:
+        # Fused greedy fast path: only valid for the greedy (non-sampling) fold.
+        # Gated/RNN subclasses return None (hidden-state-dependent bias); fall
+        # through to the block sampler below.
+        draft_tokens = None
+        if (
+            not self.folded_sampling
+            and self._fused_greedy
+            and isinstance(self.markov_head, VanillaMarkov)
+        ):
+            draft_tokens = self.markov_head.sample_block_greedy_fused(
+                base_logits, first_prev_tokens=anchor
+            )
 
-            def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-                del step_idx
-                # In-graph philox noise: each replay advances the generator
-                # and redraws.
-                noise = self.exp_noise[:bs].exponential_()
-                return SampleStepTokens.execute(
-                    step_logits=step_logits,
-                    temperatures=self.temperatures[:bs],
-                    greedy_mask=self.greedy_mask[:bs],
-                    exp_noise=noise,
+        if draft_tokens is None:
+            if self.folded_sampling:
+
+                def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+                    del step_idx
+                    # In-graph philox noise: each replay advances the generator
+                    # and redraws.
+                    noise = self.exp_noise[:bs].exponential_()
+                    return SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=self.temperatures[:bs],
+                        greedy_mask=self.greedy_mask[:bs],
+                        exp_noise=noise,
+                    )
+
+            else:
+                sampler = greedy_step_sampler
+
+            draft_tokens, corrected_logits = self.markov_head.sample_block(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                sampler=sampler,
+                collect_corrected=self.folded_sampling,
+            )
+            if self.folded_sampling:
+                self.corrected_out[: bs * self.gamma].copy_(
+                    corrected_logits.reshape(bs * self.gamma, -1)
                 )
 
         else:
@@ -143,10 +176,6 @@ class DsparkDraftSampler:
             sampler=sampler,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.folded_sampling:
-            self.corrected_out[: bs * self.gamma].copy_(
-                corrected_logits.reshape(bs * self.gamma, -1)
-            )
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
                 draft_hidden=sample_hidden,

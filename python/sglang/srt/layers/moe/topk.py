@@ -395,7 +395,9 @@ class TopK(BaseFusedOp):
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
-    --fused_shared_experts_scaling_factor: scaling factor for fused shared experts on AMD-platform.
+    --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
+      topk weight (models pass 1/ep_size under standard EP, where the per-rank shared-expert
+      outputs are all-reduced).
     """
 
     def __init__(
@@ -439,8 +441,8 @@ class TopK(BaseFusedOp):
             num_fused_shared_experts = 0
             output_format = TopKOutputFormat.STANDARD
 
-        # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
-        # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
+        # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
+        # (consumes topk_ids/weights); otherwise BYPASSED. No-op on other backends.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
@@ -780,6 +782,8 @@ def fused_topk_cpu(
         raise ValueError("packed_out is not supported for CPU fused topk")
     if num_token_non_padded is not None:
         raise ValueError("num_token_non_padded is not supported for CPU fused topk")
+    if correction_bias is not None and correction_bias.dtype != torch.float32:
+        correction_bias = correction_bias.to(torch.float32)
 
     if scoring_func == "softmax":
         topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
@@ -2155,6 +2159,14 @@ def _post_process_topk_ids(
             num_physical_routed_experts,
             topk_config,
         )
+    elif (
+        num_fused_shared_experts > 0 and fused_shared_experts_scaling_factor is not None
+    ):
+        # Standard EP all-reduces the per-rank shared-expert outputs; without the
+        # supplied 1/ep_size factor the shared contribution is summed ep_size times.
+        topk_weights[
+            :, -num_fused_shared_experts:
+        ] *= fused_shared_experts_scaling_factor
 
     if _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
