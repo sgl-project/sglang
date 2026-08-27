@@ -22,7 +22,6 @@ EXPECTED_OUTPUT = (
 MAX_NEW_TOKENS = 16
 
 
-
 def load_lora_via_stream(engine, lora_name, tensors, config_dict):
     """Wire-load an adapter over the stream path: register (control plane) +
     prefixed tensors through a sync_base=False weight-update session."""
@@ -31,9 +30,12 @@ def load_lora_via_stream(engine, lora_name, tensors, config_dict):
         return result
     engine.begin_weight_update(selector="all", sync_base=False)
     engine.update_weights_from_tensor(
-        named_tensors=[(f"{lora_name}:{key}", tensor) for key, tensor in tensors.items()]
+        named_tensors=[
+            (f"{lora_name}:{key}", tensor) for key, tensor in tensors.items()
+        ]
     )
     return engine.end_weight_update()
+
 
 class TestLoRALoadFromTensor(CustomTestCase):
     @classmethod
@@ -77,7 +79,12 @@ class TestLoRALoadFromTensor(CustomTestCase):
         TEST_LORA_COUNT = 10
         for i in range(TEST_LORA_COUNT):
             print(f"[Test]Loading LoRA adapter {i+1}/10: self_cognition_Alice_{i}")
-            result = load_lora_via_stream(test_engine, f"self_cognition_Alice_{i}", self.lora_tensors, self.lora_config_dict)
+            result = load_lora_via_stream(
+                test_engine,
+                f"self_cognition_Alice_{i}",
+                self.lora_tensors,
+                self.lora_config_dict,
+            )
             self.assertTrue(
                 result.success,
                 f"Failed to load LoRA adapter {i}: {result.error_message}",
@@ -114,7 +121,12 @@ class TestLoRALoadFromTensor(CustomTestCase):
     def test_lora_e2e_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
 
-        result = self.load_lora_via_stream(engine, "self_cognition_Alice", self.lora_tensors, self.lora_config_dict)
+        result = load_lora_via_stream(
+            self.engine,
+            "self_cognition_Alice",
+            self.lora_tensors,
+            self.lora_config_dict,
+        )
         self.assertTrue(
             result.success,
             f"Failed to load LoRA from tensors: {result.error_message}",
@@ -155,7 +167,12 @@ class TestLoRALoadFromTensor(CustomTestCase):
         print("[Test]Testing LoRA load, unload, load from tensor params...")
 
         # Load LoRA adapter from tensors
-        result = self.load_lora_via_stream(engine, "self_cognition_Alice_multiple", self.lora_tensors, self.lora_config_dict)
+        result = load_lora_via_stream(
+            self.engine,
+            "self_cognition_Alice_multiple",
+            self.lora_tensors,
+            self.lora_config_dict,
+        )
         self.assertTrue(
             result.success,
             f"Failed to load LoRA from tensors: {result.error_message}",
@@ -176,7 +193,12 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 lora_path=["self_cognition_Alice_multiple"],
             )
         # Load LoRA adapter again
-        result_again = self.load_lora_via_stream(engine, "self_cognition_Alice_multiple", self.lora_tensors, self.lora_config_dict)
+        result_again = load_lora_via_stream(
+            self.engine,
+            "self_cognition_Alice_multiple",
+            self.lora_tensors,
+            self.lora_config_dict,
+        )
         self.assertTrue(
             result_again.success,
             f"Failed to load LoRA from tensors: {result_again.error_message}",
@@ -237,7 +259,9 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 "down_proj",
             ],
         ) as srt_runner:
-            result = srt_runner.load_lora_via_stream(engine, lora_name, self.lora_tensors, self.lora_config_dict)
+            result = load_lora_via_stream(
+                srt_runner.engine, lora_name, self.lora_tensors, self.lora_config_dict
+            )
             self.assertTrue(
                 result.success,
                 f"Failed to load LoRA from tensors: {result.error_message}",
@@ -327,15 +351,26 @@ class TestLoRALoadFromTensor(CustomTestCase):
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
-        named_tensors = list(self.lora_tensors.items())
-        bucket = FlattenedTensorBucket(named_tensors=[(n, t) for n, t in named_tensors])
+        lora_name = "self_cognition_Alice_flattened"
+        named_tensors = [
+            (f"{lora_name}:{key}", tensor) for key, tensor in self.lora_tensors.items()
+        ]
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         bucket_dict = {
             "flattened_tensor": bucket.get_flattened_tensor(),
             "metadata": bucket.get_metadata(),
         }
         serialized = MultiprocessingSerializer.serialize(bucket_dict, output_str=True)
 
-        result = self.load_lora_via_stream(engine, "self_cognition_Alice_flattened", serialized, self.lora_config_dict)
+        result = self.engine.register_lora_adapter(
+            lora_name=lora_name, config_dict=self.lora_config_dict
+        )
+        self.assertTrue(result.success, f"Failed: {result.error_message}")
+        self.engine.begin_weight_update(selector="all", sync_base=False)
+        self.engine.update_weights_from_tensor(
+            named_tensors=[serialized], load_format="flattened_bucket"
+        )
+        result = self.engine.end_weight_update()
         self.assertTrue(result.success, f"Failed: {result.error_message}")
 
         output = self.engine.generate(
