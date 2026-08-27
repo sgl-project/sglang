@@ -2,35 +2,16 @@
 
 from typing import Literal, get_args
 
-from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
-    ModelOptFp8Config as ModelOptFp8DiffusionConfig,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp8Config,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu import MXFP8Config
 
-QuantizationMethods = Literal[
-    "fp8", "modelopt", "modelopt_fp8", "modelopt_fp4", "modelslim", "mxfp8"
-]
+QuantizationMethods = Literal[None]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
-    "modelopt": ModelOptFp8DiffusionConfig,
-    "modelopt_fp8": ModelOptFp8Config,
-    "modelopt_fp4": ModelOptFp4Config,
-    "modelslim": ModelSlimConfig,
-    "fp8": Fp8Config,
-    "mxfp8": MXFP8Config,
-}
+_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
 
 
 def register_quantization_config(quantization: str):
@@ -42,7 +23,17 @@ def register_quantization_config(quantization: str):
     Args:
         quantization (str): The quantization method name.
 
-
+    Examples:
+        >>> from sglang.multimodal_gen.runtime.layers.quantization import register_quantization_config
+        >>> from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
+        >>> from sglang.multimodal_gen.runtime.layers.quantization.base_config import QuantizationConfig
+        >>>
+        >>> @register_quantization_config("my_quant")
+        ... class MyQuantConfig(QuantizationConfig):
+        ...     pass
+        >>>
+        >>> get_quantization_config("my_quant")
+        <class 'MyQuantConfig'>
     """  # noqa: E501
 
     def _wrapper(quant_config_cls):
@@ -72,7 +63,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     return method_to_config[quantization]
 
 
-__all__ = [
+all = [
     "QuantizationMethods",
     "QuantizationConfig",
     "get_quantization_config",

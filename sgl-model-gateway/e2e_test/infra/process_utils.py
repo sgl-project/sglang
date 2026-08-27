@@ -127,41 +127,11 @@ def wait_for_workers_ready(
 
 
 def detect_ib_device() -> str | None:
-    """Detect first active InfiniBand device usable for PD KV transfer.
-
-    Enumerates `/sys/class/infiniband/` (the canonical device list that
-    sglang's `_validate_ib_devices` checks against) and returns the first
-    PORT_ACTIVE port. Prioritizes ``mlx5_ib*`` (native InfiniBand) over
-    ``mlx5_eth*`` (Ethernet/RoCE) — on the production CI runners both
-    families show up under /sys/class/infiniband, but ``mlx5_eth*`` are
-    plain Ethernet ports that don't carry the RDMA traffic mooncake
-    needs for prefill/decode KV transfer. Picking an eth port led to
-    decode-side 500s on every PD MMLU request (worker comes up healthy
-    but KV reads fail at request time).
-
-    Avoids the legacy `mlx5_<N>` alias form: on these runners
-    ``ibv_devinfo mlx5_0`` resolves to ``mlx5_ib0`` and reports active,
-    but sglang's `_validate_ib_devices` walks /sys/class/infiniband and
-    rejects the alias name.
+    """Detect first active InfiniBand device (e.g., mlx5_0).
 
     Returns:
-        Device name (e.g., ``mlx5_ib0``), or None if nothing usable.
+        Device name if found (e.g., "mlx5_0"), None otherwise.
     """
-    ib_dir = "/sys/class/infiniband"
-    try:
-        all_devs = os.listdir(ib_dir)
-    except FileNotFoundError:
-        return None
-
-    if not all_devs:
-        return None
-
-    # Prefer native IB ports over Ethernet/RoCE. Within each family keep
-    # /sys ordering stable.
-    ib_first = sorted(d for d in all_devs if "_ib" in d)
-    eth_last = sorted(d for d in all_devs if "_ib" not in d)
-    candidates = ib_first + eth_last
-
     try:
         subprocess.run(
             ["ibv_devinfo", "-l"],
@@ -172,7 +142,8 @@ def detect_ib_device() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
 
-    for dev in candidates:
+    for i in range(12):
+        dev = f"mlx5_{i}"
         try:
             res = subprocess.run(
                 ["ibv_devinfo", dev],
@@ -180,12 +151,11 @@ def detect_ib_device() -> str | None:
                 text=True,
                 timeout=2,
             )
-            if res.returncode != 0:
-                continue
-            for line in res.stdout.splitlines():
-                if "state:" in line and "PORT_ACTIVE" in line:
-                    logger.info("Detected IB device: %s", dev)
-                    return dev
+            if res.returncode == 0 and "state:" in res.stdout:
+                for line in res.stdout.splitlines():
+                    if "state:" in line and "PORT_ACTIVE" in line:
+                        logger.info("Detected IB device: %s", dev)
+                        return dev
         except Exception:
             pass
     return None

@@ -4,7 +4,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/communication_op.py
 
 import torch
-import torch.distributed as dist
+import torch.distributed
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
@@ -13,20 +13,16 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 
 
-def tensor_model_parallel_all_reduce(
-    input_: torch.Tensor, tp_group: dist.ProcessGroup = None
-) -> torch.Tensor:
+def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    tp_group = tp_group or get_tp_group()
-    return tp_group.all_reduce(input_)
+    return get_tp_group().all_reduce(input_)
 
 
 def tensor_model_parallel_all_gather(
-    input_: torch.Tensor, dim: int = -1, tp_group: dist.ProcessGroup = None
+    input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
-    tp_group = tp_group or get_tp_group()
-    return tp_group.all_gather(input_, dim)
+    return get_tp_group().all_gather(input_, dim)
 
 
 # TODO: remove model, make it sequence_parallel
@@ -44,11 +40,6 @@ def sequence_model_parallel_all_gather(
     return get_sp_group().all_gather(input_, dim)
 
 
-def sequence_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce the input tensor across model parallel group."""
-    return get_sp_group().all_reduce(input_)
-
-
 def cfg_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1, separate_tensors: bool = False
 ) -> torch.Tensor:
@@ -61,6 +52,4 @@ def cfg_model_parallel_all_reduce(
     op: torch._C._distributed_c10d.ReduceOp = torch._C._distributed_c10d.ReduceOp.SUM,
 ) -> torch.Tensor:
     """All-reduce the input tensor across CFG parallel group."""
-    if not input_.is_contiguous():
-        input_ = input_.contiguous()
     return get_cfg_group().all_reduce(input_, op=op)

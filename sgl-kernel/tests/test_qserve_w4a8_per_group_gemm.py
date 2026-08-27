@@ -1,5 +1,3 @@
-import sys
-
 import pytest
 import torch
 from sgl_kernel import qserve_w4a8_per_group_gemm
@@ -182,4 +180,4 @@ def test_accuracy(M, N, K, group_size, out_dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    pytest.main([__file__])

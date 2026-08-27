@@ -2,10 +2,12 @@
 
 use async_trait::async_trait;
 use tracing::debug;
-use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::discover_metadata::get_server_info;
-use crate::core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID};
+use crate::{
+    core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID},
+    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+};
 
 /// DP (Data Parallel) information for a worker.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

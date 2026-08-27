@@ -215,11 +215,12 @@ mod pd_routing_unit_tests {
             let app_context = {
                 use std::sync::{Arc, OnceLock};
 
-                use data_connector::{
-                    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-                };
                 use smg::{
                     core::{LoadMonitor, WorkerRegistry},
+                    data_connector::{
+                        MemoryConversationItemStorage, MemoryConversationStorage,
+                        MemoryResponseStorage,
+                    },
                     middleware::TokenBucket,
                     policies::PolicyRegistry,
                 };
@@ -765,14 +766,14 @@ mod pd_routing_unit_tests {
         let implemented_endpoints = vec![
             ("/health", "GET", true),
             ("/health_generate", "GET", true), // Note: Python uses POST, we use GET
-            ("/server_info", "GET", true),
+            ("/get_server_info", "GET", true),
             ("/v1/models", "GET", true),
-            ("/model_info", "GET", true),
+            ("/get_model_info", "GET", true),
             ("/generate", "POST", true),
             ("/v1/chat/completions", "POST", true),
             ("/v1/completions", "POST", true),
             ("/flush_cache", "POST", true),
-            ("/v1/loads", "GET", true),
+            ("/get_loads", "GET", true),
             ("/register", "POST", false), // NOT IMPLEMENTED - needs dynamic worker management
         ];
 

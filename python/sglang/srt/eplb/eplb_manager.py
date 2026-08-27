@@ -41,9 +41,6 @@ class EPLBManager:
     def on_forward_pass_end(self):
         next(self._main_generator)
 
-    def reset_generator(self):
-        self._main_generator = self._entrypoint()
-
     # can be more complex if needed
     def _entrypoint(self):
         while True:

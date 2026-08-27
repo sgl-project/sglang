@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
 
 import torch
 
@@ -48,7 +48,6 @@ class MoeRunnerConfig:
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
-    swiglu_limit: Optional[float] = None
 
 
 @dataclass
@@ -83,11 +82,7 @@ class MoeRunnerCore(ABC):
 
     @abstractmethod
     def run(
-        self,
-        runner_input: RunnerInput,
-        quant_info: MoeQuantInfo,
-        running_state: dict,
-        hooks: Optional[Any] = None,
+        self, runner_input: RunnerInput, quant_info: MoeQuantInfo, running_state: dict
     ) -> RunnerOutput:
         pass
 

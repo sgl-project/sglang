@@ -5,7 +5,6 @@ use std::{collections::HashMap, sync::Arc};
 use axum::response::Response;
 use http::StatusCode;
 use serde_json::{json, Map, Value};
-use smg_grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -17,6 +16,7 @@ use super::{
 };
 use crate::{
     core::Worker,
+    grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
     observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage},

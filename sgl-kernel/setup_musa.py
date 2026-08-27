@@ -28,7 +28,7 @@ from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
-third_party = Path(os.environ.get("SGLANG_MUSA_THIRD_PARTY_DIR", "build/_deps"))
+third_party = Path("third_party")
 arch = platform.machine().lower()
 
 
@@ -76,43 +76,10 @@ include_dirs = [
 ]
 
 sources = [
-    "csrc/allreduce/custom_all_reduce.cu",
-    "csrc/attention/merge_attn_states.cu",
     "csrc/common_extension_musa.cc",
-    "csrc/elementwise/activation.cu",
-    "csrc/elementwise/concat_mla.cu",
-    "csrc/elementwise/pos_enc.cu",
-    "csrc/elementwise/fused_add_rms_norm_kernel.mu",
-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
-    "csrc/moe/moe_align_kernel.cu",
-    "csrc/moe/moe_fused_gate_musa.cu",
-    "csrc/moe/kimi_k2_moe_fused_gate.cu",
-    "csrc/moe/moe_sum.cu",
-    "csrc/moe/moe_sum_reduce.cu",
-    "csrc/moe/moe_topk_softmax_kernels.cu",
-    "csrc/quantization/gguf/gguf_kernel.cu",
-    "csrc/speculative/eagle_utils.cu",
-    "csrc/speculative/ngram_utils.cu",
-    "csrc/speculative/packbit.cu",
-    "csrc/speculative/speculative_sampling.cu",
-    "csrc/kvcacheio/transfer.cu",
-    "csrc/gemm/awq_kernel.cu",
-    "csrc/gemm/bmm_fp8.cu",
-    "csrc/gemm/dsv3_fused_a_gemm.cu",
-    "csrc/gemm/dsv3_router_gemm_bf16_out.cu",
-    "csrc/gemm/dsv3_router_gemm_entry.cu",
-    "csrc/gemm/dsv3_router_gemm_float_out.cu",
-    "csrc/gemm/per_token_quant_fp8.cu",
-    "csrc/gemm/per_token_group_quant_8bit.cu",
-    "csrc/gemm/per_token_group_quant_8bit_v2.cu",
-    "csrc/memory/weak_ref_tensor.cpp",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
-    # XXX (MUSA): The following files contain MUSA-specific implementations.
-    "csrc/musa/pos_encoding_contiguous.mu",
-    "csrc/musa/moe_gemv_swiglu.mu",
-    "csrc/musa/ternary.mu",
-    "csrc/musa/top_k_top_p_sampling.mu",
+    str(_FLASHINFER_REPO.source_dir / "csrc/sampling.cu"),
 ]
 
 cxx_flags = ["force_mcc"]
@@ -193,7 +160,7 @@ class _CustomBuildExt(BuildExtension):
     @staticmethod
     def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
         """Clone a git repository and checkout a specific tag/commit."""
-        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        repo_path.parent.mkdir(exist_ok=True)
         if not repo_path.exists():
             clone_cmd = ["git", "clone"]
             if git_shallow:
@@ -206,10 +173,8 @@ class _CustomBuildExt(BuildExtension):
             subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
 
     def run(self):
-        if os.environ.get("SGLANG_MUSA_SKIP_THIRD_PARTY", "0") == "1":
-            print(
-                "Skipping third-party repositories cloning (SGLANG_MUSA_SKIP_THIRD_PARTY=1)"
-            )
+        if os.environ.get("SKIP_THIRD_PARTY", "0") == "1":
+            print("Skipping third-party repositories cloning (SKIP_THIRD_PARTY=1)")
         else:
             print("Cloning third-party repositories...")
             self._clone_and_checkout(
@@ -230,7 +195,7 @@ class _CustomBuildExt(BuildExtension):
 
 
 setup(
-    name="sglang-kernel",
+    name="sgl-kernel",
     version=_get_version(),
     packages=find_packages(where="python"),
     package_dir={"": "python"},

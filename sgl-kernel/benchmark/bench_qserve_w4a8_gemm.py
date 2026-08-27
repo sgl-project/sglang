@@ -11,9 +11,11 @@ from sgl_kernel import (
     qserve_w4a8_per_group_gemm,
 )
 
-from sglang.utils import is_in_ci
-
-IS_CI = is_in_ci()
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:

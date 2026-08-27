@@ -42,24 +42,17 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerUpdateWeightsMixin:
-    def flush_cache_after_weight_update(self: Scheduler, recv_req) -> None:
-        if recv_req.flush_cache:
-            flush_cache_success = self.flush_cache(
-                empty_cache=recv_req.torch_empty_cache
-            )
-            assert flush_cache_success, "Cache flush failed after updating weights"
 
     def update_weights_from_disk(
         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
     ):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
-        tp_success = success
-        if success and self.draft_worker is not None:
-            success, message = self.draft_worker.update_weights_from_disk(recv_req)
-        if tp_success:
-            self.flush_cache_after_weight_update(recv_req)
-        if not success:
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
@@ -84,7 +77,9 @@ class SchedulerUpdateWeightsMixin:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            self.flush_cache_after_weight_update(recv_req)
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -93,13 +88,13 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        if recv_req.disable_draft_model:
-            worker = self.tp_worker
-        else:
-            worker = self.draft_worker or self.tp_worker
+        worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
+        # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
-            self.flush_cache_after_weight_update(recv_req)
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -110,12 +105,11 @@ class SchedulerUpdateWeightsMixin:
     ):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
-        tp_success = success
-        if success and self.draft_worker is not None:
-            success, message = self.draft_worker.update_weights_from_ipc(recv_req)
-        if tp_success:
-            self.flush_cache_after_weight_update(recv_req)
-        if not success:
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
@@ -128,8 +122,8 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
+            self._is_no_request()
+        ), "release_memory_occupation should be called only when no ongoing request."
 
         tags = recv_req.tags
 
@@ -187,10 +181,8 @@ class SchedulerUpdateWeightsMixin:
 
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
-            return CheckWeightsReqOutput(
-                success=True, message="Success.", payload=payload
-            )
+            self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            return CheckWeightsReqOutput(success=True, message="Success.")
         except Exception as e:
             logger.warning(f"check_weights see error: {e}")
             traceback.print_exc()
@@ -225,7 +217,6 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
-    with torch.inference_mode():
-        self_named_buffers = dict(model.named_buffers())
-        for name, tensor in static_params["buffers"]:
-            self_named_buffers[name][...] = tensor
+    self_named_buffers = dict(model.named_buffers())
+    for name, tensor in static_params["buffers"]:
+        self_named_buffers[name][...] = tensor

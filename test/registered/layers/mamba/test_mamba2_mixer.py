@@ -13,10 +13,9 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.utils import get_device, get_device_count
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=32, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=50, suite="stage-b-test-large-2-gpu")
 
 NUM_GPUS = 2
 
@@ -36,14 +35,12 @@ def test_mixer2_gated_norm_multi_gpu(
     seq_len: int,
     hidden_size_n_groups: tuple[int, int],
     dtype: torch.dtype,
-    device: str = get_device(),
+    device: str = "cuda",
 ):
-    if device not in ["cuda", "xpu"]:
-        pytest.skip("Test only supports CUDA and XPU devices")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device not available")
 
-    assert (
-        get_device_count() >= NUM_GPUS
-    ), f"This test requires at least {NUM_GPUS} GPUs, but only {get_device_count()} available"
+    assert torch.cuda.device_count() == NUM_GPUS
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS
@@ -80,8 +77,8 @@ def mixer2_gated_norm_tensor_parallel(
 ):
     torch.manual_seed(0)
 
-    device = torch.device(get_device(local_rank))
-    torch.get_device_module(device).set_device(device)
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
 

@@ -5,93 +5,55 @@
 import functools
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import diffusers
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_sp_world_size,
-)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
-from sglang.multimodal_gen.runtime.layers.fused_scale_shift_gate import (
-    FusedLayerNormScaleShiftGateSelect01,
-    FusedResidualLayerNormScaleShiftGateSelect01,
-)
 from sglang.multimodal_gen.runtime.layers.layernorm import (
-    LayerNormScaleShift,
+    LayerNorm,
     RMSNorm,
-    ScaleResidualLayerNormScaleShift,
-    apply_qk_norm_with_optional_rope,
+    apply_qk_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
-    QuantizationConfig,
-)
-from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
-    NunchakuConfig,
-    is_nunchaku_available,
-)
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    fuse_scale_shift_gate_select01_kernel,
+    fuse_scale_shift_kernel,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-
-try:
-    from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
-except Exception:
-    NunchakuFeedForward = None
-
-
-def _local_seq_len(seq_len: int, sp_world_size: int) -> int:
-    """get the local seq len, from seq_len padding to the next multiple of sp_world_size, then shard to local"""
-    if sp_world_size <= 1:
-        return seq_len
-    padded_len = seq_len
-    if padded_len % sp_world_size != 0:
-        padded_len += sp_world_size - (padded_len % sp_world_size)
-    return padded_len // sp_world_size
+_is_cuda = current_platform.is_cuda()
 
 
 def _get_qkv_projections(
     attn: "QwenImageCrossAttention", hidden_states, encoder_hidden_states=None
 ):
-    if attn.use_fused_qkv:
-        img_qkv, _ = attn.to_qkv(hidden_states)
-        img_query, img_key, img_value = [
-            x.contiguous() for x in img_qkv.chunk(3, dim=-1)
-        ]
-    else:
-        img_query, _ = attn.to_q(hidden_states)
-        img_key, _ = attn.to_k(hidden_states)
-        img_value, _ = attn.to_v(hidden_states)
+    img_query, _ = attn.to_q(hidden_states)
+    img_key, _ = attn.to_k(hidden_states)
+    img_value, _ = attn.to_v(hidden_states)
 
     txt_query = txt_key = txt_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            txt_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            txt_query, txt_key, txt_value = [
-                x.contiguous() for x in txt_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            txt_query, _ = attn.add_q_proj(encoder_hidden_states)
-            txt_key, _ = attn.add_k_proj(encoder_hidden_states)
-            txt_value, _ = attn.add_v_proj(encoder_hidden_states)
+        txt_query, _ = attn.add_q_proj(encoder_hidden_states)
+        txt_key, _ = attn.add_k_proj(encoder_hidden_states)
+        txt_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return img_query, img_key, img_value, txt_query, txt_key, txt_value
 
@@ -152,6 +114,14 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
+
+        # self.rope = NDRotaryEmbedding(
+        #     rope_dim_list=axes_dim,
+        #     rope_theta=theta,
+        #     use_real=False,
+        #     repeat_interleave_real=False,
+        #     dtype=torch.float32 if current_platform.is_mps() or current_platform.is_musa() else torch.float64,
+        # )
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
@@ -380,7 +350,7 @@ class QwenEmbedLayer3DRope(nn.Module):
             if idx != layer_num:
                 video_freq = self._compute_video_freqs(frame, height, width, idx)
             else:
-                # For the condition image, we set the layer index to -1
+                ### For the condition image, we set the layer index to -1
                 video_freq = self._compute_condition_freqs(frame, height, width)
             video_freq = video_freq.to(device)
             vid_freqs.append(video_freq)
@@ -497,8 +467,6 @@ class QwenImageCrossAttention(nn.Module):
         context_pre_only: bool = False,
         parallel_attention=False,
         out_dim: int = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         assert dim % num_heads == 0
         super().__init__()
@@ -510,103 +478,38 @@ class QwenImageCrossAttention(nn.Module):
         self.eps = eps
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.prefix = prefix
 
-        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
-
+        # Use separate Q/K/V projections
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
-
-        if self.use_fused_qkv:
-            # Use fused QKV projection for nunchaku quantization
-            self.to_qkv = MergedColumnParallelLinear(
-                dim,
-                [self.inner_dim] * 3,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_qkv",
-            )
-        else:
-            self.to_q = ReplicatedLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_q",
-            )
-            self.to_k = ReplicatedLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_k",
-            )
-            self.to_v = ReplicatedLinear(
-                dim,
-                self.inner_dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_v",
-            )
+        self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
-            self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
-            if self.use_fused_added_qkv:
-                self.to_added_qkv = MergedColumnParallelLinear(
-                    added_kv_proj_dim,
-                    [self.inner_dim] * 3,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.to_added_qkv",
-                )
-            else:
-                self.add_q_proj = ReplicatedLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_q_proj",
-                )
-                self.add_k_proj = ReplicatedLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_k_proj",
-                )
-                self.add_v_proj = ReplicatedLinear(
-                    added_kv_proj_dim,
-                    self.inner_dim,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.add_v_proj",
-                )
+            self.add_q_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_k_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
+            self.add_v_proj = ReplicatedLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True
+            )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(
-                self.inner_dim,
-                self.dim,
-                bias=out_bias,
-                quant_config=quant_config,
-                prefix=f"{prefix}.to_add_out",
-            )
+            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(
-                    self.inner_dim,
-                    self.dim,
-                    bias=out_bias,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.to_out.0",
-                )
+                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
             )
         else:
             self.to_out = None
@@ -624,7 +527,6 @@ class QwenImageCrossAttention(nn.Module):
             supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.AITER,
-                AttentionBackendEnum.AITER_SAGE,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
                 AttentionBackendEnum.SAGE_ATTN_3,
@@ -638,19 +540,7 @@ class QwenImageCrossAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         **cross_attention_kwargs,
     ):
-        """Run joint text-image attention.
-
-        `attn_mask` or `attention_mask` takes precedence. Otherwise,
-        `encoder_hidden_states_mask` keeps valid text tokens in the joint
-        text-image sequence.
-        """
         seq_len_txt = encoder_hidden_states.shape[1]
-        attn_mask = cross_attention_kwargs.get("attn_mask")
-        if attn_mask is None:
-            attn_mask = cross_attention_kwargs.get("attention_mask")
-        encoder_hidden_states_mask = cross_attention_kwargs.get(
-            "encoder_hidden_states_mask"
-        )
 
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -665,7 +555,26 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
-        img_cache = txt_cache = None
+        # Apply QK normalization
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                allow_inplace=True,
+            )
+
+        # Apply RoPE
         if image_rotary_emb is not None:
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
@@ -675,28 +584,6 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm_with_optional_rope(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
-                cos_sin_cache=img_cache,
-                is_neox=False,
-                allow_inplace=True,
-            )
-            txt_query, txt_key = apply_qk_norm_with_optional_rope(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
-                cos_sin_cache=txt_cache,
-                is_neox=False,
-                allow_inplace=True,
-            )
-        elif img_cache is not None and txt_cache is not None:
             img_query, img_key = apply_flashinfer_rope_qk_inplace(
                 img_query, img_key, img_cache, is_neox=False
             )
@@ -709,24 +596,12 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
-        if attn_mask is None and encoder_hidden_states_mask is not None:
-            image_mask = torch.ones(
-                (hidden_states.shape[0], img_query.shape[1]),
-                device=encoder_hidden_states_mask.device,
-                dtype=torch.bool,
-            )
-            attn_mask = torch.cat(
-                [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
-                dim=1,
-            )
 
         # Compute joint attention
         joint_hidden_states = self.attn(
             joint_query,
             joint_key,
             joint_value,
-            attn_mask=attn_mask,
-            num_replicated_prefix=seq_len_txt,
         )
 
         # Reshape back
@@ -747,65 +622,6 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
-class QwenImageGELU(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        inner_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.proj = ReplicatedLinear(
-            dim,
-            inner_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj",
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.proj(hidden_states)
-        return F.gelu(hidden_states, approximate="tanh")
-
-
-class QwenImageFeedForward(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        dim_out: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        mult: int = 4,
-    ) -> None:
-        super().__init__()
-        inner_dim = dim * mult
-        self.net = nn.ModuleList(
-            [
-                QwenImageGELU(
-                    dim,
-                    inner_dim,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.net.0",
-                ),
-                nn.Dropout(0.0),
-                ReplicatedLinear(
-                    inner_dim,
-                    dim_out,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.net.2",
-                ),
-            ]
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.net[0](hidden_states)
-        hidden_states = self.net[1](hidden_states)
-        hidden_states, _ = self.net[2](hidden_states)
-        return hidden_states
-
-
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -814,33 +630,23 @@ class QwenImageTransformerBlock(nn.Module):
         attention_head_dim: int,
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
-        quant_config: Optional[QuantizationConfig] | NunchakuConfig = None,
-        prefix: str = "",
         zero_cond_t: bool = False,
     ):
         super().__init__()
-        self.prefix = prefix
 
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        self.quant_config = quant_config
         self.zero_cond_t = zero_cond_t
 
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
-                dim,
-                6 * dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.img_mod",
+            nn.Linear(
+                dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
-        self.img_norm1 = LayerNormScaleShift(
-            hidden_size=dim, eps=eps, elementwise_affine=False
-        )
+        self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         self.attn = QwenImageCrossAttention(
             dim=dim,
@@ -848,97 +654,27 @@ class QwenImageTransformerBlock(nn.Module):
             added_kv_proj_dim=dim,
             context_pre_only=False,
             head_dim=attention_head_dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
         )
-        self.img_norm2 = ScaleResidualLayerNormScaleShift(
-            dim, eps=eps, elementwise_affine=False
+        self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.img_mlp = FeedForward(
+            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
-                dim,
-                6 * dim,
-                bias=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.txt_mod",
+            nn.Linear(
+                dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
-        self.txt_norm1 = LayerNormScaleShift(
-            hidden_size=dim, eps=eps, elementwise_affine=False
-        )
+        self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
-        self.txt_norm2 = ScaleResidualLayerNormScaleShift(
-            hidden_size=dim, eps=eps, elementwise_affine=False
-        )
-        # Utils
-        self.fuse_mul_add = MulAdd()
-        self.fused_ln_ss_gate_select01 = FusedLayerNormScaleShiftGateSelect01()
-        self.fused_res_ln_ss_gate_select01 = (
-            FusedResidualLayerNormScaleShiftGateSelect01()
+        self.txt_norm2 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_mlp = FeedForward(
+            dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
 
-        nunchaku_enabled = (
-            quant_config is not None
-            and hasattr(quant_config, "get_name")
-            and quant_config.get_name() == "svdquant"
-            and is_nunchaku_available()
-        )
-        if nunchaku_enabled:
-            ff_class = diffusers.models.attention.FeedForward
-            self.img_mlp = ff_class(
-                dim=dim,
-                dim_out=dim,
-                activation_fn="gelu-approximate",
-            )
-            self.txt_mlp = ff_class(
-                dim=dim,
-                dim_out=dim,
-                activation_fn="gelu-approximate",
-            )
-        else:
-            self.img_mlp = QwenImageFeedForward(
-                dim=dim,
-                dim_out=dim,
-                quant_config=quant_config,
-                prefix=f"{prefix}.img_mlp",
-            )
-            self.txt_mlp = QwenImageFeedForward(
-                dim=dim,
-                dim_out=dim,
-                quant_config=quant_config,
-                prefix=f"{prefix}.txt_mlp",
-            )
-
-        if nunchaku_enabled:
-            nunchaku_kwargs = {
-                "precision": quant_config.precision,
-                "rank": quant_config.rank,
-                "act_unsigned": quant_config.act_unsigned,
-            }
-            self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
-            self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
-
-    def _modulate(
-        self,
-        x: torch.Tensor,
-        mod_params: torch.Tensor,
-        norm_module: Union[LayerNormScaleShift, ScaleResidualLayerNormScaleShift],
-        index: Optional[torch.Tensor] = None,
-        gate_x: Optional[torch.Tensor] = None,
-        residual_x: Optional[torch.Tensor] = None,
-    ) -> Union[
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ]:
-        # Apply attention gates and add residual (like in Megatron)
-        #   - residual_out = gate_x * x + residual_x
-        # - x = norm(residual_out) * (1 + scale) + shift
-        # TODO: clean code here
-        is_scale_residual = isinstance(norm_module, ScaleResidualLayerNormScaleShift)
-
+    def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
             actual_batch = x.shape[0]
@@ -950,58 +686,42 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[:actual_batch],
                 scale[actual_batch : 2 * actual_batch],
             )
-            gate0, gate1 = (
-                gate[:actual_batch],
-                gate[actual_batch : 2 * actual_batch],
-            )
-            if is_scale_residual:
-                x, residual_out, gate_result = self.fused_res_ln_ss_gate_select01(
+            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
+
+            if _is_cuda:
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                if not index.is_contiguous():
+                    index = index.contiguous()
+                x, gate_result = fuse_scale_shift_gate_select01_kernel(
                     x,
-                    residual_x,
-                    gate_x,
-                    getattr(norm_module.norm, "weight", None),
-                    getattr(norm_module.norm, "bias", None),
-                    scale0,
-                    shift0,
-                    gate0,
-                    scale1,
-                    shift1,
-                    gate1,
-                    index,
-                    norm_module.eps,
-                )
-                return x, residual_out, gate_result
-            else:
-                x, gate_result = self.fused_ln_ss_gate_select01(
-                    x,
-                    getattr(norm_module.norm, "weight", None),
-                    getattr(norm_module.norm, "bias", None),
-                    scale0,
-                    shift0,
-                    gate0,
-                    scale1,
-                    shift1,
-                    gate1,
-                    index,
-                    norm_module.eps,
+                    scale0=scale0.contiguous(),
+                    shift0=shift0.contiguous(),
+                    gate0=gate0.contiguous(),
+                    scale1=scale1.contiguous(),
+                    shift1=shift1.contiguous(),
+                    gate1=gate1.contiguous(),
+                    index=index,
                 )
                 return x, gate_result
+            else:
+                mask = (index == 0).unsqueeze(-1)
+                shift_result = torch.where(
+                    mask, shift0.unsqueeze(1), shift1.unsqueeze(1)
+                )
+                scale_result = torch.where(
+                    mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
+                )
+                gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
+                return (
+                    fuse_scale_shift_kernel(x, scale_result, shift_result),
+                    gate_result,
+                )
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-        if is_scale_residual:
-            modulated, residual_out = norm_module(
-                residual=residual_x,
-                x=x,
-                gate=gate_x,
-                shift=shift_result,
-                scale=scale_result,
-            )
-            return modulated, residual_out, gate_result
-        else:
-            modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-            return modulated, gate_result
+            return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
 
     def forward(
         self,
@@ -1012,44 +732,24 @@ class QwenImageTransformerBlock(nn.Module):
         temb_txt_silu: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
-        modulate_index: Optional[torch.Tensor] = None,
+        modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params, _ = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
-        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
-
-        if (
-            self.quant_config is not None
-            and hasattr(self.quant_config, "get_name")
-            and self.quant_config.get_name() == "svdquant"
-        ):
-            # When NOT using nunchaku, reshape mod_params from [B, 6*dim] to [B, dim*6]
-            # When using nunchaku (svdquant), keep original format
-            img_mod_params = (
-                img_mod_params.view(img_mod_params.shape[0], -1, 6)
-                .transpose(1, 2)
-                .reshape(img_mod_params.shape[0], -1)
-            )
-            txt_mod_params = (
-                txt_mod_params.view(txt_mod_params.shape[0], -1, 6)
-                .transpose(1, 2)
-                .reshape(txt_mod_params.shape[0], -1)
-            )
+        img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_modulated, img_gate1 = self._modulate(
-            hidden_states, img_mod1, self.img_norm1, modulate_index
-        )
+
+        img_normed = self.img_norm1(hidden_states)
+
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
         # Process text stream - norm1 + modulation
-        txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
-        txt_modulated = self.txt_norm1(
-            encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
-        )
-        txt_gate1 = txt_gate1_raw.unsqueeze(1)
+        txt_normed = self.txt_norm1(encoder_hidden_states)
+        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -1059,10 +759,8 @@ class QwenImageTransformerBlock(nn.Module):
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
-            # Image stream (will be processed as "sample")
-            hidden_states=img_modulated,
-            # Text stream (will be processed as "context")
-            encoder_hidden_states=txt_modulated,
+            hidden_states=img_modulated,  # Image stream (will be processed as "sample")
+            encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -1070,38 +768,25 @@ class QwenImageTransformerBlock(nn.Module):
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
+
+        # Apply attention gates and add residual (like in Megatron)
+        hidden_states = hidden_states + img_gate1 * img_attn_output
+
+        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
         # Process image stream - norm2 + MLP
-        img_modulated2, hidden_states, img_gate2 = self._modulate(
-            img_attn_output,
-            img_mod2,
-            self.img_norm2,
-            modulate_index,
-            gate_x=img_gate1,
-            residual_x=hidden_states,
+        img_normed2 = self.img_norm2(hidden_states)
+        img_modulated2, img_gate2 = self._modulate(
+            img_normed2, img_mod2, modulate_index
         )
         img_mlp_output = self.img_mlp(img_modulated2)
-
-        if img_mlp_output.dim() == 2:
-            img_mlp_output = img_mlp_output.unsqueeze(0)
-        hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
+        hidden_states = hidden_states + img_gate2 * img_mlp_output
 
         # Process text stream - norm2 + MLP
-        txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        txt_modulated2, encoder_hidden_states = self.txt_norm2(
-            residual=encoder_hidden_states,
-            x=txt_attn_output,
-            gate=txt_gate1,
-            shift=txt_shift2,
-            scale=txt_scale2,
-        )
-        txt_gate2 = txt_gate2_raw.unsqueeze(1)
+        txt_normed2 = self.txt_norm2(encoder_hidden_states)
+        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-
-        if txt_mlp_output.dim() == 2:
-            txt_mlp_output = txt_mlp_output.unsqueeze(0)
-        encoder_hidden_states = self.fuse_mul_add(
-            txt_mlp_output, txt_gate2, encoder_hidden_states
-        )
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -1130,36 +815,11 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
-    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
-
-    @classmethod
-    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
-        return {
-            "skip": [
-                "norm",
-                "embed",
-                "rotary",
-                "pos_embed",
-            ],
-            "svdq_w4a4": [
-                "attn.to_qkv",
-                "attn.to_out",
-                "attn.add_qkv_proj",
-                "attn.to_add_out",
-                "img_mlp",
-                "txt_mlp",
-            ],
-            "awq_w4a16": [
-                "img_mod",
-                "txt_mod",
-            ],
-        }
 
     def __init__(
         self,
         config: QwenImageDitConfig,
         hf_config: dict[str, Any],
-        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
         patch_size = config.arch_config.patch_size
@@ -1197,20 +857,8 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
 
-        self.img_in = ReplicatedLinear(
-            in_channels,
-            self.inner_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix="img_in",
-        )
-        self.txt_in = ReplicatedLinear(
-            joint_attention_dim,
-            self.inner_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix="txt_in",
-        )
+        self.img_in = nn.Linear(in_channels, self.inner_dim)
+        self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -1218,23 +866,17 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
-                    quant_config=quant_config,
-                    prefix=f"transformer_blocks.{layer_idx}",
                     zero_cond_t=self.zero_cond_t,
                 )
-                for layer_idx in range(num_layers)
+                for _ in range(num_layers)
             ]
         )
 
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
         )
-        self.proj_out = ReplicatedLinear(
-            self.inner_dim,
-            patch_size * patch_size * self.out_channels,
-            bias=True,
-            quant_config=quant_config,
-            prefix="proj_out",
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
         )
 
         self.timestep_zero = torch.zeros(
@@ -1245,23 +887,11 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
-        sp_world_size = get_sp_world_size()
-
         modulate_index_list = []
         for sample in img_shapes:
             first_size = sample[0][0] * sample[0][1] * sample[0][2]
             total_size = sum(s[0] * s[1] * s[2] for s in sample)
-            if sp_world_size > 1:
-                first_local_size = _local_seq_len(first_size, sp_world_size)
-                tail_local_size = _local_seq_len(total_size - first_size, sp_world_size)
-                idx = torch.cat(
-                    [
-                        torch.zeros(first_local_size, device=device, dtype=torch.int),
-                        torch.ones(tail_local_size, device=device, dtype=torch.int),
-                    ]
-                )
-            else:
-                idx = (torch.arange(total_size, device=device) >= first_size).int()
+            idx = (torch.arange(total_size, device=device) >= first_size).int()
             modulate_index_list.append(idx)
 
         modulate_index = torch.stack(modulate_index_list)
@@ -1291,7 +921,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
-                Valid-token mask of the input conditions, where True keeps a text token.
+                Mask of the input conditions.
             timestep ( `torch.LongTensor`):
                 Used to indicate denoising step.
             attention_kwargs (`dict`, *optional*):
@@ -1316,10 +946,8 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
-        if isinstance(encoder_hidden_states_mask, list):
-            encoder_hidden_states_mask = encoder_hidden_states_mask[0]
 
-        hidden_states, _ = self.img_in(hidden_states)
+        hidden_states = self.img_in(hidden_states)
 
         timestep = (timestep / 1000).to(hidden_states.dtype)
 
@@ -1331,22 +959,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             modulate_index = None
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
-        encoder_hidden_states, _ = self.txt_in(encoder_hidden_states)
-
-        block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
-        if encoder_hidden_states_mask is not None:
-            encoder_hidden_states_mask = encoder_hidden_states_mask.to(
-                device=hidden_states.device, dtype=torch.bool
-            )
-            batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones(
-                (batch_size, image_seq_len),
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            block_attention_kwargs["attn_mask"] = torch.cat(
-                [encoder_hidden_states_mask, image_mask], dim=1
-            )
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
@@ -1367,7 +980,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 temb_img_silu=temb_img_silu,
                 temb_txt_silu=temb_txt_silu,
                 image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=block_attention_kwargs,
+                joint_attention_kwargs=attention_kwargs,
                 modulate_index=modulate_index,
             )
 
@@ -1384,7 +997,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb_txt)
 
-        output, _ = self.proj_out(hidden_states)
+        output = self.proj_out(hidden_states)
         return output
 
 

@@ -4,14 +4,13 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_musa = is_musa()
 
-if _is_cuda or _is_hip or _is_musa:
+if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -46,7 +45,7 @@ class TreeMaskMode(IntEnum):
 
 
 def build_tree_kernel_efficient(
-    bonus_tokens: torch.Tensor,
+    verified_id: torch.Tensor,
     parent_list: List[torch.Tensor],
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -59,7 +58,7 @@ def build_tree_kernel_efficient(
     tree_mask_buf: Optional[torch.Tensor] = None,
     position_buf: Optional[torch.Tensor] = None,
 ):
-    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
+    draft_tokens = torch.cat((verified_id.unsqueeze(1), draft_tokens), dim=1).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
@@ -105,10 +104,10 @@ def build_tree_kernel_efficient(
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
-    retrieve_buf = torch.full(
+    retrive_buf = torch.full(
         (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
-    retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
+    retrive_index, retrive_next_token, retrive_next_sibling = retrive_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
     # then, positions = [7, 8, 8, 9]
@@ -126,9 +125,9 @@ def build_tree_kernel_efficient(
             seq_lens,
             tree_mask,
             positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -141,9 +140,9 @@ def build_tree_kernel_efficient(
             seq_lens,
             tree_mask,
             positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
             topk,
             spec_steps,
             num_verify_tokens,
@@ -152,9 +151,9 @@ def build_tree_kernel_efficient(
     return (
         tree_mask,
         positions,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
         draft_tokens,
     )
 
@@ -164,13 +163,13 @@ def verify_tree_greedy_func(
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
     candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
-    if _is_cuda or _is_hip or _is_musa:
+    if _is_cuda or _is_hip:
         from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
@@ -178,10 +177,9 @@ def verify_tree_greedy_func(
             accept_index=accept_index,  # mutable
             accept_token_num=accept_token_num,  # mutable
             candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
         )
 
@@ -193,10 +191,9 @@ def verify_tree_greedy_func(
             accept_index=accept_index,
             accept_token_num=accept_token_num,
             candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num

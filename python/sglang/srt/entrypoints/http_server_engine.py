@@ -20,8 +20,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
     start_time = time.perf_counter()
 
-    ssl_verify = server_args.ssl_verify()
-
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
             try:
@@ -29,9 +27,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
                     "Content-Type": "application/json; charset=utf-8",
                     "Authorization": f"Bearer {server_args.api_key}",
                 }
-                response = session.get(
-                    f"{base_url}/health_generate", headers=headers, verify=ssl_verify
-                )
+                response = session.get(f"{base_url}/health_generate", headers=headers)
                 if response.status_code == 200:
                     return p
             except requests.RequestException:
@@ -68,10 +64,8 @@ class HttpServerEngineAdapter(EngineBase):
         Returns:
             The JSON response from the server
         """
-        url = f"{self.server_args.url()}/{endpoint}"
-        response = requests.post(
-            url, json=payload or {}, verify=self.server_args.ssl_verify()
-        )
+        url = f"http://{self.server_args.host}:{self.server_args.port}/{endpoint}"
+        response = requests.post(url, json=payload or {})
         response.raise_for_status()
         return response.json()
 
@@ -100,7 +94,7 @@ class HttpServerEngineAdapter(EngineBase):
         )
 
     def shutdown(self):
-        kill_process_tree(self.process.pid, wait_timeout=60)
+        kill_process_tree(self.process.pid)
 
     def generate(
         self,
@@ -114,7 +108,6 @@ class HttpServerEngineAdapter(EngineBase):
         token_ids_logprob=None,
         lora_path=None,
         custom_logit_processor=None,
-        priority=None,
     ):
         payload = {
             "text": prompt,
@@ -127,7 +120,6 @@ class HttpServerEngineAdapter(EngineBase):
             "token_ids_logprob": token_ids_logprob,
             "lora_path": lora_path,
             "custom_logit_processor": custom_logit_processor,
-            "priority": priority,
         }
         # Filter out None values
         payload = {k: v for k, v in payload.items() if v is not None}

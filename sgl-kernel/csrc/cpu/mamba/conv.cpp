@@ -550,6 +550,8 @@ at::Tensor causal_conv1d_fwd_cpu(
     bool silu_activation,
     int64_t pad_slot_id,
     bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::causal_conv1d_fwd_cpu", std::vector<c10::IValue>({x, weight, bias}));
+
   CHECK_CONTIGUOUS(weight);
   auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
 
@@ -655,6 +657,8 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::causal_conv1d_update_cpu", std::vector<c10::IValue>({x, weight, bias}));
+
   CHECK_CONTIGUOUS(x);
   CHECK_CONTIGUOUS(weight);
   auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);

@@ -33,7 +33,6 @@ pub use submit_tokenizer_job::SubmitTokenizerJobStep;
 pub use update_policies_for_worker::UpdatePoliciesForWorkerStep;
 pub use update_remaining_policies::UpdateRemainingPoliciesStep;
 pub use update_worker_properties::UpdateWorkerPropertiesStep;
-use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
 use super::shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep};
 use crate::{
@@ -46,6 +45,7 @@ use crate::{
         Worker, WorkerRegistry,
     },
     protocols::worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
+    workflow::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition},
 };
 
 /// Find workers by URL, supporting both DP-aware (prefix match) and regular (exact match) modes.

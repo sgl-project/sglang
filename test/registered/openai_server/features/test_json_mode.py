@@ -10,15 +10,14 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_amd_ci,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=118, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=109, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=180, suite="stage-b-test-small-1-gpu-amd")
 
 
-class JSONModeMixin:
+class TestJSONModeMixin:
     """Mixin class containing JSON mode test methods"""
 
     def test_json_mode_response(self):
@@ -107,9 +106,6 @@ class ServerWithGrammarBackend(CustomTestCase):
             cls.backend,
         ]
 
-        if is_in_amd_ci():
-            other_args.append("--constrained-json-disable-any-whitespace")
-
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -123,15 +119,15 @@ class ServerWithGrammarBackend(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestJSONModeXGrammar(ServerWithGrammarBackend, JSONModeMixin):
+class TestJSONModeXGrammar(ServerWithGrammarBackend, TestJSONModeMixin):
     backend = "xgrammar"
 
 
-class TestJSONModeOutlines(ServerWithGrammarBackend, JSONModeMixin):
+class TestJSONModeOutlines(ServerWithGrammarBackend, TestJSONModeMixin):
     backend = "outlines"
 
 
-class TestJSONModeLLGuidance(ServerWithGrammarBackend, JSONModeMixin):
+class TestJSONModeLLGuidance(ServerWithGrammarBackend, TestJSONModeMixin):
     backend = "llguidance"
 
 

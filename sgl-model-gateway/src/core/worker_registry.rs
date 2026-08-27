@@ -14,7 +14,6 @@
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
-use smg_mesh::OptionalMeshSyncManager;
 use uuid::Uuid;
 
 use crate::{
@@ -23,6 +22,7 @@ use crate::{
         worker::{HealthChecker, RuntimeType, WorkerType},
         ConnectionMode, Worker,
     },
+    mesh::OptionalMeshSyncManager,
     observability::metrics::Metrics,
 };
 
@@ -57,16 +57,11 @@ impl HashRing {
         for worker in workers {
             // Create Arc<str> once per worker, share across all virtual nodes
             let url: Arc<str> = Arc::from(worker.url());
-            let url_bytes = url.as_bytes();
 
             // Create multiple virtual nodes per worker
             for vnode in 0..VIRTUAL_NODES_PER_WORKER {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(url_bytes);
-                hasher.update(b"#");
-                hasher.update(&(vnode as u64).to_le_bytes());
-                let hash = hasher.finalize();
-                let pos = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+                let vnode_key = format!("{}#{}", url, vnode);
+                let pos = Self::hash_position(&vnode_key);
                 entries.push((pos, Arc::clone(&url)));
             }
         }

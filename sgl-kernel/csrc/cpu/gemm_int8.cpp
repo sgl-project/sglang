@@ -380,6 +380,8 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
 
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A) {
+  RECORD_FUNCTION("sgl-kernel::per_token_quant_int8_cpu", std::vector<c10::IValue>({A}));
+
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(A);
   CHECK_DIM(2, A);
 
@@ -425,6 +427,8 @@ at::Tensor int8_scaled_mm_cpu(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales1, scales2, bias}));
+
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_INPUT(mat1);
@@ -473,7 +477,6 @@ at::Tensor int8_scaled_mm_cpu(
   return out;
 }
 
-#ifndef __aarch64__
 // fused `per_token_quant_int8_cpu` and `int8_scaled_mm_cpu`
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -482,6 +485,8 @@ at::Tensor int8_scaled_mm_with_quant(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni) {
+  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
+
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
@@ -540,4 +545,3 @@ at::Tensor int8_scaled_mm_with_quant(
   });
   return out;
 }
-#endif  // #ifndef __aarch64__

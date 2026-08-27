@@ -1,6 +1,5 @@
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -41,10 +40,10 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
-            mm_items=mm_items,
-            im_start_id=self.IM_START_TOKEN_ID,
-            im_end_id=self.IM_END_TOKEN_ID,
-            im_token_id=self.IM_TOKEN_ID,
-        )
+        return {
+            "input_ids": input_ids.tolist(),
+            "mm_items": mm_items,
+            "im_start_id": self.IM_START_TOKEN_ID,
+            "im_end_id": self.IM_END_TOKEN_ID,
+            "im_token_id": self.IM_TOKEN_ID,
+        }

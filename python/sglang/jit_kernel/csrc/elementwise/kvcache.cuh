@@ -149,7 +149,7 @@ struct StoreKVCacheKernel {
     auto dtype = SymbolicDType{};
     auto device = SymbolicDevice{};
     auto indice_dtype = SymbolicDType{};
-    device.set_options<kDLCUDA, kDLROCM>();
+    device.set_options<kDLCUDA>();
 
     TensorMatcher({B, D})  //
         .with_strides({KS, 1})

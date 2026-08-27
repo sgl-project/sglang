@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only HunYuan model compatible with HuggingFace weights."""
-
 import re
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -53,7 +52,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -403,7 +401,8 @@ class HunYuanDecoderLayer(nn.Module):
             if isinstance(config.intermediate_size, int)
             else config.intermediate_size[layer_id]
         )
-        rope_theta, rope_scaling = get_rope_config(config)
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
