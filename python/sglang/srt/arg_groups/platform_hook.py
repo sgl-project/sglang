@@ -11,8 +11,8 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.utils.common import is_cuda, is_hip, is_host_cpu_arm64, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -66,3 +66,68 @@ def handle_nccl_pre_warm(server_args: Any):
             "Ignoring pre_warm_nccl setting on current hardware."
         )
         declare_resolution(server_args, "_handle_nccl_pre_warm", pre_warm_nccl=False)
+
+
+def handle_xpu_backends(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.device == "xpu":
+        # Decode graph is opt-in on XPU: unless the user explicitly set
+        # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
+        # disabled so the default startup doesn't require graph capture.
+        if (Phase.DECODE, "backend") not in server_args._cuda_graph_config_locked:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+        elif cfg.cuda_graph_config.decode.backend not in (
+            Backend.DISABLED,
+            Backend.FULL,
+        ):
+            logger.warning(
+                "XPU platform only supports decode backend 'full'; "
+                "disabling unsupported decode backend '%s'.",
+                cfg.cuda_graph_config.decode.backend,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+
+
+def handle_cpu_backends(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.device == "cpu":
+        if cfg.attention_backend is None:
+            declare_resolution(
+                server_args,
+                "_handle_cpu_backends",
+                attention_backend=(
+                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
+                ),
+            )
+        declare_resolution(
+            server_args,
+            "_handle_cpu_backends",
+            sampling_backend="pytorch",
+        )
+
+
+def handle_hpu_backends(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.device == "hpu":
+        declare_resolution(
+            server_args,
+            "_handle_hpu_backends",
+            attention_backend="torch_native",
+        )
+        declare_resolution(
+            server_args,
+            "_handle_hpu_backends",
+            sampling_backend="pytorch",
+        )
