@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_schedule,
     get_spec,
 )
@@ -106,7 +107,7 @@ class XPUAttentionBackend(AttentionBackend):
         # when deterministic inference is enabled to keep attention reduction
         # order fixed. This mirrors the flash-attention (fa3) backend.
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
 
