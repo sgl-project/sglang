@@ -1,4 +1,4 @@
-"""Unit tests for Spark3Detector - no server, no model loading."""
+"""Unit tests for Spark25Detector - no server, no model loading."""
 
 import json
 import unittest
@@ -6,7 +6,7 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.spark3_detector import Spark3Detector
+from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -50,13 +50,13 @@ def _tools():
     ]
 
 
-class TestSpark3DetectorDetectAndParse(CustomTestCase):
+class TestSpark25DetectorDetectAndParse(CustomTestCase):
     def setUp(self):
         self.tools = _tools()
-        self.detector = Spark3Detector()
+        self.detector = Spark25Detector()
 
-    def test_spark3_parser_is_registered(self):
-        self.assertIs(FunctionCallParser.ToolCallParserEnum["spark"], Spark3Detector)
+    def test_spark25_parser_is_registered(self):
+        self.assertIs(FunctionCallParser.ToolCallParserEnum["spark25"], Spark25Detector)
 
     def test_nonstream_parses_multiple_calls_and_preserves_normal_text(self):
         text = (
@@ -95,7 +95,7 @@ class TestSpark3DetectorDetectAndParse(CustomTestCase):
         )
         self.assertEqual(json.loads(result.calls[1].parameters), {})
 
-    def test_null_and_conversion_fallbacks_match_spark3_protocol(self):
+    def test_null_and_conversion_fallbacks_match_spark2_5_protocol(self):
         text = _xml(
             "set_state",
             [
@@ -139,7 +139,7 @@ class TestSpark3DetectorDetectAndParse(CustomTestCase):
         self.assertEqual(result.normal_text, "plain")
         self.assertEqual(self.detector.finish(self.tools).normal_text, "<tool_")
 
-        truncated = Spark3Detector()
+        truncated = Spark25Detector()
         result = truncated.parse_streaming_increment(
             "plain<tool_call>set_state<arg_key>count</arg_key>", self.tools
         )
@@ -149,14 +149,14 @@ class TestSpark3DetectorDetectAndParse(CustomTestCase):
         self.assertFalse(self.detector.supports_structural_tag())
         self.assertTrue(self.detector.parses_required_natively())
         self.assertIs(
-            FunctionCallParser(self.tools, "spark").get_structure_constraint(
+            FunctionCallParser(self.tools, "spark25").get_structure_constraint(
                 "required"
             ),
             None,
         )
 
 
-class TestSpark3DetectorStreaming(CustomTestCase):
+class TestSpark25DetectorStreaming(CustomTestCase):
     def setUp(self):
         self.tools = _tools()
 
@@ -167,7 +167,7 @@ class TestSpark3DetectorStreaming(CustomTestCase):
             + _xml("now", [])
             + "done"
         )
-        detector = Spark3Detector()
+        detector = Spark25Detector()
         normal_parts = []
         calls = []
 
