@@ -7,6 +7,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
 )
@@ -81,6 +82,23 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
 def test_sensenova_u1_rejects_unaligned_resolution():
     with pytest.raises(ValueError, match="divisible by 32"):
         SenseNovaU1SamplingParams(width=2160, height=3840)
+
+
+def test_sensenova_u1_accepts_openai_image_api_num_frames():
+    params = SenseNovaU1SamplingParams(
+        prompt="hello",
+        width=2048,
+        height=2048,
+        num_frames=1,
+    )
+
+    assert params.num_frames == 1
+    assert params.data_type == DataType.IMAGE
+
+
+def test_sensenova_u1_rejects_video_frame_count():
+    with pytest.raises(ValueError, match="num_frames=1"):
+        SenseNovaU1SamplingParams(width=2048, height=2048, num_frames=2)
 
 
 def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():

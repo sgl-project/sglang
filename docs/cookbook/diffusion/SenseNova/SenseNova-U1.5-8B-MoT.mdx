@@ -80,16 +80,11 @@ with open("output_sensenova_u15.png", "wb") as f:
 
 ## 5. Benchmark
 
-Test Environment:
-
-- Hardware: RTX40 series
-- Model: sensenova/SenseNova-U1.5-8B-MoT
-- Docker Image: TBD
-- SGLang diffusion version: TBD
-
 ### 5.1 Speedup Benchmark
 
 #### 5.1.1 Generate an image
+
+RTX 40series
 
 **Server Command**:
 
@@ -113,5 +108,28 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 **Result**:
 
 ```text Output
-TBD
+================= Serving Benchmark Result =================
+Task:                                         text-to-image
+Model:                                        /workspace/models/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+Dataset:                                      vbench
+--------------------------------------------------
+Benchmark duration (s):                       13.84
+Request rate:                                 inf
+Max request concurrency:                      1
+Successful requests:                          1/1
+Completed outputs:                            1
+Outputs per prompt:                           1
+--------------------------------------------------
+Request throughput (req/s):                   0.07
+Output throughput (outputs/s):                0.07
+Latency Mean (s):                             13.84
+Latency Median (s):                           13.84
+Latency P90 (s):                              13.84
+Latency P95 (s):                              13.84
+Latency P99 (s):                              13.84
+--------------------------------------------------
+Peak Memory Max (MB):                         34326.00
+Peak Memory Mean (MB):                        34326.00
+Peak Memory Median (MB):                      34326.00
+------------------------------------------------------------
 ```

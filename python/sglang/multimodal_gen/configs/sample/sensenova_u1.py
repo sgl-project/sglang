@@ -41,8 +41,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
     data_type: DataType = field(default=DataType.IMAGE, init=False)
     height: int = 2048
     width: int = 2048
-    num_frames: int = field(default=1, init=False)
-    fps: int = field(default=1, init=False)
+    num_frames: int = 1
+    fps: int = 1
     num_inference_steps: int = 50
     guidance_scale: float = 4.0
     cfg_norm: str = DEFAULT_CFG_NORM
@@ -81,6 +81,10 @@ class SenseNovaU1SamplingParams(SamplingParams):
                 "SenseNova-U1 requires width and height to be divisible by "
                 f"{SENSENOVA_U1_RESOLUTION_ALIGNMENT}, got "
                 f"{self.width}x{self.height}."
+            )
+        if self.num_frames != 1:
+            raise ValueError(
+                f"SenseNova-U1 is an image model and requires num_frames=1, got {self.num_frames}."
             )
         if self.cfg_norm not in SENSENOVA_U1_CFG_NORM_CHOICES:
             raise ValueError(
