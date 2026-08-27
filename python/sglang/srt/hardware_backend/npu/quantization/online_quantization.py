@@ -107,10 +107,15 @@ def npu_quantize_w4a4_dense_weight(
         )
 
     scale = weight.abs().amax(dim=-1) / 7.0
-    scale = scale.clamp_min(torch.finfo(weight.dtype).eps)
+    # ModelSlim clamps with FP32 epsilon cast to the source dtype. Using the
+    # much larger FP16 machine epsilon changes small-channel scales.
+    eps = torch.tensor(
+        torch.finfo(torch.float32).eps, dtype=weight.dtype, device=weight.device
+    )
+    scale = scale.clamp_min(eps)
     quantized = torch.round(weight / scale.unsqueeze(-1))
     quantized = quantized.clamp_(-8, 7).to(torch.int32)
-    return quantized, scale.to(torch.float32)
+    return quantized, scale
 
 
 def npu_format_online_weight(

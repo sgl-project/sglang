@@ -173,6 +173,14 @@ class NPUOnlineW4A4Int4LinearMethod(_NPUOnlineIntegerLinearMethod):
 
     quant_mode = "w4a4_int4"
 
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return _apply_w4a4_dynamic_linear(layer=layer, x=x, bias=bias)
+
 
 def get_npu_online_linear_method() -> Optional[LinearMethodBase]:
     spec = get_npu_online_integer_quant_spec()
@@ -429,6 +437,25 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
+def _apply_w4a4_dynamic_linear(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    original_dtype = x.dtype
+    quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
+        x, dst_type=torch.quint4x2
+    )
+    return torch.ops.npu.npu_quant_matmul(
+        quant_out,
+        layer.weight,
+        layer.weight_scale,
+        pertoken_scale=dynamic_scale.flatten(),
+        bias=bias,
+        output_dtype=original_dtype,
+    )
+
+
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
     def process_weights_after_loading(self, layer):
@@ -450,18 +477,7 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         bias: Optional[torch.Tensor] = None,
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-            x, dst_type=torch.quint4x2
-        )
-        return torch.ops.npu.npu_quant_matmul(
-            quant_out,
-            layer.weight,
-            layer.weight_scale,
-            pertoken_scale=dynamic_scale.flatten(),
-            bias=bias,
-            output_dtype=original_dtype,
-        )
+        return _apply_w4a4_dynamic_linear(layer=layer, x=x, bias=bias)
 
 
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
