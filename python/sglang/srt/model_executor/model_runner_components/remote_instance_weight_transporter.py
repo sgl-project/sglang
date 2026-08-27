@@ -78,11 +78,13 @@ class RemoteInstanceWeightTransporter:
         """
         import requests as http_requests
 
-        if get_parallel().dist_init_addr:
+        if get_parallel().config.dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).
             # Derive host from dist_init_addr (shared across all nodes).
             bootstrap_host = (
-                NetworkAddress.parse(get_parallel().dist_init_addr).resolved().host
+                NetworkAddress.parse(get_parallel().config.dist_init_addr)
+                .resolved()
+                .host
             )
         else:
             bootstrap_host = "127.0.0.1"

@@ -73,8 +73,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.kitchen_int8 import (
+    KitchenInt8LinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
+    ModelOptFp4LinearMethod,
     ModelOptFp8Config,
     _prepare_nvfp4_weight_bytes,
 )
@@ -1247,6 +1251,83 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.checkpoint_uses_native_qkv_layout)
         self.assertEqual(config.checkpoint_weight_scale_layout, "swizzled")
         self.assertTrue(config.swap_weight_nibbles)
+
+    def test_minimax_h3_mixed_nvfp4_companions_dispatch_each_layer(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "format_version": "1.0",
+                    "layers": {
+                        "blocks.0.attn.qkv_proj": {"format": "nvfp4"},
+                        "blocks.0.attn.out_proj": {
+                            "format": "int8_tensorwise",
+                            "convrot": True,
+                            "convrot_groupsize": 256,
+                        },
+                        "blocks.0.mlp.fc1": {"format": "float8_e4m3fn"},
+                    },
+                }
+            )
+        }
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as checkpoint:
+            save_file(
+                {
+                    "blocks.0.attn.qkv_proj.weight": torch.zeros(
+                        (32, 8), dtype=torch.uint8
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale": torch.ones(
+                        (32, 1), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.attn.qkv_proj.weight_scale_2": torch.tensor(1.0),
+                    "blocks.0.attn.out_proj.weight": torch.zeros(
+                        (32, 256), dtype=torch.int8
+                    ),
+                    "blocks.0.attn.out_proj.weight_scale": torch.ones((32, 1)),
+                    "blocks.0.mlp.fc1.weight": torch.ones(
+                        (32, 64), dtype=torch.float8_e4m3fn
+                    ),
+                    "blocks.0.mlp.fc1.weight_scale": torch.tensor(1.0),
+                },
+                checkpoint.name,
+                metadata=metadata,
+            )
+            _, markers = inspect_minimax_h3_safetensors([checkpoint.name])
+            config = resolve_minimax_h3_checkpoint_quantization(
+                markers,
+                [checkpoint.name],
+            )
+
+        self.assertIsInstance(config, ModelOptFp4Config)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization."
+            "modelopt_quant.current_platform.get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ):
+            self.assertIsInstance(
+                config.get_quant_method(
+                    LinearBase(input_size=16, output_size=32),
+                    "blocks.0.attn.qkv_proj",
+                ),
+                ModelOptFp4LinearMethod,
+            )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization."
+            "kitchen_int8._load_comfy_kitchen"
+        ):
+            self.assertIsInstance(
+                config.get_quant_method(
+                    LinearBase(input_size=256, output_size=32),
+                    "blocks.0.attn.out_proj",
+                ),
+                KitchenInt8LinearMethod,
+            )
+        self.assertIsInstance(
+            config.get_quant_method(
+                LinearBase(input_size=64, output_size=32),
+                "blocks.0.mlp.fc1",
+            ),
+            Fp8LinearMethod,
+        )
 
     def test_builder_adds_diffusers_quant_type_for_nvfp4(self):
         updated = _updated_quant_config(
