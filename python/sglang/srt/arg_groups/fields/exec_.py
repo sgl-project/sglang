@@ -238,7 +238,12 @@ class ExecKernel(msgspec.Struct):
                 "'flashmla_sparse' forces the BF16 sparse prefill path, and "
                 "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=[
+                "auto",
+                "flashmla_kvcache",
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+            ],
         ),
     ] = "auto"
     dsa_triton_union: A[
