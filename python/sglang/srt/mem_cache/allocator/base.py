@@ -61,13 +61,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def free_group_begin(self):
+        # Nesting would drop the outer batch, then double-free it at the end.
+        assert self.is_not_in_free_group, "free groups cannot be nested"
         self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.cat(self.free_group))
+            # Consume the batch: a spent group must not be flushed twice.
+            free_group = self.free_group
+            self.free_group = []
+            self._release_free_group(torch.cat(free_group))
+
+    def _release_free_group(self, free_index: torch.Tensor):
+        """Release one group's batched indices. Default: the plain free path."""
+        self.free(free_index)
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:

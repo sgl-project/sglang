@@ -319,9 +319,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
+        # Resolve the SWA side before deferring the full side: a cache action
+        # later in this group can re-point free_index at a different SWA slot.
+        self.free_swa(free_index)
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
         assert (
@@ -375,12 +377,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().free_group_begin()
         self.swa_free_group = []
 
+    def _release_free_group(self, free_index: torch.Tensor):
+        # The SWA side was resolved at enqueue time; free() would re-read a
+        # mapping that no longer describes these full indices.
+        self.full_attn_allocator.free(free_index)
+
     def free_group_end(self):
         super().free_group_end()
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
             self.swa_attn_allocator.free(torch.cat(swa_free_group))
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
@@ -483,6 +494,20 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return kv_indices
 
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        # The identity mapping is registered with the KV pool and read by the
+        # attention kernels; editing it resolves a slot to the padding row.
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator has no full->SWA mapping to rewrite"
+        )
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator has no full->SWA mapping to clear"
+        )
+
     def alloc(self, need_size: int):
         assert self.page_size == 1
         return self.swa_attn_allocator.alloc(need_size)
@@ -518,10 +543,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
-
-    def free_group_begin(self):
-        self.is_not_in_free_group = False
-        self.free_group = []
 
     def free_group_end(self):
         self.is_not_in_free_group = True
