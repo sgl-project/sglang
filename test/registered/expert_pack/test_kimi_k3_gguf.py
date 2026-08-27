@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.quantization.expert_pack import ExpertPackConfig
 from sglang.srt.layers.quantization.gguf import (
     GGUFLinearMethod,
     _ordered_gguf_shard_ids,
@@ -18,6 +17,7 @@ from sglang.srt.model_loader.kimi_k3_gguf import (
     kimi_k3_checkpoint_targets,
     routed_expert_tensor,
 )
+from sglang.srt.models.kimi_k3 import _uses_split_gguf_kv_b
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -25,13 +25,12 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class TestKimiK3GGUFMapping(unittest.TestCase):
     def test_split_kv_capability_is_expert_pack_specific(self) -> None:
-        self.assertTrue(
-            ExpertPackConfig.supports_kimi_k3_quantized_latent_projections
-        )
-        self.assertTrue(ExpertPackConfig.supports_kimi_k3_split_gguf_kv_b)
         self.assertTrue(ModelSlimConfig.supports_kimi_k3_quantized_latent_projections)
-        self.assertFalse(
-            getattr(ModelSlimConfig, "supports_kimi_k3_split_gguf_kv_b", False)
+        self.assertFalse(_uses_split_gguf_kv_b(ModelSlimConfig))
+        self.assertTrue(
+            _uses_split_gguf_kv_b(
+                SimpleNamespace(supports_kimi_k3_split_gguf_kv_b=True)
+            )
         )
 
     def test_maps_dense_kda_mla_moe_and_residual_tensors(self) -> None:
