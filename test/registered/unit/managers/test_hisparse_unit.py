@@ -326,6 +326,16 @@ class TestHiSparseMTPDemandSelector(unittest.TestCase):
                 mtp_demand_buffer=False,
             )
         )
+        unresolved_device = SimpleNamespace(**vars(server_args))
+        unresolved_device.device = None
+        self.assertTrue(
+            selector(
+                unresolved_device,
+                model_config,
+                device_capability=(9, 0),
+                mtp_demand_buffer=True,
+            )
+        )
         for field, value in (
             ("speculative_num_steps", 1),
             ("speculative_num_draft_tokens", 2),

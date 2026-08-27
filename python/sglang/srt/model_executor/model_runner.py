@@ -276,7 +276,7 @@ def _prefill_cuda_graph_allows_context_parallel(
 def _supports_glm52_hisparse_mtp(server_args: ServerArgs) -> bool:
     return bool(
         server_args.enable_hisparse
-        and server_args.device == "cuda"
+        and server_args.device in (None, "cuda")
         and server_args.kv_cache_dtype == "fp8_e4m3"
         and server_args.dsa_decode_backend == "flashmla_kv"
         and server_args.speculative_algorithm == "EAGLE"
