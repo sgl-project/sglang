@@ -239,6 +239,26 @@ class TestModuleWeightBytes:
         module.register_buffer("b", backing[512:])
         assert module_weight_bytes(module) == 4096
 
+    def test_invalid_storage_is_skipped(self):
+        """Offloaded models may expose a tensor whose storage cannot be queried."""
+
+        class InvalidStorage:
+            def data_ptr(self):
+                raise RuntimeError("invalid python storage")
+
+        class InvalidStorageTensor:
+            def untyped_storage(self):
+                return InvalidStorage()
+
+        class ModuleWithInvalidStorage:
+            def parameters(self):
+                return iter((torch.ones(4), InvalidStorageTensor()))
+
+            def buffers(self):
+                return iter(())
+
+        assert module_weight_bytes(ModuleWithInvalidStorage()) == 4 * 4
+
 
 class TestPinBenefit:
     def test_a_stepped_component_counts_every_step(self):
@@ -265,3 +285,17 @@ class TestPinBenefit:
 
     def test_missing_step_count_is_treated_as_one_use(self):
         assert pin_benefit_bytes(weight_bytes=1000, uses_per_request=0) == 1000
+
+
+def test_the_forced_host_size_behaves_like_a_machine_of_that_size(monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+    available = host_memory_budget.host_memory_available_bytes()
+    # available is the pretend total minus this process's own anonymous
+    # memory, so it must sit strictly inside the pretend machine
+    assert 0 < available <= 32 * 1024**3
+    # and a larger pretend machine reports more room, same process
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "64")
+    larger = host_memory_budget.host_memory_available_bytes()
+    assert (
+        abs((larger - available) - 32 * 1024**3) < 512 * 1024**2
+    ), "the same process on a machine twice the size has one machine more room"

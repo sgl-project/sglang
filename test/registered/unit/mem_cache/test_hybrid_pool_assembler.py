@@ -2,9 +2,12 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _evict_mamba_for_device_alloc,
+    _evict_swa_for_device_alloc,
     _split_hicache_size,
     build_full_draft_pools,
 )
@@ -21,6 +24,40 @@ class _Pool:
 
     def get_kv_size_bytes(self):
         return self._kv_bytes
+
+
+class TestDeviceAllocEviction(CustomTestCase):
+    def test_swa_evicts_only_allocation_shortfall(self):
+        cache = MagicMock()
+        cache.token_to_kv_pool_allocator.swa_available_size.return_value = 8
+
+        _evict_swa_for_device_alloc(cache, required_size=10)
+
+        cache.evict_for_alloc.assert_called_once_with(EvictParams(swa_num_tokens=2))
+        cache.evict.assert_not_called()
+
+    def test_mamba_evicts_only_allocation_shortfall(self):
+        cache = MagicMock()
+        allocator = cache.req_to_token_pool.mamba_allocator
+        allocator.schedulable_available_size.return_value = 8
+
+        _evict_mamba_for_device_alloc(cache, required_size=10)
+
+        cache.evict_for_alloc.assert_called_once_with(EvictParams(mamba_num=2))
+        cache.evict.assert_not_called()
+
+    def test_sufficient_capacity_skips_eviction(self):
+        cache = MagicMock()
+        cache.token_to_kv_pool_allocator.swa_available_size.return_value = 10
+        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = (
+            10
+        )
+
+        _evict_swa_for_device_alloc(cache, required_size=10)
+        _evict_mamba_for_device_alloc(cache, required_size=10)
+
+        cache.evict_for_alloc.assert_not_called()
+        cache.evict.assert_not_called()
 
 
 class TestSplitHicacheSize(CustomTestCase):
@@ -64,7 +101,13 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                 page_size=512,
             )
         )
-        server_args = SimpleNamespace(hicache_mem_layout="page_first")
+        # The layout comes from the published configuration.
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(model_path="dummy", hicache_mem_layout="page_first")
+        publish(server_args, role="scheduler")
+        self.addCleanup(reset_context)
 
         with (
             patch(

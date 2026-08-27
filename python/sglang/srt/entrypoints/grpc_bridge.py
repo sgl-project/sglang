@@ -7,7 +7,6 @@ TokenizerManager's event loop.
 """
 
 import asyncio
-import dataclasses
 import json
 import logging
 from types import SimpleNamespace
@@ -15,7 +14,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from pydantic import ValidationError
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+from sglang.srt.runtime_context import (
+    get_lora,
+    get_serving,
+)
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -299,7 +303,9 @@ class RuntimeHandle:
             gen = self.tokenizer_manager.generate_request(obj, request=request)
             if stream:
                 completed_choices = set()
-                expected_choices = obj.batch_size * obj.parallel_sample_num
+                # generate_request does not normalize obj until iteration begins.
+                sampling_params = obj.sampling_params or {}
+                expected_choices = max(1, int(sampling_params.get("n", 1)))
                 async for chunk in gen:
                     choice_finished = (
                         chunk.get("meta_info", {}).get("finish_reason") is not None
@@ -398,7 +404,7 @@ class RuntimeHandle:
         result = {
             "model_path": self.tokenizer_manager.model_path,
             "served_model_name": self.tokenizer_manager.served_model_name,
-            "tokenizer_path": self.tokenizer_manager.server_args.tokenizer_path,
+            "tokenizer_path": get_serving().tokenizer_path,
             "is_generation": self.tokenizer_manager.is_generation,
             "weight_version": self.tokenizer_manager.config_value("weight_version"),
             "load_format": self.tokenizer_manager.config_value("load_format"),
@@ -411,13 +417,13 @@ class RuntimeHandle:
         if embedding_model_spec is not None:
             result["embedding"] = resolved_embedding_plan(
                 embedding_model_spec,
-                server_args=self.server_args,
+                config=resolving_view(self.server_args),
                 model_config=model_config,
             )
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        result: Dict[str, Any] = dataclasses.asdict(self.tokenizer_manager.server_args)
+        result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
         result.update(self.scheduler_info)
         result["kv_events"] = (
             self.tokenizer_manager.server_args.describe_kv_events_publisher()
@@ -459,9 +465,7 @@ class RuntimeHandle:
                 "max_model_len": self.tokenizer_manager.model_config.context_len,
             }
         ]
-        if self.tokenizer_manager.server_args.enable_lora and hasattr(
-            self.tokenizer_manager, "lora_registry"
-        ):
+        if get_lora().enable_lora and hasattr(self.tokenizer_manager, "lora_registry"):
             lora_registry = self.tokenizer_manager.lora_registry
             for _, lora_ref in lora_registry.get_all_adapters().items():
                 models.append(

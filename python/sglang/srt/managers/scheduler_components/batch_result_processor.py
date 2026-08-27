@@ -40,11 +40,13 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.sampling.sampling_observer import CommittedTokens
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.coordinator import BeamCoordinator
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
@@ -68,7 +70,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +81,6 @@ class SchedulerBatchResultProcessor:
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
-    server_args: ServerArgs
     model_config: ModelConfig
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -92,6 +93,7 @@ class SchedulerBatchResultProcessor:
     model_worker: BaseTpWorker
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
+    beam_coordinator: BeamCoordinator
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -190,6 +192,51 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
+    def _visible_output_len(req: Req) -> int:
+        return req.finished_len if req.finished_len is not None else len(req.output_ids)
+
+    @classmethod
+    def snapshot_auxiliary_output_starts(
+        cls,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> Optional[List[int]]:
+        if result.auxiliary_host_output is None:
+            return None
+        return [cls._visible_output_len(req) for req in batch.reqs]
+
+    @classmethod
+    def _build_auxiliary_commits(
+        cls,
+        batch: ScheduleBatch,
+        output_starts: List[int],
+    ) -> List[Optional[CommittedTokens]]:
+        commits: List[Optional[CommittedTokens]] = []
+        for req, output_start in zip(batch.reqs, output_starts, strict=True):
+            output_end = cls._visible_output_len(req)
+            if output_end < output_start:
+                raise RuntimeError("committed output length moved backwards")
+            if output_end == output_start:
+                commits.append(None)
+                continue
+            commits.append(
+                CommittedTokens(
+                    output_index=output_start,
+                    token_ids=tuple(req.output_ids[output_start:output_end]),
+                )
+            )
+        return commits
+
+    @classmethod
+    def consume_auxiliary_output(
+        cls,
+        batch: ScheduleBatch,
+        output: HostAuxiliaryOutput,
+        output_starts: List[int],
+    ) -> None:
+        output.consume(batch, cls._build_auxiliary_commits(batch, output_starts))
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -201,6 +248,10 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
+                batch, result
+            )
+            auxiliary_output = result.auxiliary_host_output
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -229,7 +280,6 @@ class SchedulerBatchResultProcessor:
             hidden_state_offset = 0
             prefill_hidden_capture_mode = self._get_prefill_hidden_capture_mode(
                 batch,
-                self.server_args,
             )
 
             # Check finish conditions
@@ -265,12 +315,19 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
+                    if req.beam_group is not None:
+                        # The relay point already replaced the sampled-token
+                        # append; the group owns all finish semantics.
+                        self.beam_coordinator.commit_prefill(
+                            req, up_to_tick=batch.forward_iter
+                        )
+                    else:
+                        # req output_ids are set here
+                        req.output_ids.append(next_token_id)
 
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
+                        self._maybe_update_reasoning_tokens(req, next_token_id)
 
-                    req.update_finish_state()
+                        req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -324,6 +381,13 @@ class SchedulerBatchResultProcessor:
                         )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+            if auxiliary_output is not None:
+                self.consume_auxiliary_output(
+                    batch,
+                    auxiliary_output,
+                    auxiliary_output_starts,
+                )
 
         else:  # embedding or reward model
             if result.copy_done is not None:
@@ -562,10 +626,7 @@ class SchedulerBatchResultProcessor:
             )
 
     @staticmethod
-    def _get_prefill_hidden_capture_mode(
-        batch: ScheduleBatch,
-        server_args: ServerArgs,
-    ) -> CaptureHiddenMode:
+    def _get_prefill_hidden_capture_mode(batch: ScheduleBatch) -> CaptureHiddenMode:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
@@ -812,6 +873,8 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
+        auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -847,8 +910,27 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        # Folds the relay point's selection into the DAG and sets the finish
+        # states the loop below observes. Beam + spec is rejected at admission.
+        newly_finished_beam_groups = set()
+        if batch.spec_algorithm.is_none() and logits_output is not None:
+            newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
+
         for i, req in enumerate(batch.reqs):
             req: Req
+
+            if req.beam_group is not None:
+                # Under overlap a finished row reappears for one overshoot tick;
+                # gate on the committing tick so this runs exactly once.
+                if req.finished() and (
+                    id(req.beam_group) not in newly_finished_beam_groups
+                ):
+                    continue
+                req.time_stats.set_last_decode_finish_time()
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
+                continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
@@ -905,6 +987,13 @@ class SchedulerBatchResultProcessor:
                     # here; spec already advanced it in _resolve_spec_v2_tokens.
                     self._accept_grammar_tokens(req, next_token_id)
                 req.grammar.finished = req.finished()
+
+        if auxiliary_output is not None:
+            self.consume_auxiliary_output(
+                batch,
+                auxiliary_output,
+                auxiliary_output_starts,
+            )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
