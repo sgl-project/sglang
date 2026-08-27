@@ -46,10 +46,14 @@ class _FetchingReceiver(_ConcreteReceiver):
 
 def _fetching_receiver(connection_pool):
     receiver = object.__new__(_FetchingReceiver)
+    # The table holds this receiver's snapshot: publishing fetched endpoints
+    # to the pool is generation-gated on it.
+    receiver.prefill_info = object()
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
         connection_lock=threading.Lock(),
         is_mla_backend=False,
+        prefill_info_table={"prefill:8998": receiver.prefill_info},
     )
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1
