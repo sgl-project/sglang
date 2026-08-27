@@ -55,9 +55,6 @@ class RadixLinearAttention(nn.Module):
         activation: str = "silu",
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
-        # KDA safe-gate clamp. None (the default) disables the clamp; kernels
-        # that read it must always find the attribute, so it is declared here
-        # rather than probed for.
         lower_bound: Optional[float] = None,
     ):
         super().__init__()

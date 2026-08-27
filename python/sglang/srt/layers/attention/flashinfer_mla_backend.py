@@ -1086,10 +1086,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         elif fast_verify_plan_kwargs is not None:
-            # Sync-free TARGET_VERIFY replay (DFLASH only, see
-            # _build_fast_verify_plan_kwargs): build kv_indices straight into
-            # the wrapper's cuda-graph buffer so the plan below can skip its
-            # device-to-device buffer refresh along with the blocking D2H.
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
@@ -1124,10 +1120,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 causal=True,
             )
         elif fast_verify_plan_kwargs is not None:
-            # mla paged prefill, host-fed plan: identical _plan_info to the
-            # wrapper.plan below, minus its three blocking .to("cpu") reads
-            # and four graph-buffer copies. kv_indices already live in the
-            # wrapper's cuda-graph buffer (written by the triton fill above).
             fast_mla_decode_plan(
                 wrapper_paged,
                 fast_verify_plan_kwargs["qo_indptr_cpu"],
@@ -1223,9 +1215,6 @@ class FlashInferMLAMultiStepDraftBackend:
             )
 
         self.max_context_len = self.attn_backends[0].max_context_len
-        # Not an AttentionBackend subclass; declare the generic-introspection
-        # fields explicitly (the metadata glue graph snapshots forward_metadata
-        # across attn_backend_list leaves).
         self.attn_backend_list = self.attn_backends
         self.forward_metadata = None
 

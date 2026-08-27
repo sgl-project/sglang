@@ -3413,9 +3413,6 @@ class FlashAttentionMultiStepBackend:
                     fa_impl_ver=fa_impl_ver,
                 )
             )
-        # Not an AttentionBackend subclass; declare the generic-introspection
-        # fields explicitly (the metadata glue graph snapshots forward_metadata
-        # across attn_backend_list leaves).
         self.attn_backend_list = self.attn_backends
         self.forward_metadata = None
 

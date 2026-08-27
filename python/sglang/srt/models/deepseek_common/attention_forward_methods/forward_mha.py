@@ -259,9 +259,6 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
-        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
-        # gate to inner_state, so every *_core dispatched from forward_core
-        # takes it as a trailing arg. None everywhere else.
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
@@ -295,9 +292,6 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
-        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
-        # gate to inner_state, so every *_core dispatched from forward_core
-        # takes it as a trailing arg. None everywhere else.
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
@@ -349,9 +343,6 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
-        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
-        # gate to inner_state, so every *_core dispatched from forward_core
-        # takes it as a trailing arg. None everywhere else.
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)

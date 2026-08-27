@@ -681,9 +681,6 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
-        # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its
-        # gate to inner_state, so every *_core dispatched from forward_core
-        # takes it as a trailing arg. None everywhere else.
         gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True

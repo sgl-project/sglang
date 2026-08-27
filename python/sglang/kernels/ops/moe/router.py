@@ -407,13 +407,7 @@ def router_gate_matvec_kernel(
     HBM round trip per CTA instead of a serial dependent-load chain, which
     is what dominates in the real model where ~94MB/layer of expert traffic
     flushes L2 between gate calls.
-
-    USE_GDC (PDL): the first weight tile is producer-independent, so its
-    (latency-bound, cold-HBM) load is issued BEFORE gdc_wait -- it overlaps
-    the producer's tail. Only the x read (the producer's output) sits behind
-    the wait. gdc_launch_dependents after the store lets the consumer
-    (_router_triton_kernel, itself a PDL waiter) start early. Accumulation
-    order is unchanged: bitwise-identical output."""
+    """
     pid_m = tl.program_id(0)
     pid_e = tl.program_id(1)
     e_offs = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
@@ -429,10 +423,6 @@ def router_gate_matvec_kernel(
     ).to(tl.float32)
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
-        # Early trigger: the wait above (and every consumer's wait) fences on
-        # full upstream completion, so this only releases the LAUNCH of the
-        # PDL'd router top-k kernel -- its prologue + bias prefetch now
-        # overlap this kernel's whole body, not just its tail. M <= 8 always.
         tl.extra.cuda.gdc_launch_dependents()
     x = tl.load(x_ptr + pid_m * stride_xm + k_offs, mask=k_mask, other=0.0).to(
         tl.float32

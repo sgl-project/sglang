@@ -415,18 +415,8 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    # PDL: overlap this kernel's launch/prologue with the tail of the
-    # producer kernel; all dependent loads (num_tokens_post_padded,
-    # sorted_token_ids, expert_ids, A/C) happen after the wait.
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
-        # Early trigger (decode-sized grids only): griddepcontrol.wait always
-        # fences on FULL upstream completion, so triggering here is safe for
-        # every consumer and lets PDL-launched dependents (activation /
-        # down-GEMM / combine) run their prologue + independent loads under
-        # this kernel's whole body instead of only its tail. Gated off for
-        # prefill-sized grids, where an early-launched dependent would steal
-        # SMs from a machine-filling producer.
         if GDC_EARLY:
             tl.extra.cuda.gdc_launch_dependents()
 
@@ -724,9 +714,6 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
-    # PDL: this block's output is fully written; allow dependent kernels
-    # (activation / down-GEMM / sum) to start their prologue. Early-return
-    # blocks above trigger implicitly on exit.
     if USE_GDC and not GDC_EARLY:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -1005,10 +992,6 @@ def invoke_fused_moe_kernel(
             b_desc = None
 
         pdl_kwargs = (
-            # GDC_EARLY: decode-sized grids trigger dependents right after
-            # their own wait (full-body overlap for PDL consumers); prefill
-            # keeps the end trigger so early-launched dependents don't steal
-            # SMs from a machine-filling GEMM.
             {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
             if is_arch_support_pdl()
             else {}
@@ -1231,11 +1214,6 @@ def _moe_sum_reduce_kernel(
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
 
     if USE_GDC:
-        # PDL: everything read here is the producer's (down-GEMM) output,
-        # which already triggers dependents right after its store. Trigger our
-        # own dependents immediately: gdc_wait fences on full completion, so
-        # this only lets the next PDL kernel (the fused AR+norm) overlap its
-        # prologue with this kernel's body.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 

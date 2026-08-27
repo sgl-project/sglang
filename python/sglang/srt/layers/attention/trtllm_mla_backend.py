@@ -196,11 +196,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     supports_ragged_verify_graph: bool = True
 
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
-        # Plan-stream fixup hook: nothing to redo. Plan-time metadata (paged
-        # block tables from req_to_token / seq_lens) is draft-output
-        # independent, and the draft-dependent inputs (input_ids / positions)
-        # are re-copied on the compute stream by load_batch's pre-planned fast
-        # path. Chain (topk=1) verify consumes no tree mask.
         pass
 
     def __init__(
@@ -580,10 +575,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ) -> None:
-        # `disable_flashinfer_ragged` keeps the parent-class signature so
-        # callers that hold a FlashInferMLAAttnBackend reference (e.g. the
-        # hybrid linear-attention wrapper) can delegate uniformly; this
-        # backend decides the ragged fallback itself and forces it on.
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             (self.disable_chunked_prefix_cache and has_prefix)

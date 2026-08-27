@@ -998,12 +998,6 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @property
     def kv_cache_dtype(self):
-        # trtllm_mla / dsa fuse-rope checks read this off the top-level backend
-        # via get_attn_backend().kv_cache_dtype. Delegate to the full-attn
-        # sub-backend so hybrid models report the right dtype; it defaults to
-        # None on AttentionBackend, so when the sub-backend doesn't set it the
-        # fuse-rope check just evaluates False, matching the non-hybrid
-        # non-fp8 path.
         return self.full_attn_backend.kv_cache_dtype
 
     def _is_full_attn(

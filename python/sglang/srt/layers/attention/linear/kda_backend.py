@@ -414,10 +414,6 @@ class KDAAttnBackend(MambaAttnBackendBase):
             f"{decode_backend} only picks the fallback kernel for shapes "
             "the fused kernel does not cover."
         )
-        # Fused chain-verify fast path: one kernel replaces the transpose-copy +
-        # conv1d + transpose-copy + recurrence sequence on the MTP verify chain.
-        # Opt-in; anything the fused kernel does not cover falls back to the
-        # reference two-kernel path below.
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()

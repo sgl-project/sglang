@@ -890,13 +890,6 @@ def _fused_moe_kernel_sequence(
             # According to micro benchmark results, torch.compile can get better performance for small token.
             if _use_moe_sum_reduce_torch_compile(num_tokens):
                 if is_arch_support_pdl():
-                    # PDL-chained triton reduce: its prologue overlaps the
-                    # down-GEMM tail (that kernel already triggers dependents
-                    # after its store); the inductor kernel cannot carry PDL
-                    # launch attributes. Numerics: one fp32 rounding
-                    # (sum * scale, then cast) vs the compile path's two
-                    # (sum -> cast, then scale in output dtype) -- slightly
-                    # more precise, not bit-equal.
                     moe_sum_reduce_triton(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states,
