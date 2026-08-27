@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     RESIDENCY_POLICY_LEADING,
     RESIDENCY_POLICY_STRIDED,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
     _resolve_auto_residency_warmup_shape,
@@ -3432,8 +3433,17 @@ class TestApplyAndRollback:
         assert args.auto_modes == {"text_encoder": LAYERWISE_OFFLOAD}
         assert module.layerwise_offload_managers[0].pinned_layer_indices() == (0,)
 
-    def test_component_offload_promotion_marks_resident_without_moving(self):
-        module = nn.Linear(4, 4)
+    def test_component_offload_promotion_materializes_before_validation(self):
+        class RecordingLinear(nn.Linear):
+            def __init__(self):
+                super().__init__(4, 4)
+                self.to_targets = []
+
+            def to(self, *args, **kwargs):
+                self.to_targets.append(args[0])
+                return super().to(*args, **kwargs)
+
+        module = RecordingLinear()
         args = _StubResidencyArgs()
         applied = apply_residency_changes(
             plan=_plan_for([_candidate("text_encoder", weight_gib=1)]),
@@ -3441,12 +3451,14 @@ class TestApplyAndRollback:
             server_args=args,
         )
         assert args.auto_modes == {"text_encoder": RESIDENT}
+        assert module.to_targets == [current_platform.get_local_torch_device()]
         assert [p.component_name for p in applied] == ["text_encoder"]
 
         rollback_residency_changes(
             applied=applied, modules={"text_encoder": module}, server_args=args
         )
         assert args.auto_modes == {}
+        assert module.to_targets[-1] == "cpu"
 
     def test_component_resident_can_be_demoted_and_rollback_restores_it(self):
         module = nn.Linear(4, 4)
