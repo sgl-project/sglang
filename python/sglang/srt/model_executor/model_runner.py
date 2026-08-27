@@ -265,10 +265,8 @@ def _prefill_cuda_graph_allows_context_parallel(
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
-    # Per-rank padded token count of the cuda graph this forward replayed
-    # (None for eager). The dp-gathered buffer is strided by it, so the state
-    # capturer needs the value from THIS forward's runner, not whichever
-    # runner ran last.
+    # Per-rank padded size of the graph this forward replayed (None for eager);
+    # the dp-gathered buffer is strided by it.
     graph_num_tokens: Optional[int] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -1647,10 +1645,8 @@ class ModelRunner:
         # pass the actual number of tokens per DP rank in CUDA graph, not the batch
         # size — the width is captured_req_width.
 
-        # The runner that ran THIS forward reports its padded per-rank size;
-        # reading self.decode_cuda_graph_runner.bs here instead gave the state
-        # capturer another graph's (or an unset) stride on prefill-graph
-        # forwards.
+        # From the runner that ran this forward: the decode runner's own bs is
+        # another graph's stride once a prefill graph replays.
         cuda_graph_num_tokens = output.graph_num_tokens
 
         if (

@@ -436,21 +436,11 @@ def get_dp_local_slice_cpu(
     can_run_graph: bool,
     cuda_graph_batch: Optional[int],
 ) -> Tuple[int, int]:
-    # CPU (start, length) slice for this rank's REAL rows in the dp-gathered
-    # buffer, no D2H sync. Layouts (verified against the buffer's zero-routing
-    # regions on a dp2 devbox):
-    #   graph replay (decode or piecewise prefill): uniform segments strided by
-    #     the replayed graph's padded per-rank size -- cuda_graph_batch, which
-    #     ModelRunnerOutput.graph_num_tokens now carries from the runner that
-    #     ran THIS forward. max(global_num_tokens) is NOT the stride there: a
-    #     prefill graph pads 300 real tokens to a 320-token capture size.
-    #   eager: packed by global_num_tokens (under eager MAX_LEN the entries are
-    #     already uniform, so the sum degenerates to rank * max).
-    # The length is the rank's REAL count (original_*): the rows and
-    # out_cache_loc entries past it belong to graph padding -- every pad row
-    # holds the routing of a zero hidden state, and scattering them through the
-    # pad out_cache_loc entries overwrote live tokens' captured rows with that
-    # single row (the R3 repeated-row corruption).
+    # CPU (start, length) slice for this rank's real rows, no D2H sync. A graph
+    # forward strides by the replayed graph's padded size, not by
+    # max(global_num_tokens): a prefill graph pads 300 tokens to a 320 capture.
+    # The length excludes that padding -- every pad row holds the routing of a
+    # zero hidden state, and its out_cache_loc entry points at a live token.
     global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = get_attention_dp_rank()
     if can_run_graph:
