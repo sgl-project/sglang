@@ -561,12 +561,6 @@ class FlashInferAttnBackend(AttentionBackend):
             unsupported_reason = "hybrid linear/state-space models are not supported"
         elif is_minimax_sparse(model_runner.model_config.hf_config):
             unsupported_reason = "hybrid sparse-attention models are not supported"
-        elif model_runner.spec_algorithm.is_speculative():
-            unsupported_reason = "speculative decoding is not supported"
-        elif self.is_dllm_model:
-            unsupported_reason = "DLLM is not supported"
-        elif self.is_multimodal:
-            unsupported_reason = "multimodal models are not supported"
         elif self.enable_mis:
             unsupported_reason = "multi-item scoring is not supported"
         elif self.prefill_uses_dequant_workspace or self.is_nvfp4_kvcache:
