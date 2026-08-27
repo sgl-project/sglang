@@ -2421,14 +2421,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 input_dtype=fp4_dtype,
             ).transpose(-1, -2)
 
-            # HF stores the block scale as a float32 whose value IS the e8m0
-            # byte (bias-127 exponent), e.g. 116 -> 2^(116-127) = 2^-11. It is
-            # already e8m0-encoded, so cast straight to uint8. Applying
-            # round(log2)+127 here would re-bias the exponent (116 -> 134 -> 2^7)
-            # and inflate every scale by ~2^17, blowing up the GMM output.
+            # Two e8m0 storage conventions: (a) fp32 holds 2^(e-127) -> recover
+            # e from the exponent field; (b) fp32 holds the e8m0 byte itself
+            # (int in 0..255, used by MiMo-V2.5-Pro) -> cast to uint8. Pick
+            # with is_int_like. Never re-encode with round(log2)+127: it
+            # re-biases the exponent (116->134->2^7), inflating scales by ~2^17.
             scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
             scale = scale_inv.data.to(torch.float32)
-            e8m0 = scale.clamp(0, 255).to(torch.uint8)
+            s_flat = scale.detach().float().flatten()
+            is_int_like = bool(
+                bool(torch.all(s_flat >= 0))
+                and bool(torch.all(s_flat <= 255))
+                and bool(torch.allclose(s_flat, s_flat.round()))
+            )
+            if is_int_like:
+                e8m0 = scale.to(torch.uint8)
+            else:
+                # float32 holds 2^(e-127): recover e from the exponent field.
+                e8m0 = (scale.view(torch.int32) >> 23 & 0xFF).to(torch.uint8)
             scale = e8m0.reshape(
                 scale.shape[0],
                 scale.shape[1],
