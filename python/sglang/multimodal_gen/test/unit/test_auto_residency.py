@@ -63,6 +63,7 @@ def _record(
     stage_duration_ms=None,
     step_duration_ms=(),
     phase_active_components=None,
+    phase_full_weight_transition_components=None,
 ) -> WarmupMemoryRecord:
     return WarmupMemoryRecord(
         width=width,
@@ -76,6 +77,9 @@ def _record(
         stage_duration_ms=stage_duration_ms or {},
         step_duration_ms=step_duration_ms,
         phase_active_components=phase_active_components or {},
+        phase_full_weight_transition_components=(
+            phase_full_weight_transition_components or {}
+        ),
     )
 
 
@@ -339,7 +343,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, active, used = estimate_workload_phase_peaks(
+        peaks, active, used, _ = estimate_workload_phase_peaks(
             records=[small, large],
             target_units=832 * 480 * 81,
             component_weight_bytes={"transformer": 28 * GIB_BYTES},
@@ -361,13 +365,34 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, _, _ = estimate_workload_phase_peaks(
+        peaks, _, _, _ = estimate_workload_phase_peaks(
             records=[record],
             target_units=record.workload_units(),
             component_weight_bytes={"transformer": 10 * GIB_BYTES},
         )
 
         assert peaks["denoise"] == 11 * GIB_BYTES
+
+    def test_phase_estimation_preserves_full_weight_transition_components(self):
+        record = WarmupMemoryRecord(
+            width=1024,
+            height=1024,
+            num_frames=1,
+            baseline_allocated_bytes=2 * GIB_BYTES,
+            peak_allocated_bytes=4 * GIB_BYTES,
+            succeeded=True,
+            phase_peak_allocated_bytes={"lora_switch": 4 * GIB_BYTES},
+            phase_full_weight_transition_components={"lora_switch": ("transformer",)},
+        )
+
+        peaks, _, _, transitions = estimate_workload_phase_peaks(
+            records=[record],
+            target_units=record.workload_units(),
+            component_weight_bytes={"transformer": 2 * GIB_BYTES},
+        )
+
+        assert peaks == {"lora_switch": 4 * GIB_BYTES}
+        assert transitions == {"lora_switch": ("transformer",)}
 
     def test_phase_estimation_prefers_target_layout_over_smaller_warmup(self):
         small = WarmupMemoryRecord(
@@ -391,7 +416,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("transformer",)},
         )
 
-        peaks, active, used = estimate_workload_phase_peaks(
+        peaks, active, used, _ = estimate_workload_phase_peaks(
             records=[small, target],
             target_units=target.workload_units(),
             component_weight_bytes={"transformer": 40 * GIB_BYTES},
@@ -423,7 +448,7 @@ class TestEstimateDefaultWorkloadPeak:
             phase_active_components={"denoise": ("text_encoder",)},
         )
 
-        peaks, active, used = estimate_workload_phase_peaks(
+        peaks, active, used, _ = estimate_workload_phase_peaks(
             records=[transformer_phase, encoder_phase],
             target_units=transformer_phase.workload_units(),
             component_weight_bytes={
@@ -475,6 +500,8 @@ def _report(
     phase_peaks_gib: dict[str, int] | None = None,
     phase_components: dict[str, tuple[str, ...]] | None = None,
     phase_present_components: dict[str, tuple[str, ...]] | None = None,
+    phase_full_weight_transition_components: dict[str, tuple[str, ...]] | None = None,
+    component_weight_gib: dict[str, int] | None = None,
     node_rank: int = 0,
     pinned_host_gib: int = 0,
     host_pin_capacity_gib: int = 0,
@@ -501,6 +528,13 @@ def _report(
             else phase_components or {}
         ),
         used_components_by_phase=phase_components or {},
+        full_weight_transition_components_by_phase=(
+            phase_full_weight_transition_components or {}
+        ),
+        current_device_weight_bytes_by_component={
+            name: value * GIB_BYTES
+            for name, value in (component_weight_gib or {}).items()
+        },
         node_rank=node_rank,
         pinned_host_bytes=pinned_host_gib * GIB_BYTES,
         host_pin_capacity_bytes=host_pin_capacity_gib * GIB_BYTES,
@@ -811,6 +845,56 @@ class TestPlanAutoResidency:
             "transformer:resident"
         ]
 
+    def test_request_end_residency_is_carried_into_the_next_request(self):
+        text_offload = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            current_placement=True,
+        )
+        text_resident = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            target_layerwise_resident_layers=(48,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=20 * GIB_BYTES,
+            inactive_device_delta_bytes=20 * GIB_BYTES,
+            target_device_weight_bytes=20 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=80,
+                    estimated_gib=40,
+                    target_workload_measured=True,
+                    phase_peaks_gib={"text_encode": 30, "idle": 40},
+                    phase_components={
+                        "text_encode": ("text_encoder",),
+                        "idle": (),
+                    },
+                    phase_present_components={
+                        "text_encode": ("text_encoder",),
+                        "idle": ("transformer",),
+                    },
+                    component_weight_gib={"transformer": 40},
+                    candidates=[text_offload, text_resident],
+                )
+            ]
+        )
+
+        # The first warmup encoded text before the retained DiT existed. The
+        # next request starts with that 40 GiB DiT, so a resident encoder would
+        # need 90 GiB before the explicit reserve and is not feasible.
+        assert plan.changes == []
+
     def test_other_phase_can_block_component_residency(self):
         plan = plan_auto_residency(
             reports=[
@@ -825,6 +909,102 @@ class TestPlanAutoResidency:
         )
 
         assert not plan.changes
+
+    def test_inactive_phase_charges_full_permanent_target(self):
+        layerwise = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            current_placement=True,
+        )
+        resident = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            target_layerwise_resident_layers=(48,),
+            target_layerwise_pinned_layers=((),),
+            permanent_residency=True,
+            inactive_device_delta_bytes=20 * GIB_BYTES,
+            target_device_weight_bytes=25 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=80,
+                    estimated_gib=55,
+                    target_workload_measured=True,
+                    phase_peaks_gib={"denoise": 55},
+                    candidates=[layerwise, resident],
+                )
+            ]
+        )
+
+        # The managed-layer delta would fit in the 21 GiB post-reserve
+        # headroom, but the complete permanent 25 GiB footprint does not.
+        assert plan.changes == []
+
+    def test_full_materialization_phase_does_not_double_count_transitioned_weights(
+        self,
+    ):
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(1,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=90,
+                    estimated_gib=50,
+                    target_workload_measured=True,
+                    phase_peaks_gib={"lora_switch": 50},
+                    phase_full_weight_transition_components={
+                        "lora_switch": ("transformer",)
+                    },
+                    candidates=[component_offload, layerwise],
+                )
+            ]
+        )
+
+        assert [candidate.target_mode() for candidate in plan.changes] == [
+            LAYERWISE_OFFLOAD
+        ]
+
+    def test_reports_reserve_shortfall_for_a_newly_calibrated_placement(self):
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=30,
+                    estimated_gib=28,
+                    target_workload_measured=True,
+                    phase_peaks_gib={"decode": 28},
+                )
+            ]
+        )
+
+        assert plan.current_placement_reserve_shortfall_bytes == 2 * GIB_BYTES
 
     def test_unobserved_later_component_gets_a_conservative_phase(self):
         first_transformer = _candidate("first_transformer", weight_gib=26, h2d_gib=100)
@@ -1700,6 +1880,11 @@ class TestCollectResidencyTargets:
         )
         assert component.current_placement
         assert full_stage.h2d_bytes_per_request == component.h2d_bytes_per_request
+        assert all(
+            candidate.h2d_bytes_per_request <= component.h2d_bytes_per_request
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        )
         assert any(
             candidate.target_layerwise_resident_layers == (2,)
             for candidate in candidates
@@ -1784,7 +1969,6 @@ class TestCollectResidencyTargets:
         assert (
             resident.device_transition_delta_bytes == manager.offloaded_weight_bytes()
         )
-
         module.disable_offload()
         candidates = collect_residency_targets(
             modules={"transformer": module},
@@ -2156,6 +2340,47 @@ class TestApplyAndRollback:
         )
 
         assert events == ["source:sync", "target:load"]
+
+    def test_vram_rollback_releases_before_restoring_resident_layers(self):
+        events: list[str] = []
+
+        class _TrackedModule(nn.Module):
+            def to(self, *args, **kwargs):
+                events.append("text_encoder:release")
+                return self
+
+        manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="transformer",
+        )
+        transformer = _FakeLayerwiseDit([manager])
+        applied = [
+            AppliedResidencyChange(
+                component_name="text_encoder",
+                residency_mode=COMPONENT_OFFLOAD,
+                applied_device_delta_bytes=10,
+            ),
+            AppliedResidencyChange(
+                component_name="transformer",
+                residency_mode=LAYERWISE_OFFLOAD,
+                previous_layerwise_resident_layers=(1,),
+                previous_layerwise_pinned_layers=((),),
+                previous_layerwise_offload_enabled=False,
+                applied_device_delta_bytes=-10,
+            ),
+        ]
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={
+                "text_encoder": _TrackedModule(),
+                "transformer": transformer,
+            },
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["text_encoder:release", "transformer:load"]
 
     def test_hostpin_rollback_releases_new_owner_before_restoring_old_owner(
         self, monkeypatch

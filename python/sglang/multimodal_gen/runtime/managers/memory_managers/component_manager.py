@@ -63,6 +63,7 @@ class WarmupPhasePeak:
     active_components: tuple[str, ...]
     allocated_bytes: int
     used_components: tuple[str, ...] = ()
+    full_weight_transition_components: tuple[str, ...] = ()
 
 
 class ResidencyBatch(Protocol):
@@ -140,6 +141,7 @@ class ComponentResidencyManager:
         self._warmup_phase_key: str | None = None
         self._warmup_phase_components: tuple[str, ...] = ()
         self._warmup_phase_used_components: tuple[str, ...] = ()
+        self._warmup_phase_full_weight_transition_components: tuple[str, ...] = ()
         self._warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
         self._completed_warmup_phase_peaks: dict[str, WarmupPhasePeak] = {}
 
@@ -228,6 +230,7 @@ class ComponentResidencyManager:
         self._warmup_phase_key = None
         self._warmup_phase_components = ()
         self._warmup_phase_used_components = ()
+        self._warmup_phase_full_weight_transition_components = ()
         self._warmup_phase_peaks = {}
         self._completed_warmup_phase_peaks = {}
         if self._track_warmup_memory:
@@ -259,6 +262,43 @@ class ComponentResidencyManager:
                 components=self._warmup_active_components(),
                 used_components=(),
             )
+
+    @contextmanager
+    def full_weight_transition(self, component_names: Iterable[str]) -> Iterator[None]:
+        """Measure request logic that temporarily materializes complete weights."""
+        names = tuple(sorted(set(component_names)))
+        if not self._track_warmup_memory or not names:
+            yield
+            return
+        previous_phase = (
+            self._warmup_phase_key,
+            self._warmup_phase_components,
+            self._warmup_phase_used_components,
+            self._warmup_phase_full_weight_transition_components,
+        )
+        self._begin_warmup_phase(
+            key=(
+                f"{self.state.stage_index}:{self.state.stage_name}:"
+                f"full-weight-transition:{','.join(names)}"
+            ),
+            components=self._warmup_active_components(),
+            used_components=(),
+            full_weight_transition_components=names,
+        )
+        try:
+            yield
+        finally:
+            previous_key, components, used_components, transitions = previous_phase
+            if previous_key is None:
+                self._record_warmup_phase_peak()
+                self._warmup_phase_key = None
+            else:
+                self._begin_warmup_phase(
+                    key=previous_key,
+                    components=components,
+                    used_components=used_components,
+                    full_weight_transition_components=transitions,
+                )
 
     def begin_stage(self) -> None:
         """Prepare a stage that declares one uninterrupted component use."""
@@ -616,6 +656,7 @@ class ComponentResidencyManager:
         key: str,
         components: tuple[str, ...],
         used_components: tuple[str, ...],
+        full_weight_transition_components: tuple[str, ...] = (),
     ) -> None:
         if not self._track_warmup_memory:
             return
@@ -623,6 +664,9 @@ class ComponentResidencyManager:
         self._warmup_phase_key = key
         self._warmup_phase_components = tuple(sorted(set(components)))
         self._warmup_phase_used_components = tuple(sorted(set(used_components)))
+        self._warmup_phase_full_weight_transition_components = tuple(
+            sorted(set(full_weight_transition_components))
+        )
         torch.get_device_module().reset_peak_memory_stats()
 
     def _begin_warmup_transition(
@@ -688,6 +732,9 @@ class ComponentResidencyManager:
             active_components=self._warmup_phase_components,
             allocated_bytes=int(torch.get_device_module().max_memory_allocated()),
             used_components=self._warmup_phase_used_components,
+            full_weight_transition_components=(
+                self._warmup_phase_full_weight_transition_components
+            ),
         )
         previous = self._warmup_phase_peaks.get(self._warmup_phase_key)
         if previous is None:
@@ -702,6 +749,12 @@ class ComponentResidencyManager:
                 allocated_bytes=max(previous.allocated_bytes, peak.allocated_bytes),
                 used_components=tuple(
                     sorted(set(previous.used_components) & set(peak.used_components))
+                ),
+                full_weight_transition_components=tuple(
+                    sorted(
+                        set(previous.full_weight_transition_components)
+                        & set(peak.full_weight_transition_components)
+                    )
                 ),
             )
 

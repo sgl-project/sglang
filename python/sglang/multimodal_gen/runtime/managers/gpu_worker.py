@@ -64,6 +64,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     WarmupMemoryRecord,
     apply_residency_changes,
     collect_residency_targets,
+    component_current_device_weight_bytes,
     component_runtime_weight_bytes,
     describe_error,
     estimate_candidate_latency_savings_ns,
@@ -730,6 +731,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
         phase_used_components: dict[str, tuple[str, ...]] = {}
+        phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
         untracked_active_components: tuple[str, ...] = ()
         residency_manager = peek_global_component_residency_manager()
         if residency_manager is not None:
@@ -737,6 +739,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_allocated_peaks[phase_name] = peak.allocated_bytes
                 phase_components[phase_name] = peak.active_components
                 phase_used_components[phase_name] = peak.used_components
+                phase_full_weight_transition_components[phase_name] = (
+                    peak.full_weight_transition_components
+                )
             untracked_active_components = residency_manager.current_device_components()
         request_allocated_peak = max(
             int(torch.get_device_module().max_memory_allocated()),
@@ -750,6 +755,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             phase_allocated_peaks["request:untracked"] = request_allocated_peak
             phase_components["request:untracked"] = untracked_active_components
             phase_used_components["request:untracked"] = ()
+            phase_full_weight_transition_components["request:untracked"] = ()
         metrics = req.metrics
         width, height, num_frames, num_inference_steps = workload
         self._auto_residency_warmup_records.append(
@@ -763,6 +769,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_peak_allocated_bytes=phase_allocated_peaks,
                 phase_active_components=phase_components,
                 phase_used_components=phase_used_components,
+                phase_full_weight_transition_components=(
+                    phase_full_weight_transition_components
+                ),
                 num_inference_steps=num_inference_steps,
                 total_duration_ms=(
                     float(metrics.total_duration_ms) if metrics is not None else 0.0
@@ -1294,6 +1303,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
         plan = plan_auto_residency(reports=reports)
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
+        if (
+            self._auto_residency_round_sizes
+            and plan.current_placement_reserve_shortfall_bytes > 0
+        ):
+            shortfall_gib = plan.current_placement_reserve_shortfall_bytes / GIB_BYTES
+            if self.is_output_rank:
+                logger.warning(
+                    "Auto residency calibration exceeded the VRAM reserve by "
+                    "%.1f GiB; rolling back the latest adjustment round.",
+                    shortfall_gib,
+                )
+            return self._rollback_everywhere(
+                cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
+                already_failed=False,
+                latest_round_only=True,
+            )
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
                 logger.info("%s", summary)
@@ -1469,6 +1494,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             estimated_phase_peaks,
             active_components_by_phase,
             used_components_by_phase,
+            full_weight_transition_components_by_phase,
         ) = estimate_workload_phase_peaks(
             records=records,
             target_units=target_units,
@@ -1537,6 +1563,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             estimated_peak_bytes_by_phase=estimated_phase_peaks,
             active_components_by_phase=active_components_by_phase,
             used_components_by_phase=used_components_by_phase,
+            full_weight_transition_components_by_phase=(
+                full_weight_transition_components_by_phase
+            ),
+            current_device_weight_bytes_by_component=(
+                component_current_device_weight_bytes(self.pipeline.modules)
+            ),
             node_rank=self.server_args.node_rank,
             pinned_host_bytes=layerwise_pinned_host_bytes(self.pipeline.modules),
             host_pin_capacity_bytes=layerwise_host_pin_capacity_bytes(

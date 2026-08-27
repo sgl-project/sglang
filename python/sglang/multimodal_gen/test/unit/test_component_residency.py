@@ -234,6 +234,44 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
     )
 
 
+def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+        max_memory_allocated=lambda: 7,
+        memory_allocated=lambda: 2,
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    stage = _Stage()
+    module = torch.nn.Linear(2, 2)
+    pipeline = SimpleNamespace(
+        modules={"transformer": module},
+        _stage_name_mapping={"lora_switch": stage},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.strategy_for = Mock()
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    with manager.full_weight_transition(("transformer",)):
+        pass
+
+    assert manager._warmup_phase_peaks[
+        "0:lora_switch:full-weight-transition:transformer"
+    ] == WarmupPhasePeak(
+        (),
+        7,
+        full_weight_transition_components=("transformer",),
+    )
+    assert manager._warmup_phase_key == "0:lora_switch:setup"
+    manager.strategy_for.assert_not_called()
+
+
 def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     device_module = SimpleNamespace(
         is_available=lambda: True,
