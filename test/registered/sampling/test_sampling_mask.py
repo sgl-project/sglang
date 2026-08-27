@@ -1,8 +1,19 @@
+import json
 import math
 import unittest
+from types import SimpleNamespace
 
 import requests
+import torch
 
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskStatus,
+)
+from sglang.srt.layers.sampler import Sampler, _SamplingMaskCapture
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -24,9 +35,11 @@ _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
     "0.7",
+    "--sampling-mask-max-tokens",
+    "64",
 )
 _INVALID_SAMPLING_MASK_ERROR = (
-    "top_p-only sampling is valid but can return huge masks in the tail"
+    "return_sampling_mask requires top_k=1 for greedy sampling"
 )
 
 
@@ -132,6 +145,16 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         for sampling_mask in top_k_top_p_one_sampling_masks:
             self.assertGreaterEqual(len(sampling_mask), _TOP_K)
 
+    def test_generate_returns_greedy_singleton_mask(self):
+        masks = self._generate_sampling_masks(
+            {
+                "temperature": 0.0,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+            }
+        )
+        self.assertTrue(all(len(mask) == 1 for mask in masks))
+
     def test_sampling_mask_matches_topk_logprobs(self):
         """Check the returned mask and its renormalized logprobs.
 
@@ -230,6 +253,41 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
 
+    def test_generate_streams_aligned_sampling_masks(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "top_k": _TOP_K,
+                    "top_p": _TOP_P,
+                    "max_new_tokens": _MAX_NEW_TOKENS,
+                    "ignore_eos": True,
+                },
+                "return_sampling_mask": True,
+                "stream": True,
+            },
+            stream=True,
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        output_ids = []
+        sampling_masks = []
+        for line in response.iter_lines():
+            if not line.startswith(b"data: ") or line[6:] == b"[DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            output_ids = chunk["output_ids"]
+            sampling_masks = chunk["meta_info"]["output_token_sampling_mask"]
+            self.assertEqual(len(sampling_masks), len(output_ids))
+
+        self.assertEqual(len(output_ids), _MAX_NEW_TOKENS)
+        self.assertEqual(len(sampling_masks), len(output_ids))
+        for output_id, sampling_mask in zip(output_ids, sampling_masks):
+            self.assertIn(output_id, sampling_mask)
+
     def test_generate_rejects_unbounded_sampling_mask(self):
         self._assert_rejects_unbounded_sampling_mask(
             {
@@ -242,11 +300,59 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         self._assert_rejects_unbounded_sampling_mask(
             {
                 "temperature": 1.0,
+                "top_k": 65,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+            }
+        )
+        self._assert_rejects_unbounded_sampling_mask(
+            {
+                "temperature": 1.0,
                 "top_p": 1.0,
                 "max_new_tokens": _MAX_NEW_TOKENS,
                 "ignore_eos": True,
             }
         )
+
+
+class TestSamplingMaskPacking(CustomTestCase):
+    def test_overflow_never_materializes_a_partial_mask(self):
+        # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
+        # produce more positive weights than the fixed transport can hold.
+        sampler = Sampler.__new__(Sampler)
+        sampler.sampling_mask_max_tokens = 3
+        sampler.tp_sync_group = None
+        sampler.cp_sync_group = None
+        capture = _SamplingMaskCapture(
+            batch_indices=torch.tensor([0]),
+            weights=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]),
+            token_ids=None,
+            selected_weight=torch.tensor([0.2]),
+        )
+
+        sampling_output = sampler._build_sampling_mask_output(
+            torch.tensor([0]), capture
+        )
+
+        self.assertEqual(
+            sampling_output.statuses.tolist(), [SamplingMaskStatus.OVERFLOW]
+        )
+        self.assertEqual(sampling_output.lengths.tolist(), [3])
+        self.assertAlmostEqual(sampling_output.selected_logprobs.item(), -math.log(5))
+
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=sampling_output,
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            [SimpleNamespace(return_sampling_mask=True)], output
+        )
+        self.assertEqual(
+            output.next_token_sampling_mask_status,
+            [SamplingMaskStatus.OVERFLOW],
+        )
+        self.assertEqual(output.next_token_sampling_mask_idx, [None])
+        self.assertEqual(output.next_token_sampling_logprobs, [None])
 
 
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):

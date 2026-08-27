@@ -304,18 +304,14 @@ class MetadataBuffers:
         size: int,
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
+        max_sampling_mask_tokens: int,
         max_top_logprobs_num: int = 128,
-        max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
-        if max_sampling_mask_tokens is None:
-            max_sampling_mask_tokens = (
-                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
-            )
-        self.enable_sampling_mask = max_sampling_mask_tokens > 0
+        self.enable_sampling_mask = True
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -507,11 +503,6 @@ class MetadataBuffers:
                     device="cpu",
                 )
         if req.return_sampling_mask:
-            if not self.enable_sampling_mask:
-                raise RuntimeError(
-                    "return_sampling_mask with disaggregation requires "
-                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
-                )
             # Sentinel -1: the decode side records None for this handoff token.
             self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
             sampling_masks = req.output_token_sampling_mask
@@ -526,7 +517,7 @@ class MetadataBuffers:
                         raise RuntimeError(
                             f"Sampling mask length {mask_len} exceeds disaggregation "
                             f"metadata capacity {max_mask_len}. Increase "
-                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
+                            "--sampling-mask-max-tokens."
                         )
                     self.output_token_sampling_mask_len[req.metadata_buffer_index][
                         0

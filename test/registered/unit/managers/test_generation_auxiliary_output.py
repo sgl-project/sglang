@@ -6,7 +6,11 @@ import pytest
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -93,6 +97,35 @@ def test_auxiliary_output_releases_device_holder_after_copy():
     assert logits_output.auxiliary_device_output is None
     assert result.auxiliary_host_output is not device_output
     assert device_output.copy_count == 1
+    assert result.copy_done.record_count == 1
+
+
+def test_sampling_mask_output_uses_generation_result_copy_path():
+    sampling_output = SamplingMaskOutput(
+        token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
+        lengths=torch.tensor([2], dtype=torch.int32),
+        selected_logprobs=torch.tensor([-0.5]),
+        statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
+    )
+    result = GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=sampling_output,
+        ),
+        next_token_ids=torch.tensor([3]),
+        copy_done=CopyDone(),
+    )
+
+    with patch(
+        "sglang.srt.managers.utils._async_d2h",
+        side_effect=lambda tensor: tensor.clone(),
+    ) as copy_tensor:
+        result.copy_to_cpu(return_logprob=False)
+
+    assert copy_tensor.call_count == 5
+    assert sampling_output.token_ids.tolist() == [[3, 5]]
+    assert sampling_output.lengths.tolist() == [2]
+    assert sampling_output.statuses.tolist() == [SamplingMaskStatus.OK]
     assert result.copy_done.record_count == 1
 
 

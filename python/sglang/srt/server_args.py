@@ -3579,6 +3579,14 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    sampling_mask_max_tokens: A[
+        int,
+        "The maximum number of token IDs in a returned sampling mask. Requests "
+        "are aborted if their realized sampling support exceeds this limit. "
+        "Use the same value on disaggregated prefill and decode nodes; clients "
+        "should set top_k below the limit to leave headroom for cutoff ties.",
+        NS("exec.features"),
+    ] = 4096
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -3680,6 +3688,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_sampling_mask_max_tokens()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -8629,6 +8638,13 @@ class ServerArgs:
     def _validate_prefill_decode_interval(self):
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
+
+    def _validate_sampling_mask_max_tokens(self):
+        if self.sampling_mask_max_tokens <= 0:
+            raise ValueError(
+                "--sampling-mask-max-tokens must be positive "
+                f"(got {self.sampling_mask_max_tokens})."
+            )
 
     def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(

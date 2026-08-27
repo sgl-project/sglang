@@ -102,6 +102,38 @@ class TestSamplingBatchInfoLen(CustomTestCase):
         self.assertEqual(len(info), 5)
 
 
+class TestSamplingMaskBatchIndices(CustomTestCase):
+
+    def test_filter_rebuilds_row_indices(self):
+        info = _make_info(
+            batch_size=4,
+            return_sampling_masks=[False, True, False, True],
+            sampling_mask_batch_indices=torch.tensor([1, 3]),
+        )
+
+        info.filter_batch([1, 2, 3], torch.tensor([1, 2, 3]))
+
+        self.assertEqual(info.return_sampling_masks, [True, False, True])
+        self.assertEqual(info.sampling_mask_batch_indices.tolist(), [0, 2])
+
+    def test_merge_offsets_rhs_row_indices(self):
+        lhs = _make_info(
+            batch_size=2,
+            return_sampling_masks=[False, True],
+            sampling_mask_batch_indices=torch.tensor([1]),
+        )
+        rhs = _make_info(
+            batch_size=3,
+            return_sampling_masks=[True, False, True],
+            sampling_mask_batch_indices=torch.tensor([0, 2]),
+        )
+
+        lhs.merge_batch(rhs)
+
+        self.assertEqual(lhs.return_sampling_masks, [False, True, True, False, True])
+        self.assertEqual(lhs.sampling_mask_batch_indices.tolist(), [1, 2, 4])
+
+
 class TestMergeCustomLogitProcessor(CustomTestCase):
 
     def test_both_none_returns_none(self):

@@ -4,6 +4,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import SamplingMaskStatus
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -34,6 +36,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         server_args=SimpleNamespace(
             enable_metrics=False,
             enable_hisparse=False,
+            sampling_mask_max_tokens=4096,
         ),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
@@ -138,6 +141,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     logits_output=SimpleNamespace(
                         hidden_states=hidden_states,
                         customized_info=None,
+                        sampling_mask_output=None,
                     ),
                     next_token_ids=torch.tensor([0, 1]),
                     extend_input_len_per_req=[2, 3],
@@ -165,6 +169,71 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 self.assertEqual(last.hidden_states, [[22.0]])
 
 
+class TestPrefillSkippedOutput(CustomTestCase):
+    def test_sampling_mask_middle_chunk_does_not_require_logits_output(self):
+        """A non-token-producing PP chunk may omit its logits output."""
+        req = _PrefillReq(
+            rid="middle",
+            inflight_middle_chunks=1,
+            return_hidden_states=False,
+        )
+        req.return_sampling_mask = True
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=CaptureHiddenMode.NULL,
+            spec_info=None,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            auxiliary_host_output=None,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+            logits_output=None,
+            next_token_ids=torch.zeros(1, dtype=torch.int64),
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+            grammar_advanced=False,
+            can_run_cuda_graph=False,
+            skipped_output_comm=True,
+        )
+        processor = _make_processor(self)
+
+        with patch.object(
+            envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM,
+            "get",
+            return_value=True,
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(req.inflight_middle_chunks, 0)
+        self.assertEqual(req.output_ids, [])
+        processor.output_streamer.stream_output.assert_called_once_with(
+            [req], False, req
+        )
+
+
+class TestSamplingMaskStatusErrors(CustomTestCase):
+    def test_overflow_and_invalid_have_distinct_http_errors(self):
+        processor = _make_processor(self)
+
+        overflow = processor.get_sampling_mask_finish_reason(
+            status=SamplingMaskStatus.OVERFLOW
+        )
+        self.assertEqual(overflow.status_code, 400)
+        self.assertEqual(overflow.err_type, "BadRequestError")
+        self.assertIn("cutoff ties", overflow.message)
+
+        invalid = processor.get_sampling_mask_finish_reason(
+            status=SamplingMaskStatus.INVALID
+        )
+        self.assertEqual(invalid.status_code, 500)
+        self.assertEqual(invalid.err_type, "InternalServerError")
+
+
 class TestDecodeHiddenStateRetention(CustomTestCase):
     def test_last_mode_multi_step_storage_stays_bounded(self):
         processor = _make_processor(self)
@@ -184,7 +253,10 @@ class TestDecodeHiddenStateRetention(CustomTestCase):
                 auxiliary_host_output=None,
                 routed_experts_output=None,
                 indexer_topk_output=None,
-                logits_output=SimpleNamespace(hidden_states=hidden_states),
+                logits_output=SimpleNamespace(
+                    hidden_states=hidden_states,
+                    sampling_mask_output=None,
+                ),
                 next_token_ids=None,
                 can_run_cuda_graph=False,
                 num_correct_drafts=0,
