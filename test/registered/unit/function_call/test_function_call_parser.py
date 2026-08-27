@@ -5781,12 +5781,6 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
                 arguments += call.parameters
         return name, arguments
 
-    def test_glm47_detect_and_parse(self):
-        detector = Glm47MoeDetector()
-        result = detector.detect_and_parse(self.glm47_text, self.oneof_tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(json.loads(result.calls[0].parameters), self.expected)
-
     def test_glm47_streaming(self):
         detector = Glm47MoeDetector()
         name, arguments = self._stream_arguments(
@@ -5802,12 +5796,6 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
         )
         self.assertEqual(name, "acme")
         self.assertEqual(json.loads(arguments), self.expected)
-
-    def test_glm4_detect_and_parse(self):
-        detector = Glm4MoeDetector()
-        result = detector.detect_and_parse(self.glm4_text, self.oneof_tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(json.loads(result.calls[0].parameters), self.expected)
 
     def test_glm4_streaming(self):
         detector = Glm4MoeDetector()

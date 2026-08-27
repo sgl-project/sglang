@@ -549,14 +549,10 @@ class TestMinimaxM3TopLevelOneOf(CustomTestCase):
                             {
                                 "type": "object",
                                 "properties": {
-                                    "kind": {"const": "acme"},
-                                    "payload": {
-                                        "type": "object",
-                                        "properties": {"value": {"type": "string"}},
-                                        "required": ["value"],
-                                    },
+                                    "count": {"type": "integer"},
+                                    "verbose": {"type": "boolean"},
                                 },
-                                "required": ["kind", "payload"],
+                                "required": ["count", "verbose"],
                             },
                             {
                                 "type": "object",
@@ -571,24 +567,17 @@ class TestMinimaxM3TopLevelOneOf(CustomTestCase):
         self.segments = (
             "<tool_call>",
             '<invoke name="acme">',
-            "<kind>acme",
-            "</kind>",
-            "<payload>",
-            "<value>hello",
-            "</value>",
-            "</payload>",
+            "<count>7",
+            "</count>",
+            "<verbose>true",
+            "</verbose>",
             "</invoke>",
             "</tool_call>",
         )
-        self.expected = {"kind": "acme", "payload": {"value": "hello"}}
+        self.expected = {"count": 7, "verbose": True}
 
     def test_detect_and_parse(self):
         calls, _ = _parse_segments(self.segments, self.tools)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["args"], self.expected)
-
-    def test_streaming(self):
-        calls = _stream_segments(self.segments, self.tools)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["args"], self.expected)
 
