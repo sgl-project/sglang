@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
@@ -59,9 +60,10 @@ def choose_initial_resident_components(
     """Choose resident startup components without removing runtime options.
 
     This is a load-feasibility seed, not a second serving-placement planner.
-    Every selected ordinary module can still be demoted to component or
-    layerwise offload by warmup calibration. Unknown weights and explicit
-    component choices remain on their configured load path.
+    Native DiTs using the coarse residency mechanism can still be demoted to
+    component offload by warmup calibration. Auxiliary modules, layerwise
+    components, unknown weights, and explicit choices retain their configured
+    loading semantics.
     """
     reserve_bytes = max(
         MIN_INITIAL_RESIDENCY_RESERVE_BYTES,
@@ -89,17 +91,21 @@ def choose_initial_resident_components(
         if (
             weight_bytes is None
             or weight_bytes <= 0
+            or not is_dit_component_name(item.component_name)
             or server_args.residency_mode(item.component_name) == RESIDENT
+            or (
+                server_args.configured_residency_mode(item.component_name)
+                == LAYERWISE_OFFLOAD
+            )
             or server_args.explicit_residency_mode(item.component_name) is not None
         ):
             continue
-        uses = denoising_steps if is_dit_component_name(item.component_name) else 1
         options.append(
             PlacementOption(
                 group_key=item.component_name,
                 option_key=f"{item.component_name}:resident",
                 resource_delta_bytes={"gpu:load": weight_bytes},
-                estimated_latency_savings=weight_bytes * uses,
+                estimated_latency_savings=weight_bytes * denoising_steps,
                 preference_cost=(weight_bytes,),
             )
         )

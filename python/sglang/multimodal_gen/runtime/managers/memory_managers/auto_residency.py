@@ -276,6 +276,7 @@ class AutoResidencyPlan(msgspec.Struct, frozen=True):
     budget_bytes: int = 0
     resource_budget_bytes: dict[str, int] = {}
     resource_delta_bytes: dict[str, int] = {}
+    host_pin_target_bytes_by_rank: dict[int, int] = {}
     changes: list[ResidencyTarget] = []
     recovering_from_oom: bool = False
     skip_reason: str | None = None
@@ -290,6 +291,7 @@ class AppliedResidencyChange(msgspec.Struct, frozen=True):
     previous_layerwise_offload_enabled: bool = True
     previous_layerwise_configured: bool = True
     previous_auto_residency_mode: str | None = None
+    previous_host_pin_budget_state: tuple[int, int] | None = None
     pinned_host_changed: bool = False
     applied_device_delta_bytes: int = 0
 
@@ -881,7 +883,7 @@ def layerwise_pinned_host_bytes(
 def layerwise_host_pin_capacity_bytes(
     modules: Mapping[str, object], *, pin_budget=None
 ) -> int:
-    """This process's non-overlapping HostPin allowance."""
+    """This process's non-overlapping share of the HostPin planner budget."""
     seen_budgets: set[int] = set()
     total = 0
     for module in modules.values():
@@ -893,9 +895,9 @@ def layerwise_host_pin_capacity_bytes(
             if budget_id in seen_budgets:
                 continue
             seen_budgets.add(budget_id)
-            total += max(0, budget.available_bytes - budget.reserve_bytes)
+            total += budget.planning_capacity_bytes
     if pin_budget is not None and id(pin_budget) not in seen_budgets:
-        total += max(0, pin_budget.available_bytes - pin_budget.reserve_bytes)
+        total += pin_budget.planning_capacity_bytes
     return total
 
 
@@ -1139,9 +1141,9 @@ def _unconfigured_layerwise_targets(
 ) -> tuple[list[ResidencyTarget], int]:
     """Virtual layerwise frontier for a component still using coarse offload.
 
-    The first selected virtual state configures real managers lazily. It starts
-    pageable and is remeasured immediately; the next fixed-point round then
-    exposes the exact HostPin frontier from the realized stores.
+    Estimated layer stores expose the complete resident-layer and HostPin
+    prefix frontier before managers exist. The selected state configures the
+    real managers lazily, and the single validation warmup checks that estimate.
     """
     managers = _estimate_unconfigured_layerwise_managers(
         module=module,
@@ -2109,21 +2111,22 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         for candidate in candidates
     )
     if has_host_resources:
+        reports_by_node: dict[int, list[RankResidencyReport]] = {}
         for report in reports:
-            prefix = f"node{report.node_rank}:rank{report.rank}"
+            reports_by_node.setdefault(report.node_rank, []).append(report)
+        for node_rank, node_reports in reports_by_node.items():
+            prefix = f"node{node_rank}"
             resource_budgets[f"hostpin:{prefix}"] = max(
                 0,
-                report.host_pin_capacity_bytes - report.pinned_host_bytes,
+                sum(report.host_pin_capacity_bytes for report in node_reports)
+                - sum(report.pinned_host_bytes for report in node_reports),
             )
-            resource_budgets[f"hostram:{prefix}:unpin"] = (
-                report.host_transition_headroom_bytes
+            transition_headroom = sum(
+                report.host_transition_headroom_bytes for report in node_reports
             )
-            resource_budgets[f"hostram:{prefix}:pin"] = (
-                report.host_transition_headroom_bytes
-            )
-            resource_budgets[f"hostram:{prefix}:materialize"] = (
-                report.host_transition_headroom_bytes
-            )
+            resource_budgets[f"hostram:{prefix}:unpin"] = transition_headroom
+            resource_budgets[f"hostram:{prefix}:pin"] = transition_headroom
+            resource_budgets[f"hostram:{prefix}:materialize"] = transition_headroom
 
     candidate_by_key = {candidate.option_key(): candidate for candidate in candidates}
     report_candidates = [
@@ -2234,20 +2237,26 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                     rank_candidate.device_transition_delta_bytes
                 )
             if has_host_resources:
-                prefix = f"node{report.node_rank}:rank{report.rank}"
+                prefix = f"node{report.node_rank}"
                 host_resource = f"hostpin:{prefix}"
                 resource_deltas[host_resource] = (
                     resource_deltas.get(host_resource, 0)
                     + rank_candidate.pinned_host_delta_bytes
                 )
-                resource_deltas[f"hostram:{prefix}:unpin"] = (
-                    rank_candidate.host_unpin_scratch_bytes
+                unpin_resource = f"hostram:{prefix}:unpin"
+                resource_deltas[unpin_resource] = (
+                    resource_deltas.get(unpin_resource, 0)
+                    + rank_candidate.host_unpin_scratch_bytes
                 )
-                resource_deltas[f"hostram:{prefix}:pin"] = (
-                    rank_candidate.host_pin_scratch_bytes
+                pin_resource = f"hostram:{prefix}:pin"
+                resource_deltas[pin_resource] = (
+                    resource_deltas.get(pin_resource, 0)
+                    + rank_candidate.host_pin_scratch_bytes
                 )
-                resource_deltas[f"hostram:{prefix}:materialize"] = (
-                    rank_candidate.host_materialize_scratch_bytes
+                materialize_resource = f"hostram:{prefix}:materialize"
+                resource_deltas[materialize_resource] = (
+                    resource_deltas.get(materialize_resource, 0)
+                    + rank_candidate.host_materialize_scratch_bytes
                 )
         estimated_latency_savings = (
             min(
@@ -2333,6 +2342,17 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         if not candidate.current_placement:
             changed_candidates.append(candidate)
     changes = rank_candidates_by_h2d_savings(changed_candidates)
+    host_pin_targets = {}
+    if has_host_resources:
+        for report, rank_candidates in zip(reports, report_candidates):
+            host_pin_targets[report.rank] = max(
+                0,
+                report.pinned_host_bytes
+                + sum(
+                    rank_candidates[selection.option_key].pinned_host_delta_bytes
+                    for selection in placement.selections
+                ),
+            )
 
     return AutoResidencyPlan(
         estimated_peak_bytes=estimated_peak,
@@ -2340,6 +2360,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         budget_bytes=budget,
         resource_budget_bytes=resource_budgets,
         resource_delta_bytes=placement.resource_delta_bytes,
+        host_pin_target_bytes_by_rank=host_pin_targets,
         changes=changes,
         recovering_from_oom=recovering_from_oom,
         current_placement_reserve_shortfall_bytes=(current_placement_reserve_shortfall),
@@ -2351,6 +2372,7 @@ def apply_residency_changes(
     plan: AutoResidencyPlan,
     modules: Mapping[str, object],
     server_args: ServerArgs,
+    rank: int | None = None,
 ) -> list[AppliedResidencyChange]:
     """Apply complete target states transactionally on this rank.
 
@@ -2367,6 +2389,7 @@ def apply_residency_changes(
     must abort).
     """
     applied: list[AppliedResidencyChange] = []
+    previous_host_pin_budget_state = None
     try:
         ordered_changes = sorted(
             plan.changes,
@@ -2383,6 +2406,12 @@ def apply_residency_changes(
         target_modules: dict[str, nn.Module] = {}
         snapshots: dict[str, AppliedResidencyChange] = {}
         previous_pins_by_component: dict[str, tuple[tuple[int, ...], ...]] = {}
+        if rank is not None and rank in plan.host_pin_target_bytes_by_rank:
+            previous_host_pin_budget_state = (
+                server_args.host_pin_budget().set_spendable_capacity(
+                    plan.host_pin_target_bytes_by_rank[rank]
+                )
+            )
         for candidate in ordered_changes:
             if candidate.component_name in target_modules:
                 raise RuntimeError(
@@ -2454,6 +2483,7 @@ def apply_residency_changes(
                     previous_layerwise_offload_enabled=enabled.pop(),
                     previous_layerwise_configured=previous_configured,
                     previous_auto_residency_mode=previous_auto_mode,
+                    previous_host_pin_budget_state=previous_host_pin_budget_state,
                     pinned_host_changed=(
                         previous_configured
                         and candidate.target_layerwise_pinned_layers != previous_pinned
@@ -2471,6 +2501,7 @@ def apply_residency_changes(
                 component_name=candidate.component_name,
                 residency_mode=candidate.residency_mode,
                 previous_auto_residency_mode=previous_auto_mode,
+                previous_host_pin_budget_state=previous_host_pin_budget_state,
                 applied_device_delta_bytes=applied_device_delta_bytes,
             )
         pinning_changes = [
@@ -2594,6 +2625,10 @@ def apply_residency_changes(
             rollback_residency_changes(
                 applied=applied, modules=modules, server_args=server_args
             )
+            if previous_host_pin_budget_state is not None and not applied:
+                server_args.host_pin_budget().restore_capacity(
+                    previous_host_pin_budget_state
+                )
         except Exception as rollback_error:
             raise AutoResidencyRollbackError(
                 f"residency adjustment failed ({describe_error(apply_error)}) and rollback "
@@ -2617,6 +2652,20 @@ def rollback_residency_changes(
     """
     applied = list(applied)
     errors: list[str] = []
+    previous_host_pin_budget_states = {
+        adjustment.previous_host_pin_budget_state
+        for adjustment in applied
+        if adjustment.previous_host_pin_budget_state is not None
+    }
+    if len(previous_host_pin_budget_states) > 1:
+        errors.append("host pin capacity history is inconsistent")
+    elif previous_host_pin_budget_states:
+        try:
+            server_args.host_pin_budget().restore_capacity(
+                previous_host_pin_budget_states.pop()
+            )
+        except Exception as e:
+            errors.append(f"host pin capacity: {describe_error(e)}")
     pinning_changes = [
         adjustment
         for adjustment in applied

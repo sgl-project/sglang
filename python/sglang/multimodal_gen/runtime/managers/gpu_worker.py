@@ -1377,6 +1377,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 plan=plan,
                 modules=self._auto_residency_modules(),
                 server_args=self.server_args,
+                rank=self.rank,
             )
             if not newly_applied:
                 raise RuntimeError("placement plan applied no residency changes")

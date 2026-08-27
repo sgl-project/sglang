@@ -42,6 +42,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -1869,9 +1872,9 @@ class TestPlanAutoResidency:
             "hot_dit",
             "cold_encoder",
         ]
-        assert plan.resource_budget_bytes["hostpin:node0:rank0"] == 0
+        assert plan.resource_budget_bytes["hostpin:node0"] == 0
 
-    def test_dynamic_hostpin_is_constrained_for_every_worker(self):
+    def test_dynamic_hostpin_uses_one_node_budget_and_assigns_rank_quotas(self):
         pin_more = ResidencyTarget(
             component_name="transformer",
             residency_mode=LAYERWISE_OFFLOAD,
@@ -1899,8 +1902,86 @@ class TestPlanAutoResidency:
         assert [candidate.component_name for candidate in plan.changes] == [
             "transformer"
         ]
-        assert plan.resource_budget_bytes["hostpin:node0:rank0"] == 20 * GIB_BYTES
-        assert plan.resource_budget_bytes["hostpin:node0:rank1"] == 20 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostpin:node0"] == 40 * GIB_BYTES
+        assert plan.host_pin_target_bytes_by_rank == {
+            0: 10 * GIB_BYTES,
+            1: 10 * GIB_BYTES,
+        }
+
+    def test_node_hostpin_can_assign_asymmetric_rank_quotas(self):
+        rank0 = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=30 * GIB_BYTES,
+        )
+        rank1 = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=5 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    host_pin_capacity_gib=20,
+                    candidates=[rank0],
+                ),
+                _report(
+                    rank=1,
+                    host_pin_capacity_gib=20,
+                    candidates=[rank1],
+                ),
+            ]
+        )
+
+        assert [candidate.component_name for candidate in plan.changes] == [
+            "transformer"
+        ]
+        assert plan.host_pin_target_bytes_by_rank == {
+            0: 30 * GIB_BYTES,
+            1: 5 * GIB_BYTES,
+        }
+
+    def test_hostpin_capacity_is_scoped_per_node(self):
+        pin_more = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((0,),),
+            pinned_host_delta_bytes=30 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    rank=0,
+                    node_rank=0,
+                    host_pin_capacity_gib=20,
+                    candidates=[pin_more],
+                ),
+                _report(
+                    rank=1,
+                    node_rank=1,
+                    host_pin_capacity_gib=20,
+                    candidates=[pin_more],
+                ),
+            ]
+        )
+
+        assert plan.changes == []
+        assert plan.resource_budget_bytes["hostpin:node0"] == 20 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostpin:node1"] == 20 * GIB_BYTES
 
     def test_hostpin_repack_must_fit_transition_headroom(self):
         pin_more = ResidencyTarget(
@@ -1924,7 +2005,7 @@ class TestPlanAutoResidency:
         )
 
         assert plan.changes == []
-        assert plan.resource_budget_bytes["hostram:node0:rank0:pin"] == 5 * GIB_BYTES
+        assert plan.resource_budget_bytes["hostram:node0:pin"] == 5 * GIB_BYTES
 
     def test_component_demotion_must_fit_host_materialization_headroom(self):
         demote = ResidencyTarget(
@@ -1946,10 +2027,7 @@ class TestPlanAutoResidency:
         )
 
         assert plan.changes == []
-        assert (
-            plan.resource_budget_bytes["hostram:node0:rank0:materialize"]
-            == 5 * GIB_BYTES
-        )
+        assert plan.resource_budget_bytes["hostram:node0:materialize"] == 5 * GIB_BYTES
 
     def test_layerwise_materialization_must_fit_transition_vram(self):
         resident = ResidencyTarget(
@@ -2229,8 +2307,9 @@ class _FakeLazyLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
 class _StubResidencyArgs:
     """Duck-typed stand-in for the two ServerArgs hooks adjustments use."""
 
-    def __init__(self):
+    def __init__(self, host_pin_budget=None):
         self.auto_modes: dict[str, str] = {}
+        self._host_pin_budget = host_pin_budget
 
     def auto_residency_mode(self, component_name):
         return self.auto_modes.get(component_name)
@@ -2245,7 +2324,7 @@ class _StubResidencyArgs:
         self.auto_modes.pop(component_name, None)
 
     def host_pin_budget(self):
-        return None
+        return self._host_pin_budget
 
 
 def _plan_for(candidates: list[ResidencyTarget]) -> AutoResidencyPlan:
@@ -2802,6 +2881,73 @@ class TestCollectResidencyTargets:
 
 
 class TestApplyAndRollback:
+    def test_apply_and_rollback_restore_rank_hostpin_quota(self):
+        budget = HostPinBudget(
+            available_bytes=40 * GIB_BYTES,
+            reserve_bytes=2 * GIB_BYTES,
+        )
+        args = _StubResidencyArgs(host_pin_budget=budget)
+        target = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=GIB_BYTES,
+        )
+        plan = AutoResidencyPlan(
+            host_pin_target_bytes_by_rank={0: 12 * GIB_BYTES},
+            changes=[target],
+        )
+
+        applied = apply_residency_changes(
+            plan=plan,
+            modules={"text_encoder": nn.Linear(2, 2)},
+            server_args=args,
+            rank=0,
+        )
+        assert budget.available_bytes == 12 * GIB_BYTES
+        assert budget.reserve_bytes == 0
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"text_encoder": nn.Linear(2, 2)},
+            server_args=args,
+        )
+        assert budget.available_bytes == 40 * GIB_BYTES
+        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
+    def test_apply_failure_restores_rank_hostpin_quota(self):
+        budget = HostPinBudget(
+            available_bytes=40 * GIB_BYTES,
+            reserve_bytes=2 * GIB_BYTES,
+        )
+        args = _StubResidencyArgs(host_pin_budget=budget)
+        plan = AutoResidencyPlan(
+            host_pin_target_bytes_by_rank={0: 12 * GIB_BYTES},
+            changes=[
+                ResidencyTarget(
+                    component_name="missing",
+                    residency_mode=COMPONENT_OFFLOAD,
+                    target_residency_mode=RESIDENT,
+                    target_resident_weight_bytes=GIB_BYTES,
+                    h2d_bytes_per_request=GIB_BYTES,
+                )
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="is missing"):
+            apply_residency_changes(
+                plan=plan,
+                modules={},
+                server_args=args,
+                rank=0,
+            )
+
+        assert budget.available_bytes == 40 * GIB_BYTES
+        assert budget.reserve_bytes == 2 * GIB_BYTES
+        assert budget.planning_capacity_bytes == 38 * GIB_BYTES
+
     def test_lazy_layerwise_configuration_rolls_back_to_component_offload(self):
         module = _FakeLazyLayerwiseDit(num_layers=4)
         args = _StubResidencyArgs()

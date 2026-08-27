@@ -43,6 +43,9 @@ class _Args:
             self.modes.get(component_name, COMPONENT_OFFLOAD),
         )
 
+    def configured_residency_mode(self, component_name):
+        return self.modes.get(component_name, COMPONENT_OFFLOAD)
+
     def explicit_residency_mode(self, component_name):
         return (
             self.modes.get(component_name) if component_name in self.explicit else None
@@ -96,7 +99,7 @@ def test_initial_seed_stays_conservative_for_unknown_fixed_resident_weights():
     assert selected == set()
 
 
-def test_initial_seed_does_not_override_explicit_component_mode():
+def test_initial_seed_does_not_override_explicit_or_auxiliary_components():
     args = _Args(
         modes={"transformer": LAYERWISE_OFFLOAD},
         explicit={"transformer"},
@@ -108,7 +111,20 @@ def test_initial_seed_does_not_override_explicit_component_mode():
         denoising_steps=8,
     )
 
-    assert selected == {"vae"}
+    assert selected == set()
+
+
+def test_initial_seed_keeps_layerwise_dit_on_its_configured_load_path():
+    args = _Args(modes={"transformer": LAYERWISE_OFFLOAD})
+
+    selected = choose_initial_resident_components(
+        args,
+        [_weight("transformer", 8)],
+        available_bytes=40 * GIB_BYTES,
+        denoising_steps=8,
+    )
+
+    assert selected == set()
 
 
 def test_initial_seed_applies_one_reversible_override():
