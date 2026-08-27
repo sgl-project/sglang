@@ -3237,17 +3237,17 @@ class ServerArgs:
         int,
         "P95/P50 output-length ratio that enables proactive decode demotion.",
         NS("disagg"),
-    ] = 8
+    ] = 4
     proactive_decode_demotion_cache_usage: A[
         float,
         "KV pool usage ratio that enables proactive decode demotion.",
         NS("disagg"),
-    ] = 0.90
+    ] = 0.95
     proactive_decode_safe_cache_usage: A[
         float,
         "KV pool usage ratio at which proactive decode demotion stops.",
         NS("disagg"),
-    ] = 0.85
+    ] = 0.75
     candidate_demotion_output_len_threthold: A[
         float,
         "Output-length multiplier over P50 for proactive demotion candidates.",
