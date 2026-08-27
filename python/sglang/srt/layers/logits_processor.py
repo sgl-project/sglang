@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.aux_hidden_states import (
@@ -136,6 +137,10 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+
+    # Beam search only: raw pre-sample logits for the scheduler-side joint
+    # selection; see beam_search.logits_capture.
+    beam: Optional[BeamLogitsCapture] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None

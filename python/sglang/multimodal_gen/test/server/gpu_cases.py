@@ -1179,7 +1179,7 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
                 "--layerwise-offload-components",
                 "dit,text_encoder,vae",
                 "--layerwise-resident-layers",
-                "video_vae=24",
+                "video_vae=36",
             ],
             env_vars={
                 "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
@@ -1212,6 +1212,7 @@ def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
             },
         ),
         run_perf_check=True,
+        perf_repeat_requests=2,
         run_consistency_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
@@ -1230,6 +1231,40 @@ if not current_platform.is_hip():
 ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
+
+
+# Intel Arc Pro B60 has 24 GiB of XPU memory, so only sub-~5B-parameter
+# checkpoints fit fully resident. Larger cases in ONE_GPU_CASES (FLUX.1-dev,
+# FLUX.2-dev, Qwen-Image, Hunyuan3D, SANA-Video, image-edit families) OOM on
+# 24 GiB, and the FP8/NVFP4 quant paths are CUDA-only.
+ONE_GPU_XPU_CASE_IDS = (
+    "zimage_image_t2i",
+    "flux_2_klein_image_t2i",
+    "flux_2_klein_base_image_t2i",
+    "wan2_1_t2v_1.3b",
+)
+
+
+def _select_xpu_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
+    cases_by_id = {case.id: case for case in ONE_GPU_CASES}
+    missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
+    if missing:
+        raise RuntimeError(f"Unknown XPU diffusion case(s): {missing}")
+    return [cases_by_id[case_id] for case_id in case_ids]
+
+
+# Consistency GT images are H100-generated; XPU output diverges at the
+# pixel level (different attention kernels + fp reductions on Xe2) so
+# SSIM/PSNR against the H100 golden always fails. test_server_1_gpu.py
+# parametrizes directly from ONE_GPU_CASES, so mutate those entries in
+# place -- overriding only via ONE_GPU_XPU_CASES would be ignored.
+if current_platform.is_xpu():
+    _xpu_ids = set(ONE_GPU_XPU_CASE_IDS)
+    for _i, _case in enumerate(ONE_GPU_CASES):
+        if _case.id in _xpu_ids and _case.run_consistency_check:
+            ONE_GPU_CASES[_i] = replace(_case, run_consistency_check=False)
+
+ONE_GPU_XPU_CASES = _select_xpu_cases(ONE_GPU_XPU_CASE_IDS)
 
 
 # Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
@@ -1298,6 +1333,9 @@ PARAMETRIZED_CASE_GROUPS = {
     ],
     "1-gpu-5090": [
         ("test_server_1_gpu_5090.py", ONE_GPU_5090_CASES),
+    ],
+    "1-gpu-xpu": [
+        ("test_server_1_gpu.py", ONE_GPU_XPU_CASES),
     ],
     "2-gpu": [
         ("test_server_2_gpu.py", TWO_GPU_CASES),
