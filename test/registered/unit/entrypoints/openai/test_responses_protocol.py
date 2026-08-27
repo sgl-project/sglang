@@ -1,9 +1,12 @@
 import json
 import unittest
+import warnings
 
 from utils import make_serving  # noqa: F401 — bootstrap import
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
     PromptTokensDetails,
     ResponsesRequest,
     ResponsesResponse,
@@ -404,6 +407,93 @@ class ToolChoiceObjectFormTestCase(CustomTestCase):
             ort.ResponseCreatedEvent(
                 type="response.created", sequence_number=0, response=resp.model_dump()
             )
+
+
+class PDDisaggregationFieldsTestCase(CustomTestCase):
+    """/v1/responses must accept the same PD-disaggregation body parameters as
+    /v1/chat/completions and /v1/completions, otherwise it cannot be used in a
+    PD disaggregated deployment at all."""
+
+    PD_FIELDS = (
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "routed_dp_rank",
+        "disagg_prefill_dp_rank",
+        "data_parallel_rank",
+    )
+
+    def test_declares_same_pd_fields_as_other_endpoints(self):
+        for field in self.PD_FIELDS:
+            self.assertIn(field, ChatCompletionRequest.model_fields)
+            self.assertIn(field, CompletionRequest.model_fields)
+            self.assertIn(
+                field,
+                ResponsesRequest.model_fields,
+                f"/v1/responses is missing {field!r}",
+            )
+
+    def test_scalar_values_round_trip(self):
+        req = ResponsesRequest.model_validate(
+            {
+                "input": "hi",
+                "bootstrap_host": "10.0.0.1",
+                "bootstrap_port": 8998,
+                "bootstrap_room": 12345,
+                "routed_dp_rank": 2,
+                "disagg_prefill_dp_rank": 3,
+            }
+        )
+        self.assertEqual(req.bootstrap_host, "10.0.0.1")
+        self.assertEqual(req.bootstrap_port, 8998)
+        self.assertEqual(req.bootstrap_room, 12345)
+        self.assertEqual(req.routed_dp_rank, 2)
+        self.assertEqual(req.disagg_prefill_dp_rank, 3)
+
+    def test_list_shaped_bootstrap_values_accepted(self):
+        req = ResponsesRequest.model_validate(
+            {
+                "input": "hi",
+                "bootstrap_host": ["h1", "h2"],
+                "bootstrap_port": [1, 2],
+                "bootstrap_room": [10, 20],
+            }
+        )
+        self.assertEqual(req.bootstrap_host, ["h1", "h2"])
+        self.assertEqual(req.bootstrap_port, [1, 2])
+        self.assertEqual(req.bootstrap_room, [10, 20])
+
+    def test_deprecated_data_parallel_rank_migrates(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            req = ResponsesRequest.model_validate(
+                {"input": "hi", "data_parallel_rank": 5}
+            )
+        self.assertEqual(req.routed_dp_rank, 5)
+        self.assertTrue(any(w.category is DeprecationWarning for w in caught))
+
+    def test_explicit_routed_dp_rank_wins_over_deprecated_alias(self):
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            req = ResponsesRequest.model_validate(
+                {"input": "hi", "data_parallel_rank": 5, "routed_dp_rank": 9}
+            )
+        self.assertEqual(req.routed_dp_rank, 9)
+
+    def test_fields_default_to_none(self):
+        req = ResponsesRequest.model_validate({"input": "hi"})
+        for field in self.PD_FIELDS:
+            self.assertIsNone(getattr(req, field))
+
+    def test_existing_reasoning_validator_still_applies(self):
+        # Guard against the added validator shadowing the existing ones.
+        req = ResponsesRequest.model_validate(
+            {"input": "hi", "reasoning": {"effort": "none"}}
+        )
+        self.assertEqual(
+            req.chat_template_kwargs,
+            {"thinking": False, "enable_thinking": False},
+        )
 
 
 if __name__ == "__main__":
