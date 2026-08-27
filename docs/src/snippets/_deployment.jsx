@@ -578,8 +578,14 @@ export const Deployment = ({ config, benchmarks }) => {
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
 
-  const findBenchmark = (list, sel) =>
-    (list || []).find((b) => DIMENSIONS.every((d) => b.match[d] === sel[d])) || null;
+  // Entries may also key on overlay dims (e.g. kvDsaPair): an entry applies
+  // only when every declared key equals the selection, and the most specific
+  // match wins, so plain hw×strategy entries stay the fallback.
+  const findBenchmark = (list, sel) => {
+    const hits = (list || []).filter((b) =>
+      Object.entries(b.match || {}).every(([k, v]) => sel[k] === v));
+    return hits.sort((a, b) => Object.keys(b.match).length - Object.keys(a.match).length)[0] || null;
+  };
 
   // Accepts a single measurement object or an array; always returns an array.
   const normalizeSpeed = (speed) => {
@@ -671,12 +677,19 @@ export const Deployment = ({ config, benchmarks }) => {
     // Overlay dims ride along: they never key cells, so snapping must not drop
     // them (it did — a strict-mode hash round-trip lost the spec default).
     // Keep the parsed value when it names a real option, else the row default.
+    // A hash can also name an option that showWhen hides (or a rule disables)
+    // for the composed selection; snap those like an interactive reseat would.
     for (const spec of overlayDimSpecs) {
       const want = parsed[spec.id];
       const opts = spec.options || [];
-      valid[spec.id] = opts.some((o) => o.id === want)
+      const picked = opts.some((o) => o.id === want)
         ? want
         : spec.default ?? (opts[0] && opts[0].id) ?? "";
+      const withPick = { ...valid, [spec.id]: picked };
+      const usable = visibleOptions(spec, withPick).filter((o) => !optionDisabled(o, withPick));
+      valid[spec.id] = usable.some((o) => o.id === picked)
+        ? picked
+        : (usable[0] && usable[0].id) ?? picked;
     }
     return valid;
   };
@@ -2488,8 +2501,16 @@ export const Deployment = ({ config, benchmarks }) => {
       {modal === "bench" && benchEntry && (() => {
         const bc = buildBenchCommands(benchEntry, sel);
         if (!bc) return null;
-        const selSummary =
-          `${sel.hw.toUpperCase()} · ${sel.variant} · ${sel.quant.toUpperCase()} · ${sel.strategy} · ${sel.nodes}`;
+        const selSummary = [
+          sel.hw && sel.hw.toUpperCase(),
+          sel.variant,
+          sel.quant && sel.quant.toUpperCase(),
+          sel.strategy,
+          sel.kvDsaPair,
+          sel.nodes,
+        ]
+          .filter((part) => part !== undefined && part !== null && part !== "")
+          .join(" · ");
         let selConc = null;
         let speedCmd = null;
         if (bc.speed) {

@@ -530,6 +530,10 @@ def deepseek_v4_attention_with_output(
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
+    if real_num_tokens == 0:
+        output.zero_()
+        return
+
     query = query[:real_num_tokens]
     key_value = key_value[:real_num_tokens]
 
@@ -3230,7 +3234,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()

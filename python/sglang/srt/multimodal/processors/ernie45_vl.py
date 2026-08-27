@@ -404,7 +404,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             ]
             base_output.videos, _ = map(list, zip(*videos_processed))
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 
