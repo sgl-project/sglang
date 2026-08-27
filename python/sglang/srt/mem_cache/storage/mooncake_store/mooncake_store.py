@@ -603,9 +603,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.mla_suffix = storage_config.unified_suffix
 
             self.registered_pools = {}
-            # Backend-neutral unified-layout staging (hicache_key_scheme.
-            # KVCacheLayoutAdapter); constructed in register_mem_pool_host for
-            # partitioned namespaces.
+            # Backend-neutral unified-layout staging
+            # (pool_host.unified_layout.KVCacheLayoutAdapter); constructed in
+            # register_mem_pool_host for partitioned namespaces.
             self.layout_adapter = None
 
             self.gb_per_page = None
@@ -711,7 +711,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.storage_config is not None
             and self.storage_config.unified_layer_ranges is not None
         ):
-            from sglang.srt.mem_cache.hicache_key_scheme import KVCacheLayoutAdapter
+            from sglang.srt.mem_cache.pool_host.unified_layout import (
+                KVCacheLayoutAdapter,
+            )
 
             self.layout_adapter = KVCacheLayoutAdapter(
                 self.mem_pool_host,
@@ -1124,8 +1126,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return results
 
     def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Layout-adapter read: fetch each slab to its target (pool if
-        contiguous there, else staging), then scatter successful pages."""
+        """Layout-adapter read into the pool or component-major staging.
+
+        All-direct plans fetch into the pool. If any slab is strided, every
+        slab lands in staging so the result forms an H2D-ready component arena;
+        successful pages are then scattered into the host pool.
+        """
         start_time = time.perf_counter()
         adapter = self.layout_adapter
         results: List[bool] = []

@@ -60,11 +60,11 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.hicache_key_scheme import KVCacheLayoutAdapter
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.pool_host import common as pool_common
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified_layout import KVCacheLayoutAdapter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -244,7 +244,7 @@ def span_list(tensor) -> tuple[list[int], list[int]]:
 
 def chunk_view(pool, index, l0, l1, h0, h1):
     """One chunk of one page, as a tensor whose dim order IS the byte order."""
-    return pool._page_kv_view_unified(index)[:, l0:l1, :, h0:h1]
+    return pool._unified_page_view(index)[:, l0:l1, :, h0:h1]
 
 
 def chunk_descriptors(pool, layer_ranges, head_ranges) -> tuple[int, int]:
@@ -252,7 +252,7 @@ def chunk_descriptors(pool, layer_ranges, head_ranges) -> tuple[int, int]:
     under the shipped (layer-major) order."""
     total, smallest = 0, None
     if head_ranges is None:
-        view = pool._page_view_unified(0)
+        view = pool._unified_page_view(0)[0]
         for l0, l1 in layer_ranges:
             n, block = descriptor_count(*_shape_stride(view[l0:l1]))
             total += n
@@ -274,14 +274,9 @@ def _shape_stride(t):
 
 def staged_fraction(pool, layer_ranges, head_ranges) -> float:
     """Fraction of a page's chunk bytes that go through the staging buffer."""
-    if head_ranges is None:
-        slabs = pool._slab_schedule(layer_ranges)
-        total = sum(s[2] for s in slabs)
-        staged = sum(s[2] for s in slabs if not s[3])
-    else:
-        slabs = pool._slab_schedule(layer_ranges, head_ranges)
-        total = sum(s[5] for s in slabs)
-        staged = sum(s[5] for s in slabs if not s[6])
+    slabs = pool.build_unified_layout(layer_ranges, head_ranges).slabs
+    total = sum(slab.nbytes for slab in slabs)
+    staged = sum(slab.nbytes for slab in slabs if not slab.direct)
     return staged / total
 
 
@@ -511,12 +506,8 @@ def measure(model: Model, layout: str, grid_label, layer_ranges, head_ranges) ->
     )
     # The dominant cost driver is not the layout but the per-slab copy_ size,
     # i.e. how finely the fleet grid cuts a page. Report it next to the result.
-    slabs = (
-        pool._slab_schedule(layer_ranges)
-        if head_ranges is None
-        else pool._slab_schedule(layer_ranges, head_ranges)
-    )
-    slab_bytes = min(s[2] if head_ranges is None else s[5] for s in slabs)
+    slabs = pool.build_unified_layout(layer_ranges, head_ranges).slabs
+    slab_bytes = min(slab.nbytes for slab in slabs)
 
     # Same payload through the production save/load entry points against a
     # do-nothing transport: adds key fan-out, sub-batching and the exists filter.
@@ -919,7 +910,9 @@ class TestUnifiedLayoutSaveLoadPerf(CustomTestCase):
             )
             for p, page in enumerate(logical):
                 self.assertTrue(
-                    torch.equal(reader._page_view_unified(p * model.page_size), page),
+                    torch.equal(
+                        reader._unified_page_view(p * model.page_size)[0], page
+                    ),
                     layout,
                 )
 
@@ -1033,7 +1026,7 @@ class TestUnifiedLayoutSaveLoadPerf(CustomTestCase):
                     all(ok), f"{writer_layout} -> {reader_layout} load failed"
                 )
                 for i, page in enumerate(logical):
-                    got = reader._page_kv_view_unified(i * model.page_size)
+                    got = reader._unified_page_view(i * model.page_size)
                     # logical is (kv, head, layer, token, dim); the unified view
                     # is (kv, layer, token, head, dim).
                     want = page.permute(0, 2, 3, 1, 4)

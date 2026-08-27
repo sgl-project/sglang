@@ -51,11 +51,8 @@ API, kept for richer future identities (numerics_id pinning).
 from __future__ import annotations
 
 import hashlib
-import logging
 
 import msgspec
-
-logger = logging.getLogger(__name__)
 
 # Bump when the struct schema or its encoding changes: the digest is
 # computed over the encoded struct, so any schema change must change every key.
@@ -226,8 +223,8 @@ def build_unified_suffixes(
     rank's shard must tile the grid, and every identity field must match.
     Raises with the remedy in the message; never degrades silently.
 
-    Returns one suffix per owned chunk, in ascending head-group order. A
-    rank whose kv-head shard is coarser than ``head_group`` owns
+    Returns one suffix per owned chunk in layer-major/head-minor order. A rank
+    whose kv-head shard is coarser than ``head_group`` owns
     ``local_kv_heads // head_group`` chunks (head fan-out): rank ``r`` owns
     head groups ``[r * n, (r + 1) * n)`` — the same arithmetic as the
     mooncake split-heads virtual ranks, re-keyed topology-free.
@@ -365,8 +362,8 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     # the pool view already matches).
     adapter: bool
     # LOCAL half-open chunk ranges for the adapter, or None without it.
-    layer_ranges: Optional[list[tuple[int, int]]] = None
-    head_ranges: Optional[list[tuple[int, int]]] = None
+    layer_ranges: list[tuple[int, int]] | None = None
+    head_ranges: list[tuple[int, int]] | None = None
 
 
 # Host layouts the adapter can present in the unified byte order. Deliberately
@@ -389,8 +386,8 @@ def plan_unified_kv(
     end_layer: int,
     is_final_stage: bool,
     pool_layout: str,
-    head_group_knob: Optional[int] = None,
-    layer_partition: Optional[int] = None,
+    head_group_knob: int | None = None,
+    layer_partition: int | None = None,
 ) -> UnifiedKVPlan:
     """Derive the namespace and this rank's chunk plan from deployment facts.
 
@@ -489,119 +486,3 @@ def plan_unified_kv(
         layer_ranges=layer_ranges,
         head_ranges=head_ranges,
     )
-
-
-class KVCacheLayoutAdapter:
-    """Backend-neutral staging machinery for unified-layout IO.
-
-    The host pools expose the unified gather/scatter primitives; this
-    class owns everything else a backend needs to serve a partitioned
-    (unified-v2:*) namespace: the per-chunk key fan-out, the sub-batch
-    geometry, and one pinned staging buffer per IO direction (backup and
-    prefetch run on concurrent controller threads). A backend brings only
-    its own pointer-based batch put/get and, for RDMA transports, a
-    ``register_buffer`` hook for the staging buffers.
-
-    When every slab is already pool-contiguous no staging is allocated and
-    all transfers resolve to pool addresses (pure zero-copy).
-    """
-
-    def __init__(self, mem_pool_host, storage_config, register_buffer=None):
-        self.pool = mem_pool_host
-        self.page_size = mem_pool_host.page_size
-        self.layer_ranges = storage_config.unified_layer_ranges
-        self.head_ranges = storage_config.unified_head_ranges
-        suffixes = storage_config.unified_suffix
-        assert isinstance(suffixes, list) and self.layer_ranges is not None
-        self.suffixes = suffixes
-        # Rank-replicated (MLA-family) chunks are single objects; sharded
-        # pools store one K and one V object per chunk.
-        self.split_kv = self.head_ranges is not None
-        self.keys_per_page = len(suffixes) * (2 if self.split_kv else 1)
-        self.staging_set = None
-        self.staging_get = None
-        self.staging_pages = 0
-        if self.pool.unified_zero_copy(self.layer_ranges, self.head_ranges):
-            logger.info(
-                "HiCache KV layout adapter: everything pool-contiguous, "
-                "zero-copy (no staging buffers)."
-            )
-            return
-        extra = storage_config.extra_config or {}
-        staging_mb = extra.get("staging_buffer_mb", 256)
-        page_bytes = self.pool.unified_bytes_per_page(
-            self.layer_ranges, self.head_ranges
-        )
-        staging_bytes = max(int(staging_mb) << 20, page_bytes)
-        self.staging_pages = staging_bytes // page_bytes
-        staging_numel = self.staging_pages * page_bytes
-        self.staging_set = self._alloc_staging(staging_numel)
-        self.staging_get = self._alloc_staging(staging_numel)
-        if register_buffer is not None:
-            register_buffer(self.staging_set)
-            register_buffer(self.staging_get)
-        logger.info(
-            "HiCache KV layout adapter: 2 x %d-page staging buffers "
-            "(%.1f MB each) for the backup and prefetch threads.",
-            self.staging_pages,
-            staging_numel / (1 << 20),
-        )
-
-    def _alloc_staging(self, numel):
-        # Pinned so RDMA transports can register and DMA it directly.
-        # (Overridable seam: CPU-only tests allocate unpinned.)
-        import torch
-
-        return torch.empty(numel, dtype=torch.uint8, pin_memory=True)
-
-    def chunk_keys(self, page_keys: list) -> list:
-        """Fan page keys out to chunk keys, in the pools' slab order:
-        page-major, suffix (layer-major, head-minor), K then V."""
-        key_list = []
-        if not self.split_kv:
-            for key_ in page_keys:
-                for suffix in self.suffixes:
-                    key_list.append(f"{key_}_{suffix}_k")
-            return key_list
-        for key_ in page_keys:
-            for suffix in self.suffixes:
-                key_list.append(f"{key_}_{suffix}_k")
-                key_list.append(f"{key_}_{suffix}_v")
-        return key_list
-
-    def sub_batches(self, keys: list, host_indices):
-        """Split a batch into staging-sized (page_keys, indices) pieces;
-        each piece reuses the staging buffers from offset 0."""
-        if not keys:
-            return
-        pages_per_batch = self.staging_pages or len(keys)
-        for start in range(0, len(keys), pages_per_batch):
-            page_keys = keys[start : start + pages_per_batch]
-            indices = host_indices[
-                start * self.page_size : (start + len(page_keys)) * self.page_size
-            ]
-            yield page_keys, indices
-
-    def gather(self, indices):
-        """Write path: (ptrs, sizes) per slab — unified-order bytes, staged
-        into staging_set only where the pool view is not already
-        contiguous."""
-        return self.pool.gather_unified_chunks(
-            indices, self.layer_ranges, self.head_ranges, self.staging_set
-        )
-
-    def read_metas(self, indices):
-        """Read path targets: direct slabs fetch straight into the pool,
-        staged slabs into staging_get."""
-        return self.pool.get_unified_chunk_meta(
-            indices, self.layer_ranges, self.head_ranges, self.staging_get
-        )
-
-    def scatter(self, indices, page_ok):
-        """Read path finalize: copy staged slabs of successful pages from
-        staging_get into the pool (direct slabs already landed in place)."""
-        if self.staging_get is None or not any(page_ok):
-            return
-        self.pool.scatter_unified_chunks(
-            indices, self.layer_ranges, self.head_ranges, self.staging_get, page_ok
-        )

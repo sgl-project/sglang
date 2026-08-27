@@ -7,7 +7,6 @@ import unittest
 import msgspec
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
-    KVCacheLayoutAdapter,
     KVCacheNamespace,
     build_unified_suffixes,
     derive_namespace,
@@ -17,6 +16,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     plan_unified_kv,
 )
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
+from sglang.srt.mem_cache.pool_host.unified_layout import KVCacheLayoutAdapter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -473,6 +473,28 @@ class TestUnifiedKVPlan(CustomTestCase):
         # head_group alone is a no-op for replicated pools (no head axis).
         plan = self._plan(rank_replicated=True, local_kv_heads=0, head_group_knob=2)
         self.assertFalse(plan.adapter)
+
+    def test_global_suffixes_map_to_rank_local_ranges(self):
+        plan = self._plan(
+            attn_tp_rank=1,
+            start_layer=30,
+            end_layer=61,
+            head_group_knob=2,
+            layer_partition=30,
+        )
+        digest = namespace_digest(plan.namespace)
+        self.assertEqual(
+            plan.suffixes,
+            [
+                f"{digest}_L30-60_H2",
+                f"{digest}_L30-60_H3",
+                f"{digest}_L60-61_H2",
+                f"{digest}_L60-61_H3",
+            ],
+        )
+        # Suffixes use model-global coordinates; pool views are rank-local.
+        self.assertEqual(plan.layer_ranges, [(0, 30), (30, 31)])
+        self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
 
     def test_host_layout_partitions_the_keyspace(self):
         """page_first and page_first_direct serialize a page differently and we
@@ -942,7 +964,7 @@ class TestMlaLayoutAdapter(CustomTestCase):
         page_ok = [True, False, True]
         reader.scatter_unified_chunks(indices, self._RANGES, None, staging, page_ok)
         for p, L in enumerate(logical):
-            got = reader._page_view_unified(p * self._PS)
+            got = reader._unified_page_view(p * self._PS)[0]
             for l0, l1 in self._RANGES:
                 if page_ok[p]:
                     self.assertTrue(torch.equal(got[l0:l1], L[l0:l1]))
@@ -951,9 +973,11 @@ class TestMlaLayoutAdapter(CustomTestCase):
 
 
 class TestMhaDirectChunks(CustomTestCase):
-    """MHA skip-convert: the unified order is (head, layer, token, dim), so
-    a multi-head pool always stages — but a single-kv-head page_first_direct
-    pool is degenerate-contiguous and goes zero-copy."""
+    """MHA skip-convert for the (layer, token, head, dim) object order.
+
+    Whole-head page_first_direct slabs are direct; splitting the head axis
+    makes them strided and therefore staged.
+    """
 
     def _pool(self, head_num):
         import torch
@@ -1035,8 +1059,8 @@ class TestMhaDirectChunks(CustomTestCase):
 
 class TestLayoutAdapterGatherScatter(CustomTestCase):
     """The layout-neutrality property the adapter exists for: every
-    supported layout gathers byte-identical unified chunks ((head, layer,
-    token, dim) per K/V half), and the fetch + scatter path inverts them."""
+    supported layout gathers byte-identical unified chunks ((layer, token,
+    head, dim) per K/V half), and the fetch + scatter path inverts them."""
 
     _PS, _HEADS, _LAYERS, _DIM, _PAGES = 4, 4, 6, 8, 2
 
@@ -1199,7 +1223,7 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
                 indices, layer_ranges, head_ranges, staging_r, [True] * self._PAGES
             )
             for p, L in enumerate(logical):
-                got = reader._page_kv_view_unified(p * self._PS)
+                got = reader._unified_page_view(p * self._PS)
                 want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
                 for l0, l1 in layer_ranges:
                     for h0, h1 in head_ranges:
@@ -1208,6 +1232,113 @@ class TestLayoutAdapterGatherScatter(CustomTestCase):
                                 got[:, l0:l1, :, h0:h1], want[:, l0:l1, :, h0:h1]
                             )
                         )
+
+    def test_read_metas_assembles_h2d_component_arenas(self):
+        """Key-ordered gets land as K/V -> page -> head group -> layer.
+
+        The short final layer range makes this catch both required
+        permutations: K/V deinterleaving and layer/head transposition.
+        """
+        import ctypes
+
+        import torch
+
+        logical = self._logical()
+        layer_ranges = [(0, 4), (4, 6)]
+        head_ranges = [(0, 2), (2, 4)]
+        indices = torch.arange(self._PAGES * self._PS)
+
+        writer = self._pool("page_first_direct", logical)
+        staging_w = torch.zeros(
+            self._PAGES * writer.unified_bytes_per_page(layer_ranges, head_ranges),
+            dtype=torch.uint8,
+        )
+        src_ptrs, src_sizes = writer.gather_unified_chunks(
+            indices, layer_ranges, head_ranges, staging_w
+        )
+
+        reader = self._pool("page_first", [torch.zeros_like(page) for page in logical])
+        staging_r = torch.zeros_like(staging_w)
+        dst_ptrs, dst_sizes = reader.get_unified_chunk_meta(
+            indices, layer_ranges, head_ranges, staging_r
+        )
+        self.assertEqual(src_sizes, dst_sizes)
+        self.assertEqual(
+            dst_sizes,
+            [512, 512, 512, 512, 256, 256, 256, 256] * self._PAGES,
+        )
+
+        base = staging_r.data_ptr()
+        self.assertEqual(
+            reader.build_unified_layout(
+                layer_ranges, head_ranges
+            ).read_component_regions(indices),
+            {"k": (0, 3072), "v": (3072, 3072)},
+        )
+        self.assertEqual(
+            [ptr - base for ptr in dst_ptrs],
+            [
+                0,
+                3072,
+                768,
+                3840,
+                512,
+                3584,
+                1280,
+                4352,
+                1536,
+                4608,
+                2304,
+                5376,
+                2048,
+                5120,
+                2816,
+                5888,
+            ],
+        )
+
+        for dst, src, size in zip(dst_ptrs, src_ptrs, src_sizes):
+            ctypes.memmove(dst, src, size)
+
+        component_bytes = staging_r.numel() // 2
+        arena_shape = (
+            self._PAGES,
+            len(head_ranges),
+            self._LAYERS,
+            self._PS,
+            self._HEADS // len(head_ranges),
+            self._DIM,
+        )
+        got_k = staging_r[:component_bytes].view(torch.bfloat16).view(arena_shape)
+        got_v = staging_r[component_bytes:].view(torch.bfloat16).view(arena_shape)
+        want_k = torch.stack(
+            [
+                page[0]
+                .view(len(head_ranges), -1, self._LAYERS, self._PS, self._DIM)
+                .permute(0, 2, 3, 1, 4)
+                for page in logical
+            ]
+        )
+        want_v = torch.stack(
+            [
+                page[1]
+                .view(len(head_ranges), -1, self._LAYERS, self._PS, self._DIM)
+                .permute(0, 2, 3, 1, 4)
+                for page in logical
+            ]
+        )
+        self.assertTrue(torch.equal(got_k, want_k))
+        self.assertTrue(torch.equal(got_v, want_v))
+
+        # The production path still CPU-scatters today; it must use the same
+        # placement map and must not publish a failed page from staging.
+        reader.scatter_unified_chunks(
+            indices, layer_ranges, head_ranges, staging_r, [True, False]
+        )
+        got_page0 = reader._unified_page_view(0)
+        want_page0 = logical[0].permute(0, 2, 3, 1, 4)
+        self.assertTrue(torch.equal(got_page0, want_page0))
+        self.assertEqual(reader._unified_page_view(self._PS).abs().sum().item(), 0)
 
 
 class TestLayoutAdapterStaging(CustomTestCase):
@@ -1282,6 +1413,41 @@ class TestLayoutAdapterStaging(CustomTestCase):
         )
         self.assertEqual(writer.staging_pages, 1)
         self.assertEqual(writer.keys_per_page, 8)
+        self.assertEqual(
+            writer.chunk_keys(["h0"]),
+            [
+                "h0_ns_L0-2_H0_k",
+                "h0_ns_L0-2_H0_v",
+                "h0_ns_L0-2_H1_k",
+                "h0_ns_L0-2_H1_v",
+                "h0_ns_L2-6_H0_k",
+                "h0_ns_L2-6_H0_v",
+                "h0_ns_L2-6_H1_k",
+                "h0_ns_L2-6_H1_v",
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    slab.component,
+                    slab.selection[1].start,
+                    slab.selection[1].stop,
+                    slab.selection[3].start,
+                    slab.selection[3].stop,
+                )
+                for slab in writer.layout.slabs
+            ],
+            [
+                ("k", 0, 2, 0, 2),
+                ("v", 0, 2, 0, 2),
+                ("k", 0, 2, 2, 4),
+                ("v", 0, 2, 2, 4),
+                ("k", 2, 6, 0, 2),
+                ("v", 2, 6, 0, 2),
+                ("k", 2, 6, 2, 4),
+                ("v", 2, 6, 2, 4),
+            ],
+        )
 
         page_keys = [f"h{p}" for p in range(gs._PAGES)]
         indices = torch.arange(gs._PAGES * gs._PS)
@@ -1302,11 +1468,23 @@ class TestLayoutAdapterStaging(CustomTestCase):
         self.assertEqual(len(registered), 2)
         for sub_keys, sub_indices in reader.sub_batches(page_keys, indices):
             ptrs, sizes = reader.read_metas(sub_indices)
+            self.assertTrue(
+                torch.equal(
+                    reader.read_source_indices(sub_indices),
+                    torch.arange(gs._PS, dtype=torch.int64),
+                )
+            )
+            component_views = reader.read_component_views(sub_indices)
+            self.assertEqual(set(component_views), {"k", "v"})
+            self.assertEqual(
+                component_views["k"].numel() + component_views["v"].numel(),
+                sum(sizes),
+            )
             for key, ptr, size in zip(reader.chunk_keys(sub_keys), ptrs, sizes):
                 ctypes.memmove(ptr, store[key], size)
             reader.scatter(sub_indices, [True] * len(sub_keys))
         for p, L in enumerate(logical):
-            got = reader.pool._page_kv_view_unified(p * gs._PS)
+            got = reader.pool._unified_page_view(p * gs._PS)
             want = L.permute(0, 2, 3, 1, 4)  # -> (kv, layer, token, head, dim)
             for l0, l1 in layer_ranges:
                 for h0, h1 in head_ranges:

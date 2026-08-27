@@ -41,10 +41,10 @@ class HiCacheStorageConfig:
     # unified key scheme: when set, backends MUST use this topology-free
     # chunk coordinate ("{ns_digest}_L{s}-{e}[_H{j}]") verbatim as the key
     # suffix instead of their hand-rolled rank/pp/cp suffixes. A list means
-    # head fan-out (this rank owns several head-group chunks per page, in
-    # ascending head order — mirrors the split-heads mha_suffix list); only
-    # multi-key backends (mooncake) accept the list form. Built and validated
-    # in HiCacheController._generate_storage_config via hicache_key_scheme.py;
+    # partition fan-out: one suffix per local (layer range, head range), in
+    # layer-major/head-minor order. Only multi-key backends (mooncake) accept
+    # the list form. Built and validated in
+    # HiCacheController._generate_storage_config via hicache_key_scheme.py;
     # None under the legacy rank-suffix scheme.
     unified_suffix: Optional[Union[str, List[str]]] = None
     # Layout adapter (set iff any partition knob is set): the LOCAL
