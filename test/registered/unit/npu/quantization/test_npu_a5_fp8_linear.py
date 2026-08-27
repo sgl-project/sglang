@@ -17,7 +17,7 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 # package first mirrors how the engine loads quantization at model-config time.
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    npu_w8a8_block_fp8_linear,
+    npu_w8a8_mxfp8_linear,
 )
 from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
     process_npu_arch35_mxfp8_linear_weights,
@@ -42,7 +42,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
 
     def test_rejects_non_fp8_weight(self):
         with self.assertRaisesRegex(ValueError, "expects float8_e4m3fn weights"):
-            npu_w8a8_block_fp8_linear(
+            npu_w8a8_mxfp8_linear(
                 torch.empty(1, 128, dtype=torch.bfloat16),
                 torch.empty(128, 64, dtype=torch.bfloat16),
                 [128, 128],
@@ -62,7 +62,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         npu_ops.npu_dynamic_mx_quant.return_value = (quantized, input_scale)
         npu_ops.npu_quant_matmul.return_value = matmul_output
         with patch.object(torch.ops, "npu", npu_ops, create=True):
-            output = npu_w8a8_block_fp8_linear(
+            output = npu_w8a8_mxfp8_linear(
                 input_tensor,
                 weight,
                 [64, 128],
@@ -89,7 +89,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         weight_scale = torch.empty(2, 64, 2, dtype=torch.uint8)
 
         with self.assertRaisesRegex(RuntimeError, "view size is not compatible"):
-            npu_w8a8_block_fp8_linear(input_tensor, weight, [64, 128], weight_scale)
+            npu_w8a8_mxfp8_linear(input_tensor, weight, [64, 128], weight_scale)
 
     def test_preserves_supported_input_dtype(self):
         input_tensor = torch.randn(2, 128, dtype=torch.float16)
@@ -103,7 +103,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
 
         with patch.object(torch.ops, "npu", npu_ops, create=True):
-            npu_w8a8_block_fp8_linear(input_tensor, weight, [128, 128], weight_scale)
+            npu_w8a8_mxfp8_linear(input_tensor, weight, [128, 128], weight_scale)
 
         self.assertEqual(
             npu_ops.npu_quant_matmul.call_args.kwargs["output_dtype"],
@@ -123,7 +123,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
 
         with patch.object(torch.ops, "npu", npu_ops, create=True):
-            npu_w8a8_block_fp8_linear(
+            npu_w8a8_mxfp8_linear(
                 input_tensor,
                 weight,
                 [128, 128],

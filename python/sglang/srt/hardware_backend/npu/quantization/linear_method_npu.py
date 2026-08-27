@@ -307,7 +307,7 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
-def npu_w8a8_block_fp8_linear(
+def npu_w8a8_mxfp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     block_size: List[int],
@@ -325,7 +325,7 @@ def npu_w8a8_block_fp8_linear(
     """
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(
-            f"npu_w8a8_block_fp8_linear expects float8_e4m3fn weights, "
+            f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, "
             f"got {weight.dtype}"
         )
 

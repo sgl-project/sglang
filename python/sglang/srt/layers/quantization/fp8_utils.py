@@ -805,10 +805,10 @@ def _dispatch_auto_backend() -> Callable:
         # Imported here, not at module scope: the NPU module is only importable
         # once torch_npu has registered torch.ops.npu.
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            npu_w8a8_block_fp8_linear,
+            npu_w8a8_mxfp8_linear,
         )
 
-        return npu_w8a8_block_fp8_linear
+        return npu_w8a8_mxfp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
