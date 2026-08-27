@@ -1498,6 +1498,13 @@
                     ]
                   },
                   {
+                    "group": "SenseNova",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
+                    ]
+                  },
+                  {
                     "group": "Z-Image",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"

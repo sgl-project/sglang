@@ -1,0 +1,98 @@
+---
+title: SenseNova-U1.5-8B-MoT
+metatags:
+    description: "Run SenseNova-U1.5-8B-MoT text-to-image generation with SGLang's native multimodal generation runtime."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "Chinese typography", "poster layouts", "native pipeline"]} />
+
+## 1. Model Introduction
+
+[SenseNova-U1.5-8B-MoT](https://huggingface.co/sensenova/SenseNova-U1.5-8B-MoT) is a text-to-image model in the SenseNova-U1 family. It is useful for high-resolution poster, infographic, and enterprise visual-generation workloads where prompt following, layout structure, and Chinese text rendering are important.
+
+SGLang supports this checkpoint through the native `multimodal_gen` runtime. The integration is an offline generation pipeline invoked with `sglang generate`; it does not use the autoregressive LLM serving engine, token streaming, or KV-cache based decoding path.
+
+## 2. SGLang-diffusion Installation
+
+Install SGLang with the diffusion extra before running the native generation pipeline:
+
+```bash Command
+cd /path/to/sglang
+pip install uv
+uv pip install -e "python[diffusion]" --prerelease=allow
+```
+
+For general environment setup, see the [SGLang Diffusion installation guide](../../../docs/sglang-diffusion/installation).
+
+## 3. Model Deployment
+
+### 3.1 Offline Image Generation
+
+Run `sglang generate` from the SGLang repository root. If you are using an editable source checkout, set `PYTHONPATH` so the command resolves to the local `python/` package:
+
+```bash Command
+cd /workspace/sglang
+export PYTHONPATH=/workspace/sglang/python
+
+sglang generate \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --prompt "A cinematic mountain lake at sunrise, realistic photography." \
+  --width 2048 \
+  --height 2048 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --seed 42 \
+  --output-file-path output_sensenova_u15.png
+```
+
+For a local checkpoint, pass the local model directory:
+
+```bash Command
+sglang generate \
+  --model-path /workspace/models/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT \
+  --prompt "A clean technology poster with structured layout and clear typography." \
+  --width 2304 \
+  --height 4096 \
+  --num-outputs-per-prompt 1 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --seed 42 \
+  --output-file-path output_sensenova_u15_4k.png
+```
+
+### 3.2 Resolution Requirements
+
+SenseNova-U1.5-8B-MoT requires both `--width` and `--height` to be divisible by `32`. The pipeline validates this before generation so unsupported sizes fail with a clear error instead of a model-internal reshape error.
+
+Common aligned resolutions:
+
+| Aspect ratio | Resolution |
+| --- | --- |
+| 1:1 | `2048 x 2048` |
+| 9:16 | `2016 x 3584` |
+| 9:16 4K | `2304 x 4096` |
+| 16:9 | `4096 x 2304` |
+
+Do not use `2160 x 3840` for 9:16 generation with this model: the aspect ratio is correct, but `2160` is not divisible by `32`.
+
+### 3.3 Sampling Parameters
+
+The native SGLang CLI uses the standard multimodal generation sampling parameters:
+
+| SenseNova reference script | SGLang generate parameter | Notes |
+| --- | --- | --- |
+| `--cfg_scale` | `--guidance-scale` | Classifier-free guidance scale. |
+| `--num_steps` | `--num-inference-steps` | Number of denoising steps. |
+| `--batch_size` | Use repeated requests or `--num-outputs-per-prompt` | `--num-outputs-per-prompt` follows SGLang's `n` semantics. |
+| `--output` | `--output-file-path` | Sets the exact output image path. |
+
+Model-private options such as `cfg_norm`, `timestep_shift`, `cfg_interval`, and `think_mode` use the model defaults in SGLang and are not exposed as public CLI parameters.
+
+## 4. Notes and Limitations
+
+- The native SenseNova-U1 pipeline currently supports single-GPU execution (`--num-gpus 1`).
+- Native tensor parallelism and pipeline parallelism are not implemented for this pipeline yet.
+- High-resolution poster generation can be memory intensive. If `2304 x 4096` does not fit on your GPU, try `2016 x 3584` first and then upscale offline.
+- This page covers offline generation with `sglang generate`. Server-mode and OpenAI-compatible image API examples will be documented after they are validated for this native pipeline.
