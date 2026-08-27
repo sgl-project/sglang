@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import statistics
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Collection, Iterable, Mapping, Sequence
 
 import msgspec
 import torch
@@ -110,6 +110,7 @@ POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
 
 PLACEMENT_STATUS_SKIPPED = "skipped"
 PLACEMENT_STATUS_ADJUSTED = "adjusted"
+PLACEMENT_STATUS_VALIDATED = "validated"
 PLACEMENT_STATUS_ROLLED_BACK = "rolled_back"
 PLACEMENT_STATUS_ROLLBACK_FAILED = "rollback_failed"
 
@@ -308,6 +309,10 @@ class AutoResidencyPlan(msgspec.Struct, frozen=True):
 class AppliedResidencyChange(msgspec.Struct, frozen=True):
     component_name: str
     residency_mode: str
+    # Keep the exact object modified by the transaction. Lazy stage-owned
+    # components are not guaranteed to remain discoverable by name after a
+    # failed request, but rollback must still restore that same module.
+    module_ref: object | None = None
     previous_layerwise_resident_layers: tuple[int, ...] | None = None
     previous_layerwise_residency_policies: tuple[str, ...] | None = None
     previous_layerwise_pinned_layers: tuple[tuple[int, ...], ...] | None = None
@@ -327,6 +332,34 @@ def residency_device_growth_bytes(candidate: ResidencyTarget) -> int:
         candidate.present_device_delta_bytes,
         candidate.inactive_device_delta_bytes,
     )
+
+
+def pre_warmup_residency_targets(
+    candidates: Iterable[ResidencyTarget],
+    *,
+    excluded_components: Collection[str] = (),
+) -> list[ResidencyTarget]:
+    """Keep only weight-safe choices before activation memory is measured.
+
+    Static planning knows complete component weights but not the runtime
+    working set. It may demote an unsafe configured layout or redistribute
+    HostPin at the same device footprint, but promoting more weights here can
+    consume activation headroom that only the first shape probe can reveal.
+    """
+    candidates = list(candidates)
+    current_device_bytes = {
+        candidate.component_name: candidate.target_device_weight_bytes
+        for candidate in candidates
+        if candidate.current_placement
+    }
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.component_name not in excluded_components
+        and candidate.component_name in current_device_bytes
+        and candidate.target_device_weight_bytes
+        <= current_device_bytes[candidate.component_name]
+    ]
 
 
 def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
@@ -2764,6 +2797,7 @@ def apply_residency_changes(
                 snapshots[candidate.component_name] = AppliedResidencyChange(
                     component_name=candidate.component_name,
                     residency_mode=candidate.residency_mode,
+                    module_ref=module,
                     previous_layerwise_resident_layers=previous,
                     previous_layerwise_residency_policies=previous_policies,
                     previous_layerwise_pinned_layers=previous_pinned,
@@ -2787,6 +2821,7 @@ def apply_residency_changes(
             snapshots[candidate.component_name] = AppliedResidencyChange(
                 component_name=candidate.component_name,
                 residency_mode=candidate.residency_mode,
+                module_ref=module,
                 previous_auto_residency_mode=previous_auto_mode,
                 previous_host_pin_budget_state=previous_host_pin_budget_state,
                 applied_device_delta_bytes=applied_device_delta_bytes,
@@ -2972,7 +3007,11 @@ def rollback_residency_changes(
     ]
     for adjustment in pinning_changes:
         try:
-            module = modules.get(adjustment.component_name)
+            module = (
+                adjustment.module_ref
+                if adjustment.module_ref is not None
+                else modules.get(adjustment.component_name)
+            )
             if not isinstance(module, LayerwiseOffloadableModuleMixin):
                 raise RuntimeError("lost layerwise offload capability")
             if not module.layerwise_offload_managers:
@@ -3003,7 +3042,11 @@ def rollback_residency_changes(
         ):
             torch.get_device_module().empty_cache()
         try:
-            module = modules.get(adjustment.component_name)
+            module = (
+                adjustment.module_ref
+                if adjustment.module_ref is not None
+                else modules.get(adjustment.component_name)
+            )
             if adjustment.previous_layerwise_resident_layers is not None:
                 if not isinstance(module, LayerwiseOffloadableModuleMixin):
                     raise RuntimeError("lost layerwise offload capability")

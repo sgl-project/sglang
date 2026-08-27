@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     format_applied_changes,
     measured_failed_workload_phase_peaks,
     plan_auto_residency,
+    pre_warmup_residency_targets,
     rank_candidates_by_h2d_savings,
     resolve_measured_default_workload,
     rollback_residency_changes,
@@ -1152,6 +1153,27 @@ class TestPlanAutoResidency:
             LAYERWISE_OFFLOAD
         ]
 
+    def test_pre_warmup_targets_defer_device_weight_promotion(self):
+        current = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=8 * GIB_BYTES,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        resident = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=8 * GIB_BYTES,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=8 * GIB_BYTES,
+        )
+
+        assert pre_warmup_residency_targets([current, resident]) == [current]
+
     def test_pre_warmup_report_skips_uncalibrated_promotion_below_threshold(
         self, monkeypatch
     ):
@@ -1187,6 +1209,87 @@ class TestPlanAutoResidency:
             "30.0 GiB VRAM budget is below the 60.0 GiB uncalibrated residency "
             "threshold"
         )
+
+    def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
+        from sglang.multimodal_gen.runtime.managers import gpu_worker
+
+        transformer = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=20 * GIB_BYTES,
+            permanent_residency=True,
+        )
+        vae = ResidencyTarget(
+            component_name="vae",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=GIB_BYTES,
+            permanent_residency=True,
+            target_device_weight_bytes=GIB_BYTES,
+            current_placement=True,
+        )
+        modules = {"transformer": object(), "vae": object()}
+        worker = SimpleNamespace(
+            rank=0,
+            pipeline=SimpleNamespace(
+                preload_residency_excluded_components=frozenset(("transformer",))
+            ),
+            server_args=SimpleNamespace(
+                num_gpus=1,
+                nnodes=1,
+                node_rank=0,
+                host_pin_budget=lambda: None,
+            ),
+            _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
+            _collect_auto_residency_targets=lambda _workload: [transformer, vae],
+            _auto_residency_modules=lambda: modules,
+        )
+        monkeypatch.setattr(
+            gpu_worker, "resolve_keep_resident_min_available_gb", lambda _args: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_runtime_weight_bytes",
+            lambda _modules: {"transformer": 20 * GIB_BYTES, "vae": GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_current_device_weight_bytes",
+            lambda _modules: {"transformer": 0, "vae": 0},
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_pinned_host_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_host_pin_capacity_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "host_memory_available_bytes", lambda: 100 * GIB_BYTES
+        )
+        monkeypatch.setattr(
+            gpu_worker.torch,
+            "get_device_module",
+            lambda: SimpleNamespace(memory_allocated=lambda: 2 * GIB_BYTES),
+        )
+
+        report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
+            worker,
+            workload=DefaultWorkload(
+                width=1920,
+                height=1088,
+                num_frames=24,
+                num_inference_steps=15,
+            ),
+        )
+
+        assert [candidate.component_name for candidate in report.candidates] == ["vae"]
+        assert report.estimated_peak_bytes_by_phase["static:transformer"] == (
+            22 * GIB_BYTES
+        )
+        assert report.used_components_by_phase["static:transformer"] == ("transformer",)
 
     def test_reserve_floor_is_capped_on_a_small_card(self):
         # Keep enough room for unmeasured activations without applying the
@@ -3320,7 +3423,9 @@ class TestApplyAndRollback:
 
         rollback_residency_changes(
             applied=applied,
-            modules={"text_encoder": module},
+            # Lazy stage-owned components can disappear from the manager's
+            # per-request name index before validation rollback.
+            modules={},
             server_args=args,
         )
         assert len(module.layerwise_offload_managers) == 1

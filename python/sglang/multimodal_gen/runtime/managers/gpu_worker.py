@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
     PLACEMENT_STATUS_SKIPPED,
+    PLACEMENT_STATUS_VALIDATED,
     POST_ADJUSTMENT_REGRESSION_FRACTION,
     AppliedResidencyChange,
     AutoResidencyPlan,
@@ -80,6 +81,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     measured_failed_workload_phase_peaks,
     plan_auto_residency,
     plan_summary_payload,
+    pre_warmup_residency_targets,
     rank_candidates_by_h2d_savings,
     resolve_default_workload,
     resolve_measured_default_workload,
@@ -1265,20 +1267,25 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 remaining_gpu_mem_gb -= usage_gb
         return can_stay_resident
 
-    def apply_auto_residency(self, *, pre_warmup: bool = False) -> OutputBatch:
+    def apply_auto_residency(
+        self, *, pre_warmup: bool = False, validate_only: bool = False
+    ) -> OutputBatch:
         """Apply one warmup-calibrated residency adjustment round.
 
         Every rank executes this handler at the same queue position; the plan
         is computed from all-gathered rank reports so each rank reaches the
-        same decision. Post-adjustment warmup can expose more safe headroom, so
-        the server may call this again with measurements from the new layout.
-        A failure on any rank rolls every rank back to the previously
+        same decision. After applying a plan, the server calls this once in
+        validation-only mode with measurements from the new layout. Validation
+        may keep or roll back that plan, but never starts another placement
+        search. A failure on any rank rolls every rank back to the previously
         calibrated placement.
 
         Everything before the first all-gather is fenced into a skip report:
         an uncaught raise there would leave the peer ranks parked in the
         collective until the group timeout.
         """
+        if pre_warmup and validate_only:
+            raise ValueError("static placement cannot be validation-only")
         records = list(self._auto_residency_warmup_records)
         # Each round must describe one placement. Intersecting phase ownership
         # across old and newly adjusted layouts would double-count weights that
@@ -1314,6 +1321,26 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         reports = self._auto_residency_all_gather(local_report)
         recovering_from_oom = any(report.warmup_oom for report in reports)
+        if validate_only:
+            invalid_report = next(
+                (
+                    report
+                    for report in reports
+                    if report.skip_reason is not None
+                    or report.estimated_peak_bytes is None
+                ),
+                None,
+            )
+            if invalid_report is not None:
+                reason = invalid_report.skip_reason or "no usable warmup measurement"
+                return self._rollback_everywhere(
+                    cause=(
+                        "post-adjustment calibration could not validate rank "
+                        f"{invalid_report.rank}: {reason}"
+                    ),
+                    already_failed=False,
+                    latest_round_only=True,
+                )
         if (
             not pre_warmup
             and self._auto_residency_round_sizes
@@ -1344,7 +1371,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     latest_round_only=True,
                 )
         plan = plan_auto_residency(reports=reports)
-        summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if (
             not pre_warmup
             and self._auto_residency_round_sizes
@@ -1367,6 +1393,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 latest_round_only=True,
                 retryable=True,
             )
+        if validate_only:
+            if self.is_output_rank:
+                logger.info(
+                    "Auto residency: post-adjustment calibration passed; "
+                    "keeping the selected placement."
+                )
+            return OutputBatch(
+                output=plan_summary_payload(
+                    plan=plan, status=PLACEMENT_STATUS_VALIDATED
+                )
+            )
+        summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
                 logger.info("%s", summary)
@@ -1593,7 +1631,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 ),
             )
 
-        candidates = self._collect_auto_residency_targets(workload)
+        all_candidates = self._collect_auto_residency_targets(workload)
+        candidates = pre_warmup_residency_targets(
+            all_candidates,
+            excluded_components=(self.pipeline.preload_residency_excluded_components),
+        )
         if not candidates:
             return RankResidencyReport(
                 rank=self.rank,
@@ -1607,14 +1649,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         current_device_weights = component_current_device_weight_bytes(modules)
         permanent_components = {
             candidate.component_name
-            for candidate in candidates
+            for candidate in all_candidates
             if candidate.current_placement and candidate.permanent_residency
         }
         baseline_allocated = int(torch.get_device_module().memory_allocated())
         phase_peaks = {}
         phase_active = {}
         phase_used = {}
-        for component_name in sorted({c.component_name for c in candidates}):
+        for component_name in sorted(active_weights):
             phase_name = f"static:{component_name}"
             phase_peaks[phase_name] = baseline_allocated + (
                 0

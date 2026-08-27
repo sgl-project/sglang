@@ -171,6 +171,7 @@ async def maybe_apply_auto_residency(
         PLACEMENT_STATUS_ADJUSTED,
         PLACEMENT_STATUS_ROLLBACK_FAILED,
         PLACEMENT_STATUS_ROLLED_BACK,
+        PLACEMENT_STATUS_VALIDATED,
     )
 
     skip_reason = auto_residency_skip_reason(server_args)
@@ -205,9 +206,11 @@ async def maybe_apply_auto_residency(
                 f"auto residency rollback failed: {rollback.error}"
             ) from error
         # Restore warm caches for the previous calibrated placement before
-        # turning ready, keeping the caller's fail-open contract.
+        # turning ready. Once placement was mutated, failure to revalidate the
+        # restored state is unsafe to ignore even when the initial synthetic
+        # warmup itself was implicit.
         await run_async_client_warmup(
-            server_args, forward, fail_open=fail_open, rewarm=True
+            server_args, forward, fail_open=False, rewarm=True
         )
 
     for _ in range(MAX_AUTO_RESIDENCY_ROUNDS):
@@ -244,7 +247,7 @@ async def maybe_apply_auto_residency(
             )
             if status == PLACEMENT_STATUS_ROLLED_BACK:
                 await run_async_client_warmup(
-                    server_args, forward, fail_open=fail_open, rewarm=True
+                    server_args, forward, fail_open=False, rewarm=True
                 )
                 if retryable:
                     logger.warning(
@@ -289,6 +292,31 @@ async def maybe_apply_auto_residency(
                 )
                 continue
             await rollback_and_rewarm(e)
+            return
+
+        try:
+            validation = await forward(AutoResidencyReq(action="validate"))
+        except Exception as e:
+            await rollback_and_rewarm(e)
+            return
+        validation_status = _auto_residency_status(validation)
+        if validation_status == PLACEMENT_STATUS_ROLLBACK_FAILED:
+            raise RuntimeError(f"auto residency rollback failed: {validation.error}")
+        if validation_status == PLACEMENT_STATUS_ROLLED_BACK:
+            await run_async_client_warmup(
+                server_args, forward, fail_open=False, rewarm=True
+            )
+            return
+        if (
+            validation.error is not None
+            or validation_status != PLACEMENT_STATUS_VALIDATED
+        ):
+            await rollback_and_rewarm(
+                RuntimeError(
+                    validation.error
+                    or "post-adjustment calibration returned no validation result"
+                )
+            )
             return
         return
 
