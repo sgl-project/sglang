@@ -186,6 +186,8 @@ ONLINE_QUANTIZATION_CHOICES = [
     "w4a4_int4",
 ]
 
+W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS = {"Qwen3MoeForCausalLM"}
+
 
 SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
@@ -4711,6 +4713,7 @@ class ServerArgs:
             from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
+            self._validate_npu_online_quantization()
 
             current = self.cuda_graph_config.prefill.tc_compiler
             if current is not None and current != "eager":
@@ -4719,6 +4722,18 @@ class ServerArgs:
                     "cuda_graph_config[prefill].tc_compiler='eager'."
                 )
                 self.cuda_graph_config.prefill.tc_compiler = "eager"
+
+    def _validate_npu_online_quantization(self):
+        if self.online_quantization != "w4a4_int4":
+            return
+
+        architectures = self.get_model_config().hf_config.architectures
+        if not W4A4_ONLINE_QUANTIZATION_SUPPORTED_ARCHS.intersection(architectures):
+            raise ValueError(
+                "--online-quantization w4a4_int4 is disabled for dense models "
+                "because dense W4A4 is inaccurate; it is currently MoE-only. "
+                f"Got architectures={architectures}."
+            )
 
     def _handle_mps_backends(self):
         if self.device == "mps":

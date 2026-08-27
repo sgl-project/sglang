@@ -40,7 +40,8 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.platforms import current_platform
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -80,7 +81,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 _is_cpu = is_cpu()
-_is_npu = is_npu()
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -185,7 +185,7 @@ class LinearBase(torch.nn.Module):
         self.quant_config = quant_config
         if quant_config is None:
             self.quant_method = None
-            if _is_npu:
+            if current_platform.is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     get_npu_online_linear_method,
                 )
@@ -278,7 +278,7 @@ class ReplicatedLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         # The per-tensor quant-scale must be 1 dimension
-        if _is_npu:
+        if current_platform.is_npu():
             if param.size() != loaded_weight.size() and param.size(0) == 1:
                 if torch.allclose(loaded_weight, loaded_weight[0]):
                     loaded_weight = loaded_weight[:1]
