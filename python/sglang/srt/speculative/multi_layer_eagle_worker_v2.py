@@ -962,8 +962,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        # Multi-layer eagle has no draft forward, only draft extend.
-        return self._draft_worker.draft_runner
+        return self._draft_worker.draft_runner_list[-1]
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
