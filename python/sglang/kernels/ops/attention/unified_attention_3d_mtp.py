@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from AITER's Triton unified-attention implementation.
-"""Qwen3.5 MTP-verify specialization of AITER's Triton unified attention.
+"""MTP-verify specialization of AITER's Triton unified attention (3D split-K).
 
 Forked from ROCm/aiter @ d9e5ef7, kernel_unified_attention_3d in
 aiter/ops/triton/_triton_kernels/attention/unified_attention.py. The kernel body
@@ -29,6 +29,9 @@ Real constraints, mirrored by the gate in srt/layers/attention/aiter_backend.py:
     so 192 and 80 do not compile. 256 is the only measured size; 128 should be
     correct but is not tuned (num_warps=2 balances VGPR pressure at 256).
   - Causal only. seq_mask carries no tree mask, so spec decoding needs topk==1.
+
+The gate is on shape, not on model; Qwen3.5-397B-A17B at TP1/TP2 (16:1 GQA,
+head_dim 256) is the only config known to match today.
 """
 
 import math
@@ -78,8 +81,8 @@ def find_seq_idx(
     return left - 1
 
 
-qwen35_mtp_unified_attention_3d_repr = make_kernel_repr(
-    "qwen35_mtp_unified_attention_3d",
+_unified_attention_3d_mtp_repr = make_kernel_repr(
+    "unified_attention_3d_mtp",
     [
         "num_query_heads",
         "num_queries_per_kv",
@@ -98,8 +101,8 @@ qwen35_mtp_unified_attention_3d_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=qwen35_mtp_unified_attention_3d_repr)
-def qwen35_mtp_unified_attention_3d_kernel(
+@triton.jit(repr=_unified_attention_3d_mtp_repr)
+def unified_attention_3d_mtp_kernel(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
@@ -486,8 +489,8 @@ def qwen35_mtp_unified_attention_3d_kernel(
         tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
-_qwen35_mtp_reduce_segments_repr = make_kernel_repr(
-    "qwen35_mtp_reduce_segments",
+_unified_attention_3d_mtp_reduce_segments_repr = make_kernel_repr(
+    "unified_attention_3d_mtp_reduce_segments",
     [
         "num_query_heads",
         "TILE_SIZE",
@@ -497,8 +500,8 @@ _qwen35_mtp_reduce_segments_repr = make_kernel_repr(
 )
 
 
-@triton.jit(repr=_qwen35_mtp_reduce_segments_repr)
-def qwen35_mtp_reduce_segments_kernel(
+@triton.jit(repr=_unified_attention_3d_mtp_reduce_segments_repr)
+def unified_attention_3d_mtp_reduce_segments_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     segm_output_ptr,
     # [num_tokens, num_query_heads, max_num_segments, head_size]
@@ -599,7 +602,7 @@ def qwen35_mtp_reduce_segments_kernel(
     )
 
 
-def unified_attention_3d_mtp_qwen35(
+def unified_attention_3d_mtp_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -659,9 +662,7 @@ def unified_attention_3d_mtp_qwen35(
     )
     segment_expsum = torch.empty_like(segment_max)
 
-    qwen35_mtp_unified_attention_3d_kernel[
-        (total_num_q_blocks, num_kv_heads, num_segments)
-    ](
+    unified_attention_3d_mtp_kernel[(total_num_q_blocks, num_kv_heads, num_segments)](
         segm_output_ptr=segment_output,
         segm_max_ptr=segment_max,
         segm_expsum_ptr=segment_expsum,
@@ -717,7 +718,7 @@ def unified_attention_3d_mtp_qwen35(
         num_stages=2,
     )
 
-    qwen35_mtp_reduce_segments_kernel[(num_tokens, num_query_heads)](
+    unified_attention_3d_mtp_reduce_segments_kernel[(num_tokens, num_query_heads)](
         output_ptr=out,
         segm_output_ptr=segment_output,
         segm_max_ptr=segment_max,

@@ -16,14 +16,14 @@ if _RUNNABLE:
         from aiter.ops.triton.utils.types import e4m3_dtype
 
         from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
-            unified_attention_3d_mtp_qwen35,
+            unified_attention_3d_mtp_func,
         )
     except Exception:
         _RUNNABLE = False
 
 
 @unittest.skipUnless(_RUNNABLE, "requires HIP gfx950 with aiter")
-class TestAiterUnifiedAttentionMTP(CustomTestCase):
+class TestUnifiedAttention3dMtp(CustomTestCase):
     def test_matches_aiter(self):
         # TP2 shard of Qwen3.5-397B-A17B: 32 q / 2 kv heads split over two ranks.
         self._check_matches_aiter(num_query_heads=16, num_kv_heads=1)
@@ -91,7 +91,7 @@ class TestAiterUnifiedAttentionMTP(CustomTestCase):
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        unified_attention_3d_mtp_qwen35(
+        unified_attention_3d_mtp_func(
             q=query,
             k=key,
             v=value,
