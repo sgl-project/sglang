@@ -534,8 +534,11 @@ def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> 
     if not backend:
         raise ValueError("backend must be a non-empty string")
 
+    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         logger.warning("Overriding existing sampler factory for backend '%s'", backend)
+    SAMPLING_BACKEND_CHOICES.add(backend)
     _CUSTOM_SAMPLER_FACTORIES[backend] = factory
 
 

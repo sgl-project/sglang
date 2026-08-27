@@ -303,10 +303,12 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 ]
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
 
-# --- Grammar ---
+# --- Sampling and grammar ---
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 add_grammar_backend_choices = GRAMMAR_BACKEND_CHOICES.extend
+
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
 # --- MoE and GEMM runners ---
 
@@ -9529,7 +9531,7 @@ class ServerArgs:
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
-        sampling_backend_choices = {"flashinfer", "pytorch", "ascend"}
+        sampling_backend_choices = set(SAMPLING_BACKEND_CHOICES)
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             sampling_backend_choices.add("token_oracle")
         parser.add_argument(
