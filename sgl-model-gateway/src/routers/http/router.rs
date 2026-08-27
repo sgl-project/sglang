@@ -724,7 +724,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "get_server_info").await
+        self.proxy_get_request(req, "server_info").await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
@@ -732,7 +732,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "get_model_info").await
+        self.proxy_get_request(req, "model_info").await
     }
 
     async fn route_generate(

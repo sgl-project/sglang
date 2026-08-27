@@ -5,6 +5,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.token_dispatcher import (
@@ -167,6 +168,7 @@ class FlashinferDispatcher(BaseDispatcher):
             (1, self.router_topk), dtype=torch.float32, device="cuda"
         )
 
+    @debug_kernel_api
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> FlashinferDispatchOutput:
@@ -243,6 +245,7 @@ class FlashinferDispatcher(BaseDispatcher):
             moe_output,
         )
 
+    @debug_kernel_api
     def combine(self, combine_input: FlashinferCombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
         output_hidden_size = hidden_states.shape[-1]

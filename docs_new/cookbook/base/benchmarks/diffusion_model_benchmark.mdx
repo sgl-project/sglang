@@ -1,0 +1,235 @@
+---
+title: Diffusion Models Benchmark Documentation
+metatags:
+    description: "Benchmark diffusion model serving throughput and latency with SGLang - supports image and video generation with flexible configurations."
+---
+
+`sglang.multimodal_gen.benchmarks.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of Diffusion Models. It supports two backends (`sglang-image`, `sglang-video`) and offers flexible configurations for request rates, dataset types, and profiling.
+
+## 1. Quick Start
+
+### 1.1 Benchmarking in Low Concurrency
+
+Run a benchmark on a local server (port 30000) generating 1 videos/images from the `vbench` dataset.
+
+```bash Command
+# For text to video: such as Wan2.2-T2V-A14B-Diffusers
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1
+
+# For image to video: such as Wan2.2-I2V-A14B-Diffusers
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task i2v --num-prompts 1 --max-concurrency 1
+
+# For image-text to video: such as Wan2.2-TI2V-5B-Diffusers
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task ti2v --num-prompts 1 --max-concurrency 1
+
+# For text to image: such as Qwen-Image
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task t2i --num-prompts 1 --max-concurrency 1
+
+# For image-text to image: such as Qwen-Image-Edit
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task ti2i --num-prompts 1 --max-concurrency 1
+```
+
+### 1.2 Benchmarking in High Concurrency
+
+Run a benchmark on a local server (port 30000) generating 20 videos/images from the `vbench` dataset.
+
+```bash Command
+# For text to video: such as Wan2.2-T2V-A14B-Diffusers
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20
+
+# For image to video: such as Wan2.2-I2V-A14B-Diffusers
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task i2v --num-prompts 20 --max-concurrency 20
+
+# For image-text to video: such as Wan2.2-TI2V-5B-Diffusers
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task ti2v --num-prompts 20 --max-concurrency 20
+
+# For text to image: such as Qwen-Image
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task t2i --num-prompts 20 --max-concurrency 20
+
+# For image-text to image: such as Qwen-Image-Edit
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-image --dataset vbench --task ti2i --num-prompts 20 --max-concurrency 20
+```
+
+## 2. Parameter Reference
+
+### 2.1 Connection & Backend Settings
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Argument</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>**Required**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The backend type to use. Choices: `sglang-image`, `sglang-video`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--base-url`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Base URL of the server (e.g., `http://localhost:30000`). If specified, this overrides `--host` and `--port`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--host`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The server host (e.g., `127.0.0.1`).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--port`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The server port.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--model`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Model name or path.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.2 Workload & Task Configuration
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "33%"}} />
+    <col style={{width: "33%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Argument</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Choices</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--task`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`t2v`, `i2v`, `ti2v`, `t2i`, `ti2i`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Defines the generation task: `t2v` (Text-to-Video), `i2v` (Image-to-Video), `ti2v` (Text+Image-to-Video), `t2i` (Text-to-image), `ti2i` (Text+Image-to-Image).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dataset`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`vbench`, `random`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The source of prompts/inputs.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dataset-path`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>(Optional) Path to a local dataset file if not using built-in presets.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-prompts`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The total number of prompts/requests to execute during the benchmark.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.3 Generation Parameters
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Argument</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--width`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The target width for the generated image or video.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--height`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The target height for the generated image or video.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-frames`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of frames to generate (Specific to Video backends).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--fps`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Frames Per Second configuration (Specific to Video backends).</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.4 Concurrency & Load Control
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Argument</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--request-rate`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The number of requests initiated per second. If set to `inf`, all requests are sent immediately (burst). If set to a number, request arrival times follow a Poisson process.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--max-concurrency`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The maximum number of requests allowed to execute simultaneously. This simulates a semaphore or upstream limit. Even if `request-rate` is high, the actual processing rate is capped by this value.</td>
+    </tr>
+  </tbody>
+</table>
+
+### 2.5 Logging & Output
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Argument</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--output-file`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to save the benchmark metrics (JSON format).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disable-tqdm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>If set, disables the progress bar in the console.</td>
+    </tr>
+  </tbody>
+</table>
+
+## 3. Metrics
+
+- `Request Throughput` (req/s), Output Throughput (tok/s)
+- `Latency Mean` (ms): Time to Per Step
+- `Peak Memory Max` (ms): Max Memory Usage during running

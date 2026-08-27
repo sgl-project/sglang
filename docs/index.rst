@@ -14,9 +14,9 @@ Its core features include:
 
 - **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
 - **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
+- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
 - **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend across the world, with native RL integrations and adoption by well-known post-training frameworks such as AReaL, Miles, slime, Tunix, verl and more.
+- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as AReaL, Miles, slime, Tunix, verl and more.
 
 .. toctree::
    :maxdepth: 1
@@ -41,9 +41,11 @@ Its core features include:
    :caption: Advanced Features
 
    advanced_features/server_arguments.md
+   advanced_features/object_storage.md
    advanced_features/hyperparameter_tuning.md
    advanced_features/attention_backend.md
    advanced_features/speculative_decoding.ipynb
+   advanced_features/adaptive_speculative_decoding.md
    advanced_features/structured_outputs.ipynb
    advanced_features/structured_outputs_for_reasoning_models.ipynb
    advanced_features/tool_parser.ipynb
@@ -51,6 +53,7 @@ Its core features include:
    advanced_features/quantization.md
    advanced_features/quantized_kv_cache.md
    advanced_features/expert_parallelism.md
+   advanced_features/dp_dpa_smg_guide.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
    advanced_features/epd_disaggregation.md
@@ -60,6 +63,8 @@ Its core features include:
    advanced_features/vlm_query.ipynb
    advanced_features/dp_for_multi_modal_encoder.md
    advanced_features/cuda_graph_for_multi_modal_encoder.md
+   advanced_features/piecewise_cuda_graph.md
+   advanced_features/breakable_cuda_graph.md
    advanced_features/sgl_model_gateway.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
@@ -67,21 +72,29 @@ Its core features include:
    advanced_features/sglang_for_rl.md
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 2
    :caption: Supported Models
 
-   supported_models/generative_models.md
-   supported_models/multimodal_language_models.md
-   supported_models/diffusion_language_models.md
-   supported_models/diffusion_models.md
-   supported_models/embedding_models.md
-   supported_models/reward_models.md
-   supported_models/rerank_models.md
-   supported_models/classify_models.md
-   supported_models/support_new_models.md
-   supported_models/transformers_fallback.md
-   supported_models/modelscope.md
-   supported_models/mindspore_models.md
+   supported_models/text_generation/index
+   supported_models/retrieval_ranking/index
+   supported_models/specialized/index
+   supported_models/extending/index
+
+.. toctree::
+   :maxdepth: 2
+   :caption: SGLang Diffusion
+
+   diffusion/index
+   diffusion/installation
+   diffusion/compatibility_matrix
+   diffusion/api/cli
+   diffusion/api/openai_api
+   diffusion/performance/index
+   diffusion/performance/ring_sp_performance
+   diffusion/performance/attention_backends
+   diffusion/performance/cache/index
+   diffusion/quantization
+   diffusion/contributing
 
 .. toctree::
    :maxdepth: 1
@@ -91,7 +104,7 @@ Its core features include:
    platforms/cpu_server.md
    platforms/tpu.md
    platforms/nvidia_jetson.md
-   platforms/ascend_npu_support.rst
+   platforms/ascend/ascend_npu_support.rst
    platforms/xpu.md
 
 .. toctree::
@@ -100,6 +113,7 @@ Its core features include:
 
    developer_guide/contribution_guide.md
    developer_guide/development_guide_using_docker.md
+   developer_guide/development_jit_kernel_guide.md
    developer_guide/benchmark_and_profiling.md
    developer_guide/bench_serving.md
    developer_guide/evaluating_new_models.md
@@ -116,6 +130,7 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/post_training_integration.md
+   references/release_lookup
    references/learn_more.md
 
 .. toctree::

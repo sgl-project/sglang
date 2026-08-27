@@ -1,0 +1,295 @@
+syntax = "proto3";
+package sglang.runtime.v1;
+
+service SglangService {
+  // SGLang-native RPCs (typed proto)
+  rpc TextGenerate(TextGenerateRequest) returns (stream TextGenerateResponse);
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc TextEmbed(TextEmbedRequest) returns (TextEmbedResponse);
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+  rpc Classify(ClassifyRequest) returns (ClassifyResponse);
+  rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);
+  rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc GetLoad(GetLoadRequest) returns (GetLoadResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
+  rpc FlushCache(FlushCacheRequest) returns (FlushCacheResponse);
+  rpc PauseGeneration(PauseGenerationRequest) returns (PauseGenerationResponse);
+  rpc ContinueGeneration(ContinueGenerationRequest) returns (ContinueGenerationResponse);
+
+  // OpenAI-compatible RPCs (JSON pass-through)
+  rpc ChatComplete(OpenAIRequest) returns (stream OpenAIStreamChunk);
+  rpc Complete(OpenAIRequest) returns (stream OpenAIStreamChunk);
+  rpc OpenAIEmbed(OpenAIRequest) returns (OpenAIResponse);
+  rpc OpenAIClassify(OpenAIRequest) returns (OpenAIResponse);
+  rpc Score(OpenAIRequest) returns (OpenAIResponse);
+  rpc Rerank(OpenAIRequest) returns (OpenAIResponse);
+
+  // Admin/Ops RPCs
+  rpc StartProfile(StartProfileRequest) returns (StartProfileResponse);
+  rpc StopProfile(StopProfileRequest) returns (StopProfileResponse);
+  rpc UpdateWeightsFromDisk(UpdateWeightsRequest) returns (UpdateWeightsResponse);
+}
+
+// Sampling parameters shared across text and tokenized RPCs.
+message SamplingParams {
+  optional float temperature = 1;
+  optional float top_p = 2;
+  optional int32 top_k = 3;
+  optional float min_p = 4;
+  optional float frequency_penalty = 5;
+  optional float presence_penalty = 6;
+  optional float repetition_penalty = 7;
+  optional int32 max_new_tokens = 8;
+  optional int32 min_new_tokens = 9;
+  repeated string stop = 10;
+  repeated int32 stop_token_ids = 11;
+  optional bool ignore_eos = 12;
+  optional int32 n = 13;
+  optional string json_schema = 14;
+  optional string regex = 15;
+}
+
+// ---- Text-based generate (text in, text out) ----
+
+message TextGenerateRequest {
+  string text = 1;
+  optional SamplingParams sampling_params = 2;
+  optional bool stream = 3;
+  optional bool return_logprob = 4;
+  optional int32 top_logprobs_num = 5;
+  optional int32 logprob_start_len = 6;
+  optional bool return_text_in_logprobs = 7;
+  optional string rid = 8;
+  optional string lora_path = 9;
+  optional string routing_key = 10;
+  optional int32 routed_dp_rank = 11;
+  map<string, string> trace_headers = 12;
+}
+
+message TextGenerateResponse {
+  string text = 1;
+  map<string, string> meta_info = 2;
+  bool finished = 3;
+}
+
+// ---- Tokenized generate (input_ids in, token_ids out) ----
+
+message GenerateRequest {
+  repeated int32 input_ids = 1;
+  optional SamplingParams sampling_params = 2;
+  optional bool stream = 3;
+  optional bool return_logprob = 4;
+  optional int32 top_logprobs_num = 5;
+  optional int32 logprob_start_len = 6;
+  optional string rid = 7;
+  optional string lora_path = 8;
+  optional string routing_key = 9;
+  optional int32 routed_dp_rank = 10;
+  map<string, string> trace_headers = 11;
+}
+
+message GenerateResponse {
+  repeated int32 output_ids = 1;
+  map<string, string> meta_info = 2;
+  bool finished = 3;
+}
+
+// ---- Text-based embed (text in, embedding out) ----
+
+message TextEmbedRequest {
+  string text = 1;
+  optional string rid = 2;
+  optional string routing_key = 3;
+  map<string, string> trace_headers = 4;
+}
+
+message TextEmbedResponse {
+  repeated float embedding = 1;
+  map<string, string> meta_info = 2;
+}
+
+// ---- Tokenized embed (input_ids in, embedding out) ----
+
+message EmbedRequest {
+  repeated int32 input_ids = 1;
+  optional string rid = 2;
+  optional string routing_key = 3;
+  map<string, string> trace_headers = 4;
+}
+
+message EmbedResponse {
+  repeated float embedding = 1;
+  map<string, string> meta_info = 2;
+}
+
+// ---- Health check ----
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+}
+
+// ---- Model info ----
+
+message GetModelInfoRequest {}
+
+message GetModelInfoResponse {
+  string model_path = 1;
+  string json_info = 2;
+}
+
+// ---- Server info ----
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  string json_info = 1;
+}
+
+// ---- Abort ----
+
+message AbortRequest {
+  string rid = 1;
+  bool abort_all = 2;
+}
+
+message AbortResponse {
+  bool success = 1;
+}
+
+// ---- Classify (same internal path as embed, uses EmbeddingReqInput) ----
+
+message ClassifyRequest {
+  string text = 1;
+  repeated int32 input_ids = 2;
+  optional string rid = 3;
+  optional string routing_key = 4;
+  map<string, string> trace_headers = 5;
+}
+
+message ClassifyResponse {
+  repeated float embedding = 1;
+  map<string, string> meta_info = 2;
+}
+
+// ---- Tokenize / Detokenize (local ops, no inference) ----
+
+message TokenizeRequest {
+  string text = 1;
+  optional bool add_special_tokens = 2;
+}
+
+message TokenizeResponse {
+  repeated int32 tokens = 1;
+  int32 count = 2;
+  int32 max_model_len = 3;
+  string input_text = 4;
+}
+
+message DetokenizeRequest {
+  repeated int32 tokens = 1;
+}
+
+message DetokenizeResponse {
+  string text = 1;
+}
+
+// ---- List models ----
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelCard models = 1;
+}
+
+message ModelCard {
+  string id = 1;
+  string root = 2;
+  optional string parent = 3;
+  optional int32 max_model_len = 4;
+}
+
+// ---- Get load ----
+
+message GetLoadRequest {
+  optional int32 dp_rank = 1;
+}
+
+message GetLoadResponse {
+  string json_info = 1;
+}
+
+// ---- Flush cache ----
+
+message FlushCacheRequest {}
+
+message FlushCacheResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ---- Pause / Continue generation ----
+
+message PauseGenerationRequest {
+  string mode = 1;
+}
+
+message PauseGenerationResponse {
+  string message = 1;
+}
+
+message ContinueGenerationRequest {}
+
+message ContinueGenerationResponse {
+  string message = 1;
+}
+
+// ---- OpenAI-compatible pass-through messages ----
+
+message OpenAIRequest {
+  bytes json_body = 1;
+  map<string, string> trace_headers = 2;
+}
+
+message OpenAIStreamChunk {
+  bytes json_chunk = 1;
+  bool finished = 2;
+}
+
+message OpenAIResponse {
+  bytes json_body = 1;
+  int32 status_code = 2;
+}
+
+// ---- Admin: Profile ----
+
+message StartProfileRequest {
+  optional string output_dir = 1;
+}
+
+message StartProfileResponse {
+  string message = 1;
+}
+
+message StopProfileRequest {}
+
+message StopProfileResponse {
+  string message = 1;
+}
+
+// ---- Admin: Weight update ----
+
+message UpdateWeightsRequest {
+  string model_path = 1;
+  optional string load_format = 2;
+}
+
+message UpdateWeightsResponse {
+  bool success = 1;
+  string message = 2;
+}

@@ -33,7 +33,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
             "Qwen/Qwen3-0.6B",
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--skip-server-warmup"],
+            other_args=["--skip-server-warmup", "--enable-metrics"],
             env=env,
         )
         cls.addClassCleanup(kill_process_tree, cls.process.pid)

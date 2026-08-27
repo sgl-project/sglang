@@ -1,6 +1,8 @@
 //! gRPC router implementations
 
-use crate::{grpc_client::sglang_proto::MultimodalInputs, protocols::common::StringOrArray};
+use smg_grpc_client::sglang_proto::MultimodalInputs;
+
+use crate::protocols::common::StringOrArray;
 
 pub mod client; // Used by core/
 pub(crate) mod common;

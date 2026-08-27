@@ -2,7 +2,7 @@
 
 You can install SGLang using one of the methods below.
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
 
 ## Method 1: With pip or uv
 
@@ -11,23 +11,40 @@ It is recommended to use uv for faster installation:
 ```bash
 pip install --upgrade pip
 pip install uv
-uv pip install "sglang"
+uv pip install sglang
 ```
 
-**Quick fixes to common problems**
-- In some cases (e.g., GB200), the above command might install a wrong torch version (e.g., the CPU version) due to dependency resolution. To fix this, you can first run the above command and then force-reinstall the correct [PyTorch](https://pytorch.org/get-started/locally/) with the following:
-  ```
-  uv pip install "torch==2.9.1" "torchvision" --extra-index-url https://download.pytorch.org/whl/cu129 --force-reinstall
-  ```
-- For CUDA 13, Docker is recommended (see the Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, installing the matching `sgl_kernel` wheel from [the sgl-project whl releases](https://github.com/sgl-project/whl/releases) after installing SGLang also works. Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang (you can find this by running `uv pip show sgl_kernel`). Examples:
-  ```bash
-  # x86_64
-  uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
+### For CUDA 13
 
-  # aarch64
-  uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
-  ```
-- If you encounter `OSError: CUDA_HOME environment variable is not set`, set it to your CUDA install root with either of the following solutions:
+Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, follow these steps:
+
+1. Install PyTorch with CUDA 13 support first:
+```bash
+# Replace X.Y.Z with the version by your SGLang install
+uv pip install torch==X.Y.Z torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+```
+
+2. Install sglang:
+```bash
+uv pip install sglang
+```
+
+3. Install the `sglang-kernel` wheel for CUDA 13 from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sglang-kernel/index.html). Replace `X.Y.Z` with the `sglang-kernel` version required by your SGLang install (you can find this by running `uv pip show sglang-kernel`). Examples:
+```bash
+# x86_64
+uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sglang_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
+
+# aarch64
+uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sglang_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
+```
+
+4. If you encounter `ptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'` on B300/GB300, fix it with:
+```bash
+export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+```
+
+### **Quick fixes to common problems**
+- If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
@@ -35,7 +52,7 @@ uv pip install "sglang"
 
 ```bash
 # Use the last release branch
-git clone -b v0.5.6.post2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Install the python packages
@@ -211,4 +228,3 @@ echo "Build and push completed successfully!"
 
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
 - To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
-- When encountering `ptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'` on B300/GB300, fix it with `export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`.

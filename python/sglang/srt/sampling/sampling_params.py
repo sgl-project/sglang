@@ -65,30 +65,45 @@ class SamplingParams:
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,
     ) -> None:
+        # For non-optional params, treat None as "use default" so that callers
+        # (e.g. /generate) can pass null without crashing verify().
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
         if stop_token_ids:
-            self.stop_token_ids = set(stop_token_ids)
+            filtered = {int(t) for t in stop_token_ids if t is not None}
+            self.stop_token_ids = filtered or None
         else:
             self.stop_token_ids = None
         self.stop_regex_strs = stop_regex
-        self.temperature = temperature
-        self.top_p = top_p
-        self.top_k = top_k
-        self.min_p = min_p
-        self.frequency_penalty = frequency_penalty
-        self.presence_penalty = presence_penalty
-        self.repetition_penalty = repetition_penalty
-        self.min_new_tokens = min_new_tokens
+        self.temperature = temperature if temperature is not None else 1.0
+        self.top_p = top_p if top_p is not None else 1.0
+        self.top_k = top_k if top_k is not None else -1
+        self.min_p = min_p if min_p is not None else 0.0
+        self.frequency_penalty = (
+            frequency_penalty if frequency_penalty is not None else 0.0
+        )
+        self.presence_penalty = (
+            presence_penalty if presence_penalty is not None else 0.0
+        )
+        self.repetition_penalty = (
+            repetition_penalty if repetition_penalty is not None else 1.0
+        )
+        self.min_new_tokens = min_new_tokens if min_new_tokens is not None else 0
         self.regex = regex
-        self.n = n
+        self.n = n if n is not None else 1
         self.json_schema = json_schema
         self.ebnf = ebnf
         self.structural_tag = structural_tag
-        self.ignore_eos = ignore_eos
-        self.skip_special_tokens = skip_special_tokens
-        self.spaces_between_special_tokens = spaces_between_special_tokens
-        self.no_stop_trim = no_stop_trim
+        self.ignore_eos = ignore_eos if ignore_eos is not None else False
+        self.skip_special_tokens = (
+            skip_special_tokens if skip_special_tokens is not None else True
+        )
+        self.spaces_between_special_tokens = (
+            spaces_between_special_tokens
+            if spaces_between_special_tokens is not None
+            else True
+        )
+        self.no_stop_trim = no_stop_trim if no_stop_trim is not None else False
         self.custom_params = custom_params
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias

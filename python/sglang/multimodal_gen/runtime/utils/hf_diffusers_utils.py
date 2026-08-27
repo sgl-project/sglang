@@ -26,12 +26,11 @@ import shutil
 import time
 from functools import reduce
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional, Union, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
-from huggingface_hub import snapshot_download
 from huggingface_hub.errors import (
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
@@ -40,11 +39,19 @@ from huggingface_hub.errors import (
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 from transformers import AutoConfig, PretrainedConfig
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.model_overlay import (
+    maybe_load_overlay_model_index,
+    maybe_resolve_overlay_model_path,
+)
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    normalize_flat_modelopt_quant_config,
+)
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -68,15 +75,15 @@ def _check_index_files_for_missing_shards(
     missing_files = []
     checked_subdirs = []
 
-    # Check the root directory and all subdirectories that might contain model weights
-    dirs_to_check = [model_path]
-
     # Add common subdirectories for diffusers models
     try:
         subdirs = os.listdir(model_path)
     except OSError as e:
         logger.warning("Failed to list model directory %s: %s", model_path, e)
         return True, [], []  # Assume valid if we can't check
+
+    # Check the root directory and all subdirectories that might contain model weights
+    dirs_to_check = [model_path]
 
     for subdir in subdirs:
         subdir_path = os.path.join(model_path, subdir)
@@ -175,7 +182,6 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     """
     if not is_in_ci():
         return True, False
-
     is_valid, missing_files, checked_subdirs = _check_index_files_for_missing_shards(
         model_path
     )
@@ -205,6 +211,34 @@ def _ci_validate_diffusers_model(model_path: str) -> tuple[bool, bool]:
     return True, False
 
 
+def _verify_diffusers_model_complete(path: str) -> bool:
+    """Check if a diffusers model directory has all required component subdirectories."""
+    config_path = os.path.join(path, "model_index.json")
+    if not os.path.exists(config_path):
+        return False
+
+    try:
+        with open(config_path) as config_file:
+            model_index = json.load(config_file)
+    except Exception as exc:
+        logger.warning("Failed to read model_index.json at %s: %s", config_path, exc)
+        return False
+
+    component_keys = [
+        key
+        for key, value in model_index.items()
+        if isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(item, str) for item in value)
+    ]
+    if component_keys:
+        return all(os.path.exists(os.path.join(path, key)) for key in component_keys)
+
+    return os.path.exists(os.path.join(path, "transformer")) and os.path.exists(
+        os.path.join(path, "vae")
+    )
+
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     # ChatGLMConfig.model_type: ChatGLMConfig,
     # DbrxConfig.model_type: DbrxConfig,
@@ -231,8 +265,7 @@ def get_hf_config(
     model_override_args: dict | None = None,
     **kwargs,
 ) -> PretrainedConfig:
-    is_gguf = check_gguf_file(component_model_path)
-    if is_gguf:
+    if check_gguf_file(component_model_path):
         raise NotImplementedError("GGUF models are not supported.")
 
     config = AutoConfig.from_pretrained(
@@ -249,13 +282,6 @@ def get_hf_config(
     if model_override_args:
         config.update(model_override_args)
 
-    # Special architecture mapping check for GGUF models
-    if is_gguf:
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
-
     return config
 
 
@@ -266,14 +292,9 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
-    try:
-        config = AutoConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
-    except ValueError as e:
-        raise e
-
-    return config
+    return AutoConfig.from_pretrained(
+        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
 
 
 def load_dict(file_path):
@@ -293,30 +314,69 @@ def load_dict(file_path):
         ) from e
 
 
+def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
+    """Download component repos if needed and patch legacy flat ModelOpt configs."""
+    local_component_path = (
+        maybe_download_model(component_path)
+        if not os.path.exists(component_path)
+        else component_path
+    )
+    config_path = os.path.join(local_component_path, "config.json")
+    if not os.path.exists(config_path):
+        return local_component_path
+
+    with get_lock(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = cast(dict[str, Any], json.load(f))
+        except Exception as exc:
+            logger.warning("Failed to read component config %s: %s", config_path, exc)
+            return local_component_path
+
+        quant_config = config.get("quantization_config")
+        normalized_quant_config = normalize_flat_modelopt_quant_config(quant_config)
+        if normalized_quant_config == quant_config:
+            return local_component_path
+
+        config["quantization_config"] = normalized_quant_config
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+            f.write("\n")
+        logger.warning(
+            "Patched legacy flat ModelOpt quantization_config at %s with quant_type=%s "
+            "for diffusers compatibility.",
+            config_path,
+            normalized_quant_config.get("quant_type"),
+        )
+
+    return local_component_path
+
+
 def get_diffusers_component_config(
-    model_path: str,
+    component_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
-
     # Download from HuggingFace Hub if path doesn't exist locally
-    if not os.path.exists(model_path):
-        model_path = maybe_download_model(model_path)
+    component_path = prepare_diffusers_component_path_for_loading(component_path)
 
-    # tokenizer
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in model_path:
+    if "scheduler" in component_path:
         config_names.append("scheduler_config.json")
     else:
         config_names.append("config.json")
 
     config_file_paths = [
-        os.path.join(model_path, config_name) for config_name in config_names
+        os.path.join(component_path, config_name) for config_name in config_names
     ]
 
     combined_config = reduce(
         lambda acc, path: acc | load_dict(path), config_file_paths, {}
     )
+
+    _clean_hf_config_inplace(combined_config)
+
+    logger.debug("HF model config: %s", combined_config)
 
     return combined_config
 
@@ -337,9 +397,9 @@ CONTEXT_LENGTH_KEYS = [
 def attach_additional_stop_token_ids(tokenizer):
     # Special handling for stop token <|eom_id|> generated by llama 3 tool use.
     if "<|eom_id|>" in tokenizer.get_added_vocab():
-        tokenizer.additional_stop_token_ids = set(
-            [tokenizer.get_added_vocab()["<|eom_id|>"]]
-        )
+        tokenizer.additional_stop_token_ids = {
+            tokenizer.get_added_vocab()["<|eom_id|>"]
+        }
     else:
         tokenizer.additional_stop_token_ids = None
 
@@ -358,7 +418,10 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
 
 
 def maybe_download_lora(
-    model_name_or_path: str, local_dir: str | None = None, download: bool = True
+    model_name_or_path: str,
+    local_dir: str | None = None,
+    download: bool = True,
+    weight_name: str | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -366,6 +429,8 @@ def maybe_download_lora(
         model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
+        weight_name: Specific safetensors filename to load (pins deterministic selection
+                     for repos with multiple weight files)
 
     Returns:
         Local path to the model
@@ -383,14 +448,22 @@ def maybe_download_lora(
     if os.path.isfile(local_path):
         return local_path
 
-    weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    if weight_name is not None:
+        target = os.path.join(local_path, weight_name)
+        if not os.path.isfile(target):
+            raise FileNotFoundError(
+                f"Specified lora_weight_name '{weight_name}' not found in {local_path}"
+            )
+        return target
+
+    guessed = _best_guess_weight_name(local_path, file_extension=".safetensors")
     # AMD workaround: PR 15813 changed from model_name_or_path to local_path,
     # which can return None. Fall back to original behavior on ROCm.
-    if weight_name is None and current_platform.is_rocm():
-        weight_name = _best_guess_weight_name(
+    if guessed is None and current_platform.is_rocm():
+        guessed = _best_guess_weight_name(
             model_name_or_path, file_extension=".safetensors"
         )
-    return os.path.join(local_path, weight_name)
+    return os.path.join(local_path, guessed)
 
 
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
@@ -412,20 +485,6 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
             "Only HuggingFace diffusers format is supported."
         )
 
-    # Check for transformer and vae directories
-    transformer_dir = os.path.join(model_path, "transformer")
-    vae_dir = os.path.join(model_path, "vae")
-
-    if not os.path.exists(transformer_dir):
-        raise ValueError(
-            f"Model directory {model_path} does not contain a transformer/ directory."
-        )
-
-    if not os.path.exists(vae_dir):
-        raise ValueError(
-            f"Model directory {model_path} does not contain a vae/ directory."
-        )
-
     # Load the config
     with open(config_path) as f:
         config = json.load(f)
@@ -435,6 +494,37 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
         raise ValueError("model_index.json does not contain _diffusers_version")
 
     logger.info("Diffusers version: %s", config["_diffusers_version"])
+
+    component_keys = [
+        key
+        for key, value in config.items()
+        if isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(item, str) for item in value)
+    ]
+    if component_keys:
+        missing_components = [
+            component_key
+            for component_key in component_keys
+            if not os.path.exists(os.path.join(model_path, component_key))
+        ]
+        if missing_components:
+            missing_str = ", ".join(missing_components)
+            raise ValueError(
+                f"Model directory {model_path} is missing required component "
+                f"directories: {missing_str}."
+            )
+    else:
+        transformer_dir = os.path.join(model_path, "transformer")
+        vae_dir = os.path.join(model_path, "vae")
+        if not os.path.exists(transformer_dir):
+            raise ValueError(
+                f"Model directory {model_path} does not contain a transformer/ directory."
+            )
+        if not os.path.exists(vae_dir):
+            raise ValueError(
+                f"Model directory {model_path} does not contain a vae/ directory."
+            )
     return cast(dict[str, Any], config)
 
 
@@ -450,10 +540,17 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     import tempfile
 
-    from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
-    # If it's a local path, verify it directly
+    overlay_config = maybe_load_overlay_model_index(
+        model_name_or_path,
+        snapshot_download_fn=snapshot_download,
+        hf_hub_download_fn=hf_hub_download,
+    )
+    if overlay_config is not None:
+        return overlay_config
+
+    # If it's a local path, verify it directly.
     if os.path.exists(model_name_or_path):
         try:
             return verify_model_config_and_directory(model_name_or_path)
@@ -494,14 +591,14 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             # Add the pipeline name for downstream use
             config["pipeline_name"] = config["_class_name"]
 
-            logger.info(
+            logger.debug(
                 "Downloaded model_index.json for %s, pipeline: %s",
                 model_name_or_path,
                 config["_class_name"],
             )
             return config
     except EntryNotFoundError:
-        logger.warning(
+        logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
@@ -527,6 +624,8 @@ def maybe_download_model(
     download: bool = True,
     is_lora: bool = False,
     allow_patterns: list[str] | None = None,
+    force_diffusers_model: bool = False,
+    skip_overlay_resolution: bool = False,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -536,26 +635,30 @@ def maybe_download_model(
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
-
+        force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
     Returns:
         Local path to the model
     """
-
-    def _verify_model_complete(path: str) -> bool:
-        """Check if model directory has required subdirectories."""
-        transformer_dir = os.path.join(path, "transformer")
-        vae_dir = os.path.join(path, "vae")
-        config_path = os.path.join(path, "model_index.json")
-        return (
-            os.path.exists(config_path)
-            and os.path.exists(transformer_dir)
-            and os.path.exists(vae_dir)
+    if force_diffusers_model and not skip_overlay_resolution:
+        # return overlay model path if applicable
+        overlay_model_path = maybe_resolve_overlay_model_path(
+            model_name_or_path,
+            local_dir=local_dir,
+            download=download,
+            allow_patterns=allow_patterns,
+            snapshot_download_fn=snapshot_download,
+            hf_hub_download_fn=hf_hub_download,
+            verify_diffusers_model_complete_fn=_verify_diffusers_model_complete,
+            base_model_download_fn=maybe_download_model,
         )
+        if overlay_model_path is not None:
+            return overlay_model_path
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
-        if is_lora or _verify_model_complete(model_name_or_path):
-            # CI validation: check all subdirectories for missing shards
+        if not force_diffusers_model:
+            return model_name_or_path
+        if is_lora or _verify_diffusers_model_complete(model_name_or_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(
                     model_name_or_path
@@ -569,8 +672,6 @@ def maybe_download_model(
                         )
                         # Fall through to download
                     else:
-                        # Local path is not in HF cache structure, can't clean up
-                        # Raise error since we can't fix this automatically
                         raise ValueError(
                             f"CI validation failed for local model at {model_name_or_path}. "
                             "Some safetensors shards are missing. "
@@ -584,7 +685,7 @@ def maybe_download_model(
                 return model_name_or_path
         else:
             logger.warning(
-                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "Local model at %s appears incomplete (missing required components), "
                 "will attempt re-download",
                 model_name_or_path,
             )
@@ -600,29 +701,25 @@ def maybe_download_model(
             ignore_patterns=["*.onnx", "*.msgpack"],
             local_dir=local_dir,
             local_files_only=True,
-            resume_download=True,
             max_workers=8,
-            etag_timeout=60,
         )
-        if is_lora or _verify_model_complete(local_path):
-            # CI validation: check all subdirectories for missing shards
+        if not force_diffusers_model:
+            return str(local_path)
+        if is_lora or _verify_diffusers_model_complete(local_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
-                    if cleanup_performed:
-                        logger.warning(
-                            "CI validation failed for cached model at %s, "
-                            "cache has been cleaned up, will re-download",
-                            local_path,
-                        )
-                        # Fall through to download
-                    else:
-                        # This shouldn't happen for HF cache paths, but handle it
-                        logger.warning(
-                            "CI validation failed for cached model at %s, "
-                            "but cleanup was not performed, will attempt re-download",
-                            local_path,
-                        )
+                    logger.warning(
+                        "CI validation failed for cached model at %s, "
+                        "%s, will re-download",
+                        local_path,
+                        (
+                            "cache has been cleaned up"
+                            if cleanup_performed
+                            else "cleanup was not performed"
+                        ),
+                    )
+                    # Fall through to download
                 else:
                     logger.info("Found complete model in cache at %s", local_path)
                     return str(local_path)
@@ -630,7 +727,6 @@ def maybe_download_model(
                 logger.info("Found complete model in cache at %s", local_path)
                 return str(local_path)
         else:
-            # Model found in cache but incomplete
             if not download:
                 raise ValueError(
                     f"Model {model_name_or_path} found in cache but is incomplete and download=False."
@@ -671,13 +767,13 @@ def maybe_download_model(
                     ignore_patterns=["*.onnx", "*.msgpack"],
                     allow_patterns=allow_patterns,
                     local_dir=local_dir,
-                    resume_download=True,
                     max_workers=8,
-                    etag_timeout=120,
                 )
 
+            if not force_diffusers_model:
+                return str(local_path)
             # Verify downloaded model is complete (skip for LoRA)
-            if not is_lora and not _verify_model_complete(local_path):
+            elif not is_lora and not _verify_diffusers_model_complete(local_path):
                 logger.warning(
                     "Downloaded model at %s is incomplete, retrying with force_download=True",
                     local_path,
@@ -687,12 +783,10 @@ def maybe_download_model(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
                         local_dir=local_dir,
-                        resume_download=True,
                         max_workers=8,
-                        etag_timeout=60,
                         force_download=True,
                     )
-                if not _verify_model_complete(local_path):
+                if not _verify_diffusers_model_complete(local_path):
                     raise ValueError(
                         f"Downloaded model at {local_path} is still incomplete after forced re-download. "
                         "The model repository may be missing required components (model_index.json, transformer/, or vae/)."
@@ -737,3 +831,70 @@ def maybe_download_model(
             raise ValueError(
                 f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
             ) from e
+
+
+# Unified download functions with Hugging Face-compatible names
+def hf_hub_download(
+    repo_id: str,
+    filename: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    **kwargs,
+) -> str:
+    """Unified hf_hub_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import model_file_download
+
+        return model_file_download(
+            model_id=repo_id,
+            file_path=filename,
+            cache_dir=local_dir,
+            **kwargs,
+        )
+    else:
+        from huggingface_hub import hf_hub_download as _hf_hub_download
+
+        return _hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=local_dir,
+            **kwargs,
+        )
+
+
+def snapshot_download(
+    repo_id: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    ignore_patterns: Optional[Union[list[str], str]] = None,
+    allow_patterns: Optional[Union[list[str], str]] = None,
+    local_files_only: bool = False,
+    max_workers: int = 8,
+    **kwargs,
+) -> str:
+    """Unified snapshot_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import snapshot_download as _ms_snapshot_download
+
+        ms_kwargs = {
+            "model_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+        }
+        ms_kwargs.update(kwargs)
+        return _ms_snapshot_download(**ms_kwargs)
+    else:
+        from huggingface_hub import snapshot_download as _hf_snapshot_download
+
+        hf_kwargs = {
+            "repo_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+            "etag_timeout": 60,
+        }
+        hf_kwargs.update(kwargs)
+        return _hf_snapshot_download(**hf_kwargs)

@@ -14,8 +14,7 @@ number = 5
 
 @sgl.function
 def expand_tip(s, topic, tip):
-    s += (
-        """Please expand a tip for a topic into a detailed paragraph.
+    s += """Please expand a tip for a topic into a detailed paragraph.
 
 Topic: staying healthy
 Tip: Regular Exercise
@@ -29,12 +28,7 @@ Topic: writing a blog post
 Tip: structure your content effectively
 Paragraph: A well-structured post is easier to read and more enjoyable. Start with an engaging introduction that hooks the reader and clearly states the purpose of your post. Use headings and subheadings to break up the text and guide readers through your content. Bullet points and numbered lists can make information more digestible. Ensure each paragraph flows logically into the next, and conclude with a summary or call-to-action that encourages reader engagement.
 
-Topic: """
-        + topic
-        + "\nTip: "
-        + tip
-        + "\nParagraph:"
-    )
+Topic: """ + topic + "\nTip: " + tip + "\nParagraph:"
     s += sgl.gen("paragraph", max_tokens=128, stop=["\n\n"], temperature=0)
 
 

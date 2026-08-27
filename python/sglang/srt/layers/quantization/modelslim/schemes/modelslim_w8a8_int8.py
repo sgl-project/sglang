@@ -14,10 +14,10 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
+from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
 
 
-class ModelSlimW8A8Int8(ModelSlimScheme):
+class ModelSlimW8A8Int8(ModelSlimLinearScheme):
 
     def __init__(
         self,

@@ -15,7 +15,7 @@
 import multiprocessing as mp
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.lora_utils import (
     LORA_MODELS_QWEN3,
     run_lora_multiple_batch_on_model_cases,
@@ -24,10 +24,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(
     est_time=30,
-    suite="stage-b-test-small-1-gpu-amd",
+    suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/13107",
 )
-register_cuda_ci(est_time=97, suite="nightly-1-gpu", nightly=True)
 
 
 class TestLoRAQwen3(CustomTestCase):

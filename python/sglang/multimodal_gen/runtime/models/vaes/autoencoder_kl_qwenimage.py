@@ -13,7 +13,10 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -789,6 +792,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.input_channels = config.arch_config.input_channels
         self.latents_mean = config.arch_config.latents_mean
         self.config = config.arch_config
+        self.use_parallel_decode = config.use_parallel_decode
 
         self.encoder = QwenImageEncoder3d(
             base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout,
@@ -840,6 +844,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             .view(1, latent_channels, 1, 1, 1)
             .to(cuda_device, dtype)
         )
+
+
 
     def enable_tiling(
         self,
@@ -956,30 +962,62 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         return posterior
 
-    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+    def _decode_with_parallel_dispatch(self, z: torch.Tensor) -> DecoderOutput:
+        if self.use_parallel_decode and get_sp_world_size() > 1:
+            num_frame = z.shape[2]
+            num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
+            tile_latent_min_height = (
+                self.tile_sample_min_height // self.spatial_compression_ratio
+            )
+            tile_latent_min_width = (
+                self.tile_sample_min_width // self.spatial_compression_ratio
+            )
+            mode = self.parallel_decode_mode
+            if mode == "auto":
+                if (
+                    z.shape[-2] > tile_latent_min_height
+                    or z.shape[-1] > tile_latent_min_width
+                ):
+                    mode = "tiled"
+                else:
+                    mode = "patch"
+
+            if mode == "patch":
+                decoded = super().parallel_patch_decode(z)[:, :, :num_sample_frames]
+            else:
+                decoded = super().parallel_tiled_decode(z)[:, :, :num_sample_frames]
+            return DecoderOutput(sample=decoded)
+
+        return DecoderOutput(sample=self._decode(z))
+
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
         _, _, num_frame, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
 
         if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
-            return self.tiled_decode(z, return_dict=return_dict)
+            return self.tiled_decode(z).sample
 
         self.clear_cache()
         x = self.post_quant_conv(z)
         for i in range(num_frame):
             self._conv_idx = [0]
             if i == 0:
-                out = self.decoder(x[:, :, i: i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
             else:
-                out_ = self.decoder(x[:, :, i: i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out_ = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
                 out = torch.cat([out, out_], 2)
-
         out = torch.clamp(out, min=-1.0, max=1.0)
         self.clear_cache()
-        if not return_dict:
-            return (out,)
-
-        return DecoderOutput(sample=out)
+        return out
 
     def decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
         r"""
@@ -996,27 +1034,44 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 returned.
         """
         if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
+            decoded_slices = [
+                self._decode_with_parallel_dispatch(z_slice).sample
+                for z_slice in z.split(1)
+            ]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z).sample
+            decoded = self._decode_with_parallel_dispatch(z).sample
 
         return decoded
 
-    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_v(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
-                y / blend_extent
-            )
+        if blend_extent <= 0:
+            return b
+        weight = (
+            torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent
+        ).view(1, 1, 1, blend_extent, 1)
+        b[:, :, :, :blend_extent, :] = (
+            a[:, :, :, -blend_extent:, :] * (1 - weight)
+            + b[:, :, :, :blend_extent, :] * weight
+        )
         return b
 
-    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_h(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
-                x / blend_extent
-            )
+        if blend_extent <= 0:
+            return b
+        weight = (
+            torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent
+        ).view(1, 1, 1, 1, blend_extent)
+        b[:, :, :, :, :blend_extent] = (
+            a[:, :, :, :, -blend_extent:] * (1 - weight)
+            + b[:, :, :, :, :blend_extent] * weight
+        )
         return b
 
     def tiled_encode(self, x: torch.Tensor) -> AutoencoderKLOutput:

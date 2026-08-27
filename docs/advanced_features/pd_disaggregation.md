@@ -130,9 +130,11 @@ PD Disaggregation with Mooncake supports the following environment variables for
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
 
 ```bash
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=True
 ```
+
+The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
 
 #### Prefill Server Configuration
 | Variable | Description | Default |
@@ -140,6 +142,7 @@ export MC_FORCE_MNNVL=True
 | **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KVCache transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
 | **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the number of parallel transfer queues. KVCache transfer requests from multiple decode instances will be sharded into these queues so that they can share the threads and the transfer bandwidth at the same time. If it is set to `1`, then we transfer requests one by one according to fcfs strategy | `4` |
 | **`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`** | Timeout (seconds) for receiving destination KV indices during request initialization | `300` |
+| **`SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL`** | Interval (seconds) between cleanups of bootstrap entries | `120` |
 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600` (10 minutes) to relax the timeout condition.
 Please be aware that this setting will cause prefill instances to take a longer time to clean up the affected memory resources when a running decode node loses connection.
@@ -153,6 +156,58 @@ Please be aware that this setting will cause prefill instances to take a longer 
 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600` (10 minutes) to relax the timeout condition.
 
+
+## Heterogeneous TP with GPU Staging Buffer
+
+When prefill and decode use different tensor parallelism (TP) sizes (e.g., prefill TP=4, decode DP attention with TP=1), the KV cache memory layout differs between the two sides. The **GPU staging buffer** solves this by gathering KV head slices into a contiguous buffer on the prefill side, performing bulk RDMA transfer, then scattering into the correct KV cache pages on the decode side. This provides **2–5x throughput improvement** over the default per-token slice approach at high concurrency and matches homogeneous TP baselines within ~5%.
+
+Enable the staging buffer when prefill and decode use **different TP sizes** with the **Mooncake** transfer backend. When both sides use the same TP size, staging is automatically bypassed even if enabled.
+
+> **Note:** The staging buffer is designed for non-MLA models (e.g. GQA, MHA). MLA models (e.g. DeepSeek-V2/V3) should not enable this flag.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|:---------|:------------|:-------:|
+| **`SGLANG_DISAGG_STAGING_BUFFER`** | Enable GPU staging buffer for heterogeneous TP KV transfer | `False` |
+| **`SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB`** | Prefill-side per-worker staging buffer size in MB | `64` |
+| **`SGLANG_DISAGG_STAGING_POOL_SIZE_MB`** | Decode-side ring buffer pool total size in MB | `4096` |
+
+### Usage Example
+
+```bash
+# Set staging buffer environment variables on BOTH prefill and decode
+export SGLANG_DISAGG_STAGING_BUFFER=1
+export SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=64
+export SGLANG_DISAGG_STAGING_POOL_SIZE_MB=4096
+
+# Prefill with TP=4
+python -m sglang.launch_server \
+  --model-path $MODEL_PATH \
+  --disaggregation-mode prefill \
+  --port 30000 \
+  --tp 4 \
+  --trust-remote-code \
+  --disaggregation-ib-device mlx5_1,mlx5_2
+
+# Decode with TP=1 (or DP attention with effective attention TP=1)
+python -m sglang.launch_server \
+  --model-path $MODEL_PATH \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --tp 4 \
+  --dp 4 \
+  --enable-dp-attention \
+  --trust-remote-code \
+  --disaggregation-ib-device mlx5_3,mlx5_4
+
+# Router
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://127.0.0.1:30000 \
+  --decode http://127.0.0.1:30001 \
+  --host 0.0.0.0 --port 8000
+```
 
 ## NIXL
 ### Requirements

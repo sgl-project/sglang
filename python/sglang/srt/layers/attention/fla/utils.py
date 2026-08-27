@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import inspect
 import logging
 import os
 import sys
@@ -14,10 +15,22 @@ import torch
 import triton
 from packaging import version
 
+from sglang.srt.utils.common import torch_release
+
 logger = logging.getLogger(__name__)
 
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
+FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
+
+
+SUPPORTS_AUTOTUNE_CACHE = (
+    "cache_results" in inspect.signature(triton.autotune).parameters
+)
+
+autotune_cache_kwargs = (
+    {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
+)
 
 
 @lru_cache(maxsize=1)
@@ -204,11 +217,6 @@ def checkpoint(fn):
     return wrapper
 
 
-@lru_cache(maxsize=None)
-def check_pytorch_version(version_s: str = "2.4") -> bool:
-    return version.parse(torch.__version__) >= version.parse(version_s)
-
-
 def _cpu_device_warning():
     import warnings
 
@@ -309,7 +317,7 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return False
 
 
-if check_pytorch_version("2.4"):
+if torch_release >= (2, 4):
     device = "cuda" if device == "cpu" else device
     autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
     autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
@@ -326,3 +334,6 @@ else:
 
     def custom_device_ctx(index: int):
         return torch.cuda.device(index)
+
+
+device_platform = get_available_device()

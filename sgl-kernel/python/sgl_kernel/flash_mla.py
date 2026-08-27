@@ -35,6 +35,9 @@ def get_mla_metadata(
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
     if is_fp8_kvcache and topk is None:
         return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
             cache_seqlens,
@@ -86,6 +89,9 @@ def flash_mla_with_kvcache(
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
         softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if indices is not None:
@@ -149,6 +155,9 @@ def flash_mla_sparse_fwd(
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
     )

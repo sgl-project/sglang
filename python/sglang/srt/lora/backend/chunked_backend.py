@@ -1,11 +1,20 @@
+import dataclasses
+from typing import List, Optional, Tuple
+
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
+    chunked_embedding_lora_a_forward,
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
-from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    generate_sequence_lengths,
+    get_lm_head_pruned_lens,
+    merge_and_chunk_segments,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 
@@ -33,14 +42,42 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         super().__init__(max_loras_per_batch, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
 
-    def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+    def run_lora_a_embedding(
+        self,
+        input_ids: torch.Tensor,
+        weights: torch.Tensor,
+        vocab_size: int,
+        extra_embeddings: torch.Tensor = None,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
+        assert (
+            extra_embeddings is None
+        ), "Extra embeddings for lora a is not supported yet in chunked backend"
+        return chunked_embedding_lora_a_forward(
+            input_ids=input_ids,
+            weights=weights,
+            batch_info=self.batch_info,
+            vocab_size=vocab_size,
+        )
+
+    def run_lora_a_sgemm(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
+        stack_num: int = 1,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
         return chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=weights,
-            batch_info=self.batch_info,
-            num_slices=1,
+            batch_info=batch_info,
+            num_slices=stack_num,
         )
 
     def run_lora_b_sgemm(
@@ -49,16 +86,20 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         weights: torch.Tensor,
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
         max_slice_size = output_dim
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
         return chunked_sgmv_lora_expand_forward(
             x=x,
             weights=weights,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             slice_offsets=output_offset,
             max_slice_size=max_slice_size,
             base_output=base_output,
@@ -72,20 +113,21 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
-        # qkv_lora_a: (num_lora, 3 * r, input_dim)
-        # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+        # qkv_lora_a: (num_lora, n_slices * r, input_dim)
+        # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         lora_a_output = chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=qkv_lora_a,
             batch_info=self.batch_info,
-            num_slices=3,
+            num_slices=n_slices,
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
@@ -141,15 +183,18 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         Returns:
             The determined chunk size
         """
-
-        if self.max_chunk_size <= MIN_CHUNK_SIZE:
-            return MIN_CHUNK_SIZE
-
         num_tokens = (
             forward_batch.extend_num_tokens
             if forward_batch.forward_mode.is_extend()
             else forward_batch.batch_size
         )
+        return self._determine_chunk_size_for_tokens(num_tokens)
+
+    def _determine_chunk_size_for_tokens(self, num_tokens: int) -> int:
+        """Determine chunk size given a token count directly."""
+        if self.max_chunk_size <= MIN_CHUNK_SIZE:
+            return MIN_CHUNK_SIZE
+
         if num_tokens >= 256:
             chunk_size = 128
         elif num_tokens >= 64:
@@ -157,6 +202,18 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         else:  # num_tokens < 64
             chunk_size = 16
         return min(self.max_chunk_size, chunk_size)
+
+    @staticmethod
+    def _build_req_seg_indptr(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Build per-request cumulative token boundaries on CPU (pinned)."""
+        bs = forward_batch.batch_size
+        if forward_batch.forward_mode.is_decode():
+            indptr = torch.arange(bs + 1, dtype=torch.int32, pin_memory=True)
+        else:
+            seg_lens = generate_sequence_lengths(forward_batch, device="cpu")
+            indptr = torch.zeros(bs + 1, dtype=torch.int32, pin_memory=True)
+            torch.cumsum(seg_lens, dim=0, out=indptr[1:])
+        return indptr
 
     def init_cuda_graph_batch_info(
         self,
@@ -179,6 +236,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 num_segments=None,  # Set per batch
                 max_len=None,  # Not used in CSGMV backend
+                req_seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                req_weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
             )
 
     def prepare_lora_batch(
@@ -209,9 +268,15 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             scalings, dtype=torch.float, pin_memory=True, device="cpu"
         )
 
+        bs = forward_batch.batch_size
+        req_wi_tensor = torch.tensor(
+            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+        )
+        req_seg_indptr_cpu = self._build_req_seg_indptr(forward_batch)
+
         if not use_cuda_graph:
             batch_info = LoRABatchInfo(
-                bs=forward_batch.batch_size,
+                bs=bs,
                 num_segments=num_segments,
                 max_len=chunk_size,
                 use_cuda_graph=False,
@@ -230,12 +295,17 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 permutation=torch.empty(
                     (len(permutation),), dtype=torch.int32, device=self.device
                 ),
-                # Not used in chunked kernels
                 seg_lens=None,
+                req_seg_indptr=torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                ),
+                req_weight_indices=torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                ),
             )
         else:
             batch_info = self.cuda_graph_batch_info
-            batch_info.bs = forward_batch.batch_size
+            batch_info.bs = bs
             batch_info.num_segments = num_segments
             batch_info.max_len = chunk_size
 
@@ -251,8 +321,89 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
+        batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
+        batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
 
         self.batch_info = batch_info
+        self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
+            self._prepare_lm_head_batch_info(forward_batch, weight_indices, batch_info)
+        )
+
+    def _prepare_lm_head_batch_info(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        batch_info: LoRABatchInfo,
+    ) -> Tuple[Optional[LoRABatchInfo], Optional[List[LoRABatchInfo]]]:
+
+        # Precompute lm_head_batch_info for pruned lm_head LoRA
+        pruned_lens = get_lm_head_pruned_lens(forward_batch)
+        lm_head_batch_info = None
+        lm_head_pass_batch_infos = None
+
+        if pruned_lens is not None:
+            pruned_total = sum(pruned_lens)
+            chunk_size = self._determine_chunk_size_for_tokens(pruned_total)
+            lm_head_segments = merge_and_chunk_segments(
+                weight_indices, pruned_lens, chunk_size=chunk_size
+            )
+            lm_head_batch_info = self._build_lm_head_batch_info(
+                lm_head_segments, batch_info, chunk_size, pruned_total
+            )
+
+            # Precompute per-pass batch_infos for logprobs chunking
+            pass_segments = self._get_lm_head_pass_segments(weight_indices, pruned_lens)
+            if pass_segments is not None:
+                lm_head_pass_batch_infos = []
+                for seg_wi, seg_lens_list in pass_segments:
+                    pass_total = sum(seg_lens_list)
+                    pass_chunk_size = self._determine_chunk_size_for_tokens(pass_total)
+                    chunked_segments = merge_and_chunk_segments(
+                        seg_wi, seg_lens_list, chunk_size=pass_chunk_size
+                    )
+                    lm_head_pass_batch_infos.append(
+                        self._build_lm_head_batch_info(
+                            chunked_segments,
+                            batch_info,
+                            pass_chunk_size,
+                            pass_total,
+                        )
+                    )
+
+        return lm_head_batch_info, lm_head_pass_batch_infos
+
+    def _build_lm_head_batch_info(
+        self,
+        lm_head_segments: Tuple[List[int], List[int]],
+        batch_info: LoRABatchInfo,
+        chunk_size: int,
+        expected_tokens: int,
+    ) -> LoRABatchInfo:
+        seg_weight_indices_cpu, seg_lens_cpu = lm_head_segments
+        pruned_total = sum(seg_lens_cpu)
+        num_segments = len(seg_weight_indices_cpu)
+
+        weight_indices = torch.tensor(
+            seg_weight_indices_cpu, dtype=torch.int32, device=self.device
+        )
+        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32, device=self.device)
+        seg_indptr = torch.zeros(
+            (num_segments + 1,), dtype=torch.int32, device=self.device
+        )
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+
+        # Identity permutation (lm_head tokens are in original order)
+        permutation = torch.arange(pruned_total, dtype=torch.int32, device=self.device)
+
+        return dataclasses.replace(
+            batch_info,
+            num_segments=num_segments,
+            max_len=chunk_size,
+            seg_indptr=seg_indptr,
+            weight_indices=weight_indices,
+            permutation=permutation,
+            expected_tokens=expected_tokens,
+        )
 
     @staticmethod
     def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):

@@ -32,6 +32,9 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils import BaseOutput
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -51,7 +54,9 @@ class FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
     prev_sample: torch.FloatTensor
 
 
-class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
+class FlowMatchEulerDiscreteScheduler(
+    SchedulerMixin, ConfigMixin, BaseScheduler, SchedulerRLMixin
+):
     """
     Euler scheduler.
 
@@ -447,6 +452,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
         s_noise: float = 1.0,
         generator: torch.Generator | None = None,
         per_token_timesteps: torch.Tensor | None = None,
+        batch=None,
         return_dict: bool = True,
     ) -> FlowMatchEulerDiscreteSchedulerOutput | tuple[torch.FloatTensor, ...]:
         """
@@ -516,12 +522,19 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin, BaseScheduler
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
-        if self.config.stochastic_sampling:
-            x0 = sample - current_sigma * model_output
-            noise = torch.randn_like(sample)
-            prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
+        if batch is not None and batch.rollout:
+            if not self.already_prepared_rollout(batch):
+                raise RuntimeError("Rollout not prepared before step")
+            prev_sample = self.flow_sde_sampling(
+                batch, model_output, sample, current_sigma, next_sigma, generator
+            )
         else:
-            prev_sample = sample + dt * model_output
+            if self.config.stochastic_sampling:
+                x0 = sample - current_sigma * model_output
+                noise = torch.randn_like(sample)
+                prev_sample = (1.0 - next_sigma) * x0 + next_sigma * noise
+            else:
+                prev_sample = sample + dt * model_output
 
         # upon completion increase step index by one
         assert self._step_index is not None, "_step_index should not be None"

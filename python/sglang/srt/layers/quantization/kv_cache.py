@@ -40,6 +40,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale = torch.nn.Parameter(
             torch.tensor(-1.0, dtype=torch.float32), requires_grad=False
         )
+        layer.k_scale._skip_weight_check = True
+        layer.v_scale._skip_weight_check = True
 
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")

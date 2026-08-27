@@ -52,14 +52,22 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
+from sglang.kernel_api_logging import debug_kernel_api
+
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_func
 except ImportError:
     flash_attn_varlen_func = None
 
 from sglang.srt.configs import MoonViTConfig
+from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.utils import add_prefix
 
 
+@debug_kernel_api
 def multihead_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -246,7 +254,7 @@ class MoonVisionPatchEmbed(nn.Module):
         ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
         self.patch_size = patch_size
 
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_dim, out_dim, kernel_size=patch_size, stride=patch_size
         )
 
@@ -393,21 +401,53 @@ class MLP2(nn.Module):
         bias: whether to use bias in linear layer.
     """
 
-    def __init__(self, dims: list[int], activation, bias=True):
+    def __init__(
+        self,
+        dims: list[int],
+        activation,
+        bias: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
         assert len(dims) == 3
-        self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)
-        self.fc1 = nn.Linear(dims[1], dims[2], bias=bias)
+
+        self.quant_config = quant_config
+        if isinstance(self.quant_config, ModelSlimConfig):
+            self.fc0 = ReplicatedLinear(
+                dims[0],
+                dims[1],
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("fc0", prefix),
+            )
+            self.fc1 = ReplicatedLinear(
+                dims[1],
+                dims[2],
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("fc1", prefix),
+            )
+        else:
+            self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)
+            self.fc1 = nn.Linear(dims[1], dims[2], bias=bias)
+            for m in [self.fc0, self.fc1]:
+                nn.init.trunc_normal_(m.weight, std=math.sqrt(2 / m.in_features))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         self.activation = activation
-        for m in [self.fc0, self.fc1]:
-            nn.init.trunc_normal_(m.weight, std=math.sqrt(2 / m.in_features))
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc0(x)
-        x = self.activation(x)
-        return self.fc1(x)
+        if isinstance(self.quant_config, ModelSlimConfig):
+            x = x.flatten(0, 1)
+            x, _ = self.fc0(x)
+            x = self.activation(x)
+            x, _ = self.fc1(x)
+        else:
+            x = self.fc0(x)
+            x = self.activation(x)
+            x = self.fc1(x)
+        return x
 
 
 class MoonVitEncoderLayer(nn.Module):

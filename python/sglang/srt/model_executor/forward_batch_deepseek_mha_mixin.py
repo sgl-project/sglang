@@ -28,6 +28,9 @@ class ForwardBatchDeepSeekMHAMixin:
     prefix_chunk_cu_seq_lens: Optional[torch.Tensor] = None
     # Max lengths of prefix cache for each chunk, (num_prefix_chunks,)
     prefix_chunk_max_seq_lens: Optional[List[int]] = None
+    # Per-chunk flag: True if any sequence has kv_len==0 in that chunk.
+    # Precomputed on CPU to avoid GPU-CPU sync in the hot path.
+    prefix_chunk_has_zero_kv: Optional[List[bool]] = None
     # Number of tokens in each prefix cache chunk, (num_prefix_chunks,)
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
@@ -162,6 +165,13 @@ class ForwardBatchDeepSeekMHAMixin:
 
         self.prefix_chunk_num_tokens = prefix_chunk_seq_lens_cpu.sum(dim=1).tolist()
         assert max(self.prefix_chunk_num_tokens) <= self.get_max_chunk_capacity()
+
+        # Per-chunk flag: does any sequence have kv_len == 0?
+        # Pure CPU check (prefix_chunk_seq_lens_cpu is on CPU), no GPU sync.
+        self.prefix_chunk_has_zero_kv = [
+            bool((prefix_chunk_seq_lens_cpu[i] == 0).any())
+            for i in range(self.num_prefix_chunks)
+        ]
 
         # Precompute the kv indices for each chunk
         self.prepare_chunked_kv_indices(device)

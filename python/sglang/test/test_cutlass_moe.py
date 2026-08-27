@@ -6,8 +6,8 @@ import triton.testing  # Added import
 from transformers import AutoConfig
 
 from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 

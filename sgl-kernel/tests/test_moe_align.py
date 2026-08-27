@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -271,4 +272,4 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

@@ -3,12 +3,14 @@ import logging
 import torch
 import triton
 
-from sglang.srt.utils import ceil_div, is_cuda
+from sglang.srt.utils import ceil_div, is_cuda, is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
-if _is_cuda:
+_is_musa = is_musa()
+
+if _is_cuda or _is_musa:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
@@ -665,6 +667,8 @@ def _fwd_kernel_ep_scatter_2(
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+    # Platform-specific semaphore for atomic_add performance tuning
+    ATOMIC_ADD_SEM: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -689,7 +693,9 @@ def _fwd_kernel_ep_scatter_2(
             topk_index = topk_idx_int32.to(tl.int64)
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
             if expert_id >= 0:
-                dest_token_index_int32 = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_int32 = tl.atomic_add(
+                    expert_start_loc + expert_id, 1, sem=ATOMIC_ADD_SEM
+                )
                 dest_token_index = dest_token_index_int32.to(tl.int64)
 
                 tl.store(
@@ -783,6 +789,8 @@ def ep_scatter(
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
         SCALE_HIDDEN_SIZE=scale_hidden_size,
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        # XXX (MUSA): Atomic add with "relaxed" semaphore on musa backend for better performance
+        ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
     )
     return
 
@@ -1381,3 +1389,76 @@ def silu_and_mul_masked_post_per_tensor_quant_fwd(
         NUM_STAGE=NUM_STAGES,
     )
     return output
+
+
+@triton.jit
+def _fp8_per_token_quant_to_per_tensor_quant_kernel(
+    x_ptr,
+    x_scale_ptr,
+    x_scale_stride0,
+    x_scale_stride1,
+    x_scale_stride2,
+    masked_m_ptr,
+    output_scale_ptr,
+    output_ptr,
+    m,
+    k,
+    K_SCALE_BLOCK_SIZE: tl.constexpr,
+    K_BLOCK_SIZE: tl.constexpr,
+):
+    pid_k, pid_m, pid_e = (
+        tl.program_id(axis=0),
+        tl.program_id(axis=1),
+        tl.program_id(axis=2),
+    )
+    pid_m_dim = tl.num_programs(1)
+
+    token_id = pid_m
+    last_effective_id = tl.load(masked_m_ptr + pid_e)
+
+    if token_id >= last_effective_id:
+        return
+    output_scale_val_inv = 1.0 / tl.load(output_scale_ptr).to(tl.float32)
+    k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
+
+    x_ptrs = x_ptr + pid_e * m * k + k_offsets
+    output_ptrs = output_ptr + pid_e * m * k + k_offsets
+    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
+
+    for tok_idx in tl.range(token_id, last_effective_id, pid_m_dim):
+        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
+        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
+        hidden = hidden * scale_fp32 * output_scale_val_inv
+        tl.store(output_ptrs + tok_idx * k, hidden.to(output_ptr.dtype.element_ty))
+
+
+def fp8_per_token_to_per_tensor_quant_triton(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    output_scale: torch.Tensor,
+    output: torch.Tensor,
+):
+    K_SCALE_BLOCK_SIZE = 128
+    assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
+    assert x.is_contiguous()
+    assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
+    assert output_scale.numel() == 1
+
+    K_BLOCK_SIZE = 1024
+    assert x.size(2) % K_BLOCK_SIZE == 0
+    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
+        x,
+        x_scale,
+        *x_scale.stride(),
+        masked_m,
+        output_scale,
+        output,
+        x.size(1),
+        x.size(2),
+        K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
+        K_BLOCK_SIZE=K_BLOCK_SIZE,
+        num_warps=8,
+    )

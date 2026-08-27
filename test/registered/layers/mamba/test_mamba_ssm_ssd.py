@@ -1,10 +1,11 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=13, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=34, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
+import os
 
 import pytest
 import torch
@@ -13,7 +14,12 @@ from einops import rearrange, repeat
 
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.ops import mamba_chunk_scan_combined
+from sglang.srt.utils import get_device
+from sglang.srt.utils.common import is_hip
 from sglang.utils import is_in_ci
+
+if is_hip():
+    os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
 
 # Added by the IBM Team, 2024
 
@@ -33,7 +39,15 @@ def segsum(x):
     return x_segsum
 
 
-def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
+def ssd_minimal_discrete(
+    X,
+    A,
+    B,
+    C,
+    block_len,
+    initial_states=None,
+    return_intermediate_states=False,
+):
     """
     Arguments:
         X: (batch, length, n_heads, d_head)
@@ -81,13 +95,17 @@ def ssd_minimal_discrete(X, A, B, C, block_len, initial_states=None):
     # Add output of intra-chunk and inter-chunk terms
     # (diagonal and off-diagonal blocks)
     Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+    if return_intermediate_states:
+        return Y, final_state, states
     return Y, final_state
 
 
-def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device="cuda"):
+def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device=None):
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    if device is None:
+        device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     torch.manual_seed(0)
     A = -torch.exp(torch.rand(n_heads, dtype=itype, device=device))
@@ -110,7 +128,7 @@ def generate_continuous_batched_examples(
     n_heads,
     d_head,
     itype,
-    device="cuda",
+    device=None,
     return_naive_ref=True,
 ):
 
@@ -123,8 +141,10 @@ def generate_continuous_batched_examples(
 
     # generate the full-length example
     A, dt, X, B, C = generate_random_inputs(
-        num_examples, full_length, n_heads, d_head, itype
+        num_examples, full_length, n_heads, d_head, itype, device
     )
+    # Capture the resolved device from the tensors
+    device = X.device
 
     if return_naive_ref:
         Y_min, final_state_min = ssd_minimal_discrete(
@@ -212,8 +232,9 @@ if is_in_ci():
 @pytest.mark.parametrize("d_head", SINGLE_DHEAD)
 @pytest.mark.parametrize("seq_len_chunk_size", SINGLE_SEQ_LEN_CHUNK_SIZE)
 def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # this tests the kernels on a single example (no batching)
 
@@ -304,8 +325,9 @@ if is_in_ci():
     ],
 )
 def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, itype):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # this test with multiple examples in a continuous batch
     # (i.e. chunked prefill)
@@ -383,8 +405,9 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     ],
 )
 def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device not available")
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
 
     # This test verifies the correctness of the chunked prefill implementation
     # in the mamba2 ssd kernels, by comparing concatenation (in the sequence
@@ -605,6 +628,69 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x: f"seq{i} state " + x,
         )  # noqa: B023
+
+
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("n_heads", [4, 16])
+@pytest.mark.parametrize("d_head", [32, 64])
+@pytest.mark.parametrize("seq_len_chunk_size", [(128, 32), (256, 64)])
+def test_mamba_chunk_scan_intermediate_states(
+    d_head,
+    n_heads,
+    seq_len_chunk_size,
+    itype,
+):
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    if itype == torch.bfloat16:
+        atol, rtol = 5e-2, 5e-2
+    else:
+        atol, rtol = 8e-3, 5e-3
+
+    batch_size = 1
+    seqlen, chunk_size = seq_len_chunk_size
+
+    A, dt, X, B, C = generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype)
+
+    _, ref_final_state, ref_states = ssd_minimal_discrete(
+        X * dt.unsqueeze(-1), A * dt, B, C, chunk_size, return_intermediate_states=True
+    )
+
+    Y = torch.empty_like(X)
+    states, final_state = mamba_chunk_scan_combined(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=None,
+        return_intermediate_states=True,
+        return_final_states=True,
+        out=Y,
+    )
+
+    num_chunks = seqlen // chunk_size
+    assert states.shape == (batch_size, num_chunks, n_heads, d_head, d_head)
+    assert ref_states.shape == states.shape
+
+    torch.testing.assert_close(
+        final_state[:, -1],
+        ref_final_state[:, -1].to(torch.float32),
+        atol=atol,
+        rtol=rtol,
+    )
+
+    for chunk_idx in range(num_chunks):
+        torch.testing.assert_close(
+            states[:, chunk_idx, -1],
+            ref_states[:, chunk_idx, -1].to(states.dtype),
+            atol=atol,
+            rtol=rtol,
+            msg=lambda x: f"chunk {chunk_idx} " + x,
+        )
 
 
 if __name__ == "__main__":

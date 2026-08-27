@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bump sgl-kernel version in SGLang files to match the version in sgl-kernel/pyproject.toml.
+Bump sglang-kernel version in SGLang files to match the version in sgl-kernel/pyproject.toml.
 Updates:
   - python/pyproject.toml
   - python/sglang/srt/entrypoints/engine.py
@@ -37,7 +37,7 @@ def get_kernel_version_from_source() -> str:
 
 
 def update_python_pyproject(new_version: str) -> bool:
-    """Update sgl-kernel version in python/pyproject.toml"""
+    """Update sglang-kernel version in python/pyproject.toml"""
     pyproject_path = Path("python/pyproject.toml")
 
     if not pyproject_path.exists():
@@ -46,10 +46,10 @@ def update_python_pyproject(new_version: str) -> bool:
 
     content = pyproject_path.read_text()
 
-    # Replace "sgl-kernel==x.x.x" with new version
+    # Replace "sglang-kernel==x.x.x" with new version
     new_content = re.sub(
-        r'"sgl-kernel==[^"]+"',
-        f'"sgl-kernel=={new_version}"',
+        r'"sglang-kernel==[^"]+"',
+        f'"sglang-kernel=={new_version}"',
         content,
     )
 
@@ -63,7 +63,7 @@ def update_python_pyproject(new_version: str) -> bool:
 
 
 def update_engine_py(new_version: str) -> bool:
-    """Update sgl-kernel version in python/sglang/srt/entrypoints/engine.py"""
+    """Update sglang-kernel version in python/sglang/srt/entrypoints/engine.py"""
     engine_path = Path("python/sglang/srt/entrypoints/engine.py")
 
     if not engine_path.exists():
@@ -72,9 +72,9 @@ def update_engine_py(new_version: str) -> bool:
 
     content = engine_path.read_text()
 
-    # Replace version in assert_pkg_version("sgl-kernel", "version", ...)
+    # Replace version in assert_pkg_version("sglang-kernel", "version", ...)
     new_content = re.sub(
-        r'(assert_pkg_version\s*\(\s*"sgl-kernel"\s*,\s*)"[^"]+"',
+        r'(assert_pkg_version\s*\(\s*"sglang-kernel"\s*,\s*)"[^"]+"',
         rf'\1"{new_version}"',
         content,
     )
@@ -117,7 +117,7 @@ def update_dockerfile(new_version: str) -> bool:
 
 def main():
     kernel_version = get_kernel_version_from_source()
-    print(f"Bumping sgl-kernel version to: {kernel_version}\n")
+    print(f"Bumping sglang-kernel version to: {kernel_version}\n")
 
     updated_files = []
 

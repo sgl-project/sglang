@@ -1,5 +1,4 @@
 import logging
-import weakref
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -10,14 +9,24 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_num_new_pages
+
+_is_npu = is_npu()
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.allocator_npu import (
+        NPUPagedTokenToKVPoolAllocator,
+    )
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 
-class SWAKVPool(KVCache):
+class SWAKVPool(BaseSWAKVPool):
     """KV cache with separate pools for full and SWA attention layers."""
 
     def __init__(
@@ -43,9 +52,11 @@ class SWAKVPool(KVCache):
         self.device = device
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
+        self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = 0
         self.page_size = page_size
         self.swa_loc = None
+        self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
         kwargs["enable_memory_saver"] = False
@@ -92,6 +103,16 @@ class SWAKVPool(KVCache):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        # Wait happens at this wrapper. Inner pools must not wait again.
+        self.layer_transfer_counter = layer_transfer_counter
+        self.full_kv_pool.register_layer_transfer_counter(None)
+        self.swa_kv_pool.register_layer_transfer_counter(None)
+
+    def _wait_for_layer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
     def get_kv_size_bytes(self):
         k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
         k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
@@ -115,6 +136,7 @@ class SWAKVPool(KVCache):
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_key_buffer(layer_id_pool)
@@ -122,6 +144,7 @@ class SWAKVPool(KVCache):
             return self.full_kv_pool.get_key_buffer(layer_id_pool)
 
     def get_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_value_buffer(layer_id_pool)
@@ -129,6 +152,7 @@ class SWAKVPool(KVCache):
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
     def get_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
             return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
@@ -190,7 +214,7 @@ class SWAKVPool(KVCache):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
         full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
@@ -205,7 +229,7 @@ class SWAKVPool(KVCache):
 
         return {"full": full_kv_cpu, "swa": swa_kv_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # Load KV cache back from CPU to both full and SWA pools
         # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
         full_kv_cpu = kv_cache_cpu["full"]
@@ -230,46 +254,53 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: SWAKVPool,
+        kvcache: BaseSWAKVPool,
         need_sort: bool,
     ):
-        assert isinstance(kvcache, SWAKVPool)
+        assert isinstance(kvcache, BaseSWAKVPool)
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
 
+        full_kv_pool = getattr(kvcache, "full_kv_pool", None)
+        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+
         if page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(
                 size,
                 dtype,
                 device,
-                kvcache.full_kv_pool,
+                full_kv_pool,
                 need_sort,
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa,
                 dtype,
                 device,
-                kvcache.swa_kv_pool,
+                swa_kv_pool,
                 need_sort,
             )
         else:
-            self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+            if _is_npu:
+                PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
+            else:
+                PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator
+            self.full_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size,
                 page_size,
                 dtype,
                 device,
-                kvcache.full_kv_pool,
+                full_kv_pool,
                 need_sort,
             )
-            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+            self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size_swa,
                 page_size,
                 dtype,
                 device,
-                kvcache.swa_kv_pool,
+                swa_kv_pool,
                 need_sort,
             )
         # Note: append one more item of value -1 in the end so -1 maps to -1.
@@ -294,7 +325,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.clear()
         self._kvcache = kvcache
-        self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
     def available_size(self):
         return min(
@@ -347,7 +378,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        if _is_npu:
+            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
+                alloc_swa_indices.to(torch.int64)
+            )
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
     def alloc_extend(
@@ -360,10 +396,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
-        if num_tokens > self.full_attn_allocator.available_size():
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        if num_new_pages > self.full_attn_allocator.available_size() // self.page_size:
             return None
-        if num_tokens > self.swa_attn_allocator.available_size():
+        if num_new_pages > self.swa_attn_allocator.available_size() // self.page_size:
             return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
@@ -375,6 +414,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+            num_new_pages=num_new_pages,
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             prefix_lens,
@@ -383,11 +423,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             swa_last_loc,
             extend_num_tokens,
+            num_new_pages=num_new_pages,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        if _is_npu:
+            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
+                alloc_swa_indices.to(torch.int64)
+            )
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -410,7 +456,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        if _is_npu:
+            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
+                alloc_swa_indices.to(torch.int64)
+            )
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -428,6 +479,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        """Write full_to_swa_index_mapping[full_indices[i]] = swa_indices[i].
+
+        Used by HiCache load-back path to rebuild the mapping after FULL and SWA device alloc.
+        """
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        if _is_npu:
+            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
+                swa_indices.to(torch.int64)
+            )
+        else:
+            self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
@@ -454,8 +522,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )

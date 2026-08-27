@@ -1,0 +1,226 @@
+---
+title: SGLang Cookbook
+metatags:
+    description: The SGLang Cookbook is a practical collection of examples and guides that show developers how to efficiently run SGLang with a variety of models on different platforms.
+---
+
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/sgl-project/sgl-cookbook/pulls)
+
+A community-maintained repository of practical guides and recipes for deploying and using SGLang in production environments. Our mission is simple: answer the question **"How do I use SGLang (and related models) on hardware Y for task Z?"** with clear, actionable solutions.
+
+## 🎯 What You'll Find Here
+
+This cookbook aggregates battle-tested SGLang recipes covering:
+
+- **Models**: Mainstream LLMs and Vision-Language Models (VLMs)
+- **Use Cases**: Inference serving, deployment strategies, multimodal applications
+- **Hardware**: GPU and CPU configurations, optimization for different accelerators
+- **Best Practices**: Configuration templates, performance tuning, troubleshooting guides
+
+Each recipe provides step-by-step instructions to help you quickly implement SGLang solutions for your specific requirements.
+
+## Guides
+
+### Autoregressive Models
+
+#### Qwen
+
+- [x] [Qwen3.5](./autoregressive/Qwen/Qwen3.5) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [Qwen3](./autoregressive/Qwen/Qwen3)
+- [x] [Qwen3-Next](./autoregressive/Qwen/Qwen3-Next)
+- [x] [Qwen3-VL](./autoregressive/Qwen/Qwen3-VL)
+- [x] [Qwen3-Coder](./autoregressive/Qwen/Qwen3-Coder)
+- [x] [Qwen3-Coder-Next](./autoregressive/Qwen/Qwen3-Coder-Next) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [Qwen2.5-VL](./autoregressive/Qwen/Qwen2.5-VL)
+
+#### DeepSeek
+
+- [x] [DeepSeek-V3.2](./autoregressive/DeepSeek/DeepSeek-V3_2)
+- [x] [DeepSeek-V3.1](./autoregressive/DeepSeek/DeepSeek-V3_1)
+- [x] [DeepSeek-V3](./autoregressive/DeepSeek/DeepSeek-V3)
+- [x] [DeepSeek-R1](./autoregressive/DeepSeek/DeepSeek-R1)
+- [x] [DeepSeek-OCR](./autoregressive/DeepSeek/DeepSeek-OCR)
+- [x] [DeepSeek-OCR-2](./autoregressive/DeepSeek/DeepSeek-OCR-2) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+
+#### Llama
+
+- [ ] [Llama4-Scout](./autoregressive/Llama/Llama4)
+- [x] [Llama3.3-70B](./autoregressive/Llama/Llama3.3-70B)
+- [x] [Llama3.1](./autoregressive/Llama/Llama3.1)
+
+#### GLM
+
+- [ ] [GLM-Glyph](./autoregressive/GLM/GLM-Glyph)
+- [x] [GLM-5](./autoregressive/GLM/GLM-5) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [GLM-OCR](./autoregressive/GLM/GLM-OCR) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [GLM-4.5](./autoregressive/GLM/GLM-4.5)
+- [x] [GLM-4.5V](./autoregressive/GLM/GLM-4.5V)
+- [x] [GLM-4.6](./autoregressive/GLM/GLM-4.6)
+- [x] [GLM-4.6V](./autoregressive/GLM/GLM-4.6V)
+- [x] [GLM-4.7](./autoregressive/GLM/GLM-4.7)
+- [x] [GLM-4.7-Flash](./autoregressive/GLM/GLM-4.7-Flash) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+
+#### OpenAI
+
+- [x] [gpt-oss](./autoregressive/OpenAI/GPT-OSS)
+
+#### Moonshotai
+
+- [x] [Kimi-K2.6](./autoregressive/Moonshotai/Kimi-K2.6) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [Kimi-K2.5](./autoregressive/Moonshotai/Kimi-K2.5)
+- [x] [Kimi-K2](./autoregressive/Moonshotai/Kimi-K2)
+- [x] [Kimi-Linear](./autoregressive/Moonshotai/Kimi-Linear)
+
+#### MiniMax
+
+- [ ] [MiniMax-M2](./autoregressive/MiniMax/MiniMax-M2)
+- [x] [MiniMax-M2.5](./autoregressive/MiniMax/MiniMax-M2.5) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+
+#### NVIDIA
+
+- [x] [Nemotron 3 Nano Omni](./autoregressive/NVIDIA/Nemotron3-Nano-Omni)
+- [x] [Nemotron-Nano-3-30B-A3B](./autoregressive/NVIDIA/Nemotron3-Nano)
+- [x] [Nemotron3-Super](./autoregressive/NVIDIA/Nemotron3-Super)
+
+#### Ernie
+
+- [x] [Ernie4.5](./autoregressive/Ernie/Ernie4.5)
+- [ ] [Ernie4.5-VL](./autoregressive/Ernie/Ernie4.5-VL)
+
+#### InternVL
+
+- [ ] [InternVL3.5](./autoregressive/InternVL/InternVL3.5)
+
+#### InternLM
+
+- [ ] [Intern-S1](./autoregressive/InternLM/Intern-S1)
+
+#### Jina AI
+
+- [ ] [Jina-reranker-m0](./autoregressive/Jina/Jina-reranker-m0)
+
+#### Mistral
+
+- [ ] [Mistral-3](./autoregressive/Mistral/Ministral-3)
+- [x] [Devstral 2](./autoregressive/Mistral/Devstral-2)
+
+#### Xiaomi
+
+- [x] [MiMo-V2-Flash](./autoregressive/Xiaomi/MiMo-V2-Flash)
+
+#### FlashLabs
+
+- [x] [Chroma 1.0](./autoregressive/FlashLabs/Chroma1.0)<span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+
+#### StepFun
+
+- [x] [Step-3.5-Flash](./autoregressive/StepFun/Step3.5) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [Step3-VL-10B](./autoregressive/StepFun/Step3-VL-10B) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+
+#### InclusionAI
+
+- [x] [Ling-2.5-1T](./autoregressive/InclusionAI/Ling-2.5-1T) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [Ring-2.5-1T](./autoregressive/InclusionAI/Ring-2.5-1T) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+- [x] [LLaDA-2.1](./autoregressive/InclusionAI/LLaDA-2.1) <span style={{backgroundColor: '#fde8e2', color: '#C5602D', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 'normal', marginLeft: '8px'}}>NEW</span>
+
+### Diffusion Models
+
+#### FLUX
+
+- [x] [FLUX](./diffusion/FLUX/FLUX)
+
+#### Qwen-Image
+
+- [ ] [Qwen-Image](./diffusion/Qwen-Image/Qwen-Image)
+- [x] [Qwen-Image-Edit](./diffusion/Qwen-Image/Qwen-Image-Edit)
+
+#### Wan
+
+- [ ] [Wan2.1](./diffusion/Wan/Wan2.1)
+- [x] [Wan2.2](./diffusion/Wan/Wan2.2)
+
+#### Z-Image
+
+- [x] [Z-Image-Turbo](./diffusion/Z-Image/Z-Image-Turbo)
+
+### Benchmarks
+
+- [x] [Diffusion Model Benchmark](./base/benchmarks/diffusion_model_benchmark.mdx)
+- [x] [LLM Benchmark](./base/benchmarks/autoregressive_model_benchmark.mdx)
+
+## Reference
+
+- [Installation (PyPI)](../docs/get-started/install) - Install SGLang via pip or uv (stable and nightly)
+- [Server arguments](./base/reference/server_arguments) - Understanding all the arguments
+
+## 🚀 Quick Start
+
+1. Browse the recipe index above to find your model
+2. Follow the step-by-step instructions in each guide
+3. Adapt configurations to your specific hardware and requirements
+4. Join our community to share feedback and improvements
+
+## 🤝 Contributing
+
+We believe the best documentation comes from practitioners. Whether you've optimized SGLang for a specific model, solved a tricky deployment challenge, or discovered performance improvements, we encourage you to contribute your recipes!
+
+**Ways to contribute:**
+
+- Add a new recipe for a model not yet covered
+- Improve existing recipes with additional tips or configurations
+- Report issues or suggest enhancements
+- Share your production deployment experiences
+
+**To contribute:**
+
+<CodeGroup>
+```bash Contribute a Recipe
+# Fork the repo and clone locally
+git clone https://github.com/YOUR_USERNAME/sglang-cookbook.git
+cd sglang-cookbook
+
+# Create a new branch
+git checkout -b add-my-recipe
+
+# Add your recipe following the template in DeepSeek-V3.2
+# Submit a PR!
+```
+</CodeGroup>
+
+## 🛠️ Local Development
+
+### Prerequisites
+
+- Node.js >= 20.0
+- npm or yarn
+
+### Setup and Run
+
+Install dependencies and start the development server:
+
+<CodeGroup>
+```bash Local Development
+# Install dependencies
+npm install
+
+# Start development server (hot reload enabled)
+npm start
+```
+</CodeGroup>
+
+The site will automatically open in your browser at `http://localhost:3000`.
+
+## 📖 Resources
+
+- [SGLang GitHub](https://github.com/sgl-project/sglang)
+- [SGLang Documentation](https://sgl-project.github.io)
+- [Community Slack/Discord](https://discord.gg/MpEEuAeb)
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](https://github.com/sgl-project/sgl-cookbook/blob/main/LICENSE) file for details.
+
+---
+
+**Let's build this resource together!** 🚀 Star the repo and contribute your recipes to help the SGLang community grow.

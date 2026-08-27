@@ -3,9 +3,30 @@ import os
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 
+if current_platform.is_npu():
+    import torch_npu
+
+    patches = [
+        ["profiler.profile", torch_npu.profiler.profile],
+        ["profiler.schedule", torch_npu.profiler.schedule],
+    ]
+    torch_npu._apply_patches(patches)
+
 logger = init_logger(__name__)
+
+
+def _resolve_profiler_log_dir(log_dir: str | None) -> str:
+    if log_dir is not None:
+        return log_dir
+
+    diffusion_profiler_dir = os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR")
+    if diffusion_profiler_dir:
+        return diffusion_profiler_dir
+
+    return os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
 
 
 class SGLDiffusionProfiler:
@@ -27,12 +48,13 @@ class SGLDiffusionProfiler:
         full_profile: bool = False,
         num_steps: int | None = None,
         num_inference_steps: int | None = None,
-        log_dir: str = "./logs",
+        log_dir: str | None = None,
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
         self.full_profile = full_profile
-        self.log_dir = log_dir
+
+        self.log_dir = _resolve_profiler_log_dir(log_dir)
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -40,14 +62,25 @@ class SGLDiffusionProfiler:
             pass
 
         activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() or (
+            hasattr(torch, "musa") and torch.musa.is_available()
+        ):
             activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if current_platform.is_npu():
+            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            activities.append(torch.profiler.ProfilerActivity.XPU)
 
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
             with_stack=True,
-            on_trace_ready=None,
+            on_trace_ready=(
+                None
+                if not current_platform.is_npu()
+                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+            ),
         )
         if self.full_profile:
             # profile all stages
@@ -106,8 +139,13 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() or (
+            hasattr(torch, "musa") and torch.musa.is_available()
+        ):
             torch.cuda.synchronize()
+        if current_platform.is_npu():
+            torch.npu.synchronize()
+            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
         self.profiler.stop()
 
         if export_trace:

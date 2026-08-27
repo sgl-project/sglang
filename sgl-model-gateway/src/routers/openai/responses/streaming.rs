@@ -424,7 +424,7 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<crate::mcp::McpManager>>,
+    active_mcp: Option<&Arc<smg_mcp::McpManager>>,
     ctx: &StreamingEventContext<'_>,
 ) -> bool {
     let mut final_response = match handler.snapshot_final_response() {
@@ -637,7 +637,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
     headers: Option<&HeaderMap>,
     req: StreamingRequest,
-    active_mcp: &Arc<crate::mcp::McpManager>,
+    active_mcp: &Arc<smg_mcp::McpManager>,
     server_keys: Vec<String>,
 ) -> Response {
     // Transform MCP tools to function tools in payload

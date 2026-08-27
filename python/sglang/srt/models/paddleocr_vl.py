@@ -26,6 +26,7 @@ from transformers.utils import torch_int
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -113,7 +114,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,

@@ -1,0 +1,149 @@
+---
+title: "Environment Variables"
+metatags:
+    description: "Reference commonly used Ascend NPU environment variables for configuring SGLang runtime behavior."
+---
+SGLang supports various environment variables related to Ascend NPU that can be used to configure its runtime behavior.
+This document provides a list of commonly used environment variables and aims to stay updated over time.
+
+## Directly Used in SGLang
+
+<table>
+  <thead>
+    <tr>
+      <th>Environment Variable</th>
+      <th>Description</th>
+      <th>Default Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>SGLANG_NPU_USE_MLAPO</code></td>
+      <td>Adopts the <code>MLAPO</code> fusion operator in attention &lt;br/&gt; preprocessing stage of the MLA model.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_USE_FIA_NZ</code></td>
+      <td>Reshapes KV Cache for FIA NZ format.&lt;br/&gt; <code>SGLANG_USE_FIA_NZ</code> must be enabled with <code>SGLANG_NPU_USE_MLAPO</code></td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_USE_MULTI_STREAM</code></td>
+      <td>Enable dual-stream computation of shared experts &lt;br/&gt; and routing experts in DeepSeek models.&lt;br/&gt; Enable dual-stream computation in DeepSeek NSA Indexer.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT</code></td>
+      <td>Disable cast model weight tensor to a specific NPU &lt;br/&gt; ACL format.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
+      <td>The maximum number of dispatched tokens on each rank.</td>
+      <td><code>128</code></td>
+    </tr>
+  </tbody>
+</table>
+
+## Used in DeepEP Ascend
+
+<table>
+  <thead>
+    <tr>
+      <th>Environment Variable</th>
+      <th>Description</th>
+      <th>Default Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS</code></td>
+      <td>Enable ant-moving function in dispatch stage. Indicates &lt;br/&gt; the number of tokens transmitted per round on each rank.</td>
+      <td><code>8192</code></td>
+    </tr>
+    <tr>
+      <td><code>DEEPEP_NORMAL_LONG_SEQ_ROUND</code></td>
+      <td>Enable ant-moving function in dispatch stage. Indicates &lt;br/&gt; the number of rounds transmitted on each rank.</td>
+      <td><code>1</code></td>
+    </tr>
+    <tr>
+      <td><code>DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ</code></td>
+      <td>Enable ant-moving function in combine stage. &lt;br/&gt; The value <code>0</code> means disabled.</td>
+      <td><code>0</code></td>
+    </tr>
+    <tr>
+      <td><code>MOE_ENABLE_TOPK_NEG_ONE</code></td>
+      <td>Needs to be enabled when the expert ID to be processed by &lt;br/&gt; DEEPEP contains -1.</td>
+      <td><code>0</code></td>
+    </tr>
+    <tr>
+      <td><code>DEEP_NORMAL_MODE_USE_INT8_QUANT</code></td>
+      <td>Quantizes x to int8 and returns (tensor, scales) in dispatch operator.</td>
+      <td><code>0</code></td>
+    </tr>
+  </tbody>
+</table>
+
+## Others
+
+<table>
+  <thead>
+    <tr>
+      <th>Environment Variable</th>
+      <th>Description</th>
+      <th>Default Value</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>TASK_QUEUE_ENABLE</code></td>
+      <td>Used to control the optimization level of the dispatch queue&lt;br/&gt; about the task_queue operator. <a href="https://www.hiascend.com/document/detail/zh/Pytorch/730/comref/Envvariables/docs/zh/environment_variable_reference/TASK_QUEUE_ENABLE.md">Detail</a></td>
+      <td><code>1</code></td>
+    </tr>
+    <tr>
+      <td><code>INF_NAN_MODE_ENABLE</code></td>
+      <td>Controls whether the chip uses saturation mode or INF_NAN mode. <a href="https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/800alpha001/apiref/envref/envref_07_0056.html">Detail</a></td>
+      <td><code>1</code></td>
+    </tr>
+    <tr>
+      <td><code>STREAMS_PER_DEVICE</code></td>
+      <td>Configures the maximum number of streams for the stream pool. <a href="https://www.hiascend.com/document/detail/zh/Pytorch/720/comref/Envvariables/Envir_041.html">Detail</a></td>
+      <td><code>32</code></td>
+    </tr>
+    <tr>
+      <td><code>PYTORCH_NPU_ALLOC_CONF</code></td>
+      <td>Controls the behavior of the cache allocator. &lt;br/&gt;This variable changes memory usage and may cause performance fluctuations. <a href="https://www.hiascend.com/document/detail/zh/Pytorch/700/comref/Envvariables/Envir_012.html">Detail</a></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td><code>ASCEND_MF_STORE_URL</code></td>
+      <td>The address of config store in MemFabric during PD separation, &lt;br/&gt;which is generally set to the IP address of the P primary node&lt;br/&gt; with an arbitrary port number.</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td><code>ASCEND_LAUNCH_BLOCKING</code></td>
+      <td>Controls whether synchronous mode is enabled during operator execution. <a href="https://www.hiascend.com/document/detail/zh/Pytorch/710/comref/Envvariables/Envir_006.html">Detail</a></td>
+      <td><code>0</code></td>
+    </tr>
+    <tr>
+      <td><code>HCCL_OP_EXPANSION_MODE</code></td>
+      <td>Configures the expansion position for communication algorithm scheduling. <a href="https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/800alpha001/apiref/envref/envref_07_0094.html">Detail</a></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td><code>HCCL_BUFFSIZE</code></td>
+      <td>Controls the size of the buffer area for shared data between two NPUs. &lt;br/&gt;The unit is MB, and the value must be greater than or equal to 1. <a href="https://www.hiascend.com/document/detail/zh/Pytorch/60RC3/ptmoddevg/trainingmigrguide/performance_tuning_0047.html">Detail</a></td>
+      <td><code>200</code></td>
+    </tr>
+    <tr>
+      <td><code>HCCL_SOCKET_IFNAME</code></td>
+      <td>Configures the name of the network card used by the Host &lt;br/&gt;during HCCL initialization. <a href="https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/apiref/envvar/envref_07_0075.html">Detail</a></td>
+      <td></td>
+    </tr>
+    <tr>
+      <td><code>GLOO_SOCKET_IFNAME</code></td>
+      <td>Configures the network interface name for GLOO communication.</td>
+      <td></td>
+    </tr>
+  </tbody>
+</table>

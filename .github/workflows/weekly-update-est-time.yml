@@ -1,0 +1,79 @@
+name: Weekly Update Est Time
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # Monday 00:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-est-time:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Update est_time values
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/ci/update_est_time.py \
+            --summary-file /tmp/est_time_summary.md
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No est_time changes detected"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "Est_time changes detected:"
+            git diff --stat
+          fi
+
+      - name: Create PR
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+          BRANCH_NAME="bot/update-est-time-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH_NAME"
+
+          git add -A
+          git commit -m "chore: update CI test est_time from recent run data"
+
+          git push origin "$BRANCH_NAME"
+
+          {
+            echo "## Summary"
+            echo
+            echo "Updates \`est_time\` values in CI test registration calls based on the 90th percentile of the last 15 successful executions from scheduled PR Test runs on main."
+            echo
+            echo "This keeps the LPT load-balancing algorithm accurate for partitioning tests across parallel CI jobs."
+            echo
+            if [ -f /tmp/est_time_summary.md ]; then
+              cat /tmp/est_time_summary.md
+              echo
+            fi
+            echo "🤖 Generated with GitHub Actions"
+          } > /tmp/pr_body.md
+
+          gh pr create \
+            --title "chore: update CI test est_time values" \
+            --body-file /tmp/pr_body.md \
+            --base main \
+            --head "$BRANCH_NAME"

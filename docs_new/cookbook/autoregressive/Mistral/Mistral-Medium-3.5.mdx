@@ -1,0 +1,463 @@
+---
+title: Mistral Medium 3.5
+metatags:
+    description: "Deploy Mistral Medium 3.5 with SGLang - 128B dense flagship merged model with hybrid reasoning, 256K context, vision input, and FP8 quantization."
+---
+
+import { MistralMedium35Deployment } from '/src/snippets/autoregressive/mistral-medium-3-5-deployment.jsx';
+
+## 1. Model Introduction
+
+**Mistral Medium 3.5** is Mistral AI's first flagship **merged model** — a single dense 128B checkpoint that handles instruction following, reasoning, and coding in one set of weights. It replaces Mistral Medium 3.1 and Magistral in Le Chat, and replaces Devstral 2 in the Vibe coding agent. Reasoning effort is configurable per request, so the same model can answer a quick chat reply or work through a deep agentic run. The vision encoder was trained from scratch to handle variable image sizes and aspect ratios.
+
+**Key Features:**
+
+- **Dense 128B parameters** — no MoE, no MLA, plain GQA (96 heads, 8 KV heads, head_dim=128)
+- **256K context window** — YARN RoPE scaling on top of the original 4K base
+- **Hybrid Reasoning**: Toggle between instant reply and deep reasoning per request via `reasoning_effort` (`"none"` or `"high"`)
+- **Vision**: Accepts text + image input; from-scratch encoder that handles variable image sizes/aspect ratios
+- **Function Calling**: Native tool calling and JSON output
+- **FP8 Native**: Released with FP8 e4m3 static-tensor quantization built in
+- **Multilingual**: 24 supported languages including English, French, German, Spanish, Portuguese, Italian, Japanese, Korean, Russian, Chinese, Arabic, Persian, Indonesian, Malay, Nepali, Polish, Romanian, Serbian, Swedish, Turkish, Ukrainian, Vietnamese, Hindi, and Bengali
+- **License**: Modified MIT (open for commercial and non-commercial use except for companies with large revenue)
+
+**Architecture:**
+
+- Mistral 3 backbone with YARN RoPE for 256K context
+- Dense (no MoE), 128B parameters
+- Standard GQA attention (not MLA)
+- Pixtral-style vision encoder (48 layers, patch_size=14, spatial_merge=2, image_size=1540) trained from scratch
+- Multimodal input: text + image
+
+**Models:**
+
+- **[mistralai/Mistral-Medium-3.5-128B](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B)** (FP8)
+
+The HuggingFace repo ships both the mistral native layout (`params.json` + `consolidated-*.safetensors`) and the HF layout (`config.json` + `model-*.safetensors`). SGLang auto-detects the format — the HF layout is preferred when both are present.
+
+---
+
+## 2. SGLang Installation
+
+Refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+**Docker Images by Hardware:**
+
+| Hardware | Docker Image |
+| --- | --- |
+| H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mistral-medium-3.5` |
+| B200 / B300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mistral-medium-3.5` |
+
+> Day-0 support for Mistral Medium 3.5 is not yet in `lmsysorg/sglang:latest` — pull one of the tags above (matching your GPU's CUDA driver) until the changes propagate to the next stable release.
+
+---
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to generate a launch command for Mistral Medium 3.5.
+
+<MistralMedium35Deployment />
+
+### 3.2 Configuration Tips
+
+- **Tensor Parallelism**: Mistral Medium 3.5 FP8 (~130 GB) requires `--tp 4` on Hopper (H100/H200) and `--tp 2` on Blackwell (B200/B300).
+- **Reasoning effort**: Reasoning depth is configurable per request via `reasoning_effort` (`"none"`, `"high"`). No restart required — toggle per call.
+- **Recommended temperature**: `0.7` when `reasoning_effort="high"`. Anywhere from `0.0` to `0.7` when `reasoning_effort="none"`, depending on the task — lower for to-the-point answers, higher for creative output.
+- **Context length vs memory**: The model has a 256K context window. If you are memory-constrained, lower `--context-length` (e.g. `32768`) and increase once things are stable.
+- **Tool calling**: Enable `--tool-call-parser mistral` to activate native function calling support.
+- **Reasoning parser**: Enable `--reasoning-parser mistral` to separate `reasoning_content` from the main response content.
+- **System prompt**: The model ships with a recommended system prompt in `chat_template.jinja` and `SYSTEM_PROMPT.txt`. If you do not pass a system message yourself, the chat template injects Mistral's default (model identity, current date, tool-use guidelines). For full fidelity with Mistral's reference setup, load `SYSTEM_PROMPT.txt` from the HF repo and substitute `{name}`, `{today}`, `{yesterday}` (see Section 4.6).
+
+### 3.3 Speculative Decoding (EAGLE)
+
+Mistral ships an EAGLE draft head, [`mistralai/Mistral-Medium-3.5-128B-EAGLE`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B-EAGLE), that lets you run speculative decoding on top of the dense 128B target. The draft is a 2-layer GQA body sharing the target's vocab/head, FP8-quantized like the target (~4 GB), and is meant for low-concurrency latency-bound serving.
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path mistralai/Mistral-Medium-3.5-128B \
+  --tp 4 \
+  --dtype bfloat16 \
+  --tool-call-parser mistral \
+  --reasoning-parser mistral \
+  --speculative-algorithm EAGLE \
+  --speculative-draft-model-path mistralai/Mistral-Medium-3.5-128B-EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --port 30000
+```
+
+- **`--dtype bfloat16` is required.** The draft `params.json` does not carry a `dtype` field, so `--dtype auto` falls back to fp32 and downcasts to fp16, which conflicts with the bf16 target when the embed/head are shared. Setting bf16 explicitly keeps both sides aligned (this is a no-op for the target — it already loads as bf16).
+- The draft uses the same vocab and lm_head as the target. Memory overhead on top of the base model is ~4 GB per TP shard.
+- `(num-steps, eagle-topk, num-draft-tokens) = (3, 1, 4)` is the recommended starting point. Tune for your workload — wider trees (higher `eagle-topk` / `num-draft-tokens`) help high-acceptance (templated) outputs, narrower trees keep latency tight on more diverse text.
+- EAGLE shines at low concurrency. At high concurrency, throughput is dominated by the target's batched forward pass and the draft's contribution shrinks; consider running without EAGLE for batch-serving workloads.
+
+---
+
+## 4. Model Invocation
+
+### 4.1 Thinking Mode
+
+Mistral Medium 3.5 is a hybrid reasoning model. By default it does not produce a reasoning trace — pass `reasoning_effort="high"` to switch on the deep-reasoning path. Mistral recommends `temperature=0.7` for reasoning mode.
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Medium-3.5-128B",
+    messages=[
+        {"role": "user", "content": "Solve step by step: what is 17 × 23 + 144 / 12?"},
+    ],
+    temperature=0.7,
+    extra_body={"reasoning_effort": "high"},
+)
+
+print("Reasoning:", response.choices[0].message.reasoning_content)
+print("Answer:", response.choices[0].message.content)
+```
+
+**Output:**
+
+```text Output
+Reasoning: I need to follow the order of operations (PEMDAS/BODMAS): multiplication and
+division before addition, evaluated left to right.
+
+17 × 23: I'll break it as 17 × (20 + 3) = 340 + 51 = 391.
+144 / 12 = 12.
+Finally, 391 + 12 = 403.
+
+Answer: **17 × 23 + 144 / 12 = 403**
+
+Step by step:
+1. 17 × 23 = 391
+2. 144 / 12 = 12
+3. 391 + 12 = 403
+```
+
+### 4.2 Instruct Mode (Reasoning Off)
+
+To skip the reasoning trace and get a fast direct response, set `reasoning_effort="none"`. For instruct mode, Mistral recommends temperature in the `0.0`–`0.7` range depending on how creative the task is:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Medium-3.5-128B",
+    messages=[
+        {"role": "user", "content": "What is the capital of France?"},
+    ],
+    temperature=0.1,
+    extra_body={"reasoning_effort": "none"},
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output:**
+
+```text Output
+The capital of France is **Paris**. It is one of the most famous and visited cities in
+the world, known for its rich history, art, culture, and landmarks like the Eiffel Tower,
+Louvre Museum, and Notre-Dame Cathedral.
+```
+
+### 4.3 Streaming with Reasoning
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+stream = client.chat.completions.create(
+    model="mistralai/Mistral-Medium-3.5-128B",
+    messages=[
+        {"role": "user", "content": "Explain the difference between async and threading in Python."},
+    ],
+    temperature=0.7,
+    extra_body={"reasoning_effort": "high"},
+    stream=True,
+)
+
+print("=== Reasoning ===")
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+        print(delta.reasoning_content, end="", flush=True)
+    elif delta.content:
+        print("\n=== Response ===")
+        print(delta.content, end="", flush=True)
+print()
+```
+
+### 4.4 Tool Calling
+
+Mistral Medium 3.5 supports native function calling. Enable with `--tool-call-parser mistral`:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Medium-3.5-128B",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=tools,
+    tool_choice="auto",
+)
+
+tool_calls = response.choices[0].message.tool_calls
+for tc in tool_calls:
+    print(f"Tool: {tc.function.name}")
+    print(f"Args: {tc.function.arguments}")
+```
+
+**Output:**
+
+```text Output
+Tool: get_weather
+Args: {"location": "Paris"}
+```
+
+### 4.5 Vision (Image Input)
+
+Mistral Medium 3.5 accepts image inputs alongside text. The vision encoder was retrained from scratch to handle variable image sizes and aspect ratios:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY",
+)
+
+response = client.chat.completions.create(
+    model="mistralai/Mistral-Medium-3.5-128B",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe what you see in this image."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png"},
+                },
+            ],
+        }
+    ],
+    temperature=0.7,
+    extra_body={"reasoning_effort": "none"},
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output:**
+
+```text Output
+The image features a stylized representation of the acronym "SGL." The letters
+are large, bold, and orange with a brown outline, giving them a three-dimensional
+effect. To the left of the letters, there is a graphic that resembles a neuron
+or a node with connections, also in a similar orange and brown color scheme. The
+node has a code symbol (</>) inside a square, suggesting a connection to
+programming or technology.
+```
+
+### 4.6 Loading the Reference System Prompt
+
+Mistral ships a `SYSTEM_PROMPT.txt` alongside the weights. The reference setup loads it from the HF repo and substitutes `{name}`, `{today}`, and `{yesterday}` at runtime so the model knows its identity and the current date. SGLang's chat template will inject a default system prompt if you omit one, but for full parity with Mistral's reference, load it explicitly:
+
+```python Example
+from datetime import datetime, timedelta
+from huggingface_hub import hf_hub_download
+from openai import OpenAI
+
+MODEL = "mistralai/Mistral-Medium-3.5-128B"
+
+def load_system_prompt(repo_id: str, filename: str = "SYSTEM_PROMPT.txt") -> str:
+    path = hf_hub_download(repo_id=repo_id, filename=filename)
+    today = datetime.today().strftime("%Y-%m-%d")
+    yesterday = (datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    name = repo_id.split("/")[-1]
+    with open(path) as f:
+        return f.read().format(name=name, today=today, yesterday=yesterday)
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model=MODEL,
+    messages=[
+        {"role": "system", "content": load_system_prompt(MODEL)},
+        {"role": "user", "content": "Write me a sentence where every word starts with the next letter in the alphabet — start with 'a' and end with 'z'."},
+    ],
+    temperature=0.1,
+    extra_body={"reasoning_effort": "none"},
+)
+
+print(response.choices[0].message.content)
+```
+
+---
+
+## 5. Benchmarks
+
+Validation runs on 4× H200 with `--tp 4`, served via the `/v1/chat/completions` endpoint.
+
+### 5.1 Accuracy Benchmarks
+
+#### GSM8K
+
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
+```
+
+**Results:**
+
+```text Output
+Accuracy: 0.945
+Invalid: 0.000
+Latency: 13.594 s
+Output throughput: 1560.660 token/s
+```
+
+#### MMMU
+
+```bash Command
+python3 benchmark/mmmu/bench_sglang.py --port 30000
+```
+
+**Results:**
+
+```text Output
+Overall accuracy: 0.586
+```
+
+### 5.2 Speed Benchmarks
+
+#### Latency (Low Concurrency)
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name random \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --port 30000
+```
+
+**Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Successful requests:                     10
+Benchmark duration (s):                  38.86
+Total input tokens:                      6101
+Total generated tokens:                  2684
+Output token throughput (tok/s):         69.07
+Mean E2E Latency (ms):                   3883.80
+Median TTFT (ms):                        95.90
+Median TPOT (ms):                        14.19
+==================================================
+```
+
+#### Throughput (High Concurrency)
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name random \
+  --num-prompts 1000 \
+  --max-concurrency 100 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --port 30000
+```
+
+**Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Successful requests:                     1000
+Benchmark duration (s):                  117.28
+Total input tokens:                      512842
+Total generated tokens:                  262023
+Output token throughput (tok/s):         2234.18
+Total token throughput (tok/s):          6607.01
+Mean E2E Latency (ms):                   11303.79
+Median TTFT (ms):                        152.95
+Median TPOT (ms):                        42.53
+==================================================
+```
+
+### 5.3 EAGLE Speculative Decoding (Latency)
+
+Same 4× H200 setup, EAGLE configuration from [Section 3.3](#3-3-speculative-decoding-eagle). Single-stream latency benchmark (`--max-concurrency 1`).
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name random \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --port 30000
+```
+
+**Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Successful requests:                     10
+Benchmark duration (s):                  27.64
+Total input tokens:                      6101
+Total generated tokens:                  2684
+Output token throughput (tok/s):         97.10
+Mean E2E Latency (ms):                   2762.99
+Median TTFT (ms):                        90.69
+Median TPOT (ms):                        9.73
+Accept length:                           1.72
+==================================================
+```
+
+EAGLE delivers **~1.41× output throughput and ~29% lower E2E latency** vs. the baseline in [Section 5.2](#5-2-speed-benchmarks) on the same workload. Acceptance length of 1.72 means each draft cycle averages roughly 1.7 accepted tokens.

@@ -11,6 +11,7 @@ from transformers.modeling_utils import PreTrainedModel
 from sglang.srt.configs.dots_vlm import DotsVisionConfig
 from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -113,7 +114,7 @@ class DotsPatchEmbed(nn.Module):
         self.temporal_patch_size = config.temporal_patch_size
         self.embed_dim = config.embed_dim
         self.config = config
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             config.num_channels,
             config.embed_dim,
             kernel_size=(config.patch_size, config.patch_size),

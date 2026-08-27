@@ -613,7 +613,6 @@ class Glm4MoeDetector(BaseFormatDetector):
         arguments = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
-            arg_value = arg_value.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 

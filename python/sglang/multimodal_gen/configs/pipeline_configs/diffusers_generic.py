@@ -50,10 +50,6 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
     vae_slicing: bool = False  # slice VAE decode for lower memory usage
     vae_sp: bool = False
 
-    # Attention backend for diffusers models (e.g., "flash", "_flash_3_hub", "sage", "xformers")
-    # See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
-    diffusers_attention_backend: str | None = None
-
     # Quantization config for pipeline-level quantization
     # See: https://huggingface.co/docs/diffusers/main/en/quantization/overview
     # Use PipelineQuantizationConfig for component-level control:

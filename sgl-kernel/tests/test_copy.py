@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import sgl_kernel
 import torch
@@ -13,4 +15,4 @@ def test_copy_to_gpu_no_ce(size):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

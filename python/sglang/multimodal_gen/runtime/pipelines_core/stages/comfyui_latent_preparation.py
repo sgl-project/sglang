@@ -5,6 +5,7 @@ This stage extends LatentPreparationStage to handle device mismatch issues
 that occur when tensors are pickled and unpickled via broadcast_pyobj in
 multi-GPU scenarios.
 """
+
 import dataclasses
 
 import torch

@@ -18,7 +18,12 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import (
+    EmbeddingPoolerOutput,
+    Pooler,
+    PoolingType,
+    pool_hidden_states,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
@@ -63,7 +68,16 @@ class Qwen2ForRewardModel(nn.Module):
         logits = self.score(hidden_states)
         pooled_logits = self.pooler(logits, forward_batch).embeddings
 
-        return EmbeddingPoolerOutput(pooled_logits)
+        pooled_hidden = None
+        if forward_batch.return_pooled_hidden_states:
+            pooled_hidden = pool_hidden_states(
+                self.pooler.pooling_type, hidden_states, forward_batch
+            )
+
+        return EmbeddingPoolerOutput(
+            embeddings=pooled_logits,
+            pooled_hidden_states=pooled_hidden,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Filter out lm_head weights of Qwen2ForCausalLM

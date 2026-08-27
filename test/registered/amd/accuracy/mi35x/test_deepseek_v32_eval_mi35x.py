@@ -32,9 +32,9 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# Register for AMD CI - MI35x DeepSeek-V3.2 accuracy test (~60 min for basic only)
+# Register for AMD CI - MI35x DeepSeek-V3.2 accuracy test (~90 min for basic only)
 register_amd_ci(
-    est_time=3600,
+    est_time=5400,
     suite="nightly-amd-8-gpu-mi35x-deepseek-v32",
     nightly=True,
 )
@@ -74,7 +74,7 @@ MI35X_DEEPSEEK_V32_MODELS = [
         model_path="deepseek-ai/DeepSeek-V3.2",
         tp_size=8,
         accuracy_threshold=0.93,
-        timeout=3600,
+        timeout=5400,
         variant="basic",
         other_args=[
             "--trust-remote-code",
@@ -215,6 +215,9 @@ class TestDeepSeekV32EvalMI35x(unittest.TestCase):
                         )
                         passed = acc >= config.accuracy_threshold
                         status = "✅ PASS" if passed else "❌ FAIL"
+                        print(
+                            f"  accuracy={acc:.3f} threshold={config.accuracy_threshold} {status}"
+                        )
 
                         all_results.append(
                             {

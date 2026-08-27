@@ -427,7 +427,7 @@ def selective_state_update(
         else (0, 0)
     )
 
-    with torch.cuda.device(x.device.index):
+    with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
             x,

@@ -126,16 +126,28 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16
     return C.reshape(origin_C_shape).to(output_dtype)
 
 
-def torch_naive_moe(a, w1, w2, b, routed_scaling_factor):
+def torch_naive_moe(a, w1, w2, b, routed_scaling_factor, output_dtype=torch.bfloat16):
+
+    a = a.to(torch.float32)
+    w1 = w1.to(torch.float32)
+    w2 = w2.to(torch.float32)
+    b = b.to(torch.float32) if b is not None else None
 
     ic1 = torch.matmul(a, w1.transpose(0, 1))
     ic2 = SiluAndMul(ic1)
     ic3 = torch.matmul(ic2, w2.transpose(0, 1))
 
-    return ic3 + b * routed_scaling_factor
+    out = ic3 if b is None else ic3 + b * routed_scaling_factor
+
+    return out.to(output_dtype)
 
 
-def torch_w8a8_per_column_moe(a, w1_q, w2_q, w1_s, w2_s, b, routed_scaling_factor):
+def torch_w8a8_per_column_moe(
+    a, w1_q, w2_q, w1_s, w2_s, b, routed_scaling_factor, output_dtype=torch.bfloat16
+):
+
+    a = a.to(torch.float32)
+    b = b.to(torch.float32) if b is not None else None
 
     # Perform per-token quantization
     a_q, a_s = per_token_quant_int8(a)
@@ -150,7 +162,9 @@ def torch_w8a8_per_column_moe(a, w1_q, w2_q, w1_s, w2_s, b, routed_scaling_facto
         a1_q, w2_q, a1_s, w2_s, bias=None, output_dtype=torch.float32
     )
 
-    return ic3 + b * routed_scaling_factor
+    out = ic3 if b is None else ic3 + b * routed_scaling_factor
+
+    return out.to(output_dtype)
 
 
 def scaled_weight(weight, scales):
@@ -286,3 +300,141 @@ def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:
     """
     last_dim = x.shape[-1]
     return x[..., : last_dim // 2] if x.is_contiguous() else x
+
+
+def awq_reverse_reorder_int_tensor(int_tensor, bits: int):
+    assert bits == 4
+
+    int_tensor = int_tensor.T.contiguous()
+    compress_ratio = 32 // bits
+    assert int_tensor.shape[-1] % compress_ratio == 0
+
+    order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+    order_tensor = torch.tensor(
+        order_map, dtype=torch.int32, device=int_tensor.device
+    ).reshape(1, -1)
+    order_tensor = order_tensor.repeat(int_tensor.shape[1] // compress_ratio, 1)
+    order_tensor = order_tensor + torch.arange(
+        0,
+        int_tensor.shape[1],
+        compress_ratio,
+        dtype=torch.int32,
+        device=int_tensor.device,
+    ).reshape(-1, 1)
+    order_tensor = order_tensor.reshape(-1)
+
+    reverse_order_tensor = torch.arange(order_tensor.shape[0])[order_tensor]
+    reverse_order_tensor = reverse_order_tensor[order_tensor]
+    int_tensor = int_tensor[:, reverse_order_tensor]
+    return int_tensor
+
+
+def unpack_and_dequant_awq(
+    awq_qweight: torch.Tensor,
+    awq_qzeros: torch.Tensor,
+    awq_scales: torch.Tensor,
+    bits: int,
+    group_size: int,
+):
+    """
+    Args:
+        awq_qweight (`torch.LongTensor`):
+            Expected shape: (in_features, out_features // (32 // bits))
+        awq_qzeros (`torch.LongTensor`):
+            Expected shape: (in_features // group_size, out_features // (32 // bits))
+        awq_scales (`torch.LongTensor`):
+            Expected shape: (in_features // group_size, out_features)
+
+    Returns:
+        fp16_weight (`torch.LongTensor`):
+            With shape (in_features, out_features).
+        zeros (`torch.LongTensor`):
+            With shape (in_features // group_size, out_features).
+    """
+    assert bits == 4
+
+    qzeros = awq_qzeros
+    qweight = awq_qweight
+    qweight = qweight.T.contiguous()
+
+    scales = awq_scales
+    scales = scales.reshape(-1, 1, scales.shape[-1])
+
+    infeatures = awq_qweight.shape[0]
+
+    wf = torch.tensor(
+        list(range(0, 32, bits)), dtype=torch.int32, device=qzeros.device
+    ).unsqueeze(0)
+    zeros = torch.bitwise_right_shift(torch.unsqueeze(qzeros, 2), wf.unsqueeze(0)).to(
+        torch.int16 if bits == 8 else torch.int8
+    )
+
+    torch.bitwise_and(zeros, (2**bits) - 1, out=zeros)
+
+    zeros = zeros.reshape(-1, 1, zeros.shape[1] * zeros.shape[2])
+
+    weight = torch.bitwise_right_shift(
+        torch.unsqueeze(qweight, 1), wf.unsqueeze(-1)
+    ).to(torch.int16 if bits == 8 else torch.int8)
+    torch.bitwise_and(weight, (2**bits) - 1, out=weight)
+    weight = weight.reshape(-1, group_size, weight.shape[2])
+
+    weight = weight.view(-1, weight.shape[-1])
+    zeros = zeros.view(-1, zeros.shape[-1])
+
+    zeros = zeros.T.contiguous()
+    zeros = awq_reverse_reorder_int_tensor(zeros, bits)
+    weight = awq_reverse_reorder_int_tensor(weight, bits)
+
+    # Dequantize weights.
+    scales = awq_scales
+    zeros = zeros.contiguous()
+    scale_zeros = zeros * scales
+
+    g_idx = torch.tensor(
+        [i // group_size for i in range(infeatures)], dtype=torch.int32
+    )
+    scale_mat = scales[g_idx]
+    scale_zeros_mat = scale_zeros[g_idx].to(torch.bfloat16)
+
+    qdq_weight_T = weight * scale_mat - scale_zeros_mat.to(torch.bfloat16)
+
+    fp16_weight = qdq_weight_T.T
+
+    return fp16_weight, zeros
+
+
+def unpack_4bit_to_32bit_signed(qweight, qzeros):
+    # Unpack 4-bit values and interpret them as signed integers
+    unpacked_weights = torch.zeros(
+        (qweight.shape[0] * 8, qweight.shape[1]),
+        dtype=torch.int8,
+        device=qweight.device,
+        requires_grad=False,
+    )
+    unpacked_zeros = torch.zeros(
+        (qzeros.shape[0], qzeros.shape[1] * 8),
+        dtype=torch.int8,
+        device=qzeros.device,
+        requires_grad=False,
+    )
+
+    for row in range(unpacked_weights.shape[0]):
+        i = row % 8
+        unpacked_weights[row, :] = (qweight[row // 8, :] >> (4 * i)) & 0xF
+
+    for col in range(unpacked_zeros.shape[1]):
+        i = col % 8
+        unpacked_zeros[:, col] = (qzeros[:, col // 8] >> (4 * i)) & 0xF
+
+    return unpacked_weights, unpacked_zeros + 1
+
+
+def unpack_and_dequant_gptq(qweight, qzeros, scales):
+    unpacked_qweight, unpacked_qzeros = unpack_4bit_to_32bit_signed(qweight, qzeros)
+    group_size = unpacked_qweight.shape[0] // scales.shape[0]
+    scales = scales.repeat_interleave(group_size, dim=0)
+    unpacked_qzeros = unpacked_qzeros.repeat_interleave(group_size, dim=0)
+    unpacked_qweight = (unpacked_qweight - unpacked_qzeros) * scales
+
+    return unpacked_qweight.T

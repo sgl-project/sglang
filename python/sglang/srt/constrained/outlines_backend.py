@@ -24,9 +24,9 @@ from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
+    InvalidGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
@@ -142,7 +142,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         self.whitespace_pattern = whitespace_pattern
 
-    def _compile_regex(self, regex: str) -> Optional[OutlinesGrammar]:
+    def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
             if hasattr(RegexGuide, "from_regex"):
                 # outlines >= 0.1.1
@@ -152,7 +152,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
             logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
 
         jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
@@ -171,7 +171,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         except (NotImplementedError, json.decoder.JSONDecodeError, ValueError) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._compile_regex(regex)
 
     def dispatch_regex(self, key_string: str):

@@ -9,13 +9,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use data_connector::{self, ConversationId, ResponseId};
 use serde_json::{json, Value};
+use smg_mcp::{self as mcp, McpManager};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    data_connector::{self, ConversationId, ResponseId},
-    mcp::{self, McpManager},
     protocols::{
         chat::ChatCompletionRequest,
         common::{Function, Tool, ToolChoice, ToolChoiceValue},

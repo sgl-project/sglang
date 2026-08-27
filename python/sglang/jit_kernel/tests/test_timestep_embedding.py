@@ -1,4 +1,5 @@
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -12,6 +13,30 @@ except Exception:
 from sglang.jit_kernel.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
+from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=16, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+
+CORRECTNESS_BATCH_SIZES = get_ci_test_range(
+    [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384],
+    [1, 128, 2048, 16384],
+)
+CORRECTNESS_DIMS = get_ci_test_range(
+    [32, 128, 256, 512, 1536, 2048, 4096, 8192],
+    [32, 512, 8192],
+)
+DIFFUSERS_BATCH_SIZES = get_ci_test_range(
+    [1, 2, 8, 128, 256, 512, 1536, 2048, 16384],
+    [1, 512, 16384],
+)
+DIFFUSERS_DIMS = get_ci_test_range([32, 256, 512, 1536, 8192], [32, 512, 8192])
+DTYPES = get_ci_test_range(
+    [torch.float16, torch.bfloat16, torch.float32],
+    [torch.float16, torch.bfloat16],
+)
+SCALES = get_ci_test_range([1, 0.01], [1, 0.01])
 
 
 def get_timestep_embedding_reference(
@@ -47,11 +72,9 @@ def get_timestep_embedding_reference(
     return emb
 
 
-@pytest.mark.parametrize(
-    "batch_size", [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384]
-)
-@pytest.mark.parametrize("dim", [32, 128, 256, 512, 1536, 2048, 4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("batch_size", CORRECTNESS_BATCH_SIZES)
+@pytest.mark.parametrize("dim", CORRECTNESS_DIMS)
+@pytest.mark.parametrize("dtype", DTYPES)
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
@@ -64,12 +87,12 @@ def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
     torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 8, 128, 256, 512, 1536, 2048, 16384])
-@pytest.mark.parametrize("dim", [32, 256, 512, 1536, 8192])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("batch_size", DIFFUSERS_BATCH_SIZES)
+@pytest.mark.parametrize("dim", DIFFUSERS_DIMS)
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("flip_sin_to_cos", [False, True])
 @pytest.mark.parametrize("downscale_freq_shift", [0, 1])
-@pytest.mark.parametrize("scale", [1, 0.01])
+@pytest.mark.parametrize("scale", SCALES)
 def test_timestep_embedding_correctness_with_diffusers(
     batch_size, dim, flip_sin_to_cos, downscale_freq_shift, scale, dtype
 ):
@@ -157,4 +180,4 @@ def test_timestep_embedding_perf():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

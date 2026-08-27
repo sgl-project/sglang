@@ -32,8 +32,8 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather_into_tensor,
-    attn_tp_reduce_scatter_tensor,
+    attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -157,7 +157,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
                 get_local_dp_buffer(),
                 hidden_states,
             )
-            attn_tp_all_gather_into_tensor(
+            attn_cp_all_gather_into_tensor(
                 hidden_states,
                 local_hidden_states,
             )
@@ -174,17 +174,21 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        if context.is_same_group_size(
-            hidden_states_input_mode, output_mode
-        ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return NSACPCommunicateSummableTensorPairFn._trivial
-
+        # Check exact enum match first: even if group sizes happen to be equal
+        # (e.g. tp_size == attn_cp_size makes FULL and SCATTERED both size 1),
+        # FULL and SCATTERED have different data layouts under CP and require
+        # an explicit scatter operation.
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.SCATTERED)
         ):
             return NSACPCommunicateSummableTensorPairFn._scatter_hidden_states
+
+        if context.is_same_group_size(
+            hidden_states_input_mode, output_mode
+        ) and context.is_same_group_size(residual_input_mode, output_mode):
+            return NSACPCommunicateSummableTensorPairFn._trivial
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
@@ -203,8 +207,8 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         if nsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             input_hidden_states = hidden_states
-            hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
-                context.attn_tp_rank
+            hidden_states = hidden_states.tensor_split(context.attn_cp_size)[
+                context.attn_cp_rank
             ]
-            attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+            attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
         return hidden_states, residual

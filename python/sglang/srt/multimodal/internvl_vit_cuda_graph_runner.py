@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """ViT CUDA Graph Runner class."""
+
 from __future__ import annotations
 
 from typing import Dict, Hashable, Tuple

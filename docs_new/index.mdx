@@ -1,0 +1,497 @@
+---
+title: Welcome to SGLang
+description: High-performance serving framework for large language and multimodal models.
+keywords:
+  - sglang
+  - llm serving
+  - multimodal
+  - inference runtime
+mode: wide
+---
+
+<a
+  class="github-button"
+  href="https://github.com/sgl-project/sglang"
+  data-size="large"
+  data-show-count="true"
+  aria-label="Star sgl-project/sglang on GitHub"
+>
+  Star
+</a>
+<a
+  class="github-button"
+  href="https://github.com/sgl-project/sglang/fork"
+  data-icon="octicon-repo-forked"
+  data-size="large"
+  data-show-count="true"
+  aria-label="Fork sgl-project/sglang on GitHub"
+>
+  Fork
+</a>
+<script async defer src="https://buttons.github.io/buttons.js"></script>
+<br></br>
+
+<CardGroup cols={2}>
+  <Card title="Performance & Runtime" icon="arrow-trend-up">
+    Designed for low-latency, high-throughput inference with RadixAttention, prefix caching, and multi-GPU parallelism.
+  </Card>
+
+<Card title="Models & Ecosystem" icon="hexagon-nodes">
+  Broad support for Llama, Qwen, DeepSeek, and more. Compatible with Hugging
+  Face and OpenAI APIs.
+</Card>
+
+<Card title="Extensive Hardware Support" icon="microchip">
+  Native support across <a href="./docs/hardware-platforms/overview">Hardware Platforms</a>
+  including NVIDIA, AMD, Intel Xeon, Google TPU, and Ascend NPU accelerators.
+</Card>
+
+  <Card title="Community & Training" icon="users">
+    Open-source with widespread adoption, powering 400k+ GPUs and integrated with major RL frameworks.
+  </Card>
+</CardGroup>
+
+SGLang powers large-scale production deployments, generating trillions of tokens each day across more than 400,000 GPUs worldwide. It is hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+
+---
+
+## Get Started
+
+SGLang is an inference framework meant for production level serving.
+It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
+
+<CardGroup cols={2}>
+<Card title="Install SGLang" icon="angles-down" href="./docs/get-started/install">
+  Install SGLang with pip, from source, or via Docker on your preferred hardware platform.
+</Card>
+
+<Card title="Quickstart" icon="zap" href="./docs/get-started/quickstart">
+  Launch your first model server and send requests in minutes with OpenAI-compatible APIs.
+</Card>
+</CardGroup>
+
+## News and latest blogs
+
+{/* BEGIN_LMSYS_SGLANG_BLOG_CARDS */}
+<div className="not-prose">
+  <div
+    style={{
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
+      gap: "1rem",
+      alignItems: "stretch",
+    }}
+  >
+    <a
+      href="https://lmsys.org/blog/2026-04-25-deepseek-v4/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/deepseek_v4/benchmark_vs_oss.png"
+          alt="DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"April 25, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-04-10-sglang-hisparse/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/hisparse/hisparse_overview.png"
+          alt="HiSparse: Turbocharging Sparse Attention with Hierarchical Memory"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"HiSparse: Turbocharging Sparse Attention with Hierarchical Memory"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"April 10, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-03-25-gtc2026/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/gtc2026/happyhour-crowd.jpg"
+          alt="Highlights of SGLang at NVIDIA GTC 2026"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Highlights of SGLang at NVIDIA GTC 2026"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"March 31, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-03-25-eep-partial-failure-tolerance/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/eep-partial-failure-tolerance/figure.png"
+          alt="Elastic EP in SGLang: Achieving Partial Failure Tolerance for DeepSeek MoE Deployments"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"Elastic EP in SGLang: Achieving Partial Failure Tolerance for DeepSeek MoE Deployments"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"March 25, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/rocm_miles_rl/fig_1.png"
+          alt="ROCm Support for Miles: Large-Scale RL Post-Training on AMD Instinct\u2122 GPUs"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"ROCm Support for Miles: Large-Scale RL Post-Training on AMD Instinct\u2122 GPUs"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"March 17, 2026"}
+        </p>
+      </div>
+    </a>
+    <a
+      href="https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/"
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{
+        display: "block",
+        border: "1px solid rgba(128, 128, 128, 0.3)",
+        borderRadius: "0.75rem",
+        overflow: "hidden",
+        textDecoration: "none",
+        color: "inherit",
+        height: "100%",
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 9",
+          overflow: "hidden",
+          background: "rgba(128, 128, 128, 0.15)",
+        }}
+      >
+        <img
+          src="https://lmsys.org/images/blog/nemotron-3-super/figure_1.svg"
+          alt="SGLang Adds Day-0 Support for NVIDIA Nemotron 3 Super for building High-Efficiency Multi-Agent Systems"
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition: "center",
+            display: "block",
+          }}
+        />
+      </div>
+      <div style={{ padding: "0.9rem 1rem 1rem" }}>
+        <p
+          style={{
+            margin: 0,
+            fontWeight: 600,
+            lineHeight: 1.35,
+            fontSize: "0.98rem",
+          }}
+        >
+          {"SGLang Adds Day-0 Support for NVIDIA Nemotron 3 Super for building High-Efficiency Multi-Agent Systems"}
+        </p>
+        <p
+          style={{
+            margin: "0.55rem 0 0",
+            fontSize: "0.85rem",
+            opacity: 0.75,
+          }}
+        >
+          {"March 11, 2026"}
+        </p>
+      </div>
+    </a>
+  </div>
+</div>
+{/* END_LMSYS_SGLANG_BLOG_CARDS */}
+
+---
+
+## Learn more and join the community
+
+<div className="not-prose">
+  <div
+    style={{
+      padding: "0.9rem 0",
+      borderTop: "1px solid rgba(128, 128, 128, 0.24)",
+      borderBottom: "1px solid rgba(128, 128, 128, 0.24)",
+    }}
+  >
+    <p
+      style={{
+        margin: "0 0 0.35rem",
+        fontSize: "0.82rem",
+        fontWeight: 700,
+        letterSpacing: "0.08em",
+        textTransform: "uppercase",
+        opacity: 0.72,
+      }}
+    >
+      Stay connected
+    </p>
+    <div
+      style={{
+        display: "grid",
+        gap: "0.55rem",
+        fontSize: "0.97rem",
+        lineHeight: 1.7,
+      }}
+    >
+      <div>
+        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
+          <Icon icon="map" size={14} />
+        </span>{" "}
+        <a href="https://roadmap.sglang.io">Development roadmap</a>
+        <span style={{ opacity: 0.62 }}> to follow current priorities and upcoming work.</span>
+      </div>
+      <div>
+        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
+          <Icon icon="calendar-days" size={14} />
+        </span>{" "}
+        <a href="https://meet.sglang.io">Weekly public development meeting</a>
+        <span style={{ opacity: 0.62 }}> to hear updates and join open discussions.</span>
+      </div>
+      <div>
+        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
+          <Icon icon="slack" size={14} />
+        </span>{" "}
+        <a href="https://slack.sglang.io/">Slack</a>
+        <span style={{ opacity: 0.62 }}> for questions, feedback, and community support.</span>
+      </div>
+      <div>
+        <a href="https://x.com/lmsysorg">X Twitter</a>
+        <span style={{ opacity: 0.62 }}> and </span>
+        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
+          <Icon icon="linkedin" size={14} />
+        </span>{" "}
+        <a href="https://www.linkedin.com/company/sgl-project/">LinkedIn</a>
+        <span style={{ opacity: 0.62 }}> for project updates.</span>
+      </div>
+      <div>
+        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
+          <Icon icon="newspaper" size={14} />
+        </span>{" "}
+        <a href="https://lmsys.org/blog/">LMSYS blog</a>
+        <span style={{ opacity: 0.62 }}> for release notes, benchmarks, and technical deep dives.</span>
+      </div>
+      <div>
+        <span style={{ display: "inline-flex", alignItems: "center", verticalAlign: "-0.125em" }}>
+          <Icon icon="book-open" size={14} />
+        </span>{" "}
+        <a href="https://github.com/sgl-project/sgl-learning-materials">Learning materials</a>
+        <span style={{ opacity: 0.62 }}> for blogs, slides, and videos.</span>
+      </div>
+    </div>
+  </div>
+</div>

@@ -53,6 +53,9 @@ class LongcatFlashConfig(PretrainedConfig):
         zero_expert_type="identity",
         nextn_use_scmoe=False,
         num_nextn_predict_layers=1,
+        ngram_vocab_size_ratio=None,
+        emb_neighbor_num=None,
+        emb_split_num=None,
         **kwargs,
     ):
         super().__init__(
@@ -102,3 +105,8 @@ class LongcatFlashConfig(PretrainedConfig):
         self.zero_expert_type = zero_expert_type
         self.routed_scaling_factor = routed_scaling_factor
         self.hidden_act = "silu"
+        self.use_ngram_embedding = ngram_vocab_size_ratio is not None
+        if self.use_ngram_embedding:
+            self.ngram_embedding_m = int(ngram_vocab_size_ratio * vocab_size)
+            self.ngram_embedding_n = emb_neighbor_num
+            self.ngram_embedding_k = emb_split_num

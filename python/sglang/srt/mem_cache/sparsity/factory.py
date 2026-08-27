@@ -59,33 +59,51 @@ def _create_backend_adaptor(
 
 
 def _parse_sparse_config(server_args) -> SparseConfig:
-    """Parse hierarchical sparse config"""
-    # Parse extra config if provided
-    extra_config_str = server_args.hierarchical_sparse_attention_extra_config
+    """Parse hierarchical sparse config from JSON string.
+
+    Required fields with defaults: top_k (2048), device_buffer_size (2*top_k),
+    host_to_device_ratio (2).
+    Optional fields (default None): algorithm, backend, min_sparse_prompt_len,
+    page_size. All remaining fields go to sparse_extra_config.
+    """
+    extra_config_str = server_args.hisparse_config
     if extra_config_str is not None:
         try:
             extra_config = json.loads(extra_config_str)
-
-            # Extract algorithm and backend
-            algorithm = extra_config.pop("algorithm", "quest")
-            backend = extra_config.pop("backend", "flashattention")
-            min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", 2048)
-
-            # Everything else goes to algorithm_extra_config
-            sparse_extra_config = extra_config
         except json.JSONDecodeError as e:
-            logger.warning(
-                f"Failed to parse hierarchical_sparse_attention_extra_config: {e}"
-            )
+            raise ValueError(f"Failed to parse hisparse_config: {e}") from e
+    else:
+        extra_config = {}
 
-    config = SparseConfig(
+    top_k = extra_config.pop("top_k", 2048)
+    device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
+    host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
+
+    if device_buffer_size < top_k:
+        raise ValueError(
+            f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
+        )
+
+    algorithm = extra_config.pop("algorithm", None)
+    backend = extra_config.pop("backend", None)
+    min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
+    page_size = extra_config.pop("page_size", None)
+
+    return SparseConfig(
+        top_k=top_k,
+        device_buffer_size=device_buffer_size,
+        host_to_device_ratio=host_to_device_ratio,
         algorithm=algorithm,
         backend=backend,
-        page_size=server_args.page_size,
+        page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
-        sparse_extra_config=sparse_extra_config,
+        sparse_extra_config=extra_config,
     )
-    return config
+
+
+def parse_hisparse_config(server_args) -> SparseConfig:
+    """Parse hisparse config from server_args, returning defaults if no config provided."""
+    return _parse_sparse_config(server_args)
 
 
 def create_sparse_coordinator(

@@ -22,6 +22,7 @@ def main():
         Path("sgl-kernel/pyproject.toml"),
         Path("sgl-kernel/pyproject_cpu.toml"),
         Path("sgl-kernel/pyproject_rocm.toml"),
+        Path("sgl-kernel/pyproject_musa.toml"),
         Path("sgl-kernel/python/sgl_kernel/version.py"),
     ]
 

@@ -593,7 +593,6 @@ class InternLM2Tokenizer(PreTrainedTokenizer):
                 current_sub_tokens.append(token)
                 prev_is_special = False
         out_string += self.sp_model.decode(current_sub_tokens)
-        out_string = self.clean_up_tokenization(out_string)
         out_string = self._maybe_add_prefix_space(tokens=tokens, decoded=out_string)
         return out_string[1:]
 

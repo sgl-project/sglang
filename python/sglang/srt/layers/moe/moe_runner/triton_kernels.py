@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -84,6 +84,7 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         runner_input: TritonKernelsRunnerInput,
         quant_info: TritonKernelsQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> TritonKernelsRunnerOutput:
         from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
             triton_kernel_fused_experts,

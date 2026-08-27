@@ -128,10 +128,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and self.running_batch.is_empty()
                 )
                 if self.running_batch.is_empty() and self.split_prefill_batch is None:
-                    self.check_memory()
-                    self.check_tree_cache()
-                    self.new_token_ratio = self.init_new_token_ratio
-                    self.maybe_sleep_on_idle()
+                    self.on_idle()
 
             if adjust_stream_group:
                 prefill_stream.synchronize()

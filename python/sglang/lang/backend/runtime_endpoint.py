@@ -67,7 +67,7 @@ class RuntimeEndpoint(BaseBackend):
 
     def get_server_info(self):
         res = http_request(
-            self.base_url + "/get_server_info",
+            self.base_url + "/server_info",
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -382,7 +382,7 @@ class Runtime:
         # client code without installing SRT server and its dependency if they want.
         from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
-        from sglang.srt.utils import is_port_available
+        from sglang.srt.utils.network import is_port_available
 
         self.server_args = ServerArgs(*args, log_level=log_level, **kwargs)
 
@@ -531,7 +531,7 @@ class Runtime:
 
     async def get_server_info(self):
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.url}/get_server_info") as response:
+            async with session.get(f"{self.url}/server_info") as response:
                 if response.status == 200:
                     return await response.json()
                 else:

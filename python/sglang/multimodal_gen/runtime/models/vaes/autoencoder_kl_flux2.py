@@ -49,6 +49,9 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
         down_block_types: Tuple[str, ...] = arch_config.down_block_types
         up_block_types: Tuple[str, ...] = arch_config.up_block_types
         block_out_channels: Tuple[int, ...] = arch_config.block_out_channels
+        decoder_block_out_channels: Optional[Tuple[int, ...]] = getattr(
+            arch_config, "decoder_block_out_channels", None
+        )
         layers_per_block: int = arch_config.layers_per_block
         act_fn: str = arch_config.act_fn
         latent_channels: int = arch_config.latent_channels
@@ -79,7 +82,7 @@ class AutoencoderKLFlux2(ParallelTiledVAE):
             in_channels=latent_channels,
             out_channels=out_channels,
             up_block_types=up_block_types,
-            block_out_channels=block_out_channels,
+            block_out_channels=decoder_block_out_channels or block_out_channels,
             layers_per_block=layers_per_block,
             norm_num_groups=norm_num_groups,
             act_fn=act_fn,

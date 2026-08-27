@@ -1,0 +1,143 @@
+---
+title: "TeaCache Acceleration"
+description: "Configure TeaCache for temporal similarity-based diffusion acceleration."
+---
+
+> **Note**: This is one of two caching strategies available in SGLang.
+> For an overview of all caching options, see [caching](./caching-acceleration).
+
+TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
+
+## Overview
+
+TeaCache works by:
+1. Tracking the L1 distance between modulated inputs across consecutive timesteps
+2. Accumulating the rescaled L1 distance over steps
+3. When accumulated distance is below a threshold, reusing the cached residual
+4. Supporting CFG (Classifier-Free Guidance) with separate positive/negative caches
+
+## How It Works
+
+### L1 Distance Tracking
+
+At each denoising step, TeaCache computes the relative L1 distance between the current and previous modulated inputs:
+
+```text
+rel_l1 = |current - previous|.mean() / |previous|.mean()
+```
+
+This distance is then rescaled using polynomial coefficients and accumulated:
+
+```text
+accumulated += poly(coefficients)(rel_l1)
+```
+
+### Cache Decision
+
+- If `accumulated >= threshold`: Force computation, reset accumulator
+- If `accumulated < threshold`: Skip computation, use cached residual
+
+### CFG Support
+
+For models that support CFG cache separation (Wan, Hunyuan, Z-Image), TeaCache maintains separate caches for positive and negative branches:
+- `previous_modulated_input` / `previous_residual` for positive branch
+- `previous_modulated_input_negative` / `previous_residual_negative` for negative branch
+
+For models that don't support CFG separation (Flux, Qwen), TeaCache is automatically disabled when CFG is enabled.
+
+## Configuration
+
+TeaCache is configured via `TeaCacheParams` in the sampling parameters:
+
+```python
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
+params = TeaCacheParams(
+    teacache_thresh=0.1,           # Threshold for accumulated L1 distance
+    coefficients=[1.0, 0.0, 0.0],  # Polynomial coefficients for L1 rescaling
+)
+```
+
+### Parameters
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "28%"}} />
+    <col style={{width: "14%"}} />
+    <col style={{width: "58%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`teacache_thresh`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>float</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Threshold for accumulated L1 distance. Lower = more caching, faster but potentially lower quality</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`coefficients`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list[float]</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Polynomial coefficients for L1 rescaling. Model-specific tuning</td>
+    </tr>
+  </tbody>
+</table>
+
+### Model-Specific Configurations
+
+Different models may have different optimal configurations. The coefficients are typically tuned per-model to balance speed and quality.
+
+## Supported Models
+
+TeaCache is built into the following model families:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "34%"}} />
+    <col style={{width: "28%"}} />
+    <col style={{width: "38%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Family</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>CFG Cache Separation</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Wan (wan2.1, wan2.2)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hunyuan (HunyuanVideo)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>To be supported</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>To be supported</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Flux</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>To be supported</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>To be supported</td>
+    </tr>
+  </tbody>
+</table>
+
+
+## References
+
+- [TeaCache: Accelerating Diffusion Models with Temporal Similarity](https://arxiv.org/abs/2411.14324)

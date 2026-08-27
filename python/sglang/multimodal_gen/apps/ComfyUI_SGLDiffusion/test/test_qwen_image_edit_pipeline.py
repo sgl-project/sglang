@@ -1,6 +1,7 @@
 """Test for ComfyUIQwenImageEditPipeline with pass-through scheduler (I2I/edit mode)."""
 
 import os
+import sys
 
 import pytest
 import torch
@@ -132,4 +133,4 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
