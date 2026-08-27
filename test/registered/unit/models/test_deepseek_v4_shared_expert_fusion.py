@@ -64,10 +64,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_disables_shared_fusion_without_enforce(self):
         self._publish(enforce=False)
-        with patch(
-            "sglang.srt.distributed.parallel_state._MOE_EP",
-            new_callable=lambda: SimpleNamespace(world_size=1),
-        ):
+        with get_parallel().override(moe_ep_size=1):
             self.assertEqual(
                 DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
                     SimpleNamespace(n_shared_experts=1), None
@@ -81,10 +78,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_enables_shared_fusion_when_enforced(self):
         self._publish(enforce=True)
-        with patch(
-            "sglang.srt.distributed.parallel_state._MOE_EP",
-            new_callable=lambda: SimpleNamespace(world_size=1),
-        ):
+        with get_parallel().override(moe_ep_size=1):
             self.assertIsNone(
                 DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
                     SimpleNamespace(n_shared_experts=1), None
@@ -95,10 +89,9 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
     def test_enforcing_with_more_than_one_shared_expert_is_rejected(self):
         self._publish(enforce=True)
-        with patch(
-            "sglang.srt.distributed.parallel_state._MOE_EP",
-            new_callable=lambda: SimpleNamespace(world_size=1),
-        ), self.assertRaisesRegex(ValueError, "exactly one shared"):
+        with get_parallel().override(moe_ep_size=1), self.assertRaisesRegex(
+            ValueError, "exactly one shared"
+        ):
             DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
                 SimpleNamespace(n_shared_experts=2), None
             )
@@ -120,10 +113,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         matched = SimpleNamespace(
             get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
         )
-        with patch(
-            "sglang.srt.distributed.parallel_state._MOE_EP",
-            new_callable=lambda: SimpleNamespace(world_size=1),
-        ):
+        with get_parallel().override(moe_ep_size=1):
             self.assertIsNone(
                 DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
                     SimpleNamespace(n_shared_experts=1), matched
@@ -134,10 +124,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         """A DSV4 DSpark draft must inherit the target's default fusion policy."""
         self._publish(enforce=False)
 
-        with patch(
-            "sglang.srt.distributed.parallel_state._MOE_EP",
-            new_callable=lambda: SimpleNamespace(world_size=1),
-        ):
+        with get_parallel().override(moe_ep_size=1):
             self._install(DeepseekV4ForCausalLMDSpark)
 
             self.assertTrue(is_shared_experts_fusion_disabled())
@@ -145,10 +132,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
     def test_dspark_records_explicitly_forced_fusion(self):
         """A forced DSpark build must retain its fused shared-expert count."""
         self._publish(enforce=True)
-        with patch(
-            "sglang.srt.distributed.parallel_state._MOE_EP",
-            new_callable=lambda: SimpleNamespace(world_size=1),
-        ):
+        with get_parallel().override(moe_ep_size=1):
             self._install(DeepseekV4ForCausalLMDSpark)
 
             class Stage(nn.Module):
