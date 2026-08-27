@@ -31,12 +31,23 @@ class ConfigArgumentMerger:
                 for action in parser._actions
                 if isinstance(action, argparse._StoreTrueAction)
             ]
+            # Deprecated aliases can share a destination with a supported
+            # canonical action, so support must be decided across all actions.
+            supported_action_dests = {
+                action.dest
+                for action in parser._actions
+                if isinstance(
+                    action,
+                    (argparse._StoreTrueAction, argparse._StoreAction),
+                )
+            }
             self.unsupported_actions = {
                 a.dest: a
                 for a in parser._actions
                 if a.option_strings
                 and not isinstance(a, argparse._StoreTrueAction)
                 and not isinstance(a, argparse._StoreAction)
+                and a.dest not in supported_action_dests
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
