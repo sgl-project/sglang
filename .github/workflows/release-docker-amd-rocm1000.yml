@@ -1,4 +1,4 @@
-name: Build ROCm 10.0.0 RC4 Docker Images (AMD)
+name: Build ROCm 10.0.0 GA Docker Images (AMD)
 on:
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ permissions:
   pull-requests: read
 
 env:
-  # Scratch registry for the ROCm 10 RC4 bring-up images.
+  # Scratch registry for the ROCm 10.0.0 GA bring-up images.
   IMAGE_REPO: bingxche/sgl-test
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm10rc4', 'gfx950-rocm10rc4']
+        gpu_arch: ['gfx942-rocm1000', 'gfx950-rocm1000']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -94,8 +94,8 @@ jobs:
           echo "Pretend version: ${pretend_version}"
 
           case "${{ matrix.gpu_arch }}" in
-            gfx942-rocm10rc4) rocm_tag="rocm10rc4-mi30x" ;;
-            gfx950-rocm10rc4) rocm_tag="rocm10rc4-mi35x" ;;
+            gfx942-rocm1000) rocm_tag="rocm1000-mi30x" ;;
+            gfx950-rocm1000) rocm_tag="rocm1000-mi35x" ;;
             *)
               echo "Unsupported gfx arch"
               exit 1
@@ -111,12 +111,12 @@ jobs:
           docker push ${IMAGE_REPO}:${tag}-${{ env.DATE }}
 
   validate-pr:
-    name: Run full AMD PR suite with ROCm 10 RC4
+    name: Run full AMD PR suite with ROCm 10.0.0 GA
     needs: publish
     if: github.event_name == 'push' || inputs.job_select == 'all'
     uses: ./.github/workflows/pr-test-amd-rocm720.yml
     with:
-      rocm_version: rocm10rc4
+      rocm_version: rocm1000
       ref: ${{ github.sha }}
       runner_arch: mi300
       run_all_tests: true
@@ -124,12 +124,12 @@ jobs:
     secrets: inherit
 
   validate-nightly:
-    name: Run full AMD nightly suite with ROCm 10 RC4
+    name: Run full AMD nightly suite with ROCm 10.0.0 GA
     needs: publish
     if: github.event_name == 'push' || inputs.job_select == 'all'
     uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
-      rocm_version: rocm10rc4
+      rocm_version: rocm1000
       ref: ${{ github.sha }}
       job_filter: all
       continue_on_error: true

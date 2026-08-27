@@ -5,16 +5,16 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm724 -t v0.5.10.post1-rocm724-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm10rc4 -t v0.5.10.post1-rocm10rc4-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm10rc4 -t v0.5.10.post1-rocm10rc4-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm1000 -t v0.5.10.post1-rocm1000-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm1000 -t v0.5.10.post1-rocm1000-mi35x -f rocm.Dockerfile .
 #
 # Flavor notes:
 #   GPU_ARCH=*-rocm724 is built on a Python 3.12 base and upgrades the stack to
 #   torch 2.11 (+torchvision 0.26 / torchaudio 2.11) and Triton 3.7.
 #   The ROCm 7.2.0 flavors remain on Python 3.10 and torch 2.9.1.
-#   GPU_ARCH=*-rocm10rc4 is Python 3.12 + torch 2.11, and takes the
-#   whole ROCm stack from AMD's prerelease wheel channel rather than an apt
-#   ROCm base image; see the rocm10rc4-base stage for what that changes.
+#   GPU_ARCH=*-rocm1000 is Python 3.12 + torch 2.11, and takes the
+#   whole ROCm stack from AMD's stable wheel channel rather than an apt
+#   ROCm base image; see the rocm1000-base stage for what that changes.
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -39,11 +39,11 @@ ARG BASE_IMAGE_942_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_re
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
-# The ROCm 10 RC4 flavors default to the rocm10rc4-base stage below rather
+# The ROCm 10.0.0 GA flavors default to the rocm1000-base stage below rather
 # than a published image; point these at one to build on a prebuilt base.
-ARG BASE_IMAGE_942_ROCM10RC4="rocm10rc4-base"
-ARG BASE_IMAGE_950_ROCM10RC4="rocm10rc4-base"
-ARG BASE_IMAGE_ROCM10RC4="ubuntu:24.04"
+ARG BASE_IMAGE_942_ROCM1000="rocm1000-base"
+ARG BASE_IMAGE_950_ROCM1000="rocm1000-base"
+ARG BASE_IMAGE_ROCM1000="ubuntu:24.04"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -137,21 +137,20 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
 # ===============================
-# Shared ROCm 10.0.0 RC4 base for gfx942 and gfx950. AMD does not publish a
-# ROCm 10 RC4 rocm/pytorch or ROCm development image, so the stack is assembled
-# from AMD's prerelease wheels on a plain Ubuntu base. AMD also publishes RC4
-# tarballs, but the wheel channel supplies the matching PyTorch and device
-# artifacts in one place and mirrors the approach already validated for 7.14.
+# Shared ROCm 10.0.0 GA base for gfx942 and gfx950. Assemble the stack from
+# AMD's stable wheels on a plain Ubuntu base so each output image carries only
+# its own GPU device payload. This also keeps the GA comparison aligned with
+# the wheel-based RC4 images already validated by this workflow.
 # The SDK lands in site-packages instead of /opt/rocm, which the rest of this
 # Dockerfile and AITER both assume, hence the path fixups below.
 #
-# This is deliberately the versioned prerelease channel, not a nightly or
-# devrelease build. Every ROCm/PyTorch artifact below is pinned to 10.0.0rc4.
+# This is deliberately AMD's stable channel, not a prerelease or nightly.
+# Every ROCm/PyTorch artifact below is pinned to the 10.0.0 GA release.
 #
 # Python 3.12 (the Ubuntu 24.04 default) rather than 3.13/3.14: st_attn==0.0.7,
 # vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.8.2 publish wheels only up to
 # cp313 and no sdist, so pip has no candidate at all for srt_hip on 3.14.
-FROM $BASE_IMAGE_ROCM10RC4 AS rocm10rc4-base
+FROM $BASE_IMAGE_ROCM1000 AS rocm1000-base
 
 # Re-declare the global selector inside this stage so each matrix build installs
 # only the device payload for its target image (gfx942 or gfx950).
@@ -160,12 +159,12 @@ ARG GPU_ARCH
 # ROCM_TRITON_VERSION rather than TRITON_VERSION: the final stage declares a
 # TRITON_VERSION of its own for the ROCm 7.2 wheel, and a --build-arg would
 # otherwise land on both.
-ARG ROCM_SDK_VERSION="10.0.0rc4"
+ARG ROCM_SDK_VERSION="10.0.0"
 ARG ROCM_TORCH_VERSION="2.11.0"
 ARG ROCM_TORCHVISION_VERSION="0.26.0"
 ARG ROCM_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM_TRITON_VERSION="3.8.0+git4cff872c"
-ARG ROCM_INDEX_URL="https://rocm.prereleases.amd.com/whl-multi-arch/"
+ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -190,17 +189,15 @@ RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
 # The two release jobs invoke separate Docker builds. Derive the device target
 # from GPU_ARCH so the MI300 image carries only gfx942 wheels and the MI350
 # image carries only gfx950 wheels. Keeping the packages as explicit specs also
-# avoids the RC4 resolver issue where a multi-device extras expression installs
-# only its first device payload.
+# makes the intended per-image device payload explicit to the resolver.
 RUN set -eux; \
     ROCM_DEVICE_ARCH="${GPU_ARCH%%-*}"; \
     case "${ROCM_DEVICE_ARCH}" in \
       gfx942) OTHER_ROCM_DEVICE_ARCH="gfx950" ;; \
       gfx950) OTHER_ROCM_DEVICE_ARCH="gfx942" ;; \
-      *) echo "Unsupported ROCm 10 RC4 GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
+      *) echo "Unsupported ROCm 10.0.0 GA GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
     esac; \
     python3 -m pip install --no-cache-dir \
-        --pre \
         --index-url ${ROCM_INDEX_URL} \
         "rocm-sdk-core==${ROCM_SDK_VERSION}" \
         "rocm-sdk-libraries==${ROCM_SDK_VERSION}" \
@@ -264,10 +261,10 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 RUN ln -s ${ROCM_HOME} /opt/rocm
 
 # ===============================
-# Base image 942 with ROCm 10 RC4 and args (Python 3.12 + torch 2.11)
+# Base image 942 with ROCm 10.0.0 GA and args (Python 3.12 + torch 2.11)
 # BUILD_TRITON=0 keeps the Triton installed above, which is the build AMD ships
 # with this SDK; the BUILD_TRITON=1 path installs a ROCm 7.2 wheel instead.
-FROM $BASE_IMAGE_942_ROCM10RC4 AS gfx942-rocm10rc4
+FROM $BASE_IMAGE_942_ROCM1000 AS gfx942-rocm1000
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -280,8 +277,8 @@ ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
 # ===============================
-# Base image 950 with ROCm 10 RC4 and args (Python 3.12 + torch 2.11)
-FROM $BASE_IMAGE_950_ROCM10RC4 AS gfx950-rocm10rc4
+# Base image 950 with ROCm 10.0.0 GA and args (Python 3.12 + torch 2.11)
+FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -406,14 +403,14 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # ubuntu24.04 base installs the `rocm` apt metapackage and does not; noble's
 # distro table has MI300 (74A*) but no MI355X (75A3), so gfx950-rocm724 would
 # otherwise report "AMD Radeon Graphics" and miss every name-keyed config.
-# The ROCm 10 RC4 flavors need nothing here: their libdrm comes from the pip SDK, which
+# The ROCm 10.0.0 GA flavors need nothing here: their libdrm comes from the pip SDK, which
 # links the ids table into libdrm_amdgpu.so itself (the .so carries the MI300X /
 # MI325X / MI355X names and never opens share/libdrm/amdgpu.ids).
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm10rc4*) \
-        echo "ROCm 10 RC4 (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
+      *rocm1000*) \
+        echo "ROCm 10.0.0 GA (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
         ;; \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
@@ -454,17 +451,17 @@ RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 # Install AMD SMI Python package from ROCm distribution.
-# Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10 RC4
+# Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10.0.0 GA
 # SDK pre-installs this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*|*rocm724*|*rocm10rc4*) \
-        echo "ROCm 7.2 / 10 RC4 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+      *rocm720*|*rocm724*|*rocm1000*) \
+        echo "ROCm 7.2 / 10.0.0 GA flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
         && python3 -m pip install --no-cache-dir . \
         ;; \
       *) \
-        echo "Not rocm720/rocm724/rocm10rc4 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        echo "Not rocm720/rocm724/rocm1000 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
         ;; \
     esac
 
@@ -486,9 +483,9 @@ RUN case "${GPU_ARCH}" in \
 # Populate the PIP_CONSTRAINT file, which only the explicitly upgraded torch
 # stages define, so resolving AITER and SGLang cannot replace the torch stack.
 # Triton is left out: on rocm724 the BUILD_TRITON step installs it later, and on
-# rocm10rc4 it came from the ROCm SDK alongside torch.
+# rocm1000 it came from the ROCm SDK alongside torch.
 RUN case "${GPU_ARCH}" in \
-      *-rocm724|*-rocm10rc4) \
+      *-rocm724|*-rocm1000) \
         python3 -m pip freeze \
           | grep -E '^(torch|torchvision|torchaudio)(==| @ )' \
           > /etc/sglang/constraints/torch-rocm.txt \
@@ -645,7 +642,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     # flavors keep the extras they used before.
     && case "${GPU_ARCH}" in \
          *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip"; all_extras="all_hip_rocm724" ;; \
-         *-rocm10rc4) srt_extras="srt_hip_rocm724,diffusion_hip"; all_extras="all_hip_rocm724" ;; \
+         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; all_extras="all_hip_rocm724" ;; \
          *) srt_extras="srt_hip,diffusion_hip"; all_extras="all_hip" ;; \
        esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
@@ -658,7 +655,7 @@ RUN python -m pip cache purge
 
 RUN case "${GPU_ARCH##*-}" in \
       rocm724) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
-      rocm10rc4) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
+      rocm1000) expected_torch="2.11."; expected_audio="2.11."; expected_vision="0.26." ;; \
       *) exit 0 ;; \
     esac \
     && python3 -m pip check \
@@ -895,13 +892,13 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       build-essential autoconf automake libtool pkg-config git \
       libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
   # Mooncake's dependencies.sh apt-installs Ubuntu's libabsl-dev (20220623 on
-  # the noble base used by rocm724 and rocm10rc4). NIXL's meson then finds
+  # the noble base used by rocm724 and rocm1000). NIXL's meson then finds
   # absl_base but no absl_log and refuses to fall back to its bundled Abseil --
   # "that would result in a mix of Abseil versions at runtime" -- so nixl fails
   # at metadata generation. Drop just the -dev package (headers and pkg-config
   # files); the runtime library that already-built components link against
   # stays in place.
-  case "${GPU_ARCH}" in *-rocm724|*-rocm10rc4) apt-get remove -y libabsl-dev ;; esac; \
+  case "${GPU_ARCH}" in *-rocm724|*-rocm1000) apt-get remove -y libabsl-dev ;; esac; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \

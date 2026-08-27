@@ -50,12 +50,12 @@ fi
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724|-rocm10rc4)?$ ]]; then
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724|-rocm1000)?$ ]]; then
     echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
     case "${IMAGE_GPU_ARCH}" in
         *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
         *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
-        *-rocm10rc4) IMAGE_BASE_ARG_SUFFIX="_ROCM10RC4"; IMAGE_STAGE_SUFFIX="-rocm10rc4" ;;
+        *-rocm1000) IMAGE_BASE_ARG_SUFFIX="_ROCM1000"; IMAGE_STAGE_SUFFIX="-rocm1000" ;;
         *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
     esac
     IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
@@ -85,7 +85,7 @@ unset IMAGE_GPU_ARCH
 # Install the required dependencies in CI.
 # Select the dependency extra that matches each image's torch stack. Plain
 # srt_hip pins compressed-tensors 0.15.0, which requires torch<2.11.
-if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm10rc4" ]]; then
+if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
@@ -266,7 +266,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
-  # Only the rocm724 and rocm10rc4 (noble) bases attempt to install
+  # Only the rocm724 and rocm1000 (noble) bases attempt to install
   # libgrpc++-dev; 7.0 and 7.2.0 built MORI without it for months before this
   # step existed, so skip the apt round trip there. Where it does run, neither
   # step may be fatal: apt-get update
@@ -284,12 +284,12 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ] || [ '${IMAGE_STAGE_SUFFIX}' = '-rocm10rc4' ]; then
+    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm724' ] || [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ]; then
       apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
       apt-get install -y --no-install-recommends libgrpc++-dev || echo '[MORI] libgrpc++-dev unavailable; building MORI without it'
     fi
     # Same rocm_sysdeps handling as docker/rocm.Dockerfile's MORI step: the pip
-    # ROCm SDK used by the rocm10rc4 images vendors NUMA and libdrm there, off
+    # ROCm SDK used by the rocm1000 images vendors NUMA and libdrm there, off
     # every default search path. Kept scoped to this build rather than exported
     # image-wide because rocm_sysdeps/include also carries zlib.h / expat.h /
     # elf.h, which would shadow the system headers for every other component.
@@ -413,7 +413,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     "
 
     # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
-    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm10rc4" ]]; then
+    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" || "${IMAGE_STAGE_SUFFIX}" == "-rocm1000" ]]; then
         docker exec -i ci_sglang python3 - <<'PY'
 from pathlib import Path
 p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
