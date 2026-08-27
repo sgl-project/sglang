@@ -142,7 +142,7 @@ export const LTXDeployment = () => {
 
     let command = `sglang serve \\\n  --model-path ${config.repoId} \\\n  --pipeline-class-name ${pipelineClass}`;
     if (values.hardware === 'xeon') {
-      command += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+      command = `SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu ` + command;
     }
     command += getParallelFlags();
     if (values.model === 'ltx23' && values.pipeline !== 'one-stage') {
