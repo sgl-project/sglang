@@ -4713,10 +4713,17 @@ class ServerArgs:
         memory-saver rejection in its own __init__; config-time rules can be
         added here as they're discovered.
         """
-        from sglang.srt.configs.model_config import is_deepseek_v4
+        from sglang.srt.configs.model_config import (
+            is_deepseek_v4,
+            uses_kda_attention,
+        )
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
         rules = [
+            (
+                "KDA hybrid linear attention",
+                lambda: uses_kda_attention(self.get_model_config().hf_config),
+            ),
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
             (
@@ -5372,6 +5379,7 @@ class ServerArgs:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
         ]:
             # Set attention backend for DeepSeek
@@ -7788,10 +7796,12 @@ class ServerArgs:
             "KimiK25ForConditionalGeneration",
             "KimiK3ForConditionalGeneration",
             "MiMoV2ForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
-                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+                f"Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2, GLM5Next."
             )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
@@ -8262,6 +8272,16 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
+            if (
+                "SGLANG_DSA_FUSE_TOPK" not in os.environ
+                and "SGLANG_NSA_FUSE_TOPK" not in os.environ
+            ):
+                os.environ["SGLANG_DSA_FUSE_TOPK"] = "0"
+                logger.warning(
+                    "SGLANG_DSA_FUSE_TOPK=0 forced for deterministic inference "
+                    "(avoids _append_kpool_tail_to_topk_kernel crash)."
+                )
+
             # Moved to the resolution pipeline (arg_groups/overrides.py:
             # _deterministic_allreduce_fusion_disable), invoked here at its
             # legacy slot.
@@ -8295,6 +8315,7 @@ class ServerArgs:
                         "PixtralForConditionalGeneration",
                         "GlmMoeDsaForCausalLM",
                         "Glm4MoeLiteForCausalLM",
+                        "Glm5NextForConditionalGeneration",
                     ]
                 except Exception:
                     pass
