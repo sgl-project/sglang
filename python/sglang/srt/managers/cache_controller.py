@@ -284,6 +284,12 @@ class PrefetchOperation(StorageOperation):
 
 class HiCacheController:
 
+    # Set by the scheduler to the forward stream; gates load-back H2D behind
+    # in-flight forwards (see start_loading). Declared on the class so that
+    # instances built without __init__ -- and Mock(spec=...) doubles -- still
+    # resolve it.
+    load_fence_stream = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -361,9 +367,6 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
-        # Set by the scheduler to the forward stream; gates load-back H2D
-        # behind in-flight forwards (see start_loading).
-        self.load_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
