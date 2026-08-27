@@ -2807,6 +2807,11 @@ class SchedulerDisaggregationDecodeMixin:
                 >= p50_output_len
                 * self.server_args.proactive_decode_demotion_output_len_threthold
             )
+            logger.warning(
+                "Proactive decode demotion: p50_output_len=%s p95_output_len=%s",
+                p50_output_len,
+                p95_output_len,
+            )
 
         if not self.if_output_len_imbalance:
             return False
@@ -2819,10 +2824,6 @@ class SchedulerDisaggregationDecodeMixin:
         if batch is None or batch.is_empty():
             return False
 
-        # This runs before the next forward is launched. In overlap mode,
-        # _apply_war_barrier has already ordered the scheduler stream after the
-        # previous forward, and result processing skips requests marked here as
-        # retracted.
         collector = getattr(self, "decode_metric_collector", None)
         p50_output_len = getattr(collector, "p50_output_len", None)
         if p50_output_len is None or p50_output_len <= 0:
