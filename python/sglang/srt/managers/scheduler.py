@@ -3537,32 +3537,17 @@ class Scheduler(
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
-            # Spec tails must be settled: with their result still in flight
-            # (overlap), the accept count is unknown and every schedule-time
-            # tail value would be stale by it. Skipping costs one unmixed
-            # step; the running batch decodes next iteration as usual.
-            spec_tails_unsettled = False
-            if (
-                not self.spec_algorithm.is_none()
-                and self.enable_overlap
-                and self.last_batch is not None
-            ):
-                # Any tail present in the in-flight batch (its decode, a
-                # mixed step, or its own prefill) has unprocessed results.
-                in_flight = {r.rid for r in self.last_batch.reqs}
-                spec_tails_unsettled = any(
-                    r.rid in in_flight for r in running_batch.reqs
-                )
             running_batch.filter_batch()
-            if not running_batch.is_empty() and not spec_tails_unsettled:
+            if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
-                if not self.spec_algorithm.is_none():
-                    # Spec carries bonus tokens on the draft input / relay
-                    # publishes; stash the settled tails' pending tokens so
-                    # the mixed input resolve reads real values in both
-                    # scheduling modes.
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec carries bonus tokens on the draft
+                    # input, not in the relay; stash the tails' pending
+                    # tokens so the mixed input resolve reads real values.
+                    # Overlap reads the published relay and late-binds the
+                    # tail state at forward entry (resolve_mixed_spec_tails).
                     last_tokens = torch.tensor(
                         [r.output_ids[-1] for r in running_batch.reqs],
                         dtype=torch.int64,
