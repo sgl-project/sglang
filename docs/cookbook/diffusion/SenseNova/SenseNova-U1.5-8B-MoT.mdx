@@ -77,22 +77,4 @@ Common aligned resolutions:
 
 Do not use `2160 x 3840` for 9:16 generation with this model: the aspect ratio is correct, but `2160` is not divisible by `32`.
 
-### 3.3 Sampling Parameters
-
-The native SGLang CLI uses the standard multimodal generation sampling parameters:
-
-| SenseNova reference script | SGLang generate parameter | Notes |
-| --- | --- | --- |
-| `--cfg_scale` | `--guidance-scale` | Classifier-free guidance scale. |
-| `--num_steps` | `--num-inference-steps` | Number of denoising steps. |
-| `--batch_size` | Use repeated requests or `--num-outputs-per-prompt` | `--num-outputs-per-prompt` follows SGLang's `n` semantics. |
-| `--output` | `--output-file-path` | Sets the exact output image path. |
-
-Model-private options such as `cfg_norm`, `timestep_shift`, `cfg_interval`, and `think_mode` use the model defaults in SGLang and are not exposed as public CLI parameters.
-
-## 4. Notes and Limitations
-
-- The native SenseNova-U1 pipeline currently supports single-GPU execution (`--num-gpus 1`).
-- Native tensor parallelism and pipeline parallelism are not implemented for this pipeline yet.
-- High-resolution poster generation can be memory intensive. If `2304 x 4096` does not fit on your GPU, try `2016 x 3584` first and then upscale offline.
-- This page covers offline generation with `sglang generate`. Server-mode and OpenAI-compatible image API examples will be documented after they are validated for this native pipeline.
+High-resolution poster generation can be memory intensive. If `2304 x 4096` does not fit on your GPU, try `2016 x 3584` first and then upscale offline.
