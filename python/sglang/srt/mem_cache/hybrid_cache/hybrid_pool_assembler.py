@@ -219,7 +219,12 @@ def _build_deepseek_v4_device_pool_group(
         ),
         mappings.c4_state,
     )
-    return DevicePoolGroup(entries, mappings.transfer_layer_num, page_size)
+    return DevicePoolGroup(
+        entries,
+        mappings.transfer_layer_num,
+        page_size,
+        rank_replicated=True,
+    )
 
 
 def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
@@ -250,7 +255,7 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
             rows_are_pages=True,
         ),
     ]
-    return DevicePoolGroup(entries, num_layers, page_size)
+    return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
 def build_kv_host_pool(

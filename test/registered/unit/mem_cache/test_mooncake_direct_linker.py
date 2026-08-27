@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _storage_suffix,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -165,6 +166,7 @@ def test_load_and_offload_share_gc_freeze(monkeypatch):
     )
     linker.page_size = 2
     linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=2)
+    linker.offload_owner = True
     linker.gc_frozen = False
     linker.offload_queue = Queue()
     linker.pending_loads = {"first": [object()]}
@@ -188,6 +190,27 @@ def test_load_and_offload_share_gc_freeze(monkeypatch):
 
     assert calls == ["Mooncake direct linker"]
     assert linker.stats["load"] == 2
+
+
+def test_storage_suffix_is_shared_only_for_rank_replicated_pools():
+    assert (
+        _storage_suffix(
+            rank_replicated=True,
+            tp_rank=7,
+            attn_cp_rank=2,
+            pp_rank=1,
+        )
+        == "cp2_pp1"
+    )
+    assert (
+        _storage_suffix(
+            rank_replicated=False,
+            tp_rank=7,
+            attn_cp_rank=2,
+            pp_rank=1,
+        )
+        == "tp7_cp2_pp1"
+    )
 
 
 def test_load_waits_for_scheduler_stream(monkeypatch):
@@ -268,6 +291,7 @@ def test_offload_runs_on_background_thread(monkeypatch):
     linker.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=2)
     linker.pools = linker.pool_group.entry_map
     linker.storage = _Storage()
+    linker.offload_owner = True
     linker.gc_frozen = False
     linker.stats = {"lookup": 0, "load": 0, "offload": 0}
     linker.offload_queue = Queue()
@@ -297,6 +321,43 @@ def test_offload_runs_on_background_thread(monkeypatch):
     assert linker.pop_completed_offload()
     linker.offload_queue.put(None)
     linker.offload_thread.join(timeout=5)
+
+
+def test_rank_replicated_follower_completes_without_storage_put(monkeypatch):
+    monkeypatch.setattr(mooncake_direct_linker, "freeze_gc", lambda _: None)
+
+    class _Storage:
+        def batch_set_v2(self, transfers):
+            raise AssertionError("A replicated MLA follower must not write Mooncake.")
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.page_size = 2
+    linker.pool_group = DevicePoolGroup(
+        [pool], num_layers=1, page_size=2, rank_replicated=True
+    )
+    linker.storage = _Storage()
+    linker.offload_owner = False
+    linker.gc_frozen = False
+    linker.offload_queue = Queue()
+    linker.offload_results = Queue()
+
+    assert linker.offload(
+        [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=["page"],
+                device_indices=torch.tensor([0, 1]),
+            )
+        ]
+    )
+    assert linker.offload_queue.empty()
+    assert linker.num_completed_offloads() == 1
+    assert linker.pop_completed_offload()
 
 
 def test_async_offload_pins_node_until_completion():
@@ -470,6 +531,7 @@ def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
         components={ComponentType.FULL, ComponentType.SWA},
     )
     assert group.num_layers == 3
+    assert group.rank_replicated
     assert set(group.entry_map) == {
         PoolName.SWA,
         PoolName.DEEPSEEK_V4_C4,
@@ -548,6 +610,7 @@ def test_dsa_device_pool_group_uses_assembler_strategy():
     )
 
     assert group.num_layers == 2
+    assert group.rank_replicated
     assert set(group.entry_map) == {PoolName.KV, PoolName.INDEXER}
     assert group.sources == {
         PoolName.KV: PoolName.KV,

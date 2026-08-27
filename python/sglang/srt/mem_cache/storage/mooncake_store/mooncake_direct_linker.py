@@ -26,6 +26,16 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _storage_suffix(
+    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> str:
+    parts = []
+    if not rank_replicated:
+        parts.append(f"tp{tp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
@@ -91,19 +101,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.num_layers = self.pool_group.num_layers
 
         tp_rank = 0
+        tp_size = server_args.tp_size
+        tp_group = params.attn_tp_cache_group or params.tp_cache_group
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+            tp_rank = torch.distributed.get_rank(group=tp_group)
+            tp_size = torch.distributed.get_world_size(group=tp_group)
+        rank_replicated = self.pool_group.rank_replicated
+        self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
+            tp_size=tp_size,
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             attn_cp_rank=params.attn_cp_rank,
             attn_cp_size=params.attn_cp_size,
-            is_mla_model=True,
+            is_mla_model=rank_replicated,
             enable_storage_metrics=False,
             is_page_first_layout=False,
             model_name=server_args.model_path,
@@ -119,9 +134,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.storage = storage
         self.storage.mem_pool_host = self.pool_group
         self.storage.registered_pools = self.pools
-        rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
-        self.storage.mla_suffix = rank_suffix
-        self.storage.mha_suffix = rank_suffix
+        storage_suffix = _storage_suffix(
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+        )
+        self.storage.mla_suffix = storage_suffix
+        self.storage.mha_suffix = storage_suffix
+        logger.info(
+            "Mooncake direct linker storage topology: "
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            rank_replicated,
+            tp_rank,
+            tp_size,
+            self.offload_owner,
+            storage_suffix,
+        )
 
         self.register_buffers()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
@@ -318,6 +347,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
+        if not self.offload_owner:
+            self.offload_results.put(True)
+            return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready_event = device_module.Event()

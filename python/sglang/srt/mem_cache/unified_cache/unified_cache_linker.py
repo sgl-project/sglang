@@ -270,7 +270,12 @@ class DevicePoolGroup:
     """Physical device pools sharing one logical linker layer range."""
 
     def __init__(
-        self, entries: Sequence[DevicePoolEntry], num_layers: int, page_size: int
+        self,
+        entries: Sequence[DevicePoolEntry],
+        num_layers: int,
+        page_size: int,
+        *,
+        rank_replicated: bool = False,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -279,6 +284,7 @@ class DevicePoolGroup:
         self.sources = {entry.name: entry.indices_from_pool for entry in self.entries}
         self.num_layers = num_layers
         self.page_size = page_size
+        self.rank_replicated = rank_replicated
         self.kv_buffer = None
 
     def resolve_transfers(
