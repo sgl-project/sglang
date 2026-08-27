@@ -724,13 +724,13 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
             # Keep CUDA/XPU behavior on autocast; CPU uses _module_in_fp32 to
             # materialize module weights in fp32 during the forward region.
             autocast_ctx = (
-                _module_in_fp32(
+                torch.autocast(
+                    device_type=hidden_states.device.type, dtype=torch.float32
+                )
+                if hidden_states.device.type != "cpu"
+                else _module_in_fp32(
                     self,
                     enabled=next(self.parameters()).dtype != torch.float32,
-                )
-                if hidden_states.device.type == "cpu"
-                else torch.autocast(
-                    device_type=hidden_states.device.type, dtype=torch.float32
                 )
             )
             with autocast_ctx:
