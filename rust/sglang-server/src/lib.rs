@@ -12,7 +12,6 @@
 //! a `PyObject`.
 
 mod api_server;
-mod frontend;
 mod message;
 mod multi_modality;
 mod renderer;
@@ -261,7 +260,7 @@ impl Server {
 /// Handle for the standalone text-only preprocessing server.
 #[pyclass]
 struct Renderer {
-    rt: runtime::RenderRuntime,
+    rt: sglang_renderer::http::RendererRuntime,
 }
 
 #[pymethods]
@@ -276,14 +275,16 @@ impl Renderer {
             .unwrap_or_else(|| server_args.bind())
             .parse()
             .map_err(|e| value_error("bad http_addr", e))?;
-        let cfg = RuntimeConfig {
-            rust_server_args: RustServerServerArgs {
+        let rt = sglang_renderer::http::RendererRuntime::start(
+            sglang_renderer::http::RendererRuntimeConfig {
                 http_addr,
-                ..Default::default()
+                http_workers: server_args.http_api_worker_num(),
+                tokenizer_workers: server_args.tokenizer_worker_num,
+                queue_capacity: 8192,
+                renderer: crate::renderer::renderer_config(&server_args),
             },
-            server_args: std::sync::Arc::new(server_args),
-        };
-        let rt = runtime::start_render(cfg).map_err(|e| value_error("renderer start failed", e))?;
+        )
+        .map_err(|e| value_error("renderer start failed", e))?;
         Ok(Self { rt })
     }
 

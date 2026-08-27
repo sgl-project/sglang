@@ -2,9 +2,117 @@
 
 use crate::{
     GenerationInput, RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds,
-    TokenIdsRequest,
+    TokenIdsRequest, TokenizationBackend,
 };
+use futures::{channel::oneshot, future::BoxFuture};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+enum PoolJob {
+    Tokenize {
+        request: Box<TextRequest>,
+        reply: oneshot::Sender<Result<TokenIdsRequest, Error>>,
+    },
+    Stop,
+}
+
+struct TokenizerPoolInner {
+    jobs: flume::Sender<PoolJob>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for TokenizerPoolInner {
+    fn drop(&mut self) {
+        let workers = self.workers.get_mut().expect("tokenizer workers mutex");
+        for _ in 0..workers.len() {
+            let _ = self.jobs.send(PoolJob::Stop);
+        }
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Bounded CPU tokenizer pool owned by renderer state.
+#[derive(Clone)]
+pub struct PooledTokenizer {
+    inner: Arc<TokenizerPoolInner>,
+}
+
+pub struct NoTokenizer;
+
+impl TokenizationBackend for NoTokenizer {
+    fn tokenize(
+        &self,
+        _request: TextRequest,
+    ) -> BoxFuture<'static, Result<TokenIdsRequest, Error>> {
+        Box::pin(async {
+            Err(Error::Validation(
+                "this server accepts token-ID prompts only".into(),
+            ))
+        })
+    }
+}
+
+impl PooledTokenizer {
+    pub fn new(
+        tokenizer: Arc<dyn TextTokenizer>,
+        worker_count: usize,
+        queue_capacity: usize,
+    ) -> Self {
+        let worker_count = worker_count.max(1);
+        let (jobs, rx) = flume::bounded(queue_capacity.max(1));
+        let auto_specials = Arc::new(tokenizer.auto_specials());
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let rx = rx.clone();
+            let tokenizer = tokenizer.clone();
+            let auto_specials = auto_specials.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("renderer-tokenizer-{index}"))
+                    .spawn(move || {
+                        while let Ok(job) = rx.recv() {
+                            match job {
+                                PoolJob::Tokenize { request, reply } => {
+                                    let result = tokenize_text_request(
+                                        *request,
+                                        tokenizer.as_ref(),
+                                        auto_specials.as_slice(),
+                                    );
+                                    let _ = reply.send(result);
+                                }
+                                PoolJob::Stop => break,
+                            }
+                        }
+                    })
+                    .expect("spawn renderer tokenizer worker"),
+            );
+        }
+        Self {
+            inner: Arc::new(TokenizerPoolInner {
+                jobs,
+                workers: Mutex::new(workers),
+            }),
+        }
+    }
+}
+
+impl TokenizationBackend for PooledTokenizer {
+    fn tokenize(&self, request: TextRequest) -> BoxFuture<'static, Result<TokenIdsRequest, Error>> {
+        let jobs = self.inner.jobs.clone();
+        Box::pin(async move {
+            let (reply, result) = oneshot::channel();
+            jobs.send_async(PoolJob::Tokenize {
+                request: Box::new(request),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Unavailable)?;
+            result.await.map_err(|_| Error::WorkerDropped)?
+        })
+    }
+}
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
@@ -251,7 +359,7 @@ pub fn validate_completion_fields(
     return_hidden_states: bool,
     limits: &RendererLimits,
 ) -> Result<(), Error> {
-    if limits.skip_tokenizer_init && !input_ids.is_some_and(|ids| !ids.is_empty()) {
+    if limits.skip_tokenizer_init && input_ids.is_none_or(|ids| ids.is_empty()) {
         return Err(Error::Validation(
             "skip_tokenizer_init is set: request must provide input_ids".into(),
         ));

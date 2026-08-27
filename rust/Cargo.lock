@@ -3707,6 +3707,7 @@ dependencies = [
  "dynamo-protocols",
  "dynamo-renderer",
  "dynamo-tokenizers",
+ "flume",
  "futures",
  "hf-hub",
  "regex-syntax",

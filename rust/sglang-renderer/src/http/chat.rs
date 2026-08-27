@@ -66,9 +66,12 @@ async fn chat_completions<B: InferenceBackend>(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
-        || state.lowerer.config().stream_response_default_include_usage;
+        || state
+            .renderer
+            .config()
+            .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let lowered = match state.lowerer.lower_chat(request, &response_id).await {
+    let lowered = match state.renderer.lower_chat(request, &response_id).await {
         Ok(lowered) => lowered,
         Err(error) => {
             let status = renderer_status(error.kind());
@@ -82,7 +85,17 @@ async fn chat_completions<B: InferenceBackend>(
     let mut submitted = Vec::with_capacity(generation_inputs.len());
 
     for (index, generation_input) in generation_inputs.into_iter().enumerate() {
-        let submission = match submit_generation(&mut session, generation_input, stream).await {
+        let prepared = match state
+            .renderer
+            .prepare_generation_input(generation_input)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return openai_error(renderer_status(error.kind()), error.to_string(), false);
+            }
+        };
+        let submission = match submit_generation(&mut session, prepared, stream).await {
             Ok(submission) => submission,
             Err(response) => return response,
         };

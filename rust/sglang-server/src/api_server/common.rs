@@ -15,6 +15,7 @@ use axum::{
 use std::sync::Arc;
 
 use super::app::AppState;
+use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
@@ -47,7 +48,7 @@ async fn await_control_result(
     // scheduler, a client that hangs up mid-await) leaves the entry behind. A
     // monitor polling `/server_info` then leaks one `DetokState` per poll, forever.
     // The guard deregisters on drop; it is disarmed below when the result lands.
-    let mut guard = state.frontend.abort_guard(rid.clone());
+    let mut guard = AbortGuard::new(state.senders.clone(), rid.clone());
     let received = rx.recv().await;
     if received.is_some() {
         guard.disarm(&rid); // completed normally — nothing to abort

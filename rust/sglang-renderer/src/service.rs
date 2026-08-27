@@ -93,6 +93,60 @@ impl RendererService {
         self.prepare_many(lowered.generation_inputs).await
     }
 
+    pub fn config(&self) -> &RendererConfig {
+        self.lowerer.config()
+    }
+
+    pub async fn lower_chat(
+        &self,
+        request: CreateChatCompletionRequest,
+        response_id: &str,
+    ) -> Result<LoweredChat, RendererError> {
+        self.lowerer.lower_chat(request, response_id).await
+    }
+
+    pub fn lower_completions(
+        &self,
+        request: CreateCompletionRequest,
+        response_id: &str,
+    ) -> Result<Vec<GenerationInput>, RendererError> {
+        self.lowerer.lower_completions(request, response_id)
+    }
+
+    pub async fn prepare_generation_input(
+        &self,
+        request: GenerationInput,
+    ) -> Result<TokenIdsRequest, RendererError> {
+        self.prepare_one(request).await
+    }
+
+    pub async fn tokenize_prompt(
+        &self,
+        text: String,
+        add_special_tokens: bool,
+    ) -> Result<crate::TokenIds, RendererError> {
+        let request = TextRequest {
+            rid: "tokenize".into(),
+            text,
+            skip_special_tokens: !add_special_tokens,
+            options: Default::default(),
+        };
+        Ok(self.backend.tokenize(request).await?.input_ids)
+    }
+
+    pub async fn tokenize_chat(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<crate::TokenIds, RendererError> {
+        let lowered = self.lowerer.lower_chat(request, "tokenize").await?;
+        let request = lowered
+            .generation_inputs
+            .into_iter()
+            .next()
+            .ok_or_else(|| RendererError::Internal("Chat rendering produced no prompt".into()))?;
+        Ok(self.prepare_one(request).await?.input_ids)
+    }
+
     pub async fn prepare_completions(
         &self,
         request: CreateCompletionRequest,

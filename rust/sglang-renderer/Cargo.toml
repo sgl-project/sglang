@@ -11,6 +11,7 @@ http = ["dep:axum", "dep:tokio", "dep:uuid"]
 
 [dependencies]
 async-stream = { workspace = true }
+flume = "0.12.0"
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

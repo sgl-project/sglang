@@ -3,8 +3,8 @@ use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 
 use crate::{
-    FrontendError, GenerationEvent, GenerationFinishReason, GenerationInput, GenerationOutput,
-    GenerationSubmission, InferenceSession, MatchedStop, TokenIds,
+    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationSubmission,
+    InferenceSession, MatchedStop, TokenIds, TokenIdsRequest,
 };
 
 use super::completions::SubmittedChoice;
@@ -14,7 +14,7 @@ pub(super) struct TestSession;
 impl InferenceSession for TestSession {
     fn submit(
         &mut self,
-        _request: GenerationInput,
+        _request: TokenIdsRequest,
         _stream: bool,
     ) -> BoxFuture<'_, Result<GenerationSubmission, FrontendError>> {
         Box::pin(async { unreachable!("tests inject submissions directly") })

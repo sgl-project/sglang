@@ -9,5 +9,4 @@ pub mod ids;
 pub mod io_struct;
 pub mod request;
 pub mod response;
-pub mod sampling;
 pub mod types;

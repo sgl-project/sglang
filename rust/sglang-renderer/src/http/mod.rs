@@ -13,24 +13,28 @@ use axum::{
 use futures::StreamExt;
 
 use crate::{
-    FrontendError, GenerationEvent, GenerationInput, GenerationOutput, GenerationSubmission,
-    InferenceBackend, InferenceSession, OpenAIRequestLowerer, RendererErrorKind,
+    FrontendError, GenerationEvent, GenerationOutput, GenerationSubmission, InferenceBackend,
+    InferenceSession, RendererErrorKind,
 };
 
 mod chat;
 mod completions;
 mod render;
+mod runtime;
+mod tokenize;
+
+pub use runtime::{RendererRuntime, RendererRuntimeConfig};
 #[cfg(test)]
 mod test_utils;
 
 pub struct OpenAIHttpFrontend<B> {
-    pub(crate) lowerer: Arc<OpenAIRequestLowerer>,
+    pub(crate) renderer: Arc<crate::RendererService>,
     pub(crate) backend: B,
 }
 
 impl<B> OpenAIHttpFrontend<B> {
-    pub fn new(lowerer: Arc<OpenAIRequestLowerer>, backend: B) -> Self {
-        Self { lowerer, backend }
+    pub fn new(renderer: Arc<crate::RendererService>, backend: B) -> Self {
+        Self { renderer, backend }
     }
 }
 
@@ -38,14 +42,16 @@ pub fn inference_routes<B>(frontend: OpenAIHttpFrontend<B>) -> Router<()>
 where
     B: InferenceBackend,
 {
+    let renderer = frontend.renderer.clone();
     Router::new()
         .merge(chat::routes())
         .merge(completions::routes())
         .with_state(Arc::new(frontend))
+        .merge(tokenize::routes(renderer))
 }
 
 pub fn render_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
-    render::routes(renderer)
+    render::routes(renderer.clone()).merge(tokenize::routes(renderer))
 }
 
 pub(crate) fn unix_seconds_u32() -> u32 {
@@ -93,7 +99,7 @@ pub(crate) fn renderer_status(kind: RendererErrorKind) -> StatusCode {
 
 pub(crate) async fn submit_generation<S: InferenceSession>(
     session: &mut S,
-    request: GenerationInput,
+    request: crate::TokenIdsRequest,
     stream: bool,
 ) -> Result<GenerationSubmission, Response> {
     session.submit(request, stream).await.map_err(|error| {

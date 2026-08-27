@@ -3,7 +3,7 @@
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
-use crate::{GenerationInput, TokenIds};
+use crate::{TokenIds, TokenIdsRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchedStop {
@@ -78,7 +78,7 @@ pub trait InferenceBackend: Clone + Send + Sync + 'static {
 pub trait InferenceSession: Send + 'static {
     fn submit(
         &mut self,
-        request: GenerationInput,
+        request: TokenIdsRequest,
         stream: bool,
     ) -> BoxFuture<'_, Result<GenerationSubmission, FrontendError>>;
 

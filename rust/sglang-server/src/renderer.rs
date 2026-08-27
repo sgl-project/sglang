@@ -4,38 +4,41 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
-use tokio::sync::oneshot;
 
-use crate::frontend::{AbortGuard, FrontendHandle};
+use crate::api_server::guard::AbortGuard;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::request::RequestKind;
 use crate::message::request::{GenerateRequest, Request};
-use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
+use crate::tokenizer_manager::wiring::{Senders, TmEvent};
+use crate::utils::fsm::RequestState;
 
 use sglang_renderer::{
-    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOptions, GenerationOutput,
+    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
     GenerationOutputExtras, GenerationSubmission, InferenceBackend, InferenceSession, MatchedStop,
     RendererLimits, SamplingDefaults, TokenIds, TokenizationBackend,
 };
-pub(crate) use sglang_renderer::{
-    GenerationInput, OpenAIRequestLowerer, RendererConfig, RendererError as RenderServiceError,
-    RendererService, TextRequest, TokenIdsRequest,
-};
+pub(crate) use sglang_renderer::{RendererConfig, RendererService, TokenIdsRequest};
 
 #[derive(Clone)]
 pub(crate) struct ServerInferenceBackend {
-    frontend: Arc<FrontendHandle>,
+    senders: Senders,
+    response_buf: usize,
 }
 
 impl ServerInferenceBackend {
-    pub(crate) fn new(frontend: Arc<FrontendHandle>) -> Self {
-        Self { frontend }
+    pub(crate) fn new(senders: Senders, response_buf: usize) -> Self {
+        Self {
+            senders,
+            response_buf,
+        }
     }
 }
 
 pub(crate) struct ServerInferenceSession {
-    frontend: Arc<FrontendHandle>,
+    senders: Senders,
+    response_buf: usize,
     guard: AbortGuard,
 }
 
@@ -44,8 +47,9 @@ impl InferenceBackend for ServerInferenceBackend {
 
     fn begin_session(&self) -> Self::Session {
         ServerInferenceSession {
-            frontend: self.frontend.clone(),
-            guard: self.frontend.empty_abort_guard(),
+            senders: self.senders.clone(),
+            response_buf: self.response_buf,
+            guard: AbortGuard::new_empty(self.senders.clone()),
         }
     }
 }
@@ -53,14 +57,13 @@ impl InferenceBackend for ServerInferenceBackend {
 impl InferenceSession for ServerInferenceSession {
     fn submit(
         &mut self,
-        request: GenerationInput,
+        request: TokenIdsRequest,
         _stream: bool,
     ) -> BoxFuture<'_, Result<GenerationSubmission, FrontendError>> {
         Box::pin(async move {
             let request = GenerateRequest::from(request);
             let (rid, mut receiver) = self
-                .frontend
-                .submit(RequestKind::Generate(Box::new(request)))
+                .submit_request(RequestKind::Generate(Box::new(request)))
                 .await
                 .map_err(|_| FrontendError {
                     status_code: 503,
@@ -98,8 +101,7 @@ impl InferenceSession for ServerInferenceSession {
     fn detokenize(&mut self, token_ids: TokenIds) -> BoxFuture<'_, Result<String, FrontendError>> {
         Box::pin(async move {
             let (_rid, mut receiver) = self
-                .frontend
-                .submit(RequestKind::Detokenize { token_ids })
+                .submit_request(RequestKind::Detokenize { token_ids })
                 .await
                 .map_err(|_| FrontendError {
                     status_code: 503,
@@ -126,6 +128,31 @@ impl InferenceSession for ServerInferenceSession {
 
     fn complete(&mut self, submission_id: &str) {
         self.guard.disarm(&submission_id.into());
+    }
+}
+
+impl ServerInferenceSession {
+    async fn submit_request(
+        &self,
+        kind: RequestKind,
+    ) -> Result<(Rid, tokio::sync::mpsc::Receiver<ResponseItem>), flume::SendError<TmEvent>> {
+        let rid = match &kind {
+            RequestKind::Generate(request) => request.rid.clone(),
+            RequestKind::Control(request) => request.rid().into(),
+            RequestKind::Detokenize { .. } => Rid::new(),
+        };
+        let (sink, response) = tokio::sync::mpsc::channel(self.response_buf);
+        let request = Request {
+            rid: rid.clone(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(sink),
+            kind,
+        };
+        self.senders
+            .tok_manager_tx
+            .send_async(TmEvent::Intake(request))
+            .await?;
+        Ok((rid, response))
     }
 }
 
@@ -185,58 +212,17 @@ fn generation_output(output: ChunkEvent) -> Result<GenerationOutput, FrontendErr
     })
 }
 
-/// Work accepted by the shared tokenization pool. Inference requests retain
-/// their FSM, while standalone requests use the renderer crate's contracts.
-pub(crate) enum TokenizationJob {
-    Inference(Request),
-    Standalone(Box<StandaloneTokenizationJob>),
-}
-
-pub(crate) struct StandaloneTokenizationJob {
-    pub(crate) request: TextRequest,
-    pub(crate) reply: oneshot::Sender<Result<TokenIdsRequest, RenderServiceError>>,
-}
-
-struct ServerTokenizationBackend {
-    jobs: flume::Sender<TokenizationJob>,
-}
-
-impl TokenizationBackend for ServerTokenizationBackend {
-    fn tokenize(
-        &self,
-        request: TextRequest,
-    ) -> BoxFuture<'static, Result<TokenIdsRequest, RenderServiceError>> {
-        let jobs = self.jobs.clone();
-        Box::pin(async move {
-            let (reply, result) = oneshot::channel();
-            jobs.send_async(TokenizationJob::Standalone(Box::new(
-                StandaloneTokenizationJob { request, reply },
-            )))
-            .await
-            .map_err(|_| RenderServiceError::Unavailable)?;
-            result.await.map_err(|error| {
-                tracing::error!(%error, "renderer worker dropped reply");
-                RenderServiceError::WorkerDropped
-            })?
-        })
-    }
-}
-
 pub(crate) fn new_renderer_service(
     server_args: Arc<ServerArgs>,
-    jobs: flume::Sender<TokenizationJob>,
+    backend: Arc<dyn TokenizationBackend>,
 ) -> RendererService {
     RendererService::new(
-        new_request_lowerer(&server_args),
-        Arc::new(ServerTokenizationBackend { jobs }),
+        sglang_renderer::OpenAIRequestLowerer::new(renderer_config(&server_args)),
+        backend,
     )
 }
 
-pub(crate) fn new_request_lowerer(server_args: &ServerArgs) -> OpenAIRequestLowerer {
-    OpenAIRequestLowerer::new(renderer_config(server_args))
-}
-
-fn renderer_config(args: &ServerArgs) -> RendererConfig {
+pub(crate) fn renderer_config(args: &ServerArgs) -> RendererConfig {
     RendererConfig {
         served_model_name: args.served_model_name.clone(),
         tokenizer_path: args.tokenizer_path.clone(),
@@ -263,59 +249,21 @@ fn renderer_config(args: &ServerArgs) -> RendererConfig {
     }
 }
 
-impl From<TextRequest> for GenerateRequest {
-    fn from(request: TextRequest) -> Self {
-        native_generate_request(
-            request.rid,
-            Some(request.text),
-            None,
-            request.skip_special_tokens,
-            request.options,
-        )
-    }
-}
-
 impl From<TokenIdsRequest> for GenerateRequest {
     fn from(request: TokenIdsRequest) -> Self {
-        native_generate_request(
-            request.rid,
-            None,
-            Some(request.input_ids),
-            false,
-            request.options,
-        )
-    }
-}
-
-fn native_generate_request(
-    rid: String,
-    text: Option<String>,
-    input_ids: Option<TokenIds>,
-    skip_special_tokens: bool,
-    options: GenerationOptions,
-) -> GenerateRequest {
-    GenerateRequest {
-        rid: Rid::from_client(&rid),
-        text,
-        input_ids,
-        skip_special_tokens,
-        sampling_params: options.sampling_params,
-        stream: options.stream,
-        return_logprob: options.return_logprob,
-        logprob_start_len: options.logprob_start_len,
-        top_logprobs_num: options.top_logprobs_num,
-        token_ids_logprob: options.token_ids_logprob,
-        return_hidden_states: options.return_hidden_states,
-        return_text_in_logprobs: options.return_text_in_logprobs,
-        ..Default::default()
-    }
-}
-
-impl From<GenerationInput> for GenerateRequest {
-    fn from(request: GenerationInput) -> Self {
-        match request {
-            GenerationInput::Text(request) => request.into(),
-            GenerationInput::TokenIds(request) => request.into(),
+        let options = request.options;
+        Self {
+            rid: Rid::from_client(&request.rid),
+            input_ids: Some(request.input_ids),
+            sampling_params: options.sampling_params,
+            stream: options.stream,
+            return_logprob: options.return_logprob,
+            logprob_start_len: options.logprob_start_len,
+            top_logprobs_num: options.top_logprobs_num,
+            token_ids_logprob: options.token_ids_logprob,
+            return_hidden_states: options.return_hidden_states,
+            return_text_in_logprobs: options.return_text_in_logprobs,
+            ..Default::default()
         }
     }
 }
@@ -324,11 +272,8 @@ impl From<GenerationInput> for GenerateRequest {
 mod tests {
     use super::*;
     use sglang_renderer::{
-        SamplingParams, TextTokenizer, prepare_direct_request, tokenize_text_prompt,
-    };
-
-    use crate::tokenizer_manager::to_scheduler::{
-        Limits, check_total_tokens, validate_generate_request,
+        GenerationInput, GenerationOptions, SamplingParams, TextRequest, TextTokenizer,
+        prepare_direct_request,
     };
 
     #[test]
@@ -353,11 +298,25 @@ mod tests {
             },
         };
 
-        let engine = GenerateRequest::from(rendered);
+        let prepared = prepare_direct_request(
+            GenerationInput::Text(rendered),
+            &WordTokenizer,
+            &[],
+            &RendererLimits {
+                skip_tokenizer_init: false,
+                vocab_size: 128,
+                context_len: 128,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: false,
+                enable_return_hidden_states: true,
+            },
+        )
+        .unwrap();
+        let engine = GenerateRequest::from(prepared);
         assert_eq!(engine.rid.client_facing(), "client-rid");
-        assert_eq!(engine.text.as_deref(), Some("prompt"));
-        assert_eq!(engine.input_ids, None);
-        assert!(engine.skip_special_tokens);
+        assert_eq!(engine.text, None);
+        assert_eq!(engine.input_ids, Some(vec![7]));
+        assert!(!engine.skip_special_tokens);
         assert_eq!(engine.sampling_params.max_new_tokens, Some(17));
         assert_eq!(engine.sampling_params.temperature, 0.25);
         assert!(engine.stream);
@@ -375,64 +334,5 @@ mod tests {
         fn encode(&self, text: &str) -> Result<Vec<i32>, sglang_renderer::RendererError> {
             Ok(text.split_whitespace().map(|_| 7).collect())
         }
-    }
-
-    #[test]
-    fn standalone_and_inference_stages_prepare_identical_completions() {
-        let limits = Limits {
-            skip_tokenizer_init: false,
-            vocab_size: 128,
-            context_len: 5,
-            num_reserved_tokens: 0,
-            allow_auto_truncate: true,
-            enable_return_hidden_states: false,
-        };
-        let request = TextRequest {
-            rid: "completion-1".into(),
-            text: "one two three".into(),
-            skip_special_tokens: false,
-            options: GenerationOptions {
-                sampling_params: SamplingParams {
-                    max_new_tokens: Some(4),
-                    stop: Some(crate::message::types::OneOrMany::One("two words".into())),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        };
-
-        let standalone = prepare_direct_request(
-            GenerationInput::Text(request.clone()),
-            &WordTokenizer,
-            &[],
-            &RendererLimits::from(&limits),
-        )
-        .unwrap();
-
-        let mut inference = GenerateRequest::from(request);
-        validate_generate_request(&inference.rid, &inference, &limits).unwrap();
-        inference
-            .sampling_params
-            .normalize(limits.skip_tokenizer_init, limits.vocab_size)
-            .unwrap();
-        inference.input_ids = Some(
-            tokenize_text_prompt(
-                inference.text.as_deref().unwrap_or_default(),
-                inference.skip_special_tokens,
-                &mut inference.sampling_params,
-                &WordTokenizer,
-                &[],
-            )
-            .unwrap(),
-        );
-        check_total_tokens(&mut inference, &limits).unwrap();
-
-        assert_eq!(inference.input_ids, Some(standalone.input_ids));
-        assert_eq!(
-            inference.sampling_params,
-            standalone.options.sampling_params
-        );
-        assert_eq!(inference.sampling_params.stop_str_max_len, 2);
-        assert_eq!(inference.sampling_params.max_new_tokens, Some(2));
     }
 }
