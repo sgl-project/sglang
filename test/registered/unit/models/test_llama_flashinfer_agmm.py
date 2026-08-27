@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import inspect
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -184,6 +186,33 @@ class EligibilityTests(unittest.TestCase):
     def test_route_source_contains_no_explicit_device_synchronization(self):
         source = inspect.getsource(self.module)
         self.assertNotIn(".synchronize(", source)
+
+
+class ServerArgumentTests(unittest.TestCase):
+    def test_true_sp_flag_parses_from_cli_and_yaml(self):
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        defaults = parser.parse_args(["--model", "dummy"])
+        self.assertFalse(defaults.enable_flashinfer_agmm_true_sp)
+
+        cli = parser.parse_args(
+            ["--model", "dummy", "--enable-flashinfer-agmm-true-sp"]
+        )
+        self.assertTrue(cli.enable_flashinfer_agmm_true_sp)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "server.yaml"
+            config.write_text("enable-flashinfer-agmm-true-sp: true\n")
+            merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                ["--config", str(config), "--model", "dummy"]
+            )
+            yaml_args = parser.parse_args(merged)
+
+        self.assertTrue(yaml_args.enable_flashinfer_agmm_true_sp)
 
 
 class FakePackedWeight:
