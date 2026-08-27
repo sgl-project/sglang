@@ -61,8 +61,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def free_group_begin(self):
-        # Nesting would drop the outer batch here, then double-free it on the
-        # outer end().
+        # Nesting would drop the outer batch, then double-free it at the end.
         assert self.is_not_in_free_group, "free groups cannot be nested"
         self.is_not_in_free_group = False
         self.free_group = []
