@@ -1,0 +1,26 @@
+[package]
+name = "sglang-renderer"
+description = "Engine-free request rendering for SGLang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+dynamo-parsers = "7.0.1"
+dynamo-protocols = "5.1.0"
+dynamo-renderer = "5.0.0"
+hf-hub = { version = "0.4", default-features = false }
+regex-syntax = "=0.8.11"
+
+# Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
+dynamo-tokenizers = "1.7.0"
+
+[dev-dependencies]
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
