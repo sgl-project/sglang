@@ -107,26 +107,28 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         ]
 
         for value in ("[{]", "[}"):
-            with self.subTest(value=value):
-                text = _wrapped(
-                    _invoke("create_tasks", _param("tasks", "false", value))
-                )
-                split = text.index(f"</{DSML}parameter>")
-                detector = DeepSeekV4Detector()
-                normal, calls = "", []
-                for chunk in (text[:split], text[split:]):
-                    result = detector.parse_streaming_increment(chunk, tools)
-                    normal += result.normal_text
-                    calls.extend(result.calls)
+            text = _wrapped(_invoke("create_tasks", _param("tasks", "false", value)))
+            expected = DeepSeekV4Detector().detect_and_parse(text, tools).calls[0]
+            for width in range(1, len(text) + 1):
+                with self.subTest(value=value, width=width):
+                    chunks = [
+                        text[index : index + width]
+                        for index in range(0, len(text), width)
+                    ]
+                    detector = DeepSeekV4Detector()
+                    normal, calls = "", []
+                    for chunk in chunks:
+                        result = detector.parse_streaming_increment(chunk, tools)
+                        normal += result.normal_text
+                        calls.extend(result.calls)
 
-                expected = DeepSeekV4Detector().detect_and_parse(text, tools).calls[0]
-                self.assertEqual(normal, "")
-                self.assertEqual(
-                    [call.name for call in calls if call.name], ["create_tasks"]
-                )
-                self.assertEqual(
-                    "".join(call.parameters for call in calls), expected.parameters
-                )
+                    self.assertEqual(normal, "")
+                    self.assertEqual(
+                        [call.name for call in calls if call.name], ["create_tasks"]
+                    )
+                    self.assertEqual(
+                        "".join(call.parameters for call in calls), expected.parameters
+                    )
 
     def test_tolerated_outer_formats_keep_existing_streaming_results(self):
         invoke_start = f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
