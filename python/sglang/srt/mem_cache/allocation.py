@@ -257,7 +257,9 @@ def alloc_req_slots(
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+                tree_cache.evict_for_alloc(
+                    EvictParams(num_tokens=0, mamba_num=mamba_num)
+                )
     req_pool_indices = req_to_token_pool.alloc(reqs)
     if req_pool_indices is None:
         raise RuntimeError(
@@ -704,5 +706,6 @@ def alloc_for_spec_decode(
             len(reqs),
         )
 
-    for i, req in enumerate(reqs):
-        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i]))
+    nxt_kv_lens_list = nxt_kv_lens_cpu.tolist()
+    for req, nxt_kv_len in zip(reqs, nxt_kv_lens_list, strict=True):
+        req.kv.kv_allocated_len = max(req.kv.kv_allocated_len, nxt_kv_len)

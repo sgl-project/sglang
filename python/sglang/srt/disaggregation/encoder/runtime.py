@@ -50,10 +50,10 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_observability,
     get_parallel,
     get_serving,
+    publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
@@ -1474,6 +1474,7 @@ def launch_dp_worker(
     dispatch_path: str,
     result_path: str,
 ):
+    publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
@@ -1491,10 +1492,10 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     This function owns backend construction only.  HTTP/gRPC middleware,
     service registration, and network serving remain Transport concerns.
     """
-    if get_parallel().dp_size > 1:
+    if get_parallel().config.dp_size > 1:
         raise ValueError(
             "launch_local_runtime requires --dp-size 1; got "
-            f"dp_size={get_parallel().dp_size}."
+            f"dp_size={get_parallel().config.dp_size}."
         )
 
     # Set up prometheus metrics.
@@ -1512,8 +1513,10 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     zmq_context = zmq.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
-    if get_parallel().dist_init_addr:
-        dist_init_method = NetworkAddress.parse(get_parallel().dist_init_addr).to_tcp()
+    if get_parallel().config.dist_init_addr:
+        dist_init_method = NetworkAddress.parse(
+            get_parallel().config.dist_init_addr
+        ).to_tcp()
     else:
         dist_init_method = NetworkAddress(
             get_serving().host or "127.0.0.1", port_args.nccl_port
@@ -1529,7 +1532,7 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
 
     send_sockets: List[zmq.Socket] = []
     tp_processes: List[mp.Process] = []
-    for rank in range(1, configured_tp_size()):
+    for rank in range(1, get_parallel().config.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_context, zmq.PUSH, schedule_path, bind=False)
@@ -1569,12 +1572,12 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     HTTP uses this entry point today.  gRPC can reuse it later without
     importing HTTP application state or Uvicorn.
     """
-    if get_parallel().dp_size <= 1 or server_args.tp_size != 1:
+    if get_parallel().config.dp_size <= 1 or get_parallel().config.tp_size != 1:
         raise ValueError(
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
-            f"dp_size={get_parallel().dp_size}, tp_size={server_args.tp_size}."
+            f"dp_size={get_parallel().config.dp_size}, tp_size={get_parallel().config.tp_size}."
         )
-    dp_size = get_parallel().dp_size
+    dp_size = get_parallel().config.dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
 
     # DP mode: workers (subprocesses) write metrics to the shared multiproc dir;

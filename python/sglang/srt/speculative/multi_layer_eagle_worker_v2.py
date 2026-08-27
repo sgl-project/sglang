@@ -185,7 +185,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
         ]
         self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
+            draft_tp_context
+            if get_parallel().config.enable_dp_attention
+            else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -844,7 +846,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner_for_draft_extend.prune_draft_extend_logits
                 )
             else:
-                prune_logits = not require_gathered_buffer(self.server_args)
+                prune_logits = not require_gathered_buffer()
             if prune_logits:
                 forward_batch.spec_info.select_index = select_index
             # Left unmarked on every platform: each de-tied runner has its own

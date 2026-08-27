@@ -14,7 +14,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -307,9 +307,7 @@ def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     return _mooncake_transfer_engine
 
 
-def maybe_init_shared_mooncake_transfer_engine(
-    *, server_args: ServerArgs, gpu_id: int
-) -> None:
+def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     """
     Need MooncakeTransferEngine when:
     1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
