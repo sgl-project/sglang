@@ -43,6 +43,48 @@ export const benchmarks = [
       "The Low Latency recipe with FP8 KV + TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept 3.00): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,853.88 aggregate output tok/s — 1.6% above the BF16 + TileLang Low Latency row, with mean TPOT 6.25 ms vs 6.43 ms. Draft and target full-graph capture succeeded for this combination. The speed rows were measured with the NEXTN spelling and --disable-shared-experts-fusion, which resolve to the same runtime path as the published command on this tree.",
   },
   {
+    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", dcp: "4" },
+    sglang_version: "d6ab04bdf1",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
+          max_concurrency: 16,
+          num_prompts: 80,
+        },
+        ttft_ms: 534.1,
+        tpot_ms: 7.31,
+        tokens_per_sec_per_gpu: 2100.76,
+      },
+    ],
+    notes:
+      "The Low Latency recipe with FP8 KV + TRT-LLM DSA and DCP4 (--dcp-size 4 --dcp-comm-backend a2a --dcp-replicate-q-proj) on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,680.61 aggregate output tok/s at a 3.937 accept length — about 10% below the non-DCP FP8 Low Latency row. TRT-LLM DSA DCP decode returns the LSE natively, so this arm needs no patch.",
+  },
+  {
+    match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "bf16-tilelang", dcp: "4" },
+    sglang_version: "d6ab04bdf1",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 1024,
+          osl: 256,
+          max_concurrency: 16,
+          num_prompts: 80,
+        },
+        ttft_ms: 510.0,
+        tpot_ms: 8.0,
+        tokens_per_sec_per_gpu: 1957.25,
+      },
+    ],
+    notes:
+      "The Low Latency recipe with BF16 KV + TileLang DSA and DCP4 on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,565.8 aggregate output tok/s at a 3.90 accept length. TileLang DSA DCP decode needs the LSE fix that ships in the current release image.",
+  },
+  {
     match: { hw: "gb300", strategy: "high-throughput" },
     sglang_version: "d6ab04bdf1",
     latencyPercentile: "Mean",

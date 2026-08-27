@@ -106,6 +106,10 @@ On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 
 
 On AMD ROCm, use BF16 KV cache with TileLang DSA, set `SGLANG_USE_AITER=1`, keep the MoE runner on Triton, and disable CUDA graphs. The ROCm recipe uses TP8 on a single eight-GPU node. MI300X and MI325X both use gfx942, but the MI325X entry remains explicitly unverified because it is inferred from MI300X rather than measured directly. AMD validation covers text generation and GSM8K only; multimodal serving remains unverified.
 
+### Decode context parallelism
+
+Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
+
 ### Extend the cache hierarchy
 
 Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill reusable cache entries into host memory. Select **+ L3** only after configuring Mooncake on every serving node; the generated command exposes the required configuration path. These options remain selectable but are marked **Not Verified** until the resulting command is validated on the chosen hardware.

@@ -30,7 +30,8 @@ export const config = {
     return (
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
-      s.hicache === "off"
+      s.hicache === "off" &&
+      s.dcp === "off"
     );
   },
 
@@ -99,6 +100,22 @@ export const config = {
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
           hints: ["Start Mooncake and place the configuration file on every serving node."],
+        },
+      ],
+    },
+    {
+      id: "dcp",
+      title: "Context Parallelism",
+      default: "off",
+      options: [
+        { id: "off", label: "Off" },
+        {
+          id: "4",
+          label: "DCP 4",
+          disabled: (s) => s.hw !== "gb300",
+          disableReason: "DCP is validated only on 4x GB300 TP4/EP4 for now.",
+          flags: ["--dcp-size 4", "--dcp-comm-backend a2a", "--dcp-replicate-q-proj"],
+          hints: ["Measured on 4x GB300 with both KV/DSA pairings, adaptive MTP 5/1/6, full decode graph."],
         },
       ],
     },
@@ -260,7 +277,8 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off"
+        s.hicache === "off" &&
+        ["off", "4"].includes(s.dcp)
           ? "verified"
           : "unverified",
       env: [],
@@ -290,7 +308,8 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off"
+        s.hicache === "off" &&
+        s.dcp === "off"
           ? "verified"
           : "unverified",
       env: [],
