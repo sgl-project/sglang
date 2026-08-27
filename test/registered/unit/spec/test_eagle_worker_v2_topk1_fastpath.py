@@ -277,7 +277,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(stored_hidden_states.shape, (6, 4))
 
     def test_draft_extend_pruning_and_graph_row_count_gates(self):
-        server_args = object()
         with patch(
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
             True,
@@ -285,7 +284,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
             return_value=False,
         ):
-            self.assertTrue(_prune_draft_extend_logits(server_args))
+            self.assertTrue(_prune_draft_extend_logits())
         with patch(
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
             True,
@@ -293,7 +292,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
             return_value=True,
         ):
-            self.assertFalse(_prune_draft_extend_logits(server_args))
+            self.assertFalse(_prune_draft_extend_logits())
         with patch(
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
             False,
@@ -301,7 +300,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
             return_value=False,
         ):
-            self.assertFalse(_prune_draft_extend_logits(server_args))
+            self.assertFalse(_prune_draft_extend_logits())
 
         runner = EAGLEDraftExtendCudaGraphRunner.__new__(
             EAGLEDraftExtendCudaGraphRunner
