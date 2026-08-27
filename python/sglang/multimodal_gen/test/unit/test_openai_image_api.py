@@ -72,6 +72,14 @@ def test_response_resize_is_only_populated_for_glm_image():
     assert _get_response_resize(SamplingParams(width=1280, height=736)) is None
 
 
+def test_response_resize_prefers_requested_size_over_generation_canvas():
+    glm_sampling = GlmImageSamplingParams(width=1280, height=736)
+    glm_sampling.requested_width = 1280
+    glm_sampling.requested_height = 720
+
+    assert _get_response_resize(glm_sampling) == "1280x720"
+
+
 def test_response_resize_uses_actual_generated_image_size(tmp_path):
     output_path = tmp_path / "output.png"
     Image.new("RGB", (1280, 736)).save(output_path)
