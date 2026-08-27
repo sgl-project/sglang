@@ -357,6 +357,7 @@ class DeepseekV2MLP(nn.Module):
             if (
                 gemm_output_zero_allocator is not None
                 and x.shape[0] <= 256
+                and getattr(self.gate_up_proj, "weight", None) is not None
                 and self.gate_up_proj.weight.dtype == torch.uint8
             ):
                 y = gemm_output_zero_allocator.allocate(
@@ -371,6 +372,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
+            and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
@@ -490,9 +492,12 @@ class MoEGate(nn.Module):
                     "quark",
                 ):
                     correction_bias_dtype = torch.bfloat16
-            self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
+            correction_bias = torch.empty(
+                (config.n_routed_experts), dtype=correction_bias_dtype
             )
+            if quant_config is not None and quant_config.get_name() == "expert_pack":
+                correction_bias.zero_()
+            self.e_score_correction_bias = nn.Parameter(correction_bias)
         else:
             self.e_score_correction_bias = None
         if _is_cpu and _is_cpu_amx_available:
@@ -739,6 +744,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -785,13 +791,23 @@ class DeepseekV2MoE(nn.Module):
                 "awq_marlin",
                 "moe_wna16",
             }
+            shared_gate_up_weight = getattr(
+                self.shared_experts.gate_up_proj, "weight", None
+            )
+            if shared_gate_up_weight is None:
+                shared_gate_up_weight = getattr(
+                    self.shared_experts.gate_up_proj, "qweight", None
+                )
+            if shared_gate_up_weight is None:
+                raise ValueError(
+                    "shared expert gate/up projection has no weight storage"
+                )
             self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+                not is_packed_weight and shared_gate_up_weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                and shared_gate_up_weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
                 if (
@@ -818,6 +834,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_deepep_v2()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -840,6 +857,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -1959,8 +1977,11 @@ class DeepseekV2AttentionMLA(
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
-        self._q_b_proj_verified_shape = self.has_q_b_proj and (
-            tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
+        q_b_weight = (
+            getattr(self.q_b_proj, "weight", None) if self.has_q_b_proj else None
+        )
+        self._q_b_proj_verified_shape = q_b_weight is not None and (
+            tuple(q_b_weight.shape) in q_b_proj_verified_shapes
         )
         self._use_min_latency_q_b_gemm: bool | None = None
 
@@ -2075,7 +2096,7 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        if self.attn_mha.kv_b_proj is None:
+        if self.attn_mha.kv_b_proj is None and hasattr(self, "kv_b_proj"):
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
@@ -2215,6 +2236,14 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        if hasattr(self, "q_a_proj"):
+            return torch.cat(
+                (
+                    self.q_a_proj(hidden_states)[0],
+                    self.kv_a_proj_with_mqa(hidden_states)[0],
+                ),
+                dim=-1,
+            )
         if self._use_min_latency_fused_a_gemm is None:
             self._use_min_latency_fused_a_gemm = (
                 self.has_fused_proj
@@ -2731,10 +2760,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
+        self.enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
