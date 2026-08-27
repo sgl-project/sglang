@@ -219,6 +219,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -4276,6 +4277,16 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        # While the KV region is released (colocate RL: memory saver paused, pages
+        # unmapped), the pool clears below would write unmapped device memory -- an
+        # async illegal memory access. release_memory_occupation already flushed
+        # right before pausing, so a flush that arrives during the pause has nothing
+        # left to do; skip it instead of corrupting the CUDA context.
+        updater = getattr(self, "weight_updater", None)
+        if updater is not None and GPU_MEMORY_TYPE_KV_CACHE in getattr(updater, "offload_tags", set()):
+            logger.info("flush_cache skipped: KV region is released; already flushed before pause")
+            return True
+
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
