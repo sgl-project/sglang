@@ -1898,8 +1898,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
+        # ModelSlim can quantize K3 latent projections while still storing
+        # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
         split_gguf_kv_b = getattr(
-            quant_config, "supports_kimi_k3_quantized_latent_projections", False
+            quant_config, "supports_kimi_k3_split_gguf_kv_b", False
         )
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
