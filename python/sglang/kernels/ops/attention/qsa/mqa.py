@@ -136,9 +136,12 @@ def _qsa_mqa_decode_kernel(
         page_table + batch * stride_pt_batch + page_columns * stride_pt_page,
         mask=valid,
         other=-1,
-    )
+    ).to(tl.int64)
     valid &= pages >= 0
 
+    # int64 page ids: the compressed cache is addressed as
+    # page * page_size * head_dim, which passes 2**31 elements once the pool is
+    # large enough, and Triton keeps the offset in the width of its operands.
     key_ptrs = (
         k_cache
         + pages[:, None] * stride_k_page
