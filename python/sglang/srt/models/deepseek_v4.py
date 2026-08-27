@@ -45,7 +45,10 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.hardware_backend.npu.utils import (
+    is_npu_arch35,
+    use_npu_arch35_mxfp8_wo_a,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -228,21 +231,6 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 ]
-
-
-def _use_npu_arch35_mxfp8_wo_a(quant_config) -> bool:
-    """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
-
-    Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
-    ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
-    NPU arch35 MXFP8 scale layout.
-    """
-    if not _is_npu or not is_npu_arch35() or quant_config is None:
-        return False
-    if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
-        return False
-    weight_block_size = getattr(quant_config, "weight_block_size", None)
-    return tuple(weight_block_size or ()) == (128, 128)
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -673,7 +661,7 @@ class MqaAttentionBase(nn.Module):
         )
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
-        self.use_npu_arch35_mxfp8_wo_a = _use_npu_arch35_mxfp8_wo_a(quant_config)
+        self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
         quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
@@ -3636,7 +3624,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (_FP8_WO_A_GEMM or _use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (_FP8_WO_A_GEMM or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
