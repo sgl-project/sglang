@@ -1622,6 +1622,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
+                # This worker reads device memory outside the CUDA stream, so
+                # without waiting here the read can race the prefill forward
+                # that is still writing these pages. Cleared afterwards so a
+                # chunk re-enqueued on a staging defer does not wait twice.
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
+
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -2141,6 +2149,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2180,6 +2189,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                wait_event=wait_event,
             )
         )
 
@@ -2294,6 +2304,12 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if should_skip:
             return
 
+        # Pages handed over before their forward is known to have completed
+        # carry a completion event; the transfer worker waits on it before it
+        # reads them. Same handoff as MoriKVSender.send().
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
+
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -2302,6 +2318,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -2313,6 +2330,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
