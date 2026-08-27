@@ -84,6 +84,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
+    prefill_graph_tolerates_sum_len,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
@@ -777,8 +778,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
+        # MegaMoE is exempt (prefill_graph_tolerates_sum_len): its idle ranks
+        # still execute MegaMoE with 0 tokens, so per-rank SUM_LEN buckets stay
+        # collective-safe and need no eager fallback.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
+            return False
+        if prefill_graph_tolerates_sum_len():
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
@@ -1038,6 +1044,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.prepare_prefill_shared_read_snapshot(
+                forward_batch, num_qo_tokens=num_tokens
+            )
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
