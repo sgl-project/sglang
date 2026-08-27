@@ -85,7 +85,7 @@
             "expected_avg_denoise_ms": 426.59,
             "expected_median_denoise_ms": 427.94,
             "load_peak_vram_mb": 4934.0,
-            "runtime_peak_vram_mb": 18246.0,
+            "runtime_peak_vram_mb": 30428.0,
             "estimated_full_test_time_s": 160.9
         },
         "zimage_image_t2i": {

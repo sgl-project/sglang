@@ -2256,21 +2256,54 @@ class LayerwiseOffloadableModuleMixin:
                 manager.release_all()
                 manager.register_forward_hooks()
 
-    def remove_layerwise_offload(self) -> None:
+    def remove_layerwise_offload(self, *, to_cpu: bool = False) -> None:
         """Restore an ordinary component-managed module.
 
-        Every real layer is materialized before the manager stores are dropped,
-        and HostPin allowances are returned first. Auto residency uses this for
-        both a selected component-offload target and transactional rollback of
-        a lazily configured layerwise target.
+        HostPin allowances are returned first. Resident targets materialize
+        every real layer on the device. Component-offload targets instead bind
+        the manager's existing host tensors directly, avoiding a transient full
+        device copy that can OOM while undoing a lazily configured placement.
         """
         managers = list(self.layerwise_offload_managers or ())
         if not managers:
             return
         for manager in managers:
             manager.set_pinned_layers(())
-        self.restore_non_layer_weights()
-        self.disable_offload()
+        if to_cpu:
+            parameters = dict(self.named_parameters())
+            with torch.inference_mode(False), torch.no_grad():
+                for manager in managers:
+                    if manager.enabled:
+                        # Inference weights are immutable, but preserve any
+                        # materialized update before releasing device tensors.
+                        manager.sync_all_layers_to_cpu()
+                        manager.release_all()
+                        manager.remove_forward_hooks()
+                        manager.enabled = False
+                    for name, host_tensor in manager.iter_cpu_weights():
+                        parameter = parameters.get(name)
+                        if parameter is None:
+                            raise RuntimeError(
+                                f"layerwise parameter {name!r} disappeared"
+                            )
+                        local_tensor = host_tensor.detach()
+                        parameter.data = (
+                            manager._wrap_for_target(parameter, local_tensor)
+                            if isinstance(parameter, DTensor)
+                            else local_tensor
+                        )
+                for name, host_tensor in self._parked_non_layer_weights.items():
+                    parameter = parameters.get(name)
+                    if parameter is not None:
+                        parameter.data = host_tensor
+            if current_platform.is_mps() and hasattr(
+                self, "_mps_cpu_non_layer_parameters"
+            ):
+                self.restore_mps_cpu_non_layer_weights()
+            self.to("cpu")
+        else:
+            self.restore_non_layer_weights()
+            self.disable_offload()
         self.layerwise_offload_managers = []
         self._parked_non_layer_weights.clear()
         self._park_placeholders.clear()

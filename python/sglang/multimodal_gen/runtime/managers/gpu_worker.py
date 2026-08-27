@@ -51,10 +51,12 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     GIB_BYTES,
+    MAX_LATENCY_EQUIVALENCE_NS,
     PLACEMENT_STATUS_ADJUSTED,
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
     PLACEMENT_STATUS_SKIPPED,
+    POST_ADJUSTMENT_REGRESSION_FRACTION,
     AppliedResidencyChange,
     AutoResidencyRollbackError,
     DefaultWorkload,
@@ -1265,6 +1267,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 skip_reason=describe_error(e),
             )
         reports = self._auto_residency_all_gather(local_report)
+        if self._auto_residency_round_sizes:
+            regressions = []
+            for report in reports:
+                reference_ns = report.estimated_request_duration_ns
+                measured_ns = report.measured_request_duration_ns
+                tolerance_ns = max(
+                    MAX_LATENCY_EQUIVALENCE_NS,
+                    int(reference_ns * POST_ADJUSTMENT_REGRESSION_FRACTION),
+                )
+                if reference_ns > 0 and measured_ns > reference_ns + tolerance_ns:
+                    regressions.append((measured_ns - reference_ns, report))
+            if regressions:
+                _, regressed = max(regressions, key=lambda item: item[0])
+                cause = (
+                    "post-adjustment calibration regressed request duration "
+                    f"from {regressed.estimated_request_duration_ns / 1e9:.2f}s "
+                    f"to {regressed.measured_request_duration_ns / 1e9:.2f}s"
+                )
+                if self.is_output_rank:
+                    logger.warning("Auto residency: %s; rolling back", cause)
+                return self._rollback_everywhere(
+                    cause=cause,
+                    already_failed=False,
+                    latest_round_only=True,
+                )
         plan = plan_auto_residency(reports=reports)
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if plan.skip_reason is not None or not plan.changes:
@@ -1523,6 +1550,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 torch.get_device_module().memory_allocated()
             ),
             estimated_request_duration_ns=estimated_request_duration_ns,
+            measured_request_duration_ns=measured_request_duration_ns,
             candidate_latency_savings_ns=candidate_latency_savings_ns,
             candidates=candidates,
             skip_reason=skip_reason,

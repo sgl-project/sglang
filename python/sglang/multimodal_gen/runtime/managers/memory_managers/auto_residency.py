@@ -92,6 +92,11 @@ ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
 MIN_LATENCY_EQUIVALENCE_NS = 50_000_000
 MAX_LATENCY_EQUIVALENCE_NS = 100_000_000
 LATENCY_EQUIVALENCE_FRACTION = 0.01
+# The transfer model ranks feasible placements; the mandatory warmup is the
+# authority on whether a selected placement actually helped. Allow normal
+# measurement noise, but undo a round whose calibrated request is materially
+# slower than the original layout.
+POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
 
 PLACEMENT_STATUS_SKIPPED = "skipped"
 PLACEMENT_STATUS_ADJUSTED = "adjusted"
@@ -235,6 +240,7 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     host_transition_headroom_bytes: int = 0
     device_transition_allocated_bytes: int = 0
     estimated_request_duration_ns: int = 0
+    measured_request_duration_ns: int = 0
     candidate_latency_savings_ns: dict[str, int] = {}
     candidates: list[ResidencyTarget] = []
     skip_reason: str | None = None
@@ -1996,11 +2002,10 @@ def apply_residency_changes(
                     candidate.target_layerwise_pinned_layers or ()
                 )
                 if target_mode == COMPONENT_OFFLOAD:
-                    module.remove_layerwise_offload()
+                    module.remove_layerwise_offload(to_cpu=True)
                     server_args.set_auto_residency_mode(
                         candidate.component_name, COMPONENT_OFFLOAD
                     )
-                    module.to("cpu")
                 elif target_mode == RESIDENT:
                     server_args.set_auto_residency_mode(
                         candidate.component_name, RESIDENT
@@ -2082,7 +2087,6 @@ def rollback_residency_changes(
                 if not isinstance(module, LayerwiseOffloadableModuleMixin):
                     raise RuntimeError("lost layerwise offload capability")
                 if not adjustment.previous_layerwise_configured:
-                    module.remove_layerwise_offload()
                     if adjustment.previous_auto_residency_mode is None:
                         server_args.clear_auto_residency_mode(adjustment.component_name)
                     else:
@@ -2090,11 +2094,12 @@ def rollback_residency_changes(
                             adjustment.component_name,
                             adjustment.previous_auto_residency_mode,
                         )
-                    if (
-                        server_args.residency_mode(adjustment.component_name)
-                        != RESIDENT
-                    ):
-                        module.to("cpu")
+                    module.remove_layerwise_offload(
+                        to_cpu=(
+                            server_args.residency_mode(adjustment.component_name)
+                            != RESIDENT
+                        )
+                    )
                     continue
                 currently_enabled = {
                     manager.enabled for manager in module.layerwise_offload_managers

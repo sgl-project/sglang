@@ -1397,7 +1397,7 @@
             "expected_avg_denoise_ms": 938.38,
             "expected_median_denoise_ms": 945.14,
             "load_peak_vram_mb": 43244.0,
-            "runtime_peak_vram_mb": 47874.0,
+            "runtime_peak_vram_mb": 59772.0,
             "estimated_full_test_time_s": 160.2
         },
         "qwen_image_layered_i2i": {
@@ -1509,7 +1509,7 @@
             "expected_avg_denoise_ms": 871.39,
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 27320.0,
-            "runtime_peak_vram_mb": 37434.0,
+            "runtime_peak_vram_mb": 48504.0,
             "estimated_full_test_time_s": 77.0
         },
         "wan2_2_i2v_a14b_2gpu": {
@@ -2158,7 +2158,7 @@
             "expected_avg_denoise_ms": 551.91,
             "expected_median_denoise_ms": 555.79,
             "load_peak_vram_mb": 43244.0,
-            "runtime_peak_vram_mb": 47874.0,
+            "runtime_peak_vram_mb": 59770.0,
             "estimated_full_test_time_s": 143.7
         },
         "fsdp-inference": {

@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     PLACEMENT_STATUS_ROLLED_BACK,
     PLACEMENT_STATUS_SKIPPED,
     AppliedResidencyChange,
+    RankResidencyReport,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -23,6 +24,46 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class TestAutoResidencyWarmup(unittest.TestCase):
+    def test_worker_rolls_back_a_materially_slower_calibrated_round(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.rank = 0
+        worker.is_output_rank = False
+        worker.server_args = SimpleNamespace()
+        worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_round_sizes = [1]
+        report = RankResidencyReport(
+            rank=0,
+            budget_bytes=1,
+            estimated_peak_bytes=1,
+            estimated_request_duration_ns=10_000_000_000,
+            measured_request_duration_ns=20_000_000_000,
+        )
+        worker._build_auto_residency_report = mock.Mock(return_value=report)
+        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        rolled_back = OutputBatch(
+            error="request duration regressed",
+            output={"status": PLACEMENT_STATUS_ROLLED_BACK},
+        )
+        worker._rollback_everywhere = mock.Mock(return_value=rolled_back)
+
+        with mock.patch.object(
+            gpu_worker_module,
+            "resolve_default_workload",
+            return_value=SimpleNamespace(),
+        ), mock.patch.object(
+            gpu_worker_module,
+            "resolve_measured_default_workload",
+            return_value=SimpleNamespace(),
+        ):
+            response = worker.apply_auto_residency()
+
+        self.assertIs(response, rolled_back)
+        worker._rollback_everywhere.assert_called_once()
+        kwargs = worker._rollback_everywhere.call_args.kwargs
+        self.assertIn("10.00s to 20.00s", kwargs["cause"])
+        self.assertFalse(kwargs["already_failed"])
+        self.assertTrue(kwargs["latest_round_only"])
+
     def test_worker_rollback_response_rewarms_the_restored_layout(self):
         actions = []
 

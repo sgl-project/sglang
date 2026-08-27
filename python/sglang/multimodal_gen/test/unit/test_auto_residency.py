@@ -482,6 +482,7 @@ def _report(
     device_transition_allocated_gib: int = 0,
     target_workload_measured: bool = False,
     estimated_request_duration_ns: int = 0,
+    measured_request_duration_ns: int = 0,
     candidate_latency_savings_ns: dict[str, int] | None = None,
 ) -> RankResidencyReport:
     return RankResidencyReport(
@@ -506,6 +507,7 @@ def _report(
         host_transition_headroom_bytes=(host_transition_headroom_gib * GIB_BYTES),
         device_transition_allocated_bytes=(device_transition_allocated_gib * GIB_BYTES),
         estimated_request_duration_ns=estimated_request_duration_ns,
+        measured_request_duration_ns=measured_request_duration_ns,
         candidate_latency_savings_ns=candidate_latency_savings_ns or {},
         candidates=candidates if candidates is not None else [_candidate("vae")],
         skip_reason=skip_reason,
@@ -1831,6 +1833,7 @@ class TestApplyAndRollback:
         assert len(module.layerwise_offload_managers) == 1
         assert module.layerwise_offload_managers[0].resident_layers == 2
         assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
+        manager = module.layerwise_offload_managers[0]
 
         rollback_residency_changes(
             applied=applied,
@@ -1839,11 +1842,14 @@ class TestApplyAndRollback:
         )
         assert module.layerwise_offload_managers == []
         assert args.auto_modes == {}
+        assert module.layers[0].weight.device.type == "cpu"
+        assert manager.load_all_layers_calls == 0
 
     def test_layerwise_can_become_component_offload_and_rollback(self):
         module = _FakeLazyLayerwiseDit(num_layers=4)
         args = _StubResidencyArgs()
         module.configure_layerwise_offload(args)
+        manager = module.layerwise_offload_managers[0]
         args.auto_modes["text_encoder"] = LAYERWISE_OFFLOAD
         candidates = collect_residency_targets(
             modules={"text_encoder": module},
@@ -1866,6 +1872,9 @@ class TestApplyAndRollback:
 
         assert module.layerwise_offload_managers == []
         assert args.auto_modes == {"text_encoder": COMPONENT_OFFLOAD}
+        assert module.layers[0].weight.device.type == "cpu"
+        assert target.target_resident_weight_bytes == 0
+        assert manager.load_all_layers_calls == 0
 
         rollback_residency_changes(
             applied=applied,
