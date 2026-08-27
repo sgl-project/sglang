@@ -236,13 +236,6 @@ class CommonKVManager(BaseKVManager):
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
-        # Terminal status already pushed to decode, per room. The transfer
-        # worker, poll() and abort() can all conclude the same room, so the
-        # notification (and the Success/Failed decision behind it) is latched
-        # here and emitted once.
-        self._concluded_rooms: Dict[int, KVPoll] = {}
-        self._conclude_lock = threading.Lock()
-
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
@@ -387,10 +380,6 @@ class CommonKVManager(BaseKVManager):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
-    @staticmethod
-    def _transfer_info_is_dummy(info) -> bool:
-        return bool(info.is_dummy)
-
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         """Every decode endpoint of a room that expects data from this rank.
 
@@ -403,7 +392,7 @@ class CommonKVManager(BaseKVManager):
             return []
         targets: List[Tuple[str, int]] = []
         for info in list(infos.values()):
-            if self._transfer_info_is_dummy(info):
+            if info.is_dummy:
                 continue
             target = (info.endpoint, info.dst_port)
             if target not in targets:
@@ -430,11 +419,7 @@ class CommonKVManager(BaseKVManager):
     def parse_kv_status_message(
         self, msg: List[bytes]
     ) -> Optional[Tuple[int, int, int, Optional[str]]]:
-        """Decode a prefill status message, or None when it is not one.
-
-        The reason frame is accepted even by backends that never send it, so a
-        prefill that starts emitting one does not break an older decode.
-        """
+        """Decode a prefill status message, or None when it is not one."""
         if self.kv_status_msg_tag is not None:
             if not msg or msg[0] != self.kv_status_msg_tag:
                 return None
@@ -465,7 +450,7 @@ class CommonKVManager(BaseKVManager):
         status: KVPoll,
         failure_reason: Optional[str] = None,
     ) -> None:
-        """Best-effort push of a terminal transfer status to decode endpoints."""
+        """Push of a terminal transfer status to decode endpoints."""
         if not targets:
             return
         parts = self._encode_kv_status_message(bootstrap_room, status, failure_reason)
@@ -486,43 +471,39 @@ class CommonKVManager(BaseKVManager):
         targets: Optional[List[Tuple[str, int]]] = None,
         failure_reason: Optional[str] = None,
     ) -> Optional[KVPoll]:
-        """Latch a room's terminal status once and push it to decode.
+        """Mark a room's terminal status and push it to decode.
 
-        Concurrent callers collapse onto the status the first one latched. A
-        Success requested after a failure was recorded is downgraded, so decode
+        A Success requested after a failure was recorded is downgraded, so decode
         never sees Success for a transfer that already broke. Returns the status
-        that was latched, or None when the room had already been cleared.
+        that was emitted, or None when the room had already been cleared.
+
+        Callers are transfer workers, and a room is sharded onto a single worker,
+        so this runs at most once per room without any at-most-once bookkeeping.
 
         ``targets`` defaults to every non-dummy decode endpoint of the room.
         """
-        with self._conclude_lock:
-            already_concluded = self._concluded_rooms.get(bootstrap_room)
-            if already_concluded is not None:
-                return already_concluded
-            if bootstrap_room not in self.request_status:
-                # The sender already cleared this room. Concluding now would
-                # re-create it in request_status, leave a failure record that a
-                # request reusing this bootstrap_room would adopt, and latch a
-                # room that clear() will never come back to unlatch.
-                return None
-            if status == KVPoll.Success:
-                with self.failure_lock:
-                    recorded = self.failure_records.get(bootstrap_room)
-                if recorded is not None:
-                    status = KVPoll.Failed
-                    failure_reason = recorded
-                elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
-                    status = KVPoll.Failed
-                    failure_reason = (
-                        failure_reason or "Room marked Failed before the transfer ended"
-                    )
-            if status == KVPoll.Failed:
-                with self.failure_lock:
-                    # Keep the first root cause; later callers see the symptom.
-                    failure_reason = self.failure_records.setdefault(
-                        bootstrap_room, failure_reason or "KV transfer failed"
-                    )
-            self._concluded_rooms[bootstrap_room] = status
+        if bootstrap_room not in self.request_status:
+            # The sender already cleared this room. Concluding now would
+            # re-create it in request_status and leave a failure record that a
+            # request reusing this bootstrap_room would adopt as its own.
+            return None
+        if status == KVPoll.Success:
+            with self.failure_lock:
+                recorded = self.failure_records.get(bootstrap_room)
+            if recorded is not None:
+                status = KVPoll.Failed
+                failure_reason = recorded
+            elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
+                status = KVPoll.Failed
+                failure_reason = (
+                    failure_reason or "Room marked Failed before the transfer ended"
+                )
+        if status == KVPoll.Failed:
+            with self.failure_lock:
+                # Keep the first root cause; later callers see the symptom.
+                failure_reason = self.failure_records.setdefault(
+                    bootstrap_room, failure_reason or "KV transfer failed"
+                )
 
         self.update_status(bootstrap_room, status)
         if targets is None:
@@ -536,14 +517,10 @@ class CommonKVManager(BaseKVManager):
         failure_reason: str,
         targets: Optional[List[Tuple[str, int]]] = None,
     ) -> Optional[KVPoll]:
-        """Record the reason, mark the room Failed and tell decode, once."""
+        """Record the reason, mark the room Failed and tell decode."""
         return self.conclude_transfer(
             bootstrap_room, KVPoll.Failed, targets, failure_reason
         )
-
-    def forget_concluded_room(self, bootstrap_room: int) -> None:
-        with self._conclude_lock:
-            self._concluded_rooms.pop(bootstrap_room, None)
 
     def apply_prefill_status(
         self,
@@ -1554,10 +1531,6 @@ class CommonKVSender(BaseKVSender):
             # Drop a held ack target if the room concluded without draining
             # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
             self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "forget_concluded_room"):
-            # Drop the terminal-once latch, otherwise a later request reusing
-            # this bootstrap_room would never notify decode.
-            self.kv_mgr.forget_concluded_room(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1834,8 +1807,6 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
-        # Mirrors the add in __init__; without it the tracker grows for every
-        # room that ends any way other than the backend's own success path.
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
