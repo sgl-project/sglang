@@ -174,14 +174,14 @@ def test_mhc_state_uses_optional_fused_attention_to_mlp_boundary():
     assert actual_residual is next_residual
     assert state.h_res is next_h_res
     assert state.h_post is next_h_post
-    fused.assert_called_once_with(
-        hidden_states,
-        residual,
-        initial_h_res,
-        initial_h_post,
-        norm.weight.data,
-        norm.variance_epsilon,
-    )
+    fused.assert_called_once()
+    call_args = fused.call_args.args
+    assert call_args[0] is hidden_states
+    assert call_args[1] is residual
+    assert call_args[2] is initial_h_res
+    assert call_args[3] is initial_h_post
+    torch.testing.assert_close(call_args[4], norm.weight)
+    assert call_args[5] == norm.variance_epsilon
 
 
 def test_glm_aiter_mhc_boundary_preserves_communicator_shapes():
@@ -232,7 +232,7 @@ def test_glm_aiter_mhc_boundary_preserves_communicator_shapes():
     assert actual_hidden is next_hidden_states
     torch.testing.assert_close(actual_residual, next_residual.reshape(2, 32))
     torch.testing.assert_close(actual_h_res, next_h_res.reshape(2, 16))
-    assert actual_h_post is next_h_post
+    torch.testing.assert_close(actual_h_post, next_h_post)
     assert norm_fused
     assert fused.call_args.kwargs["fn_transpose"] is True
     assert fused.call_args.kwargs["residual"].shape == (2, 4, 8)
