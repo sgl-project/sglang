@@ -14,6 +14,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,7 +72,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner._prepare_forward_metadata_for_replay(
             forward_batch,
             static_forward_batch,
-            num_tokens=16,
+            shape_key=ShapeKey(size=16),
         )
 
         attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)
