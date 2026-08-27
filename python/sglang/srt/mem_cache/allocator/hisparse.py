@@ -249,7 +249,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    # This allocator does not participate in free groups; both hooks are no-ops.
     def free_group_begin(self):
         return
 
