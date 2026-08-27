@@ -11,8 +11,8 @@ from sglang.srt.environ import envs
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
 
 HEADER = """
-| Model | Server | Client | Output Throughput | Expected Output Throughput | Accuracy | Expected Accuracy | Status |
-| ----- | ------ | ------ | ----------------- | -------------------------- | -------- | ----------------- | ------ |
+| Model | Server | Client | Prompts | Output Throughput | Expected Output Throughput | Accuracy | Expected Accuracy | Status |
+| ----- | ------ | ------ | ------- | ----------------- | -------------------------- | -------- | ----------------- | ------ |
 """
 
 _HEADER_WRITTEN = False
@@ -43,12 +43,13 @@ def write_results_to_github_step_summary(results: dict):
         output_throughput_threshold = metrics.get("output_throughput_threshold", "N/A")
         server = metrics.get("server", "N/A")
         client = metrics.get("client", "N/A")
+        num_prompts = metrics.get("num_prompts", "N/A")
         error = metrics.get("error", "")
         status = "PASS" if error == "" else f"FAIL: {error}"
         summary += (
-            f"| {model} | {server} | {client} | {output_throughput} "
-            f"| {output_throughput_threshold} | {accuracy} "
-            f"| {accuracy_threshold} | {status} |\n"
+            f"| {model} | {server} | {client} | {num_prompts} "
+            f"| {output_throughput} | {output_throughput_threshold} "
+            f"| {accuracy} | {accuracy_threshold} | {status} |\n"
         )
     write_github_step_summary(summary)
     _append_metric_records(results)
@@ -76,6 +77,9 @@ def _append_metric_records(results: dict) -> None:
                         "output_throughput_threshold"
                     ),
                     "latency": metrics.get("latency"),
+                    "num_prompts": metrics.get("num_prompts"),
+                    "num_threads": metrics.get("num_threads"),
+                    "max_tokens": metrics.get("max_tokens"),
                     "error": metrics.get("error", ""),
                     "status": "pass" if not metrics.get("error") else "fail",
                 }
