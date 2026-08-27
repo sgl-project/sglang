@@ -160,7 +160,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Load draft model weights only.
         if (
-            get_parallel().enable_dp_attention
+            get_parallel().config.enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
         ):
             ctx = draft_tp_context(get_parallel().attn_tp_group)
@@ -186,7 +186,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
+            draft_tp_context
+            if get_parallel().config.enable_dp_attention
+            else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
 

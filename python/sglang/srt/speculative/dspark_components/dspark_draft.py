@@ -205,6 +205,9 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
+        # token) changes per step, so avoid a fresh torch.full every decode.
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -358,12 +361,17 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        draft_block_ids = torch.full(
-            (bs, query_token_num),
-            int(self._mask_token_id),
-            dtype=torch.long,
-            device=device,
-        )
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
+            buf = torch.full(
+                (bs, query_token_num),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            self._draft_block_ids_buf = buf
+        draft_block_ids = buf[:bs]
+
         draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
@@ -444,7 +452,7 @@ class DraftBlockProposer:
     ) -> None:
         # The dense DSpark draft still reuses the target batch's graph tier.
         # Set graph eligibility before the DP-MoE-only metadata early return.
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         # Graph bucket selection uses the raw per-rank request counts.  Keep
