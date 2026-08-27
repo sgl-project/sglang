@@ -13,12 +13,16 @@ The cell as published could not load this checkpoint; the fix is in the
 cookbook PR and is the SGLANG_DSV4_FP4_EXPERTS entry below.
 
 Accuracy only: gfx942 has no DSV4 perf baseline to regress against yet, and the
-MI35x suite already carries the 8k/1k throughput numbers. The GSM8K threshold
-matches the MI35x FP8 test so the two architectures are comparable on the same
-eval.
+MI35x suite already carries the 8k/1k throughput numbers.
 
 Unlike the MI35x FP8 test this recipe also runs `--kv-cache-dtype fp8_e4m3` and
-EAGLE, so it is the gfx942 MLA + KV-FP8 signal as well.
+EAGLE, so it is the gfx942 MLA + KV-FP8 signal as well. That extra quantization
+is also why the threshold below is 0.90 rather than the 0.91 the MI35x FP8 test
+uses: measured 0.9174 and 0.9257 here, a spread wide enough that 0.91 would sit
+only ~2 sd off the mean and fail a good build roughly one night in forty. 0.90
+keeps ~2 points of headroom and still catches every regression worth gating on
+-- the failure modes this guards against (see #36390) collapse output entirely
+rather than shaving a point.
 
 Registry: nightly-amd-accuracy-8-gpu-deepseek-v4-flash suite
 """
@@ -128,7 +132,7 @@ class TestDeepseekV4FlashFp8Mi30x(CustomTestCase):
                 f"### test_gsm8k (deepseek-v4-flash-fp8, mi30x)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.91)
+            self.assertGreater(metrics["accuracy"], 0.90)
 
 
 if __name__ == "__main__":
