@@ -24,6 +24,7 @@ on via ``topk_length``); the per-token compressed count is recovered from the
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -40,6 +41,11 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices i
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
 )
+
+# A/B gate: route decode through aiter's fp8 ASM MLA kernel
+# (``mla_decode_fwd_v4_nm``) instead of the triton bf16 path. Read once at
+# import so it's stable across CUDA-graph capture/replay.
+_USE_AITER_MLA_DECODE = os.environ.get("SGLANG_USE_AITER_MLA_DECODE", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +90,8 @@ def store_swa_into_unified(
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring stride
     final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+    unified_kv_fp8: Optional[torch.Tensor] = None,  # [pages, 512] fp8 mirror
+    unified_kv_rope: Optional[torch.Tensor] = None,  # [pages, 64]  bf16 mirror
 ) -> None:
     n_rows, D = kv.shape
     if n_rows == 0:
@@ -108,6 +116,29 @@ def store_swa_into_unified(
         BLOCK_D=triton.next_power_of_2(D),
         num_warps=8,
     )
+
+    # Mirror the same rows into the store-time fp8 pool so decode can read
+    # fixed-shape fp8 (cuda-graph safe). Reuses the identical scatter kernel
+    # (same loc + final-window mask), so the fp8/rope mirror stays byte-for-byte
+    # consistent with the bf16 SWA ring. fp8 is stored/scattered as raw bytes
+    # (uint8 view) since triton has no float8 store.
+    if unified_kv_fp8 is not None and unified_kv_rope is not None:
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+            pack_native_bf16_to_2buff,
+        )
+
+        buff, rope = pack_native_bf16_to_2buff(kv)  # [T,512] fp8, [T,64] bf16
+        swa_scatter_fp8_mirror(
+            buff=buff,
+            rope=rope,
+            state_slot=state_slot,
+            positions=positions,
+            unified_kv_fp8=unified_kv_fp8,
+            unified_kv_rope=unified_kv_rope,
+            win=win,
+            ring_stride=ring_stride,
+            final_pos=final_pos,
+        )
 
 
 @triton.jit
@@ -161,6 +192,64 @@ def scatter_bf16_into_unified(
     )
 
 
+def swa_scatter_fp8_mirror(
+    *,
+    buff: torch.Tensor,  # [T, 512] fp8 (already packed)
+    rope: torch.Tensor,  # [T, 64]  bf16 (already packed)
+    state_slot: torch.Tensor,  # [T] int
+    positions: torch.Tensor,  # [T] int
+    unified_kv_fp8: torch.Tensor,  # [pages, 512] fp8 mirror
+    unified_kv_rope: torch.Tensor,  # [pages, 64]  bf16 mirror
+    win: int,
+    ring_stride: int,
+    final_pos: Optional[torch.Tensor] = None,  # [T] req's last position
+) -> None:
+    """Scatter pre-packed fp8/rope rows into the SWA ring mirror.
+
+    Uses the same loc + final-window mask as the bf16 SWA scatter. Split out of
+    ``store_swa_into_unified`` so the decode path can pack the SWA new-token rows
+    together with the compressed rows in a *single* ``_quant_k_cache`` launch and
+    then scatter each slice, instead of paying two separate pack launches per
+    layer. fp8 is scattered as raw bytes (uint8 view) since triton has no float8
+    store.
+    """
+    n_rows = buff.shape[0]
+    if n_rows == 0:
+        return
+    has_final = final_pos is not None
+    fp_arg = final_pos if has_final else positions
+    buff_u8 = buff.contiguous().view(torch.uint8)
+    rope = rope.contiguous()
+    _swa_scatter_kernel[(n_rows,)](
+        buff_u8,
+        state_slot,
+        positions,
+        fp_arg,
+        unified_kv_fp8.view(torch.uint8),
+        n_rows,
+        ring_stride,
+        win=win,
+        D=512,
+        HAS_FINAL=has_final,
+        BLOCK_D=triton.next_power_of_2(512),
+        num_warps=8,
+    )
+    _swa_scatter_kernel[(n_rows,)](
+        rope,
+        state_slot,
+        positions,
+        fp_arg,
+        unified_kv_rope,
+        n_rows,
+        ring_stride,
+        win=win,
+        D=64,
+        HAS_FINAL=has_final,
+        BLOCK_D=triton.next_power_of_2(64),
+        num_warps=4,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ragged indptr helper (shared by the decode streams + prefill builders)
 # ---------------------------------------------------------------------------
@@ -177,7 +266,26 @@ def decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
+    kv_fp8: Optional[torch.Tensor] = None,  # [pages,512] fp8 store-time pool
+    kv_rope: Optional[torch.Tensor] = None,  # [pages,64]  bf16 store-time pool
 ) -> torch.Tensor:
+    if _USE_AITER_MLA_DECODE:
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+            aiter_v4nm_paged_decode,
+            is_available,
+        )
+
+        if is_available():
+            return aiter_v4nm_paged_decode(
+                q,
+                unified_kv,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                softmax_scale,
+                kv_fp8=kv_fp8,
+                kv_rope=kv_rope,
+            )
     return sparse_attn_v4_paged_decode(
         q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
     )
