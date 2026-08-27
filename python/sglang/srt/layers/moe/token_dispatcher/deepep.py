@@ -770,7 +770,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 try:
                     _prev_evt = buffer.capture()
                     _alloc_on_comm = True
-                except Exception:
+                except (AttributeError, TypeError) as e:
+                    # ElasticBuffer.capture() is a @staticmethod returning an
+                    # EventHandle; the only tolerable failures are a version/ABI
+                    # mismatch surfacing as AttributeError/TypeError, in which
+                    # case we proceed without a pre-captured event. A bare
+                    # `except Exception` here would silently swallow real
+                    # runtime faults (e.g. CUDA errors) — narrow it.
+                    logger.warning_once(
+                        f"ElasticBuffer.capture() unavailable "
+                        f"({type(e).__name__}: {e}); proceeding without a "
+                        f"pre-captured event"
+                    )
                     _prev_evt = None
             previous_event = _prev_evt
             _num_tokens = (x[0] if isinstance(x, tuple) else x).shape[0]
@@ -921,7 +932,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 try:
                     _prev_evt = buffer.capture()
                     _alloc_on_comm = True
-                except Exception:
+                except (AttributeError, TypeError) as e:
+                    # ElasticBuffer.capture() is a @staticmethod returning an
+                    # EventHandle; the only tolerable failures are a version/ABI
+                    # mismatch surfacing as AttributeError/TypeError, in which
+                    # case we proceed without a pre-captured event. A bare
+                    # `except Exception` here would silently swallow real
+                    # runtime faults (e.g. CUDA errors) — narrow it.
+                    logger.warning_once(
+                        f"ElasticBuffer.capture() unavailable "
+                        f"({type(e).__name__}: {e}); proceeding without a "
+                        f"pre-captured event"
+                    )
                     _prev_evt = None
             with _V2Timer("combine"):
                 combined_x, _, event = buffer.combine(
