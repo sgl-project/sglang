@@ -29,6 +29,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.runtime_context import (
+    derive_attention_widths,
     get_device,
     get_exec,
     get_flags,
@@ -327,8 +328,17 @@ def is_dp_max_padding() -> bool:
 def compute_dp_attention_world_info(
     enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
 ):
-    attn_dp_size = dp_size if enable_dp_attention else 1
-    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
+    """This rank's place in the attention topology, plus the widths it sits in.
+
+    The widths come from `derive_attention_widths`; what this adds is the two
+    ranks, which are per-process and so are not part of the stamped set.
+    """
+    attn_dp_size, attn_tp_size = derive_attention_widths(
+        tp_size=tp_size,
+        attn_cp_size=attn_cp_size,
+        dp_size=dp_size,
+        enable_dp_attention=enable_dp_attention,
+    )
     attn_tp_rank = tp_rank % attn_tp_size
 
     if not enable_dp_attention:

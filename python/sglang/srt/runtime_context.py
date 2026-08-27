@@ -131,6 +131,19 @@ _PARALLEL_FIELDS = frozenset(
 )
 
 
+def derive_attention_widths(
+    *, tp_size: int, attn_cp_size: int, dp_size: int, enable_dp_attention: bool
+) -> tuple:
+    """(attn_dp_size, attn_tp_size) from the leaves.
+
+    Split out because the rank computation in
+    `dp_attention.compute_dp_attention_world_info` needs the same two numbers
+    and must not carry a second copy of the arithmetic.
+    """
+    attn_dp_size = dp_size if enable_dp_attention else 1
+    return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
+
+
 def derive_parallel_widths(
     *,
     tp_size: int,
@@ -153,7 +166,12 @@ def derive_parallel_widths(
     return {
         "world_size": world_size,
         "attn_dp_size": attn_dp_size,
-        "attn_tp_size": tp_size // attn_dp_size // attn_cp_size,
+        "attn_tp_size": derive_attention_widths(
+            tp_size=tp_size,
+            attn_cp_size=attn_cp_size,
+            dp_size=attn_dp_size,
+            enable_dp_attention=True,
+        )[1],
         "moe_ep_size": moe_ep_size,
         "moe_tp_size": tp_size // moe_ep_size // moe_dp_size,
         "dcp_enabled": dcp_enabled,
