@@ -88,10 +88,8 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export ASCEND_MF_STORE_URL=tcp://127.0.0.1:24667
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export DEEP_USE_ALLTOALL_MODE=1
-        export ENABLE_PROFILING=0
         export GLOO_SOCKET_IFNAME=<network-interface>
         export HCCL_BUFFSIZE=128
         export HCCL_SOCKET_IFNAME=<network-interface>

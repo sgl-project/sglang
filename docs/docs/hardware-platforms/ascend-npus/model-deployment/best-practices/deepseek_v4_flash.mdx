@@ -125,7 +125,6 @@ do
         --attention-backend dsv4 \
         --watchdog-timeout 9000 \
         --disaggregation-transfer-backend ascend \
-        --disaggregation-bootstrap-port 8998 \
         --mem-fraction-static 0.62 \
         --prefill-max-requests 6 \
         --max-prefill-tokens 70000 \
@@ -351,7 +350,6 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --dataset-path /root/.cache/modelscope/hub/datasets/gsm8k_deepseekv4/cache0_32000/formal_run1_64_32000_cache0.json \
     --random-input-len 32000 \
     --random-output-len 1000 \
     --num-prompts 64 \
@@ -482,7 +480,6 @@ python -m sglang.bench_serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
-    --dataset-path /root/.cache/modelscope/hub/datasets/gsm8k_deepseekv4/cache0_8000/formal_run1_320_8000_cache0.json \
     --random-input-len 8000 \
     --random-output-len 1000 \
     --num-prompts 320 \

@@ -21,7 +21,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3-32B | Atlas 800I A3 | 2 | PD Mixed | 3.5k+1.5k | 50ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms) |
-| Qwen3-32B | Atlas 800I A2 | 2 | PD Mixed | 3.5k+1.5k | 55ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-50ms-a2) |
+| Qwen3-32B | Atlas 800I A2 | 2 | PD Mixed | 3.5k+1.5k | 55ms | W8A8 INT8 | [Optimal Configuration](#qwen3-32b-w8a8-2p-in3k5-out1k5-55ms-a2) |
 
 ## Optimal Configuration
 
@@ -223,7 +223,7 @@ python -m sglang.bench_serving \
     --seed 1
 ```
 
-### Qwen3-32B W8A8 2P IN3K5 OUT1K5 50ms A2
+### Qwen3-32B W8A8 2P IN3K5 OUT1K5 55ms A2
 
 **Model**: Qwen3-32B
 
