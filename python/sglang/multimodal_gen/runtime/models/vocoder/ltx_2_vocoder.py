@@ -1,7 +1,7 @@
+import contextlib
 import math
 from abc import ABC
-from contextlib import nullcontext
-from typing import Tuple
+from typing import Iterator, Tuple
 
 import einops
 import torch
@@ -14,6 +14,22 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 
 LRELU_SLOPE = 0.1
+
+
+# LTX-2 supports CPU inference paths (https://github.com/Lightricks/LTX-2/tree/main).
+# On CPU, autocast does not reliably retag module params/buffers to fp32 for this path.
+@contextlib.contextmanager
+def _module_in_fp32(module: nn.Module, *, enabled: bool) -> Iterator[None]:
+    """Temporarily cast *module* to float32, restoring original dtype on exit."""
+    if not enabled:
+        yield
+        return
+    module_dtype = next(module.parameters()).dtype
+    module.float()
+    try:
+        yield
+    finally:
+        module.to(module_dtype)
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -705,18 +721,20 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         """
         if hasattr(self, "bwe_generator"):
             input_dtype = hidden_states.dtype
+            # Keep CUDA/XPU behavior on autocast; CPU uses _module_in_fp32 to
+            # materialize module weights in fp32 during the forward region.
             autocast_ctx = (
-                torch.autocast(
+                _module_in_fp32(
+                    self,
+                    enabled=next(self.parameters()).dtype != torch.float32,
+                )
+                if hidden_states.device.type == "cpu"
+                else torch.autocast(
                     device_type=hidden_states.device.type, dtype=torch.float32
                 )
-                if hidden_states.device.type != "cpu"
-                else nullcontext()
             )
             with autocast_ctx:
-                vocoder_input = hidden_states.to(
-                    dtype=self.vocoder.conv_pre.weight.dtype
-                )
-                waveform = self.vocoder(vocoder_input)
+                waveform = self.vocoder(hidden_states.float())
                 length_low_rate = waveform.shape[-1]
                 output_length = (
                     length_low_rate
@@ -727,10 +745,7 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                 if remainder != 0:
                     waveform = F.pad(waveform, (0, self.hop_length - remainder))
                 mel = self._compute_ltx23_mel(waveform)
-                bwe_input = mel.transpose(2, 3).to(
-                    dtype=self.bwe_generator.conv_pre.weight.dtype
-                )
-                residual = self.bwe_generator(bwe_input)
+                residual = self.bwe_generator(mel.transpose(2, 3))
                 skip = self.resampler(waveform)
                 assert residual.shape == skip.shape
                 waveform = torch.clamp(residual + skip, -1, 1)[..., :output_length]
