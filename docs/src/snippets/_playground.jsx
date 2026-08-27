@@ -842,6 +842,11 @@ export const Playground = ({ config }) => {
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
+              // Adaptive draft depth is part of an EAGLE preset, not a
+              // separate knob: a base that carries it must strip it when
+              // another algorithm is picked, or the flag survives and the
+              // server warns it away (only EAGLE/EAGLE3 honor it).
+              || head === "--speculative-adaptive"
               || head === "--speculative-dspark-block-size"
               || head === "--enable-linear-replayssm-spec"
               || head === "--linear-replayssm-cache-len"
@@ -870,6 +875,7 @@ export const Playground = ({ config }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+          "--speculative-adaptive",
           "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
           "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
