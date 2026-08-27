@@ -277,7 +277,7 @@ sgl-eval run gsm8k \\
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
         "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -317,20 +317,23 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: (s) => config.isRecommendedSelection(s) ? "in-progress" : "unverified",
+      verified: true,
+      verificationStatus: (s) =>
+        s.mmTransport === "auto" && s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.70",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
         "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -344,7 +347,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -365,18 +370,23 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.mmTransport === "auto" && s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
+        "--mem-fraction-static 0.75",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
         "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -390,7 +400,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -410,7 +422,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -421,7 +434,7 @@ sgl-eval run gsm8k \\
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
         "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -435,7 +448,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -455,7 +470,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -466,7 +482,7 @@ sgl-eval run gsm8k \\
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
         "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -480,7 +496,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -511,7 +529,7 @@ sgl-eval run gsm8k \\
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
         "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",

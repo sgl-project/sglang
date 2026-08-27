@@ -126,6 +126,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages == 0:
             out_indices = last_loc + 1
         else:
+            start_new_pages = start_new_pages.clamp(max=num_new_pages - 1)
             out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
                 start_new_pages
             ] * self.page_size * need_new_pages

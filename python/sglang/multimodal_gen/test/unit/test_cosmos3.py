@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     DomainAwareLinear,
+    _can_enable_t1_fused_qk_norm_rope,
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
@@ -89,6 +90,55 @@ def _cosmos3_server_args(config=None, batching_max_size=1):
         batching_max_size=batching_max_size,
         pipeline_config=config or Cosmos3Config(),
     )
+
+
+class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
+    def _can_enable(
+        self,
+        *,
+        is_blackwell=False,
+        is_hopper=False,
+        hidden_act="silu",
+        tp_size=1,
+        sp_size=1,
+        is_compiled=False,
+    ):
+        return _can_enable_t1_fused_qk_norm_rope(
+            is_blackwell=is_blackwell,
+            is_hopper=is_hopper,
+            hidden_act=hidden_act,
+            tp_size=tp_size,
+            sp_size=sp_size,
+            is_compiled=is_compiled,
+        )
+
+    def test_blackwell_remains_enabled(self):
+        self.assertTrue(
+            self._can_enable(
+                is_blackwell=True,
+                hidden_act="relu2",
+                tp_size=2,
+                sp_size=2,
+            )
+        )
+
+    def test_hopper_swiglu_single_gpu_enabled(self):
+        self.assertTrue(self._can_enable(is_hopper=True))
+
+    def test_hopper_dense_mlp_disabled(self):
+        self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
+
+    def test_hopper_tensor_parallel_disabled(self):
+        self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
+
+    def test_hopper_sequence_parallel_disabled(self):
+        self.assertFalse(self._can_enable(is_hopper=True, sp_size=2))
+
+    def test_compiled_path_disabled(self):
+        self.assertFalse(self._can_enable(is_hopper=True, is_compiled=True))
+
+    def test_other_architecture_disabled(self):
+        self.assertFalse(self._can_enable())
 
 
 class TestCosmos3ParamNamesMapping(unittest.TestCase):
