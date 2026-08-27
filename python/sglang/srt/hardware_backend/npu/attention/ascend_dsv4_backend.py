@@ -48,6 +48,21 @@ _LI_SINGLE_CORE = os.environ.get("SGL_LI_SINGLE_CORE", "0") == "1"
 _LI_SINGLE_CORE_LOG = os.environ.get("SGL_LI_SINGLE_CORE_LOG", "0") == "1"
 _LI_SINGLE_CORE_DONE = False
 
+# §24.53 replay-capture dump (input replay for the proc-junk source case).
+# Log-only: the report below is self-contained for off-cluster tiling
+# analysis (the dump FILE cannot leave the cluster; shapes/lens/metadata
+# partitions/junk fingerprint ride the [li-dump] report log lines instead).
+# SGL_LI_DUMP_INPUTS=1     report every call whose output contains junk
+#                          (the §24.47 _pjunk predicate, one accepted D2H
+#                          sync -- debug mode only)
+# SGL_LI_DUMP_INPUTS=all   report the first SGL_LI_DUMP_MAX calls
+#                          unconditionally (clean baseline capture)
+# SGL_LI_DUMP_DIR          unused (kept for compat)
+# SGL_LI_DUMP_MAX          max reports per rank (default 4)
+_LI_DUMP_MODE = os.environ.get("SGL_LI_DUMP_INPUTS", "0")
+_LI_DUMP_MAX = int(os.environ.get("SGL_LI_DUMP_MAX", "4"))
+_LI_DUMP_SEQ = 0
+
 # AICPU metadata layout (quant_lightning_indexer_metadata.h):
 #   LIMetadata[AIC_CORE_NUM=36][8]  per-AIC-core:
 #     [0]=coreEnable [1]=bN2Start [2]=mStart [3]=s2Start
@@ -81,6 +96,113 @@ def _force_li_single_core(meta: torch.Tensor, b_size: int) -> torch.Tensor:
                _LI_AIV_CORE_NUM, _LI_META_SIZE)
     ld[:, 0] = 0  # ldCoreEnable=0
     return meta
+
+
+def _li_rank_tag() -> str:
+    try:
+        p = get_parallel()
+        return (
+            f"dp{getattr(p, 'attn_dp_rank', '?')}"
+            f"_cp{getattr(p, 'attn_cp_rank', '?')}"
+            f"_tp{getattr(p, 'attn_tp_rank', '?')}"
+        )
+    except Exception:
+        return "rank?"
+
+
+def _li_meta_summary(m) -> str:
+    """One-line AIC/AIV core-partition summary of a metadata tensor."""
+    v = m.reshape(-1)
+    li = v[: _LI_AIC_CORE_NUM * _LI_META_SIZE].view(_LI_AIC_CORE_NUM, _LI_META_SIZE)
+    ld = v[_LI_AIC_CORE_NUM * _LI_META_SIZE:
+           (_LI_AIC_CORE_NUM + _LI_AIV_CORE_NUM) * _LI_META_SIZE].view(
+               _LI_AIV_CORE_NUM, _LI_META_SIZE)
+    en = (li[:, 0] == 1).nonzero().flatten().tolist()
+    cores = [li[c].tolist() for c in en[:4]]
+    return f"aic_en={len(en)} cores={cores} ld_en={int((ld[:, 0] != 0).sum())}"
+
+
+def _li_shape_report(kwargs: dict, out: torch.Tensor, meta_pre) -> str:
+    """§24.53b: self-contained log report for shape-only debugging.
+
+    The dump FILE cannot leave the cluster; these [li-dump] report lines
+    can. They carry everything a tiling-boundary analysis needs without the
+    tensor data: input shapes/dtypes, lens VALUES (they drive every loop
+    bound / tail block in kernel.h), the as-run + pre-rewrite core
+    partitions (proves §24.52 adoption), and a junk fingerprint (count,
+    first (row,col), per-row/col spread, value bit-pattern samples).
+    """
+    t = {k: v for k, v in kwargs.items() if torch.is_tensor(v)}
+    scal = {k: v for k, v in kwargs.items() if not torch.is_tensor(v)}
+    lines = []
+    shapes = {k: (tuple(v.shape), str(v.dtype).replace("torch.", ""))
+              for k, v in t.items()}
+    lines.append(f"shapes={shapes} out={tuple(out.shape)}")
+    lines.append(f"scalars={scal}")
+    ql = t.get("actual_seq_lengths_query")
+    kl = t.get("actual_seq_lengths_key")
+    lines.append(
+        f"lens_q={ql.tolist() if ql is not None else None} "
+        f"lens_k={kl.tolist() if kl is not None else None}"
+    )
+    lines.append(f"meta_asrun: {_li_meta_summary(t['metadata'])}")
+    lines.append(
+        f"meta_prerw: {_li_meta_summary(meta_pre) if meta_pre is not None else 'n/a'}"
+    )
+    # fp inputs: NaN/Inf in weights/scales is the classic MergeSort-misorder
+    # trigger; int8 min/max sanity-checks the quant path.
+    for k in ("weights", "query_dequant_scale", "key_dequant_scale"):
+        v = t.get(k)
+        if v is not None and v.numel():
+            f = v.float()
+            lines.append(
+                f"{k}[min,max,nan,inf]="
+                f"({f.min().item():.6g},{f.max().item():.6g},"
+                f"{int(f.isnan().sum())},{int(f.isinf().sum())})"
+            )
+    for k in ("query", "key"):
+        v = t.get(k)
+        if v is not None and v.numel():
+            lines.append(f"{k}[min,max]=({int(v.min())},{int(v.max())})")
+    # junk fingerprint on the output
+    o = out.to(torch.int64).reshape(out.shape[0], -1)
+    jm = ((o < 0) & (o != -1)) | (o >= (1 << 31) - 2)
+    cnt = int(jm.sum())
+    if cnt:
+        rc = jm.nonzero()
+        rows_any = jm.any(dim=1).nonzero().flatten()
+        vals = o[jm][:8].tolist()
+        vals_hex = [hex(v & 0xFFFFFFFF) for v in vals]
+        lines.append(
+            f"junk: cnt={cnt} first_rc=({int(rc[0, 0])},{int(rc[0, 1])}) "
+            f"rows_with_junk={int(rows_any.numel())}/{o.shape[0]} "
+            f"max_per_row={int(jm.sum(dim=1).max())} "
+            f"col_range=({int(rc[:, 1].min())},{int(rc[:, 1].max())}) "
+            f"vals={vals} hex={vals_hex}"
+        )
+        # per-request junk histogram (row order == request order for TND)
+        per_row = jm.sum(dim=1).tolist()
+        lines.append(f"junk_per_row={per_row}")
+    else:
+        lines.append("junk: cnt=0")
+    bt = t.get("block_table")
+    if bt is not None and bt.numel():
+        lines.append(
+            f"block_table[min,max]=({int(bt.min())},{int(bt.max())})"
+        )
+    return "\n".join(lines)
+
+
+def _log_li_dump(kwargs: dict, out: torch.Tensor, meta_pre, junk: int) -> None:
+    """§24.53: log-only capture of one op call (no file is written)."""
+    logger.error(
+        "[li-dump] #%d %s junk=%d single_core=%s\n%s",
+        _LI_DUMP_SEQ,
+        _li_rank_tag(),
+        junk,
+        _LI_SINGLE_CORE,
+        _li_shape_report(kwargs, out, meta_pre),
+    )
 
 from sglang.srt.hardware_backend.npu.dsv4.quant_retention import (
     install as _install_quant_retention,
@@ -923,6 +1045,11 @@ class C4IndexerAscendBackendMixin:
         q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
+        # §24.53: keep the pre-rewrite metadata for the replay dump (clone
+        # queued on the same stream, no sync; only when dumping is armed).
+        _li_meta_pre = (
+            li_quant_metadata.detach().clone() if _LI_DUMP_MODE != "0" else None
+        )
         # §24.52 single-core A/B: rewrite the AICPU split metadata so only
         # AIC core 0 runs and the LD multi-core reduce is disabled. Zero
         # binary change -- the kernel reads its core partitioning entirely
@@ -1046,6 +1173,22 @@ class C4IndexerAscendBackendMixin:
             record_op_shape("qli:out_cols", int(topk_idxs.shape[-1]), q_int8)
         except Exception:
             pass
+        # §24.53 replay-capture dump: junk-triggered ('1') or unconditional
+        # ('all'), bounded by _LI_DUMP_MAX. The .item() sync is accepted --
+        # this is an explicit debug mode, never a production path.
+        global _LI_DUMP_SEQ
+        if _LI_DUMP_MODE != "0" and _LI_DUMP_SEQ < _LI_DUMP_MAX:
+            _li_junk = -1
+            try:
+                _li_junk = int(_pjunk.sum().item())
+            except Exception:
+                pass
+            if _LI_DUMP_MODE == "all" or _li_junk > 0:
+                _LI_DUMP_SEQ += 1
+                try:
+                    _log_li_dump(kwargs, topk_idxs, _li_meta_pre, _li_junk)
+                except Exception as e:
+                    logger.warning("[li-dump] failed: %s", e)
         return topk_idxs.view(-1, self._dsv4_index_topk)
 
     def forward_c4_indexer(
