@@ -1065,7 +1065,7 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
     torch.testing.assert_close(actual, expected)
 
 
-def test_qsa_mqa_tilelang_compile_failure_falls_back_permanently(monkeypatch):
+def test_qsa_mqa_tilelang_failure_is_fatal(monkeypatch):
     q = SimpleNamespace(is_cuda=True)
     calls = {"tilelang": 0, "torch": 0}
 
@@ -1077,30 +1077,25 @@ def test_qsa_mqa_tilelang_compile_failure_falls_back_permanently(monkeypatch):
         calls["torch"] += 1
         return "torch"
 
-    monkeypatch.setenv("SGLANG_QSA_MQA_BACKEND", "auto")
+    monkeypatch.setenv("SGLANG_QSA_MQA_BACKEND", "tilelang")
     monkeypatch.setattr(mqa_module, "HAS_TILELANG", True)
-    monkeypatch.setattr(mqa_module, "_tilelang_backend_available", None)
-    assert (
+    with pytest.raises(RuntimeError, match="compile failed"):
         mqa_module._run_tilelang_or_torch(q, failing_tilelang, torch_fallback)
-        == "torch"
-    )
-    assert (
-        mqa_module._run_tilelang_or_torch(q, failing_tilelang, torch_fallback)
-        == "torch"
-    )
-    assert calls == {"tilelang": 1, "torch": 2}
+    assert calls == {"tilelang": 1, "torch": 0}
 
 
 def test_qsa_mqa_backend_torch_bypasses_tilelang(monkeypatch):
     q = SimpleNamespace(is_cuda=True)
     monkeypatch.setenv("SGLANG_QSA_MQA_BACKEND", "torch")
     monkeypatch.setattr(mqa_module, "HAS_TILELANG", True)
-    monkeypatch.setattr(mqa_module, "_tilelang_backend_available", None)
-    assert mqa_module._run_tilelang_or_torch(
-        q,
-        lambda: pytest.fail("TileLang must not run"),
-        lambda: "torch",
-    ) == "torch"
+    assert (
+        mqa_module._run_tilelang_or_torch(
+            q,
+            lambda: pytest.fail("TileLang must not run"),
+            lambda: "torch",
+        )
+        == "torch"
+    )
 
 
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
