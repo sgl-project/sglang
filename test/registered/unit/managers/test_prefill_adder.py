@@ -525,6 +525,10 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder.can_run_list), 0)
 
     def test_add_one_req_unified_swa_uses_shared_capacity(self):
+        # The real warmup is shorter than one page. Feeding an already
+        # page-rounded input into the SWA budget would round it a second time
+        # after adding decode headroom and reject the first request forever.
+        page_size = 128
         allocator = MagicMock(spec=UnifiedSWATokenToKVPoolAllocator)
         allocator.available_size.return_value = 0
         allocator.full_available_size.return_value = 0
@@ -537,13 +541,13 @@ class TestPrefillAdder(CustomTestCase):
             <= full_evictable_tokens + swa_evictable_tokens
         )
         self.mock_token_allocator = allocator
-        self.mock_tree_cache.swa_evictable_size.return_value = 64
-        self.mock_tree_cache.sliding_window_size = 128
-        adder = self.create_adder(self.create_running_batch(), page_size=8)
+        self.mock_tree_cache.swa_evictable_size.return_value = 3 * page_size
+        self.mock_tree_cache.sliding_window_size = 4096
+        adder = self.create_adder(self.create_running_batch(), page_size=page_size)
 
-        req = self.create_mock_req("unified", priority=0, max_new_tokens=16)
-        req.origin_input_ids = list(range(24))
-        req.full_untruncated_fill_ids = list(range(24))
+        req = self.create_mock_req("unified", priority=0, max_new_tokens=10)
+        req.origin_input_ids = list(range(3))
+        req.full_untruncated_fill_ids = list(range(3))
         req.swa_host_hit_length = 0
         req.last_node = MagicMock()
         req.sampling_params.ignore_eos = False
@@ -559,9 +563,12 @@ class TestPrefillAdder(CustomTestCase):
 
         self.assertEqual(result, AddReqResult.CONTINUE)
         self.assertIn(req, adder.can_run_list)
+        full_tokens, swa_tokens = allocator.can_reserve.call_args_list[0].args
+        self.assertEqual(full_tokens, 3 + 10 + page_size)
+        self.assertEqual(swa_tokens, 3 + 10 + page_size)
         self.assertTrue(
             any(
-                call.kwargs["swa_evictable_tokens"] == 64
+                call.kwargs["swa_evictable_tokens"] == 3 * page_size
                 for call in allocator.can_reserve.call_args_list
             )
         )

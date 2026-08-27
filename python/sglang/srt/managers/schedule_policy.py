@@ -885,13 +885,13 @@ class PrefillAdder:
         self,
         req: Req,
         *,
-        real_input_tokens: int,
+        extend_input_len: int,
         total_tokens: int,
     ) -> tuple[bool, Optional[int]]:
         """Check SWA pressure and return the usable chunk limit."""
         max_new_tokens = self._swa_new_tokens(req)
         swa_needed = self._swa_budget_for_req(
-            real_input_tokens,
+            extend_input_len,
             max_new_tokens,
             swa_host_hit_length=req.swa_host_hit_length,
         )
@@ -915,7 +915,7 @@ class PrefillAdder:
                 full_input_tokens, max_new_tokens
             )
         if not self._swa_req_never_fits(
-            real_input_tokens,
+            extend_input_len,
             max_new_tokens,
             req.swa_host_hit_length,
             full_tokens=full_ever_tokens,
@@ -926,7 +926,7 @@ class PrefillAdder:
         max_chunk_tokens = self.rem_chunk_tokens
         chunk_max_new = max_new_tokens
         if self.is_unified_swa:
-            max_chunk_tokens = min(max_chunk_tokens or 0, max(0, real_input_tokens - 1))
+            max_chunk_tokens = min(max_chunk_tokens or 0, max(0, extend_input_len - 1))
             chunk_max_new = 0
         swa_cap = self._swa_chunk_cap(
             chunk_max_new,
@@ -1381,8 +1381,8 @@ class PrefillAdder:
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = cand_extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        swa_extend_input_len = cand_extend_input_len - req.host_hit_length
+        real_input_tokens = self.ceil_paged_tokens(swa_extend_input_len)
         prefix_len = len(req.prefix_indices)
 
         if not self.is_unified_swa and total_tokens >= self.rem_total_tokens:
@@ -1392,7 +1392,7 @@ class PrefillAdder:
         if self.is_hybrid_swa:
             can_admit, chunk_tokens_limit = self._check_swa_admission(
                 req,
-                real_input_tokens=real_input_tokens,
+                extend_input_len=swa_extend_input_len,
                 total_tokens=total_tokens,
             )
             if not can_admit:
@@ -1416,7 +1416,7 @@ class PrefillAdder:
             if self.is_hybrid_swa:
                 can_admit, chunk_tokens_limit = self._check_swa_admission(
                     req,
-                    real_input_tokens=real_input_tokens,
+                    extend_input_len=swa_extend_input_len,
                     total_tokens=total_tokens,
                 )
                 if not can_admit:
