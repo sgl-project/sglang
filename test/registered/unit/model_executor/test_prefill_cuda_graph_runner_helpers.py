@@ -15,6 +15,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     _build_layer_model_forward_kwargs,
     _resolve_transformer_layer_model,
 )
+from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -166,6 +167,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             dtype=torch.bfloat16,
             enable_mamba_track=False,
             pp_size=2,
+            is_first_pp_rank=False,
             pp_proxy_residual_num_blocks=3,
         )
 

@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -328,6 +329,17 @@ def capture_prefill_graph(
 
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
+    parallel = get_parallel()
+    if (
+        prefill_backend == Backend.BREAKABLE
+        and parallel.enable_prefill_cp
+        and parallel.pp_size > 1
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because pipeline parallelism combined "
+            "with prefill context parallelism is not validated."
+        )
+        return result(eager_runner)
     context_length = model_runner.model_config.context_len
     if prefill_backend == Backend.FULL:
         max_capture_requests = prefill_config.full_prefill_max_req
@@ -395,10 +407,12 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
+    start_layer = model_runner.layer_info.start_layer
+    end_layer = model_runner.layer_info.end_layer
     model_runner.attention_layers = _align_pipeline_layers(
         model_runner.attention_layers, layer_model
     )
-    if len(model_runner.attention_layers) < model_runner.layer_info.end_layer:
+    if len(model_runner.attention_layers) < end_layer:
         log_info_on_rank0(
             logger,
             "Disable prefill CUDA graph because the attention-layer registry "
@@ -406,9 +420,7 @@ def capture_prefill_graph(
         )
         return result(None)
 
-    local_attention_layers = model_runner.attention_layers[
-        model_runner.layer_info.start_layer : model_runner.layer_info.end_layer
-    ]
+    local_attention_layers = model_runner.attention_layers[start_layer:end_layer]
     if any(layer is None for layer in local_attention_layers):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(

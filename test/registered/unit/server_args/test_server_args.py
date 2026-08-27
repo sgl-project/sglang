@@ -1814,15 +1814,19 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
         )
         for locked, expected in cases:
             with self.subTest(locked=locked):
-                args = SimpleNamespace(
+                args = ServerArgs(
+                    model_path="dummy",
                     pp_size=4,
                     cuda_graph_config=CudaGraphConfig(
                         prefill=PhaseConfig(backend=Backend.BREAKABLE)
                     ),
-                    _cuda_graph_config_locked=locked,
                 )
+                args._cuda_graph_config_locked = locked
                 ServerArgs._apply_cuda_graph_compatibility(args)
-                self.assertEqual(args.cuda_graph_config.prefill.backend, expected)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    expected,
+                )
 
     def test_pp_prefill_capture_limit_policy(self):
         cases = (
@@ -1837,17 +1841,17 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     pp_size=4,
                     chunked_prefill_size=chunked_prefill_size,
                     mem_fraction_static=0.8,
-                )
-                args.cuda_graph_config = CudaGraphConfig(
-                    decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
-                    prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=max_bs),
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=max_bs),
+                    ),
                 )
                 args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
                     {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
                 )
                 with patch.object(ServerArgs, "use_mla_backend", return_value=False):
                     args._handle_gpu_memory_settings(gpu_mem=None)
-                prefill = args.cuda_graph_config.prefill
+                prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 

@@ -4972,14 +4972,19 @@ class ServerArgs:
         # large buckets that can be slower than eager. An explicit backend
         # selection bypasses this default policy.
         if (
-            self.pp_size > 1
-            and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            cfg.pp_size > 1
+            and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
         ):
             logger.info(
                 "Disabling breakable prefill CUDA graph by default for pipeline "
                 "parallelism. Set --cuda-graph-backend-prefill=breakable to opt in."
             )
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_apply_cuda_graph_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             return
 
         # Breakable is the CUDA default but not multimodal-compatible;
@@ -5446,7 +5451,7 @@ class ServerArgs:
             # buckets by default and leave larger forwards on the eager path.
             # Explicit max_bs or bs settings retain their existing semantics.
             if (
-                self.pp_size > 1
+                cfg.pp_size > 1
                 and prefill_cuda_graph_config.backend == Backend.BREAKABLE
                 and (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked
                 and prefill_cuda_graph_config.max_bs

@@ -17,7 +17,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -75,6 +75,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        self.enterContext(get_parallel().override(enable_prefill_cp=False, pp_size=1))
         model_runner = SimpleNamespace(
             device="cuda",
             gpu_id=0,

@@ -345,6 +345,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
             pp_size=self.pp_size,
+            is_first_pp_rank=self.model_runner.pp_group.is_first_rank,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
