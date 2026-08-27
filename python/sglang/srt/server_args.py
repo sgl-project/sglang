@@ -10326,6 +10326,8 @@ class ServerArgs:
         if not mode or mode.lower() == "off":
             return  # disabled; nothing to validate
 
+        server_cfg = resolving_view(self)
+
         from sglang.srt.disaggregation.kv_events import (
             KVEventsConfig,
             resolve_load_pub_range,
@@ -10349,7 +10351,7 @@ class ServerArgs:
         _, reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
-            dp_size=self.dp_size,
+            dp_size=server_cfg.dp_size,
             load_publish_endpoint=mode,
         )
         if reason:
@@ -10805,14 +10807,14 @@ class ServerArgs:
         # Load range, from the same resolver SchedulerLoadPublisher binds
         # with (so the two can't drift). The decline reason is logged once at
         # startup, not here — this runs per /server_info request.
-        resolved, _reason = resolve_load_pub_range(
+        resolved_range, _reason = resolve_load_pub_range(
             kv_endpoint=cfg.endpoint,
             replay_endpoint=cfg.replay_endpoint,
-            dp_size=self.dp_size,
+            dp_size=resolved.dp_size,
             load_publish_endpoint=self.load_publish_endpoint,
         )
-        if resolved is not None:
-            descriptor["load_endpoint_port_base"] = resolved[1]
+        if resolved_range is not None:
+            descriptor["load_endpoint_port_base"] = resolved_range[1]
             descriptor["load_topic"] = LOAD_TOPIC
         return descriptor
 
