@@ -1592,7 +1592,12 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
+        NS("observability"),
+    ] = None
+    load_publish_endpoint: A[
+        Optional[str],
+        "Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or 'off'). Use 'auto' to reserve the dp_size ports packed after the --kv-events-config range, or a wildcard-host TCP address (e.g. tcp://*:6000) to place it explicitly; rank r binds port+r and /server_info advertises the base under the kv_events block. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range. Note: 'auto' reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly. The router-facing update cadence follows --load-snapshot-publish-interval (shared to avoid double-collecting the snapshot), so a large value there also staleness-caps this feed.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -10260,6 +10265,50 @@ class ServerArgs:
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
+        self.check_load_publish_args()
+
+    def check_load_publish_args(self):
+        """Fail fast at the entrypoint on a --load-publish-endpoint the
+        scheduler would decline (no active kv-events publisher to advertise
+        through, unbindable, overlapping the KV range, u16 overflow) rather
+        than only warning — or silently doing nothing — from a scheduler
+        subprocess. Routes through the same resolver the scheduler binds and
+        /server_info advertises with."""
+        mode = (self.load_publish_endpoint or "").strip()
+        if not mode or mode.lower() == "off":
+            return  # disabled; nothing to validate
+
+        server_cfg = resolving_view(self)
+
+        from sglang.srt.disaggregation.kv_events import (
+            KVEventsConfig,
+            resolve_load_pub_range,
+        )
+
+        if not self.kv_events_config:
+            raise ValueError(
+                "--load-publish-endpoint requires --kv-events-config: routers"
+                " discover the load range through /server_info's kv_events"
+                " block, absent without a publisher."
+            )
+        try:
+            cfg = KVEventsConfig.from_cli(self.kv_events_config)
+        except Exception as e:
+            raise ValueError(f"--kv-events-config is not parseable: {e}")
+        if cfg.publisher == "null" or not cfg.endpoint:
+            raise ValueError(
+                "--load-publish-endpoint needs an active --kv-events-config"
+                " publisher; got publisher='null' or an empty endpoint."
+            )
+        _, reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=server_cfg.dp_size,
+            load_publish_endpoint=mode,
+        )
+        if reason:
+            raise ValueError(reason)
+
     def check_lora_server_args(self):
         cfg = resolving_view(self)
 
@@ -10635,6 +10684,19 @@ class ServerArgs:
                                                   # DCP shards within a rank
                                                   # rather than adding
                                                   # publishers
+                "load_endpoint_port_base": <resolved>,
+                                                  # base TCP port of the load
+                                                  # range (load rank r = base
+                                                  # + r). Consumers MUST read
+                                                  # this key, not re-derive
+                                                  # it; present only when
+                                                  # --load-publish-endpoint
+                                                  # opted in and a range
+                                                  # resolved
+                "load_topic": "load",             # SUB filter for the load
+                                                  # socket; present iff
+                                                  # load_endpoint_port_base
+                                                  # is present
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -10645,17 +10707,27 @@ class ServerArgs:
           block_size would cause silent KV-cache misses by hashing
           prompts at the wrong granularity on the router side),
         * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, or port outside
-          1..65535).
+          ipc://, missing port, non-integer port, port outside
+          1..65535, or a bare unbracketed IPv6 host, which is
+          ambiguous).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
+        NOTE for load-socket consumers: pair the load port with the worker's
+        own URL host, as with the KV SUB endpoints — endpoint_host is a
+        wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
+        so splicing it yields tcp://*:PORT and connects to nothing.
+
+        Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
+        helpers the scheduler binds through — so the advertisement cannot
+        drift from the sockets.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+        from sglang.srt.disaggregation.kv_events import (
+            LOAD_TOPIC,
+            KVEventsConfig,
+            parse_advertisable_tcp,
+            resolve_load_pub_range,
+        )
 
         resolved = resolving_view(self)
         raw = resolved.kv_events_config
@@ -10671,21 +10743,12 @@ class ServerArgs:
             return None
         if cfg.publisher == "null" or not cfg.endpoint:
             return None
-        if not cfg.endpoint.startswith("tcp://"):
+        resolved_kv = parse_advertisable_tcp(cfg.endpoint)
+        if resolved_kv is None:
             return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
-            return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
+        host, port = resolved_kv
 
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -10693,6 +10756,19 @@ class ServerArgs:
             "block_size": resolved.kv_event_block_size,
             "dp_size": resolved.dp_size,
         }
+        # Load range, from the same resolver SchedulerLoadPublisher binds
+        # with (so the two can't drift). The decline reason is logged once at
+        # startup, not here — this runs per /server_info request.
+        resolved_range, _reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=resolved.dp_size,
+            load_publish_endpoint=self.load_publish_endpoint,
+        )
+        if resolved_range is not None:
+            descriptor["load_endpoint_port_base"] = resolved_range[1]
+            descriptor["load_topic"] = LOAD_TOPIC
+        return descriptor
 
     def should_report_expert_balancedness(self) -> bool:
         cfg = resolving_view(self)

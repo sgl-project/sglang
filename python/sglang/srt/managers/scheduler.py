@@ -228,6 +228,9 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import SchedulerLoadInquirer
+from sglang.srt.managers.scheduler_components.load_publisher import (
+    SchedulerLoadPublisher,
+)
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
@@ -361,6 +364,11 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 STEP_MAX_US = 2_000_000
 
+# Min wall-clock between load publishes on the stalled no-batch path, which
+# spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
+# DP-balancing writer and the router-facing socket.
+LOAD_STALL_REFRESH_S = 0.05
+
 
 def _accumulate_decode_moment(
     totals: list[float],
@@ -394,6 +402,10 @@ class Scheduler(
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    # Class-level default so on_idle's stall gate works even if a fork
+    # overrides init_load_publisher (which would otherwise not set it).
+    _last_stall_publish_ts: float = float("-inf")
 
     def __init__(
         self,
@@ -658,6 +670,8 @@ class Scheduler(
 
         self.init_kv_events_publisher()
 
+        self.init_load_publisher()
+
         self.init_load_inquirer()
 
         self.init_output_streamer()
@@ -802,18 +816,24 @@ class Scheduler(
             self.idle_sleeper = None
 
     def publish_load_snapshot(self, force: bool = False):
+        """Returns the LoadSnapshot it published, or None when disabled,
+        throttled, or failed — so co-located sinks (the router-facing load
+        publisher) can reuse it instead of walking the queues again."""
         writer = self.load_snapshot_writer
         if writer is None:
-            return
+            return None
         if not force:
             writer.publish_counter += 1
             if writer.publish_counter < writer.publish_interval:
-                return
+                return None
         writer.publish_counter = 0
         try:
-            writer.write(self.load_inquirer.get_loads())
+            load = self.load_inquirer.get_loads()
+            writer.write(load)
+            return load
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
+            return None
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -2156,6 +2176,18 @@ class Scheduler(
             max_running_requests=self.max_running_requests,
             max_total_num_tokens=self.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
+        )
+
+    def init_load_publisher(self) -> None:
+        # Router-facing load reporting; rank gating and no-op fallback live
+        # inside the component. Same interval as the DP-balancing writer so
+        # the two fire in phase and the load sink always reuses that snapshot
+        # instead of walking the queues itself.
+        self.load_publisher = SchedulerLoadPublisher(
+            kv_events_config=get_observability().kv_events_config,
+            ps=self.ps,
+            load_publish_endpoint=get_observability().load_publish_endpoint,
+            publish_interval=get_observability().load_snapshot_publish_interval,
         )
 
     def init_load_inquirer(self) -> None:
@@ -4119,7 +4151,14 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Router-facing gauge on the dedicated PUB socket, reusing the
+        # snapshot above rather than walking the queues again.
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads,
+            force=batch.forward_mode.is_extend(),
+            snapshot=snapshot,
+        )
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -4235,7 +4274,21 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
+        # Publish before the fully-idle gate: a no-batch-but-not-idle stall
+        # (queues parked under KV pressure / disagg transfer) has no
+        # process_batch_result to publish the growing gauge, and gating here
+        # froze /get_loads, DP balancing, and the LoadStat for the stall. This
+        # path spins without sleeping, so a wall-clock floor bounds the
+        # O(queue) get_loads for both sinks; the fully-idle publish runs
+        # post-flush below.
         if not self.is_fully_idle():
+            now = time.monotonic()
+            if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
+                self._last_stall_publish_ts = now
+                snapshot = self.publish_load_snapshot(force=True)
+                self.load_publisher.publish_load_stat(
+                    self.load_inquirer.get_loads, force=True, snapshot=snapshot
+                )
             return
 
         if self.enable_unified_memory:
@@ -4273,8 +4326,12 @@ class Scheduler(
         # reset token ratio
         self.new_token_ratio_tracker.reset()
 
-        # Publish the idle state so /get_loads and DP balancing do not see stale load.
-        self.publish_load_snapshot(force=True)
+        # Fully-idle publish, post-flush so the gauge reflects compacted KV.
+        # Forced (immediate) so the busy->idle transition is never delayed.
+        snapshot = self.publish_load_snapshot(force=True)
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads, force=True, snapshot=snapshot
+        )
 
         # sleep until next event
         self.maybe_sleep_on_idle()
