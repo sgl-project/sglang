@@ -6,7 +6,7 @@ use crate::{
     MatchedStop,
 };
 
-use super::completions::SubmittedChoice;
+use super::openai::completions::SubmittedChoice;
 
 fn submission() -> (
     GenerationStream,

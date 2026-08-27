@@ -4,13 +4,15 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use super::{
-    OpenAIHttpFrontend, collect_output, error_payload, openai_error, renderer_status,
-    submit_generation, unix_seconds_u32,
+use super::{completion_usage, unix_seconds_u32};
+use crate::http::{
+    OpenAIHttpFrontend,
+    error::{error_payload, openai_error, renderer_status},
+    submission::{collect_output, merge_indexed, submit_inputs},
 };
 use crate::{
-    GenerationEvent, GenerationFinishReason, GenerationInput, GenerationOutput,
-    GenerationOutputExtras, GenerationStream, MatchedStop,
+    GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
+    GenerationStream, MatchedStop, TextPrompt,
 };
 use axum::{
     Json, Router,
@@ -23,8 +25,7 @@ use axum::{
     routing::post,
 };
 use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs,
+    Choice, CompletionFinishReason, CreateCompletionRequest, CreateCompletionResponse, Logprobs,
 };
 use futures::StreamExt;
 
@@ -32,11 +33,11 @@ pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/completions", post(completions))
 }
 
-pub(super) struct SubmittedChoice {
-    pub(super) index: usize,
-    pub(super) prompt_index: usize,
-    pub(super) echo: String,
-    pub(super) events: GenerationStream,
+pub(crate) struct SubmittedChoice {
+    pub(crate) index: usize,
+    pub(crate) prompt_index: usize,
+    pub(crate) echo: String,
+    pub(crate) events: GenerationStream,
 }
 #[derive(Debug, Default)]
 pub(super) struct ChoiceExtensions {
@@ -74,62 +75,58 @@ async fn completions(
         .as_ref()
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
-    let generation_inputs = match state.renderer.lower_completions(request, &response_id) {
+    let text_requests = match state.renderer.lower_completions(request, &response_id) {
         Ok(requests) => requests,
         Err(error) => {
-            let status = renderer_status(error.kind());
+            let status = renderer_status(&error);
             return openai_error(status, error.to_string(), false);
         }
     };
     let created = unix_seconds_u32();
-    let mut submitted = Vec::with_capacity(generation_inputs.len());
+    let mut metadata = Vec::with_capacity(text_requests.len());
     let mut prompt_echo = String::new();
 
-    for (index, generation_input) in generation_inputs.into_iter().enumerate() {
+    for (index, text_request) in text_requests.iter().enumerate() {
         let prompt_index = index / n;
         let sample_index = index % n;
         if sample_index == 0 {
             prompt_echo = if !echo {
                 String::new()
-            } else if let GenerationInput::Text(request) = &generation_input {
-                request.text.clone()
-            } else if let GenerationInput::TokenIds(request) = &generation_input {
-                match state.generate_client.detokenize(request.input_ids.clone()) {
-                    Ok(echo) => echo,
-                    Err(error) => {
-                        return openai_error(
-                            StatusCode::from_u16(error.status_code)
-                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                            error.message,
-                            false,
-                        );
+            } else {
+                match &text_request.prompt {
+                    TextPrompt::Text(text) => text.clone(),
+                    TextPrompt::TokenIds(input_ids) => {
+                        match state.generate_client.detokenize(input_ids.clone()) {
+                            Ok(echo) => echo,
+                            Err(error) => {
+                                return openai_error(
+                                    StatusCode::from_u16(error.status_code)
+                                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                                    error.message,
+                                    false,
+                                );
+                            }
+                        }
                     }
                 }
-            } else {
-                unreachable!("processed completion request has a prompt")
             };
         }
-        let prepared = match state
-            .renderer
-            .prepare_generation_input(generation_input)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return openai_error(renderer_status(error.kind()), error.to_string(), false);
-            }
-        };
-        let events = match submit_generation(&state.generate_client, prepared, stream).await {
-            Ok(events) => events,
-            Err(response) => return response,
-        };
-        submitted.push(SubmittedChoice {
+        metadata.push((index, prompt_index, prompt_echo.clone()));
+    }
+    let streams = match submit_inputs(&state, text_requests, stream).await {
+        Ok(streams) => streams,
+        Err(response) => return response,
+    };
+    let submitted = metadata
+        .into_iter()
+        .zip(streams)
+        .map(|((index, prompt_index, echo), events)| SubmittedChoice {
             index,
             prompt_index,
-            echo: prompt_echo.clone(),
+            echo,
             events,
-        });
-    }
+        })
+        .collect();
 
     if stream {
         let s = completion_event_stream(
@@ -333,12 +330,11 @@ pub(super) fn completion_event_stream(
         let mut streams = Vec::with_capacity(count);
 
         for choice in submitted {
-            let index = choice.index;
             prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
-            streams.push(choice.events.map(move |event| (index, event)).boxed());
+            streams.push(choice.events);
         }
-        let mut events = futures::stream::select_all(streams);
+        let mut events = merge_indexed(streams);
 
         while let Some((index, item)) = events.next().await {
             let output = match item {
@@ -408,15 +404,6 @@ pub(super) fn completion_event_stream(
             yield completion_response_value(final_chunk, &[]).to_string();
         }
         yield "[DONE]".to_string();
-    }
-}
-
-pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
-    CompletionUsage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens.saturating_add(completion_tokens),
-        ..Default::default()
     }
 }
 
@@ -515,13 +502,13 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, submitted};
     use super::{
         ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
         unary_completion,
     };
     use crate::GenerationOutputExtras;
-    use crate::openai::{PromptSpec, completion_prompt_specs};
+    use crate::http::test_utils::{chunk, submitted};
+    use crate::protocol::openai::{PromptSpec, completion_prompt_specs};
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,

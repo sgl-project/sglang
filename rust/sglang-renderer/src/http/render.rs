@@ -13,7 +13,7 @@ use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionReque
 
 use crate::RendererService;
 
-use super::{openai_error, renderer_status};
+use super::error::{openai_error, renderer_status};
 
 #[derive(Clone)]
 struct RenderState {
@@ -57,7 +57,7 @@ async fn render_chat(
                 .expect("prepared chat request contains one choice"),
         )
         .into_response(),
-        Err(error) => openai_error(renderer_status(error.kind()), error.to_string(), false),
+        Err(error) => openai_error(renderer_status(&error), error.to_string(), false),
     }
 }
 
@@ -78,7 +78,7 @@ async fn render_completions(
         .await
     {
         Ok(prepared_requests) => Json(prepared_requests).into_response(),
-        Err(error) => openai_error(renderer_status(error.kind()), error.to_string(), false),
+        Err(error) => openai_error(renderer_status(&error), error.to_string(), false),
     }
 }
 
@@ -94,7 +94,7 @@ mod tests {
 
     use crate::{
         OpenAIRequestLowerer, RendererConfig, RendererError, RendererLimits, SamplingDefaults,
-        TextRequest, TokenIdsRequest, TokenizationBackend,
+        TextPrompt, TextRequest, TokenIdsRequest, TokenizationBackend,
     };
 
     struct WordTokenizer;
@@ -107,7 +107,12 @@ mod tests {
             Box::pin(async move {
                 Ok(TokenIdsRequest {
                     rid: request.rid,
-                    input_ids: request.text.split_whitespace().map(|_| 7).collect(),
+                    input_ids: match request.prompt {
+                        TextPrompt::Text(text) => text.split_whitespace().map(|_| 7).collect(),
+                        TextPrompt::TokenIds(_) => {
+                            panic!("token-ID prompts bypass the tokenizer backend")
+                        }
+                    },
                     options: request.options,
                 })
             })

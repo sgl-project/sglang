@@ -1,7 +1,7 @@
 //! Tokenizer primitives shared by renderer hosts.
 
 use crate::{
-    GenerationInput, RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds,
+    RendererError as Error, RendererLimits, SamplingParams, TextPrompt, TextRequest, TokenIds,
     TokenIdsRequest, TokenizationBackend,
 };
 use futures::{channel::oneshot, future::BoxFuture};
@@ -282,16 +282,26 @@ pub fn tokenize_text_request(
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
 ) -> Result<TokenIdsRequest, Error> {
-    let mut options = request.options;
+    let TextRequest {
+        rid,
+        prompt,
+        skip_special_tokens,
+        mut options,
+    } = request;
+    let TextPrompt::Text(text) = prompt else {
+        return Err(Error::Validation(
+            "token-ID prompt must bypass the tokenizer backend".into(),
+        ));
+    };
     let input_ids = tokenize_text_prompt(
-        &request.text,
-        request.skip_special_tokens,
+        &text,
+        skip_special_tokens,
         &mut options.sampling_params,
         tokenizer,
         auto_specials,
     )?;
     Ok(TokenIdsRequest {
-        rid: request.rid,
+        rid,
         input_ids,
         options,
     })
@@ -299,50 +309,58 @@ pub fn tokenize_text_request(
 
 /// Run the engine-free validation, normalization, tokenization and context checks.
 pub fn prepare_direct_request(
-    mut request: GenerationInput,
+    mut request: TextRequest,
     tokenizer: &dyn TextTokenizer,
     auto_specials: &[i32],
     limits: &RendererLimits,
 ) -> Result<TokenIdsRequest, Error> {
-    validate_generation_input(&request, limits)?;
+    validate_text_request(&request, limits)?;
     request
-        .options_mut()
+        .options
         .sampling_params
         .normalize(limits.skip_tokenizer_init, limits.vocab_size)?;
-    let mut request = match request {
-        GenerationInput::Text(request) => tokenize_text_request(request, tokenizer, auto_specials)?,
-        GenerationInput::TokenIds(request) => request,
+    let mut request = match request.prompt {
+        TextPrompt::Text(text) => tokenize_text_request(
+            TextRequest {
+                prompt: TextPrompt::Text(text),
+                ..request
+            },
+            tokenizer,
+            auto_specials,
+        )?,
+        TextPrompt::TokenIds(input_ids) => TokenIdsRequest {
+            rid: request.rid,
+            input_ids,
+            options: request.options,
+        },
     };
     check_total_tokens(&mut request, limits)?;
     Ok(request)
 }
 
 /// Validate fields that must be safe before tokenization or engine submission.
-pub fn validate_generation_input(
-    request: &GenerationInput,
-    limits: &RendererLimits,
-) -> Result<(), Error> {
-    if request.rid().len() > 128 {
+pub fn validate_text_request(request: &TextRequest, limits: &RendererLimits) -> Result<(), Error> {
+    if request.rid.len() > 128 {
         return Err(Error::Validation(format!(
             "rid is {} bytes, over the 128-byte limit",
-            request.rid().len()
+            request.rid.len()
         )));
     }
-    let input_ids = match request {
-        GenerationInput::Text(request) => {
-            if request.text.is_empty() {
+    let input_ids = match &request.prompt {
+        TextPrompt::Text(text) => {
+            if text.is_empty() {
                 return Err(Error::Validation("prompt cannot be empty".into()));
             }
             None
         }
-        GenerationInput::TokenIds(request) => {
-            if request.input_ids.is_empty() {
+        TextPrompt::TokenIds(input_ids) => {
+            if input_ids.is_empty() {
                 return Err(Error::Validation("input_ids cannot be empty".into()));
             }
-            Some(request.input_ids.as_slice())
+            Some(input_ids.as_slice())
         }
     };
-    let options = request.options();
+    let options = &request.options;
     validate_completion_fields(
         input_ids,
         options.token_ids_logprob.as_deref(),

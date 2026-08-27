@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::RendererService;
 
-use super::{error_payload, renderer_status};
+use super::error::{error_payload, renderer_status};
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
     Router::new()
@@ -95,7 +95,7 @@ async fn tokenize(
 }
 
 fn renderer_error(error: crate::RendererError) -> Response {
-    let status = renderer_status(error.kind());
+    let status = renderer_status(&error);
     (status, Json(error_payload(status, error.to_string()))).into_response()
 }
 

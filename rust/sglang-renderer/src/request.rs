@@ -20,12 +20,52 @@ pub struct GenerationOptions {
 }
 
 #[derive(Debug, Clone)]
-/// A generation request whose prompt still requires tokenization.
+/// One text-generation prompt before tokenizer-dependent preparation.
+pub enum TextPrompt {
+    Text(String),
+    TokenIds(TokenIds),
+}
+
+#[derive(Debug, Clone)]
+/// Internal text-generation request shared by every protocol frontend.
+///
+/// Chat preprocessing renders structured messages into `Text`; Completions
+/// and gRPC may also supply already-tokenized prompts through `TokenIds`.
 pub struct TextRequest {
     pub rid: String,
-    pub text: String,
+    pub prompt: TextPrompt,
     pub skip_special_tokens: bool,
     pub options: GenerationOptions,
+}
+
+impl TextRequest {
+    pub fn text(
+        rid: impl Into<String>,
+        text: impl Into<String>,
+        skip_special_tokens: bool,
+        options: GenerationOptions,
+    ) -> Self {
+        Self {
+            rid: rid.into(),
+            prompt: TextPrompt::Text(text.into()),
+            skip_special_tokens,
+            options,
+        }
+    }
+
+    pub fn token_ids(
+        rid: impl Into<String>,
+        input_ids: TokenIds,
+        skip_special_tokens: bool,
+        options: GenerationOptions,
+    ) -> Self {
+        Self {
+            rid: rid.into(),
+            prompt: TextPrompt::TokenIds(input_ids),
+            skip_special_tokens,
+            options,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -34,36 +74,6 @@ pub struct TokenIdsRequest {
     pub rid: String,
     pub input_ids: TokenIds,
     pub options: GenerationOptions,
-}
-
-#[derive(Debug, Clone)]
-/// Protocol processing output before tokenizer-dependent preparation.
-pub enum GenerationInput {
-    Text(TextRequest),
-    TokenIds(TokenIdsRequest),
-}
-
-impl GenerationInput {
-    pub fn rid(&self) -> &str {
-        match self {
-            Self::Text(request) => &request.rid,
-            Self::TokenIds(request) => &request.rid,
-        }
-    }
-
-    pub fn options(&self) -> &GenerationOptions {
-        match self {
-            Self::Text(request) => &request.options,
-            Self::TokenIds(request) => &request.options,
-        }
-    }
-
-    pub fn options_mut(&mut self) -> &mut GenerationOptions {
-        match self {
-            Self::Text(request) => &mut request.options,
-            Self::TokenIds(request) => &mut request.options,
-        }
-    }
 }
 
 /// Prototype text token-in request accepted by SGLang's `/generate` endpoint.

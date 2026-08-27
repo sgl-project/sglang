@@ -12,9 +12,11 @@ use dynamo_protocols::types::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageContent,
     ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequest,
+    ChatCompletionRequestUserMessageContentPart,
 };
-use dynamo_renderer::{ChatTemplate, ContextMixins, PromptContextMixin, PromptFormatter};
+use dynamo_renderer::{
+    ChatTemplate, ContextMixins, OAIChatLikeRequest, PromptContextMixin, PromptFormatter,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -60,10 +62,7 @@ pub enum ChatFormatter {
 
 impl ChatFormatter {
     /// Render the request's messages to a single prompt string.
-    pub(super) fn render(
-        &self,
-        request: &CreateChatCompletionRequest,
-    ) -> Result<String, TemplateError> {
+    pub(super) fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {
         match self {
             ChatFormatter::HuggingFace(formatter) => {
                 let PromptFormatter::OAI(formatter) = formatter;
@@ -136,13 +135,15 @@ pub struct LegacyFormatter {
 }
 
 impl LegacyFormatter {
-    pub(super) fn render(
-        &self,
-        request: &CreateChatCompletionRequest,
-    ) -> Result<String, TemplateError> {
+    pub(super) fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {
         let mut system_message = self.spec.system_message.clone();
         let mut messages: Vec<(String, String)> = Vec::new();
-        for message in &request.messages {
+        let typed_messages = request
+            .typed_messages()
+            .ok_or_else(|| TemplateError::Renderer {
+                message: "legacy chat templates require typed messages".into(),
+            })?;
+        for message in typed_messages {
             match message {
                 ChatCompletionRequestMessage::System(message) => {
                     system_message = extract_system_text(&message.content)?;

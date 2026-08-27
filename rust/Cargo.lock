@@ -3709,6 +3709,7 @@ dependencies = [
  "flume",
  "futures",
  "hf-hub",
+ "minijinja",
  "regex-syntax",
  "reqwest",
  "rmp-serde",

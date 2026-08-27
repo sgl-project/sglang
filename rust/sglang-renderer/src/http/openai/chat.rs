@@ -28,10 +28,11 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 
-use super::completions::completion_usage;
-use super::{
-    OpenAIHttpFrontend, collect_output, error_payload, openai_error, renderer_status,
-    submit_generation, unix_seconds_u32,
+use super::{completion_usage, unix_seconds_u32};
+use crate::http::{
+    OpenAIHttpFrontend,
+    error::{error_payload, openai_error, renderer_status},
+    submission::{collect_output, merge_indexed, submit_inputs},
 };
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
@@ -70,35 +71,28 @@ async fn chat_completions(
             .config()
             .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
-    let lowered = match state.renderer.lower_chat(request, &response_id).await {
-        Ok(lowered) => lowered,
+    let chat = match state.renderer.lower_openai_chat(request, &response_id) {
+        Ok(chat) => chat,
         Err(error) => {
-            let status = renderer_status(error.kind());
+            let status = renderer_status(&error);
             return openai_error(status, error.to_string(), false);
         }
     };
-    let generation_inputs = lowered.generation_inputs;
+    let lowered = match state.renderer.preprocess_chat(chat) {
+        Ok(lowered) => lowered,
+        Err(error) => {
+            let status = renderer_status(&error);
+            return openai_error(status, error.to_string(), false);
+        }
+    };
+    let text_requests = lowered.text_requests;
     let response_processor = lowered.response_processor;
     let created = unix_seconds_u32();
-    let mut submitted = Vec::with_capacity(generation_inputs.len());
-
-    for (index, generation_input) in generation_inputs.into_iter().enumerate() {
-        let prepared = match state
-            .renderer
-            .prepare_generation_input(generation_input)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return openai_error(renderer_status(error.kind()), error.to_string(), false);
-            }
-        };
-        let submission = match submit_generation(&state.generate_client, prepared, stream).await {
-            Ok(submission) => submission,
-            Err(response) => return response,
-        };
-        submitted.push((index, submission));
-    }
+    let streams = match submit_inputs(&state, text_requests, stream).await {
+        Ok(streams) => streams,
+        Err(response) => return response,
+    };
+    let submitted = streams.into_iter().enumerate().collect();
     if stream {
         let event_stream = chat_event_stream(
             submitted,
@@ -301,11 +295,8 @@ fn semantic_chat_stream(
     want_logprobs: bool,
 ) -> impl futures::Stream<Item = ChatResponseItem> {
     let raw = async_stream::stream! {
-        let mut streams = Vec::with_capacity(submitted.len());
-        for (index, events) in submitted {
-            streams.push(events.map(move |event| (index, event)).boxed());
-        }
-        let mut events = futures::stream::select_all(streams);
+        let streams = submitted.into_iter().map(|(_, events)| events).collect();
+        let mut events = merge_indexed(streams);
         while let Some((index, item)) = events.next().await {
             let output = match item {
                 Ok(GenerationEvent::Frame(output) | GenerationEvent::Done(output)) => output,
@@ -477,12 +468,13 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk};
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
-    use crate::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
+    use crate::http::test_utils::{chat_submitted, chunk};
+    use crate::protocol::openai::{ChatSamplingDefaults as SamplingDefaults, chat_sampling_params};
+    use crate::template::load_chat_formatter;
     use crate::{
-        GenerationOutputExtras, OpenAIRequestLowerer, RendererConfig, RendererLimits,
-        SamplingDefaults as ModelSamplingDefaults,
+        ChatPreprocessor, GenerationOutputExtras, OpenAIRequestLowerer, RendererConfig,
+        RendererLimits, SamplingDefaults as ModelSamplingDefaults,
     };
     use axum::http::StatusCode;
     use dynamo_protocols::types::CreateChatCompletionRequest;
@@ -496,7 +488,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn response_processor(
+    fn response_processor(
         reasoning_parser: Option<&str>,
         choices: usize,
     ) -> crate::ChatResponseProcessor {
@@ -527,11 +519,12 @@ mod tests {
             "n": choices
         }))
         .unwrap();
-        OpenAIRequestLowerer::new(config)
+        let formatter = load_chat_formatter(None, None, Some("chatml")).unwrap();
+        let preprocessor = ChatPreprocessor::new(&config, Some(formatter));
+        let chat = OpenAIRequestLowerer::new(config)
             .lower_chat(request, "chatcmpl-test")
-            .await
-            .unwrap()
-            .response_processor
+            .unwrap();
+        preprocessor.preprocess(chat).unwrap().response_processor
     }
 
     fn wire_context(include_usage: bool) -> ChatStreamWireContext {
@@ -635,7 +628,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice0, choice1],
-            response_processor(None, 2).await,
+            response_processor(None, 2),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -664,7 +657,7 @@ mod tests {
 
         let response = unary_chat(
             vec![choice],
-            response_processor(Some("deepseek-r1"), 1).await,
+            response_processor(Some("deepseek-r1"), 1),
             "chatcmpl-test".into(),
             "model".into(),
             1,
@@ -696,7 +689,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(Some("deepseek-r1"), 1).await,
+            response_processor(Some("deepseek-r1"), 1),
             wire_context(true),
         );
         futures::pin_mut!(stream);
@@ -731,7 +724,7 @@ mod tests {
 
         let stream = chat_event_stream(
             vec![choice],
-            response_processor(None, 1).await,
+            response_processor(None, 1),
             wire_context(true),
         );
         futures::pin_mut!(stream);
