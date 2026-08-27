@@ -363,6 +363,44 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
+        self._free_swa_indices(swa_indices)
+
+    def free_swa_exact(self, full_indices: torch.Tensor) -> int:
+        """Free tree-owned SWA pages without widening the FULL-side lookup.
+
+        Radix nodes can own disjoint entries from the same FULL page while their
+        stored SWA values belong to distinct SWA pages. Expanding ``full_indices``
+        to whole FULL pages would therefore clear a neighboring node's mapping.
+
+        The exact entries must describe whole, uniquely owned SWA pages. Return
+        the token-equivalent physical capacity released so it can be checked
+        against the tree's eviction credit.
+        """
+        if full_indices.numel() == 0:
+            return 0
+
+        mapping_indices = full_indices.to(torch.int64)
+        swa_indices = self.full_to_swa_index_mapping[mapping_indices]
+        swa_indices = swa_indices[swa_indices > 0]
+
+        expected_tokens = full_indices.numel()
+        unique_pages = torch.unique(swa_indices // self.page_size)
+        freed_tokens = unique_pages.numel() * self.page_size
+        assert (
+            swa_indices.numel() == expected_tokens and freed_tokens == expected_tokens
+        ), (
+            "tree SWA free accounting mismatch: "
+            f"credited={expected_tokens}, mapped={swa_indices.numel()}, "
+            f"physically_freed={freed_tokens}"
+        )
+
+        self.clear_full_to_swa_mapping(mapping_indices)
+        self._free_swa_indices(swa_indices)
+        return freed_tokens
+
+    def _free_swa_indices(self, swa_indices: torch.Tensor) -> None:
+        """Release already-resolved SWA indices now or at free-group flush."""
+
         if not self.is_not_in_free_group:
             # Resolve ownership now. A cache action later in this group may
             # install a new mapping for the same full index.
@@ -518,6 +556,22 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
+
+    def free_swa_exact(self, full_indices: torch.Tensor) -> int:
+        """Pure SWA uses an identity mapping, so exact FULL ids are SWA ids."""
+        if full_indices.numel() == 0:
+            return 0
+        swa_indices = full_indices[full_indices > 0]
+        expected_tokens = full_indices.numel()
+        freed_tokens = (
+            torch.unique(swa_indices // self.page_size).numel() * self.page_size
+        )
+        assert freed_tokens == expected_tokens, (
+            "tree SWA free accounting mismatch: "
+            f"credited={expected_tokens}, physically_freed={freed_tokens}"
+        )
+        self.free_swa(full_indices)
+        return freed_tokens
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
