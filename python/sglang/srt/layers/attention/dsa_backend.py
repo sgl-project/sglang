@@ -719,9 +719,15 @@ class DeepseekSparseAttnBackend(
         metadata.topk_v2_plan.copy_(plan_topk_v2(metadata.dsa_seqlens_expanded))
 
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        # The aiter backend's transform returns the same thing the sgl-kernel one
+        # does -- (num_rows, topk) int32 physical page_size=1 slots, -1 padded --
+        # so the fused table is likewise the indices themselves. It is listed
+        # explicitly rather than by inverting the check because TORCH, whose
+        # topk_func selects without transforming, must keep raising.
         if (
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
+            or self.dsa_topk_backend.is_aiter()
         ):
             return topk_indices
         raise RuntimeError(
