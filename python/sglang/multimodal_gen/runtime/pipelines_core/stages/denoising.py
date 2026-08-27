@@ -508,7 +508,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 config=dit_config,
                 default="max-autotune-no-cudagraphs",
             )
-            compile_kwargs = build_torch_compile_kwargs(mode=mode)
+            compile_kwargs = build_torch_compile_kwargs(mode=mode, module=module)
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if getattr(self.server_args, "regional_compile", False):
@@ -1223,8 +1223,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
+                # Pass None (not []) so T2V paths whose transformer has no
+                # image_embedder skip the branch; diffusers guards on
+                # `is not None` only.
                 # TODO: make sure on-device
-                "encoder_hidden_states_image": image_embeds,
+                "encoder_hidden_states_image": image_embeds if image_embeds else None,
             },
         )
 

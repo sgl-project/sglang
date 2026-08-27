@@ -46,7 +46,7 @@ from sglang.srt.disaggregation.utils import (
     resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 
 try:
@@ -405,7 +405,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.transfer_source_rank = (
-            self.kv_args.pp_rank * self.server_args.tp_size + self.kv_args.engine_rank
+            self.kv_args.pp_rank * get_parallel().config.tp_size
+            + self.kv_args.engine_rank
         )
         self.kv_args.kv_data_mem_kinds = _normalize_kv_mem_kinds(
             getattr(self.kv_args, "kv_data_mem_kinds", None),
@@ -2874,7 +2875,6 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
@@ -2887,6 +2887,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 else b""
             )
             try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
                         [
@@ -2904,6 +2905,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         ]
                     )
             except zmq.ZMQError:
+                self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
@@ -3002,8 +3004,8 @@ class NixlKVReceiver(CommonKVReceiver):
                 dst_kv_item_len = 0
                 dst_num_slots = 0
 
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
                         [

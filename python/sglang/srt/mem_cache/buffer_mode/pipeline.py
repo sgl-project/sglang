@@ -832,8 +832,12 @@ class BufferModePipeline:
             avail = cache.token_to_kv_pool_allocator.available_size()
         if avail < f.num_tokens:
             needed = f.num_tokens - avail
-            evicted = cache.evict(EvictParams(num_tokens=needed))
-            if evicted.num_tokens_evicted < needed:
+            cache.evict_for_alloc(EvictParams(num_tokens=needed))
+            if cache.supports_swa():
+                avail = cache.token_to_kv_pool_allocator.full_available_size()
+            else:
+                avail = cache.token_to_kv_pool_allocator.available_size()
+            if avail < f.num_tokens:
                 # Genuinely no room (locked pages): recompute.
                 return _drop()
 
