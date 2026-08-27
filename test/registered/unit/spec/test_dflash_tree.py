@@ -12,11 +12,12 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.speculative.dflash import write_dflash_tree_full_mask
+from sglang.srt.layers.attention.verify_mask import fill_verify_mask_indptr
 from sglang.srt.models.dflash import _beam_walk_torch
 from sglang.srt.speculative.dflash_tree import (
     build_ancestor_mask,
     build_dflash_tree_meta,
-    build_full_tree_mask,
 )
 
 # The NGRAM path's own host-side reimplementation of the device kernel. Independent
@@ -32,6 +33,28 @@ register_cuda_ci(est_time=2, stage="base-b", runner_config="1-gpu-small")
 # block_size 8 is what the DFlash 2 checkpoint resolves to, so gamma is 7.
 GAMMA = 7
 PREFIX_LENS = torch.tensor([13, 5], dtype=torch.int64)
+# Same batch shape, but long enough to make the kernel's prefix loop run several
+# times and end on a partial tile (PREFIX_BLOCK is 1024). A prefix that fits in one
+# tile would leave the loop's tail mask untested, and the tail is where a mask bug
+# spills into the next request's rows.
+LONG_PREFIX_LENS = torch.tensor([13, 2049], dtype=torch.int64)
+
+
+def _full_mask_reference(*, ancestor_mask, prefix_lens):
+    """Host derivation of the flat FULL_MASK the backends read.
+
+    Per request: `N` rows of `prefix + N` cells, the leading `prefix` all True (a
+    draft node sees the whole committed prefix) and the trailing block the request's
+    ancestor closure; requests concatenated. This is what the shipped kernel writes
+    on device, kept here as an independent oracle -- it is deliberately the naive
+    per-request python loop, which is what the kernel replaced.
+    """
+    num_nodes = ancestor_mask.shape[1]
+    rows = []
+    for request, prefix_len in enumerate(prefix_lens.tolist()):
+        prefix = torch.ones((num_nodes, int(prefix_len)), dtype=torch.bool)
+        rows.append(torch.cat([prefix, ancestor_mask[request].cpu()], dim=1).flatten())
+    return torch.cat(rows)
 
 
 def _beam_tree(*, width, slots=GAMMA, top_k=16, seed=0):
@@ -128,30 +151,42 @@ def test_closure_handles_dead_ends_and_uneven_fanout():
 
 
 @pytest.mark.parametrize("width", [1, 2, 4, 8])
-def test_full_mask_numel_matches_the_verify_sizing_formula(width):
-    """`DFlashVerifyInput.generate_attn_arg_prefill` pads the mask up to
-    `sum(prefix) * N + N**2 * bs`. If this producer disagrees, the pad path either
-    silently appends True columns or the backend reads past the rows it owns."""
+def test_row_offsets_and_layout_agree_on_the_total_size(width):
+    """Three descriptions of the same layout have to land on the same total.
+
+    `fill_verify_mask_indptr` is what the writer and the attention backend index with,
+    `_full_mask_reference` is the row-by-row layout, and
+    `DFlashVerifyInput.generate_attn_arg_prefill` sizes its padding from the closed form
+    `sum(prefix) * N + N**2 * bs`. Any one of the three drifting is a mask written where
+    the reader does not look, which is silently wrong tokens rather than an error.
+    """
     parents = _beam_tree(width=width)
     batch_size, num_nodes = parents.shape
     mask = build_ancestor_mask(node_parents=parents, max_depth=GAMMA)
 
-    full = build_full_tree_mask(ancestor_mask=mask, prefix_lens_cpu=PREFIX_LENS)
+    reference = _full_mask_reference(ancestor_mask=mask, prefix_lens=PREFIX_LENS)
+    indptr = fill_verify_mask_indptr(
+        mask_indptr=torch.zeros((batch_size + 1,), dtype=torch.int64),
+        seq_lens=PREFIX_LENS,
+        num_draft_tokens=num_nodes,
+        bs=batch_size,
+    )
 
-    expected = int(PREFIX_LENS.sum()) * num_nodes + num_nodes**2 * batch_size
-    assert full.numel() == expected
+    closed_form = int(PREFIX_LENS.sum()) * num_nodes + num_nodes**2 * batch_size
+    assert int(indptr[batch_size]) == closed_form
+    assert reference.numel() == closed_form
 
 
-def test_width_one_full_mask_is_exactly_causal():
+def test_width_one_mask_row_is_exactly_causal():
     """The mathematical precondition for keeping W=1 on the tree code path: the mask
     we hand attention must permit exactly what running with no mask permits. If the
     numbers still move at W=1, that isolates it to the backend's masked kernel path
-    rather than to this construction."""
+    rather than to the closure and layout pinned here."""
     parents = _beam_tree(width=1)
     num_nodes = parents.shape[1]
     mask = build_ancestor_mask(node_parents=parents, max_depth=GAMMA)
 
-    full = build_full_tree_mask(ancestor_mask=mask, prefix_lens_cpu=PREFIX_LENS)
+    full = _full_mask_reference(ancestor_mask=mask, prefix_lens=PREFIX_LENS)
 
     causal = torch.tril(torch.ones(num_nodes, num_nodes, dtype=torch.bool))
     expected = torch.cat(
@@ -224,6 +259,52 @@ def test_tree_meta_rejects_narrow_prefix_lens():
         build_dflash_tree_meta(
             ancestor_mask=mask, prefix_lens=PREFIX_LENS.to(torch.int32)
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the kernel needs a device")
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("poison", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bool, torch.uint8])
+def test_mask_kernel_rewrites_every_live_cell(width, poison, dtype):
+    """The shipped writer against the host oracle, in both buffer dtypes it meets.
+
+    The buffer is reused across decode steps and arrives holding the previous step's
+    bits, at different offsets, because a request's rows move as its prefix grows. So
+    every live cell has to be rewritten: `poison=True` catches a writer that skips
+    closure zeros, `poison=False` one that skips the all-True prefix span -- the
+    tempting "the prefix never changes" shortcut, which is wrong for exactly that
+    reason. `dtype` covers both buffers in production: the triton backend's captured
+    mask is uint8, the worker's own fallback is bool.
+    """
+    parents = _beam_tree(width=width)
+    batch_size, num_nodes = parents.shape
+    prefix_lens = LONG_PREFIX_LENS
+    ancestor_mask = build_ancestor_mask(node_parents=parents, max_depth=GAMMA).cuda()
+
+    expected = _full_mask_reference(
+        ancestor_mask=ancestor_mask, prefix_lens=prefix_lens
+    )
+    # Deliberately larger than needed, like the backend's captured buffer.
+    buffer = torch.full(
+        (expected.numel() + 4096,), poison, dtype=dtype, device="cuda"
+    )
+
+    written = write_dflash_tree_full_mask(
+        ancestor_mask=ancestor_mask,
+        mask_indptr=fill_verify_mask_indptr(
+            mask_indptr=torch.zeros(
+                (batch_size + 1,), dtype=torch.int64, device="cuda"
+            ),
+            seq_lens=prefix_lens.cuda(),
+            num_draft_tokens=num_nodes,
+            bs=batch_size,
+        ),
+        seq_lens=prefix_lens.cuda(),
+        out=buffer,
+    )
+
+    assert written.data_ptr() == buffer.data_ptr(), "must write in place"
+    assert torch.equal(written[: expected.numel()].cpu().bool(), expected)
 
 
 if __name__ == "__main__":

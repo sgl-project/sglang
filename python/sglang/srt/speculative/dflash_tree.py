@@ -13,7 +13,9 @@ Two different masks are involved and they must not be confused:
   per-node depth to produce absolute positions.
 - the **FULL_MASK**, a flat bool buffer, is what the attention backends consume.
   Its trailing `N x N` block per request *is* the QLEN mask, preceded by the
-  request's committed prefix columns.
+  request's committed prefix columns. It is written on device, straight into the
+  backend's own buffer, by `write_dflash_tree_full_mask` -- the row widths depend
+  on the committed prefix, and reading that on the host would cost a sync per step.
 
 Spelling: the sgl_kernel op schema says `retrive_*`. This module keeps that
 spelling on values that go straight into the op, matching the boundary
@@ -95,29 +97,3 @@ def build_dflash_tree_meta(
         num_nodes,
     )
     return positions, retrive_index, retrive_next_token, retrive_next_sibling
-
-
-def build_full_tree_mask(
-    *, ancestor_mask: torch.Tensor, prefix_lens_cpu: torch.Tensor
-) -> torch.Tensor:
-    """The flat bool mask the attention backends consume.
-
-    Per request: `N` rows of width `prefix + N`, the leading `prefix` columns all
-    True (every draft node sees the whole committed prefix) and the trailing block
-    the request's ancestor closure. Requests are concatenated, so the total is
-    `sum(prefix) * N + N**2 * bs` -- the same formula
-    `DFlashVerifyInput.generate_attn_arg_prefill` uses to size its padding.
-
-    Takes the prefix lengths on the host because the row widths are Python-level
-    loop bounds; passing the device copy would force a sync every step. These must
-    be the *committed* lengths, not the temporarily verify-extended ones.
-    """
-    batch_size, num_nodes, _ = ancestor_mask.shape
-    device = ancestor_mask.device
-    rows = []
-    for request, prefix_len in enumerate(prefix_lens_cpu.tolist()):
-        prefix = torch.ones(
-            (num_nodes, int(prefix_len)), dtype=torch.bool, device=device
-        )
-        rows.append(torch.cat([prefix, ancestor_mask[request]], dim=1).flatten())
-    return torch.cat(rows)

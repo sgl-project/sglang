@@ -24,14 +24,15 @@ from __future__ import annotations
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dflash import write_dflash_tree_full_mask
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.srt.layers.attention.verify_mask import fill_verify_mask_indptr
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_tree import (
     build_ancestor_mask,
     build_dflash_tree_meta,
-    build_full_tree_mask,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import move_accept_tokens_to_target_kvcache
@@ -61,15 +62,20 @@ def build_tree_verify_input(
     block_size: int,
     tree_width: int,
     prefix_lens: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
+    mask_buffer: torch.Tensor,
+    mask_indptr: torch.Tensor,
 ) -> DFlashVerifyInput:
     """The verify input for a beam tree: mask, tree links, depth-based positions.
 
-    `prefix_lens` must be the *committed* lengths on both sides. The device copy
-    feeds the kernel that turns per-node depth into an absolute position; the host
-    copy feeds the per-request row widths of the flat attention mask. Passing the
-    verify-extended lengths would shift every position by one block and widen
-    every mask row past what the backend allocated.
+    `prefix_lens` must be the *committed* lengths: they turn per-node depth into an
+    absolute position and set the per-request row widths of the flat attention mask.
+    Passing the verify-extended lengths would shift every position by one block and
+    widen every mask row past what the backend allocated.
+
+    Everything here stays on device. `mask_buffer` is the backend's own verify-mask
+    buffer, so the mask is written where verify will read it, and `mask_indptr`
+    is scratch for the shared row-offset formula. The host never learns a committed
+    length, which is what keeps the decode step free of a device-to-host sync.
     """
     ancestor_mask = build_ancestor_mask(
         node_parents=node_parents, max_depth=block_size - 1
@@ -77,15 +83,25 @@ def build_tree_verify_input(
     positions, retrive_index, retrive_next_token, retrive_next_sibling = (
         build_dflash_tree_meta(ancestor_mask=ancestor_mask, prefix_lens=prefix_lens)
     )
+    num_nodes = int(node_parents.shape[1])
+    custom_mask = write_dflash_tree_full_mask(
+        ancestor_mask=ancestor_mask,
+        mask_indptr=fill_verify_mask_indptr(
+            mask_indptr=mask_indptr,
+            seq_lens=prefix_lens,
+            num_draft_tokens=num_nodes,
+            bs=int(node_parents.shape[0]),
+        ),
+        seq_lens=prefix_lens,
+        out=mask_buffer,
+    )
     return DFlashVerifyInput(
         draft_token=node_tokens.reshape(-1),
         positions=positions,
-        draft_token_num=int(node_parents.shape[1]),
+        draft_token_num=num_nodes,
         topk=tree_width,
         block_size=block_size,
-        custom_mask=build_full_tree_mask(
-            ancestor_mask=ancestor_mask, prefix_lens_cpu=prefix_lens_cpu
-        ),
+        custom_mask=custom_mask,
         retrieve_index=retrive_index,
         retrieve_next_token=retrive_next_token,
         retrieve_next_sibling=retrive_next_sibling,

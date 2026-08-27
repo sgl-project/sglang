@@ -719,14 +719,6 @@ def _validate_dflash_tree_admission(server_args: ServerArgs) -> None:
             "the flag's own topk check, which runs before the speculative hook assigns topk.)"
         )
 
-    if not (cfg.disable_cuda_graph or cfg.disable_decode_cuda_graph):
-        raise ValueError(
-            f"{_DFLASH_TREE_WIDTH_FLAG} > 1 requires --disable-decode-cuda-graph for now: the "
-            "captured DFLASH verify buffers carry neither the tree custom mask nor the "
-            "retrieve_* tree links, and a zero-initialized retrieve_parent_token replays as a "
-            "star-shaped tree without warning."
-        )
-
     from sglang.srt.environ import envs
 
     if (
