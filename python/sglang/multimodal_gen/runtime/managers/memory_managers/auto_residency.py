@@ -2073,6 +2073,8 @@ def rollback_residency_changes(
             module = modules.get(adjustment.component_name)
             if not isinstance(module, LayerwiseOffloadableModuleMixin):
                 raise RuntimeError("lost layerwise offload capability")
+            if not module.layerwise_offload_managers:
+                continue
             module.release_layerwise_pins_outside(
                 adjustment.previous_layerwise_pinned_layers or ()
             )

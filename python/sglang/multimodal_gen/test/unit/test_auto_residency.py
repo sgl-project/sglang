@@ -1850,6 +1850,7 @@ class TestApplyAndRollback:
         args = _StubResidencyArgs()
         module.configure_layerwise_offload(args)
         manager = module.layerwise_offload_managers[0]
+        manager.set_pinned_layers((0,))
         args.auto_modes["text_encoder"] = LAYERWISE_OFFLOAD
         candidates = collect_residency_targets(
             modules={"text_encoder": module},
@@ -1883,6 +1884,7 @@ class TestApplyAndRollback:
         )
         assert len(module.layerwise_offload_managers) == 1
         assert args.auto_modes == {"text_encoder": LAYERWISE_OFFLOAD}
+        assert module.layerwise_offload_managers[0].pinned_layer_indices() == (0,)
 
     def test_component_offload_promotion_marks_resident_without_moving(self):
         module = nn.Linear(4, 4)
