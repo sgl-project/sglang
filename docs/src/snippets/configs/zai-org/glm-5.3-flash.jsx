@@ -8,17 +8,62 @@ export const config = {
 
   matchDims: [
     {
+      id: "quant",
+      title: "Checkpoint",
+      options: [
+        { id: "fp8", label: "FP8", subtitle: "zai-org" },
+        {
+          id: "mxfp4",
+          label: "Quark MXFP4",
+          subtitle: "AMD · gfx950",
+          showWhen: (s) => s.hw === "mi355x",
+          soft: true,
+          softReason: "These MI355X recipes are inferred from direct MI350X validation on the same gfx950 architecture; MI355X has not been measured independently.",
+        },
+      ],
+    },
+    {
       id: "strategy",
-      title: "Strategy",
+      title: "Recipe",
       options: [
         {
           id: "low-latency",
           label: "Low Latency",
           subtitle: "Adaptive MTP 5/1/6",
+          showWhen: (s) => s.quant === "fp8",
           disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
           disableReason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; use the non-speculative High Throughput recipe.",
         },
-        { id: "high-throughput", label: "High Throughput", subtitle: "Spec decode off" },
+        {
+          id: "high-throughput",
+          label: "High Throughput",
+          subtitle: "Spec decode off",
+          showWhen: (s) => s.quant === "fp8",
+        },
+        {
+          id: "mxfp4-tp1",
+          label: "TP1",
+          subtitle: "Full decode graph",
+          showWhen: (s) => s.quant === "mxfp4",
+        },
+        {
+          id: "mxfp4-tp2",
+          label: "TP2",
+          subtitle: "Full decode graph",
+          showWhen: (s) => s.quant === "mxfp4",
+        },
+        {
+          id: "mxfp4-tp4",
+          label: "TP4",
+          subtitle: "Full decode graph",
+          showWhen: (s) => s.quant === "mxfp4",
+        },
+        {
+          id: "mxfp4-tp8-ep8",
+          label: "TP8 + EP8",
+          subtitle: "TEP8 · full decode graph",
+          showWhen: (s) => s.quant === "mxfp4",
+        },
       ],
     },
   ],
@@ -90,8 +135,8 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32"],
-          disabled: (s) => s.strategy === "low-latency",
-          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
+          disabled: (s) => s.strategy === "low-latency" || s.quant === "mxfp4",
+          disableReason: "HiCache is unavailable with adaptive MTP and with the MXFP4 recipes, which use --disable-radix-cache.",
           hints: ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -100,8 +145,8 @@ export const config = {
           subtitle: "Mooncake",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
-          disabled: (s) => s.strategy === "low-latency",
-          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
+          disabled: (s) => s.strategy === "low-latency" || s.quant === "mxfp4",
+          disableReason: "HiCache is unavailable with adaptive MTP and with the MXFP4 recipes, which use --disable-radix-cache.",
           hints: ["Start Mooncake and place the configuration file on every serving node."],
         },
       ],
@@ -109,7 +154,8 @@ export const config = {
   ],
 
   modelNames: {
-    default: "zai-org/GLM-5.3-Flash",
+    fp8: "zai-org/GLM-5.3-Flash",
+    mxfp4: "amd/GLM-5.3-Flash-Quark-MXFP4",
   },
 
   placeholders: {
@@ -173,6 +219,11 @@ sgl-eval run gsm8k \\
     mi355x: "lmsysorg/sglang:v0.5.18-rocm720-mi35x",
   },
 
+  // No published ROCm image contains the mixed MXFP4/block-FP8 loader fix yet.
+  // Keep that checkpoint on the source-installed Python path until #36607 lands.
+  runModes: (s) =>
+    s.quant === "mxfp4" ? ["python"] : ["python", "docker"],
+
   github: {
     cookbookModel: "zai-org/glm-5.3-flash",
   },
@@ -229,7 +280,7 @@ sgl-eval run gsm8k \\
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
             disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
-            disableReason: "The validated AMD ROCm recipe uses the Triton MoE runner.",
+            disableReason: "DeepGemm is not part of the validated AMD ROCm recipes; FP8 uses Triton and MXFP4 uses AITER.",
           },
         ],
       },
@@ -258,7 +309,7 @@ sgl-eval run gsm8k \\
 
   cells: [
     {
-      match: { hw: "gb300", strategy: "low-latency" },
+      match: { hw: "gb300", quant: "fp8", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -289,7 +340,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb300", strategy: "high-throughput" },
+      match: { hw: "gb300", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -315,7 +366,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h100", strategy: "low-latency" },
+      match: { hw: "h100", quant: "fp8", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -345,7 +396,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h100", strategy: "high-throughput" },
+      match: { hw: "h100", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -368,7 +419,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", strategy: "low-latency" },
+      match: { hw: "h200", quant: "fp8", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -398,7 +449,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "h200", strategy: "high-throughput" },
+      match: { hw: "h200", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -420,7 +471,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", strategy: "low-latency" },
+      match: { hw: "b200", quant: "fp8", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
@@ -446,7 +497,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b200", strategy: "high-throughput" },
+      match: { hw: "b200", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -468,7 +519,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b300", strategy: "low-latency" },
+      match: { hw: "b300", quant: "fp8", strategy: "low-latency" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
@@ -494,7 +545,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "b300", strategy: "high-throughput" },
+      match: { hw: "b300", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       verificationStatus: (s) =>
@@ -516,7 +567,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb200", strategy: "low-latency" },
+      match: { hw: "gb200", quant: "fp8", strategy: "low-latency" },
       nnodes: 1,
       verified: false,
       env: [],
@@ -541,7 +592,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "gb200", strategy: "high-throughput" },
+      match: { hw: "gb200", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: false,
       env: [],
@@ -566,7 +617,7 @@ sgl-eval run gsm8k \\
     // while Triton owns the MoE runner. CUDA graphs stay disabled because that
     // is the architecture-gated configuration used for correctness validation.
     {
-      match: { hw: "mi300x", strategy: "high-throughput" },
+      match: { hw: "mi300x", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       env: ["SGLANG_USE_AITER=1"],
@@ -586,7 +637,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "mi325x", strategy: "high-throughput" },
+      match: { hw: "mi325x", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: false,
       warn: "This MI325X recipe is inferred from the validated MI300X gfx942 path. It has not been measured directly on MI325X.",
@@ -607,7 +658,7 @@ sgl-eval run gsm8k \\
       ],
     },
     {
-      match: { hw: "mi355x", strategy: "high-throughput" },
+      match: { hw: "mi355x", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
       env: ["SGLANG_USE_AITER=1"],
@@ -620,6 +671,137 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend triton",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // AMD Quark MXFP4 — compatibility target: MI355X (gfx950). The exact
+    // commands below were validated on MI350X (also gfx950), so the MI355X
+    // cells remain unverified until they are run on that hardware directly.
+    // Unlike the FP8 ROCm recipe above, mixed Quark MXFP4 + block-FP8 uses the
+    // AITER MoE runner and full decode graphs. PR #36607 commit 654df43cbee1
+    // supplies the required checkpoint-loader compatibility fix.
+    {
+      match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp1" },
+      nnodes: 1,
+      verified: false,
+      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 1",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp2" },
+      nnodes: 1,
+      verified: false,
+      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 2",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp4" },
+      nnodes: 1,
+      verified: false,
+      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 4",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp8-ep8" },
+      nnodes: 1,
+      verified: false,
+      warn: "Direct validation was on MI350X (gfx950), not MI355X. Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend dsa",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--context-length 65536",
+        "--max-running-requests 64",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 64",
+        "--mem-fraction-static 0.85",
+        "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":8}'",
+        "--watchdog-timeout 1200",
+        "--trust-remote-code",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
