@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
     WeightOnlyFP8RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
@@ -504,9 +507,21 @@ class Qwen3VLTextModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        embedding_prefix = add_prefix("embed_tokens", prefix)
+        if quant_config is not None and quant_config.quantizes_embedding(
+            embedding_prefix
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=embedding_prefix,
+            )
+        else:
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, self.padding_idx
+            )
         self.layers = nn.ModuleList(
             [
                 Qwen3VLTextDecoderLayer(
@@ -679,7 +694,16 @@ class Qwen3VLModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.visual = Qwen3VLVisionTransformer(config.vision_config)
+        vision_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.supports_srt_linear_layers
+            else None
+        )
+        self.visual = Qwen3VLVisionTransformer(
+            config.vision_config,
+            quant_config=vision_quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
         self.language_model = Qwen3VLTextModel(
             config.text_config,
             quant_config=quant_config,

@@ -162,12 +162,27 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
+
+    def reset_aux_cache_allocator(self) -> None:
+        pass
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        return physical_capacity
+
+    def alloc_aux_to_lengths(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        target_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        pass
 
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
@@ -412,7 +427,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required = ceil_align(swa_tail_len, page_size)
         available = self.token_to_kv_pool_allocator.swa_available_size()
         if available < required:
-            self.tree_cache.evict(EvictParams(swa_num_tokens=required - available))
+            self.tree_cache.evict_for_alloc(
+                EvictParams(swa_num_tokens=required - available)
+            )
             available = self.token_to_kv_pool_allocator.swa_available_size()
 
         if available < required:
@@ -1774,7 +1791,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
-            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            result = self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_to_evict)
+            )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "

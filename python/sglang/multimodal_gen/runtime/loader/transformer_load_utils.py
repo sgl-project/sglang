@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a4_config import (
+    KitchenW4A4Config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_config import (
     KitchenW4A8Config,
 )
@@ -138,6 +141,14 @@ def _merge_modelopt_fp4_configs(
     )
     if getattr(inferred_config, "group_size", None) is None:
         inferred_config.group_size = getattr(existing_config, "group_size", None)
+    inferred_config.checkpoint_uses_comfy_quantization = (
+        inferred_config.checkpoint_uses_comfy_quantization
+        or existing_config.checkpoint_uses_comfy_quantization
+    )
+    inferred_config.checkpoint_uses_native_qkv_layout = (
+        inferred_config.checkpoint_uses_native_qkv_layout
+        or existing_config.checkpoint_uses_native_qkv_layout
+    )
 
     return inferred_config
 
@@ -181,11 +192,20 @@ class TransformerQuantLoadSpec:
         return isinstance(self.quant_config, KitchenW4A8Config)
 
     @property
+    def is_serialized_kitchen_w4a4(self) -> bool:
+        return isinstance(self.quant_config, KitchenW4A4Config)
+
+    @property
     def uses_comfy_layer_markers(self) -> bool:
         return (
             self.is_comfy_fp8
             or self.is_serialized_kitchen_int8
+            or self.is_serialized_kitchen_w4a4
             or self.is_serialized_kitchen_w4a8
+            or (
+                self.quant_config is not None
+                and self.quant_config.checkpoint_uses_comfy_quantization
+            )
             or (
                 _get_quant_config_name(self.quant_config) == "mxfp8"
                 and self.quant_config.layer_markers is not None
@@ -789,6 +809,9 @@ def resolve_transformer_quant_load_spec(
         packed = getattr(model_cls, "packed_modules_mapping", None)
         if packed and hasattr(quant_config, "packed_modules_mapping"):
             quant_config.packed_modules_mapping = packed
+        quant_config.remap_checkpoint_prefixes(
+            vars(model_cls).get("param_names_mapping", {})
+        )
 
     nunchaku_config = server_args.nunchaku_config
 
@@ -865,7 +888,7 @@ def _needs_device_weight_postprocess(
 ) -> bool:
     """Return whether post-load weight processing needs CUDA/NPU tensors."""
     quant_name = _get_quant_config_name(quant_config)
-    if quant_name in ("modelopt_fp8", "comfy_fp8", "mxfp8"):
+    if quant_name in ("modelopt_fp8", "comfy_fp8", "auto-round", "mxfp8"):
         return True
     if quant_name == "kitchen_int8":
         assert isinstance(quant_config, KitchenInt8Config)

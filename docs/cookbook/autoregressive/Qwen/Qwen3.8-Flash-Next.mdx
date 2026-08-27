@@ -1,0 +1,222 @@
+---
+title: Qwen3.8-Flash-Next
+description: "Deploy Qwen3.8-Flash-Next with SGLang — day-0 recipes for Qwen's 176B-parameter (6B active) GDN + QSA hybrid Mixture-of-Experts preview of the Qwen4 architecture, on NVIDIA and AMD."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+Qwen3.8-Flash-Next support is not in a tagged release yet, so build the model-support PR rather than installing from PyPI:
+
+```bash Command
+pip install -U uv
+uv venv --python 3.12 && source .venv/bin/activate
+
+# Qwen3.8-Flash-Next model support:
+# https://github.com/sgl-project/sglang/pull/36497
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/36497/head && git checkout FETCH_HEAD
+uv pip install -e python
+```
+
+<Note>
+Model support lands in [#36497](https://github.com/sgl-project/sglang/pull/36497). Once it is in a release, `uv pip install sglang` is enough and this whole step goes away.
+</Note>
+
+Then run the **Python** output of the command panel below in that environment.
+
+</Tab>
+
+<Tab title="Docker">
+
+**NVIDIA GPUs** (H200 / B200 / B300 / GB300) — the launch image, since this is a day-0 model with no release cut yet:
+
+```bash Command
+docker pull lmsysorg/sglang:qwen38flashnext
+```
+
+**AMD GPUs** (MI350X / MI355X) — the matching ROCm build. It targets CDNA4 (gfx950) and is **not** interchangeable with the CUDA image above:
+
+```bash Command
+docker pull lmsysorg/sglang-rocm:qwen38flashnext
+```
+
+For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+Pick your hardware + quantization to generate the launch command.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/Qwen/qwen3.8-flash-next.jsx";
+import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-flash-next-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**Qwen3.8-Flash-Next** is a multimodal Mixture-of-Experts model released as an early preview of the architecture Qwen4 is being built on — the same role Qwen3-Next played for Qwen3.5, whose hybrid Gated DeltaNet + Gated Attention design then carried through the Qwen3.5, Qwen3.6, Qwen3.7 and Qwen3.8 series. Qwen is publishing the architectural changes ahead of the full Qwen4 family so the community can evaluate them independently.
+
+It has **176B total parameters — 51B of which is an N-gram embedding table — and 6B active per token**. Against Qwen3.7-Plus it cuts both training and inference cost substantially (training takes roughly 1/9 as much) while holding comparable overall quality. It takes text and images in, and the hosted production variant is served as `qwen3.8-flash` on QwenCloud.
+
+The upgrades span four axes:
+
+- **Attention — GDN + QSA hybrid.** Three of every four layers use Gated DeltaNet, which compresses history into a fixed-size recurrent state; the fourth is global attention running **Qwen Sparse Attention (QSA)**. A lightweight indexer aggregates the sequence into micro-blocks, scores importance at block level, and selects the relevant regions — so the indexing overhead shrinks along with the attention itself. Unlike approaches that reuse indices across layers, QSA compresses independently per layer, which suits an architecture that interleaves GDN and attention. Qwen measures up to 10.2× prefill and 6.6× decode speedups for the QSA attention kernel at 1M tokens.
+- **Residual — Gated Residual (GR).** The single residual stream widens into four parallel branches, with an element-wise dynamic gate controlling how much each layer reads from and writes back to each branch. Qwen reports one branch naturally becoming a long-range bus. The gate also suppresses activation outliers, and the residual state can be held in FP8.
+- **Embedding — N-gram Embedding.** Lookups keyed on the local context (current token plus a few preceding ones) rather than a single token, adding 51B parameters at almost no extra per-token compute. Because lookup addresses are known in advance, the table can live in host memory and be prefetched asynchronously alongside model compute. The final model uses a single such layer near the start of the network.
+- **Optimization — Muon.** Muon for the genuine 2-D linear maps (attention, GDN and MoE expert weights), AdamW for embeddings, the MoE router and GR's low-rank parameters, with fused QKV / SwiGLU / GDN projections split before orthogonalization. The scaling law was refit for the new architecture, and batch-size warmup was dropped — it cost 18.8% more optimizer steps without improving the result.
+
+Carried over from Qwen3-Next and refined through the Qwen3.5–Qwen3.8 series: an ultra-sparse MoE (large expert pool, few routed experts per token plus one shared expert) with global load balancing; a **multi-step-trained MTP module**, whose own full-attention layers are QSA as well, which is what keeps speculative acceptance high in practice; and the training-stability set of zero-centered RMSNorm with weight decay on norm weights, attention output gating, and normalized MoE router initialization.
+
+**Context length:** 262,144 native, extensible to 1,000,000 tokens with YaRN. **License:** see [the model card's LICENSE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
+
+**Recommended generation:** Qwen has not published sampling recommendations for this preview. SGLang applies the checkpoint's own `generation_config.json`, so leave `temperature` / `top_p` unset unless you have a measured reason not to.
+
+Each precision is its own repository:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "18%"}} />
+    <col style={{width: "44%"}} />
+    <col style={{width: "38%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Precision</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Repository</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Where it runs</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen/Qwen3.8-Flash-Next</a></td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8">Qwen/Qwen3.8-Flash-Next-FP8</a></td>
+      <td style={{padding: "9px 12px"}}>H200, B200, B300, GB300, MI350X, MI355X</td>
+    </tr>
+    <tr style={{background: "rgba(255,255,255,0.02)"}}>
+      <td style={{padding: "9px 12px"}}><strong>NVFP4</strong></td>
+      <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4">RadixArk/Qwen3.8-Flash-Next-NVFP4</a></td>
+      <td style={{padding: "9px 12px"}}>B200, B300, GB300 (Blackwell only)</td>
+    </tr>
+  </tbody>
+</table>
+
+**Resources:** [Qwen's announcement](https://qwen.ai/blog?id=qwen3.8-flash-next).
+
+## 2. Advanced Usage
+
+<Note>
+The `model` argument in the examples below is the BF16 repo id. Every precision is a **separate repo**, so `model` has to be the checkpoint the server was actually launched with — `…-Flash-Next-FP8` or `…-Flash-Next-NVFP4`. The Deploy panel's cURL snippet always shows the right id for the cell you have selected.
+</Note>
+
+### 2.1 Reasoning
+
+Qwen3.8-Flash-Next **always** reasons — thinking cannot be turned off. `--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) lets SGLang pick the matching parser from the checkpoint's chat template, and splits the thinking into `reasoning_content`, leaving `content` as the answer alone. The resolved name is logged at startup if you want to pin it explicitly later.
+
+Depth is requested with `reasoning_effort`. Qwen documents `xhigh` (the default), `medium` and `low` for the hosted model; SGLang forwards whatever you pass into the checkpoint's chat template.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3.8-Flash-Next",
+    messages=[{"role": "user", "content": "What is 15% of 240?"}],
+    reasoning_effort="xhigh",  # xhigh (default) | medium | low
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update — a sample transcript will be added here once the weights are public.
+```
+
+</Accordion>
+
+### 2.2 Tool Calling
+
+Add `--tool-call-parser auto` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured tool calls via `message.tool_calls`. As with the reasoning parser, SGLang resolves the concrete detector from the chat template at startup. No Deploy cell sets it, so this is an opt-in: add the flag to the generated command, or flip the chip in the Playground.
+
+Because this model always thinks, the final assistant turn can put text in `reasoning_content` rather than `content` — print both so a bare `None` doesn't mislead you.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+resp = client.chat.completions.create(
+    model="Qwen/Qwen3.8-Flash-Next",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Pending update — a sample transcript will be added here once the weights are public.
+```
+
+</Accordion>
