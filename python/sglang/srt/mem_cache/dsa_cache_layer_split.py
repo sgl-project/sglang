@@ -234,6 +234,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
         )
 
+    def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
+        return self._is_layer_owned(
+            self.start_layer + local_layer_idx
+        ) and super()._should_allocate_index_layer(local_layer_idx)
+
     def _log_layer_shard_plan(self) -> None:
         partitions = []
         for rank in range(self.layer_shard_size):
@@ -551,7 +556,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         from sglang.srt.utils import current_platform
 
         current_platform.synchronize()
@@ -569,9 +574,23 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
                 kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
 
-        return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
+        cpu_copy = {
+            "kv": kv_cache_cpu,
+            "index_k": self.index_key_cache.cpu_copy(indices),
+        }
+        compress_tail = self._get_compress_tail_cpu_copy(req_pool_index)
+        if compress_tail is not None:
+            cpu_copy["tail_k"], cpu_copy["tail_score"] = compress_tail
+        torch.cuda.synchronize()
+        return cpu_copy
 
-    def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self,
+        kv_cache_cpu_dict,
+        indices,
+        mamba_indices=None,
+        req_pool_index=None,
+    ):
         from sglang.srt.utils import current_platform
 
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
@@ -589,3 +608,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         current_platform.synchronize()
 
         self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
+        self._load_compress_tail_cpu_copy(
+            kv_cache_cpu_dict.get("tail_k"),
+            kv_cache_cpu_dict.get("tail_score"),
+            req_pool_index,
+        )
+        torch.cuda.synchronize()

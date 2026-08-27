@@ -24,6 +24,7 @@ class KVCacheBuildResult:
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -224,6 +225,7 @@ def build_kv_cache(
         or mamba2_config(tp_worker.model_runner.model_config) is not None
         or _registry_needs_mamba
         or kimi_linear_config(tp_worker.model_runner.model_config) is not None
+        or glm5_next_config(tp_worker.model_runner.model_config) is not None
         or hybrid_lightning_config(tp_worker.model_runner.model_config) is not None
     )
     is_dsa = is_deepseek_dsa(model_config.hf_config)

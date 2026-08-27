@@ -1718,7 +1718,9 @@ class Req(ReqDllmMixin):
         # Copies over both the kv cache and mamba state if available
         self.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
-                token_indices, mamba_indices=self.mamba_pool_idx
+                token_indices,
+                mamba_indices=self.mamba_pool_idx,
+                req_pool_index=self.req_pool_idx,
             )
         )
 
@@ -1732,6 +1734,7 @@ class Req(ReqDllmMixin):
             self.retraction_backup.cpu_tensors,
             token_indices,
             mamba_indices=self.mamba_pool_idx,
+            req_pool_index=self.req_pool_idx,
         )
         self.retraction_backup = None
 
