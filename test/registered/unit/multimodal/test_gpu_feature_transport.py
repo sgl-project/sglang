@@ -545,9 +545,6 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
                 return_value=materialized,
             ) as build_inputs,
             patch.object(
-                scheduler, "_process_and_broadcast_mm_inputs"
-            ) as cpu_broadcast,
-            patch.object(
                 scheduler_module, "is_health_check_generate_req", return_value=False
             ),
         ):
@@ -556,7 +553,6 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         build_inputs.assert_called_once_with(raw_inputs)
         self.assertIs(request.mm_inputs, materialized)
         scheduler._request_dispatcher.assert_called_once_with(request)
-        cpu_broadcast.assert_not_called()
 
     def test_materializes_batched_inputs_before_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
@@ -615,18 +611,17 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         scheduler._request_dispatcher.assert_called_once_with(request)
 
     def test_already_materialized_inputs_are_reused(self):
+        from sglang.srt.managers.io_struct import MMInputsProcessMode
         from sglang.srt.managers.schedule_batch import MultimodalInputs
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = object.__new__(Scheduler)
         mm_inputs = MultimodalInputs(mm_items=[])
 
-        with patch.object(
-            scheduler, "_process_and_broadcast_mm_inputs"
-        ) as process_and_broadcast:
-            self.assertIs(scheduler._get_multimodal_inputs(mm_inputs), mm_inputs)
-
-        process_and_broadcast.assert_not_called()
+        self.assertIs(
+            scheduler._get_multimodal_inputs(mm_inputs, MMInputsProcessMode.LOCAL),
+            mm_inputs,
+        )
 
 
 class TestVmmConsumerCount(unittest.TestCase):
