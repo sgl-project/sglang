@@ -84,7 +84,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.server_args import LoRARef, ServerArgs
+from sglang.srt.server_args import LoRARef
 from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
@@ -162,14 +162,14 @@ class TokenizerControlMixin:
     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
     """
 
-    def init_communicators(self: TokenizerManager, server_args: ServerArgs):
+    def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
             comm = FanOutCommunicator(
                 self._dispatch_to_scheduler,
-                get_parallel().dp_size,
+                get_parallel().config.dp_size,
                 mode,
             )
             setattr(self, f"{name}_communicator", comm)
@@ -178,13 +178,13 @@ class TokenizerControlMixin:
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
-            get_parallel().enable_dp_attention
-            and not get_parallel().enable_dp_attention_local_control_broadcast
+            get_parallel().config.enable_dp_attention
+            and not get_parallel().config.enable_dp_attention_local_control_broadcast
         )
         if primary_group_control:
             control_fan_out = (
-                worker_count + self.server_args.tp_size - 1
-            ) // self.server_args.tp_size
+                worker_count + get_parallel().config.tp_size - 1
+            ) // get_parallel().config.tp_size
         else:
             control_fan_out = worker_count
 
@@ -432,7 +432,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            get_parallel().config.dp_size == 1
+            or get_parallel().config.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
@@ -445,7 +446,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            get_parallel().config.dp_size == 1
+            or get_parallel().config.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
 
         results = await self.destroy_weights_update_group_communicator(obj)
@@ -458,7 +460,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            get_parallel().config.dp_size == 1
+            or get_parallel().config.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         if obj.abort_all_requests:
@@ -491,7 +494,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         # TODO: support DP
         assert (
-            get_parallel().dp_size == 1
+            get_parallel().config.dp_size == 1
         ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
@@ -506,7 +509,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         # TODO: support DP
         assert (
-            get_parallel().dp_size == 1
+            get_parallel().config.dp_size == 1
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
@@ -518,7 +521,8 @@ class TokenizerControlMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            get_parallel().config.dp_size == 1
+            or get_parallel().config.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         if obj.abort_all_requests:
@@ -556,7 +560,8 @@ class TokenizerControlMixin:
         try:
             # For now, we only support single data parallel instance
             assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+                get_parallel().config.dp_size == 1
+                or get_parallel().config.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
 
@@ -619,7 +624,8 @@ class TokenizerControlMixin:
                 )
 
             assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+                get_parallel().config.dp_size == 1
+                or get_parallel().config.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
@@ -697,7 +703,8 @@ class TokenizerControlMixin:
                 )
 
             assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+                get_parallel().config.dp_size == 1
+                or get_parallel().config.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
@@ -777,7 +784,8 @@ class TokenizerControlMixin:
             ), "lora_name must be provided to unload LoRA adapter"
 
             assert (
-                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+                get_parallel().config.dp_size == 1
+                or get_parallel().config.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
@@ -797,7 +805,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
-        if get_parallel().dp_size == 1:
+        if get_parallel().config.dp_size == 1:
             return all_parameters[0]
         else:
             return all_parameters

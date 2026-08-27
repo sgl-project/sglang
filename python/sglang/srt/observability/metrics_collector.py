@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_observability,
     get_schedule,
     get_serving,
@@ -1099,8 +1100,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             # Keep one metric series across role flips.
             engine_type = (
                 "dynamic"
-                if server_args.enable_pd_role_switch
-                else DisaggregationMode.to_engine_type(server_args.disaggregation_mode)
+                if get_disagg().enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(get_disagg().disaggregation_mode)
             )
             labels = {
                 "model_name": get_serving().served_model_name,

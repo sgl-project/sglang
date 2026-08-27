@@ -266,6 +266,9 @@ class SchedulerInvariantChecker:
                         req.cache_protected_len, req.kv.swa_evicted_seqlen
                     )
 
+                if req.beam_group is not None:
+                    full_uncached += req.beam_group.extra_uncached_tokens()
+
         return full_uncached, swa_uncached
 
     def self_check_during_busy(self):
