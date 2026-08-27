@@ -7,6 +7,19 @@ The standalone renderer reuses the Rust frontend's chat formatting, sampling
 conversion, tokenizer, and context-length checks. It does not load model
 weights or start a scheduler.
 
+## Architecture
+
+Both `sglang serve` and `sglang render` instantiate the same in-process
+`RendererService`. The service owns the rendering configuration, chat formatter,
+and access to the CPU preprocessing pool. It does not own scheduler, GPU worker,
+PD or DP transport, detokenizer, or response-stream state.
+
+The full inference server calls the service and submits the resulting native
+request through its existing engine path. The standalone server calls the same
+service and serializes the native request as a public `/generate` body. Neither
+path calls the other through HTTP, and the standalone path does not construct a
+placeholder engine client.
+
 ## Start the renderer
 
 Use a Hugging Face model identifier or local model directory as `MODEL_PATH`.
@@ -55,6 +68,26 @@ parsing, streaming shaping, and usage aggregation. A disaggregated token-in and
 token-out frontend must retain the corresponding response context and perform
 those steps after generation. That response-side contract is not part of the
 initial standalone renderer.
+
+## Transport and internal types
+
+HTTP is the implemented wire format. Its response is a dedicated,
+JSON-serializable `PreparedGenerateRequest` matching fields accepted by the
+public `/generate` endpoint. It is separate from the mutable in-process
+`GenerateRequest` and the scheduler-facing MessagePack
+`TokenizedGenerateReqInput`. Scheduler types are not a public renderer wire
+contract.
+
+A future gRPC adapter should call `RendererService` directly and preserve the
+same boundary. SGLang does not currently define a renderer protobuf. A minimal
+adapter can expose `RenderChat(OpenAIJsonRequest)` and
+`RenderCompletions(OpenAIJsonRequest)`, retaining the evolving OpenAI request as
+JSON bytes rather than duplicating that schema in protobuf. The response needs
+a new field-complete protobuf message matching `PreparedGenerateRequest`, with
+one response for chat and an ordered repeated response for completions. The
+scheduler MessagePack shape must not be promoted to that public contract.
+Adding gRPC should therefore add transport adapters, not a second rendering
+implementation.
 
 ## Current scope
 
