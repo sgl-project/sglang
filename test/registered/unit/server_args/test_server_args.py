@@ -1877,7 +1877,8 @@ class TestPrefillCudaGraphContextBuckets(CustomTestCase):
         args._validate_cuda_graph_config()
 
         self.assertEqual(
-            args.cuda_graph_config.prefill.context_buckets, [60_000, 200_000]
+            args._resolved().cuda_graph_config.prefill.context_buckets,
+            [60_000, 200_000],
         )
         self.assertIn(
             (Phase.PREFILL, "context_buckets"), args._cuda_graph_config_locked

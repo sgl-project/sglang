@@ -5201,7 +5201,11 @@ class ServerArgs:
                     f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
                 )
 
-        prefill_config = self.cuda_graph_config.prefill
+        # ``_validate_cuda_graph_config`` runs during the resolution pipeline,
+        # before the resolved config bag is published back onto ``self``.  Read
+        # the same resolving view used above; the raw dataclass field can still
+        # be ``None`` here even though ``cfg.cuda_graph_config`` is populated.
+        prefill_config = cfg.cuda_graph_config.prefill
         context_buckets = prefill_config.context_buckets
         if context_buckets is None:
             return
