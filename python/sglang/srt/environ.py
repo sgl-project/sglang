@@ -963,6 +963,10 @@ class Envs:
     # One preserves the default single-call path; values above one are useful
     # for batches whose KV sequence lengths have a large spread.
     SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS = EnvInt(1)
+    # Select between pre-captured split-1 and split-4 decode graphs using the
+    # host-side KV-length distribution. This is opt-in and mutually exclusive
+    # with an explicit split count above one.
+    SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLIT_HEURISTIC = EnvBool(False)
     # SM120 FlashMLA decode backend: "flashinfer" (default), "triton", or "torch".
     SGLANG_SM120_FLASHMLA_BACKEND = EnvStr("flashinfer")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)

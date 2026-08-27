@@ -32,7 +32,17 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -80,6 +90,39 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+TRTLLM_MHA_DECODE_SPLIT_COUNT = 4
+TRTLLM_MHA_DECODE_SPLIT_MIN_BATCH_SIZE = 16
+TRTLLM_MHA_DECODE_SPLIT_MIN_WORK_SAVING_PERCENT = 35
+
+
+def select_trtllm_mha_decode_seq_len_splits(seq_lens: Sequence[int]) -> int:
+    """Choose split-1 or split-4 from the sorted-group padding-work estimate."""
+    num_requests = len(seq_lens)
+    if num_requests < TRTLLM_MHA_DECODE_SPLIT_MIN_BATCH_SIZE:
+        return 1
+
+    ordered = sorted(max(0, int(seq_len)) for seq_len in seq_lens)
+    max_seq_len = ordered[-1]
+    if max_seq_len == 0:
+        return 1
+
+    unsplit_work = num_requests * max_seq_len
+    group_size, remainder = divmod(num_requests, TRTLLM_MHA_DECODE_SPLIT_COUNT)
+    split_work = 0
+    group_start = 0
+    for group_idx in range(TRTLLM_MHA_DECODE_SPLIT_COUNT):
+        size = group_size + (group_idx < remainder)
+        group_end = group_start + size
+        split_work += size * ordered[group_end - 1]
+        group_start = group_end
+
+    remaining_work_percent = 100 - TRTLLM_MHA_DECODE_SPLIT_MIN_WORK_SAVING_PERCENT
+    return (
+        TRTLLM_MHA_DECODE_SPLIT_COUNT
+        if split_work * 100 <= unsplit_work * remaining_work_percent
+        else 1
+    )
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -453,6 +496,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
+    # Host-selected TRT-LLM MHA decode graph variant. It stays at one unless
+    # the opt-in split heuristic is enabled.
+    trtllm_mha_decode_seq_len_splits: int = 1
+
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -754,6 +801,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
+        trtllm_mha_decode_seq_len_splits = 1
+        if envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLIT_HEURISTIC.get() and (
+            batch.forward_mode.is_decode_or_idle()
+            or batch.forward_mode.is_target_verify()
+        ):
+            # seq_lens_cpu is exact when maintained. Under overlap it may be
+            # absent, so use the request-owned committed lengths; they can lag
+            # by one verify but preserve the distribution without a D2H sync.
+            host_seq_lens = (
+                seq_lens_cpu.tolist()
+                if seq_lens_cpu is not None
+                else [req.kv_committed_len for req in batch.reqs]
+            )
+            trtllm_mha_decode_seq_len_splits = select_trtllm_mha_decode_seq_len_splits(
+                host_seq_lens
+            )
+
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed
         # lengths, so this init_new-time backfill onto the ScheduleBatch is
@@ -796,6 +860,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            trtllm_mha_decode_seq_len_splits=trtllm_mha_decode_seq_len_splits,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -1735,6 +1800,9 @@ def build_inner_fb_view(
         seq_lens=forward_batch.seq_lens,
         seq_lens_sum=forward_batch.seq_lens_sum,
         seq_lens_cpu=forward_batch.seq_lens_cpu,
+        trtllm_mha_decode_seq_len_splits=getattr(
+            forward_batch, "trtllm_mha_decode_seq_len_splits", 1
+        ),
         encoder_lens=encoder_lens,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),

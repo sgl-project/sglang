@@ -45,6 +45,9 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_mha_seq_len_splits,
+)
 from sglang.srt.runtime_context import get_buffer, get_spec
 from sglang.srt.speculative.ragged_verify import (
     build_ragged_target_verify_geometry,
@@ -98,6 +101,9 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # Host-selected execution variant; this is a Python capture/eager scalar,
+    # not device metadata.
+    decode_seq_len_splits: int = 1
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -277,6 +283,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        # Draft CUDA-graph runners do not key graphs by this target-attention
+        # variant. Keep their established static path and adapt only the target
+        # decode/verify graphs that own the producer bottleneck.
+        self.decode_seq_len_split_heuristic = (
+            envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLIT_HEURISTIC.get()
+            and not model_runner.is_draft_worker
+        )
+        if self.decode_seq_len_split_heuristic and self.decode_seq_len_splits != 1:
+            raise ValueError(
+                "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLIT_HEURISTIC cannot be "
+                "combined with an explicit split count above one"
+            )
+
+    def _resolve_decode_seq_len_splits(
+        self, forward_batch: ForwardBatch, *, in_capture: bool
+    ) -> int:
+        if not self.decode_seq_len_split_heuristic:
+            return self.decode_seq_len_splits
+        num_splits = (
+            get_capture_mha_seq_len_splits()
+            if in_capture
+            else getattr(forward_batch, "trtllm_mha_decode_seq_len_splits", 1)
+        )
+        if num_splits not in (1, 4):
+            raise ValueError(f"Invalid TRT-LLM MHA decode split variant: {num_splits}")
+        return num_splits
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -568,9 +600,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
+        decode_seq_len_splits: int,
     ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
-        metadata = TRTLLMMHAMetadata()
+        metadata = TRTLLMMHAMetadata(decode_seq_len_splits=decode_seq_len_splits)
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -866,7 +899,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._build_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens.device,
+                self._resolve_decode_seq_len_splits(forward_batch, in_capture=True),
             )
 
         if forward_mode.is_decode_or_idle():
@@ -946,6 +984,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Initialize the metadata for a forward pass."""
 
         metadata = TRTLLMMHAMetadata()
+        metadata.decode_seq_len_splits = self._resolve_decode_seq_len_splits(
+            forward_batch, in_capture=False
+        )
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
@@ -1129,7 +1170,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         num_requests = seq_lens.shape[0]
-        num_splits = min(self.decode_seq_len_splits, num_requests)
+        num_splits = min(self.forward_metadata.decode_seq_len_splits, num_requests)
         if num_splits == 1:
             return run_group(query, block_tables, seq_lens)
 

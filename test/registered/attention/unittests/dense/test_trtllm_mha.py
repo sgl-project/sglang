@@ -3,7 +3,10 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardMode,
+    select_trtllm_mha_decode_seq_len_splits,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
     is_sm90_supported,
@@ -30,6 +33,17 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestTRTLLMMHADecodeSplitHeuristic(CustomTestCase):
+    def test_selects_split_only_for_large_uneven_batches(self):
+        self.assertEqual(select_trtllm_mha_decode_seq_len_splits([1] * 64), 1)
+        self.assertEqual(
+            select_trtllm_mha_decode_seq_len_splits([1] * 12 + [100] * 4), 4
+        )
+        self.assertEqual(
+            select_trtllm_mha_decode_seq_len_splits([1] * 11 + [100] * 4), 1
+        )
 
 
 @unittest.skipIf(
