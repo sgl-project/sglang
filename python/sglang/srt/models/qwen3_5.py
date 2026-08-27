@@ -910,8 +910,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         for this GDN layer's ``in_proj_ba``.
 
         Emit it only when ``in_proj_ba`` can't consume the ``(fp8, scale)`` tuple.
-        Resolved lazily (weights finalized by first forward) with the same
-        predicate the consumer uses, so producer and consumer can't disagree.
+        Lazy so ``__init__`` does not probe ``in_proj_ba`` on every GDN layer;
+        the first forward caches the result for later steps.
         """
         if not self._fused_ar_quant_format:
             return False

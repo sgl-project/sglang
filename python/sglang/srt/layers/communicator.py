@@ -106,6 +106,10 @@ def _is_gfx950_supported() -> bool:
 
 
 _enable_fused_ar_mxfp4_quant = _is_gfx950_supported()
+_disable_fused_ar_fp8_quant = get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", "false")
+_disable_fused_ar_mxfp4_quant = get_bool_env_var(
+    "SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT", "false"
+)
 
 
 def _try_fused_allreduce_rmsnorm_quant(
@@ -136,7 +140,7 @@ def _try_fused_allreduce_rmsnorm_quant(
     if (
         _enable_fused_ar_mxfp4_quant
         and ("mxfp4" in quant_format)
-        and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT", "false")
+        and not _disable_fused_ar_mxfp4_quant
     ):
         from sglang.srt.distributed.communication_op import (
             tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant,
@@ -185,7 +189,7 @@ def _try_fused_allreduce_rmsnorm_quant(
     if (
         quant_format == "fp8_per_token"
         and hasattr(layernorm, "forward_with_allreduce_fusion_quant_per_token")
-        and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", "false")
+        and not _disable_fused_ar_fp8_quant
     ):
         return layernorm.forward_with_allreduce_fusion_quant_per_token(
             hidden_states,
@@ -713,6 +717,7 @@ class LayerCommunicator:
                         quant_result is None
                         and _use_aiter
                         and quant_format == "fp8_per_token"
+                        and not _disable_fused_ar_fp8_quant
                         and hasattr(
                             self.input_layernorm,
                             "forward_with_allreduce_fusion_quant_per_token",
@@ -730,6 +735,7 @@ class LayerCommunicator:
                         quant_result is None
                         and self.enable_fused_ar_quant
                         and quant_format != "fp8_per_token"
+                        and not _disable_fused_ar_fp8_quant
                         and "mxfp4" not in quant_format
                         and _use_aiter
                         and hasattr(
@@ -758,7 +764,11 @@ class LayerCommunicator:
                         )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
-                    if _use_aiter and quant_format == "fp8_per_token":
+                    if (
+                        _use_aiter
+                        and quant_format == "fp8_per_token"
+                        and not _disable_fused_ar_fp8_quant
+                    ):
                         # AR-fusion kernels are unavailable at this token count
                         # (typically large-batch prefill), but we can still fold
                         # the entry-proj per-token fp8 quant into the post-AR
@@ -779,7 +789,12 @@ class LayerCommunicator:
                 if residual is None:
                     residual = hidden_states
 
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
+                    if (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and ("mxfp4" in quant_format)
+                        and not _disable_fused_ar_mxfp4_quant
+                    ):
                         hidden_states, *_, _ = fused_rms_mxfp4_quant(
                             hidden_states,
                             getattr(
@@ -793,7 +808,12 @@ class LayerCommunicator:
                             None,
                             None,
                         )
-                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
+                    elif (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and (quant_format == "fp8")
+                        and not _disable_fused_ar_fp8_quant
+                    ):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
                         # When DSA is active, also preserve the unquantized bf16
                         # output as a 3-tuple (fp8, scale, bf16) so the DSA
@@ -831,6 +851,7 @@ class LayerCommunicator:
                         _use_aiter
                         and (quant_format == "fp8_per_token")
                         and not emit_bf16
+                        and not _disable_fused_ar_fp8_quant
                     ):
                         # gemma_weight (weight + 1) makes the aiter rmsnorm match
                         # GemmaRMSNorm; plain RMSNorm falls back to raw weight.
@@ -849,7 +870,12 @@ class LayerCommunicator:
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
                 else:
-                    if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
+                    if (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and ("mxfp4" in quant_format)
+                        and not _disable_fused_ar_mxfp4_quant
+                    ):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
                             getattr(
@@ -863,7 +889,12 @@ class LayerCommunicator:
                             None,
                             residual,
                         )
-                    elif _use_aiter and _is_gfx95_supported and (quant_format == "fp8"):
+                    elif (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and (quant_format == "fp8")
+                        and not _disable_fused_ar_fp8_quant
+                    ):
                         # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
                         # with residual addition. When DSA is active, pack
                         # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
@@ -901,6 +932,7 @@ class LayerCommunicator:
                         _use_aiter
                         and (quant_format == "fp8_per_token")
                         and not emit_bf16
+                        and not _disable_fused_ar_fp8_quant
                     ):
                         # See the residual-is-None branch above: gemma_weight for
                         # Gemma norms, and ``emit_bf16`` layers (bf16 sidecar)
