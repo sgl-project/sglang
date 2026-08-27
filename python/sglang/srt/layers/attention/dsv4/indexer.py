@@ -547,16 +547,7 @@ class C4IndexerBackendMixin:
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
 
-        if _is_cpu and _cpu_amx:
-            topk_transform_512_cpu(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
                 logits,
                 indexer_metadata.c4_seq_lens,
@@ -573,6 +564,15 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+            )
+        elif _is_cpu and _cpu_amx:
+            topk_transform_512_cpu(
+                logits,
+                indexer_metadata.c4_seq_lens,
+                core_metadata.page_table,
+                core_metadata.c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
             )
         else:
             topk_transform_512(
