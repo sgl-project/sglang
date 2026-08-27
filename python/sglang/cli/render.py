@@ -13,7 +13,7 @@ from pathlib import Path
 
 def render(args, extra_argv):
     del args
-    from sglang.cli.serve import normalize_positional_model_path
+    from sglang.cli.serve import _normalize_positional_model_path
     from sglang.srt.managers.utils import compute_num_reserved_tokens
     from sglang.srt.plugins import load_plugins
     from sglang.srt.server_args import prepare_server_args
@@ -29,7 +29,7 @@ def render(args, extra_argv):
 
     engine_url, server_argv = extract_engine_url(extra_argv)
     load_plugins()
-    normalized_argv, _ = normalize_positional_model_path(server_argv)
+    normalized_argv, _ = _normalize_positional_model_path(server_argv)
     server_args = prepare_server_args(normalized_argv)
     if server_args.skip_tokenizer_init:
         raise ValueError("sglang render requires a tokenizer")
