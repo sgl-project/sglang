@@ -2804,14 +2804,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mix_running_indices = running_batch.req_pool_indices
         if not self.spec_algorithm.is_none():
             # Spec decode keeps no per-step out_cache_loc on the running batch
-            # (eagle_prepare_for_decode reserves slots inside req_to_token);
-            # gather each request's pending bonus-token slot at position
-            # seq_lens, where this mixed step writes its KV.
+            # (eagle_prepare_for_decode reserves slots inside req_to_token).
+            # The scheduler only mixes settled tails, so request state is the
+            # authoritative base; the batch seq_lens tensor can be stale under
+            # overlap (refreshed only at decode forward entry). Gather each
+            # pending bonus-token slot at the committed length, where this
+            # mixed step writes its KV.
+            tail_base = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.seq_lens.device,
+            )
             running_out_cache_loc = self.req_to_token_pool.req_to_token[
                 running_batch.req_pool_indices.long(),
-                running_batch.seq_lens.long(),
+                tail_base,
             ].to(self.out_cache_loc.dtype)
         else:
+            tail_base = None
             running_out_cache_loc = running_batch.out_cache_loc
         out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
@@ -2830,17 +2839,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_cpu = merged_seq_lens_cpu
-        if not self.spec_algorithm.is_none():
+        if tail_base is not None:
             # Spec keeps decode seq_lens at the committed base (bonus token
-            # pending); this step commits it, so tail rows need the decode
-            # path's +1 or attention drops the token's own row (qo len
-            # seq_lens - prefix_lens hits 0 and the kv span excludes self).
-            bumped = self.seq_lens.clone()
-            bumped[-running_bs:] += 1
-            self.seq_lens = bumped
+            # pending); this step commits it, so tail rows carry base + 1 or
+            # attention drops the token's own row (qo len seq_lens -
+            # prefix_lens hits 0 and the kv span excludes self).
+            merged = self.seq_lens.clone()
+            merged[-running_bs:] = tail_base + 1
+            self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
+        # For overlap scheduler, the output_ids has one step delay. Spec
+        # tails are only mixed when settled, so their request state carries
+        # no delay in either mode.
+        if self.spec_algorithm.is_none():
+            delta = 0 if self.enable_overlap else -1
+        else:
+            delta = -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens = self.prefix_lens + [
