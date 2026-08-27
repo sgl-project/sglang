@@ -137,7 +137,7 @@ do
 	          --enable-dp-attention --dp-size "${DP_SIZE}" --enable-dp-lm-head \
             --mem-fraction-static 0.75 \
             --max-mamba-cache-size 180 \
-            --chunked-prefill-size 16384 \
+            --chunked-prefill-size "${K3_CHUNKED_PREFILL_SIZE:-16384}" \
             --disable-radix-cache \
             "${GRAPH_ARGS[@]}" \
             --reasoning-parser kimi_k3 \
