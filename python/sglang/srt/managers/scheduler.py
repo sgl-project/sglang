@@ -2488,6 +2488,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2810,6 +2811,7 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    router_hint=req.kv_hints,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -4471,10 +4473,25 @@ class Scheduler(
                 logger.info("Cache flushed successfully!")
             success = True
         else:
+            # HiCache in-flight ops also block the flush, so reporting only the
+            # request counts leaves "0 queued, 0 running, still refused".
+            hicache_pending = ""
+            if self.enable_hierarchical_cache:
+                tc = self.tree_cache
+                hicache_pending = (
+                    f", #write-through: {len(tc.ongoing_write_through)}"
+                    f", #load-back: {len(tc.ongoing_load_back)}"
+                )
+                if tc.enable_storage:
+                    hicache_pending += (
+                        f", #prefetch: {len(tc.ongoing_prefetch)}"
+                        f", #backup: {len(tc.ongoing_backup)}"
+                    )
             logging.warning(
-                f"Cache not flushed because there are pending requests. "
+                f"Cache not flushed because there is pending work. "
                 f"#queue-req: {len(self.waiting_queue)}, "
                 f"#running-req: {len(self.running_batch.reqs)}"
+                f"{hicache_pending}"
             )
             success = False
         return success

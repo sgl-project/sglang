@@ -1,0 +1,203 @@
+"""A storage backend that raises must not kill HiCache's storage threads.
+
+``prefetch_thread_func``, ``prefetch_io_aux_func`` and ``backup_thread_func``
+each wrap their body in ``except Empty: continue`` and nothing else, so any
+other exception ends the thread. They are unsupervised daemons, so one exception
+disables L2/L3 for the life of the process.
+
+It does not merely stop caching -- it leaks what those loops were responsible
+for returning. ``prefetch_io_aux_func`` is the only caller of
+``append_host_mem_release``, so reserved host pages are never freed and
+``prefetch_tokens_occupied`` never falls until the rate limiter blocks every
+future prefetch. ``backup_thread_func`` is the only producer for
+``ack_backup_queue``, which drives ``entry.release_host()``, so every backed-up
+node holds its host reference forever.
+
+None of it raises anywhere visible: the engine keeps serving, every request
+reports an ordinary cache miss, and the host pool quietly drains. That is what
+obliges every backend -- including KVCR's -- to guard its own surface.
+
+What turns this red: adding a general ``except Exception`` to those loops
+upstream. That would be a fix, and these tests should then be replaced by ones
+asserting the loop survives.
+
+    python -m pytest test/registered/mem_cache/test_hicache_storage_thread_survival.py -v
+"""
+
+from __future__ import annotations
+
+import threading
+import unittest
+from queue import Queue
+from unittest.mock import MagicMock
+
+import torch
+
+from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _RaisingBackend:
+    """A storage backend whose every entry point raises after N calls.
+
+    A transient core fault rather than a permanently broken backend: the first
+    ``ok_calls`` succeed, so a test can show the loop was alive right up to it.
+    """
+
+    def __init__(self, ok_calls: int = 0) -> None:
+        self.remaining_ok = ok_calls
+        self.calls = 0
+
+    def _maybe_raise(self):
+        self.calls += 1
+        if self.remaining_ok > 0:
+            self.remaining_ok -= 1
+            return
+        raise RuntimeError("backend fault")
+
+    def batch_exists(self, keys, extra_info=None):
+        self._maybe_raise()
+        return len(keys)
+
+    def batch_set_v1(self, keys, host_indices, extra_info=None):
+        self._maybe_raise()
+        return [True] * len(keys)
+
+    def batch_get_v1(self, keys, host_indices, extra_info=None):
+        self._maybe_raise()
+        return [True] * len(keys)
+
+
+def _controller(backend) -> HiCacheController:
+    """The narrowest controller the three loop functions touch.
+
+    Built with ``__new__``: the real constructor allocates device memory and starts
+    threads none of these loops use.
+    """
+    cc = HiCacheController.__new__(HiCacheController)
+    cc.storage_backend = backend
+    cc.storage_stop_event = threading.Event()
+    cc.prefetch_queue = Queue()
+    cc.prefetch_buffer = Queue()
+    cc.backup_queue = Queue()
+    cc.ack_backup_queue = Queue()
+    cc.prefetch_hit_queue = Queue()
+    cc.prefetch_revoke_queue = Queue()
+    cc.host_mem_release_queue = Queue()
+    cc.page_size = 1
+    cc.prefetch_threshold = 1
+    cc.backup_skip = False
+    cc.has_draft = False
+    cc.prefetch_sync_groups = []
+    cc.mem_pool_host = MagicMock()
+    cc.get_hash_str = lambda tokens, last_hash, page_size: [f"h{t}" for t in tokens]
+    cc.page_set_func = cc._page_set_zero_copy
+    cc.page_get_func = cc._page_get_zero_copy
+    return cc
+
+
+def _operation(n_pages: int = 2):
+    """A StorageOperation stand-in carrying what the loops read off it."""
+    return MagicMock(
+        request_id="req-1",
+        token_ids=list(range(n_pages)),
+        last_hash=None,
+        prefix_keys=None,
+        hash_value=[f"h{i}" for i in range(n_pages)],
+        host_indices=torch.arange(n_pages),
+        completed_tokens=0,
+        storage_hit_count=0,
+        is_terminated=lambda: False,
+    )
+
+
+def _run_until_idle(target, stop_event: threading.Event, settle_s: float = 0.5):
+    """Run one loop function in a thread and report whether it survived.
+
+    The loops block on a 1 s queue timeout, so ``settle_s`` must be shorter: a
+    thread merely waiting is still alive at 0.5 s, one that took an exception has
+    already exited.
+    """
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=settle_s)
+    stop_event.set()
+    return thread
+
+
+class BackupThreadSurvivalTest(unittest.TestCase):
+    def test_a_raising_backend_kills_the_backup_thread(self):
+        """One exception out of ``batch_set_v1`` ends ``backup_thread_func``.
+
+        Two operations are queued and the backend is allowed one good call, so
+        the assertion is not "the thread never ran": it acked the first
+        operation, then died on the second and left it unacked forever.
+        """
+        cc = _controller(_RaisingBackend(ok_calls=1))
+        cc.backup_queue.put(_operation())
+        cc.backup_queue.put(_operation())
+
+        thread = _run_until_idle(cc.backup_thread_func, cc.storage_stop_event)
+
+        self.assertFalse(thread.is_alive(), "backup thread survived the exception")
+        self.assertEqual(cc.ack_backup_queue.qsize(), 1)
+        self.assertEqual(cc.backup_queue.qsize(), 0, "the second op was consumed")
+
+    def test_the_dead_backup_thread_never_acks_again(self):
+        """The op that killed the thread is lost, and so is every later one.
+
+        This is the leak, not just a missed cache write: ``HiRadixCache`` calls
+        ``entry.release_host()`` only for operations it drains off
+        ``ack_backup_queue``, so an op that never arrives holds its host pages
+        for the life of the process.
+        """
+        cc = _controller(_RaisingBackend(ok_calls=0))
+        cc.backup_queue.put(_operation())
+        thread = _run_until_idle(cc.backup_thread_func, cc.storage_stop_event)
+        self.assertFalse(thread.is_alive())
+
+        # A later, healthy-looking operation. Nothing is consuming the queue.
+        cc.backup_queue.put(_operation())
+        self.assertEqual(cc.ack_backup_queue.qsize(), 0)
+        self.assertEqual(cc.backup_queue.qsize(), 1)
+
+
+class PrefetchThreadSurvivalTest(unittest.TestCase):
+    def test_a_raising_batch_exists_kills_the_prefetch_thread(self):
+        """``_storage_hit_query`` runs unguarded inside ``prefetch_thread_func``.
+
+        The operation is neither put on the hit queue nor revoked, so the scheduler is
+        left with a prefetch it will never hear about again.
+        """
+        cc = _controller(_RaisingBackend(ok_calls=0))
+        cc.prefetch_queue.put(_operation())
+
+        thread = _run_until_idle(cc.prefetch_thread_func, cc.storage_stop_event)
+
+        self.assertFalse(thread.is_alive(), "prefetch thread survived the exception")
+        self.assertEqual(cc.prefetch_hit_queue.qsize(), 0)
+        self.assertEqual(cc.prefetch_revoke_queue.qsize(), 0)
+
+    def test_a_raising_get_kills_the_io_aux_thread_and_leaks_host_pages(self):
+        """``prefetch_io_aux_func`` is the only caller that frees reserved pages.
+
+        ``append_host_mem_release`` sits *after* ``_page_transfer``, so an exception
+        skips it, and the reservation is what ``prefetch_capacity_limit`` counts against.
+        """
+        cc = _controller(_RaisingBackend(ok_calls=0))
+        cc.prefetch_buffer.put(_operation())
+
+        thread = _run_until_idle(cc.prefetch_io_aux_func, cc.storage_stop_event)
+
+        self.assertFalse(thread.is_alive(), "io aux thread survived the exception")
+        self.assertEqual(
+            cc.host_mem_release_queue.qsize(),
+            0,
+            "pages reserved for the failed prefetch were never released",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

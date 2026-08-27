@@ -285,6 +285,14 @@ class GenerateReqInput:
     data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # Versioned KV-hint envelope, set by a trusted router after worker selection
+    # and never by an application client. Passed through untouched to the HiCache
+    # storage backend via HiCacheStorageExtraInfo.extra_info; each backend reads
+    # only the action types it implements. Shape (protocol 0.1):
+    # {"protocol_version", "message_id", "actions": [{"action_id", "action_type",
+    #  "action_version", "payload"}]}. Typed in SGLang RFC #36224; the KVCR
+    # backend implements kv.source_locations@1.0 for peer-to-peer prefix reuse.
+    kv_hints: Optional[dict] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -939,6 +947,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            kv_hints=self.kv_hints,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
@@ -1025,6 +1034,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # Versioned KV-hint envelope, passed through to the HiCache storage backend.
+    # See GenerateReqInput.kv_hints.
+    kv_hints: Optional[dict] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
