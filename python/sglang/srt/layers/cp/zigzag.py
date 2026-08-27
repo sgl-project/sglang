@@ -358,20 +358,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
 
         if attention_backend == CPAttentionBackendKind.FLASHINFER:
             result = attn_fn(q[:logical_tokens])
-            pad_size = q.shape[0] - logical_tokens
-            assert pad_size >= 0
-            if pad_size > 0:
-                result = torch.cat(
-                    [result, result.new_zeros(pad_size, *result.shape[1:])], dim=0
-                )
-            return result
-
-        q_prev = q[: meta.total_q_prev_tokens]
-        q_next = q[meta.total_q_prev_tokens : logical_tokens]
-
-        prev_kwargs = {}
-        next_kwargs = {}
-        if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+        elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,
@@ -381,19 +368,19 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 use_zigzag_page_table=True,
             )
         else:
+            q_prev = q[: meta.total_q_prev_tokens]
+            q_next = q[meta.total_q_prev_tokens : logical_tokens]
             result_prev = attn_fn(
                 q_prev,
                 meta.cu_seqlens_q_prev_tensor,
                 meta.kv_len_prev_tensor,
                 meta.max_seqlen_q_prev,
-                **prev_kwargs,
             )
             result_next = attn_fn(
                 q_next,
                 meta.cu_seqlens_q_next_tensor,
                 meta.kv_len_next_tensor,
                 meta.max_seqlen_q_next,
-                **next_kwargs,
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
