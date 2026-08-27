@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -960,6 +961,7 @@ class Glm5NextModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
@@ -1065,6 +1067,7 @@ class Glm5NextModel(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        self.dflash_capture = False
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             self.enable_a2a_moe = True
         else:
@@ -1072,6 +1075,14 @@ class Glm5NextModel(nn.Module):
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    def _prepare_aux_hidden_state(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        aux_hidden_state = hidden_states + residual
+        if self.dflash_capture and self.config.mhc:
+            aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
+        return aux_hidden_state
 
     def forward(
         self,
@@ -1123,7 +1134,7 @@ class Glm5NextModel(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_tbo and not self.dflash_capture:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer
@@ -1142,13 +1153,14 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    aux_hidden_state = self._prepare_aux_hidden_state(
+                        hidden_states, residual
+                    )
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_parallel().attn_tp_group.all_gather(
-                            hidden_states + residual, dim=0
+                            aux_hidden_state, dim=0
                         )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(hidden_states + residual)
+                    aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
@@ -1395,6 +1407,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             self.capture_aux_hidden_states = True
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.dflash_capture = True
+        # Capturing before layer k + 1 gives the completed output of layer k.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def prepare_context_parallel_metadata_for_dcp(
         self,

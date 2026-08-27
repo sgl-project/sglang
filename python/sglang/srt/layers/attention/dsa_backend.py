@@ -145,9 +145,7 @@ def _should_all_gather_dsa_trtllm_fp8_kv(
     return save_kv_cache and cos_sin_cache is not None and dsa_prefill_cp
 
 
-def _should_return_dsa_trtllm_lse(
-    *, forward_mode: ForwardMode, dcp_enabled: bool
-) -> bool:
+def _should_return_dsa_dcp_lse(*, forward_mode: ForwardMode, dcp_enabled: bool) -> bool:
     return dcp_enabled and (forward_mode.is_decode() or forward_mode.is_target_verify())
 
 
@@ -3228,6 +3226,10 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=_should_return_dsa_dcp_lse(
+                    forward_mode=forward_batch.forward_mode,
+                    dcp_enabled=get_parallel().dcp_enabled,
+                ),
             )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -3526,6 +3528,10 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=_should_return_dsa_dcp_lse(
+                    forward_mode=forward_batch.forward_mode,
+                    dcp_enabled=get_parallel().dcp_enabled,
+                ),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -4141,6 +4147,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
@@ -4157,6 +4164,17 @@ class DeepseekSparseAttnBackend(
                 dim=-1,
             )
 
+        if return_lse:
+            out, lse = tilelang_sparse_fwd(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                return_lse=True,
+            )
+            # [1, tokens, H] -> [tokens, H], the [B, H] dcp_pack_a2a_send expects.
+            return out, lse.squeeze(0)
         return tilelang_sparse_fwd(
             q=q_all,
             kv=kv_cache,
@@ -4514,7 +4532,7 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
-            return_lse=_should_return_dsa_trtllm_lse(
+            return_lse=_should_return_dsa_dcp_lse(
                 forward_mode=forward_batch.forward_mode,
                 dcp_enabled=get_parallel().dcp_enabled,
             ),
