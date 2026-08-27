@@ -930,6 +930,10 @@ class ChatCompletionRequest(BaseModel):
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
+    # Per-request thinking budget, forwarded to
+    # GenerateReqInput.max_thinking_tokens. Requires the server to be launched
+    # with --enable-strict-thinking.
+    max_thinking_tokens: Optional[int] = None
 
     # SGLang multimodal controls (extensions)
     max_dynamic_patch: Optional[int] = None
