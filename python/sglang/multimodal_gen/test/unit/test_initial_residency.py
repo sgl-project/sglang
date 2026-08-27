@@ -116,9 +116,14 @@ def test_initial_seed_applies_one_reversible_override():
     inventory = [_weight("transformer", 8)]
     with (
         patch(
-            "sglang.multimodal_gen.runtime.server_args.auto_tune."
-            "auto_residency_static_skip_reason",
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.auto_residency_static_skip_reason",
             return_value=None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.resolve_keep_resident_min_available_gb",
+            return_value=30,
         ),
         patch(
             "sglang.multimodal_gen.runtime.managers.memory_managers."
@@ -141,9 +146,14 @@ def test_initial_seed_honors_the_test_allocator_cap():
     inventory = [_weight("transformer", 20)]
     with (
         patch(
-            "sglang.multimodal_gen.runtime.server_args.auto_tune."
-            "auto_residency_static_skip_reason",
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.auto_residency_static_skip_reason",
             return_value=None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.resolve_keep_resident_min_available_gb",
+            return_value=30,
         ),
         patch(
             "sglang.multimodal_gen.runtime.managers.memory_managers."
@@ -167,8 +177,8 @@ def test_initial_seed_skips_structural_fsdp_path():
     args.use_fsdp_inference = True
     with (
         patch(
-            "sglang.multimodal_gen.runtime.server_args.auto_tune."
-            "auto_residency_static_skip_reason",
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.auto_residency_static_skip_reason",
             return_value=None,
         ),
         patch(
@@ -177,6 +187,31 @@ def test_initial_seed_skips_structural_fsdp_path():
             Mock(is_cuda=Mock(return_value=True)),
         ),
     ):
+        maybe_seed_initial_residency(args, [_weight("transformer", 8)])
+
+    assert args.selected == {}
+
+
+def test_initial_seed_keeps_configured_load_path_below_admission_threshold():
+    args = _Args()
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.auto_residency_static_skip_reason",
+            return_value=None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.resolve_keep_resident_min_available_gb",
+            return_value=30,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.current_platform"
+        ) as platform,
+    ):
+        platform.is_cuda.return_value = True
+        platform.get_available_gpu_memory.return_value = 29.8
         maybe_seed_initial_residency(args, [_weight("transformer", 8)])
 
     assert args.selected == {}

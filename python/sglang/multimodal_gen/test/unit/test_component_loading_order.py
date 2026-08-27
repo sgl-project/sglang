@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
@@ -257,6 +258,35 @@ def test_preload_inventory_uses_the_actual_weight_override():
     assert not text_source.supports_fsdp_loading
     assert transformer_source.supports_fsdp_loading
     assert secondary_source.supports_fsdp_loading
+
+
+def test_preload_inventory_uses_selected_transformer_safetensors(tmp_path):
+    mixed_path = tmp_path / "flux2-dev-nvfp4-mixed.safetensors"
+    _write_safetensors(mixed_path, 64)
+    server_args = SimpleNamespace(
+        component_weights_paths={},
+        transformer_weights_path="owner/flux2-nvfp4",
+        revision=None,
+        pipeline_config=SimpleNamespace(
+            dit_precision="bf16",
+            vae_precision="fp32",
+            image_encoder_precision="fp16",
+            text_encoder_precisions=("bf16",),
+        ),
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base."
+        "resolve_transformer_safetensors_to_load",
+        return_value=[str(mixed_path)],
+    ):
+        source = ComposedPipelineBase._component_weight_source(
+            _spec("transformer", 0, "/model/transformer"), server_args
+        )
+
+    assert source.component_model_path == "owner/flux2-nvfp4"
+    assert source.checkpoint_bytes == 64
+    assert source.parameter_count == 32
 
 
 def test_preload_inventory_resolves_group_precision_fallbacks():

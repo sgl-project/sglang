@@ -20,6 +20,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.placement_budget imp
     optimize_placement,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    auto_residency_static_skip_reason,
+    resolve_keep_resident_min_available_gb,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
@@ -114,10 +118,6 @@ def maybe_seed_initial_residency(
     inventory: list[ComponentWeightEstimate],
 ) -> None:
     """Apply a reversible resident seed for warmup-calibrated auto mode."""
-    from sglang.multimodal_gen.runtime.server_args.auto_tune import (
-        auto_residency_static_skip_reason,
-    )
-
     if (
         auto_residency_static_skip_reason(server_args) is not None
         or server_args.use_fsdp_inference
@@ -134,6 +134,15 @@ def maybe_seed_initial_residency(
             available_gib,
             envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB,
         )
+    admission_gib = resolve_keep_resident_min_available_gb(server_args)
+    if available_gib < admission_gib:
+        logger.debug(
+            "Keeping configured load placement: %.1f GiB is below the %.1f GiB "
+            "initial-residency admission threshold.",
+            available_gib,
+            admission_gib,
+        )
+        return
     selected = choose_initial_resident_components(
         server_args,
         inventory,

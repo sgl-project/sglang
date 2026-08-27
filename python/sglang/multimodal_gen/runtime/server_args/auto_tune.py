@@ -48,6 +48,22 @@ IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
 
 
+def resolve_keep_resident_min_available_gb(
+    server_args: ServerArgs,
+    deployment_config: ModelDeploymentConfig | None = None,
+) -> float:
+    """Resolve the established device-memory admission threshold for residency."""
+    deployment_config = (
+        deployment_config or server_args.pipeline_config.get_model_deployment_config()
+    )
+    explicit = deployment_config.keep_resident_min_available_gb
+    if explicit is not None:
+        return explicit
+    if server_args.pipeline_config.task_type.is_image_gen():
+        return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
+    return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
+
+
 def auto_residency_static_skip_reason(server_args: ServerArgs) -> str | None:
     """Return why args cannot use pre-warmup static residency planning."""
     if envs.SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY:
@@ -120,14 +136,10 @@ class ServerArgsAutoTuner:
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
-    ) -> float | None:
-        # explicit per-model > task-type default > global default
-        explicit = deployment_config.keep_resident_min_available_gb
-        if explicit is not None:
-            return explicit
-        if self.server_args.pipeline_config.task_type.is_image_gen():
-            return IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB
-        return DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
+    ) -> float:
+        return resolve_keep_resident_min_available_gb(
+            self.server_args, deployment_config
+        )
 
     def adjust_based_on_performance_mode(self) -> None:
         """Adjust the server args based on the performance mode"""

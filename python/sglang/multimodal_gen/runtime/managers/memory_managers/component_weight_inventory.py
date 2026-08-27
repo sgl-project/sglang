@@ -88,6 +88,28 @@ def _safetensors_payload_stats(file_path: str) -> tuple[int, int | None] | None:
     return checkpoint_bytes, parameter_count
 
 
+def infer_safetensors_weight_stats(
+    file_paths: list[str],
+) -> tuple[int | None, int | None]:
+    """Infer aggregate stats for the exact safetensors files selected to load."""
+    stats = [
+        stat
+        for file_path in file_paths
+        if (stat := _safetensors_payload_stats(file_path)) is not None
+    ]
+    if not stats:
+        return None, None
+    parameter_counts = [parameters for _, parameters in stats]
+    return (
+        sum(checkpoint_bytes for checkpoint_bytes, _ in stats),
+        (
+            sum(parameter_counts)
+            if all(parameters is not None for parameters in parameter_counts)
+            else None
+        ),
+    )
+
+
 def infer_safetensors_weight_stats_by_prefix(
     file_path: str,
 ) -> dict[str, tuple[int, int]] | None:
@@ -148,22 +170,7 @@ def infer_component_weight_stats(
     """Infer checkpoint bytes and parameter count without loading tensors."""
     safetensors_files = _list_component_safetensors_files(component_model_path)
     if safetensors_files:
-        stats = [
-            stat
-            for file_path in safetensors_files
-            if (stat := _safetensors_payload_stats(file_path)) is not None
-        ]
-        if not stats:
-            return None, None
-        parameter_counts = [parameters for _, parameters in stats]
-        return (
-            sum(checkpoint_bytes for checkpoint_bytes, _ in stats),
-            (
-                sum(parameter_counts)
-                if all(parameters is not None for parameters in parameter_counts)
-                else None
-            ),
-        )
+        return infer_safetensors_weight_stats(safetensors_files)
 
     if os.path.isfile(component_model_path):
         if component_model_path.endswith(_WEIGHT_FILE_SUFFIXES):

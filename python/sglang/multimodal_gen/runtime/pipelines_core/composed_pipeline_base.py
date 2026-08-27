@@ -7,6 +7,7 @@ Base class for composed pipelines.
 This module defines the base class for pipelines that are composed of multiple stages.
 """
 
+import copy
 import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Iterator, Literal, cast
@@ -21,6 +22,10 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.gguf_weights import names_gguf_checkpoint
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_safetensors_to_load,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
     order_component_load_specs,
@@ -34,6 +39,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inv
     ComponentWeightEstimate,
     ComponentWeightSource,
     estimate_component_weight_inventory,
+    infer_safetensors_weight_stats,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     is_image_encoder_component_name,
@@ -428,9 +434,26 @@ class ComposedPipelineBase(ABC):
             and server_args.transformer_weights_path is not None
         ):
             weights_path = server_args.transformer_weights_path
+        checkpoint_bytes = None
+        parameter_count = None
+        if (
+            weights_path is not None
+            and is_legacy_dit_offload_component_name(spec.load_module_name)
+            and not names_gguf_checkpoint(weights_path)
+        ):
+            component_server_args = copy.copy(server_args)
+            component_server_args.transformer_weights_path = weights_path
+            selected_files = resolve_transformer_safetensors_to_load(
+                component_server_args, spec.component_model_path
+            )
+            checkpoint_bytes, parameter_count = infer_safetensors_weight_stats(
+                selected_files
+            )
         return ComponentWeightSource(
             component_name=spec.module_name,
             component_model_path=weights_path or spec.component_model_path,
+            checkpoint_bytes=checkpoint_bytes,
+            parameter_count=parameter_count,
             target_element_size=ComposedPipelineBase._component_target_element_size(
                 spec.load_module_name, server_args
             ),
