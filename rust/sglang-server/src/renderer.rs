@@ -10,8 +10,8 @@ use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, Request};
 
 pub(crate) use sglang_renderer::{
-    PreparedGenerateRequest, RendererConfig, RendererError as RenderServiceError, RendererService,
-    RequestLowerer, TextCompletionRequest,
+    RendererConfig, RendererError as RenderServiceError, RendererService, RequestLowerer,
+    TextCompletionRequest,
 };
 use sglang_renderer::{RendererLimits, SamplingDefaults, TokenizationBackend};
 

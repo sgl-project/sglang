@@ -9,7 +9,8 @@ use crate::openai::{lower_chat_requests, lower_completion_requests};
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{check_total_tokens, resolve_model_file, validate_request};
 use crate::{
-    ChatFormatter, ChatResponseProcessor, RendererConfig, RendererError, TextCompletionRequest,
+    ChatFormatter, ChatResponseProcessor, PreparedGenerateRequest, RendererConfig, RendererError,
+    TextCompletionRequest,
 };
 
 /// Host-provided tokenizer-dependent CPU execution for one lowered text
@@ -33,6 +34,9 @@ pub struct RequestLowerer {
 }
 
 /// Standalone request preparation: shared lowering plus host-provided CPU work.
+///
+/// This service returns transport-ready generation requests. Chat response
+/// processors remain an inference-only result of `RequestLowerer`.
 pub struct RendererService {
     lowerer: RequestLowerer,
     backend: Arc<dyn TokenizationBackend>,
@@ -40,8 +44,6 @@ pub struct RendererService {
 
 /// Lowered text-completion requests plus the processor retained to interpret
 /// their eventual engine responses.
-///
-/// `completion_requests` are tokenized only when returned by `prepare_chat`.
 pub struct LoweredChat {
     pub completion_requests: Vec<TextCompletionRequest>,
     pub response_processor: ChatResponseProcessor,
@@ -109,17 +111,16 @@ impl RendererService {
         &self,
         request: &mut CreateChatCompletionRequest,
         response_id: &str,
-    ) -> Result<LoweredChat, RendererError> {
-        let mut lowered = self.lowerer.lower_chat(request, response_id).await?;
-        lowered.completion_requests = self.prepare_many(lowered.completion_requests).await?;
-        Ok(lowered)
+    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
+        let lowered = self.lowerer.lower_chat(request, response_id).await?;
+        self.prepare_many(lowered.completion_requests).await
     }
 
     pub async fn prepare_completions(
         &self,
         request: &CreateCompletionRequest,
         response_id: &str,
-    ) -> Result<Vec<TextCompletionRequest>, RendererError> {
+    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
         let requests = self.lowerer.lower_completions(request, response_id)?;
         self.prepare_many(requests).await
     }
@@ -127,13 +128,17 @@ impl RendererService {
     async fn prepare_many(
         &self,
         requests: Vec<TextCompletionRequest>,
-    ) -> Result<Vec<TextCompletionRequest>, RendererError> {
-        try_join_all(
+    ) -> Result<Vec<PreparedGenerateRequest>, RendererError> {
+        let requests = try_join_all(
             requests
                 .into_iter()
                 .map(|request| self.prepare_one(request)),
         )
-        .await
+        .await?;
+        Ok(requests
+            .into_iter()
+            .map(PreparedGenerateRequest::from)
+            .collect())
     }
 
     async fn prepare_one(

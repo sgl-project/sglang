@@ -12,9 +12,7 @@ use axum::{
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 
 use super::openai::openai_error;
-use crate::renderer::{
-    PreparedGenerateRequest, RenderServiceError, RendererService, render_http_status,
-};
+use crate::renderer::{RenderServiceError, RendererService, render_http_status};
 
 #[derive(Clone)]
 pub(super) struct RenderState {
@@ -68,21 +66,12 @@ async fn render_chat(
         .prepare_chat(&mut request, &response_id)
         .await
     {
-        Ok(prepared) => {
-            // Render-only callers need the prepared generation request, not the
-            // retained response processor used after inference. Dropping it
-            // here is an explicit property of the preprocess-only contract.
-            let sglang_renderer::LoweredChat {
-                mut completion_requests,
-                response_processor: _,
-            } = prepared;
-            Json(PreparedGenerateRequest::from(
-                completion_requests
-                    .pop()
-                    .expect("lowered chat request contains one choice"),
-            ))
-            .into_response()
-        }
+        Ok(mut prepared_requests) => Json(
+            prepared_requests
+                .pop()
+                .expect("prepared chat request contains one choice"),
+        )
+        .into_response(),
         Err(error) => render_error(error),
     }
 }
@@ -103,13 +92,7 @@ async fn render_completions(
         .prepare_completions(&request, &response_id)
         .await
     {
-        Ok(requests) => Json(
-            requests
-                .into_iter()
-                .map(PreparedGenerateRequest::from)
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(prepared_requests) => Json(prepared_requests).into_response(),
         Err(error) => render_error(error),
     }
 }
