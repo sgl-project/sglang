@@ -4280,7 +4280,7 @@ class Scheduler(
         # While the KV region is released (colocate RL: memory saver paused, pages
         # unmapped), the pool clears below would write unmapped device memory -- an
         # async illegal memory access. release_memory_occupation already flushed
-        # right before pausing, so a flush that arrives during the pause has nothing
+        # right before pausing, so a flush arriving during the pause has nothing
         # left to do; skip it instead of corrupting the CUDA context.
         updater = getattr(self, "weight_updater", None)
         if updater is not None and GPU_MEMORY_TYPE_KV_CACHE in getattr(updater, "offload_tags", set()):

@@ -2021,25 +2021,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             continue
                         param = params_dict[mapped_name]
                         weight_loader = param.weight_loader
-                        try:
-                            weight_loader(
-                                param,
-                                loaded_weight,
-                                mapped_name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
-                        except Exception as exc:
-                            # Weight-update payloads come from the trainer's
-                            # megatron->HF converter; name the tensor so a wrong
-                            # mapping fails with its identity, not a bare shape error
-                            # from deep inside a fused loader.
-                            raise RuntimeError(
-                                f"load_weights failed for {mapped_name!r} "
-                                f"(loaded shape={tuple(loaded_weight.shape)}, "
-                                f"param shape={tuple(param.shape)}, shard_id={shard_id}, "
-                                f"expert_id={expert_id}): {exc}"
-                            ) from exc
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            mapped_name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
                     name = mapped_name
                     break
                 else:

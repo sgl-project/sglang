@@ -368,13 +368,12 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            # Flush BEFORE pausing: flush_cache -> pool.clear() zeroes pool
-            # tensors on device (req_generation, mamba/short-conv/ngram states),
-            # and those tensors are allocated inside the KV-cache memory-saver
-            # region. Pausing first unmaps that region, so the zeroing writes hit
-            # unmapped memory -- an async illegal memory access that surfaces at
-            # whatever synchronizes next (observed: the static-state buffer clones,
-            # with a different innocent buffer named on every rank).
+            # Flush BEFORE pausing: flush_cache -> pool.clear() zeroes pool tensors
+            # (req_generation, mamba/short-conv/ngram states) that live inside the
+            # KV-cache memory-saver region. Pausing first unmaps that region, so the
+            # zeroing writes hit unmapped memory -- an async illegal memory access
+            # surfacing at whatever synchronizes next. Plain-KV models never noticed:
+            # their clear() is host-side only.
             self.flush_cache()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
@@ -487,47 +486,12 @@ class SchedulerWeightUpdaterManager:
         )
 
 
-# Frozen parameter subtrees that the RL trainer never sends in weight updates.
-# Pausing GPU_MEMORY_TYPE_WEIGHTS discards weight memory; everything the trainer
-# does not rewrite after resume is garbage, so these must ride the static-state
-# stash exactly like buffers do. Text-only RL on a VLM is the motivating case:
-# the training model has no vision tower, so `visual.*` never appears in an
-# update payload -- observed as the weight checker flagging every visual.* tensor
-# after the first release/resume cycle.
-import os as _os
-
-_STATIC_PARAM_PREFIXES = tuple(
-    p for p in _os.environ.get("SGLANG_STATIC_PARAM_PREFIXES", "visual.").split(",") if p
-)
-
-
 def _export_static_state(model):
-    # Cloned one by one so a buffer whose storage the memory saver has already
-    # released fails with its NAME in the error instead of an anonymous CUDA
-    # illegal-memory-access from inside a list comprehension.
-    buffers = []
-    for name, buffer in model.named_buffers():
-        try:
-            buffers.append((name, buffer.detach().clone()))
-        except Exception as exc:
-            raise RuntimeError(
-                f"_export_static_state failed cloning buffer {name!r} "
-                f"(shape={tuple(buffer.shape)}, device={buffer.device}, "
-                f"dtype={buffer.dtype}): {exc}"
-            ) from exc
-    params = []
-    for name, p in model.named_parameters():
-        if name.startswith(_STATIC_PARAM_PREFIXES):
-            try:
-                # To host: the vision tower is ~GBs and the whole point of the pause
-                # is to hand that GPU memory to the trainer.
-                params.append((name, p.detach().to("cpu", copy=True)))
-            except Exception as exc:
-                raise RuntimeError(
-                    f"_export_static_state failed stashing param {name!r} "
-                    f"(shape={tuple(p.shape)}, device={p.device}): {exc}"
-                ) from exc
-    return dict(buffers=buffers, params=params)
+    return dict(
+        buffers=[
+            (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
+        ]
+    )
 
 
 def _import_static_state(model, static_params):
@@ -535,10 +499,3 @@ def _import_static_state(model, static_params):
         self_named_buffers = dict(model.named_buffers())
         for name, tensor in static_params["buffers"]:
             self_named_buffers[name][...] = tensor
-        stashed = static_params.get("params") or []
-        if stashed:
-            self_named_params = dict(model.named_parameters())
-            for name, tensor in stashed:
-                self_named_params[name][...] = tensor.to(
-                    self_named_params[name].device, non_blocking=True
-                )
