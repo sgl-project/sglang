@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
     from sgl_kernel_npu.dspark.top1 import (
         select_global_top1_npu,
         select_local_top1_after_add_npu,
@@ -597,6 +599,7 @@ class DSparkDraftMixin:
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
+        self._main_proj_nz_weight: Optional[torch.Tensor] = None
         self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -621,6 +624,46 @@ class DSparkDraftMixin:
         # (the runner skips the eager input_embeds staging when the draft
         # model exposes forward_embed).
         return self.embed_tokens(input_ids)
+
+    def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        expected = int(self.fc.in_features)
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "DSpark target_hidden feature dim mismatch. "
+                f"Expected shape [N, {expected}], got {tuple(target_hidden.shape)}."
+            )
+        self._prepare_main_proj_nz_weight()
+        if self._main_proj_nz_weight is None:
+            projected = self.fc(target_hidden)
+        else:
+            projected = F.linear(target_hidden, self._main_proj_nz_weight)
+        return self.hidden_norm(projected)
+
+    def _prepare_main_proj_nz_weight(self) -> None:
+        if not (_is_npu and envs.SGLANG_NPU_DSPARK_MAIN_PROJ_NZ.get()):
+            return
+        if self._main_proj_nz_weight is not None:
+            return
+        weight = self.fc.weight
+        if weight.ndim != 2 or weight.dtype not in (torch.float16, torch.bfloat16):
+            logger.warning(
+                "Skipping dense DSpark fc NZ packing for shape=%s dtype=%s",
+                tuple(weight.shape),
+                weight.dtype,
+            )
+            return
+        import torch_npu
+
+        packed = npu_format_cast(weight.detach())
+        packed_format = int(torch_npu.get_npu_format(packed))
+        if packed_format != 29:
+            logger.warning(
+                "Dense DSpark fc requested FRACTAL_NZ but got ACL format %d.",
+                packed_format,
+            )
+            return
+        self._main_proj_nz_weight = packed
+        logger.info("Cached dense DSpark fc in NPU FRACTAL_NZ format.")
 
     def compute_base_logits(
         self, hidden: torch.Tensor
@@ -650,6 +693,7 @@ class DSparkDraftMixin:
         return base_logits, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self._main_proj_nz_weight = None
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
