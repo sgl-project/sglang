@@ -313,6 +313,12 @@ sgl-eval run gsm8k \\
             "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
             "--speculative-draft-attention-backend fa4",
           ],
+          // DFLASH needs this model's hidden-state capture, which landed on the
+          // GLM-5.3-Flash support branch (PR #36708 into #36507's
+          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
+          // image the Install accordion pins. Drop this note once #36507 merges
+          // and a published image carries it.
+          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
           disable: [
             {
               when: { dpAttnOn: [true] },
