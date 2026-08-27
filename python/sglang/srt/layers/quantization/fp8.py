@@ -1660,6 +1660,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
+                if _is_npu:
+                    self._process_npu_fp4_expert_weights(layer)
+                    return
+
                 if get_moe_runner_backend().is_marlin():
                     layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                     layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
@@ -2326,6 +2330,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+
+        # MXFP4 experts on Ascend NPU run through the ASCEND runner with the
+        # NPU MXFP4 kernel. The Triton runner (the auto default) expects a
+        # `hidden_states_pre_quant` field that AscendTP dispatch does not carry,
+        # and its externally pre-quantised activation workflow is incompatible
+        # with the NPU kernel that quantises activations internally.
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUW4A8MXFP4MoEMethod,
+            )
+
+            layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
+            layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
+            moe_runner_config.layer = layer
+            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+            return
+
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
@@ -2375,6 +2396,47 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             block_shape=self.weight_block_size,
         )
 
+    def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
+        """Convert HF MXFP4 experts to the layout ``NPUW4A8MXFP4MoEMethod`` needs.
+
+        HF stores the packed FP4 weights as int8 and the block scale as float32;
+        the NPU kernel expects the weight laid out in FRACTAL_NZ (transposed) and
+        the scale as e8m0 (uint8) reshaped into ``[E, K//64, N, 2]``.
+        """
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            _get_float4_e2m1fn_x2_dtype,
+        )
+        from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+
+        for prefix in ("w13", "w2"):
+            weight = getattr(layer, f"{prefix}_weight")
+
+            weight.data = npu_format_cast(
+                weight.data.view(torch.uint8),
+                customize_dtype=torch.float8_e4m3fn,
+                input_dtype=fp4_dtype,
+            ).transpose(-1, -2)
+
+            # HF stores the block scale as a float32 whose value IS the e8m0
+            # byte (bias-127 exponent), e.g. 116 -> 2^(116-127) = 2^-11. It is
+            # already e8m0-encoded, so cast straight to uint8. Applying
+            # round(log2)+127 here would re-bias the exponent (116 -> 134 -> 2^7)
+            # and inflate every scale by ~2^17, blowing up the GMM output.
+            scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
+            scale = scale_inv.data.to(torch.float32)
+            e8m0 = scale.clamp(0, 255).to(torch.uint8)
+            scale = e8m0.reshape(
+                scale.shape[0],
+                scale.shape[1],
+                scale.shape[2] // 2,
+                2,
+            ).transpose(1, 2)
+            scale_inv.data = scale
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2385,6 +2447,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if _is_npu and self.is_fp4_expert:
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale_inv,
+                w2_weight_scale=layer.w2_weight_scale_inv,
+            )
+            out = self.runner.run(dispatch_output, quant_info)
+            return out
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
