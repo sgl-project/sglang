@@ -291,19 +291,12 @@ class SWAComponent(TreeComponent):
             old_full = full_cd.value
             if full_cd.lock_ref > 0:
                 cache_actions.append(
-                    RecoverSWAWithLockedFull(
-                        node.id,
-                        old_full,
-                        value_slice,
-                        self._translate_full_to_swa(value_slice),
-                    )
+                    RecoverSWAWithLockedFull(node.id, old_full, value_slice)
                 )
                 return 0
             full_cd.value = value_slice.clone()
             cache_actions.append(FreeDeviceKV([old_full]))
-            cache_actions.append(
-                SWARebuild(node.id, self._translate_full_to_swa(value_slice))
-            )
+            cache_actions.append(SWARebuild(node.id, value_slice))
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
@@ -316,19 +309,12 @@ class SWAComponent(TreeComponent):
             new_full = value_slice[start_idx:]
             if is_locked:
                 cache_actions.append(
-                    RecoverSWAWithLockedFull(
-                        node.id,
-                        old_full,
-                        new_full,
-                        self._translate_full_to_swa(new_full),
-                    )
+                    RecoverSWAWithLockedFull(node.id, old_full, new_full)
                 )
                 return start_idx
             node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
             cache_actions.append(FreeDeviceKV([old_full]))
-            cache_actions.append(
-                SWARebuild(node.id, self._translate_full_to_swa(new_full))
-            )
+            cache_actions.append(SWARebuild(node.id, new_full))
             return start_idx
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
@@ -368,9 +354,7 @@ class SWAComponent(TreeComponent):
         cache_actions.append(
             SWARebuild(
                 node.id,
-                self._translate_full_to_swa(
-                    node.component_data[BASE_COMPONENT_TYPE].value
-                ),
+                node.component_data[BASE_COMPONENT_TYPE].value,
             )
         )
 
@@ -403,17 +387,13 @@ class SWAComponent(TreeComponent):
             cache_actions.append(
                 SWARebuild(
                     capped_parent.id,
-                    self._translate_full_to_swa(
-                        capped_parent.component_data[BASE_COMPONENT_TYPE].value
-                    ),
+                    capped_parent.component_data[BASE_COMPONENT_TYPE].value,
                 )
             )
         cache_actions.append(
             SWARebuild(
                 node.id,
-                self._translate_full_to_swa(
-                    node.component_data[BASE_COMPONENT_TYPE].value
-                ),
+                node.component_data[BASE_COMPONENT_TYPE].value,
             )
         )
 
@@ -1171,17 +1151,21 @@ class SWAComponent(TreeComponent):
                 alloc.set_full_to_swa_mapping(full, swa)
             return
         if isinstance(action, RecoverSWAWithLockedFull):
-            # Keep the locked full, free only the incoming full.
-            alloc.set_full_to_swa_mapping(action.kept_full, action.swa_value)
+            # Keep the locked full; remap it onto the incoming full's SWA translation,
+            # freeing only the incoming full, then store the swa on the node.
+            swa_value = self._translate_full_to_swa(action.incoming_full)
+            alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
             alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.full_attn_allocator.free(action.incoming_full)
             self.tree_core.set_component_device_value(
-                action.node_id, self.component_type, action.swa_value
+                action.node_id, self.component_type, swa_value
             )
             return
         if isinstance(action, SWARebuild):
+            # Translate the node's source full value to SWA and store it on the node.
+            swa_value = self._translate_full_to_swa(action.source_value)
             self.tree_core.set_component_device_value(
-                action.node_id, self.component_type, action.swa_value
+                action.node_id, self.component_type, swa_value
             )
             return
         raise AssertionError(

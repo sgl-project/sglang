@@ -158,12 +158,15 @@ class C128SidecarComponent(TreeComponent):
         """Keep a deferred SWA rebuild aligned when C128 splits its source node."""
         for i, pending in enumerate(cache_actions):
             if isinstance(pending, SWARebuild) and pending.node_id == child.id:
-                # Slice the SWA slots the pending action already owns;
-                # re-translating here would re-read a mutable mapping.
-                split = len(new_parent.component_data[BASE_COMPONENT_TYPE].value)
                 cache_actions[i : i + 1] = [
-                    SWARebuild(new_parent.id, pending.swa_value[:split]),
-                    SWARebuild(child.id, pending.swa_value[split:]),
+                    SWARebuild(
+                        new_parent.id,
+                        new_parent.component_data[BASE_COMPONENT_TYPE].value,
+                    ),
+                    SWARebuild(
+                        child.id,
+                        child.component_data[BASE_COMPONENT_TYPE].value,
+                    ),
                 ]
                 return
 

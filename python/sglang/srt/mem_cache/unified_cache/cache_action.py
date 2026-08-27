@@ -83,24 +83,19 @@ class RebuildFullToSWAMapping(ComponentAction, frozen=True):
 
 class RecoverSWAWithLockedFull(ComponentAction, frozen=True):
     """Recover an SWA tombstone whose full is locked: keep the locked full, remap it
-    onto the incoming full's SWA translation, and free only the incoming full.
-
-    ``swa_value`` is resolved at emit time: a later action in the same barrier
-    may clear the incoming full's mapping.
-    """
+    onto the incoming full's SWA translation, and free only the incoming full."""
 
     node_id: NodeId
     kept_full: torch.Tensor
     incoming_full: torch.Tensor
-    swa_value: torch.Tensor
     component_type: ComponentType = ComponentType.SWA
 
 
 class SWARebuild(ComponentAction, frozen=True):
-    """Store a node's SWA value, resolved from its full value when emitted."""
+    """Rebuild a node's SWA value by translating its source full value, then store it."""
 
     node_id: NodeId
-    swa_value: torch.Tensor
+    source_value: torch.Tensor
     component_type: ComponentType = ComponentType.SWA
 
 
