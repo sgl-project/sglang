@@ -140,7 +140,7 @@ repos:
         pass_filenames: false
       - id: rustfmt-sgl-router
         name: rustfmt experimental/sgl-router
-        entry: bash -c 'cd experimental/sgl-router && cargo fmt -- --check'
+        entry: bash -c 'cd experimental/sgl-router && cargo fmt --all -- --check'
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false

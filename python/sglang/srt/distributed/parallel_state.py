@@ -840,6 +840,7 @@ class GroupCoordinator:
         eps: float,
         group_size: int = 128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
@@ -853,6 +854,10 @@ class GroupCoordinator:
         ``(fp8, residual_out, scale, bf16)`` — used by GDN-style layers that
         need both an FP8 projection and a bf16 gating projection without
         launching a separate per-group quant kernel.
+
+        When ``transpose_scale=True`` the kernel writes the per-group scale in
+        the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
+        caller can skip the post-kernel scale transpose.
         """
         if not (is_hip() and is_gfx95_supported()):
             return None
@@ -899,6 +904,7 @@ class GroupCoordinator:
                 group_size,
                 use_1stage_ar,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
         except Exception:
             return None

@@ -25,6 +25,7 @@ from sglang.srt.utils.hf_transformers.common import (
     get_context_length,
     get_hf_text_config,
     get_rope_config,
+    resolve_hf_gguf_reference,
 )
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
@@ -360,6 +361,43 @@ class TestCheckGgufFile(unittest.TestCase):
     def test_directory(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertFalse(check_gguf_file(d))
+
+
+class TestResolveHfGgufReference(unittest.TestCase):
+    @patch("huggingface_hub.hf_hub_download", return_value="/cache/model-Q4_K.gguf")
+    @patch("huggingface_hub.HfApi")
+    def test_resolves_quant_type(self, api_cls, download):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="model-Q8_0.gguf"),
+        ]
+
+        resolved = resolve_hf_gguf_reference("owner/repo:Q4_K", revision="revision")
+
+        self.assertEqual(resolved, "/cache/model-Q4_K.gguf")
+        download.assert_called_once_with(
+            "owner/repo", "model-Q4_K.gguf", revision="revision"
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_rejects_ambiguous_quant_type(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="fl2va-Q4_K.gguf"),
+            SimpleNamespace(rfilename="ref2va-Q4_K.gguf"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            resolve_hf_gguf_reference("owner/repo:Q4_K")
+
+    @patch("huggingface_hub.HfApi")
+    def test_reports_available_files_when_quant_type_is_missing(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="README.md"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "model-Q4_K.gguf"):
+            resolve_hf_gguf_reference("owner/repo:Q8_0")
 
 
 # ---------------------------------------------------------------------------

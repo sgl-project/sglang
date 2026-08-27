@@ -395,7 +395,9 @@ class TopK(BaseFusedOp):
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
     --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
-    --fused_shared_experts_scaling_factor: scaling factor for fused shared experts on AMD-platform.
+    --fused_shared_experts_scaling_factor: scaling factor applied to the fused shared experts'
+      topk weight (models pass 1/ep_size under standard EP, where the per-rank shared-expert
+      outputs are all-reduced).
     """
 
     def __init__(
@@ -439,8 +441,8 @@ class TopK(BaseFusedOp):
             num_fused_shared_experts = 0
             output_format = TopKOutputFormat.STANDARD
 
-        # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
-        # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
+        # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
+        # (consumes topk_ids/weights); otherwise BYPASSED. No-op on other backends.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
@@ -780,6 +782,8 @@ def fused_topk_cpu(
         raise ValueError("packed_out is not supported for CPU fused topk")
     if num_token_non_padded is not None:
         raise ValueError("num_token_non_padded is not supported for CPU fused topk")
+    if correction_bias is not None and correction_bias.dtype != torch.float32:
+        correction_bias = correction_bias.to(torch.float32)
 
     if scoring_func == "softmax":
         topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
@@ -1271,6 +1275,10 @@ def biased_topk_jit_kernel_impl(
     else:
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 
+        # DeepSeek-V4 stores e_score_correction_bias in bf16 (for the aiter
+        # sqrtsoftplus topk path). moe_fused_gate upcasts the bias to fp32
+        # in-register, so pass it through directly rather than allocating a fresh
+        # fp32 copy of this static routing bias on every MoE invocation.
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
@@ -1285,6 +1293,47 @@ def biased_topk_jit_kernel_impl(
             torch.int32
         )
         return topk_weights, topk_ids
+
+
+def biased_topk_xpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    scoring_func: str = "sigmoid",
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    apply_routed_scaling_factor_on_output: Optional[bool] = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    num_rows, _ = gating_output.shape
+    device = gating_output.device
+
+    output = torch.empty(num_rows, topk, dtype=torch.float32, device=device)
+    indices = torch.empty(num_rows, topk, dtype=torch.int32, device=device)
+
+    from sgl_kernel import biased_topk
+
+    biased_topk(
+        gating_output,
+        correction_bias,
+        output,
+        indices,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        renormalize,
+        routed_scaling_factor=(routed_scaling_factor if routed_scaling_factor else 1.0),
+        apply_routed_scaling_factor_on_output=bool(
+            apply_routed_scaling_factor_on_output
+        ),
+    )
+
+    return output, indices
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -1571,17 +1620,33 @@ def biased_grouped_topk_gpu(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        bias = correction_bias.to(dtype=gating_output.dtype)
+        scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
+
+        if envs.SGLANG_K3_RADIX4_TOPK.get():
+            from sglang.kernels.ops.moe import moe_route_radix4
+
+            # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
+            # ungrouped) is the only config covered for now; anything else
+            # falls back to aiter.
+            if moe_route_radix4.available() and moe_route_radix4.covered(
+                gating_output, bias, topk, num_expert_group, topk_group
+            ):
+                return moe_route_radix4.route_radix4(
+                    gating_output, bias, topk, renormalize, scaling
+                )
+
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
             gating_output,
-            correction_bias.to(dtype=gating_output.dtype),
+            bias,
             topk_weights,
             topk_ids,
             num_expert_group,
             topk_group,
             renormalize,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            scaling,
         )
         return topk_weights, topk_ids
     elif _is_musa and (
@@ -1741,7 +1806,8 @@ def biased_grouped_topk_gpu(
                 topk_indices,
                 gating_output,
                 renormalize,
-                correction_bias,
+                # The XPU topk_sigmoid AOT kernel requires an fp32 correction bias.
+                correction_bias.to(torch.float32),
                 scale,
             )
 
@@ -1838,7 +1904,7 @@ def remap_topk_for_per_rank_shared_slots(
     so tokens route to the correct rank. The layout is ordered by rank:
     [rank0 routed..., rank0 shared, rank1 routed..., rank1 shared, ...].
 
-    Routed IDs:  e -> e + e // num_local_routed
+    Routed IDs:  e -> e + (e // num_local_routed) * num_fused_shared_experts
     Shared IDs:  ep_rank * num_local_experts + num_local_routed
     Shared weight: 1.0 on the aiter path, else 1/routed_scaling_factor (see below).
     """
@@ -1853,9 +1919,15 @@ def remap_topk_for_per_rank_shared_slots(
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
-    # Remap routed IDs: insert gaps for shared expert slots (single fused op)
+    # Remap routed IDs: insert gaps for shared expert slots (single fused op).
+    # Each rank r == e // num_local_routed is preceded by r shared-slot blocks of
+    # width num_fused_shared_experts, so shift by (e // num_local_routed) * S --
+    # a single-slot shift (S == 1) would let routed ids collide with an earlier
+    # rank's shared slots once S > 1.
     routed = topk_ids[:, :-num_fused_shared_experts]
-    topk_ids[:, :-num_fused_shared_experts] = routed + routed // num_local_routed
+    topk_ids[:, :-num_fused_shared_experts] = (
+        routed + (routed // num_local_routed) * num_fused_shared_experts
+    )
 
     # Set shared expert IDs to route to home rank (vectorized)
     topk_ids[:, -num_fused_shared_experts:] = (
@@ -2087,6 +2159,14 @@ def _post_process_topk_ids(
             num_physical_routed_experts,
             topk_config,
         )
+    elif (
+        num_fused_shared_experts > 0 and fused_shared_experts_scaling_factor is not None
+    ):
+        # Standard EP all-reduces the per-rank shared-expert outputs; without the
+        # supplied 1/ep_size factor the shared contribution is summed ep_size times.
+        topk_weights[
+            :, -num_fused_shared_experts:
+        ] *= fused_shared_experts_scaling_factor
 
     if _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
@@ -2185,7 +2265,8 @@ def select_experts(
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
         if scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid":
-            topk_weights, topk_ids = biased_topk_jit_kernel_impl(
+            _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
+            topk_weights, topk_ids = _biased_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,

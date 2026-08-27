@@ -8,7 +8,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=25, suite="base-b-test-cpu")
+register_cpu_ci(est_time=14, suite="base-b-test-cpu")
 
 torch.manual_seed(42)
 

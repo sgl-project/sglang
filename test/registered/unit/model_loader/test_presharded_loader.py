@@ -803,18 +803,20 @@ class TestShardConfig(unittest.TestCase):
             "init_expert_location",
             "structural_signature",
         }
+        # Both tiers on one stand-in: bare names are the live groups, `config`
+        # is the published parallel bag.
         parallel = SimpleNamespace(
             tp_size=8,
             moe_dp_size=2,
             moe_ep_size=4,
             pp_size=1,
-            moe_dense_tp_size=1,
-            enable_dp_lm_head=True,
+            config=SimpleNamespace(
+                moe_dp_size=2,
+                moe_dense_tp_size=1,
+                enable_dp_lm_head=True,
+            ),
         )
         with mock.patch(
-            "sglang.srt.model_loader.loader.configured_moe_dp_size",
-            return_value=2,
-        ), mock.patch(
             "sglang.srt.model_loader.loader.get_parallel",
             return_value=parallel,
         ), mock.patch(
