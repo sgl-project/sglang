@@ -452,6 +452,15 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
+    def stash_bonus_tokens(
+        self, indices: torch.Tensor, bonus_tokens: torch.Tensor
+    ) -> None:
+        """Write only output_tokens_buf rows; for relays carrying no draft
+        extras (stash() would lazy-init the spec bufs from the payload)."""
+        self.output_tokens_buf[indices] = bonus_tokens.to(
+            self.output_tokens_buf.dtype
+        )
+
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that

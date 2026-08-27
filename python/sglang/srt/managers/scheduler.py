@@ -3542,6 +3542,18 @@ class Scheduler(
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
+                if not self.enable_overlap and not self.spec_algorithm.is_none():
+                    # Non-overlap spec carries bonus tokens on the draft
+                    # input, not in the relay; stash the tails' pending
+                    # tokens so the mixed input resolve reads real values.
+                    last_tokens = torch.tensor(
+                        [r.output_ids[-1] for r in running_batch.reqs],
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    self.future_map.stash_bonus_tokens(
+                        running_batch.req_pool_indices, last_tokens
+                    )
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full
             )
