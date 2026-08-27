@@ -826,9 +826,7 @@ class DeepseekV4AscendAttnBackend(
         speculative_step_id: int = 0,
     ):
         super().__init__(model_runner, speculative_step_id=speculative_step_id)
-        self.use_graph_swa_mask = False
         cfg = model_runner.model_config
-        self._dsv4_config = cfg
         tp_size = get_parallel().attn_tp_size
         self._dsv4_q_head_num = cfg.num_attention_heads // tp_size
         self._dsv4_kv_head_num = 1  # V4 MQA / latent
@@ -1004,211 +1002,38 @@ class DeepseekV4AscendAttnBackend(
         in_capture: bool = False,
     ):
         bs = forward_batch.batch_size
-        metadata_key = self._dsv4_graph_metadata_key(forward_batch)
         ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
+        metadata_key = (
+            ("ragged_verify", int(ragged_layout.graph_num_tokens))
+            if ragged_layout is not None
+            else bs
+        )
         if in_capture:
-            self._init_dsv4_shared_graph_metadata(
-                metadata_key=metadata_key,
-                bs=bs,
-                forward_mode=forward_batch.forward_mode,
-                seq_lens=forward_batch.seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
-            )
             self._init_dsv4_graph_metadata(
-                metadata_key,
-                bs,
-                forward_batch.forward_mode,
-                ragged_layout,
+                metadata_key=metadata_key,
+                forward_batch=forward_batch,
+                ragged_layout=ragged_layout,
             )
-        self._apply_dsv4_shared_graph_metadata(
+        self._apply_dsv4_graph_metadata(
             metadata_key=metadata_key,
             forward_batch=forward_batch,
-            ragged_layout=ragged_layout,
             in_capture=in_capture,
         )
-        if not in_capture:
-            self._apply_dsv4_graph_metadata(forward_batch)
 
-    def _dsv4_graph_metadata_key(self, forward_batch: ForwardBatch):
-        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
-        if ragged_layout is not None:
-            return ("ragged_verify", int(ragged_layout.graph_num_tokens))
-        return forward_batch.batch_size
-
-    def _init_dsv4_shared_graph_metadata(
-        self,
-        *,
-        metadata_key,
-        bs: int,
-        forward_mode: ForwardMode,
-        seq_lens: torch.Tensor,
-        out_cache_loc: Optional[torch.Tensor],
-    ) -> ForwardMetadata:
-        """Allocate the graph metadata shared by DSV4 attention paths.
-
-        Unlike ``AscendAttnBackend``, DSV4 keeps the final Attention/KV lengths
-        in dedicated storage.  ``forward_batch.seq_lens`` remains the committed
-        prefix throughout capture and replay, which is also the CUDA DSpark
-        verify-epilogue contract.
-        """
-        metadata = ForwardMetadata()
-        metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        if self.is_hybrid_swa:
-            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
-            metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
-        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
-                : out_cache_loc.shape[0]
-            ]
-
-        metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        metadata.seq_lens = torch.empty_like(seq_lens)
-        metadata.seq_lens.copy_(seq_lens)
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            metadata.actual_seq_lengths_q = torch.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens
-                + bs * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-        else:
-            metadata.actual_seq_lengths_q = torch.arange(
-                1,
-                bs + 1,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-
-        if forward_mode.is_dllm_extend():
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.dllm_block_size,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-            metadata.seq_lens_list_cumsum = (
-                torch.cumsum(extend_seq_lens, dim=0).int().tolist()
-            )
-
-        if (
-            self.q_head_num_padding is not None
-            and self.q_head_num_padding > self.tp_q_head_num
-        ):
-            dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
-            metadata.nope_padding = torch.empty(
-                (
-                    bs,
-                    1,
-                    self.q_head_num_padding - self.tp_q_head_num,
-                    self.kv_lora_rank,
-                ),
-                dtype=dtype,
-                device=seq_lens.device,
-            )
-            metadata.rope_padding = torch.empty(
-                (
-                    bs,
-                    1,
-                    self.q_head_num_padding - self.tp_q_head_num,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=dtype,
-                device=seq_lens.device,
-            )
-
-        self.graph_metadata[metadata_key] = metadata
-        return metadata
-
-    def _apply_dsv4_shared_graph_metadata(
+    def _init_dsv4_graph_metadata(
         self,
         *,
         metadata_key,
         forward_batch: ForwardBatch,
         ragged_layout,
-        in_capture: bool,
     ) -> None:
-        """Refresh common graph metadata without mutating the live prefixes."""
-        metadata = self.graph_metadata[metadata_key]
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        live_seq_lens = forward_batch.seq_lens
-        seq_lens_cpu = live_seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
-        out_cache_loc = forward_batch.out_cache_loc
-
-        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            num_tokens = out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[num_tokens:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:num_tokens].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
-            )
-
-        max_len = seq_lens_cpu[:bs].max().item()
-        is_dflash_verify = (
-            spec_info is not None
-            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
-        )
-        if forward_mode.is_target_verify() and not is_dflash_verify:
-            max_len += self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            max_len += self.speculative_step_id + 1
-        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-
-        if self.is_hybrid_swa:
-            full_page_locs = self.req_to_token[
-                req_pool_indices[:bs],
-                0 : max_len : self.page_size,
-            ]
-            swa_page_table = (
-                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
-            )
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
-
-            seq_lens_int = live_seq_lens[:bs].int()
-            starts = torch.clamp(seq_lens_int - self.sliding_window_size, min=0)
-            indices = self.graph_metadata["swa_indices"]
-            mask = (indices.unsqueeze(0) < starts.unsqueeze(1)) | (
-                indices.unsqueeze(0) >= seq_lens_int.unsqueeze(1)
-            )
-            metadata.swa_mask[:bs, 0, :].copy_(mask)
-            metadata.swa_mask[bs:, :, :].fill_(True)
-
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-            // self.page_size
-        )
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
-
-        final_seq_lens = live_seq_lens
-        if forward_mode.is_target_verify():
-            if ragged_layout is None:
-                final_seq_lens = live_seq_lens + self.speculative_num_draft_tokens
-            else:
-                final_seq_lens = live_seq_lens + ragged_layout.verify_lens.to(
-                    live_seq_lens.dtype
-                )
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            final_seq_lens = live_seq_lens + self.speculative_step_offset_npu
-        metadata.seq_lens[:bs].copy_(final_seq_lens[:bs])
-
-        self.forward_metadata = metadata
-        self.graph_mode = True
-
-    def _init_dsv4_graph_metadata(
-        self,
-        metadata_key,
-        bs: int,
-        forward_mode: ForwardMode,
-        ragged_layout=None,
-    ) -> None:
-        metadata = self.graph_metadata[metadata_key]
         device = self.device
+        metadata = ForwardMetadata()
+        metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
 
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             tokens_per_req = self._dsv4_graph_tokens_per_req
@@ -1296,7 +1121,7 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_sparse_indices[:, :, 0] = 0
             metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
 
-        self.forward_metadata = metadata
+        self.graph_metadata[metadata_key] = metadata
 
     @staticmethod
     def _copy_2d_with_tail(dst: torch.Tensor, src: torch.Tensor, val: int) -> None:
@@ -1513,6 +1338,8 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
+        valid = ctx.live_seq_lens > 0
+        positions_last = torch.clamp(ctx.live_seq_lens - 1, min=0)
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
@@ -1520,12 +1347,6 @@ class DeepseekV4AscendAttnBackend(
             if bundle is not None:
                 loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
-
-        valid = ctx.live_seq_lens > 0
-        positions_last = torch.clamp(ctx.live_seq_lens - 1, min=0)
-        for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
-                continue
             should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
             pos_cmp = positions_last[should_compress].to(torch.int64) + (1 - ratio)
             self._copy_1d_with_zero_tail(
@@ -1589,22 +1410,16 @@ class DeepseekV4AscendAttnBackend(
                 (valid.to(torch.int32) * int(ctx.tokens_per_bs)).to(device=ctx.device)
             )
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
-        if bundle is None:
-            # Metadata storage is reused by every replay of this token tier.
-            # Never leave compressed-KV write locations from the previous
-            # request. Compressor state is fixed ring storage after the DSV4
-            # memory-pool refactor; its replay metadata is refreshed through
-            # dsv4_explicit_state_block_tables below, not through this
-            # allocation bundle.
-            for ratio in self._dsv4_unique_compress_ratios:
-                if ratio not in (4, 128):
-                    continue
-                self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), None)
-            return
+        # Metadata storage is reused by every replay of this token tier.  A
+        # missing bundle must clear locations left by the previous request.
+        # Compressor state is fixed ring storage and is refreshed through
+        # dsv4_explicit_state_block_tables, not this allocation bundle.
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
-            loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
+            loc = None
+            if bundle is not None:
+                loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
 
     @staticmethod
@@ -1717,7 +1532,57 @@ class DeepseekV4AscendAttnBackend(
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
         fm.c4_topk_indices.fill_(-1)
 
-    def _apply_dsv4_graph_metadata(self, forward_batch: ForwardBatch) -> None:
+    def _apply_dsv4_graph_metadata(
+        self,
+        *,
+        metadata_key,
+        forward_batch: ForwardBatch,
+        in_capture: bool,
+    ) -> None:
+        metadata = self.graph_metadata[metadata_key]
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens_cpu = (
+            forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
+        )
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        max_len = seq_lens_cpu[:bs].max().item()
+        is_dflash_verify = (
+            spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+        )
+        if forward_mode.is_target_verify() and not is_dflash_verify:
+            max_len += self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            max_len += self.speculative_step_id + 1
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+        if self.is_hybrid_swa:
+            full_page_locs = self.req_to_token[
+                req_pool_indices[:bs],
+                0 : max_len : self.page_size,
+            ]
+            swa_page_table = (
+                self.full_to_swa_index_mapping[full_page_locs] // self.page_size
+            )
+            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(swa_page_table)
+            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables_swa[bs:, :].fill_(0)
+
+        metadata.block_tables[:bs, :max_seq_pages].copy_(
+            self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+            // self.page_size
+        )
+        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        metadata.block_tables[bs:, :].fill_(0)
+
+        self.forward_metadata = metadata
+        self.graph_mode = True
+        if in_capture:
+            return
+
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
         self._refresh_graph_seq_metadata(ctx)
@@ -1736,8 +1601,6 @@ class DeepseekV4AscendAttnBackend(
         self._refresh_graph_swa_metadata_direct(ctx)
         self._refresh_graph_dspark_sparse_metadata(ctx)
         self._refresh_graph_kernel_metadata(ctx)
-
-        self.forward_metadata = ctx.fm
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)
@@ -1857,13 +1720,8 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         if ragged_layout is not None:
-            # The metadata operator accepts an upper bound. Keep this host-free
-            # when verify_lens is device-only by using the configured cap.
-            max_seqlen_q = int(
-                ragged_layout.max_q_len
-                or ragged_layout.cap
-                or forward_batch.spec_info.draft_token_num
-            )
+            # _dspark_ragged_verify_layout always returns the capped graph layout.
+            max_seqlen_q = int(ragged_layout.cap)
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
