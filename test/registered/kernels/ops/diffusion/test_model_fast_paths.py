@@ -34,6 +34,7 @@ import sglang.multimodal_gen.runtime.models.dits.ernie_image as ernie_image
 import sglang.multimodal_gen.runtime.models.dits.flux as flux
 import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
 import sglang.multimodal_gen.runtime.models.dits.glm_image as glm_image
+import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat_image
 import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
@@ -42,6 +43,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_rmsnorm_scale_shift,
     can_use_wan_rmsnorm_silu,
     fused_ltx2_rms_norm_modulate,
+    hunyuan_qkv_rope_pack,
     mark_fused_ln_modulate_site,
     mark_hunyuan_qknorm_site,
     mark_ltx2_rms_norm_modulate_site,
@@ -56,7 +58,11 @@ from sglang.kernels.ops.diffusion.common.platform import is_cuda
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    RMSNormNoWeight,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb,
 )
@@ -85,12 +91,15 @@ from sglang.multimodal_gen.runtime.models.dits.hunyuanvideo import (
     _hunyuan_pack_qkv,
     _hunyuan_qknorm,
 )
+from sglang.multimodal_gen.runtime.models.dits.longcat_image import (
+    _apply_longcat_qknorm_rope,
+)
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import _ltx2_rms_norm_modulate
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     _eager_ln_modulate as _sana_eager_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.dits.sana import (
-    _sana_ln_modulate,
+    sana_ln_modulate,
 )
 from sglang.multimodal_gen.runtime.models.vaes import flux2_vae_cuda_opt as vae_opt
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -352,7 +361,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
     # default-stream eager serving must stay on the untouched eager chain
     n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
-    _sana_ln_modulate(norm, x, scale, shift)
+    sana_ln_modulate(norm, x, scale, shift)
     assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
     # The fusion engages on non-default streams (the BCG warmup/capture path).
     # x/scale/shift were filled on the default stream, so the side stream must
@@ -364,9 +373,9 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        out = _sana_ln_modulate(norm, x, scale, shift)
+        out = sana_ln_modulate(norm, x, scale, shift)
         assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
-        out2 = _sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
+        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
@@ -491,6 +500,54 @@ def test_ernie_qknorm_rope_first_attempt_exception_uses_pristine_inputs():
 
 
 # -------------------------------------------------------------------------
+# LongCat-Image -- full-width interleaved QKNorm + RoPE
+# -------------------------------------------------------------------------
+
+
+@requires_inline_ptx
+def test_longcat_qknorm_rope_is_bit_exact():
+    torch.manual_seed(3)
+    batch, seq, heads, head_dim = 2, 17, 24, 128
+    offset = 11
+    q = torch.randn(batch, seq, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    q_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    k_norm = RMSNorm(head_dim, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        q_norm.weight.copy_(torch.randn_like(q_norm.weight))
+        k_norm.weight.copy_(torch.randn_like(k_norm.weight))
+
+    cos = torch.randn(offset + seq, head_dim, device="cuda")
+    sin = torch.randn_like(cos)
+    image_rotary_emb = (cos[offset:], sin[offset:])
+    cache = torch.cat((cos, sin), dim=-1).contiguous()
+    positions = torch.arange(offset, offset + seq, device="cuda", dtype=torch.int64)
+
+    q_ref, k_ref = apply_qk_norm(q.clone(), k.clone(), q_norm, k_norm, head_dim)
+    q_ref = longcat_image.apply_rotary_emb(q_ref, image_rotary_emb, sequence_dim=1)
+    k_ref = longcat_image.apply_rotary_emb(k_ref, image_rotary_emb, sequence_dim=1)
+
+    q_fused, k_fused = q.clone(), k.clone()
+    q_out, k_out = _apply_longcat_qknorm_rope(
+        q_fused,
+        k_fused,
+        q_norm,
+        k_norm,
+        head_dim,
+        image_rotary_emb,
+        cache,
+        positions,
+    )
+
+    assert q_out.data_ptr() == q_fused.data_ptr()
+    assert k_out.data_ptr() == k_fused.data_ptr()
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert longcat_image._LONGCAT_QKNORM_ROPE.verified
+    assert not longcat_image._LONGCAT_QKNORM_ROPE.disabled
+
+
+# -------------------------------------------------------------------------
 # LTX-2 -- weightless RMSNorm + modulate (quality-gated)
 # -------------------------------------------------------------------------
 
@@ -583,6 +640,47 @@ def test_hunyuan_qkv_rope_pack_is_bit_exact(img_tokens, txt_tokens):
     assert torch.equal(q, q_ref)
     assert torch.equal(k, k_ref)
     assert torch.equal(v, v_ref)
+
+
+def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
+    if torch.cuda.get_device_properties(0).total_memory < 16 * 2**30:
+        pytest.skip("needs >= 16 GB GPU memory")
+
+    img_tokens, txt_tokens = 115200, 8
+    num_heads, head_dim = 24, 128
+    total_tokens = img_tokens + txt_tokens
+    projection_width = 21504
+
+    projection = torch.zeros(
+        (1, total_tokens, projection_width),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    qkv = projection[..., : 3 * num_heads * head_dim].view(
+        1, total_tokens, 3, num_heads, head_dim
+    )
+    q = qkv[:, :, 0].contiguous()
+    k = qkv[:, :, 1].contiguous()
+    v = qkv[:, :, 2]
+    assert (img_tokens - 1) * v.stride(1) > torch.iinfo(torch.int32).max
+
+    cos = torch.ones((img_tokens, head_dim // 2), device="cuda")
+    sin = torch.zeros_like(cos)
+    packed = hunyuan_qkv_rope_pack(
+        q[:, :img_tokens],
+        k[:, :img_tokens],
+        v[:, :img_tokens],
+        q[:, img_tokens:],
+        k[:, img_tokens:],
+        v[:, img_tokens:],
+        cos,
+        sin,
+    )
+    torch.cuda.synchronize()
+
+    expected_shape = (1, total_tokens, num_heads, head_dim)
+    assert all(x.shape == expected_shape for x in packed)
+    assert all(x[0, img_tokens - 1, -1, -1].item() == 0 for x in packed)
 
 
 def test_hunyuan_quality_qknorm_matches_rmsnorm():
