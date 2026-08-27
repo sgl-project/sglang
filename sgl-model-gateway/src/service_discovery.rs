@@ -89,6 +89,16 @@ impl ServiceDiscoveryConfig {
     }
 }
 
+/// Pods this discovery loop believes are registered, keyed by
+/// [`PodInfo::identity`].
+///
+/// A map rather than a set of `PodInfo`: every lookup here — the add path's
+/// dedup, the delete path's removal, the reconcile's diff — asks "is THIS pod
+/// tracked", which is a question about identity. Keying by the whole struct
+/// answers a different question ("is this pod tracked in exactly this state")
+/// and gets it wrong the moment a pod's status or readiness flips.
+type TrackedPods = Arc<Mutex<HashMap<String, PodInfo>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodType {
     Prefill,
@@ -99,6 +109,12 @@ pub enum PodType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PodInfo {
     pub name: String,
+    /// The API server's UID for this pod, used as its identity.
+    ///
+    /// `None` only for hand-built `Pod` objects; every pod returned by a LIST
+    /// or WATCH carries one. See [`PodInfo::identity`] for why the identity is
+    /// the UID and not the name.
+    pub uid: Option<String>,
     pub ip: String,
     pub status: String,
     pub is_ready: bool,
@@ -147,6 +163,7 @@ impl PodInfo {
 
     pub fn from_pod(pod: &Pod, config: Option<&ServiceDiscoveryConfig>) -> Option<Self> {
         let name = pod.metadata.name.clone()?;
+        let uid = pod.metadata.uid.clone();
         let status = pod.status.clone()?;
         let pod_ip = status.pod_ip?;
 
@@ -215,6 +232,7 @@ impl PodInfo {
 
         Some(PodInfo {
             name,
+            uid,
             ip: pod_ip,
             status: pod_status,
             is_ready,
@@ -223,6 +241,22 @@ impl PodInfo {
             is_router,
             mesh_port,
         })
+    }
+
+    /// Stable identity of the pod, used to key the tracked set.
+    ///
+    /// The UID is the only key with both properties the tracked set needs: it
+    /// does not change when the pod's status or readiness flips, and it
+    /// differs for a pod recreated under the same name. Neither the name nor
+    /// the full struct has both — the name is shared by a replaced pod (and,
+    /// under `Api::all`, by same-named pods in other namespaces), while full
+    /// struct equality breaks on the first status flip.
+    ///
+    /// Falls back to the name when the object carries no UID, which degrades
+    /// to the previous name-keyed behaviour rather than dropping the pod from
+    /// discovery altogether.
+    pub fn identity(&self) -> &str {
+        self.uid.as_deref().unwrap_or(&self.name)
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -303,7 +337,7 @@ pub async fn start_service_discovery(
     }
 
     let handle = task::spawn(async move {
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
 
         let pods: Api<Pod> = if let Some(namespace) = &config.namespace {
             Api::namespaced(client, namespace)
@@ -499,7 +533,7 @@ pub async fn start_service_discovery(
 
 async fn handle_pod_event(
     pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: TrackedPods,
     app_context: Arc<AppContext>,
     port: u16,
     pd_mode: bool,
@@ -517,10 +551,10 @@ async fn handle_pod_event(
                 }
             };
 
-            if tracker.contains(pod_info) {
+            if tracker.contains_key(pod_info.identity()) {
                 (false, tracker.len())
             } else {
-                tracker.insert(pod_info.clone());
+                tracker.insert(pod_info.identity().to_string(), pod_info.clone());
                 (true, tracker.len())
             }
         };
@@ -611,7 +645,7 @@ async fn handle_pod_event(
                         );
 
                         if let Ok(mut tracker) = tracked_pods.lock() {
-                            tracker.remove(pod_info);
+                            tracker.remove(pod_info.identity());
                         }
                     }
                 }
@@ -631,16 +665,21 @@ async fn handle_pod_event(
     }
 }
 
+/// Deregister a pod's worker, resolving the tracked entry by identity.
+///
+/// `pod_info` only has to identify the pod: the URL that gets deregistered
+/// comes from the STORED entry, which is the one that was registered. The
+/// caller may therefore pass a freshly parsed `PodInfo` — as the watch path
+/// does, where the pod's readiness has usually already flipped to false by the
+/// time the terminating object arrives.
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: TrackedPods,
     app_context: Arc<AppContext>,
     port: u16,
 ) {
-    let worker_url = pod_info.worker_url(port);
-
     // Remove pod and get remaining count in single lock acquisition
-    let (was_tracked, remaining_count) = {
+    let (stored, remaining_count) = {
         let mut tracked = match tracked_pods.lock() {
             Ok(tracked) => tracked,
             Err(e) => {
@@ -648,14 +687,15 @@ async fn handle_pod_deletion(
                 return;
             }
         };
-        let removed = tracked.remove(pod_info);
+        let removed = tracked.remove(pod_info.identity());
         (removed, tracked.len())
     };
 
-    if was_tracked {
+    if let Some(stored) = stored {
+        let worker_url = stored.worker_url(port);
         info!(
             "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            stored.name, stored.pod_type, worker_url
         );
 
         let job = Job::RemoveWorker {
@@ -692,7 +732,9 @@ async fn handle_pod_deletion(
     } else {
         debug!(
             "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
+            pod_info.name,
+            pod_info.pod_type,
+            pod_info.worker_url(port)
         );
     }
 }
@@ -731,7 +773,7 @@ struct ReconcileState {
 async fn reconcile_from_list(
     pods: &Api<Pod>,
     config: &ServiceDiscoveryConfig,
-    tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
+    tracked_pods: TrackedPods,
     app_context: Arc<AppContext>,
     port: u16,
     state: &ReconcileState,
@@ -749,7 +791,7 @@ async fn reconcile_from_list(
     // its own. Removing it would open exactly the zero-worker window this
     // reconcile exists to close, and the watch would not re-emit an Apply to
     // repair it — the pod would stay unregistered until the next resync.
-    let tracked_before: HashSet<PodInfo> = match tracked_pods.lock() {
+    let tracked_before: HashMap<String, PodInfo> = match tracked_pods.lock() {
         Ok(tracker) => tracker.clone(),
         Err(e) => {
             error!("SD resync: failed to lock tracked_pods: {}", e);
@@ -757,7 +799,8 @@ async fn reconcile_from_list(
         }
     };
 
-    // Names currently present in the API for matching pods, and add-missing.
+    // Identities currently present in the API for matching pods, and
+    // add-missing.
     // A pod with a deletion_timestamp is deliberately NOT counted as present:
     // the watch path deregisters a pod as soon as it starts terminating, and
     // the reconcile must mirror that semantic watch-independently. If it
@@ -768,6 +811,11 @@ async fn reconcile_from_list(
     // handle_pod_deletion is idempotent (removes only if tracked), so the
     // watch and the reconcile processing the same termination never conflict.
     let mut present: HashSet<String> = HashSet::new();
+
+    // Worker URLs claimed by a live, healthy pod in this LIST. Used to tell a
+    // same-URL replacement apart from a pod that is simply gone; see the
+    // removal pass below.
+    let mut claimed_urls: HashSet<String> = HashSet::new();
 
     // Page through the LIST rather than pulling the whole collection in one
     // response. With no namespace configured this is an Api::all over every
@@ -825,10 +873,16 @@ async fn reconcile_from_list(
             if pod.metadata.deletion_timestamp.is_some() {
                 continue;
             }
-            if let Some(name) = pod.metadata.name.clone() {
-                present.insert(name);
+            // Read the identity off the raw object so a pod that is present
+            // but not yet parseable into a PodInfo (no IP assigned) still
+            // counts as present and cannot be removed below.
+            if let Some(identity) = pod_identity(pod) {
+                present.insert(identity);
             }
             if let Some(pod_info) = PodInfo::from_pod(pod, Some(config)) {
+                if pod_info.is_healthy() {
+                    claimed_urls.insert(pod_info.worker_url(port));
+                }
                 // handle_pod_event dedups via tracked_pods and gates on
                 // is_healthy(), so re-adds are cheap no-ops.
                 handle_pod_event(
@@ -860,12 +914,36 @@ async fn reconcile_from_list(
         started.elapsed(),
     );
 
-    // Remove-absent: any pod tracked before the LIST whose name is no longer
-    // in the API. Iterate the STORED PodInfo values so handle_pod_deletion's
-    // exact-struct `tracked.remove(pod_info)` always matches; that call also
-    // re-checks membership under the lock, so a pod the watch removed in the
-    // meantime is a no-op rather than a duplicate deregistration.
+    // Remove-absent: any pod tracked before the LIST whose identity is no
+    // longer in the API. handle_pod_deletion re-checks membership under the
+    // lock, so a pod the watch removed in the meantime is a no-op rather than
+    // a duplicate deregistration.
     for pod_info in stale_tracked_pods(&tracked_before, &present) {
+        // A departed pod whose worker URL is now claimed by a live, healthy
+        // pod is a same-URL replacement, not a worker to deregister: with
+        // hostNetwork a pod's IP is its node's, so a rollout on that node
+        // brings up a new pod (new UID) at the address the old one had. The
+        // replacement's AddWorker in the pass above has already re-registered
+        // that URL — the registry upserts by URL — so submitting a removal for
+        // it here would tear the replacement straight back out and leave the
+        // model with no worker at all. Forget the old entry and leave the
+        // registry alone.
+        if claimed_urls.contains(&pod_info.worker_url(port)) {
+            match tracked_pods.lock() {
+                Ok(mut tracker) => {
+                    if tracker.remove(pod_info.identity()).is_some() {
+                        info!(
+                            "Replaced pod: {} | url: {} is now served by a live pod",
+                            pod_info.name,
+                            pod_info.worker_url(port)
+                        );
+                    }
+                }
+                Err(e) => error!("SD resync: failed to lock tracked_pods: {}", e),
+            }
+            continue;
+        }
+
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
@@ -876,18 +954,41 @@ async fn reconcile_from_list(
     }
 }
 
-/// Tracked pods whose name is absent from a fresh LIST of the API server.
+/// Identity of a raw API object, matching [`PodInfo::identity`].
+fn pod_identity(pod: &Pod) -> Option<String> {
+    pod.metadata
+        .uid
+        .clone()
+        .or_else(|| pod.metadata.name.clone())
+}
+
+/// Tracked pods whose identity is absent from a fresh LIST of the API server.
 ///
-/// Selection is by pod NAME (the stable key), never by full `PodInfo`
-/// equality: a tracked pod whose status/readiness has flipped since it was
-/// added must still be treated as present. The returned values are the
-/// stored `PodInfo` structs so the caller's `HashSet::remove` matches
-/// exactly.
-fn stale_tracked_pods(tracked: &HashSet<PodInfo>, present: &HashSet<String>) -> Vec<PodInfo> {
+/// Selection is by [`PodInfo::identity`] — never by name and never by full
+/// `PodInfo` equality. Full equality is too strict: a tracked pod whose
+/// status or readiness has flipped since it was added must still be treated as
+/// present. The name is too loose in the other direction, and both of its
+/// failures leave a dead worker registered for the life of the process, since
+/// the registry's health checker only marks workers unhealthy and never
+/// deregisters them:
+///
+/// - under `Api::all` (the default — no `--service-discovery-namespace`) pod
+///   names are unique only per namespace, so deleting `ns-a/engine-0` while
+///   `ns-b/engine-0` lives leaves the name present and the dead pod tracked;
+/// - a pod replaced under the same name (StatefulSet, LeaderWorkerSet, or
+///   force-delete and recreate) keeps the name present, so the replacement is
+///   tracked alongside the pod it replaced instead of evicting it.
+///
+/// The returned values are the stored `PodInfo` structs, which carry the IP
+/// the worker was actually registered under.
+fn stale_tracked_pods(
+    tracked: &HashMap<String, PodInfo>,
+    present: &HashSet<String>,
+) -> Vec<PodInfo> {
     tracked
         .iter()
-        .filter(|pod_info| !present.contains(&pod_info.name))
-        .cloned()
+        .filter(|(identity, _)| !present.contains(*identity))
+        .map(|(_, pod_info)| pod_info.clone())
         .collect()
 }
 
@@ -1111,6 +1212,10 @@ mod tests {
     }
 
     async fn create_test_app_context() -> Arc<AppContext> {
+        create_test_app_context_with_dp_aware(false).await
+    }
+
+    async fn create_test_app_context_with_dp_aware(dp_aware: bool) -> Arc<AppContext> {
         use crate::{
             config::RouterConfig, core::WorkerService, middleware::TokenBucket,
             observability::inflight_tracker::InFlightRequestTracker,
@@ -1118,6 +1223,7 @@ mod tests {
 
         let router_config = RouterConfig::builder()
             .worker_startup_timeout_secs(1)
+            .dp_aware(dp_aware)
             .build_unchecked();
 
         let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
@@ -1431,6 +1537,7 @@ mod tests {
     #[test]
     fn test_pod_info_is_healthy() {
         let healthy_pod = PodInfo {
+            uid: None,
             name: "p1".into(),
             ip: "1.1.1.1".into(),
             status: "Running".into(),
@@ -1443,6 +1550,7 @@ mod tests {
         assert!(healthy_pod.is_healthy());
 
         let not_ready_pod = PodInfo {
+            uid: None,
             name: "p2".into(),
             ip: "1.1.1.2".into(),
             status: "Running".into(),
@@ -1455,6 +1563,7 @@ mod tests {
         assert!(!not_ready_pod.is_healthy());
 
         let not_running_pod = PodInfo {
+            uid: None,
             name: "p3".into(),
             ip: "1.1.1.3".into(),
             status: "Pending".into(),
@@ -1470,6 +1579,7 @@ mod tests {
     #[test]
     fn test_pod_info_equality_with_pod_type() {
         let pod1 = PodInfo {
+            uid: None,
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1481,6 +1591,7 @@ mod tests {
         };
 
         let pod2 = PodInfo {
+            uid: None,
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1492,6 +1603,7 @@ mod tests {
         };
 
         let pod3 = PodInfo {
+            uid: None,
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1509,8 +1621,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pod_event_add_unhealthy_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
             status: "Pending".into(),
@@ -1531,14 +1644,15 @@ mod tests {
         )
         .await;
 
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!is_tracked(&tracked_pods, &pod_info));
     }
 
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "pod1".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1564,8 +1678,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_event_prefill_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "prefill-pod".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1588,7 +1703,7 @@ mod tests {
 
         // With fully async control plane, pod is tracked and job is queued
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(is_tracked(&tracked_pods, &pod_info));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1597,8 +1712,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_event_decode_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "decode-pod".into(),
             ip: "1.2.3.5".into(),
             status: "Running".into(),
@@ -1621,7 +1737,7 @@ mod tests {
 
         // With fully async control plane, pod is tracked and job is queued
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(is_tracked(&tracked_pods, &pod_info));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1630,8 +1746,9 @@ mod tests {
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_tracked_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "test-pod".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1645,7 +1762,7 @@ mod tests {
         // Add pod to tracked set first
         {
             let mut tracked = tracked_pods.lock().unwrap();
-            tracked.insert(pod_info.clone());
+            tracked.insert(pod_info.identity().to_string(), pod_info.clone());
         }
 
         let port = 8080u16;
@@ -1659,14 +1776,15 @@ mod tests {
         .await;
 
         // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!is_tracked(&tracked_pods, &pod_info));
     }
 
     #[tokio::test]
     async fn test_handle_pd_pod_deletion_untracked_pod() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "untracked-pod".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1695,8 +1813,9 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_regular_mode() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "regular-pod".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1720,7 +1839,7 @@ mod tests {
         // With fully async control plane, pod is tracked and job is queued
         // In regular mode (pd_mode=false), worker_type defaults to Regular
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(is_tracked(&tracked_pods, &pod_info));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1729,8 +1848,9 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_pd_mode_with_prefill() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "prefill-pod".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1753,7 +1873,7 @@ mod tests {
 
         // With fully async control plane, pod is tracked and job is queued
         // Worker registration and validation happen in background job
-        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(is_tracked(&tracked_pods, &pod_info));
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
@@ -1762,8 +1882,9 @@ mod tests {
     #[tokio::test]
     async fn test_unified_handler_deletion_with_pd_mode() {
         let app_context = create_test_app_context().await;
-        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let tracked_pods: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let pod_info = PodInfo {
+            uid: None,
             name: "decode-pod".into(),
             ip: "1.2.3.4".into(),
             status: "Running".into(),
@@ -1777,7 +1898,7 @@ mod tests {
         // Add pod to tracked set first
         {
             let mut tracked = tracked_pods.lock().unwrap();
-            tracked.insert(pod_info.clone());
+            tracked.insert(pod_info.identity().to_string(), pod_info.clone());
         }
 
         let port = 8080u16;
@@ -1791,7 +1912,7 @@ mod tests {
         .await;
 
         // Pod should be removed from tracking
-        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!is_tracked(&tracked_pods, &pod_info));
     }
 
     #[test]
@@ -1863,8 +1984,74 @@ mod tests {
         assert!(!PodInfo::should_include(&regular_pod, &config));
     }
 
+    /// A pod carrying an explicit UID and namespace, as the API server
+    /// returns them. `create_regular_k8s_pod` deliberately leaves both unset,
+    /// which exercises the name fallback instead.
+    fn create_identified_k8s_pod(name: &str, uid: &str, ip: &str, namespace: &str) -> Pod {
+        let mut pod = create_regular_k8s_pod(name, ip);
+        pod.metadata.uid = Some(uid.to_string());
+        pod.metadata.namespace = Some(namespace.to_string());
+        pod
+    }
+
+    /// The `PodInfo` the reconcile would have stored for such a pod.
+    fn identified_pod_info(name: &str, uid: &str, ip: &str) -> PodInfo {
+        PodInfo {
+            uid: Some(uid.to_string()),
+            ..tracked_pod_info(name, ip, "Running", true)
+        }
+    }
+
+    /// An `AppContext` whose job queue accepts submissions but never runs
+    /// them: `max_concurrent_jobs: 0` leaves the dispatcher parked on the
+    /// semaphore, so every submitted job stays observable in the status map.
+    /// This is what lets a test tell "a job was submitted" apart from "no job
+    /// was submitted" — the shared `create_test_app_context` leaves the queue
+    /// uninitialized, where submissions vanish.
+    async fn app_context_with_parked_queue(dp_aware: bool) -> Arc<AppContext> {
+        let app_context = create_test_app_context_with_dp_aware(dp_aware).await;
+        let queue = crate::core::JobQueue::new(
+            crate::core::job_queue::JobQueueConfig {
+                queue_capacity: 64,
+                max_concurrent_jobs: 0,
+            },
+            Arc::downgrade(&app_context),
+        );
+        let _ = app_context.worker_job_queue.set(queue);
+        app_context
+    }
+
+    fn submitted_job(app_context: &Arc<AppContext>, worker_url: &str) -> Option<String> {
+        app_context
+            .worker_job_queue
+            .get()
+            .expect("queue must be initialized")
+            .get_status(worker_url)
+            .map(|status| status.job_type.to_string())
+    }
+
+    fn tracked_identities(tracked: &TrackedPods) -> HashSet<String> {
+        tracked.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// The tracked set, seeded with `pods` keyed by identity.
+    fn tracked_from(pods: &[PodInfo]) -> TrackedPods {
+        Arc::new(Mutex::new(tracked_map(pods)))
+    }
+
+    fn tracked_map(pods: &[PodInfo]) -> HashMap<String, PodInfo> {
+        pods.iter()
+            .map(|pod_info| (pod_info.identity().to_string(), pod_info.clone()))
+            .collect()
+    }
+
+    fn is_tracked(tracked: &TrackedPods, pod_info: &PodInfo) -> bool {
+        tracked.lock().unwrap().contains_key(pod_info.identity())
+    }
+
     fn tracked_pod_info(name: &str, ip: &str, status: &str, is_ready: bool) -> PodInfo {
         PodInfo {
+            uid: None,
             name: name.to_string(),
             ip: ip.to_string(),
             status: status.to_string(),
@@ -1878,10 +2065,11 @@ mod tests {
 
     #[test]
     fn test_stale_tracked_pods_removes_only_absent_names() {
-        let mut tracked = HashSet::new();
-        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
-        tracked.insert(tracked_pod_info("pod-b", "10.0.0.2", "Running", true));
-        tracked.insert(tracked_pod_info("pod-c", "10.0.0.3", "Running", true));
+        let tracked = tracked_map(&[
+            tracked_pod_info("pod-a", "10.0.0.1", "Running", true),
+            tracked_pod_info("pod-b", "10.0.0.2", "Running", true),
+            tracked_pod_info("pod-c", "10.0.0.3", "Running", true),
+        ]);
 
         let mut present = HashSet::new();
         present.insert("pod-a".to_string());
@@ -1898,8 +2086,7 @@ mod tests {
         // live pod has since flipped (e.g. is_ready=false). Presence is keyed
         // by name, so the tracked entry must NOT be selected for removal —
         // full-struct equality would wrongly treat it as gone.
-        let mut tracked = HashSet::new();
-        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+        let tracked = tracked_map(&[tracked_pod_info("pod-a", "10.0.0.1", "Running", true)]);
 
         let mut present = HashSet::new();
         present.insert("pod-a".to_string());
@@ -1913,9 +2100,10 @@ mod tests {
         // A fresh LIST that returns no matching pods must drain the whole
         // tracked set (e.g. all workers were deleted while the watch was
         // down).
-        let mut tracked = HashSet::new();
-        tracked.insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
-        tracked.insert(tracked_pod_info("pod-b", "10.0.0.2", "Pending", false));
+        let tracked = tracked_map(&[
+            tracked_pod_info("pod-a", "10.0.0.1", "Running", true),
+            tracked_pod_info("pod-b", "10.0.0.2", "Pending", false),
+        ]);
 
         let stale = stale_tracked_pods(&tracked, &HashSet::new());
         assert_eq!(stale.len(), 2);
@@ -1926,8 +2114,7 @@ mod tests {
         // The returned PodInfo must be the STORED struct (not a re-parsed
         // one) so the caller's exact-struct HashSet::remove always matches.
         let stored = tracked_pod_info("pod-gone", "10.0.0.9", "Running", true);
-        let mut tracked = HashSet::new();
-        tracked.insert(stored.clone());
+        let tracked = tracked_map(std::slice::from_ref(&stored));
 
         let stale = stale_tracked_pods(&tracked, &HashSet::new());
         assert_eq!(stale, vec![stored]);
@@ -2009,22 +2196,18 @@ mod tests {
         (Api::all(Client::new(service, "default")), seen)
     }
 
-    fn tracked_names(tracked: &Arc<Mutex<HashSet<PodInfo>>>) -> HashSet<String> {
+    fn tracked_names(tracked: &TrackedPods) -> HashSet<String> {
         tracked
             .lock()
             .unwrap()
-            .iter()
+            .values()
             .map(|pod_info| pod_info.name.clone())
             .collect()
     }
 
     #[tokio::test]
     async fn test_reconcile_adds_listed_pods_and_removes_absent_ones() {
-        let tracked = Arc::new(Mutex::new(HashSet::new()));
-        tracked
-            .lock()
-            .unwrap()
-            .insert(tracked_pod_info("pod-gone", "10.0.0.1", "Running", true));
+        let tracked = tracked_from(&[tracked_pod_info("pod-gone", "10.0.0.1", "Running", true)]);
 
         let live = create_regular_k8s_pod("pod-live", "10.0.0.2");
         let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[live], None))]);
@@ -2055,13 +2238,12 @@ mod tests {
         // The pod is still in the API but has begun terminating. It must be
         // deregistered now rather than when it finally disappears, so it stops
         // receiving new traffic while its drain hook runs.
-        let tracked = Arc::new(Mutex::new(HashSet::new()));
-        tracked.lock().unwrap().insert(tracked_pod_info(
+        let tracked = tracked_from(&[tracked_pod_info(
             "pod-draining",
             "10.0.0.3",
             "Running",
             true,
-        ));
+        )]);
 
         let mut draining = create_regular_k8s_pod("pod-draining", "10.0.0.3");
         draining.metadata.deletion_timestamp = Some(Time(chrono::Utc::now()));
@@ -2087,11 +2269,7 @@ mod tests {
     async fn test_reconcile_keeps_worker_set_when_list_fails() {
         // The most consequential branch: a failed LIST must never be read as
         // "no pods exist" and drain every worker.
-        let tracked = Arc::new(Mutex::new(HashSet::new()));
-        tracked
-            .lock()
-            .unwrap()
-            .insert(tracked_pod_info("pod-a", "10.0.0.1", "Running", true));
+        let tracked = tracked_from(&[tracked_pod_info("pod-a", "10.0.0.1", "Running", true)]);
 
         let forbidden = serde_json::json!({
             "kind": "Status",
@@ -2126,16 +2304,17 @@ mod tests {
         // appear in that response through no fault of its own, and the watch
         // will not re-emit an Apply for it, so removing it here would strand
         // the worker until the next resync.
-        let tracked: Arc<Mutex<HashSet<PodInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tracked: TrackedPods = Arc::new(Mutex::new(HashMap::new()));
         let tracked_for_service = Arc::clone(&tracked);
 
         let service = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
             let tracked = Arc::clone(&tracked_for_service);
             async move {
+                let late = tracked_pod_info("late-pod", "10.0.0.9", "Running", true);
                 tracked
                     .lock()
                     .unwrap()
-                    .insert(tracked_pod_info("late-pod", "10.0.0.9", "Running", true));
+                    .insert(late.identity().to_string(), late);
                 Ok::<_, std::convert::Infallible>(json_response(200, pod_list_json(&[], None)))
             }
         });
@@ -2159,11 +2338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_follows_continue_token_across_pages() {
-        let tracked = Arc::new(Mutex::new(HashSet::new()));
-        tracked
-            .lock()
-            .unwrap()
-            .insert(tracked_pod_info("pod-gone", "10.0.0.1", "Running", true));
+        let tracked = tracked_from(&[tracked_pod_info("pod-gone", "10.0.0.1", "Running", true)]);
 
         let first = create_regular_k8s_pod("pod-page1", "10.0.0.2");
         let second = create_regular_k8s_pod("pod-page2", "10.0.0.3");
@@ -2201,6 +2376,122 @@ mod tests {
             requests[1].contains("continue=next-page-token"),
             "second page should carry the continue token, got {}",
             requests[1]
+        );
+    }
+
+    // ---- identity: replaced and same-named pods ----
+
+    #[tokio::test]
+    async fn test_reconcile_removes_pod_replaced_under_the_same_name() {
+        // A pod recreated under the same name with a new IP: StatefulSet or
+        // LeaderWorkerSet rollout, or force-delete plus recreate. Keyed by
+        // name the replacement is added alongside the pod it replaced and the
+        // dead entry is never removed, leaving that worker registered for the
+        // life of the process.
+        let replaced = identified_pod_info("engine-0", "uid-a", "10.0.0.1");
+        let tracked = tracked_from(&[replaced]);
+
+        let replacement = create_identified_k8s_pod("engine-0", "uid-b", "10.0.0.2", "ns-a");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[replacement], None))]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let identities = tracked_identities(&tracked);
+        assert!(
+            identities.contains("uid-b"),
+            "the replacement pod must be tracked"
+        );
+        assert!(
+            !identities.contains("uid-a"),
+            "the pod it replaced must be removed, not kept because the name is reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_removes_dead_pod_whose_name_lives_in_another_namespace() {
+        // With no --service-discovery-namespace the API is Api::all, where pod
+        // names are unique only per namespace — the configuration
+        // gateway-cluster-scoped.yaml ships. `ns-a/engine-0` is gone but
+        // `ns-b/engine-0` is alive, so a name key reports the dead pod as
+        // still present and nothing ever deregisters it: the registry's health
+        // checker only marks workers unhealthy.
+        let tracked = tracked_from(&[
+            identified_pod_info("engine-0", "uid-ns-a", "10.0.0.1"),
+            identified_pod_info("engine-0", "uid-ns-b", "10.0.0.2"),
+        ]);
+
+        let survivor = create_identified_k8s_pod("engine-0", "uid-ns-b", "10.0.0.2", "ns-b");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[survivor], None))]);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            create_test_app_context().await,
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let identities = tracked_identities(&tracked);
+        assert!(
+            identities.contains("uid-ns-b"),
+            "the surviving pod must stay tracked"
+        );
+        assert!(
+            !identities.contains("uid-ns-a"),
+            "a same-named pod in another namespace must not keep a dead pod registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_hands_over_a_shared_url_without_deregistering_it() {
+        // hostNetwork makes a pod's IP its node's, so a rollout on that node
+        // brings up a new pod (new UID) at the address the old one had. Both
+        // map to one worker URL, and the registry upserts by URL, so the
+        // replacement's add has already taken that slot by the time the old
+        // entry is found stale. Submitting a removal for it would tear the
+        // replacement straight back out and leave the model with no worker.
+        let replaced = identified_pod_info("engine-0", "uid-a", "10.0.0.5");
+        let tracked = tracked_from(std::slice::from_ref(&replaced));
+
+        let replacement = create_identified_k8s_pod("engine-0", "uid-b", "10.0.0.5", "ns-a");
+        let (api, _) = fake_pod_api(vec![(200, pod_list_json(&[replacement], None))]);
+        let app_context = app_context_with_parked_queue(false).await;
+        let shared_url = replaced.worker_url(8000);
+
+        reconcile_from_list(
+            &api,
+            &reconcile_test_config(),
+            Arc::clone(&tracked),
+            Arc::clone(&app_context),
+            8000,
+            &ReconcileState::default(),
+        )
+        .await;
+
+        let identities = tracked_identities(&tracked);
+        assert!(
+            identities.contains("uid-b"),
+            "the replacement must be tracked"
+        );
+        assert!(
+            !identities.contains("uid-a"),
+            "the pod it replaced must be untracked"
+        );
+        assert_eq!(
+            submitted_job(&app_context, &shared_url).as_deref(),
+            Some("AddWorker"),
+            "the last job for the shared URL must be the replacement's add, \
+             never a removal that would undo it"
         );
     }
 }
