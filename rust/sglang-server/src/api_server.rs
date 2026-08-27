@@ -11,5 +11,4 @@ mod log;
 mod native_api;
 pub(crate) mod openai;
 mod prefetch;
-mod render;
 mod submit;

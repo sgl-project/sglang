@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, native_api, openai, render};
+use super::{common, log, native_api, openai};
 use crate::frontend::FrontendHandle;
 use crate::message::config::ServerArgs;
 use crate::renderer::{OpenAIRequestLowerer, RendererService, ServerInferenceBackend};
@@ -93,7 +93,7 @@ pub(crate) async fn serve_render(
     renderer: Arc<RendererService>,
     shutdown: flume::Receiver<()>,
 ) {
-    let app = render::routes(render::RenderState::new(renderer))
+    let app = sglang_renderer::http::render_routes(renderer)
         .layer(axum::extract::DefaultBodyLimit::disable());
     let app = log::apply(app, &server_args);
     serve_http(listener, app, shutdown).await;

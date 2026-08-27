@@ -263,15 +263,6 @@ fn renderer_config(args: &ServerArgs) -> RendererConfig {
     }
 }
 
-pub(crate) fn render_http_status(error: &RenderServiceError) -> u16 {
-    match error.kind() {
-        sglang_renderer::RendererErrorKind::InvalidRequest => 400,
-        sglang_renderer::RendererErrorKind::Unavailable => 503,
-        sglang_renderer::RendererErrorKind::Tokenize
-        | sglang_renderer::RendererErrorKind::Internal => 500,
-    }
-}
-
 impl From<TextRequest> for GenerateRequest {
     fn from(request: TextRequest) -> Self {
         native_generate_request(

@@ -19,6 +19,7 @@ use crate::{
 
 mod chat;
 mod completions;
+mod render;
 #[cfg(test)]
 mod test_utils;
 
@@ -41,6 +42,10 @@ where
         .merge(chat::routes())
         .merge(completions::routes())
         .with_state(Arc::new(frontend))
+}
+
+pub fn render_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
+    render::routes(renderer)
 }
 
 pub(crate) fn unix_seconds_u32() -> u32 {
