@@ -126,6 +126,20 @@ class CpDecodeAttnTpContext:
 
     # ==================== Linear helpers ====================
 
+    def _unwrap_inactive_lora(self, linear_instance):
+        """Return the base linear, rejecting active LoRA during decode TP."""
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
+        if not isinstance(linear_instance, BaseLayerWithLoRA):
+            return linear_instance
+        if linear_instance.lora_active:
+            raise RuntimeError(
+                "CP decode attention TP does not support active LoRA adapters. "
+                "The replicated LoRA buffers cannot be sliced safely with the "
+                "decode-TP base weights; disable CP decode attention TP or LoRA."
+            )
+        return linear_instance.base_layer
+
     def _get_linear_attrs(self, linear_instance) -> List[Tuple]:
         """Return (obj, attr_name, dim) list for a linear layer."""
         from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -171,7 +185,8 @@ class CpDecodeAttnTpContext:
         row_parallel_decode_flags = []  # (RowParallelLinear, orig_flag) to restore
         orig_tp_q_head_num = None
         try:
-            for linear in modules:
+            for module in modules:
+                linear = self._unwrap_inactive_lora(module)
                 for obj, attr_name, dim in self._get_linear_attrs(linear):
                     self._activate(obj, attr_name, dim)
                     all_attrs.append((obj, attr_name))

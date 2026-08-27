@@ -2,9 +2,13 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.layers.cp.cp_decode_attn_tp import CpDecodeAttnTpContext
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.layers import ColumnParallelLinearWithLoRA
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _batch_info(*, permutation=None):
@@ -65,6 +69,7 @@ class _TorchSegmentedBackend(BaseLoRABackend):
 def _layer(backend, lora_a, lora_b):
     layer = object.__new__(ColumnParallelLinearWithLoRA)
     nn.Module.__init__(layer)
+    layer.base_layer = nn.Linear(lora_a.shape[-1], lora_b.shape[-2], bias=False)
     layer.set_lora = True
     layer.A_buffer = lora_a
     layer.B_buffer = lora_b
@@ -137,3 +142,19 @@ def test_grouped_wo_a_rejects_backend_without_repeated_metadata():
             torch.randn(3, groups, 5),
             torch.randn(3, groups, 4),
         )
+
+
+def test_cp_decode_tp_rejects_active_lora_and_unwraps_inactive_wrapper():
+    backend = _TorchSegmentedBackend(_batch_info())
+    layer = _layer(
+        backend,
+        torch.randn(2, 3, 4),
+        torch.randn(2, 10, 3),
+    )
+    context = object.__new__(CpDecodeAttnTpContext)
+
+    with pytest.raises(RuntimeError, match="does not support active LoRA"):
+        context._unwrap_inactive_lora(layer)
+
+    backend.batch_info = None
+    assert context._unwrap_inactive_lora(layer) is layer.base_layer
