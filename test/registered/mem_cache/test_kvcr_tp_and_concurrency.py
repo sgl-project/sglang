@@ -918,10 +918,10 @@ class RaisingCoreTest(unittest.TestCase):
 
     ``RemoteFailureTest`` covers a *peer* failing, which the core reports through
     its normal result path. This is the core itself raising, which skips that path
-    entirely, and nothing above this backend catches it:
-    ``test_hicache_storage_thread_survival.py`` shows each HiCache storage loop
-    ending on the first exception, unsupervised, taking the only
-    ``append_host_mem_release`` and ``ack_backup_queue`` producers with it.
+    entirely, and nothing above this backend catches it: each HiCache storage loop
+    catches only ``Empty``, so it ends on the first exception, unsupervised, and
+    takes the only ``append_host_mem_release`` and ``ack_backup_queue`` producers
+    with it.
 
     What turns these red: removing a ``@_fail_closed`` decorator.
     """

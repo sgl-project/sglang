@@ -219,8 +219,7 @@ def _fail_closed(on_error):
     until the rate limiter blocks all prefetching, permanently), and
     ``backup_thread_func`` is the sole producer for ``ack_backup_queue`` (without
     it ``HiRadixCache`` never calls ``entry.release_host()`` and backed-up nodes
-    pin host pages forever). ``test_hicache_storage_thread_survival.py`` drives
-    the real loops to pin all three down.
+    pin host pages forever).
 
     So a fault degrades to "this batch missed": HiCache recomputes, which is
     always correct -- KV that was never delivered cannot be wrong KV. ``on_error``

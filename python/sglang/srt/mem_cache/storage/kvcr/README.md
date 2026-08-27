@@ -257,8 +257,8 @@ recompute, never admit wrong KV:
 distinct prefixes each. Established that the collapse we saw is the HiCache
 sizing issue below, and *not* `local_dram_bytes`.
 
-**Unit** — `test/registered/mem_cache/test_kvcr_*.py` and
-`test_hicache_offload_stall.py`, 78 passing in-container against `873391c`.
+**Unit** — `test/registered/mem_cache/test_kvcr_*.py`, passing in-container
+against `873391c`.
 
 ## Known issues
 
