@@ -124,6 +124,13 @@ class LayerDoneCounter:
             self._last_consumed_layer = threshold
             self.on_layer_consumed(threshold + 1)
 
+    def wait_for_prefetch(self, layer_id: int):
+        if self.consumer_index < 0:
+            return
+        if layer_id >= self.num_layers:
+            return
+        self.events[self.consumer_index].wait(layer_id)
+
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1

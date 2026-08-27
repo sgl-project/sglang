@@ -226,6 +226,8 @@ def ensure_hybm_capacity(total_bytes: int, device_id: int) -> None:
     SGLANG_HICACHE_HYBM_RESERVE_GB to cover the later ones as well.
     """
     offload = _get_hybm_offload()
+    # from memfabric_hybrid import set_log_level
+    # set_log_level(1)
     if not _hybm_state["initialized"]:
         env_gb = os.environ.get("SGLANG_HICACHE_HYBM_RESERVE_GB")
         reserve = int(env_gb) * _HYBM_GB if env_gb else 0
@@ -235,6 +237,8 @@ def ensure_hybm_capacity(total_bytes: int, device_id: int) -> None:
         config.device_id = device_id
         config.reserve_size = reserve
         config.alloc_size = reserve
+        config.flags = offload.OFFLOAD_FLAG_URMA_POOL
+        config.scene = offload.Scene.LOCAL
         assert offload.initialize(config) == 0, "offload.initialize failed"
         _hybm_state.update(
             initialized=True, reserved_bytes=reserve, device_id=device_id
