@@ -1826,6 +1826,27 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         {candidate.option_key(): candidate for candidate in report.candidates}
         for report in reports
     ]
+    current_report_candidates = [
+        {
+            candidate.component_name: candidate
+            for candidate in report.candidates
+            if candidate.current_placement
+        }
+        for report in reports
+    ]
+    full_device_weight_bytes_by_component = [
+        {
+            component_name: max(
+                candidate.target_device_weight_bytes
+                for candidate in report.candidates
+                if candidate.component_name == component_name
+            )
+            for component_name in {
+                candidate.component_name for candidate in report.candidates
+            }
+        }
+        for report in reports
+    ]
     # Request timing is produced by the output rank. Other SPMD ranks still
     # contribute their VRAM and HostPin constraints, but their empty metrics
     # must not discard the replica's measured latency utility and fall back to
@@ -1856,8 +1877,21 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     options = []
     for candidate in candidates:
         resource_deltas: dict[str, int] = {}
-        for report, rank_candidates in zip(reports, report_candidates):
+        for (
+            report,
+            rank_candidates,
+            current_rank_candidates,
+            rank_full_device_weight_bytes,
+        ) in zip(
+            reports,
+            report_candidates,
+            current_report_candidates,
+            full_device_weight_bytes_by_component,
+        ):
             rank_candidate = rank_candidates[candidate.option_key()]
+            current_rank_candidate = current_rank_candidates.get(
+                candidate.component_name
+            )
             for (
                 resource_name,
                 _,
@@ -1865,10 +1899,28 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 used_components,
                 full_weight_transition_components,
             ) in phase_constraints[report.rank]:
-                if candidate.component_name in full_weight_transition_components:
-                    # The measured phase already contains the component's full
-                    # temporary materialization under every target mode.
+                transition_measured_full_weights = (
+                    candidate.component_name in full_weight_transition_components
+                    and (
+                        candidate.component_name in present_components
+                        or (
+                            current_rank_candidate is not None
+                            and current_rank_candidate.target_mode()
+                            in (LAYERWISE_OFFLOAD, RESIDENT)
+                        )
+                    )
+                )
+                if transition_measured_full_weights:
+                    # The measured phase already contains the complete weights.
                     phase_cost = 0
+                elif (
+                    candidate.component_name in full_weight_transition_components
+                    and rank_candidate.target_mode() == LAYERWISE_OFFLOAD
+                ):
+                    # Coarse offload can update CPU weights without putting the
+                    # component on the device. Layerwise offload must materialize
+                    # every layer for the same update, including non-resident ones.
+                    phase_cost = rank_full_device_weight_bytes[candidate.component_name]
                 elif candidate.component_name in used_components:
                     phase_cost = rank_candidate.active_device_delta_bytes
                 elif candidate.component_name in present_components:

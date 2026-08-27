@@ -950,9 +950,7 @@ class TestPlanAutoResidency:
         # headroom, but the complete permanent 25 GiB footprint does not.
         assert plan.changes == []
 
-    def test_full_materialization_phase_does_not_double_count_transitioned_weights(
-        self,
-    ):
+    def test_unmaterialized_weight_update_charges_full_layerwise_target(self):
         component_offload = ResidencyTarget(
             component_name="transformer",
             residency_mode=COMPONENT_OFFLOAD,
@@ -971,6 +969,17 @@ class TestPlanAutoResidency:
             target_layerwise_pinned_layers=((),),
             active_device_delta_bytes=GIB_BYTES,
             inactive_device_delta_bytes=GIB_BYTES,
+            target_device_weight_bytes=GIB_BYTES,
+        )
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=40 * GIB_BYTES,
+            h2d_bytes_per_request=0,
+            permanent_residency=True,
+            inactive_device_delta_bytes=40 * GIB_BYTES,
+            target_device_weight_bytes=40 * GIB_BYTES,
         )
 
         plan = plan_auto_residency(
@@ -983,7 +992,58 @@ class TestPlanAutoResidency:
                     phase_full_weight_transition_components={
                         "lora_switch": ("transformer",)
                     },
-                    candidates=[component_offload, layerwise],
+                    candidates=[component_offload, layerwise, resident],
+                )
+            ]
+        )
+
+        assert plan.changes == []
+
+    def test_materialized_layerwise_transition_does_not_double_count_weights(self):
+        current_layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=100 * GIB_BYTES,
+            target_layerwise_resident_layers=(1,),
+            target_layerwise_pinned_layers=((),),
+            active_device_delta_bytes=GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+            target_device_weight_bytes=GIB_BYTES,
+        )
+        resident = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=RESIDENT,
+            target_resident_weight_bytes=40 * GIB_BYTES,
+            h2d_bytes_per_request=0,
+            permanent_residency=True,
+            inactive_device_delta_bytes=40 * GIB_BYTES,
+            target_device_weight_bytes=40 * GIB_BYTES,
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=90,
+                    estimated_gib=50,
+                    target_workload_measured=True,
+                    phase_peaks_gib={"lora_switch": 50},
+                    phase_full_weight_transition_components={
+                        "lora_switch": ("transformer",)
+                    },
+                    candidates=[current_layerwise, layerwise, resident],
                 )
             ]
         )
