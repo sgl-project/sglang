@@ -40,9 +40,7 @@ def qsa_fast_topk(
 
         from sgl_kernel import top_k as top_k_module
 
-        supported_topk = getattr(
-            top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,)
-        )
+        supported_topk = getattr(top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,))
         if topk in supported_topk:
             return top_k_module.fast_topk_v2(
                 logits, lengths, topk=topk, row_starts=starts
@@ -196,9 +194,7 @@ def _expand_qsa_block_indices_kernel(
         ).to(tl.int32),
         axis=0,
     )
-    valid_token_count = tl.minimum(
-        valid_block_count * COMPRESS_RATIO, TOKEN_TOPK
-    )
+    valid_token_count = tl.minimum(valid_block_count * COMPRESS_RATIO, TOKEN_TOPK)
 
     query_position = tl.load(query_positions + row)
     visible_tokens = query_position + 1
@@ -300,6 +296,8 @@ def qsa_sparse_attention(
     v_cache: torch.Tensor,
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Torch reference for sparse GQA over physical token slots."""
 
@@ -315,7 +313,7 @@ def qsa_sparse_attention(
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
     return qsa_sparse_attention_reference(
-        q, k_cache, v_cache, token_slots, softmax_scale
+        q, k_cache, v_cache, token_slots, softmax_scale, k_scale, v_scale
     )
 
 
@@ -325,10 +323,14 @@ def qsa_sparse_attention_reference(
     v_cache: torch.Tensor,
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Device-agnostic sparse GQA reference."""
 
     scale = softmax_scale or q.shape[-1] ** -0.5
+    k_scale = 1.0 if k_scale is None else k_scale
+    v_scale = 1.0 if v_scale is None else v_scale
     outputs = []
     repeats = q.shape[1] // k_cache.shape[1]
     for row in range(q.shape[0]):
@@ -337,13 +339,17 @@ def qsa_sparse_attention_reference(
         if slots.numel() == 0:
             outputs.append(torch.zeros_like(q[row]))
             continue
-        keys = k_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
-        values = v_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) * scale
-        probabilities = torch.softmax(scores, dim=-1)
-        outputs.append(
-            torch.einsum("hk,khd->hd", probabilities, values.float()).to(q.dtype)
+        keys = (
+            k_cache.index_select(0, slots).float().repeat_interleave(repeats, dim=1)
+            * k_scale
         )
+        values = (
+            v_cache.index_select(0, slots).float().repeat_interleave(repeats, dim=1)
+            * v_scale
+        )
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
+        probabilities = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hk,khd->hd", probabilities, values).to(q.dtype))
     return torch.stack(outputs)
 
 
