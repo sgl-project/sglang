@@ -56,6 +56,7 @@ def choose_initial_resident_components(
     *,
     available_bytes: int,
     denoising_steps: int | None = None,
+    excluded_components: frozenset[str] = frozenset(),
 ) -> set[str]:
     """Choose resident startup components without removing runtime options.
 
@@ -91,6 +92,7 @@ def choose_initial_resident_components(
         if (
             weight_bytes is None
             or weight_bytes <= 0
+            or item.component_name in excluded_components
             or not is_dit_component_name(item.component_name)
             or server_args.residency_mode(item.component_name) == RESIDENT
             or (
@@ -122,6 +124,8 @@ def choose_initial_resident_components(
 def maybe_seed_initial_residency(
     server_args: ServerArgs,
     inventory: list[ComponentWeightEstimate],
+    *,
+    excluded_components: frozenset[str] = frozenset(),
 ) -> None:
     """Apply a reversible resident seed for warmup-calibrated auto mode."""
     if (
@@ -153,6 +157,7 @@ def maybe_seed_initial_residency(
         server_args,
         inventory,
         available_bytes=int(available_gib * GIB_BYTES),
+        excluded_components=excluded_components,
     )
     if not selected:
         return

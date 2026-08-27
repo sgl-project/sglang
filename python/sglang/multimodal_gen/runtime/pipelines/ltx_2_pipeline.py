@@ -638,6 +638,9 @@ class LTX2TwoStageResidencyController:
 
 class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
+    # The built-in stage LoRA establishes the DiT's runtime representation.
+    # Preserve that initialization path, then let post-load placement tune it.
+    preload_residency_excluded_components = frozenset(("transformer", "transformer_2"))
     STAGE_2_DISTILLED_SIGMA_VALUES = list(_SHARED_STAGE_2_DISTILLED_SIGMA_VALUES)
     STAGE_1_DISTILLED_LORA_STRENGTH = 0.0
     STAGE_2_DISTILLED_LORA_STRENGTH = 1.0

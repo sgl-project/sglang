@@ -92,6 +92,10 @@ class ComposedPipelineBase(ABC):
     # should contains only the modules to be loaded
     _required_config_modules: list[str] = []
     _extra_config_module_map: dict[str, str] = {}
+    # Components whose initialization mutates or aliases weights in a way that
+    # depends on their load placement. The post-load planner may still tune
+    # them after those semantics have been established.
+    preload_residency_excluded_components: frozenset[str] = frozenset()
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -488,7 +492,11 @@ class ComposedPipelineBase(ABC):
             maybe_seed_initial_residency,
         )
 
-        maybe_seed_initial_residency(server_args, self.component_weight_inventory)
+        maybe_seed_initial_residency(
+            server_args,
+            self.component_weight_inventory,
+            excluded_components=self.preload_residency_excluded_components,
+        )
 
     def load_modules(
         self,

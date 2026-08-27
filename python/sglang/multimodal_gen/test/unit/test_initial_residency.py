@@ -127,6 +127,20 @@ def test_initial_seed_keeps_layerwise_dit_on_its_configured_load_path():
     assert selected == set()
 
 
+def test_initial_seed_honors_pipeline_load_placement_exclusions():
+    args = _Args()
+
+    selected = choose_initial_resident_components(
+        args,
+        [_weight("transformer", 8), _weight("transformer_2", 8)],
+        available_bytes=40 * GIB_BYTES,
+        denoising_steps=8,
+        excluded_components=frozenset(("transformer", "transformer_2")),
+    )
+
+    assert selected == set()
+
+
 def test_initial_seed_applies_one_reversible_override():
     args = _Args()
     inventory = [_weight("transformer", 8)]
