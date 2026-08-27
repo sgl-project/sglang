@@ -94,8 +94,11 @@ class TestNPUGLM_5_2_W4A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     model_config = GLM_5_2_W4A8_16P_TWO_NODE_MODEL_CONFIG
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
-    eval_batch_size = 16
-    generation_config = {"max_tokens": 131072, "temperature": 1.0}
+    # eval_batch_size = 16
+    # generation_config = {"max_tokens": 131072, "temperature": 1.0}
+    eval_batch_size = 32
+    generation_config = {"max_tokens": 65536, "temperature": 1.0, "timeout": 1200, "stream": True}
+
 
     def test_npu_glm_5_2_w4a8_16p_gpqa(self):
         """Run NPU accuracy test for GLM-5.2-w4a8 16p two nodes on gpqa_diamond"""
