@@ -19,7 +19,7 @@ import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     npu_w8a8_block_fp8_linear,
 )
-from sglang.srt.hardware_backend.npu.quantization.mxfp8 import (
+from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
     process_npu_arch35_mxfp8_linear_weights,
 )
 

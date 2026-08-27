@@ -699,7 +699,7 @@ class Fp8LinearMethod(LinearMethodBase):
             self._process_mxfp8_linear_weight_scale(layer)
             return
         elif _is_npu and is_npu_arch35():
-            from sglang.srt.hardware_backend.npu.quantization.mxfp8 import (
+            from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
 
