@@ -145,7 +145,7 @@ On H200 (BF16, TP16 → ~95GB of weights per rank) the per-rank pool holds rough
 
 **DSA attention backend.** Every layer runs DeepSeek Sparse Attention; SGLang auto-selects the DSA backend for HYV4 (`--attention-backend dsa` with `flashmla_sparse` prefill/decode and an FP8 indexer cache over a bf16 KV pool), so the recipes don't pass attention flags. Override only with a kernel-specific reason.
 
-**MXFP8 kernel stack.** The MXFP8 checkpoint self-describes via its ModelOpt `hf_quant_config` (dynamic activations, UE8M0 group-32 weight scales) — no `--quantization` flag needed; the recipes pin `--fp8-gemm-backend deep_gemm` with the `deep_gemm` MoE runner on B300/GB300 and `flashinfer_trtllm` (the CUDA MXFP8 default) on B200. The MXFP8 kernel path requires SM100+ (Blackwell); H200 (SM90) cannot serve the MXFP8 checkpoint — use BF16 there.
+**MXFP8 kernel stack.** The MXFP8 checkpoint self-describes via its ModelOpt `hf_quant_config` (dynamic activations, UE8M0 group-32 weight scales) — no `--quantization` flag needed; the recipes pin `--moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm`, the validated HYV4 MXFP8 path (the runtime also defaults both to `deep_gemm` for HYV4 when the flags are left unset). The MXFP8 kernel path requires SM100+ (Blackwell); H200 (SM90) cannot serve the MXFP8 checkpoint — use BF16 there.
 
 **CUDA graph decode vs eager.** Decode CUDA-graph capture is on by default; long-duration soak validation of the graph path on Hy4 is still in progress. If you hit instability under long mixed agentic workloads, pass `--disable-cuda-graph` to fall back to eager decode (a restart recovers cleanly either way).
 

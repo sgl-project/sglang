@@ -173,8 +173,8 @@ sgl-eval run gsm8k \\
 
     // ----- Card 2: "MoE Parallelism" -----
     // 256 routed + 1 shared experts, top-8 sigmoid routing. The recipes run
-    // the MoE under pure TP (deep_gemm runner on B300/GB300 MXFP8,
-    // flashinfer_trtllm on B200); DeepEP is an experimentation override. No
+    // the MoE under pure TP (deep_gemm runner on MXFP8 — the validated
+    // HYV4 path); DeepEP is an experimentation override. No
     // EP knob: the runtime rewrites EP to TP for a2a-spanning backends
     // (DeepEP), so a free EP degree would advertise a topology that never
     // runs. No MegaMoE option — its fused path is not wired for Hy4's
@@ -404,10 +404,7 @@ sgl-eval run gsm8k \\
     },
 
     // ====================================================================
-    // B200 (192GB) × MXFP8 — TP8 single node (~95GB weights/rank). B200
-    // pins the flashinfer_trtllm MoE runner — the CUDA MXFP8 default and
-    // what the runtime actually resolves to (triton is ROCm-gfx95-only for
-    // MXFP8 and would be overridden); deep_gemm stays on the 288GB parts.
+    // B200 (192GB) × MXFP8 — TP8 single node (~95GB weights/rank).
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
@@ -416,7 +413,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend flashinfer_trtllm",
+        "--moe-runner-backend deep_gemm",
         "--fp8-gemm-backend deep_gemm",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -435,7 +432,7 @@ sgl-eval run gsm8k \\
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend flashinfer_trtllm",
+        "--moe-runner-backend deep_gemm",
         "--fp8-gemm-backend deep_gemm",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
