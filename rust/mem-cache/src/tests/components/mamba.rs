@@ -59,7 +59,7 @@ fn insert_params_mamba<'k>(
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: mamba_slot.map(|slot| Tensor::from_slice(&[slot])),
         prev_prefix_len: 0,
@@ -72,7 +72,7 @@ fn insert_params_mamba<'k>(
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
     }
 }
 

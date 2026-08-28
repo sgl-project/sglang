@@ -12,6 +12,8 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    BlockStoredMetadata,
+    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -71,9 +73,6 @@ if TYPE_CHECKING:
 def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
-    # TODO(Jialin): Support cache_salt with Rust after porting #30827.
-    if key.cache_salt is not None:
-        raise ValueError("cache_salt is not supported by the Rust TreeCore")
     token_ids = key.raw_token_ids()
     assert (
         isinstance(token_ids, array) and token_ids.typecode == "q"
@@ -85,13 +84,19 @@ def _kv_event_from_tagged(event: tuple):
     """Build the Python KV cache event for one of the binding's tagged tuples."""
     tag = event[0]
     if tag == "block_stored":
-        return BlockStored(
+        event_args = dict(
             block_hashes=event[1],
             parent_block_hash=event[2],
             token_ids=event[3],
             block_size=event[4],
             lora_id=None,
             medium=StorageMedium(event[5]),
+        )
+        if event[6] is None:
+            return BlockStored(**event_args)
+        return BlockStoredWithMetadata(
+            **event_args,
+            metadata=BlockStoredMetadata(cache_salt=event[6]),
         )
     if tag == "block_removed":
         return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
@@ -570,7 +575,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         key = params.key
         result = self._binding.match_prefix(
             self._bindings.MatchParamsBinding(
-                key=_radix_key_buffer(key), extra_key=key.extra_key
+                key=_radix_key_buffer(key),
+                extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
             )
         )
         return _match_result_from_binding(result)
@@ -600,6 +607,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 key=key_buffer,
                 value=value,
                 extra_key=key.extra_key,
+                cache_salt=key.cache_salt,
                 mamba_value=params.mamba_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.swa_evicted_seqlen,
@@ -698,7 +706,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         hash_value: list[str],
     ) -> InsertResult:
         result = self._binding.insert_host(
-            node_id, key.extra_key, _radix_key_buffer(key), host_value, list(hash_value)
+            node_id,
+            key.extra_key,
+            _radix_key_buffer(key),
+            host_value,
+            list(hash_value),
+            key.cache_salt,
         )
         return InsertResult(
             prefix_len=result.prefix_len,
@@ -771,7 +784,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def prefetch_anchor_info(
         self, node_id: NodeId
     ) -> tuple[Optional[str], Optional[str]]:
-        return self._binding.prefetch_anchor_info(node_id), None
+        return self._binding.prefetch_anchor_info(node_id)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)

@@ -899,7 +899,10 @@ fn split_wires_the_new_node_between_parent_and_child() {
     assert_eq!(tc.arena.node(c).key, vec![3]);
     assert_eq!(tc.arena.root_child(None, &[1]).as_ref(), Some(&new_node));
     assert_eq!(
-        tc.arena.node(new_node).children.get(&(None, vec![3])),
+        tc.arena
+            .node(new_node)
+            .children
+            .get(&(RadixNamespace::default(), vec![3])),
         Some(&c)
     );
     assert_eq!(tc.arena.node(new_node).parent(), root);
@@ -1158,7 +1161,18 @@ fn unevict_panics_on_a_node_that_still_has_its_value() {
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
+    }
+}
+
+fn match_params_in_namespace<'a>(
+    key: &'a Vec<i64>,
+    extra_key: Option<&'a str>,
+    cache_salt: Option<&'a str>,
+) -> MatchPrefixParams<'a, Vec<i64>> {
+    MatchPrefixParams {
+        key,
+        namespace: RadixNamespaceRef::new(extra_key, cache_salt),
     }
 }
 
@@ -1302,14 +1316,14 @@ fn insert_first_write_creates_the_namespace() {
     let mut tc = core();
     matched_chain(&mut tc);
     tc.insert(&InsertParams {
-        extra_key: Some("lora-1"),
+        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     // The namespace is isolated under its own root edges, created by the write.
     assert!(tc.arena.namespace_exists(Some("lora-1")));
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
-        extra_key: Some("lora-1"),
+        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
     });
     assert_eq!(result.device_indices.numel(), 0);
     assert_eq!(result.best_match_node_id, tc.root_node_handle(None));
@@ -1322,7 +1336,7 @@ fn match_prefix_empty_query_anchors_at_the_root() {
     for extra_key in [Some("lora-1"), None] {
         let result = tc.match_prefix(&MatchPrefixParams {
             key: &vec![],
-            extra_key,
+            namespace: RadixNamespaceRef::new(extra_key, None),
         });
         assert_eq!(result.best_match_node_id, root_handle);
         assert_eq!(result.last_device_node_id, root_handle);
@@ -1803,13 +1817,25 @@ fn swa_host_backed_node_advances_best_match_but_keeps_the_device_anchor() {
 fn insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         chunked: false,
         priority: 0,
+    }
+}
+
+fn insert_params_in_namespace<'a>(
+    key: &'a Vec<i64>,
+    value: &[i64],
+    extra_key: Option<&'a str>,
+    cache_salt: Option<&'a str>,
+) -> InsertParams<'a, Vec<i64>> {
+    InsertParams {
+        namespace: RadixNamespaceRef::new(extra_key, cache_salt),
+        ..insert_params(key, value)
     }
 }
 
@@ -2248,6 +2274,7 @@ fn insert_coalesces_parent_linked_block_stores() {
             token_ids: vec![1, 2, 7, 8],
             block_size: 2,
             medium: StorageMedium::Gpu,
+            cache_salt: None,
         }]
     );
     // Events hash lazily even though the storage tier is off.
@@ -2258,6 +2285,113 @@ fn insert_coalesces_parent_linked_block_stores() {
         tc.arena.node(tc.arena.resolve(leaf)).hash_value,
         Some(hashes)
     );
+    assert!(tc.salted_event_hashes.is_empty());
+}
+
+#[test]
+fn salted_event_hashes_are_sparse_and_removed_with_the_node() {
+    let mut tc = events_core(2);
+    let key = vec![1, 2, 7, 8];
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[10, 11, 12, 13],
+        None,
+        Some("tenant-a"),
+    ));
+    tc.take_events();
+
+    let leaf = tc
+        .match_prefix(&match_params_in_namespace(&key, None, Some("tenant-a")))
+        .best_match_node_id;
+    let leaf_idx = tc.arena.resolve(leaf);
+    assert_eq!(tc.salted_event_hashes[&leaf].len(), 2);
+    assert_eq!(
+        tc.arena.node(leaf_idx).hash_value,
+        Some(crate::node::get_hash_str::<Vec<i64>>(&key, None, 2))
+    );
+
+    let mut tracker = HashMap::from([(FULL, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(FULL, key.len());
+    let (candidate, step) = tc.evict_device_next_node(FULL, &tracker);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    let (_, step) = tc.evict_device_leaf(candidate.unwrap(), false);
+    accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+    tc.evict_device_end(FULL);
+    tc.take_events();
+    assert!(tc.salted_event_hashes.is_empty());
+
+    tc.insert(&insert_params_in_namespace(
+        &key,
+        &[20, 21, 22, 23],
+        None,
+        Some("tenant-a"),
+    ));
+    assert!(!tc.salted_event_hashes.is_empty());
+    tc.reset();
+    assert!(tc.salted_event_hashes.is_empty());
+}
+
+#[test]
+fn salted_event_hashes_survive_node_split() {
+    let mut tc = events_core(2);
+    let original = vec![1, 2, 3, 4];
+    tc.insert(&insert_params_in_namespace(
+        &original,
+        &[10, 11, 12, 13],
+        None,
+        Some("tenant-a"),
+    ));
+    let original_leaf = tc
+        .match_prefix(&match_params_in_namespace(
+            &original,
+            None,
+            Some("tenant-a"),
+        ))
+        .best_match_node_id;
+    let original_hashes = tc.salted_event_hashes[&original_leaf].clone();
+    tc.take_events();
+
+    let branch = vec![1, 2, 5, 6];
+    tc.insert(&insert_params_in_namespace(
+        &branch,
+        &[20, 21, 22, 23],
+        None,
+        Some("tenant-a"),
+    ));
+    tc.take_events();
+
+    let split_child = tc
+        .match_prefix(&match_params_in_namespace(
+            &original,
+            None,
+            Some("tenant-a"),
+        ))
+        .best_match_node_id;
+    let split_parent_idx = tc.arena.node(tc.arena.resolve(split_child)).parent();
+    let split_parent = tc.arena.node(split_parent_idx).id;
+    assert_eq!(tc.salted_event_hashes[&split_parent], original_hashes[..1]);
+    assert_eq!(tc.salted_event_hashes[&split_child], original_hashes[1..]);
+}
+
+#[test]
+fn salted_event_hash_walk_is_iterative_and_on_demand() {
+    let mut tc = events_core(1);
+    let mut parent = tc.arena.root();
+    for token in 1..=1100 {
+        parent = tc
+            .arena
+            .alloc_child_in_namespace(
+                parent,
+                vec![token],
+                0,
+                RadixNamespaceRef::new(None, Some("tenant-a")),
+            )
+            .unwrap();
+    }
+    assert!(tc.salted_event_hashes.is_empty());
+    tc.ensure_salted_event_hashes_(parent);
+    assert_eq!(tc.salted_event_hashes.len(), 1100);
 }
 
 #[test]
@@ -2269,6 +2403,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         token_ids: vec![10, 11],
         block_size: 2,
         medium: StorageMedium::Gpu,
+        cache_salt: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 1);
     // A different block size must not join the parent-linked store tail.
@@ -2278,6 +2413,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         token_ids: vec![12],
         block_size: 1,
         medium: StorageMedium::Gpu,
+        cache_salt: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
     // Matching size and parent are still separated across media.
@@ -2287,6 +2423,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         token_ids: vec![13],
         block_size: 1,
         medium: StorageMedium::Cpu,
+        cache_salt: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 3);
     // Matching size and medium are still separated without the parent link.
@@ -2296,6 +2433,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         token_ids: vec![14],
         block_size: 1,
         medium: StorageMedium::Cpu,
+        cache_salt: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 4);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
@@ -2329,6 +2467,25 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         &tc.kv_event_queue[6],
         KvCacheEvent::AllBlocksCleared
     ));
+
+    tc.kv_event_queue.clear();
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![1],
+        parent_block_hash: None,
+        token_ids: vec![10, 11],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+        cache_salt: Some(Arc::from("tenant-a")),
+    });
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![2],
+        parent_block_hash: Some(1),
+        token_ids: vec![12, 13],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+        cache_salt: Some(Arc::from("tenant-b")),
+    });
+    assert_eq!(tc.kv_event_queue.len(), 2);
 }
 
 #[test]
@@ -2372,7 +2529,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
     let key: Vec<(i64, i64)> = vec![(1, 2), (2, 3)];
     tc.insert(&InsertParams {
         key: &key,
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
         mamba_value: None,
         prev_prefix_len: 0,
@@ -2392,6 +2549,7 @@ fn bigram_insert_events_carry_pair_token_payloads() {
             token_ids: vec![(1, 2), (2, 3)],
             block_size: 1,
             medium: StorageMedium::Gpu,
+            cache_salt: None,
         }]
     );
 }
@@ -2413,6 +2571,7 @@ fn finish_write_through_emits_cpu_stored_events() {
             token_ids: vec![1],
             block_size: 1,
             medium: StorageMedium::Cpu,
+            cache_salt: None,
         }]
     );
 }
@@ -2463,6 +2622,7 @@ fn load_back_commit_emits_gpu_stored_events() {
             token_ids: vec![1],
             block_size: 1,
             medium: StorageMedium::Gpu,
+            cache_salt: None,
         }]
     );
 }
@@ -2481,6 +2641,7 @@ fn unevict_on_insert_emits_a_gpu_stored_event() {
             token_ids: vec![1],
             block_size: 1,
             medium: StorageMedium::Gpu,
+            cache_salt: None,
         }]
     );
 }
@@ -2568,6 +2729,7 @@ fn split_insert_stores_only_the_new_block_chained_to_the_split_parent() {
             token_ids: vec![5, 6],
             block_size: 2,
             medium: StorageMedium::Gpu,
+            cache_salt: None,
         }]
     );
     // The split divided the page hashes between the two fragments.
@@ -2640,6 +2802,7 @@ fn finish_write_through_after_a_split_publishes_both_fragments() {
             token_ids: vec![1, 2, 3, 4],
             block_size: 2,
             medium: StorageMedium::Cpu,
+            cache_salt: None,
         }]
     );
     // The matching ack cleared the pending mark on both fragments.
@@ -2662,36 +2825,45 @@ fn prefetch_anchor_info_maps_the_namespace() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let plain = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    assert_eq!(tc.prefetch_anchor_info(plain), None);
+    assert_eq!(tc.prefetch_anchor_info(plain), (None, None));
     let salted = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
-            extra_key: Some("chat"),
+            namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
         })
         .best_match_node_id;
-    assert_eq!(tc.prefetch_anchor_info(salted), Some("chat".to_string()));
+    assert_eq!(
+        tc.prefetch_anchor_info(salted),
+        (Some("chat".to_string()), Some("tenant-a".to_string()))
+    );
     // A root anchor carries no namespace: the single root serves them all.
     let root = tc.arena.root();
-    assert_eq!(tc.prefetch_anchor_info(tc.arena.node(root).id), None);
+    assert_eq!(
+        tc.prefetch_anchor_info(tc.arena.node(root).id),
+        (None, None)
+    );
     // A node minted by a split inherits the namespace.
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
         ..insert_params(&vec![7], &[30])
     });
     let split_mid = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7],
-            extra_key: Some("chat"),
+            namespace: RadixNamespaceRef::new(Some("chat"), Some("tenant-a")),
         })
         .best_match_node_id;
     assert_ne!(split_mid, salted);
-    assert_eq!(tc.prefetch_anchor_info(split_mid), Some("chat".to_string()));
+    assert_eq!(
+        tc.prefetch_anchor_info(split_mid),
+        (Some("chat".to_string()), Some("tenant-a".to_string()))
+    );
 }
 
 #[test]
@@ -3442,7 +3614,7 @@ fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
     assert_eq!(result.host_hit_length, 2);
     assert_eq!(result.best_match_node_id, result.last_host_node_id);
     let parent = tc.arena.resolve(result.best_match_node_id);
-    let child = tc.arena.node(parent).children[&(None, vec![3])];
+    let child = tc.arena.node(parent).children[&(RadixNamespace::default(), vec![3])];
     {
         let parent_node = tc.arena.node(parent);
         assert_eq!(parent_node.key, vec![1, 2]);
@@ -3696,7 +3868,7 @@ fn insert_empty_key_is_a_noop_and_mints_no_namespace_root() {
     assert_eq!(tc.arena.len(), 1);
     // A namespaced empty insert never creates the namespace root.
     let result = tc.insert(&InsertParams {
-        extra_key: Some("ghost"),
+        namespace: RadixNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![], &[])
     });
     assert!(result.mamba_exist);
@@ -3713,7 +3885,7 @@ fn root_node_handle_is_namespace_independent() {
     assert_eq!(tc.root_node_handle(Some("ghost")), root_handle);
     assert!(!tc.arena.namespace_exists(Some("ghost")));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![1], &[10])
     });
     assert_eq!(tc.root_node_handle(Some("chat")), root_handle);
@@ -3729,25 +3901,25 @@ fn dfs_weight_order_groups_the_heaviest_subtree_first() {
     let branch_a = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 99],
-            extra_key: None,
+            namespace: RadixNamespaceRef::default(),
         })
         .last_device_node_id;
     let leaf_a1 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 10],
-            extra_key: None,
+            namespace: RadixNamespaceRef::default(),
         })
         .last_device_node_id;
     let leaf_a2 = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![1, 11],
-            extra_key: None,
+            namespace: RadixNamespaceRef::default(),
         })
         .last_device_node_id;
     let leaf_b = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![2, 20],
-            extra_key: None,
+            namespace: RadixNamespaceRef::default(),
         })
         .last_device_node_id;
 
@@ -3783,7 +3955,7 @@ fn insert_empty_key_still_touches_the_existing_root() {
     assert_eq!(tc.arena.node(tc.arena.root()).priority, 7);
     // A namespaced empty insert touches the same single root.
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         priority: 9,
         ..insert_params(&vec![], &[])
     });
@@ -3794,7 +3966,7 @@ fn insert_empty_key_still_touches_the_existing_root() {
 fn insert_into_a_named_namespace_is_isolated() {
     let mut tc = core();
     tc.insert(&InsertParams {
-        extra_key: Some("lora-1"),
+        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     // The default namespace stays empty; the named namespace hits.
@@ -3802,7 +3974,7 @@ fn insert_into_a_named_namespace_is_isolated() {
     assert_eq!(miss.device_indices.numel(), 0);
     let hit = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2],
-        extra_key: Some("lora-1"),
+        namespace: RadixNamespaceRef::new(Some("lora-1"), None),
     });
     assert!(hit.device_indices.equal(&Tensor::from_slice(&[10i64, 11])));
 }
@@ -3825,7 +3997,7 @@ fn insert_sub_page_key_is_a_noop_and_mints_no_namespace_root() {
     assert!(result.mamba_exist);
     assert_eq!(tc.arena.len(), 1);
     let result = tc.insert(&InsertParams {
-        extra_key: Some("ghost"),
+        namespace: RadixNamespaceRef::new(Some("ghost"), None),
         ..insert_params(&vec![1], &[10])
     });
     assert!(result.mamba_exist);
@@ -5553,7 +5725,7 @@ fn reset_restores_a_fresh_tree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
@@ -5631,7 +5803,7 @@ fn total_size_spans_namespaces_and_aux_values() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     assert_eq!(tc.total_size(), (5, 0));
@@ -5678,7 +5850,7 @@ fn walk_for_kv_canary_chains_slots_across_namespaces() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     assert_eq!(
@@ -5954,7 +6126,7 @@ fn all_values_flatten_spans_namespaces() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let (sorted, _) = tc.all_values_flatten().sort(0, /* descending = */ false);
@@ -5966,7 +6138,7 @@ fn collect_all_nodes_visits_every_root_subtree() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[20, 21])
     });
     let mut nodes = tc.collect_all_nodes_();
@@ -5981,7 +6153,7 @@ fn pretty_format_renders_every_namespace_and_component() {
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7], &[30])
     });
     let leaf = tc
@@ -6012,7 +6184,7 @@ fn sane_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.insert(&insert_params(&vec![1, 2, 3, 4, 5], &[20, 21, 22, 13, 14]));
     tc.insert(&insert_params(&vec![1, 2, 9], &[30, 31, 39]));
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     tc
@@ -6494,7 +6666,7 @@ fn match_prefix_on_an_unknown_namespace_allocates_nothing() {
     let arena_len = tc.arena.len();
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &vec![1, 2, 3],
-        extra_key: Some("ghost"),
+        namespace: RadixNamespaceRef::new(Some("ghost"), None),
     });
     assert_eq!(result.device_indices.numel(), 0);
     assert_eq!(tc.arena.len(), arena_len);
@@ -6509,18 +6681,18 @@ fn refresh_dispatches_fire_per_walk_phase_in_a_namespace() {
     let recorder = Arc::new(RecordingComponentForTest::default());
     tc.register_component_(recorder.clone());
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8], &[40, 41])
     });
     // The deeper insert walks down through the existing [7,8] node.
     tc.insert(&InsertParams {
-        extra_key: Some("chat"),
+        namespace: RadixNamespaceRef::new(Some("chat"), None),
         ..insert_params(&vec![7, 8, 9], &[40, 41, 42])
     });
     let leaf = tc
         .match_prefix(&MatchPrefixParams {
             key: &vec![7, 8],
-            extra_key: Some("chat"),
+            namespace: RadixNamespaceRef::new(Some("chat"), None),
         })
         .best_match_node_id;
     let refreshes = recorder.refreshes.lock().unwrap();
@@ -6570,8 +6742,12 @@ fn sanity_check_detects_a_reverse_map_mismatch() {
     let parent = tc.arena.node(leaf_idx3).parent();
     let key = tc.arena.node(leaf_idx3).key.child_key(1);
     let parent_node = tc.arena.node_mut(parent);
-    parent_node.children.remove(&(None, key));
-    parent_node.children.insert((None, vec![99]), leaf_idx3);
+    parent_node
+        .children
+        .remove(&(RadixNamespace::default(), key));
+    parent_node
+        .children
+        .insert((RadixNamespace::default(), vec![99]), leaf_idx3);
     tc.sanity_check(&[], &[]);
 }
 
@@ -6639,7 +6815,7 @@ fn cyclic_child_map_tree() -> UnifiedTreeCore<Vec<i64>> {
     tc.arena
         .node_mut(tc.arena.resolve(leaf))
         .children
-        .insert((None, vec![50]), parent);
+        .insert((RadixNamespace::default(), vec![50]), parent);
     tc
 }
 
@@ -7255,7 +7431,7 @@ fn sequence_insert_params<'k>(
     });
     InsertParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(&kv),
         mamba_value,
         prev_prefix_len,
@@ -7411,12 +7587,12 @@ fn drain_full_device(tc: &mut UnifiedTreeCore<Vec<i64>>) {
 fn an_emptied_namespace_leaves_nothing_behind() {
     let mut tc = core();
     tc.insert(&InsertParams {
-        extra_key: Some("salted"),
+        namespace: RadixNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     let top = tc
         .match_prefix(&MatchPrefixParams {
-            extra_key: Some("salted"),
+            namespace: RadixNamespaceRef::new(Some("salted"), None),
             ..match_params(&vec![1, 2])
         })
         .best_match_node_id;
@@ -7428,7 +7604,7 @@ fn an_emptied_namespace_leaves_nothing_behind() {
     tc.sanity_check(&[], &[]);
     // A later insert respins the namespace from scratch.
     tc.insert(&InsertParams {
-        extra_key: Some("salted"),
+        namespace: RadixNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     assert!(tc.arena.namespace_exists(Some("salted")));
@@ -7441,7 +7617,7 @@ fn namespaces_do_not_accumulate_across_salts() {
     for salt in 0..64 {
         let salt = format!("session-{salt}");
         tc.insert(&InsertParams {
-            extra_key: Some(&salt),
+            namespace: RadixNamespaceRef::new(Some(&salt), None),
             ..insert_params(&vec![1, 2], &[10, 11])
         });
         drain_full_device(&mut tc);
@@ -7455,12 +7631,12 @@ fn namespaces_do_not_accumulate_across_salts() {
 fn a_zero_length_match_anchors_at_the_root() {
     let mut tc = core();
     tc.insert(&InsertParams {
-        extra_key: Some("salted"),
+        namespace: RadixNamespaceRef::new(Some("salted"), None),
         ..insert_params(&vec![1, 2], &[10, 11])
     });
     let anchor = tc
         .match_prefix(&MatchPrefixParams {
-            extra_key: Some("salted"),
+            namespace: RadixNamespaceRef::new(Some("salted"), None),
             ..match_params(&vec![9])
         })
         .best_match_node_id;

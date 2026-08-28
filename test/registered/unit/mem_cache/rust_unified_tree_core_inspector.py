@@ -213,6 +213,7 @@ class RustUnifiedTreeCoreInspector(
             result,
             _radix_key_buffer(params.key),
             params.key.extra_key,
+            params.key.cache_salt,
             value_chunks,
             best_value_len,
         )

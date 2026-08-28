@@ -21,6 +21,7 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
+    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.environ import envs
@@ -918,8 +919,16 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
-    def _insert(self, cache, allocator, tokens):
-        key = RadixKey(array("q", tokens))
+    def _insert(
+        self,
+        cache,
+        allocator,
+        tokens,
+        *,
+        extra_key=None,
+        cache_salt=None,
+    ):
+        key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
         value = allocator.alloc(len(tokens))
         self.assertIsNotNone(value)
         return cache.insert(InsertParams(key=key, value=value[: len(key)]))
@@ -993,6 +1002,72 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         removed = self._removed_events(cache, StorageMedium.GPU)
         self.assertEqual(len(removed), 1)
         self.assertEqual(removed[0].block_hashes, stored_hashes)
+
+    def test_cache_salt_is_included_in_store_and_remove_events(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache.take_events()
+
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, seq, cache_salt="tenant-a")
+        stored = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(stored), 1)
+        self.assertIsInstance(stored[0], BlockStoredWithMetadata)
+        self.assertEqual(stored[0].metadata.cache_salt, "tenant-a")
+        salted_hashes = self._event_hashes(stored)
+
+        cache.evict(EvictParams(num_tokens=len(seq)))
+        removed = self._removed_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0].block_hashes, salted_hashes)
+
+        unsalted, unsalted_allocator, _ = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
+        unsalted.take_events()
+        self._insert(unsalted, unsalted_allocator, seq)
+        self.assertNotEqual(
+            self._event_hashes(self._stored_events(unsalted, StorageMedium.GPU)),
+            salted_hashes,
+        )
+
+    def test_cache_salt_event_parentage_survives_node_split(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        cache.take_events()
+
+        self._insert(cache, allocator, [1, 2, 3, 4], cache_salt="tenant-a")
+        original = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(original), 1)
+        self.assertEqual(len(original[0].block_hashes), 2)
+
+        self._insert(cache, allocator, [1, 2, 5, 6], cache_salt="tenant-a")
+        branch = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(len(branch), 1)
+        self.assertIsInstance(branch[0], BlockStoredWithMetadata)
+        self.assertEqual(branch[0].metadata.cache_salt, "tenant-a")
+        self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
+        self.assertEqual(list(branch[0].token_ids), [5, 6])
+
+    def test_event_hashes_depend_on_cache_salt_but_not_extra_key(self):
+        def stored_hashes(*, extra_key=None, cache_salt=None):
+            cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+            cache.take_events()
+            self._insert(
+                cache,
+                allocator,
+                [1, 2, 3, 4],
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+            )
+            return self._event_hashes(self._stored_events(cache, StorageMedium.GPU))
+
+        self.assertNotEqual(
+            stored_hashes(cache_salt="tenant-a"),
+            stored_hashes(cache_salt="tenant-b"),
+        )
+        self.assertEqual(
+            stored_hashes(extra_key="adapter-a", cache_salt="tenant-a"),
+            stored_hashes(extra_key="adapter-b", cache_salt="tenant-a"),
+        )
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -1163,9 +1238,19 @@ class UnifiedRadixCacheSuite:
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
 
-    def _insert(self, cache, allocator, req_to_token_pool, tokens, priority=0):
+    def _insert(
+        self,
+        cache,
+        allocator,
+        req_to_token_pool,
+        tokens,
+        priority=0,
+        *,
+        extra_key=None,
+        cache_salt=None,
+    ):
         """Insert tokens, attaching mamba data when the config has mamba."""
-        key = RadixKey(array("q", tokens))
+        key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
         value = self._alloc(allocator, len(tokens))
         params = InsertParams(key=key, value=value[: len(key)], priority=priority)
         if self.cfg.has_mamba:
@@ -1197,6 +1282,48 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(len(m.device_indices), 0)
 
+        cache.sanity_check()
+
+    def test_cache_salt_and_extra_key_form_independent_namespaces(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+
+        first = self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            seq,
+            extra_key="bc",
+            cache_salt="a",
+        )
+        second = self._insert(
+            cache,
+            allocator,
+            req_to_token_pool,
+            seq,
+            extra_key="c",
+            cache_salt="ab",
+        )
+        self.assertEqual(first.prefix_len, 0)
+        self.assertEqual(second.prefix_len, 0)
+
+        first_match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", seq), extra_key="bc", cache_salt="a")
+            )
+        )
+        second_match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", seq), extra_key="c", cache_salt="ab")
+            )
+        )
+        default_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        )
+        self.assertEqual(len(first_match.device_indices), len(seq))
+        self.assertEqual(len(second_match.device_indices), len(seq))
+        self.assertEqual(len(default_match.device_indices), 0)
+        self.assertNotEqual(first_match.last_device_node, second_match.last_device_node)
         cache.sanity_check()
 
     def test_shared_prefix_split(self):

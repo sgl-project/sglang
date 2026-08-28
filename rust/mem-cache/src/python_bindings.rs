@@ -12,7 +12,7 @@ use tch::{Device, Kind, Tensor};
 
 use crate::components::{ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
-use crate::node::{NodeId, TreeCoreRuntimeError};
+use crate::node::{NodeId, RadixNamespaceRef, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
@@ -470,16 +470,23 @@ impl TreeCoreInitParamsBinding {
 pub struct MatchParamsBinding {
     pub key: Vec<i64>,
     pub extra_key: Option<String>,
+    pub cache_salt: Option<String>,
 }
 
 #[pymethods]
 impl MatchParamsBinding {
     #[new]
-    #[pyo3(signature = (key, extra_key = None))]
-    fn new(py: Python<'_>, key: &Bound<'_, PyAny>, extra_key: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (key, extra_key = None, cache_salt = None))]
+    fn new(
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        extra_key: Option<String>,
+        cache_salt: Option<String>,
+    ) -> PyResult<Self> {
         Ok(MatchParamsBinding {
             key: py_array_to_vec_i64(py, key)?,
             extra_key,
+            cache_salt,
         })
     }
 }
@@ -491,6 +498,7 @@ pub struct InsertParamsBinding {
     pub key: Vec<i64>,
     pub value: Py<PyAny>,
     pub extra_key: Option<String>,
+    pub cache_salt: Option<String>,
     pub mamba_value: Option<Py<PyAny>>,
     pub prev_prefix_len: usize,
     pub swa_evicted_seqlen: usize,
@@ -501,12 +509,13 @@ pub struct InsertParamsBinding {
 #[pymethods]
 impl InsertParamsBinding {
     #[new]
-    #[pyo3(signature = (key, value, extra_key = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None))]
+    #[pyo3(signature = (key, value, extra_key = None, cache_salt = None, prev_prefix_len = 0, swa_evicted_seqlen = 0, chunked = false, priority = 0, mamba_value = None))]
     fn new(
         py: Python<'_>,
         key: &Bound<'_, PyAny>,
         value: Py<PyAny>,
         extra_key: Option<String>,
+        cache_salt: Option<String>,
         prev_prefix_len: usize,
         swa_evicted_seqlen: usize,
         chunked: bool,
@@ -517,6 +526,7 @@ impl InsertParamsBinding {
             key: py_array_to_vec_i64(py, key)?,
             value,
             extra_key,
+            cache_salt,
             mamba_value,
             prev_prefix_len,
             swa_evicted_seqlen,
@@ -935,7 +945,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let key = key.as_ref();
         let params = MatchPrefixParams {
             key,
-            extra_key: params.extra_key.as_deref(),
+            namespace: RadixNamespaceRef::new(
+                params.extra_key.as_deref(),
+                params.cache_salt.as_deref(),
+            ),
         };
         let result = py.allow_threads(|| self.core().match_prefix(&params));
         MatchResultBinding::from_match_result(py, result)
@@ -964,7 +977,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         };
         let params = InsertParams {
             key,
-            extra_key: params.extra_key.as_deref(),
+            namespace: RadixNamespaceRef::new(
+                params.extra_key.as_deref(),
+                params.cache_salt.as_deref(),
+            ),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -995,7 +1011,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         };
         let params = InsertParams {
             key,
-            extra_key: params.extra_key.as_deref(),
+            namespace: RadixNamespaceRef::new(
+                params.extra_key.as_deref(),
+                params.cache_salt.as_deref(),
+            ),
             value: value.0,
             mamba_value,
             prev_prefix_len: params.prev_prefix_len,
@@ -1337,6 +1356,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         key: &Bound<'_, PyAny>,
         host_value: PyTensor,
         hash_value: Vec<String>,
+        cache_salt: Option<String>,
     ) -> PyResult<InsertResultBinding> {
         let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
         let host_value = host_value.0;
@@ -1346,10 +1366,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 host_value.kind()
             )));
         }
-        let result = py.allow_threads(move || {
-            self.core()
-                .insert_host(node_id, extra_key.as_deref(), key, host_value, hash_value)
-        });
+        let result = py
+            .allow_threads(move || {
+                self.core().try_insert_host_in_namespace(
+                    node_id,
+                    RadixNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                    key,
+                    host_value,
+                    hash_value,
+                )
+            })
+            .map_err(tree_core_runtime_error)?;
         InsertResultBinding::from_insert_result(py, result)
     }
 
@@ -1435,7 +1462,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-    ) -> PyResult<Option<String>> {
+    ) -> PyResult<(Option<String>, Option<String>)> {
         py.allow_threads(|| self.core().try_prefetch_anchor_info(node_id))
             .map_err(tree_core_runtime_error)
     }
@@ -1730,6 +1757,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                     token_ids,
                     block_size,
                     medium,
+                    cache_salt,
                 } => {
                     let item: Py<PyAny> = (
                         "block_stored",
@@ -1738,6 +1766,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                         token_ids,
                         block_size,
                         medium.as_str(),
+                        cache_salt.map(|salt| salt.to_string()),
                     )
                         .into_py(py);
                     list.append(item)?;
@@ -2109,6 +2138,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         result: InspectionMatchResultInput,
         key: &Bound<'_, PyAny>,
         extra_key: Option<String>,
+        cache_salt: Option<String>,
         value_chunks: Vec<PyTensor>,
         best_value_len: usize,
     ) -> PyResult<MatchResultBinding> {
@@ -2144,7 +2174,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let result = py.allow_threads(move || {
             let params = MatchPrefixParams {
                 key: &key,
-                extra_key: extra_key.as_deref(),
+                namespace: RadixNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
             };
             self.core().inspect_finalize_component_match_result(
                 component_type,
@@ -2466,7 +2496,7 @@ macro_rules! tree_core_binding {
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
-            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value))]
+            #[pyo3(signature = (node_id, extra_key, key, host_value, hash_value, cache_salt = None))]
             fn insert_host(
                 &self,
                 py: Python<'_>,
@@ -2475,9 +2505,17 @@ macro_rules! tree_core_binding {
                 key: &Bound<'_, PyAny>,
                 host_value: PyTensor,
                 hash_value: Vec<String>,
+                cache_salt: Option<String>,
             ) -> PyResult<InsertResultBinding> {
-                self.inner
-                    .insert_host(py, node_id, extra_key, key, host_value, hash_value)
+                self.inner.insert_host(
+                    py,
+                    node_id,
+                    extra_key,
+                    key,
+                    host_value,
+                    hash_value,
+                    cache_salt,
+                )
             }
 
             /// Gather a node's device value plus per-component BACKUP_HOST transfers.
@@ -2526,12 +2564,12 @@ macro_rules! tree_core_binding {
                 )
             }
 
-            /// The anchor node's namespace; None for root-like anchors.
+            /// The anchor node's caller-defined key and cache salt.
             fn prefetch_anchor_info(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-            ) -> PyResult<Option<String>> {
+            ) -> PyResult<(Option<String>, Option<String>)> {
                 self.inner.prefetch_anchor_info(py, node_id)
             }
 
@@ -3080,7 +3118,7 @@ macro_rules! tree_core_binding {
 
             #[cfg(feature = "inspection")]
             #[allow(clippy::too_many_arguments)]
-            #[pyo3(signature = (component_type, result, key, extra_key, value_chunks, best_value_len))]
+            #[pyo3(signature = (component_type, result, key, extra_key, cache_salt, value_chunks, best_value_len))]
             fn inspect_finalize_component_match_result(
                 &self,
                 py: Python<'_>,
@@ -3088,6 +3126,7 @@ macro_rules! tree_core_binding {
                 result: InspectionMatchResultInput,
                 key: &Bound<'_, PyAny>,
                 extra_key: Option<String>,
+                cache_salt: Option<String>,
                 value_chunks: Vec<PyTensor>,
                 best_value_len: usize,
             ) -> PyResult<MatchResultBinding> {
@@ -3097,6 +3136,7 @@ macro_rules! tree_core_binding {
                     result,
                     key,
                     extra_key,
+                    cache_salt,
                     value_chunks,
                     best_value_len,
                 )

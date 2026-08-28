@@ -59,14 +59,14 @@ fn evict_walk_setup(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_, 
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
     }
 }
 
 fn insert(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>, value: &[i64]) {
     tc.insert(&crate::unified_tree_core::InsertParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
         prev_prefix_len: 0,
@@ -453,7 +453,7 @@ fn host_drive_is_a_noop_without_host_leaves() {
     let mut tc = core();
     tc.insert(&crate::unified_tree_core::InsertParams {
         key: &vec![1, 2],
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(&[10i64, 11]),
         mamba_value: None,
         prev_prefix_len: 0,
@@ -1581,7 +1581,7 @@ fn finalize(tc: &UnifiedTreeCore<Vec<i64>>, result: MatchResult) -> MatchResult 
         result,
         &MatchPrefixParams {
             key: &Vec::new(),
-            extra_key: None,
+            namespace: Default::default(),
         },
         &[],
         0,

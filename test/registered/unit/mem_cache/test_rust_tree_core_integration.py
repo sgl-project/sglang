@@ -1,5 +1,6 @@
 """Integration tests driving the real compiled Rust mem_cache extension."""
 
+import hashlib
 import shutil
 import sys
 from array import array
@@ -19,6 +20,8 @@ from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    BlockStoredMetadata,
+    BlockStoredWithMetadata,
     StorageMedium,
 )
 from sglang.srt.environ import envs
@@ -458,23 +461,55 @@ def test_extra_key_isolates_namespaces():
     assert core.prefetch_anchor_info(core.root_node_handle()) == (None, None)
 
 
-def test_cache_salt_is_rejected_by_all_key_entry_points():
+def test_cache_salt_is_supported_by_all_key_entry_points():
     core = _tree_core()
-    key = RadixKey(array("q", [1, 2]), cache_salt="tenant-a")
-    message = "cache_salt is not supported"
+    tokens = array("q", [1, 2])
+    first_key = RadixKey(tokens, extra_key="bc", cache_salt="a")
+    second_key = RadixKey(tokens, extra_key="c", cache_salt="ab")
+    _pump_insert(
+        core,
+        InsertParams(key=first_key, value=torch.tensor([10, 11], dtype=torch.int64)),
+    )
+    _pump_insert(
+        core,
+        InsertParams(key=second_key, value=torch.tensor([20, 21], dtype=torch.int64)),
+    )
 
-    with pytest.raises(ValueError, match=message):
-        core.match_prefix(MatchPrefixParams(key=key))
-    with pytest.raises(ValueError, match=message):
-        core.begin_insert(
-            InsertParams(key=key, value=torch.tensor([10, 11], dtype=torch.int64))
-        )
-    with pytest.raises(ValueError, match=message):
-        core.insert_host(
-            core.root_node_handle(),
-            key,
-            torch.tensor([100, 101], dtype=torch.int64),
-            ["h0", "h1"],
+    assert core.match_prefix(
+        MatchPrefixParams(key=first_key)
+    ).device_indices.tolist() == [
+        10,
+        11,
+    ]
+    assert core.match_prefix(
+        MatchPrefixParams(key=second_key)
+    ).device_indices.tolist() == [
+        20,
+        21,
+    ]
+    assert (
+        core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).device_indices.numel()
+        == 0
+    )
+
+    host_core = _tree_core()
+    host_core.set_hicache_enabled()
+    result = host_core.insert_host(
+        host_core.root_node_handle(),
+        first_key,
+        torch.tensor([100, 101], dtype=torch.int64),
+        ["h0", "h1"],
+    )
+    assert result.inserted_host_node is not None
+    host_match = host_core.match_prefix(MatchPrefixParams(key=first_key))
+    assert host_match.host_hit_length == 2
+    assert host_core.prefetch_anchor_info(host_match.best_match_node) == ("bc", "a")
+    with pytest.raises(RuntimeError, match="does not match non-root anchor"):
+        host_core.insert_host(
+            host_match.best_match_node,
+            RadixKey(array("q", [3, 4]), extra_key="bc", cache_salt="other"),
+            torch.tensor([102, 103], dtype=torch.int64),
+            ["h2", "h3"],
         )
 
 
@@ -707,6 +742,75 @@ def test_insert_emits_block_stored_events():
     assert core.take_events() == []
 
 
+def test_salted_events_match_python_hash_and_metadata_contract():
+    core = _tree_core(enable_kv_cache_events=True, page_size=2)
+    key = RadixKey(array("q", [1, 2, 7, 8]), cache_salt="tenant-a")
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        ),
+    )
+    seed = hashlib.sha256(b"sglang-cache-salt-v1\0tenant-a").hexdigest()
+    hashes = [
+        hash_str_to_int64(value)
+        for value in mem_cache.get_hash_str(array("q", [1, 2, 7, 8]), seed, 2)
+    ]
+    assert core.take_events() == [
+        BlockStoredWithMetadata(
+            block_hashes=hashes,
+            parent_block_hash=None,
+            token_ids=[1, 2, 7, 8],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.GPU,
+            metadata=BlockStoredMetadata(cache_salt="tenant-a"),
+        )
+    ]
+
+    tracker = {ComponentType.FULL: 0}
+    core.evict_device_start(ComponentType.FULL, 4)
+    candidate = core.evict_device_next_node(ComponentType.FULL, tracker).node_id
+    assert candidate is not None
+    evicted = core.evict_device_leaf(candidate, is_write_back=False)
+    evicted.device_frees.clear()
+    evicted.host_frees.clear()
+    core.evict_device_end(ComponentType.FULL)
+    assert core.take_events() == [
+        BlockRemoved(block_hashes=hashes, medium=StorageMedium.GPU)
+    ]
+
+
+def test_salted_eagle_events_match_the_bigram_hash_contract():
+    core = _tree_core(enable_kv_cache_events=True, page_size=2, is_eagle=True)
+    raw_tokens = array("q", [1, 2, 3, 4, 5])
+    key = RadixKey(raw_tokens, cache_salt="tenant-a", is_bigram=True)
+    _pump_insert(
+        core,
+        InsertParams(
+            key=key,
+            value=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        ),
+    )
+    seed = hashlib.sha256(b"sglang-cache-salt-v1\0tenant-a").hexdigest()
+    hashes = [
+        hash_str_to_int64(value)
+        for value in mem_cache.get_hash_str(raw_tokens, seed, 2, is_bigram=True)
+    ]
+    assert core.take_events() == [
+        BlockStoredWithMetadata(
+            block_hashes=hashes,
+            parent_block_hash=None,
+            token_ids=[(1, 2), (2, 3), (3, 4), (4, 5)],
+            block_size=2,
+            lora_id=None,
+            medium=StorageMedium.GPU,
+            metadata=BlockStoredMetadata(cache_salt="tenant-a"),
+        )
+    ]
+
+
 def test_demote_emits_block_removed():
     core = _tree_core(enable_kv_cache_events=True)
     core.set_hicache_enabled()
@@ -855,6 +959,19 @@ def test_walk_for_kv_canary_swa_filter_is_inert_without_the_swa_component():
 def test_empty_keys_cross_the_binding():
     assert mem_cache.MatchParamsBinding(array("q")).key == []
     assert mem_cache.MatchParamsBinding([]).key == []
+
+
+def test_empty_cache_salt_uses_the_default_namespace_at_the_binding():
+    binding = _binding()
+    binding.insert(
+        mem_cache.InsertParamsBinding(
+            key=array("q", [1]),
+            value=torch.tensor([10], dtype=torch.int64),
+            cache_salt="",
+        )
+    )
+    result = binding.match_prefix(mem_cache.MatchParamsBinding(array("q", [1])))
+    assert result.device_indices.tolist() == [10]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

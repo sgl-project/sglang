@@ -90,7 +90,7 @@ fn insert_overlap_default_consumes_nothing() {
         Tensor::from_slice(&[0i64, 1, 2]),
         &InsertParams {
             key: &vec![0, 1, 2],
-            extra_key: None,
+            namespace: Default::default(),
             value: Tensor::from_slice(&[0i64, 1, 2]),
             mamba_value: None,
             prev_prefix_len: 0,
@@ -119,7 +119,7 @@ fn finalize_match_result_default_returns_result_unchanged() {
         result,
         &MatchPrefixParams {
             key: &Vec::new(),
-            extra_key: None,
+            namespace: Default::default(),
         },
         &[],
         0,

@@ -402,7 +402,7 @@ fn finalize(
         },
         &MatchPrefixParams {
             key: &Vec::new(),
-            extra_key: None,
+            namespace: Default::default(),
         },
         &[],
         0,
@@ -540,7 +540,7 @@ fn insert_params_swa<'k>(
 ) -> InsertParams<'k, Vec<i64>> {
     InsertParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
         value: Tensor::from_slice(value),
         mamba_value: None,
         prev_prefix_len,
@@ -2994,7 +2994,7 @@ fn match_prefix_with_an_empty_key_on_a_swa_core_is_a_clean_miss() {
     tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
     let result = tc.match_prefix(&MatchPrefixParams {
         key: &Vec::new(),
-        extra_key: None,
+        namespace: Default::default(),
     });
     assert_eq!(result.device_indices.size()[0], 0);
     assert_eq!(result.swa_host_hit_length, 0);
@@ -4573,7 +4573,7 @@ fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
 fn match_params(key: &Vec<i64>) -> MatchPrefixParams<'_, Vec<i64>> {
     MatchPrefixParams {
         key,
-        extra_key: None,
+        namespace: Default::default(),
     }
 }
 

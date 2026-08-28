@@ -2,9 +2,9 @@
 
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
+use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::fmt::Debug;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use hashbrown::hash_map::Entry;
@@ -14,24 +14,138 @@ use tch::Tensor;
 
 use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
 
-type ChildMap<K> = HashBrownMap<(Option<Arc<str>>, K), NodeIdx_, RandomState>;
+/// The two independent dimensions that partition a radix tree.
+#[derive(Debug)]
+struct RadixNamespaceData {
+    extra_key: Option<Arc<str>>,
+    cache_salt: Option<Arc<str>>,
+    hash: u64,
+}
+
+/// Compact, shared namespace stored on nodes and child edges.
+///
+/// The default namespace is represented without an allocation. Non-default
+/// namespaces share one immutable allocation down a radix path.
+#[derive(Clone, Debug, Default)]
+pub struct RadixNamespace(Option<Arc<RadixNamespaceData>>);
+
+/// Borrowed namespace used by match/insert lookups without allocating.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RadixNamespaceRef<'a> {
+    pub extra_key: Option<&'a str>,
+    pub cache_salt: Option<&'a str>,
+    hash: u64,
+}
+
+fn radix_namespace_hash(extra_key: Option<&str>, cache_salt: Option<&str>) -> u64 {
+    if extra_key.is_none() && cache_salt.is_none() {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    extra_key.hash(&mut hasher);
+    cache_salt.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl<'a> RadixNamespaceRef<'a> {
+    pub fn new(extra_key: Option<&'a str>, cache_salt: Option<&'a str>) -> Self {
+        let cache_salt = cache_salt.filter(|salt| !salt.is_empty());
+        Self {
+            extra_key,
+            cache_salt,
+            hash: radix_namespace_hash(extra_key, cache_salt),
+        }
+    }
+
+    pub fn to_owned(self) -> RadixNamespace {
+        if self.extra_key.is_none() && self.cache_salt.is_none() {
+            return RadixNamespace::default();
+        }
+        RadixNamespace(Some(Arc::new(RadixNamespaceData {
+            extra_key: self.extra_key.map(Into::into),
+            cache_salt: self.cache_salt.map(Into::into),
+            hash: self.hash,
+        })))
+    }
+}
+
+impl PartialEq for RadixNamespaceRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.extra_key == other.extra_key && self.cache_salt == other.cache_salt
+    }
+}
+
+impl Eq for RadixNamespaceRef<'_> {}
+
+impl Hash for RadixNamespaceRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl RadixNamespace {
+    pub fn new(extra_key: Option<&str>, cache_salt: Option<&str>) -> Self {
+        RadixNamespaceRef::new(extra_key, cache_salt).to_owned()
+    }
+
+    pub fn as_ref(&self) -> RadixNamespaceRef<'_> {
+        match self.0.as_deref() {
+            Some(namespace) => RadixNamespaceRef {
+                extra_key: namespace.extra_key.as_deref(),
+                cache_salt: namespace.cache_salt.as_deref(),
+                hash: namespace.hash,
+            },
+            None => RadixNamespaceRef::default(),
+        }
+    }
+
+    pub fn extra_key(&self) -> Option<&str> {
+        self.as_ref().extra_key
+    }
+
+    pub fn cache_salt(&self) -> Option<&str> {
+        self.as_ref().cache_salt
+    }
+
+    pub fn cache_salt_arc(&self) -> Option<Arc<str>> {
+        self.0
+            .as_ref()
+            .and_then(|namespace| namespace.cache_salt.clone())
+    }
+}
+
+impl PartialEq for RadixNamespace {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for RadixNamespace {}
+
+impl Hash for RadixNamespace {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+type ChildMap<K> = HashBrownMap<(RadixNamespace, K), NodeIdx_, RandomState>;
 
 /// Borrowed view of a namespaced child edge used for allocation-free lookup.
 struct ChildEdgeRef<'a, K: ChildKeyType> {
-    extra_key: Option<&'a str>,
+    namespace: RadixNamespaceRef<'a>,
     page: &'a [K::Atom],
 }
 
 impl<K: ChildKeyType> Hash for ChildEdgeRef<'_, K> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.extra_key.hash(state);
+        self.namespace.hash(state);
         self.page.hash(state);
     }
 }
 
-impl<K: ChildKeyType> Equivalent<(Option<Arc<str>>, K)> for ChildEdgeRef<'_, K> {
-    fn equivalent(&self, edge: &(Option<Arc<str>>, K)) -> bool {
-        self.extra_key == edge.0.as_deref() && self.page == edge.1.as_ref()
+impl<K: ChildKeyType> Equivalent<(RadixNamespace, K)> for ChildEdgeRef<'_, K> {
+    fn equivalent(&self, edge: &(RadixNamespace, K)) -> bool {
+        self.namespace == edge.0.as_ref() && self.page == edge.1.as_ref()
     }
 }
 
@@ -42,10 +156,10 @@ pub struct Node<K: ChildKeyType> {
     /// Own arena slot; stamped by the arena on allocation (hand-built nodes
     /// default it to the id value).
     pub(crate) idx: NodeIdx_,
-    /// The namespace this node belongs to; `None` for the default namespace.
-    pub extra_key: Option<Arc<str>>,
+    /// The namespace this node belongs to.
+    pub namespace: RadixNamespace,
     /// Child edges keyed by (namespace, the child's page key); the namespace
-    /// component mirrors the child's `extra_key` at every level.
+    /// component mirrors the child's namespace at every level.
     pub children: ChildMap<K>,
     /// The page key labelling the edge from the parent (also this node's key in the
     /// parent's `children`); empty for the root.
@@ -269,7 +383,7 @@ impl<K: ChildKeyType> Node<K> {
     pub(crate) fn new_root(id: NodeId) -> Self {
         Node {
             parent: None,
-            extra_key: None,
+            namespace: RadixNamespace::default(),
             children: ChildMap::with_hasher(RandomState::new()),
             key: K::default(),
             values: Default::default(),
@@ -291,7 +405,7 @@ impl<K: ChildKeyType> Node<K> {
     pub(crate) fn new_child(id: NodeId, key: K, priority: i64) -> Self {
         Node {
             parent: None,
-            extra_key: None,
+            namespace: RadixNamespace::default(),
             children: ChildMap::with_hasher(RandomState::new()),
             key,
             values: Default::default(),
@@ -310,13 +424,13 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// The namespaced edge key for this node's own edge from its parent.
-    pub(crate) fn edge_key(&self, page_size: usize) -> (Option<Arc<str>>, K) {
-        (self.extra_key.clone(), self.key.child_key(page_size))
+    pub(crate) fn edge_key(&self, page_size: usize) -> (RadixNamespace, K) {
+        (self.namespace.clone(), self.key.child_key(page_size))
     }
 
     /// Link `child` under this node, keyed by its namespaced page key; errors on
     /// a duplicate key. Panics if `child` is already attached (an internal invariant).
-    /// The caller sets `child.extra_key` first; the edge key mirrors it.
+    /// The caller sets `child.namespace` first; the edge key mirrors it.
     pub(crate) fn attach_child(
         &mut self,
         child: &mut Node<K>,
@@ -619,6 +733,9 @@ pub enum TreeCoreRuntimeError {
     /// SWA load-back cannot cross a node that has no value on either tier.
     #[error("SWA load-back traversal reached node {node_id} without a device or host value")]
     SwaLoadBackMissingValue { node_id: NodeId },
+    /// A host insert below a non-root anchor must remain in that anchor's namespace.
+    #[error("insert_host namespace does not match non-root anchor {node_id}")]
+    InsertHostNamespaceMismatch { node_id: NodeId },
 }
 
 // Unigram and bigram child keys.
@@ -774,13 +891,14 @@ impl ChildKeyType for Vec<(i64, i64)> {
 
 // Per-page hash chains.
 
-const DIGEST_LEN: usize = 32;
+pub(crate) const DIGEST_LEN: usize = 32;
+pub(crate) type HashDigest = [u8; DIGEST_LEN];
 
 /// SHA256(prior_digest || page atom words as little-endian u32 bytes).
-fn hash_page<K: ChildKeyType>(
+pub(crate) fn hash_page<K: ChildKeyType>(
     page: &[K::Atom],
-    prior: Option<&[u8; DIGEST_LEN]>,
-) -> [u8; DIGEST_LEN] {
+    prior: Option<&HashDigest>,
+) -> HashDigest {
     let mut hasher = Sha256::new();
     if let Some(prior) = prior {
         hasher.update(prior);
@@ -794,7 +912,7 @@ fn hash_page<K: ChildKeyType>(
 }
 
 /// Lowercase-hex encoding of a digest.
-fn digest_to_hex(digest: &[u8; DIGEST_LEN]) -> String {
+fn digest_to_hex(digest: &HashDigest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(DIGEST_LEN * 2);
     for byte in digest {
@@ -805,7 +923,7 @@ fn digest_to_hex(digest: &[u8; DIGEST_LEN]) -> String {
 }
 
 /// Decode a chained-in hex hash back to its raw digest.
-fn parse_prior_hash(prior_hash: &str) -> [u8; DIGEST_LEN] {
+fn parse_prior_hash(prior_hash: &str) -> HashDigest {
     let bytes = prior_hash.as_bytes();
     assert_eq!(
         bytes.len(),
@@ -847,9 +965,31 @@ pub fn get_hash_str<K: ChildKeyType>(
     hash_values
 }
 
+/// Per-page chained raw digests, seeded from an optional prior digest.
+pub(crate) fn get_hash_digests<K: ChildKeyType>(
+    atoms: &[K::Atom],
+    prior: Option<&HashDigest>,
+    page_size: usize,
+) -> Vec<HashDigest> {
+    assert!(page_size > 0, "page_size must be positive");
+    let mut prior = prior.copied();
+    let mut digests = Vec::with_capacity(atoms.len().div_ceil(page_size));
+    for page in atoms.chunks(page_size) {
+        let digest = hash_page::<K>(page, prior.as_ref());
+        digests.push(digest);
+        prior = Some(digest);
+    }
+    digests
+}
+
 /// The hash's first 16 hex chars as a signed 64-bit block id for events.
 pub fn hash_str_to_int64(hash_str: &str) -> i64 {
     u64::from_str_radix(&hash_str[..16], 16).expect("hash must be a hex digest") as i64
+}
+
+/// The raw digest's first eight bytes as the event protocol's signed i64.
+pub(crate) fn hash_digest_to_int64(digest: &HashDigest) -> i64 {
+    i64::from_be_bytes(digest[..8].try_into().expect("digest has eight bytes"))
 }
 
 /// Split a node's hash list at a page boundary; None-safe when never hashed.
@@ -998,9 +1138,14 @@ impl<K: ChildKeyType> NodeArena<K> {
             .collect()
     }
 
-    /// The node's namespace; None for the default.
+    /// The node's caller-defined namespace key; None for the default.
     pub fn node_extra_key(&self, node_id: NodeIdx_) -> Option<&str> {
-        self.node(node_id).extra_key.as_deref()
+        self.node(node_id).namespace.extra_key()
+    }
+
+    /// The node's cache salt; None for an unsalted namespace.
+    pub fn node_cache_salt(&self, node_id: NodeIdx_) -> Option<&str> {
+        self.node(node_id).namespace.cache_salt()
     }
 
     /// The tree's single root.
@@ -1015,9 +1160,23 @@ impl<K: ChildKeyType> NodeArena<K> {
         extra_key: Option<&str>,
         page: &[K::Atom],
     ) -> Option<NodeIdx_> {
+        self.child_on_page_in_namespace(
+            id,
+            RadixNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            page,
+        )
+    }
+
+    /// The node's child on the page within the full radix namespace, if any.
+    pub fn child_on_page_in_namespace(
+        &self,
+        id: NodeIdx_,
+        namespace: RadixNamespaceRef<'_>,
+        page: &[K::Atom],
+    ) -> Option<NodeIdx_> {
         self.node(id)
             .children
-            .get(&ChildEdgeRef::<K> { extra_key, page })
+            .get(&ChildEdgeRef::<K> { namespace, page })
             .copied()
     }
 
@@ -1026,12 +1185,28 @@ impl<K: ChildKeyType> NodeArena<K> {
         self.child_on_page(self.root, extra_key, page)
     }
 
+    /// The root's child on the key's first page within the full radix namespace.
+    pub fn root_child_in_namespace(
+        &self,
+        namespace: RadixNamespaceRef<'_>,
+        page: &[K::Atom],
+    ) -> Option<NodeIdx_> {
+        self.child_on_page_in_namespace(self.root, namespace, page)
+    }
+
     /// Whether any root edge files under the namespace.
     pub fn namespace_exists(&self, extra_key: Option<&str>) -> bool {
+        self.full_namespace_exists(RadixNamespaceRef::new(
+            extra_key, /* cache_salt = */ None,
+        ))
+    }
+
+    /// Whether any root edge files under the full radix namespace.
+    pub fn full_namespace_exists(&self, namespace: RadixNamespaceRef<'_>) -> bool {
         self.node(self.root)
             .children
             .keys()
-            .any(|(ns, _)| ns.as_deref() == extra_key)
+            .any(|(stored, _)| stored.as_ref() == namespace)
     }
 
     /// Install `child` under `parent` on its namespaced `map_key`; returns the
@@ -1042,8 +1217,10 @@ impl<K: ChildKeyType> NodeArena<K> {
         map_key: K,
         child: NodeIdx_,
     ) -> Option<NodeIdx_> {
-        let ns = self.node(child).extra_key.clone();
-        self.node_mut(parent).children.insert((ns, map_key), child)
+        let namespace = self.node(child).namespace.clone();
+        self.node_mut(parent)
+            .children
+            .insert((namespace, map_key), child)
     }
 
     /// Reserve a detached child and attach it under `parent`; `extra_key` names the
@@ -1054,6 +1231,22 @@ impl<K: ChildKeyType> NodeArena<K> {
         key: K,
         priority: i64,
         extra_key: Option<&str>,
+    ) -> Result<NodeIdx_, TreeCoreRuntimeError> {
+        self.alloc_child_in_namespace(
+            parent,
+            key,
+            priority,
+            RadixNamespaceRef::new(extra_key, /* cache_salt = */ None),
+        )
+    }
+
+    /// Reserve and attach a child in the full radix namespace.
+    pub fn alloc_child_in_namespace(
+        &mut self,
+        parent: NodeIdx_,
+        key: K,
+        priority: i64,
+        namespace: RadixNamespaceRef<'_>,
     ) -> Result<NodeIdx_, TreeCoreRuntimeError> {
         // Validate the parent and attach the child before committing a slot, so a
         // rejected add reserves nothing.
@@ -1075,10 +1268,10 @@ impl<K: ChildKeyType> NodeArena<K> {
         child_node.creation_counter = tick;
         let page_size = self.page_size;
         // Root children adopt the op namespace; deeper nodes inherit the parent's.
-        child_node.extra_key = if parent == self.root {
-            extra_key.map(Arc::from)
+        child_node.namespace = if parent == self.root {
+            namespace.to_owned()
         } else {
-            self.node(parent).extra_key.clone()
+            self.node(parent).namespace.clone()
         };
         self.node_mut(parent)
             .attach_child(&mut child_node, page_size)?;
