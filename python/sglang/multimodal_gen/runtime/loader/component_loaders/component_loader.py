@@ -176,6 +176,12 @@ class ComponentLoader(ABC):
         )
         return component_name in native_only_components
 
+    def validate_native_fallback(
+        self, _server_args: ServerArgs, _component_name: str
+    ) -> None:
+        """Validate that fallback preserves the exact component's runtime contract."""
+        pass
+
     def _load_customized_with_context(
         self,
         component_model_path: str,
@@ -289,6 +295,7 @@ class ComponentLoader(ABC):
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
+            self.validate_native_fallback(server_args, component_name)
             if native_loader_required:
                 logger.info("%s", e)
             elif "Unsupported model architecture" in str(e):
