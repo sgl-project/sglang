@@ -38,6 +38,120 @@ def test_candidate_mapping_uses_compressed_row_owner_order() -> None:
     )
 
 
+def test_candidate_clamps_metadata_length_to_score_width() -> None:
+    candidates = torch.empty((1, 4), dtype=torch.int64, device="cuda")
+    dcp_topk_candidates(
+        torch.tensor([[3.0, 1.0]], device="cuda"),
+        torch.tensor([99], dtype=torch.int32, device="cuda"),
+        candidates,
+        dcp_size=4,
+        dcp_rank=2,
+    )
+    global_indices = candidates.view(torch.int32).reshape(1, 4, 2)[..., 0]
+    torch.testing.assert_close(
+        global_indices,
+        torch.tensor([[2, 6, -1, -1]], dtype=torch.int32, device="cuda"),
+    )
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_candidate_large_width_preserves_guard_rows(tied: bool) -> None:
+    batch_size, score_width, topk = 64, 32768, 1024
+    sentinel = 0x123456789ABCDEF
+    storage = torch.full(
+        (batch_size + 2, topk),
+        sentinel,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    candidates = storage[1:-1]
+    scores = (
+        torch.zeros((batch_size, score_width), dtype=torch.float32, device="cuda")
+        if tied
+        else torch.randn((batch_size, score_width), dtype=torch.float32, device="cuda")
+    )
+    dcp_topk_candidates(
+        scores,
+        torch.full((batch_size,), score_width, dtype=torch.int32, device="cuda"),
+        candidates,
+        dcp_size=4,
+        dcp_rank=3,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.all(storage[0] == sentinel)
+    assert torch.all(storage[-1] == sentinel)
+    global_indices = candidates.view(torch.int32).reshape(batch_size, topk, 2)[..., 0]
+    assert torch.all(global_indices >= 0)
+    assert torch.all(global_indices < score_width * 4)
+    assert torch.all(torch.remainder(global_indices, 4) == 3)
+
+
+def test_candidate_large_concentrated_scores_matches_topk() -> None:
+    score_width, topk, dcp_size, dcp_rank = 32768, 1024, 4, 0
+    scores = (
+        1.0
+        + torch.arange(score_width, dtype=torch.float32, device="cuda").unsqueeze(0)
+        * 1.0e-7
+    )
+    candidates = torch.empty((1, topk), dtype=torch.int64, device="cuda")
+    dcp_topk_candidates(
+        scores,
+        torch.tensor([score_width], dtype=torch.int32, device="cuda"),
+        candidates,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+    )
+    torch.cuda.synchronize()
+
+    global_indices = candidates.view(torch.int32).reshape(1, topk, 2)[0, :, 0]
+    expected = (
+        torch.argsort(scores[0], descending=True, stable=True)[:topk].to(torch.int32)
+        * dcp_size
+        + dcp_rank
+    )
+    torch.testing.assert_close(
+        torch.sort(global_indices).values,
+        torch.sort(expected).values,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("score_width", [8193, 16384, 32768, 65536])
+def test_candidate_long_random_scores_match_exact_topk(score_width: int) -> None:
+    topk, dcp_size, dcp_rank = 1024, 4, 3
+    generator = torch.Generator(device="cuda").manual_seed(20260828 + score_width)
+    scores = torch.randn(
+        (1, score_width),
+        dtype=torch.float32,
+        device="cuda",
+        generator=generator,
+    )
+    candidates = torch.empty((1, topk), dtype=torch.int64, device="cuda")
+    dcp_topk_candidates(
+        scores,
+        torch.tensor([score_width], dtype=torch.int32, device="cuda"),
+        candidates,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+    )
+    torch.cuda.synchronize()
+
+    global_indices = candidates.view(torch.int32).reshape(1, topk, 2)[0, :, 0]
+    expected = (
+        torch.argsort(scores[0], descending=True, stable=True)[:topk].to(torch.int32)
+        * dcp_size
+        + dcp_rank
+    )
+    torch.testing.assert_close(
+        torch.sort(global_indices).values,
+        torch.sort(expected).values,
+        rtol=0,
+        atol=0,
+    )
+
+
 @pytest.mark.parametrize("topk", [512, 1024])
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("tied", [False, True])

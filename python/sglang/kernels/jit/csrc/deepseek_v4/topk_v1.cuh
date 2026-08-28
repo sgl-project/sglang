@@ -78,8 +78,12 @@ SGL_DEVICE void naive_transform(
 }
 
 [[maybe_unused]]
-SGL_DEVICE void
-radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length, const uint32_t topk) {
+SGL_DEVICE bool radix_topk(
+    const float* __restrict__ input,
+    int32_t* __restrict__ output,
+    const uint32_t length,
+    const uint32_t topk,
+    const bool stop_on_scratch_overflow = false) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kTopKBlockSize;
   constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
@@ -130,6 +134,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
   __syncthreads();
 
   const auto threshold_bin = s_threshold_bin_id;
+  const bool scratch_overflow = s_histogram[threshold_bin] - s_histogram[threshold_bin + 1] > SMEM_INPUT_SIZE;
   remain_topk -= s_histogram[threshold_bin + 1];
   if (remain_topk == 0) {
     for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -140,7 +145,9 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
       }
     }
     __syncthreads();
-    return;
+    return false;
+  } else if (scratch_overflow && stop_on_scratch_overflow) {
+    return true;
   } else {
     __syncthreads();
     if (tx < RADIX + 1) {
@@ -234,6 +241,7 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
       __syncthreads();
     }
   }
+  return scratch_overflow;
 }
 
 template <bool kUsePDL>

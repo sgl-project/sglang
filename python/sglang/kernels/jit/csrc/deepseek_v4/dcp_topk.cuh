@@ -7,6 +7,7 @@ struct DCPTopKCandidateParams {
   const int32_t* __restrict__ local_lens;
   int64_t* __restrict__ candidates;
   int64_t score_stride;
+  uint32_t score_width;
   uint32_t topk;
   uint32_t dcp_size;
   uint32_t dcp_rank;
@@ -52,7 +53,7 @@ template <bool kUsePDL>
 __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandidateParams params) {
   const uint32_t batch_idx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
-  const uint32_t local_len = params.local_lens[batch_idx];
+  const uint32_t local_len = min(static_cast<uint32_t>(params.local_lens[batch_idx]), params.score_width);
   const auto score_ptr = params.scores + batch_idx * params.score_stride;
   const auto candidate_ptr = params.candidates + batch_idx * params.topk;
 
@@ -62,6 +63,10 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
   __shared__ uint32_t threshold_key;
   __shared__ uint32_t output_count;
   __shared__ uint32_t tile_base;
+  __shared__ uint32_t radix_prefix;
+  __shared__ uint32_t radix_mask;
+  __shared__ uint32_t radix_remaining;
+  __shared__ uint32_t radix_bin;
 
   if (tx < params.topk) {
     candidate_ptr[tx] = pack_dcp_candidate(__uint_as_float(0xff800000u), -1);
@@ -76,24 +81,118 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
     return;
   }
 
-  radix_topk(score_ptr, selected, local_len, params.topk);
-  if (tx == 0) {
-    threshold_key = 0xffffffffu;
-    output_count = 0;
-  }
-  __syncthreads();
+  const bool radix_scratch_overflow = radix_topk(score_ptr, selected, local_len, params.topk, true);
+  if (!radix_scratch_overflow) {
+    if (tx == 0) {
+      threshold_key = 0xffffffffu;
+      output_count = 0;
+    }
+    __syncthreads();
 
-  if (tx < params.topk) {
-    atomicMin(&threshold_key, ordered_dcp_score(score_ptr[selected[tx]]));
+    if (tx < params.topk) {
+      atomicMin(&threshold_key, ordered_dcp_score(score_ptr[selected[tx]]));
+    }
+    __syncthreads();
+  } else {
+    // topk_v1 reports when its fixed index scratch clipped a dense coarse
+    // bucket. Select the exact 32-bit threshold with four bounded histogram
+    // passes only for those score distributions; wide rows that fit the fast
+    // path keep its lower latency.
+    constexpr uint32_t kRadix = 256;
+    constexpr uint32_t kHistogramStride = kRadix + 32;
+    constexpr uint32_t kWaveSize = 64;
+    constexpr uint32_t kWaveCount = kTopKBlockSize / kWaveSize;
+    auto* histogram_0 = reinterpret_cast<uint32_t*>(selected);
+    auto* histogram_1 = histogram_0 + kHistogramStride;
+    extern __shared__ uint32_t dynamic_smem[];
+    auto* wave_histograms = dynamic_smem;
+
+    if (tx == 0) {
+      radix_prefix = 0;
+      radix_mask = 0;
+      radix_remaining = params.topk;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int32_t shift = 24; shift >= 0; shift -= 8) {
+      for (uint32_t index = tx; index < kWaveCount * kRadix; index += kTopKBlockSize) {
+        wave_histograms[index] = 0;
+      }
+      __syncthreads();
+
+      const uint32_t prefix = radix_prefix;
+      const uint32_t mask = radix_mask;
+      const uint32_t wave_id = tx / kWaveSize;
+      uint32_t pending_bin = 0;
+      uint32_t pending_count = 0;
+      for (uint32_t local_index = tx; local_index < local_len; local_index += kTopKBlockSize) {
+        const uint32_t key = ordered_dcp_score(score_ptr[local_index]);
+        if ((key & mask) == prefix) {
+          const uint32_t bin = (key >> shift) & 0xffu;
+          if (pending_count != 0 && bin != pending_bin) {
+            atomicAdd(&wave_histograms[wave_id * kRadix + pending_bin], pending_count);
+            pending_count = 0;
+          }
+          pending_bin = bin;
+          ++pending_count;
+        }
+      }
+      if (pending_count != 0) {
+        atomicAdd(&wave_histograms[wave_id * kRadix + pending_bin], pending_count);
+      }
+      __syncthreads();
+
+      if (tx < kRadix) {
+        uint32_t count = 0;
+#pragma unroll
+        for (uint32_t wave = 0; wave < kWaveCount; ++wave) {
+          count += wave_histograms[wave * kRadix + tx];
+        }
+        histogram_0[tx] = count;
+      } else if (tx == kRadix) {
+        histogram_0[kRadix] = 0;
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int32_t level = 0; level < 8; ++level) {
+        const int32_t offset = 1 << level;
+        auto* input_histogram = level & 1 ? histogram_1 : histogram_0;
+        auto* output_histogram = level & 1 ? histogram_0 : histogram_1;
+        if (tx < kRadix) {
+          output_histogram[tx] = input_histogram[tx] + (tx + offset < kRadix ? input_histogram[tx + offset] : 0u);
+        }
+        __syncthreads();
+      }
+
+      if (tx < kRadix && histogram_0[tx] >= radix_remaining && histogram_0[tx + 1] < radix_remaining) {
+        radix_bin = tx;
+      }
+      __syncthreads();
+      if (tx == 0) {
+        radix_remaining -= histogram_0[radix_bin + 1];
+        radix_prefix |= radix_bin << shift;
+        radix_mask |= 0xffu << shift;
+      }
+      __syncthreads();
+    }
+
+    if (tx == 0) {
+      threshold_key = radix_prefix;
+      output_count = 0;
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   for (uint32_t local_index = tx; local_index < local_len; local_index += kTopKBlockSize) {
     const float score = canonicalize_dcp_score(score_ptr[local_index]);
     if (ordered_dcp_score(score) > threshold_key) {
       const uint32_t output_pos = atomicAdd(&output_count, 1u);
-      const int32_t global_index = static_cast<int32_t>(local_index * params.dcp_size + params.dcp_rank);
-      candidate_ptr[output_pos] = pack_dcp_candidate(score, global_index);
+      if (output_pos < params.topk) {
+        const int32_t global_index = static_cast<int32_t>(local_index * params.dcp_size + params.dcp_rank);
+        candidate_ptr[output_pos] = pack_dcp_candidate(score, global_index);
+      }
     }
   }
   __syncthreads();
@@ -144,20 +243,20 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
   __shared__ float candidate_scores[kMaxCandidateCount];
   __shared__ int32_t candidate_indices[kMaxCandidateCount];
   __shared__ int32_t selected[kMaxTopK];
-  __shared__ uint32_t valid_count;
   __shared__ uint32_t output_count;
   __shared__ uint32_t threshold_key;
   __shared__ uint32_t greater_count;
+  __shared__ uint32_t threshold_valid_count;
   __shared__ uint32_t tie_count;
   __shared__ uint32_t tie_min_index;
 
   device::PDLWaitPrimary<kUsePDL>();
 
   if (tx == 0) {
-    valid_count = 0;
     output_count = 0;
     threshold_key = 0xffffffffu;
     greater_count = 0;
+    threshold_valid_count = 0;
     tie_count = 0;
     tie_min_index = 0xffffffffu;
   }
@@ -175,26 +274,25 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
     const int32_t global_index = unpack_dcp_candidate_index(candidate);
     candidate_scores[candidate_id] = canonicalize_dcp_score(unpack_dcp_candidate_score(candidate));
     candidate_indices[candidate_id] = global_index;
-    if (global_index >= 0) {
-      atomicAdd(&valid_count, 1u);
-    }
   }
   __syncthreads();
 
-  if (valid_count > params.topk) {
-    radix_topk(candidate_scores, selected, candidate_count, params.topk);
-    __syncthreads();
+  radix_topk(candidate_scores, selected, candidate_count, params.topk);
+  __syncthreads();
 
-    if (tx < params.topk) {
-      atomicMin(&threshold_key, ordered_dcp_score(candidate_scores[selected[tx]]));
-    }
-    __syncthreads();
+  if (tx < params.topk) {
+    atomicMin(&threshold_key, ordered_dcp_score(candidate_scores[selected[tx]]));
+  }
+  __syncthreads();
 
-    for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
-      const int32_t global_index = candidate_indices[candidate_id];
-      const uint32_t score_key = ordered_dcp_score(candidate_scores[candidate_id]);
-      if (global_index >= 0 && score_key > threshold_key) {
-        atomicAdd(&greater_count, 1u);
+  uint32_t thread_greater_count = 0;
+  uint32_t thread_threshold_valid_count = 0;
+  for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
+    const int32_t global_index = candidate_indices[candidate_id];
+    const uint32_t score_key = ordered_dcp_score(candidate_scores[candidate_id]);
+    if (global_index >= 0) {
+      if (score_key > threshold_key) {
+        ++thread_greater_count;
         if (static_cast<uint32_t>(global_index) % kDCPSize == params.dcp_rank) {
           const uint32_t output_pos = atomicAdd(&output_count, 1u);
           const uint32_t local_raw = static_cast<uint32_t>(global_index) / kDCPSize;
@@ -203,60 +301,55 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
             local_raw_indices[output_pos] = static_cast<int32_t>(local_raw);
           }
         }
+      } else if (score_key == threshold_key) {
+        ++thread_threshold_valid_count;
       }
     }
-    __syncthreads();
+  }
+  if (thread_greater_count != 0) {
+    atomicAdd(&greater_count, thread_greater_count);
+  }
+  if (thread_threshold_valid_count != 0) {
+    atomicAdd(&threshold_valid_count, thread_threshold_valid_count);
+  }
+  __syncthreads();
 
-    if (tx == 0) {
-      tie_count = params.topk - greater_count;
-    }
-    __syncthreads();
+  if (tx == 0) {
+    const uint32_t remaining = greater_count < params.topk ? params.topk - greater_count : 0;
+    tie_count = min(remaining, threshold_valid_count);
+  }
+  __syncthreads();
 
-    if (tie_count == 1) {
-      // Random model scores almost always have one item at the top-k boundary.
-      // Avoid a second full radix selection in that common case.
-      for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
-        const int32_t global_index = candidate_indices[candidate_id];
-        if (global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key) {
-          atomicMin(&tie_min_index, static_cast<uint32_t>(global_index));
-        }
-      }
-      __syncthreads();
-      if (tx == 0 && tie_min_index % kDCPSize == params.dcp_rank) {
-        const uint32_t output_pos = atomicAdd(&output_count, 1u);
-        const uint32_t local_raw = tie_min_index / kDCPSize;
-        page_indices[output_pos] = page_to_indices(page_table, local_raw, params.page_bits);
-        if (local_raw_indices != nullptr) {
-          local_raw_indices[output_pos] = static_cast<int32_t>(local_raw);
-        }
-      }
-    } else if (tie_count > 1) {
-      for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
-        const int32_t global_index = candidate_indices[candidate_id];
-        const bool is_threshold =
-            global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key;
-        candidate_scores[candidate_id] =
-            is_threshold ? -static_cast<float>(global_index) : __uint_as_float(0xff800000u);
-      }
-      __syncthreads();
-      radix_topk(candidate_scores, selected, candidate_count, tie_count);
-      __syncthreads();
-      if (tx < tie_count) {
-        const int32_t global_index = candidate_indices[selected[tx]];
-        if (static_cast<uint32_t>(global_index) % kDCPSize == params.dcp_rank) {
-          const uint32_t output_pos = atomicAdd(&output_count, 1u);
-          const uint32_t local_raw = static_cast<uint32_t>(global_index) / kDCPSize;
-          page_indices[output_pos] = page_to_indices(page_table, local_raw, params.page_bits);
-          if (local_raw_indices != nullptr) {
-            local_raw_indices[output_pos] = static_cast<int32_t>(local_raw);
-          }
-        }
-      }
-    }
-  } else {
+  if (tie_count == 1) {
+    // Random model scores almost always have one item at the top-k boundary.
+    // Avoid a second full radix selection in that common case.
     for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
       const int32_t global_index = candidate_indices[candidate_id];
-      if (global_index >= 0 && static_cast<uint32_t>(global_index) % kDCPSize == params.dcp_rank) {
+      if (global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key) {
+        atomicMin(&tie_min_index, static_cast<uint32_t>(global_index));
+      }
+    }
+    __syncthreads();
+    if (tx == 0 && tie_min_index % kDCPSize == params.dcp_rank) {
+      const uint32_t output_pos = atomicAdd(&output_count, 1u);
+      const uint32_t local_raw = tie_min_index / kDCPSize;
+      page_indices[output_pos] = page_to_indices(page_table, local_raw, params.page_bits);
+      if (local_raw_indices != nullptr) {
+        local_raw_indices[output_pos] = static_cast<int32_t>(local_raw);
+      }
+    }
+  } else if (tie_count > 1) {
+    for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
+      const int32_t global_index = candidate_indices[candidate_id];
+      const bool is_threshold = global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key;
+      candidate_scores[candidate_id] = is_threshold ? -static_cast<float>(global_index) : __uint_as_float(0xff800000u);
+    }
+    __syncthreads();
+    radix_topk(candidate_scores, selected, candidate_count, tie_count);
+    __syncthreads();
+    if (tx < tie_count) {
+      const int32_t global_index = candidate_indices[selected[tx]];
+      if (static_cast<uint32_t>(global_index) % kDCPSize == params.dcp_rank) {
         const uint32_t output_pos = atomicAdd(&output_count, 1u);
         const uint32_t local_raw = static_cast<uint32_t>(global_index) / kDCPSize;
         page_indices[output_pos] = page_to_indices(page_table, local_raw, params.page_bits);
@@ -287,12 +380,13 @@ struct DCPTopKKernel {
       const uint32_t dcp_rank) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
+    auto W = SymbolicSize{"score_width"};
     auto S = SymbolicSize{"score_stride"};
     auto K = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
     device.set_options<kDLGPU>();
 
-    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(scores);
+    TensorMatcher({B, W}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(scores);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(local_lens);
     TensorMatcher({B, K}).with_dtype<int64_t>().with_device(device).verify(candidates);
 
@@ -306,6 +400,7 @@ struct DCPTopKKernel {
         .local_lens = static_cast<const int32_t*>(local_lens.data_ptr()),
         .candidates = static_cast<int64_t*>(candidates.data_ptr()),
         .score_stride = S.unwrap(),
+        .score_width = static_cast<uint32_t>(W.unwrap()),
         .topk = topk,
         .dcp_size = dcp_size,
         .dcp_rank = dcp_rank,
