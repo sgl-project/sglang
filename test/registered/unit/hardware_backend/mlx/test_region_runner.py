@@ -7,13 +7,13 @@ the wrong thing (spec tokens, encoder batches, LoRA-adapted weights the
 exported graph never saw). Each case guards one such silent-failure path.
 """
 
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-from sglang.srt.environ import MlxRegionStartupExport, envs
 from sglang.srt.hardware_backend.mlx.export_validation import (
     ServingForwardArg,
     resolve_body_call_kwargs,
@@ -21,18 +21,25 @@ from sglang.srt.hardware_backend.mlx.export_validation import (
     serving_forward_args,
 )
 from sglang.srt.hardware_backend.mlx.region_runner import (
-    _MAX_REGION_BATCH_SIZE,
-    _PREFILL_TOKEN_BUCKETS,
-    _STARTUP_DECODE_BATCH_SIZES,
+    _DEFAULT_MAX_DECODE_BATCH_SIZE,
+    _DEFAULT_MAX_PREFILL_TOKENS,
+    _PAD_SINK_SLOT,
     MlxRegionRunner,
+    _configured_decode_batch_sizes,
+    _configured_prefill_token_buckets,
     _kernel_contract_reject_reason,
     _nontrivial_logits_reason,
+    generate_decode_batch_sizes,
+    generate_prefill_token_buckets,
+    resolve_decode_batch_sizes,
+    resolve_prefill_token_buckets,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mps_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -64,6 +71,12 @@ def _make_runner(*, lora_enabled: bool = False) -> MlxRegionRunner:
         attn_backend=None,
     )
     runner._lora_enabled = lora_enabled
+    runner._decode_batch_sizes = generate_decode_batch_sizes(
+        _DEFAULT_MAX_DECODE_BATCH_SIZE
+    )
+    runner._prefill_token_buckets = generate_prefill_token_buckets(
+        _DEFAULT_MAX_PREFILL_TOKENS
+    )
     runner._executors = {}
     runner._failed_batch_sizes = set()
     runner._state_token = None
@@ -134,7 +147,7 @@ def test_rejects_request_shapes_the_export_never_saw():
         _decode_batch(capture_hidden_mode=CaptureHiddenMode.FULL)
     )
     assert not runner.can_run_graph(
-        _decode_batch(batch_size=_MAX_REGION_BATCH_SIZE + 1)
+        _decode_batch(batch_size=runner._decode_batch_sizes[-1] + 1)
     )
     assert not _make_runner(lora_enabled=True).can_run_graph(_decode_batch())
 
@@ -256,12 +269,12 @@ class TestStartupExport(CustomTestCase):
     The executor binds its input signature (dtypes, arities) at export, so a
     synthetic batch that differs from a real serving batch would export an
     executor that the first real batch of that shape cannot use -- the
-    startup pass would then cost boot time and buy nothing. The level knob
-    is the other failure mode: a ladder that silently drifts from the
-    documented levels.
+    startup pass would then cost boot time and buy nothing. The ladder is
+    the other failure mode: a startup pass that silently drifts from the
+    configured buckets.
     """
 
-    def _exported_keys(self, level) -> list:
+    def _exported_keys(self) -> list:
         runner = _make_runner()
         seen = []
 
@@ -270,23 +283,25 @@ class TestStartupExport(CustomTestCase):
             return object()
 
         with (
-            envs.SGLANG_MLX_REGION_STARTUP_EXPORT.override(int(level)),
             mock.patch.object(MlxRegionRunner, "_ensure_executor", fake_ensure),
             mock.patch.object(MlxRegionRunner, "execute", lambda self, b: None),
         ):
             runner._export_at_startup()
         return seen
 
-    def test_levels_select_the_documented_ladders(self):
-        self.assertEqual(self._exported_keys(MlxRegionStartupExport.OFF), [])
+    def test_startup_exports_both_configured_ladders(self):
+        # CUDA-graph parity: every shape the region can serve is captured at
+        # startup; there is no level knob and no lazy path for serving shapes.
         self.assertEqual(
-            self._exported_keys(MlxRegionStartupExport.DECODE),
-            [("decode", bs) for bs in _STARTUP_DECODE_BATCH_SIZES],
-        )
-        self.assertEqual(
-            self._exported_keys(MlxRegionStartupExport.ALL),
-            [("decode", bs) for bs in _STARTUP_DECODE_BATCH_SIZES]
-            + [("extend", b) for b in _PREFILL_TOKEN_BUCKETS],
+            self._exported_keys(),
+            [
+                ("decode", bs)
+                for bs in generate_decode_batch_sizes(_DEFAULT_MAX_DECODE_BATCH_SIZE)
+            ]
+            + [
+                ("extend", b)
+                for b in generate_prefill_token_buckets(_DEFAULT_MAX_PREFILL_TOKENS)
+            ],
         )
 
     def test_synthetic_batches_match_the_serving_signature(self):
@@ -325,9 +340,6 @@ class TestStartupExport(CustomTestCase):
                 raise RuntimeError("metal dispatch failed")
 
         with (
-            envs.SGLANG_MLX_REGION_STARTUP_EXPORT.override(
-                int(MlxRegionStartupExport.DECODE)
-            ),
             mock.patch.object(MlxRegionRunner, "_ensure_executor", fake_ensure),
             mock.patch.object(MlxRegionRunner, "execute", fake_execute),
         ):
@@ -560,6 +572,156 @@ class TestServingForwardArgLayout(CustomTestCase):
         self.assertEqual(len(args), len(ServingForwardArg))
         for arg in ServingForwardArg:
             self.assertEqual(args[arg.value], arg.name.lower())
+
+
+class TestPrefillTokenBucketResolution(CustomTestCase):
+    """The prefill bucket ladder is operator-configurable, not hardcoded."""
+
+    def test_unset_leaves_reproduce_the_shipped_ladder(self):
+        self.assertEqual(
+            resolve_prefill_token_buckets(None, None),
+            (128, 192, 256, 384, 512, 768, 1024, 1536, 2048),
+        )
+
+    def test_cap_grows_and_shrinks_the_generated_ladder(self):
+        self.assertEqual(
+            resolve_prefill_token_buckets(None, 1024),
+            (128, 192, 256, 384, 512, 768, 1024),
+        )
+        self.assertEqual(resolve_prefill_token_buckets(None, 4096)[-2:], (3072, 4096))
+
+    def test_cap_is_always_its_own_bucket(self):
+        # Otherwise a batch at exactly the cap exceeds the largest bucket and
+        # silently falls back to eager, which is the opposite of the ask.
+        for cap in (3000, 64):
+            self.assertEqual(resolve_prefill_token_buckets(None, cap)[-1], cap)
+
+    def test_explicit_buckets_win_and_are_sorted_and_deduplicated(self):
+        self.assertEqual(
+            resolve_prefill_token_buckets([512, 128, 512, 256], 4096),
+            (128, 256, 512),
+        )
+
+    def test_rejects_nonpositive_sizes(self):
+        for explicit, cap in (([0, 128], None), ([-5], None), (None, 0), (None, -5)):
+            with self.assertRaises(ValueError):
+                resolve_prefill_token_buckets(explicit, cap)
+
+    def _publish(self, **fields):
+        # The runner reads the published exec.graph leaves, never the
+        # ServerArgs instance; publish for real rather than standing a
+        # SimpleNamespace in for server_args.
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_runner_reads_the_ladder_off_the_exec_graph_bag(self):
+        self._publish()
+        self.assertEqual(
+            _configured_prefill_token_buckets(),
+            (128, 192, 256, 384, 512, 768, 1024, 1536, 2048),
+        )
+
+    def test_published_explicit_buckets_reach_the_runner(self):
+        self._publish(mlx_region_prefill_token_buckets=[640, 160, 640])
+        self.assertEqual(_configured_prefill_token_buckets(), (160, 640))
+
+    def test_published_cap_reaches_the_runner(self):
+        self._publish(mlx_region_max_prefill_tokens=512)
+        self.assertEqual(_configured_prefill_token_buckets(), (128, 192, 256, 384, 512))
+
+    def test_runner_buckets_drive_executor_selection(self):
+        runner = _make_runner()
+        runner._prefill_token_buckets = (256, 1024)
+        self.assertEqual(runner._executor_key(_extend_batch()), ("extend", 1024))
+        self.assertIsNone(
+            runner._executor_key(
+                _extend_batch(input_ids=torch.zeros(2048, dtype=torch.int64))
+            )
+        )
+
+
+class TestDecodeBatchBucketing(CustomTestCase):
+    """Decode is padded onto an exported bucket ladder, like CUDA-graph replay."""
+
+    def test_default_ladder_matches_the_cuda_graph_shape(self):
+        self.assertEqual(resolve_decode_batch_sizes(None, None), (1, 2, 4, 8, 12, 16))
+        self.assertEqual(
+            resolve_decode_batch_sizes(None, 64),
+            (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64),
+        )
+
+    def test_cap_is_always_its_own_bucket_and_explicit_wins(self):
+        self.assertEqual(resolve_decode_batch_sizes(None, 10)[-1], 10)
+        self.assertEqual(resolve_decode_batch_sizes([6, 2, 6], 64), (2, 6))
+        for explicit, cap in (([0], None), (None, 0), (None, -1)):
+            with self.assertRaises(ValueError):
+                resolve_decode_batch_sizes(explicit, cap)
+
+    def test_published_leaves_reach_the_runner(self):
+        override = get_context().override_server_args(mlx_region_decode_bs=[6, 2])
+        override.install()
+        self.addCleanup(override.restore)
+        self.assertEqual(_configured_decode_batch_sizes(), (2, 6))
+
+    def test_batch_routes_to_the_smallest_covering_bucket(self):
+        runner = _make_runner()
+        for batch_size, bucket in ((1, 1), (3, 4), (12, 12), (13, 16), (16, 16)):
+            self.assertEqual(
+                runner._executor_key(_decode_batch(batch_size=batch_size)),
+                ("decode", bucket),
+            )
+        self.assertIsNone(runner._executor_key(_decode_batch(batch_size=17)))
+
+    def _three_request_batch(self, runner):
+        batch = runner._synthetic_batch(("decode", 3))
+        return dataclasses.replace(
+            batch,
+            input_ids=torch.tensor([11, 12, 13]),
+            positions=torch.tensor([9, 19, 29]),
+            req_pool_indices=torch.tensor([5, 6, 7]),
+            seq_lens=torch.tensor([10, 20, 30]),
+            seq_lens_cpu=torch.tensor([10, 20, 30]),
+            seq_lens_sum=60,
+            out_cache_loc=torch.tensor([100, 200, 300]),
+        )
+
+    def test_pad_rows_are_the_reserved_dummy_request(self):
+        runner = _make_runner()
+        batch = self._three_request_batch(runner)
+        padded = runner._pad_decode_batch(batch, 4)
+        self.assertEqual(padded.batch_size, 4)
+        # Real rows untouched, in place.
+        self.assertEqual(padded.req_pool_indices[:3].tolist(), [5, 6, 7])
+        self.assertEqual(padded.out_cache_loc[:3].tolist(), [100, 200, 300])
+        self.assertEqual(padded.seq_lens[:3].tolist(), [10, 20, 30])
+        # Pad row: req 0, length 1 (no history), K/V to the reserved sink slot.
+        self.assertEqual(int(padded.req_pool_indices[3]), 0)
+        self.assertEqual(int(padded.seq_lens[3]), 1)
+        self.assertEqual(int(padded.seq_lens_cpu[3]), 1)
+        self.assertEqual(int(padded.out_cache_loc[3]), _PAD_SINK_SLOT)
+        self.assertEqual(padded.seq_lens_sum, 61)
+        # Exact-size batches are passed through untouched.
+        self.assertIs(runner._pad_decode_batch(batch, 3), batch)
+
+    def test_execute_pads_the_call_and_drops_pad_logits(self):
+        runner = _make_runner()
+        seen = []
+
+        def fake_execute(*args):
+            seen.append(args)
+            return torch.arange(4 * 7, dtype=torch.float32).reshape(4, 7)
+
+        runner._executors[("decode", 4)] = SimpleNamespace(execute=fake_execute)
+        out = runner.execute(self._three_request_batch(runner))
+        self.assertEqual(seen[0][ServingForwardArg.REQ_POOL_INDICES].shape, (4,))
+        self.assertEqual(out.next_token_logits.shape, (3, 7))
+        self.assertTrue(
+            torch.equal(
+                out.next_token_logits,
+                torch.arange(21, dtype=torch.float32).reshape(3, 7),
+            )
+        )
 
 
 if __name__ == "__main__":

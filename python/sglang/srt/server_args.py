@@ -1942,6 +1942,50 @@ class ServerArgs:
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
         NS("exec.graph"),
     ] = None
+    mlx_region_decode_bs: A[
+        Optional[List[int]],
+        (
+            "MLX whole-region backend only: explicit list of decode batch "
+            "sizes to export. Like CUDA-graph replay, a decode batch is padded "
+            "up to the smallest exported size that covers it and falls back to "
+            "eager Torch above the largest. Wins over --mlx-region-max-decode-bs."
+        ),
+        NS("exec.graph"),
+    ] = None
+    mlx_region_max_decode_bs: A[
+        Optional[int],
+        (
+            "MLX whole-region backend only: largest decode batch size the "
+            "region serves. The default ladder (1, 2, 4, 8, 12, 16, ...; the "
+            "same shape as the CUDA-graph capture ladder) is generated up to "
+            "this cap; larger batches fall back to eager Torch. Ignored when "
+            "--mlx-region-decode-bs is given. Defaults to 16."
+        ),
+        NS("exec.graph"),
+    ] = None
+    mlx_region_prefill_token_buckets: A[
+        Optional[List[int]],
+        (
+            "MLX whole-region backend only: explicit list of prefill token "
+            "buckets to export. The region exports one executor per padded "
+            "bucket; a prefill is served by the smallest bucket that covers "
+            "it and falls back to eager Torch above the largest. Region "
+            "prefill is single-request, so these are token counts. Wins over "
+            "--mlx-region-max-prefill-tokens."
+        ),
+        NS("exec.graph"),
+    ] = None
+    mlx_region_max_prefill_tokens: A[
+        Optional[int],
+        (
+            "MLX whole-region backend only: largest prefill token count the "
+            "region serves. The default x1.5/x1.33 bucket ladder (128, 192, "
+            "256, ...) is generated up to this cap; larger prefills fall back "
+            "to eager Torch. Ignored when --mlx-region-prefill-token-buckets "
+            "is given. Defaults to 2048."
+        ),
+        NS("exec.graph"),
+    ] = None
     cuda_graph_tc_compiler: A[
         Optional[Literal["eager", "inductor"]],
         "Compiler used by the tc_piecewise backend (currently only the prefill phase consumes it).",

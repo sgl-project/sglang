@@ -192,10 +192,12 @@ def capture_cuda_graphs(
             and envs.SGLANG_ENABLE_MLX_WHOLE_REGION.get()
         ):
             # Not a CUDA graph: decode and single-request prefill execute as
-            # one exported MLX region over Torch-owned serving state
-            # (exported lazily per batch shape, eager Torch fallback for
-            # everything else). One runner instance serves both slots; its
-            # can_run_graph dispatches on forward mode.
+            # one exported MLX region over Torch-owned serving state. Like
+            # CUDA-graph capture, the runner exports its configured shape
+            # ladders here at startup (--mlx-region-*-bs / *-token-buckets)
+            # and pads batches onto them; everything else falls back to eager
+            # Torch. One runner instance serves both slots; its can_run_graph
+            # dispatches on forward mode.
             from sglang.srt.hardware_backend.mlx.region_runner import MlxRegionRunner
 
             region_runner = MlxRegionRunner(model_runner)

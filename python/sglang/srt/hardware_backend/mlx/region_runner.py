@@ -3,14 +3,16 @@
 The region executor is a pure function over Torch-owned serving state: it
 reads the KV pool through zero-copy views, returns next-token logits, and
 commits the step's K/V delta back through the Torch-side Metal commit.
-Torch keeps ownership of scheduling, pools, sampling, LoRA, and the whole
-prefill path; this runner only replaces the decode forward.
+Torch keeps ownership of scheduling, pools, sampling, and LoRA; this runner
+replaces the decode forward and single-request prefill.
 
-One executor is exported lazily per decode batch size and reused for every
-later step of that size (the region reads all step-to-step variability —
-token ids, positions, cache slots, sequence lengths — from its tensor
-arguments). A batch size whose export fails is blacklisted and served by
-the eager Torch path instead.
+Executors are exported per padded shape bucket -- decode batch sizes and
+prefill token counts -- and reused for every later batch the bucket covers,
+the way CUDA-graph replay pads to the nearest captured size (the region reads
+all step-to-step variability -- token ids, positions, cache slots, sequence
+lengths -- from its tensor arguments). Both ladders are operator-configurable
+and exported at startup, so no shape is exported in the request path. A shape
+whose export fails is blacklisted and served by the eager Torch path instead.
 """
 
 from __future__ import annotations
@@ -19,11 +21,10 @@ import dataclasses
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
 
-from sglang.srt.environ import MlxRegionStartupExport, envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -31,20 +32,133 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
-# Sizes beyond the cap fall back to the eager Torch path rather than paying
-# an unbounded set of exports.
-_MAX_REGION_BATCH_SIZE = 16
+# Batches are padded up to the smallest exported bucket that covers them, the
+# way CUDA-graph replay pads to the nearest captured batch size, so one
+# executor per bucket serves every size below it. Sizes beyond the largest
+# bucket fall back to the eager Torch path rather than paying an unbounded
+# set of exports.
+_DEFAULT_MAX_DECODE_BATCH_SIZE = 16
 
 # Prefill token counts vary per request, so extend executors are exported per
 # padded bucket instead of per exact length. The x1.3-1.5 ladder bounds pad
 # waste well below the region's kernel win.
-_PREFILL_TOKEN_BUCKETS = (128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
+_DEFAULT_MAX_PREFILL_TOKENS = 2048
+_SMALLEST_PREFILL_BUCKET = 128
+
+
+def generate_decode_batch_sizes(max_bs: int) -> tuple[int, ...]:
+    """The default decode bucket ladder up to ``max_bs``.
+
+    Same shape as ``ServerArgs._generate_decode_cuda_graph_batch_sizes`` in
+    the non-speculative case (the region rejects speculative batches): dense
+    at small sizes, coarsening as padding waste shrinks relative to the batch.
+    """
+    ladder = (
+        [1, 2, 4, 8, 12]
+        + list(range(16, 257, 8))
+        + list(range(272, 512, 16))
+        + list(range(512, max_bs + 1, 32))
+    )
+    return tuple(bs for bs in ladder if bs <= max_bs)
+
+
+def generate_prefill_token_buckets(max_tokens: int) -> tuple[int, ...]:
+    """The default x1.5/x1.33 prefill bucket ladder up to ``max_tokens``."""
+    buckets: list[int] = []
+    size = _SMALLEST_PREFILL_BUCKET
+    while size <= max_tokens:
+        buckets.append(size)
+        if size + size // 2 <= max_tokens:
+            buckets.append(size + size // 2)
+        size *= 2
+    return tuple(buckets)
+
+
+def _resolve_bucket_ladder(
+    explicit: Optional[Sequence[int]],
+    cap: Optional[int],
+    *,
+    default_cap: int,
+    generate: Callable[[int], tuple[int, ...]],
+    list_flag: str,
+    cap_flag: str,
+) -> tuple[int, ...]:
+    """A bucket ladder from its two config leaves, or the generated default.
+
+    Mirrors the --cuda-graph-bs-* / --cuda-graph-max-bs-* pair: an explicit
+    list wins outright, otherwise the ladder is generated up to the cap. The
+    cap itself is always a bucket, so a batch at exactly that size is served
+    by the region rather than falling back to eager.
+    """
+    if explicit:
+        buckets = tuple(sorted({int(bucket) for bucket in explicit}))
+        if buckets[0] <= 0:
+            raise ValueError(f"{list_flag} takes positive sizes, found {buckets[0]}")
+        return buckets
+    cap = int(default_cap if cap is None else cap)
+    if cap <= 0:
+        raise ValueError(f"{cap_flag} must be positive, found {cap}")
+    buckets = generate(cap)
+    if not buckets or buckets[-1] != cap:
+        buckets += (cap,)
+    return buckets
+
+
+def resolve_decode_batch_sizes(
+    explicit: Optional[Sequence[int]], max_bs: Optional[int]
+) -> tuple[int, ...]:
+    """Decode buckets from --mlx-region-decode-bs / --mlx-region-max-decode-bs."""
+    return _resolve_bucket_ladder(
+        explicit,
+        max_bs,
+        default_cap=_DEFAULT_MAX_DECODE_BATCH_SIZE,
+        generate=generate_decode_batch_sizes,
+        list_flag="--mlx-region-decode-bs",
+        cap_flag="--mlx-region-max-decode-bs",
+    )
+
+
+def resolve_prefill_token_buckets(
+    explicit: Optional[Sequence[int]], max_tokens: Optional[int]
+) -> tuple[int, ...]:
+    """Prefill buckets from --mlx-region-prefill-token-buckets / -max-prefill-tokens."""
+    return _resolve_bucket_ladder(
+        explicit,
+        max_tokens,
+        default_cap=_DEFAULT_MAX_PREFILL_TOKENS,
+        generate=generate_prefill_token_buckets,
+        list_flag="--mlx-region-prefill-token-buckets",
+        cap_flag="--mlx-region-max-prefill-tokens",
+    )
+
+
+def _configured_decode_batch_sizes() -> tuple[int, ...]:
+    """This process's decode ladder, read off the published ``exec.graph`` bag.
+
+    Resolved config lives in the namespace bags, not on the ``ServerArgs``
+    instance; this is where the CUDA-graph runners read their capture ladders
+    too (``get_exec().graph.cuda_graph_config``).
+    """
+    graph = get_exec().graph
+    return resolve_decode_batch_sizes(
+        graph.mlx_region_decode_bs, graph.mlx_region_max_decode_bs
+    )
+
+
+def _configured_prefill_token_buckets() -> tuple[int, ...]:
+    """This process's prefill ladder, read off the published ``exec.graph`` bag."""
+    graph = get_exec().graph
+    return resolve_prefill_token_buckets(
+        graph.mlx_region_prefill_token_buckets, graph.mlx_region_max_prefill_tokens
+    )
+
 
 # Where a padded prefill token's K/V goes. Slot 0 is the pool's reserved
 # padding row: both allocators build their free list as ``arange(1, size + 1)``
@@ -55,11 +169,6 @@ _PREFILL_TOKEN_BUCKETS = (128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
 # is allocatable, so pad rows would overwrite a live request's K/V with no
 # error once the pool neared exhaustion.
 _PAD_SINK_SLOT = 0
-
-# Decode shapes exported at startup under SGLANG_MLX_REGION_STARTUP_EXPORT.
-# Mirrors the spirit of the CUDA-graph capture ladder; sizes off the ladder
-# still export lazily at their first batch.
-_STARTUP_DECODE_BATCH_SIZES = (1, 2, 4, 8, 16)
 
 
 def _clear_mlx_cache() -> None:
@@ -175,6 +284,8 @@ class MlxRegionRunner(BaseRunner):
 
         validate_mps_runtime()
         self._lora_enabled = bool(model_runner.server_args.enable_lora)
+        self._decode_batch_sizes = _configured_decode_batch_sizes()
+        self._prefill_token_buckets = _configured_prefill_token_buckets()
         self._executors: dict[int, Any] = {}
         self._failed_batch_sizes: set[int] = set()
         self._state_token: Optional[tuple] = None
@@ -207,15 +318,16 @@ class MlxRegionRunner(BaseRunner):
             self._export_at_startup()
 
     def _startup_keys(self) -> list[tuple]:
-        level = envs.SGLANG_MLX_REGION_STARTUP_EXPORT.get()
-        if level <= MlxRegionStartupExport.OFF:
-            return []
-        keys: list[tuple] = [
-            ("decode", batch_size) for batch_size in _STARTUP_DECODE_BATCH_SIZES
+        """Every shape the region can serve: both ladders, like CUDA capture.
+
+        There is no lazy path for serving shapes -- a batch is padded onto a
+        bucket exported here or runs eager -- so nothing exports in the
+        request path. ``_ensure_executor`` only re-exports after the KV pool
+        or weight storage the executors alias has been replaced.
+        """
+        return [("decode", batch_size) for batch_size in self._decode_batch_sizes] + [
+            ("extend", bucket) for bucket in self._prefill_token_buckets
         ]
-        if level >= MlxRegionStartupExport.ALL:
-            keys.extend(("extend", bucket) for bucket in _PREFILL_TOKEN_BUCKETS)
-        return keys
 
     def _export_at_startup(self) -> None:
         """Export (and warm) the configured shape ladder before serving.
@@ -331,9 +443,9 @@ class MlxRegionRunner(BaseRunner):
         """The executor cache key, or None when the batch shape is unservable."""
         mode = forward_batch.forward_mode
         if mode.is_decode():
-            if forward_batch.batch_size > _MAX_REGION_BATCH_SIZE:
-                return None
-            return ("decode", forward_batch.batch_size)
+            return self._bucket_key(
+                "decode", forward_batch.batch_size, self._decode_batch_sizes
+            )
         # Strictly plain EXTEND: is_extend() also admits MIXED / TARGET_VERIFY /
         # DLLM variants whose semantics the exported graph does not carry.
         if mode != ForwardMode.EXTEND:
@@ -348,10 +460,16 @@ class MlxRegionRunner(BaseRunner):
             or forward_batch.replace_embeds is not None
         ):
             return None
-        num_tokens = forward_batch.input_ids.shape[0]
-        for bucket in _PREFILL_TOKEN_BUCKETS:
-            if num_tokens <= bucket:
-                return ("extend", bucket)
+        return self._bucket_key(
+            "extend", forward_batch.input_ids.shape[0], self._prefill_token_buckets
+        )
+
+    @staticmethod
+    def _bucket_key(mode: str, size: int, buckets: Sequence[int]) -> Optional[tuple]:
+        """The smallest bucket covering ``size``, or None above the largest."""
+        for bucket in buckets:
+            if size <= bucket:
+                return (mode, bucket)
         return None
 
     def load_batch(
@@ -383,8 +501,45 @@ class MlxRegionRunner(BaseRunner):
             return LogitsProcessorOutput(
                 next_token_logits=logits[num_tokens - 1 : num_tokens]
             )
-        logits = executor.execute(*serving_forward_args(forward_batch))
-        return LogitsProcessorOutput(next_token_logits=logits)
+        batch_size = forward_batch.batch_size
+        padded = self._pad_decode_batch(forward_batch, key[1])
+        logits = executor.execute(*serving_forward_args(padded))
+        # One logits row per padded request; pad rows carry garbage by design.
+        return LogitsProcessorOutput(next_token_logits=logits[:batch_size])
+
+    def _pad_decode_batch(
+        self, forward_batch: ForwardBatch, bucket: int
+    ) -> ForwardBatch:
+        """Pad the batch-dimension tensors to the executor's bucket shape.
+
+        Pad rows are the reserved dummy request CUDA-graph replay also points
+        at: req_to_token row 0 with a sequence length of 1, so attention reads
+        no request's history, and their K/V row is committed to the pool's
+        reserved padding slot ``_PAD_SINK_SLOT``. ``execute`` drops their
+        logits.
+        """
+        pad = bucket - forward_batch.batch_size
+        if pad == 0:
+            return forward_batch
+
+        def padded(tensor: torch.Tensor, value: int) -> torch.Tensor:
+            return torch.cat([tensor, tensor.new_full((pad,), value)])
+
+        return dataclasses.replace(
+            forward_batch,
+            batch_size=bucket,
+            input_ids=padded(forward_batch.input_ids, 0),
+            positions=padded(forward_batch.positions, 0),
+            req_pool_indices=padded(forward_batch.req_pool_indices, 0),
+            seq_lens=padded(forward_batch.seq_lens, 1),
+            seq_lens_cpu=(
+                None
+                if forward_batch.seq_lens_cpu is None
+                else padded(forward_batch.seq_lens_cpu, 1)
+            ),
+            seq_lens_sum=forward_batch.seq_lens_sum + pad,
+            out_cache_loc=padded(forward_batch.out_cache_loc, _PAD_SINK_SLOT),
+        )
 
     def _pad_extend_batch(
         self, forward_batch: ForwardBatch, bucket: int
@@ -465,12 +620,13 @@ class MlxRegionRunner(BaseRunner):
             serving_export_context,
         )
 
-        # Extend executors are exported at their padded bucket shape so one
-        # export serves every prompt length the bucket covers.
+        # Executors are exported at their padded bucket shape so one export
+        # serves every prompt length (extend) or batch size (decode) the
+        # bucket covers.
         export_batch = (
             self._pad_extend_batch(forward_batch, key[1])
             if key[0] == "extend"
-            else forward_batch
+            else self._pad_decode_batch(forward_batch, key[1])
         )
         start = time.perf_counter()
         try:
