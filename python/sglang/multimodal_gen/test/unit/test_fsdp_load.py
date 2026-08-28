@@ -185,7 +185,7 @@ class TestFSDPEntrypointRegistration(unittest.TestCase):
 
 class TestOrdinaryWeightLoading(unittest.TestCase):
     def _load_replicated_weight(
-        self, device: torch.device
+        self, device: torch.device, *, allow_device_tensor_assignment: bool = False
     ) -> tuple[torch.nn.Parameter, torch.Tensor]:
         with torch.device("meta"):
             model = _ReplicatedLinearModel()
@@ -200,6 +200,7 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
             param_dtype=torch.float32,
             strict=True,
             param_names_mapping=fsdp_load.get_param_names_mapping({}),
+            allow_device_tensor_assignment=allow_device_tensor_assignment,
         )
         return model.proj.weight, checkpoint_weight
 
@@ -249,9 +250,18 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         torch.testing.assert_close(model_weight, checkpoint_weight)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_tp1_unquantized_linear_adopts_cuda_checkpoint_storage(self):
+    def test_ordinary_cuda_loading_preserves_materialization_path(self):
         model_weight, checkpoint_weight = self._load_replicated_weight(
             torch.device("cuda:0")
+        )
+
+        self.assertNotEqual(model_weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model_weight, checkpoint_weight)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_direct_cuda_loading_adopts_checkpoint_storage(self):
+        model_weight, checkpoint_weight = self._load_replicated_weight(
+            torch.device("cuda:0"), allow_device_tensor_assignment=True
         )
 
         self.assertEqual(model_weight.data_ptr(), checkpoint_weight.data_ptr())
