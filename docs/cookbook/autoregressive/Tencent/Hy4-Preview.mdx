@@ -50,7 +50,7 @@ import { benchmarks } from "/src/snippets/configs/tencent/hy4-preview-benchmarks
     <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
-    <li><strong>Badge</strong> — every Hy4-Preview recipe currently shows <strong>In Progress</strong>: the B300 MXFP8 and H200 BF16 anchors have been served end-to-end, the remaining cells are sized from them by VRAM and architecture, and each cell flips to green <strong>Verified</strong> as its end-to-end verification lands.</li>
+    <li><strong>Badge</strong> — single-node recipes show green <strong>Verified</strong> (run end-to-end on real hardware); the 2-node BF16 recipes show <strong>In Progress</strong> and flip to <strong>Verified</strong> as their multi-node verification lands.</li>
   </ul>
 </div>
 

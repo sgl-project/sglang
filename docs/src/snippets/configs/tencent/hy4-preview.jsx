@@ -12,10 +12,11 @@
 // left is ~25GB/rank ≈ 260K tokens — size `--context-length` to the pool
 // (the page's sizing table suggests 131072 there).
 //
-// Every cell carries `verificationStatus: "in-progress"`. When a recipe's
-// end-to-end verification lands, REPLACE that line with `verified: true` —
-// `verificationStatus` takes precedence over `verified` in the engine, so
-// merely adding `verified: true` would leave the badge amber.
+// Single-node recipes are `verified: true` (run end-to-end); the 2-node
+// BF16 recipes still carry `verificationStatus: "in-progress"` — when one
+// lands, REPLACE that line with `verified: true` (`verificationStatus`
+// takes precedence over `verified` in the engine, so merely adding
+// `verified: true` would leave the badge amber).
 
 export const config = {
   modelName: "Hy4-Preview",
@@ -298,7 +299,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -317,7 +318,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -337,7 +338,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -354,7 +355,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -408,7 +409,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -427,7 +428,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -482,7 +483,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -501,7 +502,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
