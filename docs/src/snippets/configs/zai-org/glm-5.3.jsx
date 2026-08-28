@@ -240,7 +240,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -256,7 +256,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -279,7 +279,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -299,7 +299,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -315,7 +315,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -338,7 +338,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -360,7 +360,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -376,7 +376,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -398,7 +398,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512",
       ],
@@ -420,7 +420,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -436,7 +436,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -457,7 +457,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -480,7 +480,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -496,7 +496,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -514,7 +514,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
