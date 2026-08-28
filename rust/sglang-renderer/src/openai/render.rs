@@ -14,7 +14,7 @@ use dynamo_protocols::types::Prompt;
 
 use super::{
     ChatCompletionRequest, CompletionRequest,
-    error::{openai_error, renderer_status},
+    error::{json_rejection_response, openai_error, renderer_status},
     protocol::{
         lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
     },
@@ -49,9 +49,7 @@ async fn render_chat(
 ) -> Response {
     let extended = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
+        Err(rejection) => return json_rejection_response(rejection),
     };
     if extended.n.is_some_and(|n| n > 1) {
         return openai_error(
@@ -83,9 +81,7 @@ async fn render_completions(
 ) -> Response {
     let extended = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
+        Err(rejection) => return json_rejection_response(rejection),
     };
     let request = extended;
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));

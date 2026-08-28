@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use super::{
     ChatCompletionRequest, OpenAIHttpFrontend, completion_usage,
-    error::{error_payload, openai_error, renderer_status},
+    error::{error_payload, json_rejection_response, openai_error, renderer_status},
     protocol::lower_chat_request,
     submission::{merge_indexed, submit_generate_requests},
     unix_seconds_u32,
@@ -57,9 +57,7 @@ async fn chat_completions(
 ) -> Response {
     let extended = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
+        Err(rejection) => return json_rejection_response(rejection),
     };
     let stream = extended.stream.unwrap_or(false);
     let model = extended.model.clone();
@@ -388,7 +386,7 @@ fn semantic_chat_stream(
                 Ok(output) => output,
                 Err(error) => {
                     yield Err(error);
-                    continue;
+                    break;
                 }
             };
             let finish_reason = chat_finish_reason(&output);
@@ -615,7 +613,7 @@ mod tests {
     use crate::openai::test_utils::{chat_submitted, chunk};
     use crate::{
         ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
-        SamplingDefaults, TokenLogprob,
+        ResponseError, SamplingDefaults, TokenLogprob,
     };
     use axum::http::StatusCode;
     use futures::StreamExt;
@@ -892,5 +890,37 @@ mod tests {
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[4], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_stops_all_choices_after_error() {
+        let (choice0, tx0) = chat_submitted(0);
+        let (choice1, tx1) = chat_submitted(1);
+        let stream = chat_event_stream(
+            vec![choice0, choice1],
+            response_processor(None, 2),
+            wire_context(true),
+        );
+        futures::pin_mut!(stream);
+
+        // Chat streams announce every choice before polling engine output.
+        stream.next().await.unwrap();
+        stream.next().await.unwrap();
+        tx0.send(Err(ResponseError {
+            status_code: 503,
+            message: "out of memory".into(),
+        }))
+        .await
+        .unwrap();
+        let error: serde_json::Value = serde_json::from_str(&stream.next().await.unwrap()).unwrap();
+        assert_eq!(error["error"]["code"], 503);
+
+        // The other choice may already be ready, but it must not be polled after
+        // the aggregate request has emitted an error.
+        tx1.send(chunk("late", true)).await.unwrap();
+        let remaining = stream.collect::<Vec<_>>().await;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[1], "[DONE]");
+        assert!(remaining.iter().all(|frame| !frame.contains("late")));
     }
 }

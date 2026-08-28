@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService};
 
 use super::{
-    error::{error_payload, renderer_status},
+    error::{error_payload, json_rejection_response, renderer_status},
     protocol::normalize_reasoning_inputs,
 };
 
@@ -33,7 +33,7 @@ async fn tokenize(
     State(renderer): State<Arc<RendererService>>,
     body: Result<Json<TokenizeRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Response> {
-    let Json(mut request) = body.map_err(|error| bad_request(error.body_text()))?;
+    let Json(mut request) = body.map_err(json_rejection_response)?;
     let has_prompt = request.prompt.is_some();
     let has_messages = request.messages.is_some();
     if has_prompt == has_messages {

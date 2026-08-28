@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    extract::rejection::JsonRejection,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -33,6 +34,15 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
         Ok::<_, std::convert::Infallible>(Event::default().data(data))
     })))
     .into_response()
+}
+
+pub(super) fn json_rejection_response(rejection: JsonRejection) -> Response {
+    let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    openai_error(status, rejection.body_text(), false)
 }
 
 pub(super) fn renderer_status(error: &RendererError) -> StatusCode {

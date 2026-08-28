@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::{
     CompletionRequest, OpenAIHttpFrontend, completion_usage,
-    error::{error_payload, openai_error, renderer_status},
+    error::{error_payload, json_rejection_response, openai_error, renderer_status},
     protocol::{lower_text_completion_request, lower_token_ids_completion_request},
     submission::{collect_output, merge_indexed, submit_generate_requests},
     unix_seconds_u32,
@@ -97,9 +97,7 @@ async fn completions(
 ) -> Response {
     let extended = match body {
         Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
+        Err(rejection) => return json_rejection_response(rejection),
     };
     let request = extended;
     let stream = request.stream.unwrap_or(false);
@@ -360,7 +358,7 @@ pub(super) fn completion_event_stream(
                 Ok(output) => output,
                 Err(error) => {
                     yield error_payload(StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.message).to_string();
-                    continue;
+                    break;
                 }
             };
 
@@ -481,7 +479,7 @@ mod tests {
     use super::{completion_event_stream, completion_logprobs, unary_completion};
     use crate::GenerationOutputExtras;
     use crate::openai::test_utils::{chunk, submitted};
-    use crate::{PositionLogprobs, TokenLogprob};
+    use crate::{PositionLogprobs, ResponseError, TokenLogprob};
     use axum::http::StatusCode;
     use futures::StreamExt;
 
@@ -565,5 +563,37 @@ mod tests {
         assert_eq!(usage["usage"]["prompt_tokens"], 5);
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn stream_stops_all_choices_after_error() {
+        let (choice0, tx0) = submitted(0, 0);
+        let (choice1, tx1) = submitted(1, 0);
+        let stream = completion_event_stream(
+            vec![choice0, choice1],
+            "cmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+            true,
+            false,
+        );
+        futures::pin_mut!(stream);
+
+        tx0.send(Err(ResponseError {
+            status_code: 503,
+            message: "out of memory".into(),
+        }))
+        .await
+        .unwrap();
+        let error: serde_json::Value = serde_json::from_str(&stream.next().await.unwrap()).unwrap();
+        assert_eq!(error["error"]["code"], 503);
+
+        tx1.send(chunk("late", true)).await.unwrap();
+        let remaining = stream.collect::<Vec<_>>().await;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[1], "[DONE]");
+        assert!(remaining.iter().all(|frame| !frame.contains("late")));
     }
 }

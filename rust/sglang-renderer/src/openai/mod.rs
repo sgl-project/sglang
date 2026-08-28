@@ -22,6 +22,8 @@ mod tests;
 
 use protocol::{ChatCompletionRequest, CompletionRequest};
 
+const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
 pub(crate) struct OpenAIHttpFrontend {
     pub(crate) renderer: Arc<crate::RendererService>,
     pub(crate) generate_client: HttpGenerateClient,
@@ -69,6 +71,9 @@ pub(crate) fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     inference_routes(frontend)
         .merge(render::routes(renderer))
         .merge(render::health_route())
+        .layer(axum::extract::DefaultBodyLimit::max(
+            DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+        ))
 }
 
 pub(crate) fn hosted_routes(
@@ -84,5 +89,7 @@ pub(crate) fn hosted_routes(
             let proxy = proxy.clone();
             async move { proxy.forward(request).await }
         })
-        .layer(axum::extract::DefaultBodyLimit::disable()))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+        )))
 }

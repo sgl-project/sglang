@@ -420,6 +420,10 @@ struct EngineFinishReason {
     kind: String,
     #[serde(default)]
     matched: Option<EngineMatchedStop>,
+    #[serde(default)]
+    status_code: Option<u16>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -455,6 +459,18 @@ fn parse_engine_frame(payload: &str) -> Result<GenerationOutput, ResponseError> 
     }
     let frame: EngineFrame = serde_json::from_str(payload)
         .map_err(|error| internal(format!("invalid engine frame: {error}")))?;
+    if let Some(reason) = frame.meta_info.finish_reason.as_ref()
+        && reason.kind == "abort"
+        && let Some(status_code) = reason.status_code
+    {
+        return Err(ResponseError {
+            status_code,
+            message: reason
+                .message
+                .clone()
+                .unwrap_or_else(|| "request aborted".to_owned()),
+        });
+    }
     let finish_reason = frame
         .meta_info
         .finish_reason
@@ -867,6 +883,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.status_code, 400);
         assert_eq!(error.message, "too long");
+    }
+
+    #[test]
+    fn coded_abort_frame_preserves_status_and_message() {
+        let error = parse_engine_frame(
+            r#"{"output_ids":[],"meta_info":{"finish_reason":{"type":"abort","status_code":503,"message":"out of memory"}}}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status_code, 503);
+        assert_eq!(error.message, "out of memory");
+    }
+
+    #[test]
+    fn uncoded_abort_frame_remains_a_finish_reason() {
+        let output = parse_engine_frame(
+            r#"{"output_ids":[],"meta_info":{"finish_reason":{"type":"abort","status_code":null,"message":"cancelled"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(output.finish_reason, Some(GenerationFinishReason::Abort));
     }
 
     #[test]
