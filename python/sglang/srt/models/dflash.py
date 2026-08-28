@@ -636,18 +636,9 @@ class DFlashDraftModel(nn.Module):
             )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-    def set_block_size(self, block_size: int) -> None:
-        """Adopt the block size the worker resolved.
-
-        The convolutions are built from the checkpoint's block_size, which
-        --speculative-num-draft-tokens may override; the layout they index
-        depends on it, so the resolved value has to reach them.
-        """
-        self.block_size = int(block_size)
-        for layer in self.layers:
-            for conv in (layer.attention_conv, layer.mlp_conv):
-                if conv is not None:
-                    conv.block_size = self.block_size
+        # The model loader calls load_weights() before set_block_size(). Build
+        # Domino projector modules here so their parameters are present while
+        # checkpoint weights are loaded.
         self.projector_type = draft_config.projector_type
         self.shift_label = draft_config.shift_label
         self.prefix_gru: Optional[nn.GRU] = None
@@ -673,6 +664,19 @@ class DFlashDraftModel(nn.Module):
                     int(draft_config.emb_dim), int(config.vocab_size), bias=False
                 ),
             )
+
+    def set_block_size(self, block_size: int) -> None:
+        """Adopt the block size the worker resolved.
+
+        The convolutions are built from the checkpoint's block_size, which
+        --speculative-num-draft-tokens may override; the layout they index
+        depends on it, so the resolved value has to reach them.
+        """
+        self.block_size = int(block_size)
+        for layer in self.layers:
+            for conv in (layer.attention_conv, layer.mlp_conv):
+                if conv is not None:
+                    conv.block_size = self.block_size
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
