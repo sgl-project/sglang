@@ -16,7 +16,8 @@ module can be imported in test environments without the full serving stack.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+import re
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -60,6 +61,7 @@ class LoRAPagePool:
         tp_rank: int = 0,
         max_lora_rank: int = 0,
         max_loras_per_batch: int = 0,
+        experts_shared_outer_loras: bool = False,
     ):
         self.total_pages = total_pages
         self.PAGE_RANK_SIZE = page_rank_size
@@ -70,11 +72,43 @@ class LoRAPagePool:
         self.tp_rank = tp_rank
         self.max_lora_rank = max_lora_rank
         self.max_loras_per_batch = max_loras_per_batch
+        self.experts_shared_outer_loras = experts_shared_outer_loras
+        self.requested_target_modules = set(target_modules)
+        self.base_model = base_model
+        # Keep the Dense and MoE control paths explicit.  Dense follows the
+        # remote paged-LoRA scheduler/page-in path; MoE must defer weight
+        # scatter to Forward so every TP/EP rank loads its local expert shard.
+        self.has_moe = self._has_moe_module(base_model)
 
         cfg = base_model.config
         if hasattr(cfg, "get_text_config"):
             cfg = cfg.get_text_config()
         self.base_hf_config = cfg
+
+        from sglang.srt.lora.mem_pool import (
+            _get_moe_ep_context,
+            _get_moe_tp_context,
+            _moe_runner_keeps_global_expert_ids,
+        )
+
+        self.moe_ep_size, self.moe_ep_rank = _get_moe_ep_context()
+        self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
+        self.num_experts_global = (
+            getattr(cfg, "num_experts", None)
+            or getattr(cfg, "num_local_experts", None)
+            or getattr(cfg, "n_routed_experts", None)
+            or 1
+        )
+        self.moe_use_local_expert_ids = (
+            self.moe_ep_size > 1
+            and not _moe_runner_keeps_global_expert_ids()
+            and self.num_experts_global % self.moe_ep_size == 0
+        )
+        self.num_experts = (
+            self.num_experts_global // self.moe_ep_size
+            if self.moe_use_local_expert_ids
+            else self.num_experts_global
+        )
 
         # Free / allocated page tracking
         self.free_page_indices: Set[int] = set(range(total_pages))
@@ -147,7 +181,43 @@ class LoRAPagePool:
     def _has_moe_module(base_model: torch.nn.Module) -> bool:
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        return any(isinstance(m, FusedMoE) for m in base_model.modules())
+        return any(
+            isinstance(m, FusedMoE)
+            or isinstance(getattr(m, "base_layer", None), FusedMoE)
+            for m in base_model.modules()
+        )
+
+    def _global_to_local_expert_id(self, global_eid: int) -> Optional[int]:
+        if not self.moe_use_local_expert_ids:
+            return global_eid
+        local_eid = global_eid - self.moe_ep_rank * self.num_experts
+        return local_eid if 0 <= local_eid < self.num_experts else None
+
+    def _iter_local_expert_weights(
+        self, weights: Union[torch.Tensor, Dict[int, torch.Tensor]]
+    ) -> Iterator[Tuple[int, torch.Tensor]]:
+        if isinstance(weights, dict):
+            for global_eid, weight in weights.items():
+                local_eid = self._global_to_local_expert_id(global_eid)
+                if local_eid is not None:
+                    yield local_eid, weight
+            return
+
+        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+            if self.moe_use_local_expert_ids:
+                start = self.moe_ep_rank * self.num_experts
+                stop = min(start + self.num_experts, weights.shape[0])
+                for global_eid in range(start, stop):
+                    yield global_eid - start, weights[global_eid]
+            else:
+                for expert_id in range(weights.shape[0]):
+                    yield expert_id, weights[expert_id]
+            return
+
+        raise TypeError(
+            "MoE LoRA weights must be a per-expert dictionary or a 3D tensor; "
+            f"got {type(weights).__name__}."
+        )
 
     # ── page storage initialisation ────────────────────────────────────────
 
@@ -169,7 +239,7 @@ class LoRAPagePool:
         )
 
         pr = self.PAGE_RANK_SIZE
-        has_moe = self._has_moe_module(base_model)
+        has_moe = self.has_moe
         tp = max(self.tp_size, 1)
 
         def allocate_module_pages(
@@ -233,6 +303,77 @@ class LoRAPagePool:
 
         allocate_module_pages(self.A_pages, "A")
         allocate_module_pages(self.B_pages, "B")
+
+        if not has_moe:
+            return
+
+        # Routed MoE pages add an expert dimension while preserving the same
+        # logical-page -> physical-page mapping used by dense modules.  The
+        # page id therefore selects all layers/modules for one adapter rank
+        # slice atomically.
+        for module_name in ("gate_up_proj", "down_proj"):
+            if module_name not in target_modules:
+                continue
+            moe_key = f"{module_name}_moe"
+            a_tensors: List[torch.Tensor] = []
+            b_tensors: List[torch.Tensor] = []
+            for layer_idx in range(self.num_layers):
+                input_dim, output_dim = get_hidden_dim(
+                    moe_key, self.base_hf_config, base_model, layer_idx
+                )
+                components = get_stacked_multiply(moe_key, base_model)
+
+                a_input_dim = input_dim
+                if (
+                    self.moe_tp_size > 1
+                    and moe_key in ROW_PARALLELISM_LINEAR_LORA_NAMES
+                    and moe_key not in REPLICATED_LINEAR_LORA_NAMES
+                ):
+                    a_input_dim = (input_dim + self.moe_tp_size - 1) // self.moe_tp_size
+
+                b_output_dim = output_dim
+                if (
+                    self.moe_tp_size > 1
+                    and moe_key not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+                    and moe_key not in REPLICATED_LINEAR_LORA_NAMES
+                ):
+                    b_output_dim = (
+                        output_dim + self.moe_tp_size - 1
+                    ) // self.moe_tp_size
+
+                a_experts = self.num_experts
+                b_experts = self.num_experts
+                if self.experts_shared_outer_loras and moe_key == "gate_up_proj_moe":
+                    a_experts = 1
+                if self.experts_shared_outer_loras and moe_key == "down_proj_moe":
+                    b_experts = 1
+
+                a_tensors.append(
+                    torch.zeros(
+                        (
+                            self.total_pages,
+                            a_experts,
+                            pr * components,
+                            a_input_dim,
+                        ),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                )
+                b_tensors.append(
+                    torch.zeros(
+                        (
+                            self.total_pages,
+                            b_experts,
+                            b_output_dim,
+                            pr,
+                        ),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                )
+            self.A_pages[moe_key] = a_tensors
+            self.B_pages[moe_key] = b_tensors
 
     def _init_embedding_pages(
         self, base_model: torch.nn.Module, target_modules: Set[str]
@@ -552,6 +693,12 @@ class LoRAPagePool:
         if needed == 0:
             return True
 
+        # Never count the target adapter's own resident pages as eviction
+        # capacity for reloading its missing pages.  Doing so produces a false
+        # positive and can turn N missing pages into N+K during page-in.
+        protected_pages = set(protected_pages)
+        protected_pages.update(self.get_protected_pages({uid}))
+
         free = len(self.free_page_indices)
         if free >= needed:
             return True
@@ -635,7 +782,6 @@ class LoRAPagePool:
         if logic_page_indices is None:
             logic_page_indices = list(range(len(phys_pages)))
 
-        tp = max(self.tp_size, 1)
         page_hidden = target.shape[-1]
 
         if phys_pages:
@@ -686,7 +832,6 @@ class LoRAPagePool:
         if logic_page_indices is None:
             logic_page_indices = list(range(len(phys_pages)))
 
-        tp = max(self.tp_size, 1)
         page_output_dim = target.shape[1]
 
         if phys_pages:
@@ -705,6 +850,116 @@ class LoRAPagePool:
                 dst = target[phys, :, : w_src.shape[-1]]
                 dst.copy_(w_src, non_blocking=True)
             self.mark_page_accessed(phys)
+
+    def _scatter_moe_a_weight_to_pages(
+        self,
+        module_name: str,
+        layer_id: int,
+        weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+        lora_rank: int,
+        phys_pages: List[int],
+        logic_page_indices: Optional[List[int]] = None,
+    ):
+        """Scatter TP/EP-local MoE LoRA-A into 4D physical pages."""
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        target = self.A_pages[module_name][layer_id]
+        if logic_page_indices is None:
+            logic_page_indices = list(range(len(phys_pages)))
+        if phys_pages:
+            target[torch.as_tensor(phys_pages, device=target.device)] = 0
+        if weights is None:
+            return
+
+        components = get_stacked_multiply(module_name, self.base_model)
+        if self.experts_shared_outer_loras and module_name == "gate_up_proj_moe":
+            if isinstance(weights, dict):
+                if len(weights) != 1:
+                    raise ValueError(
+                        "Shared-outer gate_up LoRA-A must contain exactly one "
+                        f"expert entry, got {len(weights)}."
+                    )
+                expert_weights = [(0, next(iter(weights.values())))]
+            elif weights.dim() == 3 and weights.shape[0] == 1:
+                expert_weights = [(0, weights[0])]
+            else:
+                raise ValueError(
+                    "Shared-outer gate_up LoRA-A must have expert dimension 1."
+                )
+        else:
+            expert_weights = list(self._iter_local_expert_weights(weights))
+
+        pr = self.PAGE_RANK_SIZE
+        for expert_id, expert_weight in expert_weights:
+            if not 0 <= expert_id < target.shape[1]:
+                continue
+            for logical_page, physical_page in zip(logic_page_indices, phys_pages):
+                r0 = logical_page * pr
+                r1 = min(r0 + pr, lora_rank)
+                if r1 <= r0:
+                    continue
+                width = r1 - r0
+                for component in range(components):
+                    src0 = component * lora_rank + r0
+                    src1 = src0 + width
+                    dst0 = component * pr
+                    dst1 = dst0 + width
+                    target[physical_page, expert_id, dst0:dst1, :].copy_(
+                        expert_weight[src0:src1, :], non_blocking=True
+                    )
+                self.mark_page_accessed(physical_page)
+
+    def _scatter_moe_b_weight_to_pages(
+        self,
+        module_name: str,
+        layer_id: int,
+        weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+        lora_rank: int,
+        scaling: float,
+        phys_pages: List[int],
+        logic_page_indices: Optional[List[int]] = None,
+    ):
+        """Scatter TP/EP-local MoE LoRA-B into 4D pages, scaling once."""
+        target = self.B_pages[module_name][layer_id]
+        if logic_page_indices is None:
+            logic_page_indices = list(range(len(phys_pages)))
+        if phys_pages:
+            target[torch.as_tensor(phys_pages, device=target.device)] = 0
+        if weights is None:
+            return
+
+        if self.experts_shared_outer_loras and module_name == "down_proj_moe":
+            if isinstance(weights, dict):
+                if len(weights) != 1:
+                    raise ValueError(
+                        "Shared-outer down LoRA-B must contain exactly one "
+                        f"expert entry, got {len(weights)}."
+                    )
+                expert_weights = [(0, next(iter(weights.values())))]
+            elif weights.dim() == 3 and weights.shape[0] == 1:
+                expert_weights = [(0, weights[0])]
+            else:
+                raise ValueError(
+                    "Shared-outer down LoRA-B must have expert dimension 1."
+                )
+        else:
+            expert_weights = list(self._iter_local_expert_weights(weights))
+
+        pr = self.PAGE_RANK_SIZE
+        for expert_id, expert_weight in expert_weights:
+            if not 0 <= expert_id < target.shape[1]:
+                continue
+            for logical_page, physical_page in zip(logic_page_indices, phys_pages):
+                r0 = logical_page * pr
+                r1 = min(r0 + pr, lora_rank)
+                if r1 <= r0:
+                    continue
+                width = r1 - r0
+                target[physical_page, expert_id, :, :width].copy_(
+                    expert_weight[:, r0:r1] * scaling,
+                    non_blocking=True,
+                )
+                self.mark_page_accessed(physical_page)
 
     def _scatter_adapter_weights(
         self,
@@ -727,42 +982,89 @@ class LoRAPagePool:
 
         for layer_id in range(self.num_layers):
             layer_weights = adapter.layers[layer_id].weights
-            temp_A: Dict[str, Optional[torch.Tensor]] = {}
-            temp_B: Dict[str, Optional[torch.Tensor]] = {}
-            for name, wt in layer_weights.items():
-                target_module = get_target_module_name(name, self.target_modules)
-                if "experts" in name:
-                    continue
-                if "lora_A" in name:
-                    temp_A[target_module] = wt
-                elif "lora_B" in name:
-                    temp_B[target_module] = wt
+            temp_A: Dict[
+                str, Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]]
+            ] = {key: None for key in self.A_pages}
+            temp_B: Dict[
+                str, Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]]
+            ] = {key: None for key in self.B_pages}
 
-            cur_layer_modules = lora_modules[layer_id]
-            for module_name, module in cur_layer_modules.items():
+            for name, weight in layer_weights.items():
+                target_module = get_target_module_name(
+                    name, self.requested_target_modules
+                )
+                expert_match = re.search(r"experts\.(\d+)\.", name)
+                if expert_match:
+                    target_module = f"{target_module}_moe"
+                    expert_id = int(expert_match.group(1))
+                    destination = temp_A if "lora_A" in name else temp_B
+                    if destination.get(target_module) is None:
+                        destination[target_module] = {}
+                    assert isinstance(destination[target_module], dict)
+                    destination[target_module][expert_id] = weight
+                elif "experts" in name and weight.dim() == 3:
+                    target_module = f"{target_module}_moe"
+                    if "lora_A" in name:
+                        temp_A[target_module] = weight
+                    elif "lora_B" in name:
+                        temp_B[target_module] = weight
+                elif "lora_A" in name:
+                    temp_A[target_module] = weight
+                elif "lora_B" in name:
+                    temp_B[target_module] = weight
+
+            for module_name, module in lora_modules[layer_id].items():
                 if isinstance(module, FusedMoEWithLoRA):
+                    for target_module in (
+                        "gate_up_proj_moe",
+                        "down_proj_moe",
+                    ):
+                        if target_module not in self.A_pages:
+                            continue
+                        w_a = temp_A.get(target_module)
+                        w_b = temp_B.get(target_module)
+                        if w_a is not None:
+                            w_a = module.slice_moe_lora_a_weights(
+                                w_a, self.moe_tp_rank, target_module
+                            )
+                        if w_b is not None:
+                            w_b = module.slice_moe_lora_b_weights(
+                                w_b, self.moe_tp_rank, target_module
+                            )
+                        self._scatter_moe_a_weight_to_pages(
+                            target_module,
+                            layer_id,
+                            w_a,
+                            lora_rank,
+                            phys_pages,
+                            logic_page_indices,
+                        )
+                        self._scatter_moe_b_weight_to_pages(
+                            target_module,
+                            layer_id,
+                            w_b,
+                            lora_rank,
+                            adapter.scaling,
+                            phys_pages,
+                            logic_page_indices,
+                        )
                     continue
-                target_module = get_target_module_name(module_name, self.target_modules)
+
+                target_module = get_target_module_name(
+                    module_name, self.requested_target_modules
+                )
                 if target_module not in self.A_pages:
                     continue
-
                 w_a = temp_A.get(target_module)
                 w_b = temp_B.get(target_module)
-
                 if w_a is not None:
-                    w_a_shard = module.slice_lora_a_weights(w_a)
-                else:
-                    w_a_shard = None
-
+                    w_a = module.slice_lora_a_weights(w_a)
                 if w_b is not None:
-                    w_b_shard = module.slice_lora_b_weights(w_b)
-                else:
-                    w_b_shard = None
-
+                    w_b = module.slice_lora_b_weights(w_b)
                 self._scatter_a_weight_to_pages(
                     target_module,
                     layer_id,
-                    w_a_shard,
+                    w_a,
                     lora_rank,
                     phys_pages,
                     logic_page_indices=logic_page_indices,
@@ -770,7 +1072,7 @@ class LoRAPagePool:
                 self._scatter_b_weight_to_pages(
                     target_module,
                     layer_id,
-                    w_b_shard,
+                    w_b,
                     lora_rank,
                     phys_pages,
                     logic_page_indices=logic_page_indices,
@@ -797,9 +1099,11 @@ class LoRAPagePool:
         uid: str,
         adapter: LoRAAdapter,
         lora_modules: List[Dict[str, BaseLayerWithLoRA]],
+        missing: Optional[List[int]] = None,
     ):
         """Reload only the missing (swapped-out) pages for *uid*."""
-        missing = self.get_missing_pages(uid, adapter.config.r)
+        if missing is None:
+            missing = self.get_missing_pages(uid, adapter.config.r)
         if not missing:
             return
 
@@ -840,6 +1144,12 @@ class LoRAPagePool:
         if rank <= 0:
             return True
 
+        # Defensive invariant shared with Dense Paged LoRA: an adapter may
+        # never evict its own resident pages while it is being completed.
+        protected_pages = set(protected_pages)
+        protected_pages.update(self.get_protected_pages({uid}))
+        protected_pages.update(self.get_pinned_pages())
+
         if uid not in self.page_table:
             # Full allocation
             free_before = len(self.free_page_indices)
@@ -861,7 +1171,10 @@ class LoRAPagePool:
                 self.evict_pages(needed - free_before, protected_pages)
             if len(self.free_page_indices) < needed:
                 return False
-            self.load_missing_pages(uid, adapter, lora_modules)
+            # Pass the checked snapshot through to page-in.  Because the
+            # target's resident pages are protected, the missing set cannot
+            # grow between this capacity check and allocation.
+            self.load_missing_pages(uid, adapter, lora_modules, missing=missing)
             return self.is_complete(uid, rank)
 
         return True  # already complete

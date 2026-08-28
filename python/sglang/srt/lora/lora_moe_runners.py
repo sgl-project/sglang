@@ -189,6 +189,9 @@ class LoRAInfo:
     tp_rank: int = 0
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
+    is_paged: bool = False
+    page_table: torch.Tensor | None = None
+    page_rank_size: int = 0
 
 
 @dataclass
@@ -326,6 +329,7 @@ def _add_lora_gate_up_delta(
 
     M, top_k, gate_up_dim = intermediate_cache.shape
     r = lora_info.max_lora_rank
+    rank_slice = lora_info.page_rank_size if lora_info.is_paged else r
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
 
@@ -334,10 +338,13 @@ def _add_lora_gate_up_delta(
 
     # Detect gated vs non-gated from A buffer rank dimension.
     # Gated: A has 2*r rows (gate + up). Non-gated: A has 1*r rows (w1 only).
-    is_gated = gate_up_a.shape[2] > r
+    is_gated = gate_up_a.shape[2] > rank_slice
     if is_gated:
         inter_size = gate_up_b.shape[2] // 2
-        lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+        lora_a_stacked = [
+            gate_up_a[:, :, :rank_slice, :],
+            gate_up_a[:, :, rank_slice : 2 * rank_slice, :],
+        ]
         lora_b_stacked = [
             gate_up_b[:, :, :inter_size, :],
             gate_up_b[:, :, inter_size:, :],
@@ -390,6 +397,9 @@ def _add_lora_gate_up_delta(
             expand_num_stages=2,
             expand_split_k=1,
             fully_sharded=lora_info.fully_sharded,
+            page_table=lora_info.page_table,
+            lora_ranks=lora_info.lora_ranks if lora_info.is_paged else None,
+            page_rank_size=lora_info.page_rank_size,
         )
 
 
@@ -472,6 +482,9 @@ def _add_lora_down_delta(
             mul_routed_weight=True,
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
+            page_table=lora_info.page_table,
+            lora_ranks=lora_info.lora_ranks if lora_info.is_paged else None,
+            page_rank_size=lora_info.page_rank_size,
         )
 
 

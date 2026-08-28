@@ -1011,6 +1011,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
+        self.is_paged_lora: bool = False
         self.quant_method = base_layer.quant_method
         self.moe_runner_config = base_layer.moe_runner_config
         # Don't let the MoE runner overwrite hidden_states with its output:
@@ -1118,10 +1119,26 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ):
         """Set LoRA weight tensors from memory pool."""
         self.set_lora = True
+        self.is_paged_lora = False
         self.gate_up_lora_a_weights = gate_up_lora_a_weights
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
+
+    def set_paged_lora_info(
+        self,
+        gate_up_lora_a_pages: torch.Tensor,
+        gate_up_lora_b_pages: torch.Tensor,
+        down_lora_a_pages: torch.Tensor,
+        down_lora_b_pages: torch.Tensor,
+    ):
+        """Bind fixed-address 4D physical pages for direct paged MoE LoRA."""
+        self.set_lora = True
+        self.is_paged_lora = True
+        self.gate_up_lora_a_weights = gate_up_lora_a_pages
+        self.gate_up_lora_b_weights = gate_up_lora_b_pages
+        self.down_lora_a_weights = down_lora_a_pages
+        self.down_lora_b_weights = down_lora_b_pages
 
     def _get_lora_info(self):
         """Build LoRAInfo for the current batch."""
@@ -1130,7 +1147,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         batch_info = self.lora_backend.batch_info
 
         lora_ranks = batch_info.lora_ranks
-        max_lora_rank = self.down_lora_a_weights.shape[2]
+        is_paged = self.is_paged_lora
+        if is_paged:
+            assert batch_info.page_table is not None
+            assert batch_info.page_rank_size > 0
+            max_lora_rank = batch_info.page_table.shape[1] * batch_info.page_rank_size
+        else:
+            max_lora_rank = self.down_lora_a_weights.shape[2]
         cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
         moe_lora_info = batch_info.moe_lora_info
         assert moe_lora_info is not None
@@ -1139,9 +1162,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
-        if self._lora_runner_backend.is_experimental_sgl_trtllm() or (
+        if is_paged:
+            num_experts = self.down_lora_a_weights.shape[1]
+        elif self._lora_runner_backend.is_experimental_sgl_trtllm() or (
             self._lora_runner_backend.is_experimental_sgl_marlin()
         ):
+            # Per-rank (local) expert count the LoRA buffers are indexed by, so
+            # virtual-experts indexing matches the buffers under EP.
             num_experts = (
                 self.down_lora_a_weights.shape[1]
                 if self.down_lora_a_weights is not None
@@ -1169,6 +1196,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
+            is_paged=is_paged,
+            page_table=batch_info.page_table if is_paged else None,
+            page_rank_size=batch_info.page_rank_size if is_paged else 0,
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):

@@ -86,9 +86,9 @@ class LoRAManager:
         self.max_loras_per_batch: int = max_loras_per_batch
         self.page_rank_size: int = server_args.lora_page_rank_size
         self.use_paged_pool: bool = server_args.lora_page_rank_size > 0
-        if self.use_paged_pool and server_args.lora_pages > 0:
-            max_loras_per_batch = server_args.lora_pages + 1
-            self.max_loras_per_batch = max_loras_per_batch
+        # Adapter slots and physical pages are independent capacities.  Slot 0
+        # remains the base model; --lora-pages must never resize this domain.
+        self.total_lora_pages: int = server_args.lora_pages
         self.page_pool = None
         self._page_table_cache: dict = {}
         self.load_config: LoadConfig = load_config
@@ -374,7 +374,7 @@ class LoRAManager:
                 error_message=str(e),
             )
 
-        if self.use_paged_pool and self.page_pool is not None:
+        if getattr(self, "use_paged_pool", False) and self.page_pool is not None:
             self.page_pool.free_pages(lora_ref.lora_id)
 
         return self.create_lora_update_result(success=True)
@@ -383,6 +383,30 @@ class LoRAManager:
         """
         Validate if the LoRA IDs in the batch can be loaded into the current LoRA memory pool.
         """
+        if self.use_paged_pool and self.page_pool is not None:
+            active_uids = {uid for uid in lora_ids if uid is not None}
+
+            # Dense follows the remote implementation, where the slot domain
+            # is derived from physical pages and therefore cannot overflow.
+            # MoE intentionally keeps a bounded slot domain because each slot
+            # also sizes expert intermediates; reserve slot 0 for the base.
+            if self.page_pool.has_moe and (
+                len(active_uids) + 1 > self.max_loras_per_batch
+            ):
+                return False
+
+            # Match the Dense paged admission rule: the complete active set,
+            # plus every pinned adapter, must fit in the physical page budget.
+            # This is cumulative across requests already selected for the
+            # batch, rather than a per-request free-page dry run.
+            resident_uids = active_uids | self.page_pool.pinned_uids
+            required_pages = sum(
+                self.page_pool.get_num_pages_for_rank(self.loras[uid].config.r)
+                for uid in resident_uids
+                if uid in self.loras
+            )
+            return required_pages <= self.page_pool.total_pages
+
         if len(lora_ids) > self.max_loras_per_batch:
             return False
 
@@ -414,9 +438,10 @@ class LoRAManager:
         self, new_loras: set[Optional[str]], running_loras: set[Optional[str]] = set()
     ) -> bool:
         cur_uids = new_loras | running_loras
+        use_paged_pool = getattr(self, "use_paged_pool", False)
 
-        assert len(cur_uids) <= self.max_loras_per_batch
-        if not self.use_paged_pool:
+        if not use_paged_pool:
+            assert len(cur_uids) <= self.max_loras_per_batch
             new_uids = {
                 uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
             }
@@ -434,11 +459,20 @@ class LoRAManager:
                 }
                 self._notify_lora_slots_updated(changed_slots)
 
-        if self.use_paged_pool and self.page_pool is not None:
-            protected = self.page_pool.get_protected_pages(running_loras)
-            for uid in new_loras:
-                if uid is None:
-                    continue
+        if use_paged_pool and self.page_pool is not None:
+            active_uids = {uid for uid in cur_uids if uid is not None}
+            # Protect the whole forward batch, not only the caller's
+            # running_loras argument.  ForwardBatch passes all active IDs as
+            # new_loras, so protecting only running_loras leaves the set empty
+            # and permits self-/same-batch eviction.
+            protected = self.page_pool.get_protected_pages(active_uids)
+            # MoE page-in runs independently on every TP/EP rank, so its
+            # allocation order must be deterministic.  Dense is already
+            # paged in by the scheduler and keeps the remote set iteration.
+            ordered_uids = (
+                sorted(active_uids) if self.page_pool.has_moe else active_uids
+            )
+            for uid in ordered_uids:
                 lora = self.loras.get(uid)
                 if lora is None:
                     continue
@@ -449,6 +483,12 @@ class LoRAManager:
                     self.lora_modules,
                 ):
                     return False
+                # Pages allocated by this call must also be protected while
+                # the remaining adapters in the same batch are paged in.
+                protected.update(self.page_pool.get_protected_pages({uid}))
+
+            for uid in ordered_uids:
+                self.page_pool.mark_adapter_pages_accessed(uid)
         return True
 
     def _notify_lora_slots_updated(self, slot_ids: set[int]) -> None:
@@ -505,7 +545,12 @@ class LoRAManager:
                     lora_ranks[slot] = lora.config.r
                     scalings[slot] = lora.scaling
 
-            active_uids = [None] * num_slots
+            # Remote Dense uses only the active rows.  MoE keeps a fixed slot
+            # domain because its EP/TP CUDA-graph metadata and expert buffers
+            # share this index space.
+            active_uids = [None] * (
+                self.max_loras_per_batch if self.page_pool.has_moe else num_slots
+            )
             for uid, slot in uid_to_slot.items():
                 active_uids[slot] = uid
 
@@ -600,6 +645,23 @@ class LoRAManager:
                 ):
                     base_layer = getattr(module, "base_layer", module)
                     suffix = "_shared_moe" if base_layer.is_shared_fused_moe else "_moe"
+                    if self.use_paged_pool and suffix == "_moe":
+                        assert self.page_pool is not None
+                        module.set_paged_lora_info(
+                            gate_up_lora_a_pages=self.page_pool.A_pages[
+                                "gate_up_proj_moe"
+                            ][layer_id],
+                            gate_up_lora_b_pages=self.page_pool.B_pages[
+                                "gate_up_proj_moe"
+                            ][layer_id],
+                            down_lora_a_pages=self.page_pool.A_pages["down_proj_moe"][
+                                layer_id
+                            ],
+                            down_lora_b_pages=self.page_pool.B_pages["down_proj_moe"][
+                                layer_id
+                            ],
+                        )
+                        continue
                     gate_up_key = (
                         f"gate_up_proj{suffix}"
                         if f"gate_up_proj{suffix}" in self.memory_pool.A_buffer
@@ -1015,15 +1077,40 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            allocate_moe_buffers=not self.use_paged_pool,
         )
 
         # Initializing memory pool with base model
         if self.use_paged_pool:
             from sglang.srt.lora.paged_mem_pool import LoRAPagePool
 
-            total_pages = self.max_loras_per_batch * (
-                (self.max_lora_rank + self.page_rank_size - 1) // self.page_rank_size
+            max_pages_per_lora = (
+                self.max_lora_rank + self.page_rank_size - 1
+            ) // self.page_rank_size
+            total_pages = (
+                self.total_lora_pages
+                if self.total_lora_pages > 0
+                else self.max_loras_per_batch * max_pages_per_lora
             )
+            if self.max_lora_rank <= 0:
+                raise ValueError("Paged LoRA requires a positive max_lora_rank.")
+            if total_pages < max_pages_per_lora:
+                raise ValueError(
+                    "Paged LoRA physical capacity cannot hold one complete "
+                    f"maximum-rank adapter: total_pages={total_pages}, "
+                    f"required={max_pages_per_lora}."
+                )
+
+            has_moe = LoRAPagePool._has_moe_module(self.base_model)
+            if not has_moe:
+                # Match the remote Dense implementation exactly: in paged
+                # mode every physical page can hold a rank<=page-rank adapter,
+                # so provide one metadata slot per page plus slot 0 (base).
+                derived_max = total_pages + 1
+                if self.max_loras_per_batch < derived_max:
+                    self.max_loras_per_batch = derived_max
+                    self.lora_backend.max_loras_per_batch = derived_max
+
             self.page_pool = LoRAPagePool(
                 total_pages=total_pages,
                 page_rank_size=self.page_rank_size,
@@ -1036,6 +1123,7 @@ class LoRAManager:
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
                 max_loras_per_batch=self.max_loras_per_batch,
+                experts_shared_outer_loras=self.experts_shared_outer_loras,
             )
 
         self.fetch_new_loras({None})

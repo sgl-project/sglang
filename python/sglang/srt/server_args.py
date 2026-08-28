@@ -10299,6 +10299,19 @@ class ServerArgs:
                     and (cfg.max_lora_chunk_size & (cfg.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
 
+            if cfg.lora_page_rank_size < 0:
+                raise ValueError("--lora-page-rank-size must be non-negative.")
+            if cfg.lora_pages < 0:
+                raise ValueError("--lora-pages must be non-negative.")
+            if cfg.lora_pages > 0 and cfg.lora_page_rank_size == 0:
+                raise ValueError("--lora-pages requires --lora-page-rank-size > 0.")
+            if cfg.lora_page_rank_size > 0 and cfg.lora_use_virtual_experts:
+                raise ValueError(
+                    "Paged MoE LoRA supports the classic fused_moe_lora path only; "
+                    "do not combine --lora-page-rank-size with "
+                    "--lora-use-virtual-experts."
+                )
+
             if cfg.lora_use_virtual_experts:
                 logger.info("Virtual expert computation enabled.")
 

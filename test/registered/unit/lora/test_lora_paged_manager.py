@@ -18,10 +18,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -128,6 +131,135 @@ class TestGetattrFallback(CustomTestCase):
         pool = LoRAPagePool.__new__(LoRAPagePool)
         gen = getattr(pool, "page_generation", 0)
         self.assertEqual(gen, 0)
+
+
+class TestPagedBatchAdmission(CustomTestCase):
+    """Paged admission uses actual rank pages and the fixed slot domain."""
+
+    @staticmethod
+    def _make_manager(ranks, total_pages=64, max_loras_per_batch=16):
+        mgr = LoRAManager.__new__(LoRAManager)
+        mgr.use_paged_pool = True
+        mgr.max_loras_per_batch = max_loras_per_batch
+        mgr.loras = {
+            uid: SimpleNamespace(config=SimpleNamespace(r=rank))
+            for uid, rank in ranks.items()
+        }
+        mgr.page_pool = MagicMock()
+        mgr.page_pool.total_pages = total_pages
+        mgr.page_pool.pinned_uids = set()
+        mgr.page_pool.has_moe = True
+        mgr.page_pool.get_num_pages_for_rank.side_effect = lambda rank: (rank + 7) // 8
+        return mgr
+
+    def test_mixed_rank_batch_rejected_by_page_budget(self):
+        mgr = self._make_manager({f"r64_{i}": 64 for i in range(9)})
+        self.assertFalse(mgr.validate_lora_batch(set(mgr.loras)))
+
+    def test_mixed_rank_batch_accepted_when_pages_fit(self):
+        ranks = {f"r64_{i}": 64 for i in range(7)}
+        ranks.update({f"r8_{i}": 8 for i in range(4)})
+        mgr = self._make_manager(ranks)
+        self.assertTrue(mgr.validate_lora_batch(set(ranks)))
+
+    def test_base_slot_is_reserved(self):
+        ranks = {f"r8_{i}": 8 for i in range(16)}
+        mgr = self._make_manager(ranks)
+        self.assertFalse(mgr.validate_lora_batch(set(ranks)))
+
+    def test_pinned_pages_are_included_in_budget(self):
+        mgr = self._make_manager({"active": 64, "pinned": 128}, total_pages=16)
+        mgr.page_pool.pinned_uids = {"pinned"}
+        self.assertFalse(mgr.validate_lora_batch({"active"}))
+
+    def test_dense_uses_remote_page_derived_slot_domain(self):
+        ranks = {f"r8_{i}": 8 for i in range(6)}
+        mgr = self._make_manager(ranks, total_pages=6, max_loras_per_batch=4)
+        mgr.page_pool.has_moe = False
+        self.assertTrue(mgr.validate_lora_batch(set(ranks)))
+
+
+class TestPagedBatchProtection(CustomTestCase):
+    """Forward page-in protects adapters already resident in the same batch."""
+
+    def test_new_loras_are_protected_as_one_batch(self):
+        mgr = LoRAManager.__new__(LoRAManager)
+        mgr.use_paged_pool = True
+        mgr.max_loras_per_batch = 4
+        mgr.lora_modules = []
+        mgr.loras = {
+            "a": SimpleNamespace(config=SimpleNamespace(r=8)),
+            "b": SimpleNamespace(config=SimpleNamespace(r=8)),
+        }
+
+        resident = {"a": {3}, "b": set()}
+        ensure_calls = []
+        marked = []
+        pool = MagicMock()
+        pool.total_pages = 4
+        pool.pinned_uids = set()
+        pool.get_num_pages_for_rank.side_effect = lambda rank: (rank + 7) // 8
+        pool.get_pinned_pages.return_value = set()
+        pool.get_protected_pages.side_effect = lambda uids: set().union(
+            *(resident.get(uid, set()) for uid in uids)
+        )
+
+        def ensure(uid, _adapter, protected, _modules):
+            ensure_calls.append((uid, set(protected)))
+            resident[uid] = {3 if uid == "a" else 4}
+            return True
+
+        pool.ensure_adapter_ready.side_effect = ensure
+        pool.mark_adapter_pages_accessed.side_effect = marked.append
+        mgr.page_pool = pool
+
+        self.assertTrue(mgr.fetch_new_loras({"a", "b"}))
+        calls = dict(ensure_calls)
+        self.assertIn(3, calls["b"])
+        self.assertEqual(marked, ["a", "b"])
+
+
+class TestPagedSchedulerControlPath(CustomTestCase):
+    """Dense page-ins in admission; MoE defers local shards to Forward."""
+
+    @staticmethod
+    def _make_scheduler(has_moe):
+        pool = MagicMock()
+        pool.has_moe = has_moe
+        pool.get_protected_pages.return_value = set()
+        pool.is_complete.return_value = False
+        pool.can_ensure_adapter_ready.return_value = True
+        pool.ensure_adapter_ready.return_value = True
+
+        manager = MagicMock()
+        manager.use_paged_pool = True
+        manager.page_pool = pool
+        manager.validate_lora_batch.return_value = True
+        manager.loras = {"adapter": SimpleNamespace(config=SimpleNamespace(r=8))}
+        manager.lora_modules = []
+
+        scheduler = SimpleNamespace(
+            lora_drainer=None,
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(lora_manager=manager)
+            ),
+            enable_lora_overlap_loading=False,
+            _get_lora_rank=lambda _req: 8,
+        )
+        req = SimpleNamespace(lora_id="adapter")
+        return scheduler, req, pool
+
+    def test_moe_admission_is_dry_run(self):
+        scheduler, req, pool = self._make_scheduler(has_moe=True)
+        self.assertTrue(Scheduler._can_schedule_lora_req(scheduler, req, set()))
+        pool.can_ensure_adapter_ready.assert_called_once()
+        pool.ensure_adapter_ready.assert_not_called()
+
+    def test_dense_admission_pages_in_like_remote(self):
+        scheduler, req, pool = self._make_scheduler(has_moe=False)
+        self.assertTrue(Scheduler._can_schedule_lora_req(scheduler, req, set()))
+        pool.ensure_adapter_ready.assert_called_once()
+        pool.can_ensure_adapter_ready.assert_not_called()
 
 
 if __name__ == "__main__":

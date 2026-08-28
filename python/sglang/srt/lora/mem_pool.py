@@ -147,6 +147,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        allocate_moe_buffers: bool = True,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -160,6 +161,7 @@ class LoRAMemoryPool:
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
+        self.allocate_moe_buffers: bool = allocate_moe_buffers
         self.pin_memory_available: bool = is_pin_memory_available()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
@@ -596,18 +598,22 @@ class LoRAMemoryPool:
                             for idx in range(self.num_layer)
                         ]
 
-                    # MoE expert version (4D)
-                    moe_key = f"{module_name}_moe"
-                    buffer[moe_key] = [
-                        torch.zeros(
-                            get_lora_shape_fn(
-                                moe_key, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
-                        )
-                        for idx in range(self.num_layer)
-                    ]
+                    # Paged MoE keeps routed-expert weights exclusively in
+                    # LoRAPagePool.  Dense/shared-expert buffers remain here,
+                    # but allocating a second flat [slot, expert, ...] copy
+                    # would defeat the memory-saving contract.
+                    if self.allocate_moe_buffers:
+                        moe_key = f"{module_name}_moe"
+                        buffer[moe_key] = [
+                            torch.zeros(
+                                get_lora_shape_fn(
+                                    moe_key, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
 
                     # Shared-expert MoE version (4D, separate sink namespace).
                     if self._has_shared_fused_moe(base_model):

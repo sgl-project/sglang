@@ -45,6 +45,7 @@ def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
         "stride_el",
         "slice_a_size",
         "slice_c_size",
+        "c_base_offset",
     ]
 )
 def _fused_moe_lora_kernel(
@@ -63,6 +64,8 @@ def _fused_moe_lora_kernel(
     num_experts,
     lora_ids,
     adapter_enabled,
+    page_table_ptr,
+    lora_ranks_ptr,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
     # how much to increase `a_ptr` by to get the element one row down
@@ -70,6 +73,7 @@ def _fused_moe_lora_kernel(
     stride_am,
     stride_ak,
     stride_bl,
+    stride_bpage,
     stride_be,
     stride_bk,
     stride_bn,
@@ -77,8 +81,11 @@ def _fused_moe_lora_kernel(
     stride_cn,
     stride_tl,
     stride_el,
+    stride_pt_lora,
+    stride_pt_page,
     slice_a_size,
     slice_c_size,
+    c_base_offset,
     # Meta-parameters
     num_slice_a: tl.constexpr,
     num_slice_c: tl.constexpr,
@@ -92,6 +99,11 @@ def _fused_moe_lora_kernel(
     USE_GDC: tl.constexpr,
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
+    PAGE_RANK_SIZE: tl.constexpr,
+    IS_PAGED: tl.constexpr,
+    RANK_ON_N: tl.constexpr,
+    SMALL_RANK_BLOCK: tl.constexpr,
+    ACCUMULATE_OUTPUT: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
@@ -105,6 +117,10 @@ def _fused_moe_lora_kernel(
     if moe_enabled == 0:
         # Early exit for the no moe lora case.
         return
+    if IS_PAGED:
+        actual_rank = tl.load(lora_ranks_ptr + lora_id)
+        if actual_rank <= 0:
+            return
     max_loras = tl.num_programs(axis=2)
     grid_k = tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)
 
@@ -121,6 +137,16 @@ def _fused_moe_lora_kernel(
     pid_m = first_pid_m + ((pid_m_n % num_pid_in_group) % group_size_m)
     pid_n = (pid_m_n % num_pid_in_group) // group_size_m
 
+    if IS_PAGED and RANK_ON_N:
+        # Dense Paged LoRA launches one rank-page program and returns before
+        # loading the page or executing tl.dot when it is beyond cur_rank.
+        # Paged MoE uses a tensor-core-friendly rank block (normally 16 for
+        # page_rank_size=8), but follows the same per-adapter rule.  This is
+        # what lets r8 and r64 slots in the same launch do different work.
+        rank_block_start = pid_n * BLOCK_SIZE_N
+        if rank_block_start >= actual_rank:
+            return
+
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr + lora_id)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
@@ -133,7 +159,7 @@ def _fused_moe_lora_kernel(
     # get a_ptr,b_ptr,c_ptr
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
     cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
-    cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size
+    cur_c_ptr = c_ptr + (slice_id % num_slice_c) * slice_c_size + c_base_offset
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -153,13 +179,104 @@ def _fused_moe_lora_kernel(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    b_ptrs = (
-        cur_b_ptr
-        + lora_id * stride_bl
-        + expert_id * stride_be
-        + offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
-    )
+    if IS_PAGED and RANK_ON_N:
+        if actual_rank <= SMALL_RANK_BLOCK:
+            # Keep the normal large-rank tile in this launch, but compute an
+            # r8/r16 adapter with one tensor-core-sized rank tile. Invalid
+            # logical pages are rejected before the weight load and tl.dot.
+            small_offs_n = tl.arange(0, SMALL_RANK_BLOCK).to(tl.int64)
+            small_logical_page = small_offs_n // PAGE_RANK_SIZE
+            small_rank_in_page = small_offs_n % PAGE_RANK_SIZE
+            small_physical_page = tl.load(
+                page_table_ptr
+                + lora_id * stride_pt_lora
+                + small_logical_page * stride_pt_page,
+                mask=small_offs_n < N,
+                other=-1,
+            )
+            small_safe_physical_page = tl.maximum(small_physical_page, 0)
+            small_b_ptrs = (
+                cur_b_ptr
+                + small_safe_physical_page[None, :] * stride_bpage
+                + expert_id * stride_be
+                + offs_k[:, None] * stride_bk
+                + small_rank_in_page[None, :] * stride_bn
+            )
+
+            if USE_GDC and IS_PRIMARY:
+                tl.extra.cuda.gdc_launch_dependents()
+
+            small_accumulator = tl.zeros(
+                (BLOCK_SIZE_M, SMALL_RANK_BLOCK), dtype=tl.float32
+            )
+
+            if USE_GDC and not IS_PRIMARY:
+                tl.extra.cuda.gdc_wait()
+
+            small_a_ptrs = a_ptrs
+            for k in range(0, grid_k):
+                k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)
+                b = tl.load(
+                    small_b_ptrs,
+                    mask=(small_physical_page[None, :] >= 0)
+                    & (small_offs_n[None, :] < actual_rank)
+                    & (offs_k[:, None] < k_remaining),
+                    other=0.0,
+                )
+                a = tl.load(
+                    small_a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                    other=0.0,
+                )
+                small_accumulator += tl.dot(a, b.to(a.dtype))
+                small_a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+                small_b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+
+            if MUL_ROUTED_WEIGHT:
+                moe_weight = tl.load(
+                    topk_weights_ptr + offs_token, mask=token_mask, other=0
+                )
+                small_accumulator = small_accumulator * moe_weight[:, None]
+            small_accumulator = small_accumulator.to(c_ptr.dtype.element_ty)
+            small_c_ptrs = (
+                cur_c_ptr
+                + stride_cm * offs_token[:, None]
+                + stride_cn * small_offs_n[None, :]
+            )
+            small_c_mask = token_mask[:, None] & (small_offs_n[None, :] < actual_rank)
+            if SPLIT_K == 1:
+                tl.store(small_c_ptrs, small_accumulator, mask=small_c_mask)
+            else:
+                tl.atomic_add(
+                    small_c_ptrs,
+                    small_accumulator,
+                    mask=small_c_mask,
+                    sem="relaxed",
+                )
+            return
+
+    if not IS_PAGED:
+        b_ptrs = (
+            cur_b_ptr
+            + lora_id * stride_bl
+            + expert_id * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+    elif RANK_ON_N:
+        logical_page = offs_bn // PAGE_RANK_SIZE
+        rank_in_page = offs_bn % PAGE_RANK_SIZE
+        physical_page = tl.load(
+            page_table_ptr + lora_id * stride_pt_lora + logical_page * stride_pt_page
+        )
+        safe_physical_page = tl.maximum(physical_page, 0)
+        b_ptrs = (
+            cur_b_ptr
+            + safe_physical_page[None, :] * stride_bpage
+            + expert_id * stride_be
+            + offs_k[:, None] * stride_bk
+            + rank_in_page[None, :] * stride_bn
+        )
 
     if USE_GDC and IS_PRIMARY:
         # GDC launch dependents hints the runtime system to launch dependent kernels.
@@ -177,19 +294,103 @@ def _fused_moe_lora_kernel(
     if USE_GDC and not IS_PRIMARY:
         tl.extra.cuda.gdc_wait()
 
-    for k in range(0, grid_k):
-        k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)
-        # pre-fetch lora weight
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+    if IS_PAGED and not RANK_ON_N and actual_rank <= SMALL_RANK_BLOCK:
+        # Expand must not execute a masked 64-wide dot for an r8 adapter.
+        small_offs_k = tl.arange(0, SMALL_RANK_BLOCK)
+        small_logical_page = small_offs_k // PAGE_RANK_SIZE
+        small_rank_in_page = small_offs_k % PAGE_RANK_SIZE
+        small_physical_page = tl.load(
+            page_table_ptr
+            + lora_id * stride_pt_lora
+            + small_logical_page * stride_pt_page,
+            mask=small_offs_k < K,
+            other=-1,
+        )
+        small_safe_physical_page = tl.maximum(small_physical_page, 0)
+        small_a_ptrs = cur_a_ptr + (
+            offs_token[:, None] // top_k * stride_am + small_offs_k[None, :] * stride_ak
+        )
+        small_b_ptrs = (
+            cur_b_ptr
+            + small_safe_physical_page[:, None] * stride_bpage
+            + expert_id * stride_be
+            + small_rank_in_page[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
         a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+            small_a_ptrs,
+            mask=token_mask[:, None] & (small_offs_k[None, :] < actual_rank),
+            other=0.0,
+        )
+        b = tl.load(
+            small_b_ptrs,
+            mask=(small_physical_page[:, None] >= 0)
+            & (small_offs_k[:, None] < actual_rank)
+            & (offs_bn[None, :] < N),
             other=0.0,
         )
         accumulator += tl.dot(a, b.to(a.dtype))
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
+    else:
+        for k in range(0, grid_k):
+            k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)
+            if not IS_PAGED:
+                b = tl.load(b_ptrs, mask=offs_k[:, None] < k_remaining, other=0.0)
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                    other=0.0,
+                )
+                accumulator += tl.dot(a, b.to(a.dtype))
+            elif RANK_ON_N:
+                b = tl.load(
+                    b_ptrs,
+                    mask=(physical_page[None, :] >= 0)
+                    & (offs_bn[None, :] < actual_rank)
+                    & (offs_k[:, None] < k_remaining),
+                    other=0.0,
+                )
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                    other=0.0,
+                )
+                accumulator += tl.dot(a, b.to(a.dtype))
+            else:
+                rank_block_start = k * BLOCK_SIZE_K * SPLIT_K
+                if rank_block_start < actual_rank:
+                    rank_offset = rank_block_start + offs_k
+                    logical_page = rank_offset // PAGE_RANK_SIZE
+                    rank_in_page = rank_offset % PAGE_RANK_SIZE
+                    physical_page = tl.load(
+                        page_table_ptr
+                        + lora_id * stride_pt_lora
+                        + logical_page * stride_pt_page
+                    )
+                    safe_physical_page = tl.maximum(physical_page, 0)
+                    paged_b_ptrs = (
+                        cur_b_ptr
+                        + safe_physical_page[:, None] * stride_bpage
+                        + expert_id * stride_be
+                        + rank_in_page[:, None] * stride_bk
+                        + offs_bn[None, :] * stride_bn
+                    )
+                    b = tl.load(
+                        paged_b_ptrs,
+                        mask=(physical_page[:, None] >= 0)
+                        & (rank_offset[:, None] < actual_rank)
+                        & (offs_bn[None, :] < N),
+                        other=0.0,
+                    )
+                    a = tl.load(
+                        a_ptrs,
+                        mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
+                        other=0.0,
+                    )
+                    accumulator += tl.dot(a, b.to(a.dtype))
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
+            if not IS_PAGED or RANK_ON_N:
+                b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -199,6 +400,9 @@ def _fused_moe_lora_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = cur_c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+
+    if ACCUMULATE_OUTPUT:
+        accumulator += tl.load(c_ptrs, mask=c_mask, other=0.0)
 
     if SPLIT_K == 1:
         tl.store(c_ptrs, accumulator, mask=c_mask)
@@ -239,8 +443,22 @@ def _fused_moe_lora_shrink(
     split_k: int,
     top_k_divisor: int = None,
     mul_routed_weight: bool = False,
+    page_table: torch.Tensor | None = None,
+    lora_ranks: torch.Tensor | None = None,
+    page_rank_size: int = 0,
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
+    is_paged = page_table is not None and page_rank_size > 0
+    if is_paged:
+        assert lora_ranks is not None
+        N = page_table.shape[1] * page_rank_size
+        page_table_arg = page_table
+        lora_ranks_arg = lora_ranks
+        num_slots = page_table.shape[0]
+    else:
+        page_table_arg = adapter_enabled.view(-1, 1)
+        lora_ranks_arg = adapter_enabled
+        num_slots = w1_lora_a_stacked.shape[0]
 
     use_gdc = is_sm90_supported() or is_blackwell_supported()
     shrink_config = {
@@ -262,7 +480,7 @@ def _fused_moe_lora_shrink(
         * triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         len(lora_a_stacked),
-        lora_a_stacked[0].shape[0],
+        num_slots,
     )
     _fused_moe_lora_kernel[grid](
         qcurr_hidden_states,
@@ -279,8 +497,11 @@ def _fused_moe_lora_shrink(
         num_experts,
         lora_ids,
         adapter_enabled,
+        page_table_arg,
+        lora_ranks_arg,
         qcurr_hidden_states.stride(0),
         qcurr_hidden_states.stride(1),
+        w1_lora_a_stacked.stride(0),
         w1_lora_a_stacked.stride(0),
         w1_lora_a_stacked.stride(1),
         w1_lora_a_stacked.stride(3),
@@ -289,8 +510,11 @@ def _fused_moe_lora_shrink(
         a_intermediate_cache1.stride(3),
         sorted_token_ids.stride(0),
         expert_ids.stride(0),
+        page_table_arg.stride(0),
+        page_table_arg.stride(1),
         slice_a_size=qcurr_hidden_states.numel(),
         slice_c_size=a_intermediate_cache1.numel() // num_slices,
+        c_base_offset=0,
         num_slice_a=1,
         num_slice_c=num_slices,
         top_k=(
@@ -300,6 +524,11 @@ def _fused_moe_lora_shrink(
         ),
         MUL_ROUTED_WEIGHT=False,
         IS_PRIMARY=True,
+        PAGE_RANK_SIZE=page_rank_size if is_paged else 1,
+        IS_PAGED=is_paged,
+        RANK_ON_N=True,
+        SMALL_RANK_BLOCK=16,
+        ACCUMULATE_OUTPUT=False,
         **shrink_config,
     )
 
@@ -308,7 +537,6 @@ def _fused_moe_lora_shrink(
 def _fused_moe_lora_expand(
     output: torch.Tensor,  # (num_tokens, top_k_num, N*len(lora_a_stacked),)
     a_intermediate_cache1: torch.Tensor,  # (num_slices, M, top_k_num, max_lora_rank)
-    b_intermediate_cache1: torch.Tensor,  # (num_slices, M, top_k_num, output_dim_size)
     lora_b_stacked: list[
         torch.Tensor
     ],  # [(max_loras, num_experts, max_lora_rank, K,),...]
@@ -339,10 +567,24 @@ def _fused_moe_lora_expand(
     split_k: int,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    page_table: torch.Tensor | None = None,
+    lora_ranks: torch.Tensor | None = None,
+    page_rank_size: int = 0,
 ) -> None:
 
     b_ptr = _get_ptr(lora_b_stacked, device)
-    K = max_lora_rank
+    is_paged = page_table is not None and page_rank_size > 0
+    if is_paged:
+        assert lora_ranks is not None
+        K = page_table.shape[1] * page_rank_size
+        page_table_arg = page_table
+        lora_ranks_arg = lora_ranks
+        num_slots = page_table.shape[0]
+    else:
+        K = max_lora_rank
+        page_table_arg = adapter_enabled.view(-1, 1)
+        lora_ranks_arg = adapter_enabled
+        num_slots = lora_b_stacked[0].shape[0]
     N = w1_output_dim_size
 
     w1_lora_b_stacked = lora_b_stacked[0]
@@ -367,12 +609,12 @@ def _fused_moe_lora_expand(
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         len(lora_b_stacked),
-        lora_b_stacked[0].shape[0],
+        num_slots,
     )
     _fused_moe_lora_kernel[grid](
         a_intermediate_cache1,
         b_ptr,
-        b_intermediate_cache1,
+        output,
         topk_weights,
         sorted_token_ids,
         expert_ids,
@@ -384,27 +626,36 @@ def _fused_moe_lora_expand(
         num_experts,
         lora_ids,
         adapter_enabled,
+        page_table_arg,
+        lora_ranks_arg,
         a_intermediate_cache1.stride(0),
         a_intermediate_cache1.stride(1),
+        w1_lora_b_stacked.stride(0),
         w1_lora_b_stacked.stride(0),
         w1_lora_b_stacked.stride(1),
         w1_lora_b_stacked.stride(3),
         w1_lora_b_stacked.stride(2),
-        b_intermediate_cache1.stride(2),
-        b_intermediate_cache1.stride(3),
+        output.stride(1),
+        output.stride(2),
         sorted_token_ids.stride(0),
         expert_ids.stride(0),
+        page_table_arg.stride(0),
+        page_table_arg.stride(1),
         slice_a_size=a_intermediate_cache1.numel() // num_slices,
-        slice_c_size=b_intermediate_cache1.numel() // num_slices,
+        slice_c_size=N,
+        c_base_offset=offset,
         num_slice_a=num_slices,
         num_slice_c=num_slices,
         top_k=1,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         IS_PRIMARY=False,
+        PAGE_RANK_SIZE=page_rank_size if is_paged else 1,
+        IS_PAGED=is_paged,
+        RANK_ON_N=False,
+        SMALL_RANK_BLOCK=16,
+        ACCUMULATE_OUTPUT=True,
         **expand_config,
     )
-    for i in range(num_slices):
-        output[:, :, i * N + offset : (i + 1) * N + offset] += b_intermediate_cache1[i]
 
 
 @torch.inference_mode()
@@ -442,6 +693,9 @@ def _fused_moe_lora(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    page_table: torch.Tensor | None = None,
+    lora_ranks: torch.Tensor | None = None,
+    page_rank_size: int = 0,
 ) -> None:
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert (
@@ -459,6 +713,17 @@ def _fused_moe_lora(
     assert output.shape[0] == topk_weights.shape[0]
     assert top_k_num == topk_weights.shape[1]
     device = qcurr_hidden_states.device
+    is_paged = page_table is not None and page_rank_size > 0
+    if is_paged:
+        if fully_sharded:
+            raise NotImplementedError(
+                "Paged MoE LoRA does not support fully-sharded LoRA."
+            )
+        assert lora_ranks is not None
+        assert page_table.dtype == torch.int32
+        assert lora_ranks.dtype == torch.int32
+        assert page_table.device == device and lora_ranks.device == device
+        max_lora_rank = page_table.shape[1] * page_rank_size
     num_slices = len(lora_a_stacked)
     w1_lora_b_stacked = lora_b_stacked[0]
     num_experts = lora_a_stacked[0].shape[1]
@@ -476,12 +741,6 @@ def _fused_moe_lora(
 
     a_intermediate_cache1 = torch.zeros(
         (num_slices, M, top_k_num, max_lora_rank),
-        dtype=output.dtype,
-        device=device,
-    )
-
-    b_intermediate_cache1 = torch.zeros(
-        (num_slices, M, top_k_num, w1_output_dim_size),
         dtype=output.dtype,
         device=device,
     )
@@ -515,6 +774,9 @@ def _fused_moe_lora(
         shrink_split_k,
         top_k_divisor=shrink_top_k_divisor,
         mul_routed_weight=False,
+        page_table=page_table,
+        lora_ranks=lora_ranks,
+        page_rank_size=page_rank_size,
     )
 
     if fully_sharded:
@@ -533,7 +795,6 @@ def _fused_moe_lora(
     _fused_moe_lora_expand(
         output,
         a_intermediate_cache1,
-        b_intermediate_cache1,
         lora_b_stacked,
         topk_weights,
         sorted_token_ids,
@@ -562,6 +823,9 @@ def _fused_moe_lora(
         expand_split_k,
         mul_routed_weight,
         offset,
+        page_table,
+        lora_ranks,
+        page_rank_size,
     )
 
 
@@ -595,6 +859,9 @@ def _fused_moe_lora_fake(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    page_table: torch.Tensor | None = None,
+    lora_ranks: torch.Tensor | None = None,
+    page_rank_size: int = 0,
 ) -> None:
     return
 
@@ -626,6 +893,9 @@ def _fused_moe_lora_shrink_fake(
     num_stages: int,
     split_k: int,
     mul_routed_weight: bool = False,
+    page_table: torch.Tensor | None = None,
+    lora_ranks: torch.Tensor | None = None,
+    page_rank_size: int = 0,
 ) -> None:
     return
 
@@ -633,7 +903,6 @@ def _fused_moe_lora_shrink_fake(
 def _fused_moe_lora_expand_fake(
     output: torch.Tensor,
     a_intermediate_cache1: torch.Tensor,
-    b_intermediate_cache1: torch.Tensor,
     lora_b_stacked: list[torch.Tensor],
     topk_weights: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -661,6 +930,9 @@ def _fused_moe_lora_expand_fake(
     split_k: int,
     mul_routed_weight: bool = False,
     offset: int = 0,
+    page_table: torch.Tensor | None = None,
+    lora_ranks: torch.Tensor | None = None,
+    page_rank_size: int = 0,
 ) -> None:
     return
 
@@ -686,7 +958,7 @@ try:
     direct_register_custom_op(
         op_name="fused_moe_lora_expand",
         op_func=_fused_moe_lora_expand,
-        mutates_args=["output", "b_intermediate_cache1"],
+        mutates_args=["output"],
         fake_impl=_fused_moe_lora_expand_fake,
     )
 

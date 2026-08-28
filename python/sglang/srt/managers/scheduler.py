@@ -3613,17 +3613,35 @@ class Scheduler(
 
         lora_mgr = self.tp_worker.model_runner.lora_manager
         if lora_mgr.use_paged_pool and lora_mgr.page_pool is not None:
+            # Dense-aligned cumulative admission: running_loras is updated as
+            # requests are accepted from the waiting queue, so this check
+            # reserves the logical page budget for the complete candidate
+            # batch instead of independently approving every adapter.
+            new_lora_set = {req.lora_id} | running_loras
+            if not lora_mgr.validate_lora_batch(new_lora_set):
+                return False
+
             pool = lora_mgr.page_pool
             rank = self._get_lora_rank(req)
             if rank > 0:
-                # Dry-run only: check whether enough free + evictable pages
-                # exist without actually allocating, evicting, or copying
-                # weights.  The real page-in and weight scatter happen later
-                # during the forward pass (fetch_new_loras), which runs on
-                # every TP rank and is off the scheduler's critical path.
                 protected = pool.get_protected_pages(running_loras)
-                if not pool.can_ensure_adapter_ready(req.lora_id, rank, protected):
-                    return False
+                if pool.has_moe:
+                    # MoE weights are EP/TP-local.  Admission is a dry run;
+                    # Forward performs the real scatter on every rank.
+                    if not pool.can_ensure_adapter_ready(req.lora_id, rank, protected):
+                        return False
+                elif not pool.is_complete(req.lora_id, rank):
+                    # Keep Dense consistent with the remote implementation:
+                    # complete page-in during scheduler admission.
+                    protected.update(pool.get_protected_pages({req.lora_id}))
+                    adapter = lora_mgr.loras[req.lora_id]
+                    if not pool.ensure_adapter_ready(
+                        req.lora_id,
+                        adapter,
+                        protected,
+                        lora_mgr.lora_modules,
+                    ):
+                        return False
 
         if self.enable_lora_overlap_loading:
             # For overlapping loading of LoRA weights with computation, we will load each
@@ -3632,10 +3650,10 @@ class Scheduler(
                 req.lora_id, running_loras
             )
         else:
+            if lora_mgr.use_paged_pool and lora_mgr.page_pool is not None:
+                return True
             new_lora_set = {req.lora_id} | running_loras
-            return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
-                new_lora_set
-            )
+            return lora_mgr.validate_lora_batch(new_lora_set)
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""

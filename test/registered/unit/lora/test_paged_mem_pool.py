@@ -16,6 +16,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -316,6 +317,35 @@ class TestCanEnsureAdapterReady(CustomTestCase):
         self.assertEqual(self.pool.free_page_indices, free_before)
         self.assertEqual(self.pool.page_table, pt_before)
         self.assertEqual(getattr(self.pool, "phys_page_to_uid", {}), phys_to_uid_before)
+
+    def test_own_resident_pages_are_not_evictable_capacity(self):
+        """A partial adapter cannot evict itself to reload another page."""
+        pool = _make_bare_pool(total_pages=1, page_rank_size=8)
+        pool.free_page_indices.clear()
+        pool.page_table = {"a": [0, -1]}
+        pool.adapter_ranks = {"a": 16}
+        pool.phys_page_to_uid = {0: "a"}
+        self.assertFalse(pool.can_ensure_adapter_ready("a", 16, set()))
+
+
+class TestEnsureAdapterReadyProtection(CustomTestCase):
+    """Page-in must preserve the target adapter's resident pages."""
+
+    def test_partial_reload_evicts_other_adapter_not_itself(self):
+        pool = _make_bare_pool(total_pages=2, page_rank_size=8)
+        pool.free_page_indices.clear()
+        pool.page_table = {"a": [0, -1], "b": [1]}
+        pool.adapter_ranks = {"a": 16, "b": 8}
+        pool.phys_page_to_uid = {0: "a", 1: "b"}
+        # Make a's resident page older so a missing self-protection would
+        # deterministically evict page 0 first.
+        pool.page_access_times = [0, 1]
+        pool._scatter_adapter_weights = lambda *_args, **_kwargs: None
+        adapter = SimpleNamespace(config=SimpleNamespace(r=16))
+
+        self.assertTrue(pool.ensure_adapter_ready("a", adapter, set(), []))
+        self.assertEqual(pool.page_table["a"], [0, 1])
+        self.assertEqual(pool.page_table["b"], [-1])
 
 
 if __name__ == "__main__":
