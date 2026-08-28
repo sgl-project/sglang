@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEEPSEEK_V4_FP4_INDEXER_AITER_SCATTER_VERSION = 1
 _DEEPSEEK_V4_FP4_INDEXER_AITER_APIS = {
     "aiter": (
         "rope_rotate_activation",
@@ -45,19 +44,6 @@ def _deepseek_v4_fp4_indexer_aiter_error() -> Optional[str]:
             return f"could not import {module_name} ({exc})"
 
         if module_name == "aiter":
-            scatter_version = getattr(
-                module, "DSV4_FP4_KVCACHE_SCATTER_VERSION", None
-            )
-            if type(scatter_version) is not int or (
-                scatter_version < _DEEPSEEK_V4_FP4_INDEXER_AITER_SCATTER_VERSION
-            ):
-                return (
-                    "the installed AITER contains the known multi-row K-cache "
-                    "scatter bug: DSV4_FP4_KVCACHE_SCATTER_VERSION must be >= "
-                    f"{_DEEPSEEK_V4_FP4_INDEXER_AITER_SCATTER_VERSION}, got "
-                    f"{scatter_version!r}"
-                )
-
             if not hasattr(getattr(module, "dtypes", None), "fp4x2"):
                 return "missing AITER dtype: aiter.dtypes.fp4x2"
 
@@ -75,6 +61,12 @@ def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
         return
 
     if is_hip():
+        if cfg.nnodes != 1:
+            raise ValueError(
+                "--enable-deepseek-v4-fp4-indexer on HIP supports "
+                "single-node execution only; use --nnodes 1 or remove "
+                "the FP4 indexer flag."
+            )
         if cfg.enable_hierarchical_cache:
             raise ValueError(
                 "--enable-deepseek-v4-fp4-indexer on HIP does not support "
@@ -96,7 +88,7 @@ def validate_deepseek_v4_fp4_indexer(server_args: ServerArgs) -> None:
         if aiter_error := _deepseek_v4_fp4_indexer_aiter_error():
             raise ValueError(
                 "--enable-deepseek-v4-fp4-indexer on HIP requires the "
-                f"pinned-image AITER FP4 APIs; {aiter_error}. Install a "
+                f"compatible AITER FP4 APIs; {aiter_error}. Install a "
                 "matching AITER build or remove the flag."
             )
         return

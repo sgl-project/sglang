@@ -31,23 +31,36 @@ SCALE_SENTINEL = 0xD0
 def _has_required_aiter_apis() -> bool:
     if not is_hip() or not torch.cuda.is_available():
         return False
-    try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
-        if arch != "gfx950":
-            return False
-        import aiter
-        from aiter.ops import flydsl
-
-        return all(
-            (
-                hasattr(aiter, "rope_rotate_activation"),
-                hasattr(aiter, "rmsnorm_rope_rotate_activation_fp4quant_kvcache"),
-                hasattr(flydsl, "flydsl_pa_mqa_logits_fp4"),
-                hasattr(flydsl, "flydsl_pa_mqa_logits_fp4_prefill"),
-            )
-        )
-    except Exception:
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    if arch != "gfx950":
         return False
+
+    import aiter
+    from aiter.ops import flydsl
+
+    required_apis = {
+        "aiter.dtypes.fp4x2": getattr(getattr(aiter, "dtypes", None), "fp4x2", None),
+        "aiter.rope_rotate_activation": getattr(aiter, "rope_rotate_activation", None),
+        "aiter.rmsnorm_rope_rotate_activation_fp4quant_kvcache": getattr(
+            aiter, "rmsnorm_rope_rotate_activation_fp4quant_kvcache", None
+        ),
+        "aiter.ops.flydsl.flydsl_pa_mqa_logits_fp4": getattr(
+            flydsl, "flydsl_pa_mqa_logits_fp4", None
+        ),
+        "aiter.ops.flydsl.flydsl_pa_mqa_logits_fp4_prefill": getattr(
+            flydsl, "flydsl_pa_mqa_logits_fp4_prefill", None
+        ),
+    }
+    missing = [
+        name
+        for name, value in required_apis.items()
+        if value is None or (name != "aiter.dtypes.fp4x2" and not callable(value))
+    ]
+    if missing:
+        raise RuntimeError(
+            f"missing required AITER FP4 indexer APIs: {', '.join(missing)}"
+        )
+    return True
 
 
 pytestmark = pytest.mark.skipif(
@@ -90,7 +103,7 @@ def _e8m0_to_float(scales: torch.Tensor) -> torch.Tensor:
 
 def _dequant_q(q_fp4: torch.Tensor, q_scale: torch.Tensor) -> torch.Tensor:
     q_values = _unpack_fp4(q_fp4).reshape(-1, HEADS, GROUPS, GROUP_SIZE)
-    scales = q_scale[:, 0].permute(0, 2, 3, 1).reshape(-1, HEADS, GROUPS)
+    scales = q_scale[:, 0].permute(0, 3, 2, 1).reshape(-1, HEADS, GROUPS)
     return (q_values * _e8m0_to_float(scales).unsqueeze(-1)).flatten(-2)
 
 

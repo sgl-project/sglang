@@ -74,6 +74,11 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
     ):
         cases = (
             (
+                {"nnodes": 2},
+                True,
+                "single-node execution only",
+            ),
+            (
                 {"enable_hierarchical_cache": True},
                 True,
                 "HiCache",
@@ -131,11 +136,7 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
                 "flydsl_pa_mqa_logits_fp4",
                 "flydsl_pa_mqa_logits_fp4_prefill",
             )
-        ) + (
-            ({"marker_version": None}, "known multi-row K-cache scatter bug"),
-            ({"marker_version": 0}, "known multi-row K-cache scatter bug"),
-            ({"include_fp4x2": False}, "aiter.dtypes.fp4x2"),
-        )
+        ) + (({"include_fp4x2": False}, "aiter.dtypes.fp4x2"),)
         for module_kwargs, error_pattern in cases:
             with (
                 self.subTest(module_kwargs=module_kwargs),
@@ -167,9 +168,7 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
             validate_deepseek_v4_fp4_indexer(self._server_args())
 
     @staticmethod
-    def _import_complete_aiter_module(
-        module_name, missing=None, marker_version=1, include_fp4x2=True
-    ):
+    def _import_complete_aiter_module(module_name, missing=None, include_fp4x2=True):
         api_names = {
             "aiter": (
                 "rope_rotate_activation",
@@ -184,8 +183,6 @@ class TestDeepseekV4Fp4IndexerValidation(unittest.TestCase):
             api_name: MagicMock() for api_name in api_names if api_name != missing
         }
         if module_name == "aiter":
-            if marker_version is not None:
-                attributes["DSV4_FP4_KVCACHE_SCATTER_VERSION"] = marker_version
             attributes["dtypes"] = SimpleNamespace(
                 **({"fp4x2": object()} if include_fp4x2 else {})
             )
