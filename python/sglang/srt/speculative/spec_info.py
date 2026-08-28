@@ -131,16 +131,11 @@ class SpeculativeAlgorithm(Enum):
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
 
-        The contract is algorithm-agnostic: spec runs only on pure-decode
-        steps; in a mixed step every running request commits one plain token
-        (a 1-token extend of its pending bonus token) and the worker resumes
-        drafting afterward. An algorithm joins this list once its worker's
-        resume path is verified: EAGLE-family re-seeds draft state via the
-        prefill draft-extend; dflash-family injects target hidden states into
-        the draft KV over out_cache_loc, which covers the mixed tails.
-        standalone likely works (draft prefill covers the gap) but is
-        unverified; ngram publishes its overlap relay into accept bufs, not
-        output_tokens_buf, so the mixed input resolve would read stale rows.
+        In a mixed step every running request commits one plain token and
+        the worker resumes drafting afterward; an algorithm joins this list
+        once that resume path is verified. ngram cannot join as is: its
+        overlap relay skips output_tokens_buf, which the mixed input
+        resolve reads.
         """
         return self in (
             SpeculativeAlgorithm.EAGLE,

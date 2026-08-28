@@ -1,25 +1,37 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
 
-  supportedHardware: ["gb300", "h100", "h200", "b200", "b300", "gb200"],
+  supportedHardware: [
+    "gb300", "h100", "h200", "b200", "b300", "gb200",
+    "mi300x", "mi325x", "mi355x",
+  ],
 
   matchDims: [
     {
       id: "strategy",
       title: "Strategy",
       options: [
-        { id: "low-latency", label: "Low Latency", subtitle: "Adaptive MTP 5/1/6" },
+        {
+          id: "low-latency",
+          label: "Low Latency",
+          subtitle: "Adaptive MTP 5/1/6",
+          disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
+          disableReason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; use the non-speculative High Throughput recipe.",
+        },
         { id: "high-throughput", label: "High Throughput", subtitle: "Spec decode off" },
       ],
     },
   ],
 
   isRecommendedSelection(s) {
-    const pairing = ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
+    const pairing = ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw)
+      ? "bf16-tilelang"
+      : "fp8-trtllm";
     return (
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
-      s.hicache === "off"
+      s.hicache === "off" &&
+      s.dcp === "off"
     );
   },
 
@@ -32,8 +44,8 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) => ["h100", "h200"].includes(s.hw),
-          disableReason: "FP8 KV cache with TRT-LLM DSA is not supported on Hopper GPUs.",
+          disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw),
+          disableReason: "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -79,8 +91,6 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32"],
-          disabled: (s) => s.strategy === "low-latency",
-          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
           hints: ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -89,9 +99,23 @@ export const config = {
           subtitle: "Mooncake",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
-          disabled: (s) => s.strategy === "low-latency",
-          disableReason: "HiCache with MTP speculative decoding crashes at startup in the current build (DSA draft pool lacks full_kv_pool); use it with High Throughput only.",
           hints: ["Start Mooncake and place the configuration file on every serving node."],
+        },
+      ],
+    },
+    {
+      id: "dcp",
+      title: "Context Parallelism",
+      default: "off",
+      options: [
+        { id: "off", label: "Off" },
+        {
+          id: "4",
+          label: "DCP 4",
+          disabled: (s) => s.hw !== "gb300",
+          disableReason: "DCP is validated only on 4x GB300 TP4/EP4 for now.",
+          flags: ["--dcp-size 4", "--dcp-comm-backend a2a", "--dcp-replicate-q-proj"],
+          hints: ["Measured on 4x GB300 with both KV/DSA pairings, adaptive MTP 5/1/6, full decode graph."],
         },
       ],
     },
@@ -147,8 +171,9 @@ sgl-eval run gsm8k \\
     ["gsm8k_pct", "GSM8K", "%"],
   ],
 
-  // Support is not in a public sglang release yet, so the nightly images do
-  // not work; every NVIDIA lane uses the purpose-built CUDA 13 image.
+  // Support is not in a public sglang release yet. NVIDIA uses the
+  // purpose-built CUDA 13 image. AMD validation used these ROCm 7.2 images
+  // with the GLM-5.3 ROCm engine branch mounted over the image source tree.
   dockerImages: {
     gb300: "lmsysorg/sglang:glm-5.3-flash",
     h100: "lmsysorg/sglang:glm-5.3-flash",
@@ -156,6 +181,9 @@ sgl-eval run gsm8k \\
     b200: "lmsysorg/sglang:glm-5.3-flash",
     b300: "lmsysorg/sglang:glm-5.3-flash",
     gb200: "lmsysorg/sglang:glm-5.3-flash",
+    mi300x: "lmsysorg/sglang:v0.5.18-rocm720-mi30x",
+    mi325x: "lmsysorg/sglang:v0.5.18-rocm720-mi30x",
+    mi355x: "lmsysorg/sglang:v0.5.18-rocm720-mi35x",
   },
 
   github: {
@@ -213,6 +241,8 @@ sgl-eval run gsm8k \\
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
+            disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
+            disableReason: "The validated AMD ROCm recipe uses the Triton MoE runner.",
           },
         ],
       },
@@ -237,6 +267,72 @@ sgl-eval run gsm8k \\
       ],
     },
 
+    // ----- Card: "Speculative" -----
+    // The Deploy panel only picks speculation through the Strategy dim (Low
+    // Latency = the checkpoint's adaptive MTP head, High Throughput = off).
+    // This card is the finer control, and it adds the one algorithm no cell
+    // ships: DFlash2, whose draft is a separate checkpoint.
+    //
+    // The EAGLE preset is byte-identical to what the Low Latency cells carry,
+    // so a Low Latency base derives onto that chip instead of showing
+    // "Inherited from base", and re-picking it is a no-op.
+    speculative: {
+      options: [
+        { id: "current", label: "Inherited from base" },
+        { id: "off", label: "Off (greedy)" },
+        {
+          id: "eagle",
+          label: "EAGLE / Adaptive MTP 5-1-6",
+          flags: [
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 5",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 6",
+            "--speculative-adaptive",
+          ],
+          disable: [
+            {
+              when: { dpAttnOn: [true] },
+              reason: "Adaptive MTP does not support DP-Attention — the server falls back to a static draft depth and warns. Turn DP-Attention off in the Attention card above.",
+            },
+            {
+              when: { hw: ["mi300x", "mi325x", "mi355x"] },
+              reason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; the Strategy row disables Low Latency there for the same reason.",
+            },
+          ],
+        },
+        {
+          id: "dflash",
+          label: "DFlash2",
+          // Block-wise draft: the block size comes from the draft checkpoint,
+          // so no --speculative-num-draft-tokens here. The draft is a dense
+          // model and does not run on the target's DSA backends, hence the
+          // explicit draft attention backend.
+          flags: [
+            "--speculative-algorithm DFLASH",
+            "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
+            "--speculative-draft-attention-backend fa4",
+          ],
+          // DFLASH needs this model's hidden-state capture, which landed on the
+          // GLM-5.3-Flash support branch (PR #36708 into #36507's
+          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
+          // image the Install accordion pins. Drop this note once #36507 merges
+          // and a published image carries it.
+          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
+          disable: [
+            {
+              when: { dpAttnOn: [true] },
+              reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
+            },
+            {
+              when: { hw: ["mi300x", "mi325x", "mi355x"] },
+              reason: "DFLASH speculative decoding only supports CUDA and NPU devices; the server rejects it on ROCm at startup.",
+            },
+          ],
+        },
+      ],
+    },
+
   },
 
   cells: [
@@ -247,7 +343,8 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off"
+        s.hicache === "off" &&
+        ["off", "4"].includes(s.dcp)
           ? "verified"
           : "unverified",
       env: [],
@@ -259,8 +356,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -278,7 +374,8 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off"
+        s.hicache === "off" &&
+        s.dcp === "off"
           ? "verified"
           : "unverified",
       env: [],
@@ -290,7 +387,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -300,20 +396,22 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: (s) => config.isRecommendedSelection(s) ? "in-progress" : "unverified",
+      verified: true,
+      verificationStatus: (s) =>
+        s.mmTransport === "auto" && s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.70",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -327,7 +425,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h100", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -338,7 +438,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -348,18 +447,22 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        s.mmTransport === "auto" && s.hicache === "off"
+          ? "verified"
+          : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
+        "--mem-fraction-static 0.75",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -373,7 +476,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -383,7 +488,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -393,7 +497,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -403,8 +508,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -418,7 +522,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -428,7 +534,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -438,7 +543,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) => (s.hicache === "off" ? "verified" : "unverified"),
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -448,8 +554,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -463,7 +568,9 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b300", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) =>
+        ["off", "l2"].includes(s.hicache) ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -473,7 +580,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -493,8 +599,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
-        "--speculative-algorithm NEXTN",
+        "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
@@ -518,7 +623,72 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // AMD ROCm — one non-speculative TP8 operating point. The explicit BF16
+    // KV and TileLang DSA flags match the resolved defaults observed in the
+    // validation server logs. AITER remains enabled for the ROCm kernel paths,
+    // while Triton owns the MoE runner. CUDA graphs stay disabled because that
+    // is the architecture-gated configuration used for correctness validation.
+    {
+      match: { hw: "mi300x", strategy: "high-throughput" },
+      nnodes: 1,
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--trust-remote-code",
+        "--disable-cuda-graph",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend triton",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi325x", strategy: "high-throughput" },
+      nnodes: 1,
+      verified: false,
+      warn: "This MI325X recipe is inferred from the validated MI300X gfx942 path. It has not been measured directly on MI325X.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--trust-remote-code",
+        "--disable-cuda-graph",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend triton",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", strategy: "high-throughput" },
+      nnodes: 1,
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--trust-remote-code",
+        "--disable-cuda-graph",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend triton",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
