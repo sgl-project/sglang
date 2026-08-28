@@ -22,6 +22,10 @@ from sglang.multimodal_gen.registry import (
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
     NEOVisionConfig,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1GenerationStage,
 )
@@ -248,19 +252,38 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["seed"] == 123
 
 
-def test_sensenova_u1_generation_stage_expects_expanded_multi_output_request():
+def test_sensenova_u1_multi_output_request_expands_before_generation_stage():
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
         height=4096,
         num_outputs_per_prompt=2,
     )
-    batch = SimpleNamespace(
-        num_outputs_per_prompt=2,
+    batch = Req(
+        request_id="req-0",
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
         seed=42,
+        sampling_params=sampling,
         extra=sampling.build_request_extra(),
+        output_file_name="sample.png",
     )
+    server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    input_stage = InputValidationStage()
     stage = SenseNovaU1GenerationStage(model=_FakeSenseNovaModel(), tokenizer="tok")
 
-    with pytest.raises(ValueError, match="output expansion"):
-        stage.forward(batch, server_args=SimpleNamespace())
+    expanded = list(input_stage.iter_sequential_requests(batch, server_args))
+
+    assert [req.num_outputs_per_prompt for req in expanded] == [1, 1]
+    assert [req.seed for req in expanded] == [42, 43]
+    assert [req.request_id for req in expanded] == ["req-0:0", "req-0:1"]
+    assert [req.output_file_name for req in expanded] == [
+        "sample_0.png",
+        "sample_1.png",
+    ]
+    for req in expanded:
+        output = stage.forward(req, server_args=SimpleNamespace())
+        assert len(output.output) == 1
