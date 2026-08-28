@@ -1,7 +1,7 @@
 """Moonmath MLA attention backend for CDNA3 (gfx942).
 
 Subclasses AiterAttnBackend and takes over absorbed MLA with the
-moonmath_attention A16W8 kernels (bf16 Q / fp8 KV), which read sglang's existing
+moonmath_amd A16W8 kernels (bf16 Q / fp8 KV), which read sglang's existing
 fused-576 MLATokenToKVPool key buffer directly (page_size=1, device-driven,
 cuda-graph safe). Two shapes, both H <= 16:
 
@@ -60,7 +60,7 @@ _MAX_BATCH = 8192  # size of the staged int32 seq_lens buffer
 
 
 class MoonmathMLABackend(AiterAttnBackend):
-    """MLA decode and spec-verify via moonmath_attention; aiter for the rest."""
+    """MLA decode and spec-verify via moonmath_amd; aiter for the rest."""
 
     # This backend has its own MLA kernels, so aiter's head-count assert must not
     # reject it at construction.
@@ -68,7 +68,7 @@ class MoonmathMLABackend(AiterAttnBackend):
 
     def __init__(self, model_runner):
         super().__init__(model_runner)
-        import moonmath_attention.mla as mla  # fail fast if not installed
+        import moonmath_amd.mla as mla  # fail fast if not installed
 
         self._mla = mla
         # The kernels take the fused-576 pool as fp8 e4m3fnuz at a per-tensor
