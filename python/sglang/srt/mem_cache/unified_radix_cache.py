@@ -82,7 +82,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory
+from sglang.srt.runtime_context import get_memory, get_observability
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -367,7 +367,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
-        self.host_memory_mode = server_args.hicache_host_memory_mode
+        self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
             # the admission-time load-back read path and is not layer-gated.
@@ -387,7 +387,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
-        self.extra_metric_labels = server_args.extra_metric_labels
+        self.extra_metric_labels = get_observability().extra_metric_labels
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
@@ -1792,13 +1792,27 @@ class UnifiedRadixCache(BasePrefixCache):
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
-    def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+    @rank_consensus(same_results=True)
+    def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
         if self.prefetch_stop_policy == "wait_complete":
             return False
         elif self.prefetch_stop_policy == "timeout":
-            return self._prefetch_timeout_check_linear_func(operation)
+            # Wall-clock time may differ among ranks, all-reduce is needed to ensure
+            # all ranks reach the same final result. Otherwise PP/TP ranks will diverge.
+            #
+            # For TP, if any rank reaches the timeout, the final result is timeout.
+            #
+            # For PP, PP0 makes the decision and other ranks follow PP0's decision.
+            should_terminate = False
+            if self.pp_rank == 0:
+                should_terminate = self._prefetch_timeout_check_linear_func(operation)
+            should_terminate_tensor = torch.tensor(
+                int(should_terminate), dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            return should_terminate_tensor.item() == 1
         else:
             return True
 
@@ -1809,18 +1823,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
 
-        # Determine whether or not we should terminate this prefetch request.  Make all
-        # ranks agree on the decision.  When running with PP, PPn will follow PP0's decision.
-        should_terminate = False
-        if self.pp_rank == 0:
-            should_terminate = operation.is_terminated() or self.can_terminate_prefetch(
-                operation
-            )
-        should_terminate_tensor = torch.tensor(
-            int(should_terminate), dtype=torch.int, device="cpu"
+        # Determine whether or not we should terminate this prefetch request.
+        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
+            operation
         )
-        self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-        should_terminate = should_terminate_tensor.item() == 1
 
         if not should_terminate:
             return False
