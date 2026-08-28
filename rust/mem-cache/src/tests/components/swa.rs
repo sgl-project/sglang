@@ -739,14 +739,14 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
             .equal(&Tensor::from_slice(&[20i64, 21, 22]))
     );
     let [
-        CacheAction::FreeDeviceKV(freed),
+        CacheAction::FreeDeviceKVFullOnly(freed),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
         },
     ] = result.cache_actions.as_slice()
     else {
-        panic!("expected FreeDeviceKV then SwaRebuild");
+        panic!("expected FreeDeviceKVFullOnly then SwaRebuild");
     };
     assert!(freed[0].equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert_eq!(*node_id, tc.arena.node(leaf).id);
@@ -833,7 +833,7 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
     let [
-        CacheAction::FreeDeviceKV(old_tail),
+        CacheAction::FreeDeviceKVFullOnly(old_tail),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
@@ -842,7 +842,7 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, SwaRebuild, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKV, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -960,7 +960,7 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
     );
     let [
         CacheAction::FreeDeviceKV(duplicates),
-        CacheAction::FreeDeviceKV(old_full),
+        CacheAction::FreeDeviceKVFullOnly(old_full),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
@@ -968,7 +968,7 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, FreeDeviceKV, SwaRebuild, got {:?}",
+            "expected FreeDeviceKV, FreeDeviceKVFullOnly, SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -1015,7 +1015,7 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
     );
     let [
         CacheAction::FreeDeviceKV(duplicates_head),
-        CacheAction::FreeDeviceKV(old_tail),
+        CacheAction::FreeDeviceKVFullOnly(old_tail),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
@@ -1024,7 +1024,7 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, FreeDeviceKV, SwaRebuild, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKV, FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKV, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -3119,7 +3119,7 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
     let [
-        CacheAction::FreeDeviceKV(old_tail),
+        CacheAction::FreeDeviceKVFullOnly(old_tail),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
@@ -3128,7 +3128,7 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
     ] = result.cache_actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV, SwaRebuild, FreeDeviceKV, got {:?}",
+            "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKV, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
@@ -4837,7 +4837,7 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     ));
     assert!(step.result.is_none());
     let [
-        CacheAction::FreeDeviceKV(old_full),
+        CacheAction::FreeDeviceKVFullOnly(old_full),
         CacheAction::SwaRebuild {
             node_id,
             source_value,
@@ -4845,7 +4845,7 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     ] = step.actions.as_slice()
     else {
         panic!(
-            "expected FreeDeviceKV then SwaRebuild, got {:?}",
+            "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
             action_kinds(&step.actions)
         );
     };

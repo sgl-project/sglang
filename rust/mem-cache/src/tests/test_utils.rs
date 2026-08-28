@@ -32,6 +32,7 @@ pub(crate) fn action_kinds(actions: &[CacheAction]) -> Vec<&'static str> {
         .iter()
         .map(|action| match action {
             CacheAction::FreeDeviceKV(_) => "FreeDeviceKV",
+            CacheAction::FreeDeviceKVFullOnly(_) => "FreeDeviceKVFullOnly",
             CacheAction::BackupKV(_) => "BackupKV",
             CacheAction::ReplaceWriteThroughOnNodeSplit { .. } => "ReplaceWriteThroughOnNodeSplit",
             CacheAction::MambaEvictExcessPathStates { .. } => "MambaEvictExcessPathStates",

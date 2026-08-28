@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     MambaEvictExcessPathStates,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
@@ -109,6 +110,8 @@ def _cache_action_from_tagged(action: tuple) -> CacheAction:
     tag = action[0]
     if tag == "free_device_kv":
         return FreeDeviceKV(indices=list(action[1]))
+    if tag == "free_device_kv_full_only":
+        return FreeDeviceKVFullOnly(indices=list(action[1]))
     if tag == "backup_kv":
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":

@@ -138,6 +138,7 @@ fn py_array_to_vec_i64(py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Vec<i
 fn cache_action_tag(action: &CacheAction) -> &'static str {
     match action {
         CacheAction::FreeDeviceKV(_) => "free_device_kv",
+        CacheAction::FreeDeviceKVFullOnly(_) => "free_device_kv_full_only",
         CacheAction::BackupKV(_) => "backup_kv",
         CacheAction::ReplaceWriteThroughOnNodeSplit { .. } => "replace_write_through_on_node_split",
         CacheAction::MambaEvictExcessPathStates { .. } => "mamba_evict_excess_path_states",
@@ -154,6 +155,10 @@ fn cache_action_to_py(py: Python<'_>, action: CacheAction) -> PyResult<Py<PyAny>
     let tag = cache_action_tag(&action);
     match action {
         CacheAction::FreeDeviceKV(tensors) => {
+            let tensors = PyList::new_bound(py, tensors.into_iter().map(PyTensor));
+            Ok((tag, tensors).into_py(py))
+        }
+        CacheAction::FreeDeviceKVFullOnly(tensors) => {
             let tensors = PyList::new_bound(py, tensors.into_iter().map(PyTensor));
             Ok((tag, tensors).into_py(py))
         }

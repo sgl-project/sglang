@@ -183,6 +183,9 @@ pub struct KvCanaryWalkResult {
 pub enum CacheAction {
     /// Duplicate device KV slices the cache frees after the insert.
     FreeDeviceKV(Vec<Tensor>),
+    /// Free the full side only, for a tombstoned node whose SWA peers are gone;
+    /// FreeDeviceKV would release the SWA side twice.
+    FreeDeviceKVFullOnly(Vec<Tensor>),
     /// A device->host backup work item (the write-through threshold fired).
     BackupKV(BackupKV),
     /// Replace the pending write-through node on a node split:
@@ -1347,7 +1350,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     fn is_deferrable_action_(action: &CacheAction) -> bool {
         matches!(
             action,
-            CacheAction::FreeDeviceKV(_) | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
+            CacheAction::FreeDeviceKV(_)
+                | CacheAction::FreeDeviceKVFullOnly(_)
+                | CacheAction::ReplaceWriteThroughOnNodeSplit { .. }
         )
     }
 

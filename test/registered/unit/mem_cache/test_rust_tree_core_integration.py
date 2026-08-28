@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     FreeComponentHostSlot,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
     SWARebuild,
@@ -999,7 +1000,7 @@ def test_swa_straddling_insert_crosses_the_boundary_actions():
         ),
     )
     free_tail, rebuild, free_duplicates = result.cache_actions
-    assert isinstance(free_tail, FreeDeviceKV)
+    assert isinstance(free_tail, FreeDeviceKVFullOnly)
     assert free_tail.indices[0].tolist() == [12, 13]
     assert isinstance(rebuild, SWARebuild)
     assert rebuild.source_value.tolist() == [22, 23]

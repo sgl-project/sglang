@@ -416,7 +416,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             }
             let old_full = node.take_device_value(FULL);
             node.set_device_value(FULL, value_slice.copy());
-            cache_actions.push(CacheAction::FreeDeviceKV(vec![old_full]));
+            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
             cache_actions.push(CacheAction::SwaRebuild {
                 node_id: node.id,
                 source_value: value_slice,
@@ -447,7 +447,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let node = tree_core.arena.node_mut(node_id);
             let _ = node.take_device_value(FULL);
             node.set_device_value(FULL, new_full.copy());
-            cache_actions.push(CacheAction::FreeDeviceKV(vec![old_full]));
+            cache_actions.push(CacheAction::FreeDeviceKVFullOnly(vec![old_full]));
             cache_actions.push(CacheAction::SwaRebuild {
                 node_id: node_ext_id,
                 source_value: new_full,

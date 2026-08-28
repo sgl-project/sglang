@@ -7459,6 +7459,31 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
 
+    def test_swa_tombstone_recovery_frees_full_only(self):
+        sw = self.cfg.sliding_window_size
+        cache, allocator, _ = build_fixture(self.cfg)
+        seq = list(range(1, 2 * sw + 1))
+        key = RadixKey(array("q", seq))
+        cache.insert(
+            InsertParams(
+                key=key, value=self._alloc(allocator, len(seq)), swa_evicted_seqlen=sw
+            )
+        )
+        value = self._alloc(allocator, len(seq))
+        full_available = allocator.full_attn_allocator.available_size()
+        swa_available = allocator.swa_attn_allocator.available_size()
+        cache.insert(InsertParams(key=key, value=value, swa_evicted_seqlen=0))
+
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_available + len(seq),
+        )
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size(),
+            swa_available + sw,
+        )
+        cache.sanity_check()
+
     def test_swa_recovery_keeps_recovered_node_below_window_nodes(self):
         """A tombstone recovered during the walk lands below the in-window path
         in the SWA LRU, so eviction takes the recovered span first."""
