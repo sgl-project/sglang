@@ -3137,15 +3137,10 @@ def kill_itself_when_parent_died():
 def ignore_external_stop_signals():
     """Make a worker subprocess ignore SIGINT and SIGTERM.
 
-    Server shutdown is coordinated by the tokenizer manager: on a stop signal it
-    drains in-flight requests, then explicitly stops the workers (ShutdownReq,
-    then SIGKILL via kill_process_tree). Terminal Ctrl-C and some supervisors or
-    platforms (for example Modal and ``tini -g``) deliver stop signals to the
-    whole process group, which would otherwise kill workers mid-forward at signal
-    time and sever every in-flight request before the drain can run. Plain
-    Kubernetes and Docker stops target the container's main process instead.
-    SIGKILL and SIGQUIT are unaffected, so hard kills and crash cleanup still
-    work.
+    Shutdown is owned by the tokenizer manager (drain, then ShutdownReq, then
+    SIGKILL via kill_process_tree); stop signals delivered to the whole process
+    group must not kill workers mid-forward before the drain runs. SIGKILL and
+    SIGQUIT are unaffected.
     """
     if sys.platform == "win32":
         return

@@ -5015,8 +5015,6 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
-    # Shutdown is coordinated by the tokenizer manager (drain, then ShutdownReq /
-    # SIGKILL); group-delivered SIGINT/SIGTERM must not kill this rank mid-forward.
     ignore_external_stop_signals()
 
     # Load plugins so hooks can override Scheduler and its dependencies.

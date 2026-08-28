@@ -573,8 +573,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
-        # Set by a repeated stop signal during drain: skip waiting for in-flight
-        # requests and shut down immediately.
+        # Set by a repeated stop signal during drain: abandon in-flight requests.
         self.drain_force_exit = False
         self.last_receive_tstamp = real_time()
 
@@ -2196,10 +2195,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             loop.add_signal_handler(
                 signal.SIGTERM, signal_handler.sigterm_handler, signal.SIGTERM
             )
-            # SIGINT must take the same graceful-drain path. Left unhandled, it
-            # reaches the HTTP server's default handler (uvicorn installs one),
-            # which begins shutting the server down at signal time and severs
-            # every in-flight streaming response before the drain can run.
+            # SIGINT takes the same drain path; otherwise uvicorn's default
+            # handler shuts the server down at signal time, before the drain.
             loop.add_signal_handler(
                 signal.SIGINT, signal_handler.sigterm_handler, signal.SIGINT
             )
@@ -3131,11 +3128,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
 
-        # Optional upper bound on how long the drain may wait for in-flight
-        # requests. Unset or <= 0 means wait until they all finish (the
-        # orchestrator's SIGKILL is then the only backstop). The environ
-        # registry warns and falls back to the default on unparsable values,
-        # so a bad setting cannot kill this watchdog mid-drain.
+        # Unset or <= 0 waits indefinitely; the orchestrator's SIGKILL is then
+        # the only backstop.
         drain_timeout_s = envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.get()
         drain_deadline = (
             time.monotonic() + drain_timeout_s if drain_timeout_s > 0 else None
@@ -3668,25 +3662,17 @@ class SignalHandler:
     def sigterm_handler(self, signum=None, frame=None):
         if self.tokenizer_manager.gracefully_exit:
             if signum is not None and signum in self._stop_signums_seen:
-                # The SAME signal arriving again is the operator insisting
-                # (e.g. Ctrl-C pressed twice). Stop waiting for in-flight
-                # requests and exit now.
+                # A repeated signal is the operator insisting: exit now.
                 logger.error(
                     f"Repeated stop signal received during graceful drain. "
                     f"{signum=}. Force exiting."
                 )
                 self.tokenizer_manager.drain_force_exit = True
             else:
-                # Orchestrators deliver one stop event as a bundle of DISTINCT
-                # signals (e.g. Modal sends SIGTERM and SIGINT together); a
-                # signal not seen yet joins the stop event already draining.
-                # This is identity-based on purpose, with no time window:
-                # escalation is expressed by REPEATING a signal (Ctrl-C twice,
-                # `kill -TERM` twice), which is what interactive users and
-                # supervisors actually do, while a first-time signal of a new
-                # kind carries the same "stop" intent as the drain already in
-                # progress. A clock-based window would misread signal bundles
-                # under scheduler jitter.
+                # One stop event can arrive as a bundle of distinct signals
+                # (e.g. SIGTERM and SIGINT together), so deduplication is by
+                # signal identity, not a time window; escalation is expressed
+                # by repeating a signal.
                 if signum is not None:
                     self._stop_signums_seen.add(signum)
                 logger.info(
