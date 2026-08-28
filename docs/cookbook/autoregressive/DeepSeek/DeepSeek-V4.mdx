@@ -350,7 +350,7 @@ export SGLANG_MORI_DISPATCH_DTYPE=mxfp8
 export SGLANG_MORI_RECV_BOUND=1
 
 sglang serve \
-  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --model-path {MODEL_PATH} \
   --tp 8 --dp 8 --enable-dp-attention \
   --ep-size 8 --moe-a2a-backend mori --deepep-mode normal \
   <other args from the Deploy panel>
