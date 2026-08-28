@@ -49,8 +49,8 @@ if TYPE_CHECKING:
     from sglang.srt.rust_extensions._server import (
         MmSpec,
         Server,
-        ServerArgs as RustServerArgs,
     )
+    from sglang.srt.rust_extensions._server import ServerArgs as RustServerArgs
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
