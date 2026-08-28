@@ -177,6 +177,7 @@ class WeightUpdater:
         )
 
         target_device = torch.device(self.device)
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
@@ -184,6 +185,7 @@ class WeightUpdater:
         loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
+            self.model_config.model_path = original_model_path
             return False, message
 
         def get_weight_iter(config):
@@ -206,6 +208,7 @@ class WeightUpdater:
                 iter = get_weight_iter(self.model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
+                self.model_config.model_path = original_model_path
                 return False, message
             try:
                 model = model_load_weights(self.get_model(), iter)
@@ -215,8 +218,19 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                # Roll back from the original checkpoint, not the one that
+                # just failed, and keep model_config pointing at it.
+                self.model_config.model_path = original_model_path
+                try:
+                    iter = get_weight_iter(self.model_config)
+                    model_load_weights(self.get_model(), iter)
+                except Exception as rollback_error:
+                    return False, (
+                        f"{message}\nRollback from the original checkpoint "
+                        f"also failed: {rollback_error}. Weights may be "
+                        f"inconsistent; run a full update_weights_from_disk "
+                        f"to recover."
+                    )
                 return False, message
 
         self.update_model_fields(
@@ -309,7 +323,14 @@ class WeightUpdater:
                         f"failed: {rollback_error}. Weights may be inconsistent; "
                         f"run a full update_weights_from_disk to recover."
                     )
-                return False, f"{message}\nRolled back to original weights."
+                # Rollback post-processing can replace storage just like the
+                # success path, so it gets the same staleness check.
+                rollback_note = self._storage_change_note(
+                    manifest, model, recapture_cuda_graph
+                )
+                return False, (
+                    f"{message}\nRolled back to original weights.{rollback_note}"
+                )
 
             if not seen_names:
                 if model_runner.is_draft_worker:
@@ -326,29 +347,35 @@ class WeightUpdater:
             f"Succeeded to partially update {len(seen_names)} weights "
             f"across {len(touched)} modules."
         )
-
-        changed_names = manifest.changed_names(model)
-        if changed_names:
-            recaptured = self._maybe_recapture_cuda_graph(recapture_cuda_graph)
-            if recaptured:
-                message += (
-                    f" Graph-visible storage changed for {len(changed_names)} "
-                    f"tensors; CUDA graphs recaptured."
-                )
-            else:
-                storage_warning = (
-                    f"Graph-visible storage changed for {len(changed_names)} "
-                    f"tensors (e.g. {list(changed_names[:3])}); CUDA graphs may "
-                    f"serve stale weights until recaptured. Pass "
-                    f"recapture_cuda_graph=True or restart the server."
-                )
-                logger.error(storage_warning)
-                message += f" WARNING: {storage_warning}"
-        else:
-            self._maybe_recapture_cuda_graph(recapture_cuda_graph)
+        message += self._storage_change_note(manifest, model, recapture_cuda_graph)
 
         logger.info("Partial weight update end.")
         return True, message
+
+    def _storage_change_note(
+        self: WeightUpdater,
+        manifest: ModelStorageManifest,
+        model,
+        recapture_cuda_graph: bool,
+    ) -> str:
+        """The CUDA-graph staleness note for a weight update, or ""."""
+        changed_names = manifest.changed_names(model)
+        if not changed_names:
+            self._maybe_recapture_cuda_graph(recapture_cuda_graph)
+            return ""
+        if self._maybe_recapture_cuda_graph(recapture_cuda_graph):
+            return (
+                f" Graph-visible storage changed for {len(changed_names)} "
+                f"tensors; CUDA graphs recaptured."
+            )
+        storage_warning = (
+            f"Graph-visible storage changed for {len(changed_names)} "
+            f"tensors (e.g. {list(changed_names[:3])}); CUDA graphs may "
+            f"serve stale weights until recaptured. Pass "
+            f"recapture_cuda_graph=True or restart the server."
+        )
+        logger.error(storage_warning)
+        return f" WARNING: {storage_warning}"
 
     def _maybe_recapture_cuda_graph(self: WeightUpdater, requested: bool) -> bool:
         if requested and (

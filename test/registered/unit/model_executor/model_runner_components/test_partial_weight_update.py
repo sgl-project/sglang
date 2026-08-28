@@ -1,9 +1,9 @@
 """Unit tests for srt/model_executor/model_runner_components/partial_weight_update.
 
 Critical-path bookkeeping of partial weight updates: which modules a load
-touched (and therefore which get re-post-processed), whether wrapped weight
-loaders are restored exactly, and which checkpoint tensors a prefix filter
-admits.
+touched (and therefore which get re-post-processed), that recording sees
+every load style without touching weight_loader attributes, and which
+checkpoint tensors a prefix filter admits.
 """
 
 import unittest
@@ -33,35 +33,65 @@ class _TwoLinearModel(nn.Module):
         self.second = nn.Linear(2, 2, bias=False)
 
 
-def _load(param, weight):
-    getattr(param, "weight_loader", default_weight_loader)(param, weight)
-
-
 class TestModuleTouchRecorder(CustomTestCase):
     def test_load_marks_only_touched_module(self):
         model = _TwoLinearModel()
         weight = torch.full((2, 2), 7.0)
 
         with ModuleTouchRecorder(model) as recorder:
-            _load(model.first.weight, weight)
+            default_weight_loader(model.first.weight, weight)
 
         touched = recorder.touched_modules()
         self.assertEqual([name for name, _ in touched], ["first"])
         self.assertIs(touched[0][1], model.first)
         self.assertTrue(torch.equal(model.first.weight, weight))
 
-    def test_loaders_are_restored_after_context(self):
+    def test_weight_loader_identity_is_preserved(self):
+        """Model code branches on `weight_loader is default_weight_loader`
+        (e.g. fused-expert loaders), so recording must not install or
+        replace weight_loader attributes."""
         model = _TwoLinearModel()
-        sentinel = object()
-        model.second.weight.weight_loader = sentinel
 
         with ModuleTouchRecorder(model):
-            self.assertNotIn(model.first.weight.weight_loader, (None, sentinel))
+            loader = getattr(model.first.weight, "weight_loader", default_weight_loader)
+            self.assertIs(loader, default_weight_loader)
+            loader(model.first.weight, torch.ones(2, 2))
 
         self.assertNotIn("weight_loader", model.first.weight.__dict__)
-        self.assertIs(model.second.weight.weight_loader, sentinel)
 
-    def test_property_backed_parameter_is_wrapped_and_restored(self):
+    def test_raw_data_copy_bypassing_loaders_is_recorded(self):
+        """Loads that never go through param.weight_loader (module-level
+        helpers, raw .data writes) must still mark the module, or its
+        quantization post-processing is silently skipped."""
+        model = _TwoLinearModel()
+
+        with ModuleTouchRecorder(model) as recorder:
+            model.second.weight.data.copy_(torch.ones(2, 2))
+
+        self.assertEqual([name for name, _ in recorder.touched_modules()], ["second"])
+
+    def test_sharded_view_and_fill_writes_are_recorded(self):
+        model = _TwoLinearModel()
+
+        with ModuleTouchRecorder(model) as recorder:
+            model.first.weight.data.narrow(0, 0, 1).copy_(torch.ones(1, 2))
+            model.second.weight.data.fill_(0)
+
+        self.assertEqual(
+            sorted(name for name, _ in recorder.touched_modules()),
+            ["first", "second"],
+        )
+
+    def test_non_parameter_writes_are_not_recorded(self):
+        model = _TwoLinearModel()
+        staging = torch.zeros(2, 2)
+
+        with ModuleTouchRecorder(model) as recorder:
+            staging.copy_(torch.ones(2, 2))
+
+        self.assertEqual(recorder.touched_modules(), [])
+
+    def test_property_backed_parameter_loader_is_recorded_untouched(self):
         loads = []
 
         def custom_loader(param, weight):
@@ -77,10 +107,9 @@ class TestModuleTouchRecorder(CustomTestCase):
         model = nn.Module()
         model.proj = nn.Module()
         model.proj.register_parameter("weight", param)
-        weight = torch.ones(2, 2)
 
         with ModuleTouchRecorder(model) as recorder:
-            param.weight_loader(param, weight)
+            param.weight_loader(param, torch.ones(2, 2))
 
         self.assertEqual([name for name, _ in recorder.touched_modules()], ["proj"])
         self.assertEqual(len(loads), 1)
@@ -91,9 +120,9 @@ class TestModuleTouchRecorder(CustomTestCase):
         recorder = ModuleTouchRecorder(model)
 
         with recorder:
-            _load(model.first.weight, torch.ones(2, 2))
+            default_weight_loader(model.first.weight, torch.ones(2, 2))
         with recorder:
-            _load(model.second.weight, torch.ones(2, 2))
+            default_weight_loader(model.second.weight, torch.ones(2, 2))
 
         self.assertEqual(
             sorted(name for name, _ in recorder.touched_modules()),

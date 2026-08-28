@@ -116,7 +116,13 @@ class SchedulerWeightUpdaterManager:
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
             if success and self.draft_worker is not None:
-                success, message = self.draft_worker.update_weights_from_disk(recv_req)
+                # Keep the target's message on draft success: it may carry a
+                # CUDA-graph staleness warning the draft's would drop.
+                success, draft_message = self.draft_worker.update_weights_from_disk(
+                    recv_req
+                )
+                if not success:
+                    message = draft_message
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
             if success:
