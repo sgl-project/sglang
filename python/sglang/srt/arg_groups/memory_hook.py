@@ -47,7 +47,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         generate_decode_cuda_graph_batch_sizes,
         generate_prefill_cuda_graph_batch_sizes,
     )
-    from sglang.srt.arg_groups.overrides import use_mla_backend
+    from sglang.srt.arg_groups.overrides import model_config_of, use_mla_backend
 
     cfg = resolving_view(server_args)
     # A copy, so an earlier declaration keeps the value it recorded.
@@ -255,7 +255,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         # so we adjust the mem_fraction_static accordingly. The VLM encoder
         # only runs on the prefill stage, so PD decode engines do not need
         # this headroom; prefill engines and normal (non-PD) engines do.
-        model_config = server_args.get_model_config()
+        model_config = model_config_of(server_args)
         if (
             model_config.is_multimodal
             and not cfg.language_only

@@ -34,7 +34,11 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_specific_adjustments(server_args: Any):
-    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+    from sglang.srt.arg_groups.overrides import (
+        attention_backends_of,
+        model_config_of,
+        use_mla_backend,
+    )
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -59,7 +63,7 @@ def handle_model_specific_adjustments(server_args: Any):
         # key them on.
         return
 
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
@@ -599,6 +603,7 @@ def handle_model_capability_adjustments(server_args: Any):
     from sglang.srt.arg_groups.kv_cache_hook import (
         validate_prefill_only_disable_kv_cache_args,
     )
+    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
@@ -608,7 +613,7 @@ def handle_model_capability_adjustments(server_args: Any):
         run_post_process_pass,
     )
 
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
 
     # HRM-Text needs bidirectional prompt attention (prefill), which only
@@ -849,6 +854,8 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
 
 
 def handle_language_model_only(server_args: Any):
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:
         return
@@ -869,7 +876,7 @@ def handle_language_model_only(server_args: Any):
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = server_args.get_model_config().hf_config.architectures
+    architectures = model_config_of(server_args).hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):

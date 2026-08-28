@@ -88,6 +88,8 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     if not cfg.enable_hisparse:
         return
@@ -97,7 +99,7 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         is_deepseek_v4,
     )
 
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = _is_hip()
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (

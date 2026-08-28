@@ -337,11 +337,12 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
 
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
+    from sglang.srt.arg_groups.overrides import model_config_of
     from sglang.srt.speculative.dspark_components.dspark_config import (
         checkpoint_bundles_dspark_draft,
     )
 
-    return checkpoint_bundles_dspark_draft(server_args.get_model_config().hf_config)
+    return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
@@ -662,6 +663,8 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.arg_groups.overrides import (
         attention_backends_of,
@@ -706,7 +709,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "eagle speculative decoding."
         )
 
-    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

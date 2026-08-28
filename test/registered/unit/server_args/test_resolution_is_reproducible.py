@@ -36,7 +36,7 @@ import unittest.mock
 import torch
 
 import sglang
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import model_config_of, resolution_result
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda
@@ -826,10 +826,10 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
     def test_the_copy_carries_what_resolution_left_on_the_record(self):
         """Not just the stash and the flag.
 
-        `get_model_config()` memoizes on the record, and that cache is filled
+        `model_config_of()` memoizes on the record, and that cache is filled
         during resolution. A copy that is marked resolved but arrives without it
         cannot fill it -- the read-only guard refuses the cache write -- so the
-        first `get_model_config()` raises. That is what killed the Ray
+        first `model_config_of()` raises. That is what killed the Ray
         schedulers, and it is why the carry is enumerated from the instance
         rather than from a list of names.
         """
@@ -846,7 +846,7 @@ class TestACopyStaysResolved(_RestoresProcessState, CustomTestCase):
             [],
             f"the copy did not carry what resolution left on the record: {missing}",
         )
-        self.assertIsNotNone(copy_.get_model_config())
+        self.assertIsNotNone(model_config_of(copy_))
         # Containers are copied, so the copy's declaration stays with it.
         self.assertEqual(
             len(parent._resolved_overrides) + 1, len(copy_._resolved_overrides)

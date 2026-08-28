@@ -1812,7 +1812,9 @@ def attention_backends() -> tuple:
 
 def process_model_config():
     """The process's ``ModelConfig`` (built once from the published config)."""
-    return get_server_args().get_model_config()
+    from sglang.srt.arg_groups.overrides import model_config_of
+
+    return model_config_of(get_server_args())
 
 
 def cutedsl_moe_max_num_tokens() -> int:

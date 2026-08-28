@@ -24,6 +24,8 @@ def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
     # the compatibility asserts and fusion writes stay below.
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.arg_groups.overrides import (
         _moe_runner_backend_quant_constraints,
@@ -50,7 +52,7 @@ def handle_moe_kernel_config(server_args: Any):
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
         assert (
             view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
-            or server_args.get_model_config().nvfp4_moe_meta is not None
+            or model_config_of(server_args).nvfp4_moe_meta is not None
         ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
         assert view.ep_size in [
             1,
@@ -116,6 +118,8 @@ def handle_a2a_moe(server_args: Any):
     # the resolution pipeline (arg_groups/overrides.py:
     # _a2a_backend_overrides / _a2a_ep_size); the per-backend logs,
     # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.arg_groups.overrides import (
         _a2a_backend_overrides,
@@ -259,7 +263,7 @@ def handle_a2a_moe(server_args: Any):
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
         if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
             resolved_view(server_args).quantization == "modelopt_fp4"
-            or server_args.get_model_config().nvfp4_moe_meta is not None
+            or model_config_of(server_args).nvfp4_moe_meta is not None
         ):
             envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
             logger.warning(
@@ -413,6 +417,8 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
     """Allow DeepEP v2 only where its model workflow is validated."""
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     if (
         parse_connector_type(resolved_view(server_args).model_path)
         == ConnectorType.INSTANCE
@@ -424,7 +430,7 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         )
 
     architectures = (
-        getattr(server_args.get_model_config().hf_config, "architectures", None) or []
+        getattr(model_config_of(server_args).hf_config, "architectures", None) or []
     )
 
     architecture = architectures[0] if architectures else None

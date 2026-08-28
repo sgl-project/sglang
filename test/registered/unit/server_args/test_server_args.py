@@ -825,9 +825,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         defaults.update(kw)
         view = ResolvedView(
-            SimpleNamespace(
-                get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-            )
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
@@ -969,7 +967,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.prefill_attention_backend = prefill
         args.decode_attention_backend = decode
         args.page_size = page_size
-        # Short-circuit get_model_config(): the fa4 page_size branch only needs
+        # Short-circuit model_config_of(): the fa4 page_size branch only needs
         # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
@@ -1678,7 +1676,7 @@ class TestAdaptiveSpecArgs(CustomTestCase):
             args.speculative_adaptive = True
             args.speculative_adaptive_config = f.name
             args.device = "cuda"
-            args.get_model_config = lambda: SimpleNamespace(
+            args._model_config = SimpleNamespace(
                 hf_config=SimpleNamespace(
                     architectures=["LlamaForCausalLM"],
                     get_text_config=lambda: SimpleNamespace(),

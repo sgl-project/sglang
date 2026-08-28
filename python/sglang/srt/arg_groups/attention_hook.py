@@ -29,10 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 def handle_attention_backend_compatibility(server_args: Any):
-    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+    from sglang.srt.arg_groups.overrides import (
+        attention_backends_of,
+        model_config_of,
+        use_mla_backend,
+    )
 
     cfg = resolving_view(server_args)
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
 
     # The attention_backend write clusters of this handler moved to the
     # resolution pipeline (arg_groups/overrides.py), each invoked below at
@@ -501,6 +505,7 @@ def handle_multi_item_scoring(server_args: Any):
 
 
 def handle_deterministic_inference(server_args: Any):
+    from sglang.srt.arg_groups.overrides import model_config_of
     from sglang.srt.server_args import (
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
@@ -553,7 +558,7 @@ def handle_deterministic_inference(server_args: Any):
         is_deepseek_model = False
         if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
             try:
-                hf_config = server_args.get_model_config().hf_config
+                hf_config = model_config_of(server_args).hf_config
                 model_arch = hf_config.architectures[0]
                 is_deepseek_model = model_arch in [
                     "DeepseekV2ForCausalLM",

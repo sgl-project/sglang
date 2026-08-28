@@ -184,10 +184,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.disable_radix_cache = False
         args.chunked_prefill_size = 2048
 
-        with (
-            patch.object(args, "get_model_config", return_value=args._model_config),
-            patch("sglang.srt.arg_groups.model_hook.is_cuda", return_value=True),
-        ):
+        with (patch("sglang.srt.arg_groups.model_hook.is_cuda", return_value=True),):
             handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "disable_radix_cache"))
@@ -214,7 +211,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )
 
-        with patch.object(args, "get_model_config", return_value=args._model_config):
+        if True:  # the record already carries the seeded configuration
             handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "is_embedding"))
