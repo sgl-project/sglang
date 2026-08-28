@@ -163,9 +163,12 @@ class SchedulerDllmMixin:
 
     def _fetch_waiting_reqs(self: Scheduler):
         # Calculate how many requests can be added to DLLM manager
-        max_dllm_capacity = self.dllm_config.max_running_requests - len(
-            self.dllm_manager.waiting_queue
+        max_running_reqs = (
+            self.max_running_requests
+            if self.dllm_config.needs_full_prefill
+            else self.dllm_config.max_running_requests
         )
+        max_dllm_capacity = max_running_reqs - len(self.dllm_manager.waiting_queue)
         num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
 
         if num_requests_to_add > 0:
