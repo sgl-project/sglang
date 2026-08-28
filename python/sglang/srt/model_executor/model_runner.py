@@ -223,6 +223,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -430,6 +431,12 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
+        # Events the publishers record into the mailbox above. Depth 2: the
+        # barrier drains the mailbox once per step, so at most one record can
+        # still be awaited when a slot comes around again.
+        self.shared_read_done_events = ReusableEventRing(
+            torch.get_device_module(self.device).Event, depth=2
+        )
 
         # CPU offload
         set_offloader(create_offloader(dp_rank=self.ps.dp_rank))

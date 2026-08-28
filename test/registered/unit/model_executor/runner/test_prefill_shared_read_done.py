@@ -13,6 +13,7 @@ from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -35,6 +36,9 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
         spec_algorithm=spec_algorithm,
         attn_backend=attn_backend,
         shared_read_done_event=None,
+        # The publisher draws its event from the ring that sits next to the
+        # mailbox it writes, so the fake runner carries both.
+        shared_read_done_events=ReusableEventRing(_Event, depth=2),
     )
 
 
