@@ -57,7 +57,7 @@ class TestDeepEpDeepseekV32(GSM8KAscendMixin, TestMMLU, CustomTestCase):
 
     # MMLU Configs
     mmlu_num_examples = 128
-    accuracy_mmlu_threshold = 0.85  # MMLU accuracy ≥0.85
+    accuracy_mmlu = 0.85  # MMLU accuracy ≥0.85
 
     # GSM8K Configs
     accuracy = 0.95  # GSM8K accuracy ≥0.95
