@@ -203,11 +203,11 @@ class KVReshardRuntime:
             )
         if getattr(self.kv_args, "kv_cache_layout", "nhd").lower() != "nhd":
             raise KVReshardCompatibilityError(
-                "Mooncake KV reshard V1 supports only NHD KV cache layout"
+                "Mooncake KV reshard supports only NHD KV cache layout"
             )
         if getattr(self.kv_args, "kv_is_quantized", False):
             raise KVReshardCompatibilityError(
-                "Mooncake KV reshard V1 does not support quantized KV caches"
+                "Mooncake KV reshard does not support quantized KV caches"
             )
         if not self.dtype:
             raise KVReshardCompatibilityError("KV storage dtype is unavailable")
@@ -215,12 +215,11 @@ class KVReshardRuntime:
             raise KVReshardCompatibilityError("KV layer IDs exceed the model layers")
         if len(self.kv_args.kv_data_ptrs) != 2 * len(self.layer_ids):
             raise KVReshardCompatibilityError(
-                "Draft or non-layer-indexed KV buffers are not supported in V1"
+                "Draft or non-layer-indexed KV buffers are not supported"
             )
 
     def bind_runtime(self, *, session_id: str, transfer_engine: Any) -> None:
         from mooncake.reshard.contracts import (
-            LeaseId,
             RuntimeFragmentId,
             RuntimeInstanceId,
         )
@@ -281,8 +280,6 @@ class KVReshardRuntime:
             placement_id=placement.placement_id,
             placement_digest=placement.digest,
             instance_id=RuntimeInstanceId(f"{self.participant_id}:{session_id}"),
-            generation=0,
-            lease_id=LeaseId(f"static:{self.participant_id}:{session_id}"),
             revision=self.revision,
             participant_id=self.participant_id,
             buffers=tuple(buffers),

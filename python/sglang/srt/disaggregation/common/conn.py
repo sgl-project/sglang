@@ -210,12 +210,12 @@ class CommonKVManager(BaseKVManager):
                 or bool(self.kv_args.state_types)
             ):
                 raise RuntimeError(
-                    "Mooncake KV reshard V1 supports only non-hybrid MHA/GQA "
+                    "Mooncake KV reshard supports only non-hybrid MHA/GQA "
                     "with DP=CP=DCP=1 and no auxiliary state pools"
                 )
             if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
                 raise RuntimeError(
-                    "Mooncake KV reshard V1 is mutually exclusive with staging"
+                    "Mooncake KV reshard is mutually exclusive with staging"
                 )
             from sglang.srt.disaggregation.mooncake.kv_reshard import (
                 KVReshardRuntime,
