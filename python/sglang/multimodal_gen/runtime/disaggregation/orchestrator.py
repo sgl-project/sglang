@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     is_transfer_message,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.multimodal_gen.runtime.utils.common import safe_runtime_pickle_loads
 
 logger = logging.getLogger(__name__)
 
@@ -340,8 +341,8 @@ class DiffusionServer:
         payload = parts[-1]
 
         try:
-            reqs = pickle.loads(payload)
-        except (pickle.UnpicklingError, EOFError):
+            reqs = safe_runtime_pickle_loads(payload)
+        except (pickle.UnpicklingError, EOFError, RuntimeError):
             logger.warning("DiffusionServer: failed to deserialize request")
             return
 
