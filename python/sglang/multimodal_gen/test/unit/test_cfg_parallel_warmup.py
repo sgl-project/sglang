@@ -883,6 +883,33 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
+    def test_server_based_warmup_keeps_image_input_count(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.enable_torch_compile = False
+        server_args.pipeline_config.task_type = ModelTaskType.TI2I
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=SamplingParams(
+                width=512,
+                height=512,
+                image_path=["first.png", "second.png"],
+            ),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(
+            reqs[0].image_path,
+            ["/tmp/warmup.png", "/tmp/warmup.png"],
+        )
+
     def test_server_based_warmup_keeps_required_image_input(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1

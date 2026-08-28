@@ -123,19 +123,57 @@ class TestServerManagerReadiness(unittest.TestCase):
                 num_frames=None,
                 fps=None,
                 seconds=1,
+                num_outputs_per_prompt=1,
+                image_path=None,
                 extras={"num_inference_steps": 35},
             ),
         )
 
-        self.assertEqual(
-            _case_warmup_sampling_params(case),
-            {
-                "width": 832,
-                "height": 480,
-                "num_frames": 1,
-                "num_inference_steps": 35,
-            },
+        with mock.patch(
+            "sglang.multimodal_gen.test.server.test_server_common."
+            "get_sampling_param_field_names_for_server_args",
+            return_value=frozenset({"num_inference_steps"}),
+        ):
+            self.assertEqual(
+                _case_warmup_sampling_params(case),
+                {
+                    "width": 832,
+                    "height": 480,
+                    "num_frames": 1,
+                    "num_inference_steps": 35,
+                },
+            )
+
+    def test_image_case_warmup_keeps_explicit_frames_and_inputs(self):
+        case = SimpleNamespace(
+            server_args=SimpleNamespace(modality="image"),
+            sampling_params=SimpleNamespace(
+                output_size="1024x1024",
+                num_frames=4,
+                fps=None,
+                seconds=1,
+                num_outputs_per_prompt=2,
+                image_path=["first.png", "second.png"],
+                extras={"enable_upscaling": True, "test_only": "ignored"},
+            ),
         )
+
+        with mock.patch(
+            "sglang.multimodal_gen.test.server.test_server_common."
+            "get_sampling_param_field_names_for_server_args",
+            return_value=frozenset({"enable_upscaling"}),
+        ):
+            self.assertEqual(
+                _case_warmup_sampling_params(case),
+                {
+                    "width": 1024,
+                    "height": 1024,
+                    "num_frames": 4,
+                    "num_outputs_per_prompt": 2,
+                    "image_path": ["warmup", "warmup"],
+                    "enable_upscaling": True,
+                },
+            )
 
     def test_video_case_warmup_matches_endpoint_default_fps(self):
         case = SimpleNamespace(
@@ -145,14 +183,21 @@ class TestServerManagerReadiness(unittest.TestCase):
                 num_frames=None,
                 fps=None,
                 seconds=2,
+                num_outputs_per_prompt=1,
+                image_path=None,
                 extras={},
             ),
         )
 
-        self.assertEqual(
-            _case_warmup_sampling_params(case),
-            {"num_frames": 48},
-        )
+        with mock.patch(
+            "sglang.multimodal_gen.test.server.test_server_common."
+            "get_sampling_param_field_names_for_server_args",
+            return_value=frozenset(),
+        ):
+            self.assertEqual(
+                _case_warmup_sampling_params(case),
+                {"num_frames": 48},
+            )
 
     def test_waits_for_health_after_http_startup(self):
         manager = ServerManager("test-model", port=11000, wait_deadline=1)
