@@ -2617,12 +2617,30 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
+            # Whether the paged asm prefill kernel can serve this layer on this
+            # batch. Both the gather branch below and the paged branch at the
+            # end of this method key off it, so the two stay mutually exclusive
+            # by construction: one flag, read twice, cannot drift out of sync
+            # the way two copies of the same condition would.
+            paged_asm_available = (
+                self.forward_metadata.paged_kv_view is not None
+                and _paged_prefill_asm_supports_gqa(
+                    layer.tp_q_head_num, layer.tp_k_head_num
+                )
+            )
+
             # Context-chunk prefill (extend batches WITH a prefix) via the
             # gfx950 ASM fp8 varlen fmha. The ck_tile paged batch_prefill runs
             # at ~15% FP8 MFU at these shapes while the ASM kernel is ~3.5x
             # faster; gathering the paged fp8 KV into a contiguous varlen
             # buffer costs only ~20 us per layer at 70k context. The no-prefix
             # first chunk already takes the ASM branch below.
+            #
+            # Yields to the paged asm kernel when there is one, since that reads
+            # the cache in place and does the same attention with no gather at
+            # all. This is not a blanket disable: on any batch or layer that
+            # kernel cannot serve, the flag is False and this branch runs
+            # exactly as it does today.
             if (
                 is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
@@ -2636,6 +2654,7 @@ class AiterAttnBackend(AttentionBackend):
                 and self.kv_cache_dtype == fp8_dtype
                 and not self.kv_cache_is_vectorized_5d
                 and self.forward_metadata.max_kv_len is not None
+                and not paged_asm_available
             ):
                 bs = forward_batch.batch_size
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -2794,7 +2813,7 @@ class AiterAttnBackend(AttentionBackend):
 
             kv_indptr_arg = self.forward_metadata.kv_indptr[:bs0]
             if (
-                self.forward_metadata.paged_kv_view is not None
+                paged_asm_available
                 and page_table is self.forward_metadata.kv_indices
                 and window_size == (-1, -1)
                 and sinks is None
@@ -2802,9 +2821,6 @@ class AiterAttnBackend(AttentionBackend):
                 and layer.qk_head_dim == 256
                 and layer.v_head_dim == 256
                 and self.kv_cache_dtype == fp8_dtype
-                and _paged_prefill_asm_supports_gqa(
-                    layer.tp_q_head_num, layer.tp_k_head_num
-                )
             ):
                 # These must match aiter's asm guard: there is no CK arm for 4D
                 # LINEAR page-64 fp8 hd256, so a shape the guard rejects raises
