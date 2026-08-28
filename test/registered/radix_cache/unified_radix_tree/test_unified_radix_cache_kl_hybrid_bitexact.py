@@ -42,7 +42,6 @@ import os
 import random
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     make_mamba_decode_assert,
@@ -67,6 +66,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
@@ -158,7 +158,7 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(
@@ -270,7 +270,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_multiturn_decode_cache_hit_branching(self):
         groups, branches = 3, 3
@@ -307,21 +307,14 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
     from the verify path. #29792 was a wrong-slot pick in the non-spec save;
     nothing exercises the spec-side save today.
 
-    Two settings are load-bearing rather than incidental:
+    `--speculative-num-steps 2` is load-bearing rather than incidental: it
+    matches the two MTP heads this checkpoint ships, and a third step has no
+    weights and the draft head refuses to start.
 
-    `--speculative-num-steps 2` matches the two MTP heads this checkpoint
-    ships; a third step has no weights and the draft head refuses to start.
-
-    `SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0` is required for the exact bar. The
-    sheared relative-bias path shears on `max_seqlen_q`, so a verify pass
-    (several queries) lands the same absolute (q, k) pair on a different tile
-    than a prefill pass and one output element differs. Measured on this
-    checkpoint: with the sheared path on, 12 of 16 tokens diverge from the
-    first token past a tile boundary, up to 8.1e-03; with it off, every token
-    reads exactly 0. Tracked in
-    https://github.com/sgl-project/sglang/issues/34899 -- when the shear is
-    made query-count invariant this override should be dropped, and this class
-    is what will prove it.
+    Reaching the exact bar also needs the sheared relative-bias path out of the
+    way, since its bias tile geometry follows the query count. Deterministic
+    mode now selects the invariant path on its own, so this class carries no
+    environment override; a regression there surfaces here as a nonzero KL.
     """
 
     @classmethod
@@ -351,14 +344,13 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             env={
                 **os.environ,
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_OPT_USE_INKLING_SHEARED_BIAS": "0",
             },
         )
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(

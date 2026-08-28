@@ -9,13 +9,15 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.triton.wan_temb_table_slices import (
     can_use_fused_temb_table_slices,
+    can_use_linear_gelu,
+    fused_gelu_active,
+    fused_linear_gelu_tanh,
     fused_temb_table_slices,
+    mark_fused_gelu_site,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
@@ -76,6 +78,35 @@ _is_cuda = current_platform.is_cuda()
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
+
+
+class _WanGELUMLP(MLP):
+    """Wan FFN with a quality-gated cublasLt GELU epilogue."""
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        prefix: str,
+        quant_config: QuantizationConfig | None,
+    ):
+        super().__init__(
+            dim,
+            ffn_dim,
+            act_type="gelu_pytorch_tanh",
+            prefix=prefix,
+            quant_config=quant_config,
+        )
+        mark_fused_gelu_site(self, "fc_in")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+            x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
+        else:
+            x, _ = self.fc_in(x)
+            x = self.act(x)
+        x, _ = self.fc_out(x)
+        return x
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -530,10 +561,9 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(
+        self.ffn = _WanGELUMLP(
             dim,
             ffn_dim,
-            act_type="gelu_pytorch_tanh",
             prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
         )
@@ -800,10 +830,9 @@ class WanTransformerBlock_VSA(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(
+        self.ffn = _WanGELUMLP(
             dim,
             ffn_dim,
-            act_type="gelu_pytorch_tanh",
             prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
         )

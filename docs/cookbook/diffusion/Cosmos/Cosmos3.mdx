@@ -6,11 +6,13 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "video", "sound/action", "world model", "policy"]} />
+<DiffusionModelTags tags={["omnimodal", "image + video", "sound + action", "world model", "robot policy"]} />
 
 ## 1. Model Introduction
 
-[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with its native Cosmos3 pipeline.
+[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family spanning text/image/video generation, optional synchronized sound, and robot action prediction. Its main advantage is breadth: the same native SGLang pipeline can serve media-generation checkpoints and the DROID policy checkpoint without routing through an LLM sampler.
+
+Choose Nano for the broadest modality coverage and lower deployment cost, Super for the larger 64B image/video model, and a specialized checkpoint when only T2I or I2V is needed. Sound and action are checkpoint-specific heads, so they are not available from every Cosmos3 repository.
 
 | Model | Status | Notes |
 | --- | --- | --- |
@@ -44,6 +46,12 @@ pip install "cosmos-guardrail==0.3.1"
 
 `cosmos-guardrail` downloads gated NVIDIA guardrail weights, so pass a Hugging Face token if your environment needs one. If the package is not installed, SGLang skips Cosmos3 guardrails and logs a warning. To disable Cosmos3 guardrails for local experiments, set `SGLANG_DISABLE_COSMOS3_GUARDRAILS=1` before starting the server.
 
+There may be problems loading the Cosmos-1.0-Guardrail weights on Ascend NPU. If the *_pickle.UnpicklingError* error occurs during startup, you should change ```weight_only=True``` to ```weights_only=False``` parameter in *cosmos_guardrail/cosmos_utils.py*:
+```
+#!/usr/bin/env bash
+COSMOS_GUARDRAIL_DIR="$(dirname "$(python -c 'import cosmos_guardrail; print(cosmos_guardrail.__file__)')")"
+sed -i 's/weights_only=True/weights_only=False/g' "$COSMOS_GUARDRAIL_DIR/cosmos_utils.py"
+```
 ## 3. Serve Cosmos3
 
 Serve `Cosmos3-Nano` directly from the Hugging Face model ID:
@@ -53,6 +61,14 @@ sglang serve \
   --model-path nvidia/Cosmos3-Nano \
   --num-gpus 1
 ```
+
+With `--performance-mode auto`, a Cosmos3 checkpoint keeps its DiT and VAE
+resident when every selected GPU has at least 120 GiB available at startup.
+Below that threshold, auto mode retains the conservative DiT
+component-offload policy. Cosmos3 runs one DiT per pipeline, so component
+offload above the threshold only pays to copy the weights out to host memory
+and back on every request. Serve `Cosmos3-Super` across multiple GPUs as
+shown below so each rank holds a shard of the weights.
 
 For `Cosmos3-Super`, split the model across multiple GPUs:
 
@@ -314,6 +330,37 @@ print(action["shape"], action["values"])
 ```
 
 Use `GET /v1/actions/metadata` to inspect the action modes, default horizon, padded action dimension, and accepted observation modalities. Msgpack requests and the `/v1/actions/realtime` websocket use the same action envelope.
+
+To batch policy observations inside one request, opt in with a bounded batch size:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Nano-Policy-DROID \
+  --num-gpus 1 \
+  --batching-max-size 4
+```
+
+Send one image per observation as a list or `[B, H, W, C]` uint8 array in `input.input_reference`, and either one prompt per image or one scalar prompt to broadcast across the batch. Batched prompts must currently tokenize to the same length because Cosmos3 GEN cross-attention does not mask padded text K/V. All items in one request share the domain, resolution, action horizon, and denoise settings. The standard action envelope returns one `data[i]` item per input, each with action shape `[H, D]`. For a compact msgpack response containing one `[B, H, D]` array, set `runtime.response_format="raw"` and read the top-level `actions` field.
+
+For JSON, `input_reference` can be a list of base64 image payloads. For msgpack, it can be a packed uint8 numpy array directly:
+
+```json JSON
+{
+  "input": {
+    "prompt": ["pick up the block", "close the drawer"],
+    "input_reference": [
+      {"b64_json": "<first-image-base64>"},
+      {"b64_json": "<second-image-base64>"}
+    ]
+  },
+  "parameters": {
+    "action_mode": "policy",
+    "domain_name": "droid_lerobot"
+  }
+}
+```
+
+The batch size cannot exceed `--batching-max-size`; this keeps one request from bypassing the server's configured memory limit. Batching applies to `action_mode="policy"` only. A request seed controls the random stream for the whole batch, so a batched result is deterministic for that request but is not expected to be bit-exact with separately seeded B=1 requests.
 
 `inverse_dynamics` also uses `/v1/actions/generations`; set `action_mode="inverse_dynamics"` and pass an observation video URL or server-local path as `input.observation.video`. Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
 

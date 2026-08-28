@@ -68,8 +68,23 @@ def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None, policy="auto"
 
 
 def test_pure_tp_not_folded():
-    # replica == tp: encoder already uses every replica GPU; nothing to fold.
+    # replica == tp under auto: each rank keeps a full encoder replica; auto
+    # never proposes folding here (the trade-off stays opt-in, see below).
     assert _proposed_mode(tp=2, sp=1, cfg=1) is None
+
+
+def test_explicit_fold_proposes_replica_for_any_shape():
+    # Encoder layout is independent of the DiT's parallelism: an operator's
+    # explicit fold is honored on every multi-rank replica instead of being
+    # silently ignored (pure TP) or narrowed to the SP group (dp > 1).
+    assert _proposed_mode(tp=2, sp=1, cfg=1, policy="fold") == "replica"
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
+    assert (
+        _proposed_mode(tp=2, sp=2, cfg=1, dp=2, num_gpus=8, policy="fold") == "replica"
+    )
+    # single-GPU replica: nothing to shard over
+    assert _proposed_mode(tp=1, sp=1, cfg=1, policy="fold") is None
+    assert _proposed_mode(tp=1, sp=1, cfg=1, dp=2, num_gpus=2, policy="fold") is None
 
 
 def test_single_gpu_not_folded():
@@ -121,10 +136,14 @@ def test_all_encoders_get_the_same_proposed_mode():
     assert img.parallel_folding_mode == "world"
 
 
-def test_adjust_proposes_regardless_of_policy():
-    # adjust reads the parallelism only; finalize owns the policy decision.
-    for policy in ("auto", "fold", "dp", "replicate"):
+def test_adjust_proposal_policy_dependence():
+    # adjust reads the parallelism only for auto/dp/replicate; finalize owns
+    # those policy decisions. An explicit fold is the one exception: it widens
+    # the proposal to the whole replica, because finalize cannot conjure a
+    # group that was never proposed (pure-TP replicas had none at all).
+    for policy in ("auto", "dp", "replicate"):
         assert _proposed_mode(tp=1, sp=2, cfg=1, policy=policy) == "world", policy
+    assert _proposed_mode(tp=1, sp=2, cfg=1, policy="fold") == "replica"
 
 
 def test_no_policy_touches_batching_max_size():

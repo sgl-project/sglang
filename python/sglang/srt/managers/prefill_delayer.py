@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -94,6 +98,7 @@ class PrefillDelayer:
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
+        self._prefill_max_requests = server_args.prefill_max_requests
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
@@ -103,14 +108,14 @@ class PrefillDelayer:
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
         self.dp_size = dp_size
-        self.enable_dp_attention = server_args.enable_dp_attention
+        self.enable_dp_attention = get_parallel().enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
         # env flag is on (or overlap scheduling is disabled), ride the NCCL
         # device group on `device` instead of gloo on CPU.
         use_nccl = (
-            server_args.disable_overlap_schedule
+            get_schedule().disable_overlap_schedule
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         if use_nccl:
@@ -138,7 +143,7 @@ class PrefillDelayer:
         self.skip_first_delayer = True
 
         assert (
-            not server_args.disable_overlap_schedule
+            not get_schedule().disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
@@ -249,9 +254,14 @@ class PrefillDelayer:
             # and fragment prefill into many tiny batches.
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
+                queue_capacity = (
+                    self._prefill_max_requests
+                    if self._prefill_max_requests is not None
+                    else global_max_prefill_bs_max
+                )
                 queue_min_effective = min(
                     int(global_running_batch_max * self._queue_min_ratio),
-                    global_max_prefill_bs_max,
+                    queue_capacity,
                 )
                 queue_condition = (
                     queue_min_effective > 0

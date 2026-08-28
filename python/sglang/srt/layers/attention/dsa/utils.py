@@ -13,6 +13,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
     get_parallel,
     process_model_config,
 )
@@ -67,27 +69,24 @@ INDEXER_K_CACHE_PRESHUFFLE_TILE = 16
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
     return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def should_remap_pd_dsa_seed_to_local_slots(server_args: "ServerArgs") -> bool:
+def should_remap_pd_dsa_seed_to_local_slots() -> bool:
     """Whether a PD seed should enter the allocator-local fused TopK domain."""
     return (
         is_cuda()
         and envs.SGLANG_DSA_FUSE_TOPK.get()
-        and server_args.disaggregation_mode == "decode"
-        and not server_args.enable_hisparse
+        and get_disagg().disaggregation_mode == "decode"
+        and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
     )
 
 
-def should_use_dsa_fused_topk(
-    server_args: "ServerArgs", seed_dsa_topk_from_draft_extend: bool
-) -> bool:
+def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     """Select fused TopK for PD IndexShare.
 
     PD Prefill worker:
@@ -98,10 +97,10 @@ def should_use_dsa_fused_topk(
     - Draft decode / target verify / draft extend: fused TopK enabled.
     """
     pd_index_share_seed = (
-        server_args.disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
+        get_disagg().disaggregation_mode != "null" and seed_dsa_topk_from_draft_extend
     )
     return envs.SGLANG_DSA_FUSE_TOPK.get() and (
-        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots(server_args)
+        not pd_index_share_seed or should_remap_pd_dsa_seed_to_local_slots()
     )
 
 

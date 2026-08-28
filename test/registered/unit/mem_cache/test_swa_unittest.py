@@ -226,6 +226,43 @@ class TestSWA(unittest.TestCase):
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
+    def test_clearing_the_mapping_does_not_synchronize(self):
+        """Clearing the full-to-SWA mapping must not block the stream; writing a
+        host-resident scalar into it does.
+        """
+        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        full_indices = _swa_alloc(allocator, 4)
+        mapping = allocator.full_to_swa_index_mapping
+
+        # Warm up outside the window: a first-time cudaMalloc can synchronize on
+        # its own, which the detector would report as this call's fault.
+        allocator.clear_full_to_swa_mapping(full_indices)
+
+        def sync_error(fn):
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                fn()
+            except RuntimeError as exc:
+                return exc
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+            return None
+
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the assert below no matter how the mapping is cleared.
+        pre_fix_error = sync_error(
+            lambda: mapping.__setitem__(full_indices.to(torch.int64), 0)
+        )
+        if pre_fix_error is None:
+            self.skipTest("sync debug mode does not flag a blocking H2D copy here")
+
+        self.assertIsNone(
+            sync_error(lambda: allocator.clear_full_to_swa_mapping(full_indices))
+        )
+
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
             is_eagle=False,
@@ -259,6 +296,38 @@ class TestSWA(unittest.TestCase):
         self.assertEqual(
             allocator.swa_available_size(),
             available_before_free + original_indices.numel(),
+        )
+
+    def test_free_swa_group_owns_mapping_at_enqueue_time(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=8,
+            kv_size_swa=8,
+        )
+        old_full = _swa_alloc(allocator, 1)
+        new_full = _swa_alloc(allocator, 1)
+        assert old_full is not None and new_full is not None
+        old_swa = allocator.full_to_swa_index_mapping[old_full].clone()
+        new_swa = allocator.full_to_swa_index_mapping[new_full].clone()
+
+        allocator.free_group_begin()
+        allocator.free_swa(old_full)
+
+        # Cache reconciliation can transfer a different SWA slot onto the same
+        # full slot before the group flushes. The deferred free still owns the
+        # mapping observed above, not this replacement mapping.
+        allocator.set_full_to_swa_mapping(old_full, new_swa)
+        allocator.clear_full_to_swa_mapping(new_full)
+        allocator.free_group_end()
+
+        torch.testing.assert_close(
+            allocator.full_to_swa_index_mapping[old_full], new_swa
+        )
+        self.assertTrue(
+            torch.isin(old_swa, allocator.swa_attn_allocator.free_pages).item()
+        )
+        self.assertFalse(
+            torch.isin(new_swa, allocator.swa_attn_allocator.free_pages).item()
         )
 
     def test_swa_radix_cache_1(self):
@@ -780,6 +849,49 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         self.assertEqual(tree.swa_protected_size_, 0)
         self.assertEqual(tree.full_protected_size_, 0)
         tree.sanity_check()
+
+
+class TestFreeFullPartition(CustomTestCase):
+    """`free_full` releases only the full side of a hybrid SWA allocator."""
+
+    def setUp(self):
+        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.full_baseline = self.allocator.full_available_size()
+        self.swa_baseline = self.allocator.swa_available_size()
+
+    def _sizes(self):
+        return (
+            self.allocator.full_available_size(),
+            self.allocator.swa_available_size(),
+        )
+
+    def test_free_full_keeps_the_swa_peers_allocated(self):
+        indices = _swa_alloc(self.allocator, 4)
+        self.allocator.free_full(indices)
+
+        full_avail, swa_avail = self._sizes()
+        self.assertEqual(full_avail, self.full_baseline)
+        self.assertEqual(swa_avail, self.swa_baseline - 4)
+
+    def test_free_full_leaves_the_mapping_intact(self):
+        indices = _swa_alloc(self.allocator, 4)
+        before = self.allocator.full_to_swa_index_mapping[indices].clone()
+        self.allocator.free_full(indices)
+
+        self.assertTrue(bool((before > 0).all()))
+        self.assertTrue(
+            torch.equal(self.allocator.full_to_swa_index_mapping[indices], before)
+        )
+
+    def test_free_full_is_deferred_inside_a_free_group(self):
+        indices = _swa_alloc(self.allocator, 4)
+
+        self.allocator.free_group_begin()
+        self.allocator.free_full(indices)
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline - 4)
+        self.allocator.free_group_end()
+
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline)
 
 
 if __name__ == "__main__":
