@@ -131,7 +131,7 @@ def test_initial_seed_selects_all_known_components_when_they_fit():
     assert selected == {"transformer", "text_encoder", "vae"}
 
 
-def test_initial_seed_keeps_probe_headroom_for_multiple_dits():
+def test_initial_seed_packs_reused_dits_under_the_common_reserve():
     args = _Args()
 
     selected = choose_initial_resident_components(
@@ -146,8 +146,7 @@ def test_initial_seed_keeps_probe_headroom_for_multiple_dits():
         denoising_steps=40,
     )
 
-    assert len(selected & {"transformer", "transformer_2"}) == 1
-    assert {"text_encoder", "vae"} <= selected
+    assert selected == {"transformer", "transformer_2", "vae"}
 
 
 def test_initial_seed_can_bypass_model_default_layerwise_initialization():
@@ -200,6 +199,44 @@ def test_initial_seed_applies_one_reversible_override():
         distributed=False,
         empty_cache=False,
     )
+
+
+def test_initial_seed_defers_unselected_layerwise_setup():
+    args = _Args(
+        modes={
+            "transformer": LAYERWISE_OFFLOAD,
+            "transformer_2": LAYERWISE_OFFLOAD,
+            "text_encoder": LAYERWISE_OFFLOAD,
+            "vae": LAYERWISE_OFFLOAD,
+        }
+    )
+    inventory = [
+        _weight("transformer", 27),
+        _weight("transformer_2", 27),
+        _weight("text_encoder", 10),
+        _weight("vae", 1),
+    ]
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.auto_residency_static_skip_reason",
+            return_value=None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.current_platform"
+        ) as platform,
+    ):
+        platform.is_cuda.return_value = True
+        platform.get_available_gpu_memory.return_value = 75
+        maybe_seed_initial_residency(args, inventory)
+
+    assert args.selected == {
+        "transformer": RESIDENT,
+        "transformer_2": RESIDENT,
+        "text_encoder": COMPONENT_OFFLOAD,
+        "vae": RESIDENT,
+    }
 
 
 def test_initial_seed_honors_the_test_allocator_cap():

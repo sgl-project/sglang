@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
@@ -33,7 +35,6 @@ logger = init_logger(__name__)
 GIB_BYTES = 1024**3
 MIN_INITIAL_RESIDENCY_RESERVE_BYTES = 4 * GIB_BYTES
 INITIAL_RESIDENCY_RESERVE_FRACTION = 0.20
-MULTI_DIT_INITIAL_RESIDENCY_RESERVE_FRACTION = 0.30
 
 
 def _default_denoising_steps(server_args: ServerArgs) -> int:
@@ -65,26 +66,9 @@ def choose_initial_resident_components(
     configured loading semantics. A model-default layerwise placement remains
     eligible because avoiding that initialization is the point of this seed.
     """
-    dit_count = sum(
-        is_dit_component_name(item.component_name)
-        and (
-            server_args.explicit_residency_mode(item.component_name) is None
-            or server_args.residency_mode(item.component_name) == RESIDENT
-        )
-        for item in inventory
-    )
-    # Before the first target-shape probe there is no activation/workspace
-    # measurement. Multiple denoisers can otherwise consume nearly the whole
-    # device with static weights even though only one is active at a time. Keep
-    # a larger temporary probe allowance; measured planning can spend it again.
-    reserve_fraction = (
-        MULTI_DIT_INITIAL_RESIDENCY_RESERVE_FRACTION
-        if dit_count > 1
-        else INITIAL_RESIDENCY_RESERVE_FRACTION
-    )
     reserve_bytes = max(
         MIN_INITIAL_RESIDENCY_RESERVE_BYTES,
-        int(available_bytes * reserve_fraction),
+        int(available_bytes * INITIAL_RESIDENCY_RESERVE_FRACTION),
     )
     fixed_resident = [
         item
@@ -164,14 +148,26 @@ def maybe_seed_initial_residency(
         available_bytes=int(available_gib * GIB_BYTES),
         excluded_components=excluded_components,
     )
-    if not selected:
-        return
+    coarse_offload = {
+        item.component_name
+        for item in inventory
+        if item.component_name not in selected
+        and item.component_name not in excluded_components
+        and server_args.explicit_residency_mode(item.component_name) is None
+        and server_args.residency_mode(item.component_name) == LAYERWISE_OFFLOAD
+    }
 
     for component_name in selected:
         server_args.set_auto_residency_mode(component_name, RESIDENT)
+    for component_name in coarse_offload:
+        server_args.set_auto_residency_mode(component_name, COMPONENT_OFFLOAD)
+    if not selected and not coarse_offload:
+        return
     logger.info(
-        "Initial auto residency: resident=%s (minimum free VRAM=%.1f GiB); "
-        "warmup may rebalance this load-safe seed.",
+        "Initial auto residency: resident=%s, component-offload=%s "
+        "(minimum free VRAM=%.1f GiB); warmup may rebalance this "
+        "load-safe seed.",
         sorted(selected),
+        sorted(coarse_offload),
         available_gib,
     )
