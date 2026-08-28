@@ -56,6 +56,16 @@ on:
         required: false
         type: string
         default: ''
+      amd_ci_image_repo:
+        description: 'Registry to look images up in (optional, e.g. a scratch registry for branch builds)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image_tag_suffix:
+        description: 'Marker appended after the date in the image tag (optional, e.g. _pr36871_9e4c9)'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -88,6 +98,16 @@ on:
         required: false
         type: string
         default: ''
+      amd_ci_image_repo:
+        description: 'Registry to look images up in (optional, e.g. a scratch registry for branch builds)'
+        required: false
+        type: string
+        default: ''
+      amd_ci_image_tag_suffix:
+        description: 'Marker appended after the date in the image tag (optional, e.g. _pr36871_9e4c9)'
+        required: false
+        type: string
+        default: ''
       continue_on_error:
         description: 'Continue on error (do not fail the workflow on test failures)'
         required: false
@@ -97,6 +117,8 @@ on:
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
   AMD_CI_IMAGE: ${{ inputs.amd_ci_image }}
+  AMD_CI_IMAGE_REPO: ${{ inputs.amd_ci_image_repo }}
+  AMD_CI_IMAGE_TAG_SUFFIX: ${{ inputs.amd_ci_image_tag_suffix }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 

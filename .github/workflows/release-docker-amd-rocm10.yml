@@ -19,22 +19,66 @@ on:
           - 'all'
           - gfx942-rocm1000
           - gfx950-rocm1000
+          - gfx1250-rocm1000
   schedule:
     - cron: '0 12 * * *'
+  # TEMPORARY (PR 36871): validate the branch on images it builds itself.
+  # Remove this trigger, the setup job, and everything below `publish` before
+  # merging. Scheduled and dispatched runs are unaffected.
+  push:
+    branches:
+      - amd_test_pr36871_0828
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
   cancel-in-progress: true
 
+# TEMPORARY (PR 36871): the chained PR suite calls the AMD extra suite, which
+# needs these scopes. A reusable workflow cannot elevate its caller's.
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
 jobs:
+  # TEMPORARY (PR 36871): resolved once so every job below agrees on the tag.
+  # A run crossing midnight would otherwise build one tag and look for another.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      date: ${{ steps.stamp.outputs.date }}
+      registry: ${{ steps.stamp.outputs.registry }}
+      suffix: ${{ steps.stamp.outputs.suffix }}
+      is_test: ${{ steps.stamp.outputs.is_test }}
+    steps:
+      - name: Compose tag stamp
+        id: stamp
+        run: |
+          echo "date=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "is_test=true" >> "$GITHUB_OUTPUT"
+            echo "registry=bingxche/sgl-test" >> "$GITHUB_OUTPUT"
+            echo "suffix=_pr36871_$(echo '${{ github.sha }}' | cut -c1-5)" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_test=false" >> "$GITHUB_OUTPUT"
+            echo "registry=rocm/sgl-dev" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+          fi
+
   publish:
+    needs: setup
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm1000", "gfx950-rocm1000"]') }}
+        # TEMPORARY (PR 36871): push runs build only gfx1250 here. Nothing
+        # consumes it (no MI450 pool), so it is kept out of the jobs the gate
+        # depends on. The gfx942/gfx950 images come from the publish-ci-* jobs
+        # below, one per flavor. Scheduled and dispatched runs are unchanged.
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || (github.event_name == 'push' && '["gfx1250-rocm1000"]') || '["gfx942-rocm1000", "gfx950-rocm1000"]') }}
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -69,29 +113,48 @@ jobs:
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
       - name: Login to Docker Hub (AMD)
+        if: needs.setup.outputs.is_test != 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
-      - name: Build and push to rocm/sgl-dev
+      # TEMPORARY (PR 36871): branch-test runs authenticate against the scratch
+      # registry instead. Delete along with the rest of the test scaffolding.
+      - name: Login to Docker Hub (test)
+        if: needs.setup.outputs.is_test == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
+
+      - name: Build and push
         env:
           BUILD_TYPE: ${{ matrix.build_type }}
           GPU_ARCH: ${{ matrix.gpu_arch }}
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ needs.setup.outputs.registry }}
+          TAG_SUFFIX: ${{ needs.setup.outputs.suffix }}
         run: |
           case "$GPU_ARCH" in
             gfx942-rocm1000) rocm_tag="rocm10-mi30x" ;;
             gfx950-rocm1000) rocm_tag="rocm10-mi35x" ;;
+            gfx1250-rocm1000) rocm_tag="rocm10-mi45x" ;;
+            gfx942-rocm724) rocm_tag="rocm724-mi30x" ;;
+            gfx950-rocm724) rocm_tag="rocm724-mi35x" ;;
             *)
               echo "Unsupported GPU arch: $GPU_ARCH"
               exit 1
               ;;
           esac
 
-          image_tag="v${VERSION}-${rocm_tag}-${DATE}"
+          # TAG_SUFFIX is empty outside branch-test runs. It goes after the date
+          # because amd_ci_start_container.sh matches on the tag ending in the
+          # date plus AMD_CI_IMAGE_TAG_SUFFIX.
+          image_tag="v${VERSION}-${rocm_tag}-${DATE}${TAG_SUFFIX}"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+          echo "Publishing ${REGISTRY}:${image_tag}"
 
           docker build . \
             -f docker/rocm.Dockerfile \
@@ -102,17 +165,222 @@ jobs:
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
             --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
-            -t "rocm/sgl-dev:${image_tag}" \
+            -t "${REGISTRY}:${image_tag}" \
             --no-cache
-          docker push "rocm/sgl-dev:${image_tag}"
+          docker push "${REGISTRY}:${image_tag}"
 
       - name: Login to Docker Hub (lmsys)
+        if: needs.setup.outputs.is_test != 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Branch-test images stay in the scratch registry; only released tags are
+      # mirrored to the public repo.
       - name: Push to lmsysorg/sglang-rocm
+        if: needs.setup.outputs.is_test != 'true'
         run: |
           docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
           docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+
+  # ===================================================================
+  # TEMPORARY (PR 36871) — branch scaffolding. Delete the two jobs below
+  # along with the push trigger, the setup job, the permissions block,
+  # the gfx1250 matrix leg, and the is_test conditions above.
+  # ===================================================================
+
+  # Both gates run against images this branch built. One job per flavor rather
+  # than one four-leg matrix so a ROCm 10 build failure still leaves the ROCm
+  # 7.2.4 gate free to report, and the other way round. mi300 draws the gfx942
+  # image and mi35x the gfx950 one, which is the mapping the container lookup
+  # already uses.
+  publish-ci-rocm724:
+    needs: setup
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'push'
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['gfx942-rocm724', 'gfx950-rocm724']
+        build_type: ['all']
+    env:
+      DATE: ${{ needs.setup.outputs.date }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${VERSION}.dev${DATE}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub (test)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
+
+      - name: Build and push
+        env:
+          BUILD_TYPE: ${{ matrix.build_type }}
+          GPU_ARCH: ${{ matrix.gpu_arch }}
+          PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ needs.setup.outputs.registry }}
+          TAG_SUFFIX: ${{ needs.setup.outputs.suffix }}
+        run: |
+          case "$GPU_ARCH" in
+            gfx942-rocm724) rocm_tag="rocm724-mi30x" ;;
+            gfx950-rocm724) rocm_tag="rocm724-mi35x" ;;
+            *)
+              echo "Unsupported GPU arch: $GPU_ARCH"
+              exit 1
+              ;;
+          esac
+
+          image_tag="v${VERSION}-${rocm_tag}-${DATE}${TAG_SUFFIX}"
+          echo "Publishing ${REGISTRY}:${image_tag}"
+
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
+            --build-arg "GPU_ARCH=${GPU_ARCH}" \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t "${REGISTRY}:${image_tag}" \
+            --no-cache
+          docker push "${REGISTRY}:${image_tag}"
+
+  publish-ci-rocm10:
+    needs: setup
+    if: github.repository == 'sgl-project/sglang' && github.event_name == 'push'
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['gfx942-rocm1000', 'gfx950-rocm1000']
+        build_type: ['all']
+    env:
+      DATE: ${{ needs.setup.outputs.date }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${VERSION}.dev${DATE}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub (test)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
+
+      - name: Build and push
+        env:
+          BUILD_TYPE: ${{ matrix.build_type }}
+          GPU_ARCH: ${{ matrix.gpu_arch }}
+          PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ needs.setup.outputs.registry }}
+          TAG_SUFFIX: ${{ needs.setup.outputs.suffix }}
+        run: |
+          case "$GPU_ARCH" in
+            gfx942-rocm1000) rocm_tag="rocm10-mi30x" ;;
+            gfx950-rocm1000) rocm_tag="rocm10-mi35x" ;;
+            *)
+              echo "Unsupported GPU arch: $GPU_ARCH"
+              exit 1
+              ;;
+          esac
+
+          image_tag="v${VERSION}-${rocm_tag}-${DATE}${TAG_SUFFIX}"
+          echo "Publishing ${REGISTRY}:${image_tag}"
+
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
+            --build-arg "GPU_ARCH=${GPU_ARCH}" \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t "${REGISTRY}:${image_tag}" \
+            --no-cache
+          docker push "${REGISTRY}:${image_tag}"
+
+  # amd_ci_image_repo and amd_ci_image_tag_suffix are what point the container
+  # lookup at the scratch registry and at this run's tag.
+  validate-pr-rocm724:
+    name: AMD gate on this branch's ROCm 7.2.4 images
+    needs: [setup, publish-ci-rocm724]
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/pr-test-amd-rocm720.yml
+    with:
+      rocm_version: rocm724
+      ref: ${{ github.sha }}
+      runner_arch: mi300
+      run_all_tests: true
+      amd_ci_image_repo: ${{ needs.setup.outputs.registry }}
+      amd_ci_image_tag_suffix: ${{ needs.setup.outputs.suffix }}
+      continue_on_error: true
+    secrets: inherit
+
+  validate-pr-rocm10:
+    name: AMD gate on this branch's ROCm 10 images
+    needs: [setup, publish-ci-rocm10]
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/pr-test-amd-rocm720.yml
+    with:
+      rocm_version: rocm10
+      ref: ${{ github.sha }}
+      runner_arch: mi300
+      run_all_tests: true
+      amd_ci_image_repo: ${{ needs.setup.outputs.registry }}
+      amd_ci_image_tag_suffix: ${{ needs.setup.outputs.suffix }}
+      continue_on_error: true
+    secrets: inherit

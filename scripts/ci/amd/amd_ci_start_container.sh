@@ -19,6 +19,14 @@ else
 fi
 
 
+# Where to look images up. A branch validating its own build publishes to a
+# scratch registry and points CI at it; released flavors keep the default.
+SGL_DEV_REPO="${AMD_CI_IMAGE_REPO:-rocm/sgl-dev}"
+# Marker appended after the date in a tag (e.g. _pr36871_9e4c9) so branch test
+# images can sit next to the released ones without colliding. The lookups below
+# have to carry it too, since they match on the tag ending in the date.
+IMAGE_TAG_SUFFIX="${AMD_CI_IMAGE_TAG_SUFFIX:-}"
+
 # Default base tags (can be overridden by command line arguments)
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -149,22 +157,22 @@ find_latest_image() {
 
   # First, check local cache on the runner.
   for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${IMAGE_TAG_SUFFIX}"
+    image_id=$(docker images -q "${SGL_DEV_REPO}:${image_tag}")
     if [[ -n "$image_id" ]]; then
-      echo "Found cached image locally: rocm/sgl-dev:${image_tag}" >&2
-      echo "rocm/sgl-dev:${image_tag}"
+      echo "Found cached image locally: ${SGL_DEV_REPO}:${image_tag}" >&2
+      echo "${SGL_DEV_REPO}:${image_tag}"
       return 0
     fi
   done
 
   # If not found locally, resolve the latest tag from the public registry.
   for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
-    if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
-      echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
-      echo "rocm/sgl-dev:${image_tag}"
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${IMAGE_TAG_SUFFIX}"
+    echo "Checking for image: ${SGL_DEV_REPO}:${image_tag}" >&2
+    if docker manifest inspect "${SGL_DEV_REPO}:${image_tag}" >/dev/null 2>&1; then
+      echo "Found available image: ${SGL_DEV_REPO}:${image_tag}" >&2
+      echo "${SGL_DEV_REPO}:${image_tag}"
       return 0
     fi
   done
@@ -173,25 +181,25 @@ find_latest_image() {
   echo "Exact version not found. Searching remote registry for versioned ${ROCM_VERSION}-${gpu_arch} images…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}$"
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
+    local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}${IMAGE_TAG_SUFFIX}$"
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/${SGL_DEV_REPO}/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
       if [[ "${tag}" =~ ${sgl_tag_regex} ]]; then
         echo "${tag}"
         break
       fi
     done || true)
     if [[ -n "$remote_tags" ]]; then
-      echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
-      echo "rocm/sgl-dev:${remote_tags}"
+      echo "Found available image: ${SGL_DEV_REPO}:${remote_tags}" >&2
+      echo "${SGL_DEV_REPO}:${remote_tags}"
       return 0
     fi
   done
 
   echo "No recent images found. Searching cached local versioned images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
-    local tag="${image#rocm/sgl-dev:}"
-    if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}$ ]]; then
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=${SGL_DEV_REPO}:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
+    local tag="${image#${SGL_DEV_REPO}:}"
+    if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}${IMAGE_TAG_SUFFIX}$ ]]; then
       echo "${image}"
     fi
   done | sort -r | head -n 1)
