@@ -316,6 +316,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = None
         self.release_pages = None
         self.free_group = None
+        self.full_free_group = []
         self.clear()
 
         self.hisparse_kvcache.register_mapping(
@@ -366,6 +367,15 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa_segment(self, free_indices: torch.Tensor, *, start_pos: int):
         self.logical_attn_allocator.free_swa_segment(free_indices, start_pos=start_pos)
+
+    def free_full(self, free_indices: torch.Tensor):
+        if free_indices.numel() == 0:
+            return
+
+        if self.free_group is None:
+            self.logical_attn_allocator.free_full(free_indices)
+        else:
+            self.full_free_group.append(self._copy_for_free_group(free_indices))
 
     def available_size(self) -> int:
         return min(
@@ -571,6 +581,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.free_group = None
         self.free_segments_group = None
+        self.full_free_group = []
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -585,3 +596,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.logical_attn_allocator.free_segments(
             segments, swa_evicted_seqlen=swa_evicted_seqlen
         )
+
+    def free_group_begin(self):
+        super().free_group_begin()
+        self.full_free_group = []
+
+    def free_group_end(self):
+        super().free_group_end()
+        if self.full_free_group:
+            full_free_group = self.full_free_group
+            self.full_free_group = []
+            self.free_full(torch.cat(full_free_group))
