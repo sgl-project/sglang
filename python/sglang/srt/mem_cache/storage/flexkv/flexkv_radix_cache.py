@@ -15,8 +15,8 @@ contract is identical:
   on CPU before lookup/retrieve (compute GET no longer issues REMOTE2H).
 
 * IP (layerwise) mode — enabled with ``FLEXKV_ENABLE_LAYERWISE_TRANSFER=1``.
-  ``match_prefix`` allocates uncached slots and kicks off a layerwise
-  load; the per-layer hook registered via
+  ``match_prefix`` records the host hit and the scheduler starts the layerwise
+  load after admission; the per-layer hook registered via
   ``register_layer_transfer_counter`` then waits on each layer's
   eventfd inside the model's forward pass.
 
@@ -193,7 +193,9 @@ class FlexKVRadixCache(RadixCache):
             return self._mp_match_prefix(
                 key, base_res, device_value, last_node, params.req
             )
-        return self._ip_match_prefix(key, base_res, device_value, last_node)
+        if params.req is None:
+            return base_res
+        return self._ip_match_prefix(key, base_res, device_value, last_node, params.req)
 
     def _mp_match_prefix(
         self,
@@ -244,6 +246,7 @@ class FlexKVRadixCache(RadixCache):
             last_host_node=last_node,
             best_match_node=last_node,
             host_hit_length=hit,
+            cache_protected_len=device_len,
         )
 
     def _ip_match_prefix(
@@ -252,46 +255,16 @@ class FlexKVRadixCache(RadixCache):
         base_res: MatchResult,
         device_value: torch.Tensor,
         last_node: TreeNode,
+        req: Req,
     ) -> MatchResult:
-        """Layerwise path: allocate slots and fire ``start_load_kv_layerwise``
-        immediately. Per-layer hook waits during forward."""
-        token_ids = key.raw_token_ids()
-        device_len = int(device_value.numel())
-        if device_len >= len(token_ids):
-            return base_res
+        """Layerwise LOOKUP phase.
 
-        # Quick LOOKUP first to discover how many slots we'd need.
-        token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
-        token_mask[device_len:] = True
-        # No rid here — IP mode self-pops; pass a synthetic stable key.
-        synthetic_rid = f"_ip_{id(key)}"
-        _, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids,
-            token_mask=token_mask,
-            rid=synthetic_rid,
-            sglang_req_id=None,
-        )
-        if hit <= 0:
-            return base_res
-
-        result = self._allocate_and_load(
-            key=key,
-            value_numel=device_len,
-            uncached_len=hit,
-            last_node=last_node,
-            load_fn=lambda slot_mapping: self.flexkv_connector.start_load_kv_layerwise(
-                synthetic_rid, slot_mapping
-            )[0],
-        )
-        if result is None:
-            return base_res
-        new_slots, new_node = result
-        return MatchResult(
-            device_indices=torch.cat([device_value, new_slots]),
-            last_device_node=new_node,
-            last_host_node=new_node,
-            best_match_node=new_node,
-        )
+        Prefix matching is also used for waiting-queue priority calculation,
+        before admission has committed the request. Allocating and attaching a
+        page here gives it two owners: the radix tree and request cleanup.
+        ``init_load_back`` performs the allocation after admission instead.
+        """
+        return self._mp_match_prefix(key, base_res, device_value, last_node, req)
 
     # ------------------------------------------------------------------
     # init_load_back (MP RETRIEVE)
@@ -316,14 +289,29 @@ class FlexKVRadixCache(RadixCache):
                 last_node,
             )
 
+        request_owned_req = req if self._mode is FlexKVMode.IP else None
+        load_fn = (
+            (
+                lambda slot_mapping: self.flexkv_connector.start_load_kv_layerwise(
+                    req.rid, slot_mapping
+                )[0]
+            )
+            if self._mode is FlexKVMode.IP
+            else (
+                lambda slot_mapping: self.flexkv_connector.retrieve_kv(
+                    req.rid, slot_mapping
+                )
+            )
+        )
         result = self._allocate_and_load(
             key=marker.key,
             value_numel=marker.value_numel,
             uncached_len=params.host_hit_length,
             last_node=last_node,
-            load_fn=lambda slot_mapping: self.flexkv_connector.retrieve_kv(
-                req.rid, slot_mapping
-            ),
+            tracking_rid=req.rid,
+            sglang_req_id=req.rid,
+            load_fn=load_fn,
+            request_owned_req=request_owned_req,
         )
         if result is None:
             # Allocation failed or load returned zero. ``retrieve_kv``
@@ -344,23 +332,75 @@ class FlexKVRadixCache(RadixCache):
         value_numel: int,
         uncached_len: int,
         last_node: TreeNode,
+        tracking_rid: str,
+        sglang_req_id: Optional[str],
         load_fn,
+        request_owned_req: Optional[Req] = None,
     ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
         """Shared allocator + post-load bookkeeping for MP/IP.
 
-        Returns ``(token_slots[:fetched], new_node)`` on success.
-        ``None`` on either allocation failure or zero retrieved (in
-        which case all slots are freed).
+        Prefix matches are computed before admission, so another request can
+        populate part or all of the same prefix before this method runs. Refresh
+        the device match before launching H2D to avoid overwriting a live child
+        while leaving the old node in ``evictable_leaves``.
         """
         if uncached_len <= 0:
             return None
+
+        original_value_numel = value_numel
+        target_end = min(value_numel + uncached_len, len(key))
+        uncached_len = target_end - value_numel
+        target_key = key[:target_end]
+        refreshed = super().match_prefix(MatchPrefixParams(key=target_key))
+        refreshed_indices = refreshed.device_indices
+        refreshed_len = int(refreshed_indices.numel())
+
+        if refreshed_len < value_numel:
+            self.flexkv_connector.release_pending(tracking_rid)
+            raise RuntimeError(
+                "FlexKV load-back anchor disappeared while it was protected: "
+                f"expected_at_least={value_numel}, matched={refreshed_len}, "
+                f"rid={tracking_rid}"
+            )
+
+        reused_indices = refreshed_indices[original_value_numel:refreshed_len]
+        if refreshed_len >= target_end:
+            self.flexkv_connector.release_pending(tracking_rid)
+            logger.debug(
+                "FlexKV load-back reused an already restored prefix: rid=%s "
+                "original_device=%d refreshed_device=%d target=%d",
+                tracking_rid,
+                original_value_numel,
+                refreshed_len,
+                target_end,
+            )
+            return reused_indices, refreshed.last_device_node
+
+        if refreshed_len > value_numel:
+            self.flexkv_connector.release_pending(tracking_rid)
+            token_ids = target_key.raw_token_ids()
+            token_mask = torch.zeros(len(token_ids), dtype=torch.bool)
+            token_mask[refreshed_len:] = True
+            _, uncached_len = self.flexkv_connector.lookup_kv(
+                token_ids=token_ids,
+                token_mask=token_mask,
+                rid=tracking_rid,
+                sglang_req_id=sglang_req_id,
+            )
+            uncached_len = min(uncached_len, target_end - refreshed_len)
+            value_numel = refreshed_len
+            last_node = refreshed.last_device_node
+            if uncached_len <= 0:
+                return reused_indices, last_node
+        else:
+            last_node = refreshed.last_device_node
 
         # Evict to make room when needed.
         if self.token_to_kv_pool_allocator.available_size() < uncached_len:
             self.evict(EvictParams(num_tokens=uncached_len))
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
-            return None
+            return (reused_indices, last_node) if reused_indices.numel() > 0 else None
 
         # The FlexKV ``launch`` interface takes the slot indices for the
         # tokens it will write — no leading ``-1`` padding (FlexKV has
@@ -371,7 +411,7 @@ class FlexKVRadixCache(RadixCache):
 
         if num_retrieved <= 0:
             self.token_to_kv_pool_allocator.free(token_slots)
-            return None
+            return (reused_indices, last_node) if reused_indices.numel() > 0 else None
 
         # Free the tail of the over-allocation when FlexKV returned
         # fewer than expected.
@@ -381,13 +421,28 @@ class FlexKVRadixCache(RadixCache):
         else:
             fetched_slots = token_slots
 
+        if request_owned_req is not None:
+            # Normal request completion inserts these slots into the radix tree.
+            # Until then they have exactly one owner: the request cleanup path.
+            request_owned_req.cache_protected_len = value_numel
+            request_owned_req._flexkv_uncached_restore = True
+            if reused_indices.numel() > 0:
+                fetched_slots = torch.cat([reused_indices, fetched_slots])
+            return fetched_slots, last_node
+
         new_node = TreeNode(priority=last_node.priority)
         start = value_numel
         end = start + num_retrieved
         new_node.key = key[start:end]
         new_node.value = fetched_slots
         new_node.parent = last_node
-        last_node.children[new_node.key.child_key(self.page_size)] = new_node
+        child_key = new_node.key.child_key(self.page_size)
+        if child_key in last_node.children:
+            raise RuntimeError(
+                "FlexKV load-back child appeared after prefix refresh: "
+                f"rid={tracking_rid}, child_key={child_key}"
+            )
+        last_node.children[child_key] = new_node
         self.evictable_size_ += num_retrieved
         self._update_leaf_status(last_node)
         self._update_leaf_status(new_node)
@@ -395,6 +450,8 @@ class FlexKVRadixCache(RadixCache):
         self.kv_events.record_store(new_node.parent)
         self.kv_events.record_store(new_node)
 
+        if reused_indices.numel() > 0:
+            fetched_slots = torch.cat([reused_indices, fetched_slots])
         return fetched_slots, new_node
 
     # ------------------------------------------------------------------
@@ -408,6 +465,7 @@ class FlexKVRadixCache(RadixCache):
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
+        req._flexkv_uncached_restore = False
         if not is_insert:
             self._load_markers.pop(req.rid, None)
             return
@@ -465,6 +523,12 @@ class FlexKVRadixCache(RadixCache):
 
         with self._node_lock:
             self._inflight_store_nodes[req.rid] = new_last_node
+
+    def cache_unfinished_req(  # type: ignore[override]
+        self, req: Req, chunked=False
+    ) -> None:
+        super().cache_unfinished_req(req, chunked=chunked)
+        req._flexkv_uncached_restore = False
 
     # ------------------------------------------------------------------
     # evict + completion draining
