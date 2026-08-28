@@ -1,8 +1,8 @@
 """Who installs the startup record into the runtime context, derived from code.
 
 Two guards need this answer and neither should keep its own list: matching the
-spellings by hand is how `ensure_published` once read as *not* publishing,
-which turned a correct module into a reported violation. A publisher is
+spellings by hand is how the constructors' old defensive publish once read as
+*not* publishing, which turned a correct module into a reported violation. A publisher is
 defined by what it does -- it reaches ``RuntimeContext.set_server_args`` --
 and a *constructor* publisher is an ``__init__`` that calls one.
 """

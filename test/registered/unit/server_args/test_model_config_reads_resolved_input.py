@@ -13,6 +13,7 @@ one field that is deliberately read before resolution touches it.
 """
 
 import ast
+import functools
 import pathlib
 import unittest
 
@@ -25,8 +26,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
 # Read for what the caller asked for: the constructor passes it through and
-# never stores it, while resolution later overwrites the field with the value
-# the architecture implies. Two quantities sharing one name.
+# never stores it, while resolution declares the value the architecture implies.
+# Two quantities sharing one name.
 _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 
 # Declared after the first `get_model_config()`, so the cached configuration
@@ -49,6 +50,24 @@ _STALE_FROM_THE_REGISTRIES = frozenset(
         "quantization",
     }
 )
+
+
+@functools.lru_cache(maxsize=None)
+def _parsed(path):
+    return ast.parse(path.read_text(encoding="utf-8-sig"))
+
+
+@functools.lru_cache(maxsize=None)
+def _declared_resolution_fields(path):
+    fields = set()
+    for node in ast.walk(_parsed(path)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "declare_resolution"
+        ):
+            fields |= {kw.arg for kw in node.keywords if kw.arg}
+    return frozenset(fields)
 
 
 def _registry_declared_fields():
@@ -79,7 +98,7 @@ def _registry_collection_is_after_the_build():
     collection above this handler's own `get_model_config()` call does not move
     it above the configuration another handler already cached.
     """
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
+    tree = _parsed(_SRT / "server_args.py")
     handler = next(
         node
         for node in ast.walk(tree)
@@ -106,6 +125,13 @@ def _registry_collection_is_after_the_build():
 
 
 def _server_args_names(tree, path):
+    """Every local that names the record, including the read views over it.
+
+    A resolution-time reader reads through `resolving_view(server_args)` (the
+    declaration stash over the fields): declaration-only resolvers write no
+    field, so a field read there answers with the raw input. `cfg.dtype` after `cfg = resolving_view(sa)` is
+    the same read this scan is looking for, so the local it binds counts.
+    """
     names = {"self"} if path.name == "server_args.py" else {"server_args"}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -123,13 +149,39 @@ def _server_args_names(tree, path):
                 continue
             if text == "ServerArgs":
                 names.add(arg.arg)
+    # `cfg = resolving_view(server_args)` / `resolved_view(server_args)`
+    for _ in range(2):  # a view over a view-holding local is still one
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            bare = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in ("resolving_view", "resolved_view")
+                and value.args
+                and isinstance(value.args[0], ast.Name)
+                and value.args[0].id in names
+            )
+            # `resolved = self._resolved()` is the same view, spelled as the
+            # record's own member.
+            member = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "_resolved"
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in names
+            )
+            if not (bare or member):
+                continue
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
     return names
 
 
 def _constructor_reads():
     """Fields `ModelConfig.from_server_args` takes off the record."""
     path = _SRT / "configs/model_config.py"
-    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+    tree = _parsed(path)
     constructor = next(
         node
         for node in ast.walk(tree)
@@ -172,12 +224,13 @@ def _late_resolution_fields():
     for name in (
         "server_args.py",
         "arg_groups/overrides.py",
-        "utils/template_detection.py",
+        "parser/template_detection.py",
     ):
         path = _SRT / name
-        if not path.exists():
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+        # A named file that moved away has to be loud; skipping it silently
+        # leaves the scan believing it read a module it never opened.
+        assert path.exists(), f"{name} is not where this scan looks for it"
+        tree = _parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -205,7 +258,7 @@ def _hook_declarations(dispatch, source_module):
     `test_every_opaque_callback_is_still_late`.
     """
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -225,22 +278,14 @@ def _hook_declarations(dispatch, source_module):
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             continue
-        for inner in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "declare_resolution"
-            ):
-                for keyword in inner.keywords:
-                    if keyword.arg:
-                        out[keyword.arg] = max(out.get(keyword.arg, 0), node.lineno)
+        for field in _declared_resolution_fields(path):
+            out[field] = max(out.get(field, 0), node.lineno)
     return out
 
 
 def _pipeline():
     """(ordered steps, {step: methods it reaches}) for the resolution dispatch."""
-    source = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
-    tree = ast.parse(source)
+    tree = _parsed(_SRT / "server_args.py")
     record = next(
         node
         for node in tree.body
@@ -305,7 +350,7 @@ def _opaque_callback_positions(dispatch, source_module):
     it.
     """
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -349,7 +394,7 @@ def _opaque_callback_positions(dispatch, source_module):
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             continue
-        for spelling in callbacks_in(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        for spelling in callbacks_in(_parsed(path)):
             positions[spelling] = min(positions.get(spelling, 10**9), node.lineno)
     return positions
 
@@ -392,7 +437,7 @@ def _declaration_positions():
 
     source_module = _SRT / "server_args.py"
     imported = {}
-    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+    for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 imported[alias.asname or alias.name] = node.module
@@ -405,15 +450,7 @@ def _declaration_positions():
         path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
         if not path.exists():
             return frozenset()
-        fields = set()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "declare_resolution"
-            ):
-                fields |= {kw.arg for kw in node.keywords if kw.arg}
-        return frozenset(fields)
+        return _declared_resolution_fields(path)
 
     declared_at = {}
     for index, step in enumerate(steps):
