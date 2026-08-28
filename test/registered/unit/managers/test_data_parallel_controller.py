@@ -88,6 +88,16 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_tokens, [150, 80])
 
+    def test_maps_num_active_tokens(self):
+        budget = DPBudget(dp_size=2)
+        budget.update_budget(
+            [
+                _load(dp_rank=0, timestamp=1.0, num_active_tokens=120),
+                _load(dp_rank=1, timestamp=1.0, num_active_tokens=80),
+            ]
+        )
+        self.assertEqual(budget.active_tokens, [120, 80])
+
     def test_partial_update_only_affects_reported_rank(self):
         budget = DPBudget(dp_size=3)
         budget.update_budget(
@@ -157,6 +167,13 @@ class TestDPBudgetDispatch(CustomTestCase):
         self.assertEqual(
             rank, 1, "tie on total_tokens should fall back to min total_requests"
         )
+
+    def test_active_tokens_dispatch_applies_estimated_tokens(self):
+        budget = DPBudget(dp_size=3)
+        budget.active_tokens = [100, 50, 200]
+        rank = budget.dispatch(LoadBalanceMethod.ACTIVE_TOKENS, estimated_tokens=30)
+        self.assertEqual(rank, 1)
+        self.assertEqual(budget.active_tokens[1], 80)
 
     def test_dispatch_returns_none_for_methods_not_handled(self):
         """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget

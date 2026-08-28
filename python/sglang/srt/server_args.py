@@ -1129,6 +1129,7 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "active_tokens",
             ],
         ),
         NS("parallel"),

@@ -92,6 +92,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    ACTIVE_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -107,6 +108,7 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
     def update_budget(self, loads):
@@ -119,15 +121,23 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.active_tokens[load.dp_rank] = load.num_active_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
-        elif method == LoadBalanceMethod.TOTAL_TOKENS:
-            # Use total_requests as a tie-breaker when total_tokens are equal
+        elif method in (
+            LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.ACTIVE_TOKENS,
+        ):
+            tokens = (
+                self.total_tokens
+                if method == LoadBalanceMethod.TOTAL_TOKENS
+                else self.active_tokens
+            )
             target_rank = min(
                 range(self.dp_size),
-                key=lambda i: (self.total_tokens[i], self.total_requests[i]),
+                key=lambda i: (tokens[i], self.total_requests[i]),
             )
         else:
             return None
@@ -135,6 +145,7 @@ class DPBudget:
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
+        self.active_tokens[target_rank] += estimated_tokens
         return target_rank
 
 
@@ -169,11 +180,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.ACTIVE_TOKENS: self.active_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.ACTIVE_TOKENS,
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -803,6 +816,14 @@ class DataParallelController:
         estimated_tokens = len(req.input_ids)
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
+        )
+        sock_send(self.workers[target_worker], req)
+
+    def active_tokens_scheduler(self, req: Req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        target_worker = self.dp_budget.dispatch(
+            LoadBalanceMethod.ACTIVE_TOKENS, estimated_tokens=len(req.input_ids)
         )
         sock_send(self.workers[target_worker], req)
 
