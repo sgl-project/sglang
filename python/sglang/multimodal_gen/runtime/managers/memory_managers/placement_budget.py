@@ -76,7 +76,9 @@ def _dominates(candidate: _State, other: _State) -> bool:
     return (
         candidate[1] >= other[1]
         and all(left <= right for left, right in zip(candidate[0], other[0]))
-        and all(left <= right for left, right in zip(candidate[2], other[2]))
+        # soft costs are summed and compared lexicographically by the final
+        # objective; this order is translation invariant across suffixes
+        and candidate[2] <= other[2]
     )
 
 

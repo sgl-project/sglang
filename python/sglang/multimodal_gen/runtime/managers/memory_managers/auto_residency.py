@@ -87,9 +87,10 @@ MIN_VRAM_RESERVE_BYTES = 4 * GIB_BYTES
 MAX_VRAM_RESERVE_FRACTION = 0.20
 
 # A feasible placement is not automatically useful. Predictions inside this
-# interval are treated as latency-equivalent, then the joint optimizer chooses
-# the option with the lowest additional VRAM and HostPin use. The raw estimate
-# is already an upper bound: transfer time is capped by the measured request.
+# interval are treated as latency-equivalent. The joint optimizer then avoids
+# changing strategy, minimizes device memory, preserves the faster estimate,
+# and finally minimizes HostPin. The raw estimate is already an upper bound:
+# transfer time is capped by the measured request.
 ESTIMATED_PINNED_H2D_BYTES_PER_SECOND = 24 * GIB_BYTES
 MIN_LATENCY_EQUIVALENCE_NS = 50_000_000
 MAX_LATENCY_EQUIVALENCE_NS = 100_000_000
@@ -1020,6 +1021,7 @@ def _layerwise_pin_targets(
     uses_per_streamed_layer: int,
     layer_uses: tuple[tuple[int, ...], ...] | None = None,
     constrain_host_transitions: bool = True,
+    maximum_utility_only: bool = False,
 ) -> list[tuple[tuple[int, ...], ...]]:
     """Pareto-optimal HostPin targets for one resident-layer placement.
 
@@ -1033,6 +1035,37 @@ def _layerwise_pin_targets(
         layer_uses=layer_uses,
         fallback_uses=uses_per_streamed_layer,
     )
+    if maximum_utility_only:
+        target = []
+        for manager, resident_count, manager_uses in zip(
+            managers, resident_layers, resolved_uses
+        ):
+            if not manager.pin_cpu_memory:
+                target.append(())
+                continue
+            streamed = set(
+                compute_streamed_layers(
+                    num_layers=manager.num_layers,
+                    resident_layers=resident_count,
+                    policy=manager.residency_policy,
+                )
+            )
+            transfer_bytes = manager.layer_weight_bytes()
+            target.append(
+                tuple(
+                    layer_idx
+                    for layer_idx in manager.pinnable_layer_indices()
+                    if (
+                        manager_uses[layer_idx]
+                        if layer_idx in streamed
+                        else min(1, manager_uses[layer_idx])
+                    )
+                    * transfer_bytes.get(layer_idx, 0)
+                    > 0
+                )
+            )
+        return [tuple(target)]
+
     current = [set(indices) for indices in current_pinned_layers]
     current_bytes = 0
     grouped: dict[tuple[int, int, int, bool], list[tuple[int, int]]] = {}
@@ -1494,6 +1527,8 @@ def collect_residency_targets(
     used_components: Iterable[str] | None = None,
     layerwise_layer_uses: Mapping[str, Mapping[str, tuple[int, ...]]] | None = None,
     host_transition_headroom_bytes: int | None = None,
+    host_pin_headroom_bytes: int | None = None,
+    request_duration_ns: int = 0,
 ) -> list[ResidencyTarget]:
     """Build complete target-state frontiers for auto-managed components.
 
@@ -1501,6 +1536,12 @@ def collect_residency_targets(
     but its transfer utility is absolute within the component's frontier.
     Including the current and lower-memory states lets later calibration rounds
     replace an earlier choice instead of being limited to monotonic upgrades.
+
+    When both host constraints provably cannot bind and the request-duration
+    cap cannot flatten transfer utility, every pin subset except the unique
+    maximum-utility one is dominated under the solver's latency-first ordering.
+    Only that exact condition permits collapsing the HostPin frontier; otherwise
+    every Pareto-relevant subset remains available to the joint optimizer.
     """
     custom_names = set(custom_strategy_names)
     mixed_dtype_names = set(mixed_dtype_components)
@@ -1509,7 +1550,11 @@ def collect_residency_targets(
     if baseline_residency_mode_of is None:
         baseline_residency_mode_of = residency_mode_of
     constrain_host_transitions = True
-    if host_transition_headroom_bytes is not None:
+    constrain_host_pin = True
+    if (
+        host_transition_headroom_bytes is not None
+        or host_pin_headroom_bytes is not None
+    ):
         seen_managers: set[int] = set()
         maximum_unpin_bytes = 0
         maximum_pin_bytes = 0
@@ -1531,9 +1576,12 @@ def collect_residency_targets(
                     for layer_idx in manager.pinnable_layer_indices()
                     if layer_idx not in pinned
                 )
-        constrain_host_transitions = max(maximum_unpin_bytes, maximum_pin_bytes) > max(
-            0, host_transition_headroom_bytes
-        )
+        if host_transition_headroom_bytes is not None:
+            constrain_host_transitions = max(
+                maximum_unpin_bytes, maximum_pin_bytes
+            ) > max(0, host_transition_headroom_bytes)
+        if host_pin_headroom_bytes is not None:
+            constrain_host_pin = maximum_pin_bytes > max(0, host_pin_headroom_bytes)
     candidates = []
     for name in sorted(modules):
         module = modules[name]
@@ -1729,6 +1777,15 @@ def collect_residency_targets(
         maximum_transfer_work = max(
             layerwise_maximum_transfer_work, component_transfer_work
         )
+        pin_utility_cannot_saturate = (
+            request_duration_ns > 0
+            and int(
+                maximum_transfer_work
+                / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+                * 1_000_000_000
+            )
+            <= request_duration_ns
+        )
 
         empty_resident_layers = tuple(0 for _ in managers)
         empty_pinned_layers = tuple(() for _ in managers)
@@ -1785,10 +1842,24 @@ def collect_residency_targets(
                     uses_per_streamed_layer=uses_per_request,
                     layer_uses=layer_uses,
                     constrain_host_transitions=constrain_host_transitions,
+                    maximum_utility_only=(
+                        not constrain_host_transitions
+                        and not constrain_host_pin
+                        and pin_utility_cannot_saturate
+                    ),
                 )
                 if allow_host_pin_reallocation
                 else [current_pinned_layers]
             )
+            if (
+                target_resident_layers == current_resident_layers
+                and current_pinned_layers not in pin_targets
+            ):
+                # relative utility is anchored to the measured placement; keep
+                # that exact state when non-binding host resources allow
+                # every other pin subset to collapse to its maximum-utility
+                # representative
+                pin_targets.append(current_pinned_layers)
             for target_pinned_layers in pin_targets:
                 target_pinned_bytes = sum(
                     sum(
@@ -2459,24 +2530,30 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 resource_deltas[f"hostram:{prefix}:materialize"] = (
                     rank_candidate.host_materialize_scratch_bytes
                 )
+        estimated_latency_savings = (
+            min(
+                report.candidate_latency_savings_ns.get(candidate.option_key(), 0)
+                for report in timed_reports
+            )
+            if use_latency_utility
+            else candidate.h2d_bytes_per_request
+        )
         options.append(
             PlacementOption(
                 group_key=candidate.component_name,
                 option_key=candidate.option_key(),
                 resource_delta_bytes=resource_deltas,
-                estimated_latency_savings=(
-                    min(
-                        report.candidate_latency_savings_ns.get(
-                            candidate.option_key(), 0
-                        )
-                        for report in timed_reports
-                    )
-                    if use_latency_utility
-                    else candidate.h2d_bytes_per_request
-                ),
+                estimated_latency_savings=estimated_latency_savings,
                 placement_cost_bytes=(
+                    (
+                        0
+                        if candidate.current_placement
+                        or candidate.target_mode() == candidate.residency_mode
+                        else 1
+                    ),
                     candidate.target_device_weight_bytes
                     or max(0, candidate.target_resident_weight_bytes),
+                    -estimated_latency_savings,
                     candidate.target_pinned_host_bytes
                     or max(0, candidate.pinned_host_delta_bytes),
                 ),

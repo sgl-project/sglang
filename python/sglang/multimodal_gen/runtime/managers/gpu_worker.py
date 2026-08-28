@@ -1266,7 +1266,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             num_inference_steps=(
                 workload.num_inference_steps if workload is not None else 1
             ),
-            allow_host_pin_reallocation=self.server_args.num_gpus == 1,
+            # this hint only consumes permanent-residency targets; HostPin
+            # alternatives cannot change its answer
+            allow_host_pin_reallocation=False,
             mixed_dtype_components=self._mixed_dtype_residency_components(),
         )
 
@@ -1663,6 +1665,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
         )
+        measured_request_duration_ns, _, _ = estimate_default_workload_timing(
+            records=records,
+            target_units=target_units,
+            target_num_inference_steps=workload.num_inference_steps,
+        )
+        reference_request_duration_ns = self.__dict__.get(
+            "_auto_residency_reference_request_duration_ns"
+        )
+        if reference_request_duration_ns is None and measured_request_duration_ns > 0:
+            reference_request_duration_ns = measured_request_duration_ns
+            self._auto_residency_reference_request_duration_ns = (
+                reference_request_duration_ns
+            )
+        estimated_request_duration_ns = (
+            reference_request_duration_ns or measured_request_duration_ns
+        )
         # What this process may still grow into: free VRAM plus what its
         # allocator already reserved. Unlike the raw device total, this
         # excludes memory held by other processes on a shared GPU.
@@ -1679,6 +1697,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         host_transition_headroom_bytes = (
             max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
             // local_worker_count
+        )
+        pinned_host_bytes = (
+            layerwise_pinned_host_bytes(self.pipeline.modules)
+            if include_candidates
+            else 0
+        )
+        host_pin_capacity_bytes = (
+            layerwise_host_pin_capacity_bytes(self.pipeline.modules)
+            if include_candidates
+            else 0
         )
         candidates = []
         if include_candidates:
@@ -1706,6 +1734,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 ),
                 layerwise_layer_uses=layerwise_layer_uses,
                 host_transition_headroom_bytes=host_transition_headroom_bytes,
+                host_pin_headroom_bytes=max(
+                    0, host_pin_capacity_bytes - pinned_host_bytes
+                ),
+                request_duration_ns=estimated_request_duration_ns,
             )
             candidates_by_component: dict[str, int] = {}
             for candidate in candidates:
@@ -1717,22 +1749,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 time.perf_counter() - candidate_started,
                 candidates_by_component,
             )
-        measured_request_duration_ns, _, _ = estimate_default_workload_timing(
-            records=records,
-            target_units=target_units,
-            target_num_inference_steps=workload.num_inference_steps,
-        )
-        reference_request_duration_ns = self.__dict__.get(
-            "_auto_residency_reference_request_duration_ns"
-        )
-        if reference_request_duration_ns is None and measured_request_duration_ns > 0:
-            reference_request_duration_ns = measured_request_duration_ns
-            self._auto_residency_reference_request_duration_ns = (
-                reference_request_duration_ns
-            )
-        estimated_request_duration_ns = (
-            reference_request_duration_ns or measured_request_duration_ns
-        )
         candidate_latency_savings_ns = (
             estimate_candidate_latency_savings_ns(
                 candidates=candidates,
@@ -1761,16 +1777,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 else {}
             ),
             node_rank=self.server_args.node_rank,
-            pinned_host_bytes=(
-                layerwise_pinned_host_bytes(self.pipeline.modules)
-                if include_candidates
-                else 0
-            ),
-            host_pin_capacity_bytes=(
-                layerwise_host_pin_capacity_bytes(self.pipeline.modules)
-                if include_candidates
-                else 0
-            ),
+            pinned_host_bytes=pinned_host_bytes,
+            host_pin_capacity_bytes=host_pin_capacity_bytes,
             host_transition_headroom_bytes=(
                 host_transition_headroom_bytes if include_candidates else 0
             ),
