@@ -1230,9 +1230,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().set_hicache_enabled());
     }
 
+    /// Whether the host tier (HiCache) is wired.
+    fn enable_hicache(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().enable_hicache)
+    }
+
     /// Mark the SWA host pool as wired (HiCache).
     fn set_has_swa_host_pool(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().set_has_swa_host_pool());
+    }
+
+    /// Whether the SWA host pool is wired.
+    fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().has_swa_host_pool)
     }
 
     /// Insert a host-side (backuped) tree path descending from the given node.
@@ -1553,14 +1563,29 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().is_write_back = is_write_back);
     }
 
+    /// The current write-back (vs write-through) policy.
+    fn is_write_back(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().is_write_back)
+    }
+
     /// Set the write-through backup hit threshold; decided at HiCache init.
     fn set_write_through_threshold(&self, py: Python<'_>, threshold: i64) {
         py.allow_threads(|| self.core().write_through_threshold = threshold);
     }
 
+    /// The current write-through backup hit threshold.
+    fn write_through_threshold(&self, py: Python<'_>) -> i64 {
+        py.allow_threads(|| self.core().write_through_threshold)
+    }
+
     /// Mark the storage tier (L3) wired; storage attaches after tree construction.
     fn set_enable_storage(&self, py: Python<'_>, value: bool) {
         py.allow_threads(|| self.core().set_enable_storage(value));
+    }
+
+    /// Whether the storage tier (L3) is wired.
+    fn enable_storage(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().enable_storage)
     }
 
     /// Queue the all-cleared placement event.
@@ -2292,9 +2317,19 @@ macro_rules! tree_core_binding {
                 self.inner.set_hicache_enabled(py)
             }
 
+            /// Whether the host tier (HiCache) is wired.
+            fn enable_hicache(&self, py: Python<'_>) -> bool {
+                self.inner.enable_hicache(py)
+            }
+
             /// Mark the SWA host pool as wired (HiCache).
             fn set_has_swa_host_pool(&self, py: Python<'_>) {
                 self.inner.set_has_swa_host_pool(py)
+            }
+
+            /// Whether the SWA host pool is wired.
+            fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
+                self.inner.has_swa_host_pool(py)
             }
 
             /// Insert a host-side (backuped) tree path descending from the given node.
@@ -2500,14 +2535,29 @@ macro_rules! tree_core_binding {
                 self.inner.set_is_write_back(py, is_write_back)
             }
 
+            /// The current write-back (vs write-through) policy.
+            fn is_write_back(&self, py: Python<'_>) -> bool {
+                self.inner.is_write_back(py)
+            }
+
             /// Set the write-through backup hit threshold; decided at HiCache init.
             fn set_write_through_threshold(&self, py: Python<'_>, threshold: i64) {
                 self.inner.set_write_through_threshold(py, threshold)
             }
 
+            /// The current write-through backup hit threshold.
+            fn write_through_threshold(&self, py: Python<'_>) -> i64 {
+                self.inner.write_through_threshold(py)
+            }
+
             /// Mark the storage tier (L3) wired; storage attaches after tree construction.
             fn set_enable_storage(&self, py: Python<'_>, value: bool) {
                 self.inner.set_enable_storage(py, value)
+            }
+
+            /// Whether the storage tier (L3) is wired.
+            fn enable_storage(&self, py: Python<'_>) -> bool {
+                self.inner.enable_storage(py)
             }
 
             /// Queue the all-cleared placement event.

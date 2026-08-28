@@ -313,11 +313,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
-        self._enable_hicache = False
-        self._has_swa_host_pool = False
-        self._enable_storage = False
-        self._write_through_threshold = 256
-        self._is_write_back = False
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -340,9 +335,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             TreeCoreInitParamsBinding(
                 eviction_policy=params.eviction_policy,
                 page_size=params.page_size,
-                is_write_back=self.is_write_back,
-                enable_hicache=self.enable_hicache,
-                write_through_threshold=self._write_through_threshold,
+                is_write_back=False,
+                enable_hicache=False,
+                write_through_threshold=256,
                 device=str(self.device),
                 swa_sliding_window_size=params.sliding_window_size,
                 enable_kv_cache_events=params.enable_kv_cache_events,
@@ -643,7 +638,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     # ==== HiCache ====
 
     def set_hicache_enabled(self) -> None:
-        self._enable_hicache = True
         self._binding.set_hicache_enabled()
 
     @property
@@ -653,49 +647,44 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     @property
     def enable_hicache(self) -> bool:
-        # Read-only: set_hicache_enabled is the single enable path.
-        return self._enable_hicache
+        return self._binding.enable_hicache()
 
     @property
     def has_swa_host_pool(self) -> bool:
-        return self._has_swa_host_pool
+        return self._binding.has_swa_host_pool()
 
     @has_swa_host_pool.setter
     def has_swa_host_pool(self, value: bool) -> None:
         # The Rust core has no unset path; reject a True -> False transition.
-        assert value or not self._has_swa_host_pool
-        self._has_swa_host_pool = value
+        assert value or not self.has_swa_host_pool
         if value:
             self._binding.set_has_swa_host_pool()
 
     @property
     def write_through_threshold(self) -> int:
-        return self._write_through_threshold
+        return self._binding.write_through_threshold()
 
     @write_through_threshold.setter
     def write_through_threshold(self, value: int) -> None:
         # The cache assigns tree_core.write_through_threshold at HiCache init.
-        self._write_through_threshold = value
         self._binding.set_write_through_threshold(value)
 
     @property
     def is_write_back(self) -> bool:
-        return self._is_write_back
+        return self._binding.is_write_back()
 
     @is_write_back.setter
     def is_write_back(self, value: bool) -> None:
         # The cache assigns tree_core.is_write_back at HiCache init; forward it.
-        self._is_write_back = value
         self._binding.set_is_write_back(value)
 
     @property
     def enable_storage(self) -> bool:
-        return self._enable_storage
+        return self._binding.enable_storage()
 
     @enable_storage.setter
     def enable_storage(self, value: bool) -> None:
         # The cache assigns tree_core.enable_storage at storage init; forward it.
-        self._enable_storage = value
         self._binding.set_enable_storage(value)
 
     def insert_host(

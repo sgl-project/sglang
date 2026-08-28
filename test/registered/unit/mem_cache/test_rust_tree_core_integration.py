@@ -256,6 +256,22 @@ def test_insert_suspends_at_a_backup_barrier_through_the_binding():
     core.sanity_check([], [])
 
 
+def test_configuration_reads_the_locked_rust_state():
+    core = _tree_core()
+    core._binding.set_hicache_enabled()
+    core._binding.set_is_write_back(True)
+    core._binding.set_write_through_threshold(7)
+    core._binding.set_enable_storage(True)
+    assert core.enable_hicache is True
+    assert core.is_write_back is True
+    assert core.write_through_threshold == 7
+    assert core.enable_storage is True
+
+    swa_core = _swa_tree_core()
+    swa_core._binding.set_has_swa_host_pool()
+    assert swa_core.has_swa_host_pool is True
+
+
 def test_sanity_check_passes_after_the_full_flow():
     core = _tree_core()
     _insert(core, [1, 2, 3], [10, 11, 12])
