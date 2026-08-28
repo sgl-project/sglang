@@ -14,7 +14,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
@@ -31,7 +31,7 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
     return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
 
 
-if _is_cuda:
+if _is_cuda or is_hip():
 
     def _scale_head_gate_graph_fake_impl(
         weights_raw: torch.Tensor,
