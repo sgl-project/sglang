@@ -863,15 +863,39 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    def dispatch_generate_burst(self, requests):
+        """Dispatch an already-ready request burst with longest inputs first."""
+        if self.refresh_load_budget_on_dispatch:
+            self.refresh_load_budget()
+        for req in sorted(requests, key=lambda req: len(req.input_ids), reverse=True):
+            self.dispatching_with_trace(req, refresh_load_budget=False)
+
     def event_loop(self):
         while True:
-            while True:
+            ready_requests = []
+            while len(ready_requests) < self._active_count_cache:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
+                    ready_requests.append(
+                        sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
+                    )
                 except zmq.ZMQError:
                     break
+
+            generate_burst = []
+            for recv_req in ready_requests:
+                if self.load_balance_method in (
+                    LoadBalanceMethod.ACTIVE_TOKENS,
+                    LoadBalanceMethod.ROUTER_HINT_ACTIVE_TOKENS,
+                ) and isinstance(recv_req, TokenizedGenerateReqInput):
+                    generate_burst.append(recv_req)
+                    continue
+                if generate_burst:
+                    self.dispatch_generate_burst(generate_burst)
+                    generate_burst = []
                 self._request_dispatcher(recv_req)
+            if generate_burst:
+                self.dispatch_generate_burst(generate_burst)
 
 
 def run_data_parallel_controller_process(

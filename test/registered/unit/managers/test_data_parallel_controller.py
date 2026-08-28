@@ -300,6 +300,27 @@ class TestRouterHintActiveTokensScheduler(CustomTestCase):
         self.assertEqual(ctl.dp_budget.total_requests, [4, 4, 4, 4])
 
 
+class TestRouterHintActiveTokenBurst(CustomTestCase):
+    def test_dispatches_ready_requests_by_descending_input_length(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.refresh_load_budget_on_dispatch = True
+        ctl.refresh_load_budget = MagicMock()
+        ctl.dispatching_with_trace = MagicMock()
+        requests = [
+            _req(input_ids=[1]),
+            _req(input_ids=[1, 2, 3]),
+            _req(input_ids=[1, 2]),
+        ]
+
+        ctl.dispatch_generate_burst(requests)
+
+        ctl.refresh_load_budget.assert_called_once_with()
+        self.assertEqual(
+            [call.args[0] for call in ctl.dispatching_with_trace.call_args_list],
+            [requests[1], requests[2], requests[0]],
+        )
+
+
 class TestStatusAwarenessInconsistency(CustomTestCase):
     """Document a divergence: ``round_robin_scheduler`` skips workers whose
     ``status`` is False, but ``total_requests_scheduler`` /
