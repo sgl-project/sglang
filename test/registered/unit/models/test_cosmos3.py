@@ -21,7 +21,6 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
 
 import safetensors.torch
 import torch
@@ -30,6 +29,7 @@ from sglang.srt.configs import Cosmos3Config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -251,6 +251,14 @@ class TestCosmos3MropeIndex(CustomTestCase):
 class TestAllowPatternsOverrides(CustomTestCase):
     """Validate DefaultModelLoader subfolder globbing for diffusers layouts."""
 
+    def setUp(self):
+        # Publish a default config so _prepare_weights reads real bags; the
+        # default model_checksum=None skips checksum verification.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        self.loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.AUTO))
+
     def _make_checkpoint(self, root):
         os.makedirs(os.path.join(root, "transformer"))
         os.makedirs(os.path.join(root, "vision_encoder"))
@@ -267,13 +275,10 @@ class TestAllowPatternsOverrides(CustomTestCase):
             os.path.join(root, "vision_encoder", "model.safetensors"),
         )
 
-    @patch("sglang.srt.model_loader.loader.get_global_server_args")
-    def test_override_selects_transformer_subfolder(self, mock_gsa):
-        mock_gsa.return_value = MagicMock(model_checksum=None)
-        loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.AUTO))
+    def test_override_selects_transformer_subfolder(self):
         with tempfile.TemporaryDirectory() as root:
             self._make_checkpoint(root)
-            _, files, use_safetensors = loader._prepare_weights(
+            _, files, use_safetensors = self.loader._prepare_weights(
                 root, None, True, ["transformer/*.safetensors"]
             )
             self.assertTrue(use_safetensors)
@@ -282,25 +287,19 @@ class TestAllowPatternsOverrides(CustomTestCase):
                 files[0].endswith("transformer/diffusion_pytorch_model.safetensors")
             )
 
-    @patch("sglang.srt.model_loader.loader.get_global_server_args")
-    def test_override_selects_vision_subfolder(self, mock_gsa):
-        mock_gsa.return_value = MagicMock(model_checksum=None)
-        loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.AUTO))
+    def test_override_selects_vision_subfolder(self):
         with tempfile.TemporaryDirectory() as root:
             self._make_checkpoint(root)
-            _, files, _ = loader._prepare_weights(
+            _, files, _ = self.loader._prepare_weights(
                 root, None, True, ["vision_encoder/*.safetensors"]
             )
             self.assertEqual(len(files), 1)
             self.assertTrue(files[0].endswith("vision_encoder/model.safetensors"))
 
-    @patch("sglang.srt.model_loader.loader.get_global_server_args")
-    def test_no_override_globs_repo_root(self, mock_gsa):
-        mock_gsa.return_value = MagicMock(model_checksum=None)
-        loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.AUTO))
+    def test_no_override_globs_repo_root(self):
         with tempfile.TemporaryDirectory() as root:
             self._make_checkpoint(root)
-            _, files, _ = loader._prepare_weights(root, None, True)
+            _, files, _ = self.loader._prepare_weights(root, None, True)
             # Without an override only the root-level file is discovered.
             self.assertEqual(
                 [os.path.basename(f) for f in files], ["model.safetensors"]
