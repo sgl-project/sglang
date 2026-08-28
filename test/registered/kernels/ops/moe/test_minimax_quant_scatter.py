@@ -1,6 +1,7 @@
 import random
 import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -206,6 +207,18 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
         "use_symmetric_memory",
         lambda *args, **kwargs: nullcontext(),
     )
+    monkeypatch.setattr(
+        deep_gemm_runner.deep_gemm_wrapper,
+        "get_contiguous_layout_alignment",
+        lambda expected_m, num_groups: 32,
+    )
+    monkeypatch.setattr(
+        deep_gemm_runner,
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False)
+        ),
+    )
 
     # UE8M0 packs four 128-wide scale groups into each int32. Use the smallest
     # legal K for both the gate/up and down GEMMs.
@@ -311,6 +324,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
         return (
             runner_input.use_masked_gemm,
             running_state.get("all_tokens"),
+            running_state.get("contiguous_layout_alignment"),
             runner_input.m_indices,
             post_permute_deep_gemm_to_standard(
                 runner_output,
@@ -320,18 +334,28 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
             ).hidden_states,
         )
 
-    compact_is_masked, compact_all_tokens, compact_m_indices, compact_output = (
-        run_with_layout("compact")
-    )
-    masked_is_masked, masked_all_tokens, masked_m_indices, masked_output = (
-        run_with_layout("masked")
-    )
+    (
+        compact_is_masked,
+        compact_all_tokens,
+        compact_alignment,
+        compact_m_indices,
+        compact_output,
+    ) = run_with_layout("compact")
+    (
+        masked_is_masked,
+        masked_all_tokens,
+        masked_alignment,
+        masked_m_indices,
+        masked_output,
+    ) = run_with_layout("masked")
     torch.cuda.synchronize()
 
     assert not compact_is_masked
     assert masked_is_masked
-    assert compact_all_tokens == 256
+    assert compact_all_tokens == 64
+    assert compact_alignment == 32
     assert masked_all_tokens is None
+    assert masked_alignment is None
     assert masked_m_indices is None
     valid_assignments = topk_ids[topk_ids >= 0]
     assert torch.equal(

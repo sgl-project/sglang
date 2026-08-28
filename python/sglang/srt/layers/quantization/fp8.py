@@ -1953,6 +1953,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
                 w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_runner_backend().is_cutlass():
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2507,6 +2512,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=use_mxfp8,
                 output=symm_output,
                 enable_es=(use_mxfp8, use_mxfp8),
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
             )
             return StandardCombineInput(hidden_states=output)
 

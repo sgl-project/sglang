@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
@@ -13,6 +14,54 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+
+
+class TestMxfp8MoeScaleLayout(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+
+    def test_cutlass_serialized_scales_remain_expert_first(self):
+        class CutlassBackend:
+            def is_cutlass(self):
+                return True
+
+            def is_flashinfer_trtllm(self):
+                return False
+
+            def is_flashinfer_trtllm_routed(self):
+                return False
+
+            def is_deep_gemm(self):
+                return False
+
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                torch.zeros((2, 64, 32), dtype=torch.float8_e4m3fn, device="cuda")
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros((2, 32, 32), dtype=torch.float8_e4m3fn, device="cuda")
+            ),
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros((2, 64, 1), dtype=torch.uint8, device="cuda"),
+                requires_grad=False,
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.zeros((2, 32, 1), dtype=torch.uint8, device="cuda"),
+                requires_grad=False,
+            ),
+        )
+        method = object.__new__(Fp8MoEMethod)
+
+        with patch(
+            "sglang.srt.layers.quantization.fp8.get_moe_runner_backend",
+            return_value=CutlassBackend(),
+        ):
+            method._process_mxfp8_moe_weights(layer, quantize=False)
+
+        self.assertEqual(tuple(layer.w13_weight_scale_inv.shape), (2, 64, 1))
+        self.assertEqual(tuple(layer.w2_weight_scale_inv.shape), (2, 32, 1))
 
 
 class TestInverseTransformScaleUe8m0(CustomTestCase):

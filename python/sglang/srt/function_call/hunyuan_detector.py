@@ -129,7 +129,13 @@ class HunyuanDetector(BaseFormatDetector):
         self.tool_call_regex = re.compile(
             re.escape(tool_call)
             + r"(.*?)"
+            + r"(?:"
             + re.escape(tool_sep)
+            + r"|(?="
+            + re.escape(arg_key)
+            + r"|"
+            + re.escape(tc_end)
+            + r"))"
             + r"(.*?)"
             + re.escape(tc_end),
             re.DOTALL,
@@ -383,14 +389,22 @@ class HunyuanDetector(BaseFormatDetector):
                         self._in_tool_calls = False
                     break
 
-                sep_pos = self._buffer.find(self.tool_sep_token, tc_start)
-                if sep_pos == -1:
+                name_start = tc_start + len(self.tool_call_start_token)
+                boundaries = [
+                    (self._buffer.find(token, name_start), token)
+                    for token in (
+                        self.tool_sep_token,
+                        self.arg_key_start_token,
+                        self.tool_call_end_token,
+                    )
+                ]
+                boundaries = [(pos, token) for pos, token in boundaries if pos != -1]
+                if not boundaries:
                     self._buffer = self._buffer[tc_start:]
                     break
+                boundary_pos, boundary_token = min(boundaries, key=lambda item: item[0])
 
-                tool_name = self._buffer[
-                    tc_start + len(self.tool_call_start_token) : sep_pos
-                ].strip()
+                tool_name = self._buffer[name_start:boundary_pos].strip()
 
                 if (
                     tool_name not in self._tool_indices
@@ -413,7 +427,9 @@ class HunyuanDetector(BaseFormatDetector):
                     )
                 )
 
-                self._buffer = self._buffer[sep_pos + len(self.tool_sep_token) :]
+                if boundary_token == self.tool_sep_token:
+                    boundary_pos += len(boundary_token)
+                self._buffer = self._buffer[boundary_pos:]
 
             # Phase 2: stream argument JSON of the current tool.
             before_name = self._streaming_tool_name

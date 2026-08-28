@@ -1886,6 +1886,7 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -1900,6 +1901,10 @@ class DeepseekSparseAttnBackend(
             )
             else self.dsa_prefill_impl
         )
+        if attn_sink is not None and dsa_impl != "flashmla_sparse":
+            raise RuntimeError(
+                f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
+            )
 
         if dsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
@@ -2125,6 +2130,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2196,11 +2202,18 @@ class DeepseekSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
+
+        if attn_sink is not None and self.dsa_decode_impl != "flashmla_sparse":
+            raise RuntimeError(
+                "Learnable attention sinks require flashmla_sparse, got "
+                f"{self.dsa_decode_impl}"
+            )
 
         if self.dsa_decode_impl == "trtllm":
             return self._forward_trtllm(
@@ -2282,6 +2295,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+                attn_sink=attn_sink,
             )
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -2397,6 +2411,7 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
+        attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -2422,6 +2437,18 @@ class DeepseekSparseAttnBackend(
         else:
             q_input = q_all
 
+        sink_input = attn_sink
+        if need_padding and attn_sink is not None:
+            cache = getattr(self, "_sink_pad_cache", None)
+            if cache is None:
+                cache = self._sink_pad_cache = {}
+            key = (attn_sink.data_ptr(), required_padding)
+            sink_input = cache.get(key)
+            if sink_input is None:
+                sink_input = attn_sink.new_zeros(required_padding)
+                sink_input[:num_heads] = attn_sink
+                cache[key] = sink_input
+
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
@@ -2443,6 +2470,7 @@ class DeepseekSparseAttnBackend(
             indices=indices_input,
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            attn_sink=sink_input,
             topk_length=topk_length,
         )
 

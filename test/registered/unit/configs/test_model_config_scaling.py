@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.configs.model_config import ModelConfig, compute_mla_mscale_scaling
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -91,6 +92,31 @@ class TestInitMlaScaling(CustomTestCase):
     def test_no_rope_scaling_keeps_base(self):
         base, scaling = _mla_scaling(None)
         self.assertEqual(scaling, base)
+
+    def test_hyv4_shape_derivation_uses_rope_parameters(self):
+        hf_config = SimpleNamespace(
+            architectures=["HYV4ForCausalLM"],
+            model_type="hy_v4",
+            hidden_size=2816,
+            num_hidden_layers=34,
+            num_attention_heads=32,
+            vocab_size=120832,
+            head_dim=64,
+            v_head_dim=256,
+            kv_lora_rank=512,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            index_topk=2048,
+            index_head_dim=128,
+            rope_parameters={"rope_theta": 10_000_000, "rope_type": "default"},
+        )
+        config = ModelConfig.__new__(ModelConfig)
+        config.hf_config = hf_config
+        config.hf_text_config = hf_config
+
+        config._derive_model_shapes()
+
+        self.assertEqual(config.scaling, 1 / math.sqrt(256))
 
 
 if __name__ == "__main__":

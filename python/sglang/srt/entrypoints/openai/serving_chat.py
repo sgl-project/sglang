@@ -968,11 +968,13 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
-        reasoning_effort = (
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-            if request.chat_template_kwargs
-            else None
-        )
+        reasoning_effort = None
+        if not self._uses_hunyuan_reasoning_effort():
+            reasoning_effort = (
+                request.chat_template_kwargs.pop("reasoning_effort", None)
+                if request.chat_template_kwargs
+                else None
+            )
         if self.is_gpt_oss and reasoning_effort == "none":
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
@@ -1109,6 +1111,8 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        self._normalize_hunyuan_reasoning_effort(request)
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -2374,7 +2378,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return
 
         if self.reasoning_parser == "hunyuan":
-            request.reasoning_effort = "medium" if enabled else "no_think"
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                request.reasoning_effort = "high" if enabled else "no_think"
+            else:
+                request.reasoning_effort = "medium" if enabled else "no_think"
             return
 
         if self.reasoning_parser == "inkling":
@@ -2443,6 +2451,9 @@ class OpenAIServingChat(OpenAIServingBase):
             ) == "enabled"
 
         if self.reasoning_parser == "hunyuan":
+            config = self.template_manager.reasoning_config
+            if config is not None and config.special_case == "hunyuan_effort":
+                return request.reasoning_effort not in ("none", "no_think")
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.
@@ -2503,6 +2514,41 @@ class OpenAIServingChat(OpenAIServingBase):
         return (
             request.chat_template_kwargs is not None
             and request.chat_template_kwargs.get(config.toggle_param) is True
+        )
+
+    def _normalize_hunyuan_reasoning_effort(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        if not self._uses_hunyuan_reasoning_effort():
+            return
+
+        effort = request.reasoning_effort
+        if effort is None and request.chat_template_kwargs is not None:
+            effort = request.chat_template_kwargs.get("reasoning_effort")
+        if effort is None:
+            normalized_effort = "high"
+        elif effort in ("none", "no_think"):
+            normalized_effort = "no_think"
+        elif effort in ("minimal", "low"):
+            normalized_effort = "low"
+        elif effort in ("medium", "high", "xhigh", "max"):
+            normalized_effort = "high"
+        else:
+            raise ValueError(
+                "Hunyuan reasoning_effort must be one of none, minimal, low, "
+                "medium, high, xhigh, or max"
+            )
+
+        request.reasoning_effort = normalized_effort
+        if request.chat_template_kwargs is not None:
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+
+    def _uses_hunyuan_reasoning_effort(self) -> bool:
+        config = self.template_manager.reasoning_config
+        return (
+            self.reasoning_parser == "hunyuan"
+            and config is not None
+            and config.special_case == "hunyuan_effort"
         )
 
     async def _process_tool_call_stream(

@@ -780,6 +780,8 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "HYV4ForCausalLM",
+    "HYV4ForCausalLMNextN",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
@@ -793,7 +795,42 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
+    model_arch = (getattr(hf_config, "architectures", None) or [None])[0]
+    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+        if cfg.enable_prefill_cp:
+            raise ValueError(
+                "--enable-prefill-cp is not supported for HYV4 because its "
+                "attention path does not implement DSA context-parallel metadata "
+                f"and sharding. Got architecture={model_arch!r} and "
+                f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
+            )
+        if cfg.dcp_size > 1:
+            raise ValueError(
+                "--dcp-size > 1 is not supported for HYV4 because decode context "
+                "parallelism gathers query heads across DCP ranks but does not "
+                "provide single-owner semantics for learnable attention sinks. "
+                f"Got architecture={model_arch!r} and dcp_size={cfg.dcp_size!r}."
+            )
+
     overrides: Dict[str, Any] = {}
+
+    if model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+        quant_cfg = getattr(hf_config, "quantization_config", None) or {}
+        quant_algo = (quant_cfg.get("quantization") or {}).get("quant_algo", "")
+        if str(quant_algo).upper() == "MXFP8":
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            # auto would pick flashinfer_cutedsl (fp8 GEMM) or no deep_gemm at
+            # all (MoE, no a2a) — neither is the validated HYV4 MXFP8 path.
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                if cfg.moe_runner_backend == "auto":
+                    overrides["moe_runner_backend"] = "deep_gemm"
+                if cfg.fp8_gemm_runner_backend == "auto":
+                    overrides["fp8_gemm_runner_backend"] = "deep_gemm"
+                if overrides:
+                    logger.info(
+                        "HYV4 MXFP8: defaulting MoE/FP8 GEMM backends to deep_gemm."
+                    )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
@@ -1907,8 +1944,18 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
 
     kv_cache_dtype = view.kv_cache_dtype
+    has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
+    if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+        raise ValueError(
+            "Learnable DSA attention sinks require a bfloat16 KV cache; "
+            f"got kv_cache_dtype={kv_cache_dtype}."
+        )
     if kv_cache_dtype == "auto":
-        kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+        kv_cache_dtype = (
+            "bfloat16"
+            if has_attention_sinks
+            else "fp8_e4m3" if major >= 10 else "bfloat16"
+        )
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
         )
@@ -1976,6 +2023,27 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and not is_hip()
     )
 
+    if getattr(hf_config, "learnable_sink", False):
+        backend = "flashmla_sparse"
+        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+            value = getattr(view, field)
+            if value is not None and value != backend:
+                option = "--" + field.replace("_", "-")
+                raise ValueError(
+                    f"{model_arch} uses learnable attention sinks and requires "
+                    f"{option} {backend!r}; got {value!r}"
+                )
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = backend
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = backend
+        logger.warning(
+            "Set DSA backends for learnable attention sinks: "
+            f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
+            f"decode={declared.get('dsa_decode_backend', view.dsa_decode_backend)}."
+        )
+        return declared
+
     if is_glm_sm12_fp8:
         backend = "flashinfer_sparse_mla"
         if not user_set_prefill:
@@ -2040,6 +2108,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",

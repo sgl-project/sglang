@@ -974,6 +974,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
+            dcp_size=1,
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
@@ -1018,6 +1019,71 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertEqual(
             resolution_result(server_args, "dsa_prefill_cp_mode"), "round-robin-split"
         )
+
+    def test_hyv4_mxfp8_defaults_deep_gemm_backends(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+
+        hf_config = SimpleNamespace(
+            architectures=["HYV4ForCausalLM"],
+            quantization_config={
+                "quant_method": "modelopt",
+                "quantization": {"quant_algo": "MXFP8", "kv_cache_quant_algo": None},
+            },
+        )
+        server_args = self._new_cp_args(
+            moe_runner_backend="auto", fp8_gemm_runner_backend="auto"
+        )
+        with patch("sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", True):
+            result = _deepseek_family_overrides(server_args, hf_config)
+        self.assertEqual(result["moe_runner_backend"], "deep_gemm")
+        self.assertEqual(result["fp8_gemm_runner_backend"], "deep_gemm")
+
+    def test_hyv4_mxfp8_explicit_backend_choice_is_preserved(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+
+        hf_config = SimpleNamespace(
+            architectures=["HYV4ForCausalLM"],
+            quantization_config={
+                "quant_method": "modelopt",
+                "quantization": {"quant_algo": "MXFP8", "kv_cache_quant_algo": None},
+            },
+        )
+        server_args = self._new_cp_args(
+            moe_runner_backend="cutlass", fp8_gemm_runner_backend="flashinfer_cutedsl"
+        )
+        result = _deepseek_family_overrides(server_args, hf_config)
+        self.assertNotIn("moe_runner_backend", result)
+        self.assertNotIn("fp8_gemm_runner_backend", result)
+
+    def test_hyv4_bf16_keeps_auto_backends(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+
+        hf_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        server_args = self._new_cp_args(
+            moe_runner_backend="auto", fp8_gemm_runner_backend="auto"
+        )
+        result = _deepseek_family_overrides(server_args, hf_config)
+        self.assertNotIn("moe_runner_backend", result)
+        self.assertNotIn("fp8_gemm_runner_backend", result)
+
+    def test_hyv4_legacy_prefill_cp_aliases_are_rejected(self):
+        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+
+        hf_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
+        for alias in (
+            "enable_prefill_context_parallel",
+            "enable_dsa_prefill_context_parallel",
+        ):
+            with self.subTest(alias=alias):
+                server_args = self._new_cp_args(**{alias: True})
+                server_args._handle_legacy_cp_arguments()
+
+                # Legacy normalization is declarative: the raw canonical field
+                # stays false while the resolved view carries the effective true.
+                self.assertFalse(server_args.enable_prefill_cp)
+                self.assertTrue(resolution_result(server_args, "enable_prefill_cp"))
+                with self.assertRaisesRegex(ValueError, "--enable-prefill-cp.*HYV4"):
+                    _deepseek_family_overrides(server_args, hf_config)
 
     def test_canonical_interleave_cp_mirrors_to_dsa_runtime_aliases(self):
         server_args = self._new_cp_args(
@@ -2767,6 +2833,27 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+    def test_dsa_shared_indexer_types_raise(self):
+        args = self._args(enable_dp_attention=True)
+        hf_config = SimpleNamespace(
+            index_topk_freq=1,
+            index_topk_pattern=None,
+            indexer_types=["full", "shared"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "indexer_types"):
+            args._validate_dsa_tbo_index_sharing(hf_config)
+
+    def test_dsa_full_indexer_types_are_allowed(self):
+        args = self._args(enable_dp_attention=True)
+        hf_config = SimpleNamespace(
+            index_topk_freq=1,
+            index_topk_pattern=None,
+            indexer_types=["full", "full"],
+        )
+
+        args._validate_dsa_tbo_index_sharing(hf_config)
 
 
 class TestDcpKvEventContract(CustomTestCase):
