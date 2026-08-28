@@ -555,7 +555,7 @@ def handle_model_specific_adjustments(server_args: Any):
     # (arg_groups/overrides.py: _qwen3vl_overrides).
 
     # Hybrid-mamba radix cache handling for the per-arch branch call sites
-    # dissolved above: the resolution pass server_args-guards on the arch union
+    # dissolved above: the resolution pass self-guards on the arch union
     # (and the Granite layer_types probe), so one call covers them all.
     # Hybrid-spec archs already resolved at the pre-dispatch call above;
     # for them this re-invocation is an idempotent no-op plus validation.

@@ -512,8 +512,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
             "speculative_draft_attention_backend",
         }
 
-        # The handler lives in `arg_groups/serving_hook.py` now; the record
-        # keeps a slot that calls it, so the loop is looked up by either name.
+        # The handler lives in `arg_groups/serving_hook.py`, reached either as a
+        # record method or as a bare-name call, so look the loop up by both.
         def _deprecated_alias_handler():
             for node in ast.walk(sa_class):
                 if (
