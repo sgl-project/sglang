@@ -104,6 +104,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     make_layers,
     use_intel_amx_backend,
 )
@@ -126,6 +127,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -607,7 +609,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
     ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
+        if _is_xpu:
+            current_stream = torch.xpu.current_stream()
+            stream_ctx = torch.xpu.stream
+        else:
+            current_stream = torch.cuda.current_stream()
+            stream_ctx = torch.cuda.stream
         self.alt_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
@@ -633,7 +640,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        with stream_ctx(self.alt_stream):
             router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
@@ -1107,7 +1114,12 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        alt_stream = get_stream("alt") if _is_cuda else None
+        if _is_cuda:
+            alt_stream = get_stream("alt")
+        elif _is_xpu:
+            alt_stream = torch.xpu.Stream()
+        else:
+            alt_stream = None
         self.model = Qwen2MoeModel(
             config,
             quant_config,
