@@ -52,6 +52,25 @@ docker pull lmsysorg/sglang:qwen38flashnext
 docker pull lmsysorg/sglang-rocm:qwen38flashnext
 ```
 
+<Warning>
+This tag is a preview snapshot, not a build of any tagged release, and it is **BF16-only**. It carries a copy of [#36497](https://github.com/sgl-project/sglang/pull/36497) that predates the FP8 PLE weight-scale path, so the FP8 checkpoint aborts during weight load with an `ngram_embedding.weight_scale` assertion — that is [#36616](https://github.com/sgl-project/sglang/issues/36616). Build the image yourself (below) to run FP8 on AMD.
+</Warning>
+
+To build the ROCm image from source instead — which is what you want for FP8, and the only path that pins a revision you chose:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin pull/36497/head && git checkout FETCH_HEAD
+
+docker build -f docker/rocm.Dockerfile \
+  --build-arg GPU_ARCH=gfx950-rocm724 \
+  --build-arg BRANCH_TYPE=local \
+  -t sglang-rocm:qwen38flashnext-local .
+```
+
+`BRANCH_TYPE=local` builds the checkout you are standing in rather than cloning a branch, which is what makes a PR ref usable here. `GPU_ARCH=gfx950-rocm724` is the CDNA4 flavor both MI350X and MI355X use. The ROCm attention path is Triton and TileLang, both already in that Dockerfile, so no extra AITER branch is needed.
+
 For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
 
 </Tab>

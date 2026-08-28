@@ -645,6 +645,14 @@ export const config = {
     // attention backend with `--page-size 32`, and a 16384-token prefill chunk.
     // `--kv-cache-dtype auto` is stated rather than left off so the checkpoint's
     // own declaration is visibly what decides KV precision.
+    //
+    // Only the BF16 half of this shape is measured. The launch ROCm image
+    // (lmsysorg/sglang-rocm:qwen38flashnext) validated GSM8K on the BF16
+    // checkpoint at TP8; it was snapshotted before #36497 grew the FP8 PLE
+    // weight-scale path, so the FP8 checkpoint aborts during weight load on it
+    // (#36616). The FP8 cells keep the same flags — the shape is not what
+    // fails — but carry `in-progress` until a ROCm image built from a current
+    // #36497 measures them.
     {
       match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
@@ -666,7 +674,9 @@ export const config = {
     },
     {
       match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: true,
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "The ROCm launch image predates the FP8 PLE weight-scale path in PR #36497, so the FP8 checkpoint aborts during weight load on it with an ngram_embedding.weight_scale assertion (issue #36616). These flags are the measured BF16 shape; build the ROCm image from docker/rocm.Dockerfile against a current #36497 checkout to run FP8.",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -704,7 +714,9 @@ export const config = {
     },
     {
       match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: true,
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "The ROCm launch image predates the FP8 PLE weight-scale path in PR #36497, so the FP8 checkpoint aborts during weight load on it with an ngram_embedding.weight_scale assertion (issue #36616). These flags are the measured BF16 shape; build the ROCm image from docker/rocm.Dockerfile against a current #36497 checkout to run FP8.",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
