@@ -1214,27 +1214,54 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (self._publish(sa), self._leaf("attention_backend"))[1], declared_values[-1]
         )
 
-    def test_post_materialize_pass_writes_through(self):
+    def test_a_pass_after_resolution_declares_without_writing(self):
         from sglang.srt.arg_groups.overrides import run_post_process_pass
 
-        # A pass invoked after materialization (a post-init slot, like the
-        # legacy runner-side adjustments) declares AND writes through, so
-        # field readers and the publish see the same end state.
         sa = self._construct("LlamaForCausalLM", "llama")
-        resolved_before = self._resolved(sa, "attention_backend")
+        raw_before = sa.attention_backend
 
         def _force_triton(view):
-            if view.attention_backend != "triton":
-                return {"attention_backend": "triton"}
-            return {}
+            return {"attention_backend": "triton"}
 
         run_post_process_pass(sa, _force_triton)
-        if resolved_before != "triton":
-            self.assertEqual(self._resolved(sa, "attention_backend"), "triton")
+
+        self.assertEqual("triton", self._resolved(sa, "attention_backend"))
         self.assertEqual(
-            (self._publish(sa), self._leaf("attention_backend"))[1],
-            self._resolved(sa, "attention_backend"),
+            (self._publish(sa), self._leaf("attention_backend"))[1], "triton"
         )
+        self.assertEqual(
+            raw_before,
+            sa.attention_backend,
+            "the pass wrote the field, so the record stopped answering with the "
+            "operator's input",
+        )
+
+    def test_a_pass_that_declares_nothing_runs_on_the_published_record(self):
+        """A validation slot has to survive a rebuild on the same record.
+
+        `Engine.shutdown()` leaves the launch published, and `Engine(server_args=sa)`
+        with the same instance calls `check_server_args()` again before
+        republishing. `_hisparse_validation` reaches the pass runner from there
+        and returns nothing, so refusing on identity alone would fail the
+        second launch.
+        """
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.runtime_context import publish, reset_context
+
+        sa = self._construct("LlamaForCausalLM", "llama")
+        self.addCleanup(reset_context)
+        publish(sa, role="scheduler")
+
+        def _declares_nothing(view):
+            return {}
+
+        run_post_process_pass(sa, _declares_nothing)  # must not raise
+
+        def _declares_something(view):
+            return {"attention_backend": "triton"}
+
+        with self.assertRaisesRegex(ValueError, r"on the published config"):
+            run_post_process_pass(sa, _declares_something)
 
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
@@ -2117,6 +2144,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 disable_overlap_schedule=False,
                 page_size=None,
                 linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -2137,6 +2165,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # auto + overlap wanted + extra-buffer support -> extra_buffer
         self.assertEqual(
             _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM")),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("BailingMoeV3ForCausalLM")),
             {
                 "uses_mamba_radix_cache": True,
                 "mamba_radix_cache_strategy": "extra_buffer",
@@ -2202,6 +2237,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertFalse(
             supports_mamba_cache_extra_buffer(
                 SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+            )
+        )
+        self.assertTrue(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(
+                    linear_attn_backend="triton",
+                    linear_attn_prefill_backend="flashinfer",
+                ),
+                "Qwen3_5MoeForConditionalGeneration",
             )
         )
 
