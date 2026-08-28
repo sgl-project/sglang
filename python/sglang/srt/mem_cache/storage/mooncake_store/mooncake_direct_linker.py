@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
@@ -109,7 +110,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            server_args.hicache_storage_backend_extra_config
+            get_memory().hicache_storage_backend_extra_config
         )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -121,7 +122,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_mla_model=rank_replicated,
             enable_storage_metrics=False,
             is_page_first_layout=False,
-            model_name=server_args.model_path,
+            model_name=get_model().model_path,
             extra_config=extra_config,
         )
         if storage is None:

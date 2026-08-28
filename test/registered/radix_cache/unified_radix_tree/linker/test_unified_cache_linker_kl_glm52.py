@@ -2,11 +2,11 @@
 
 import json
 import os
-import random
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -23,11 +23,10 @@ register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-h200")
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
     page_size = 64
-    kl_threshold = 0.03
+    kl_threshold = 0.02
     sampling_temperature = 0
     max_new_tokens = 64
     prefix_len = 2048
-    input_len = 4096
     decode_hit_request_batch_size = 3
     decode_hit_inter_batch_delay_s = 0.5
 
@@ -45,7 +44,6 @@ class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
                 timeout=GLM52_LAUNCH_TIMEOUT,
                 other_args=[
                     "--trust-remote-code",
-                    "--skip-tokenizer-init",
                     "--tp-size",
                     "8",
                     "--page-size",
@@ -68,14 +66,13 @@ class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
                     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 },
             )
-            rng = random.Random(123)
-            cls.input_ids = [
-                [rng.randint(1, 30000) for _ in range(cls.input_len)] for _ in range(18)
-            ]
+            cls.input_ids = get_input_ids(cls.model, num_samples=18)
         except Exception:
-            if cls.process is not None:
-                terminate_and_kill_process_tree(cls.process)
-            cls.mooncake.stop()
+            try:
+                if cls.process is not None:
+                    terminate_and_kill_process_tree(cls.process)
+            finally:
+                cls.mooncake.stop()
             raise
 
     @classmethod

@@ -451,6 +451,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        self.enable_unified_cache_external_linker = (
+            get_memory().enable_unified_cache_external_linker
+        )
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -2863,10 +2866,7 @@ class Scheduler(
 
     def _release_aborted_request(self, rid: str) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if (
-            self.enable_hicache_storage
-            or self.server_args.enable_unified_cache_external_linker
-        ):
+        if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
             self.tree_cache.release_aborted_request(rid)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3315,7 +3315,7 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
-            or self.server_args.enable_unified_cache_external_linker
+            or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.check_hicache_events()
 
@@ -3488,7 +3488,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
-                        or self.server_args.enable_unified_cache_external_linker
+                        or self.enable_unified_cache_external_linker
                     ):
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
@@ -3555,10 +3555,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if (
-            self.enable_hierarchical_cache
-            or self.server_args.enable_unified_cache_external_linker
-        ):
+        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()

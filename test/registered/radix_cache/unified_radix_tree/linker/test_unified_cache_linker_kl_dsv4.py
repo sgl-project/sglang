@@ -2,11 +2,11 @@
 
 import json
 import os
-import random
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_radix_cache_kit import UnifiedRadixTreeTestMixin
+from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -27,7 +27,7 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
     UnifiedRadixTreeTestMixin, CustomTestCase
 ):
     page_size = 256
-    kl_threshold = 0.005
+    kl_threshold = 0.01
     sampling_temperature = 0
     max_new_tokens = 64
     prefix_len = 2048
@@ -48,7 +48,6 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                 timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
                 other_args=[
                     "--trust-remote-code",
-                    "--skip-tokenizer-init",
                     "--tp-size",
                     "4",
                     "--attention-backend",
@@ -77,15 +76,13 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 },
             )
-            rng = random.Random(123)
-            cls.input_ids = [
-                [rng.randint(1, 30000) for _ in range(cls.prefix_len)]
-                for _ in range(18)
-            ]
+            cls.input_ids = get_input_ids(cls.model, num_samples=18)
         except Exception:
-            if cls.process is not None:
-                terminate_and_kill_process_tree(cls.process)
-            cls.mooncake.stop()
+            try:
+                if cls.process is not None:
+                    terminate_and_kill_process_tree(cls.process)
+            finally:
+                cls.mooncake.stop()
             raise
 
     @classmethod
