@@ -56,6 +56,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
     PLACEMENT_STATUS_SKIPPED,
+    PLACEMENT_STATUS_VALIDATED,
     POST_ADJUSTMENT_REGRESSION_FRACTION,
     AppliedResidencyChange,
     AutoResidencyRollbackError,
@@ -87,6 +88,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
+    is_dit_component_name,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
@@ -1232,14 +1234,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 remaining_gpu_mem_gb -= usage_gb
         return can_stay_resident
 
-    def apply_auto_residency(self) -> OutputBatch:
+    def apply_auto_residency(self, *, validate_only: bool = False) -> OutputBatch:
         """Apply one warmup-calibrated residency adjustment round.
 
         Every rank executes this handler at the same queue position; the plan
         is computed from all-gathered rank reports so each rank reaches the
-        same decision. Post-adjustment warmup can expose more safe headroom, so
-        the server may call this again with measurements from the new layout.
-        A failure on any rank rolls every rank back to the previously
+        same decision. After applying a plan, the server calls this once in
+        validation-only mode with measurements from the new layout. Validation
+        may keep or roll back that plan, but never starts another placement
+        search. A failure on any rank rolls every rank back to the previously
         calibrated placement.
 
         Everything before the first all-gather is fenced into a skip report:
@@ -1276,7 +1279,30 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 skip_reason=describe_error(e),
             )
         reports = self._auto_residency_all_gather(local_report)
-        if self._auto_residency_round_sizes:
+        if validate_only:
+            invalid_report = next(
+                (
+                    report
+                    for report in reports
+                    if report.skip_reason is not None
+                    or report.estimated_peak_bytes is None
+                ),
+                None,
+            )
+            if invalid_report is not None:
+                reason = invalid_report.skip_reason or "no usable warmup measurement"
+                return self._rollback_everywhere(
+                    cause=(
+                        "post-adjustment calibration could not validate rank "
+                        f"{invalid_report.rank}: {reason}"
+                    ),
+                    already_failed=False,
+                    latest_round_only=True,
+                )
+        if (
+            self._auto_residency_round_sizes
+            and not self._latest_auto_residency_round_is_resident_only()
+        ):
             regressions = []
             for report in reports:
                 reference_ns = report.estimated_request_duration_ns
@@ -1302,7 +1328,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     latest_round_only=True,
                 )
         plan = plan_auto_residency(reports=reports)
-        summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if (
             self._auto_residency_round_sizes
             and plan.current_placement_reserve_shortfall_bytes > 0
@@ -1319,6 +1344,32 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 already_failed=False,
                 latest_round_only=True,
             )
+        if validate_only:
+            if self.is_output_rank:
+                reference_ns = local_report.estimated_request_duration_ns
+                measured_ns = local_report.measured_request_duration_ns
+                if self._latest_auto_residency_round_supports_short_validation():
+                    result = "full-shape one-step memory check passed"
+                elif reference_ns > 0 and measured_ns > 0:
+                    change = (measured_ns - reference_ns) / reference_ns
+                    result = (
+                        "calibrated request estimate "
+                        f"{reference_ns / 1e9:.2f}s -> {measured_ns / 1e9:.2f}s "
+                        f"({change:+.1%})"
+                    )
+                else:
+                    result = "memory and execution checks passed"
+                logger.info(
+                    "Auto residency: post-adjustment validation passed (%s); "
+                    "keeping the selected placement.",
+                    result,
+                )
+            return OutputBatch(
+                output=plan_summary_payload(
+                    plan=plan, status=PLACEMENT_STATUS_VALIDATED
+                )
+            )
+        summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
                 logger.info("%s", summary)
@@ -1378,7 +1429,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             logger.info("%s", summary)
             logger.info("%s", format_applied_changes(plan=plan))
         return OutputBatch(
-            output=plan_summary_payload(plan=plan, status=PLACEMENT_STATUS_ADJUSTED)
+            output=plan_summary_payload(
+                plan=plan,
+                status=PLACEMENT_STATUS_ADJUSTED,
+                short_validation=(
+                    self._latest_auto_residency_round_supports_short_validation()
+                ),
+            )
         )
 
     def rollback_auto_residency(self) -> OutputBatch:
@@ -1604,6 +1661,30 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if manager is None:
             return set()
         return manager.components_with_mixed_use_dtypes()
+
+    def _latest_auto_residency_round(self) -> list[AppliedResidencyChange]:
+        if not self._auto_residency_round_sizes:
+            return []
+        round_size = self._auto_residency_round_sizes[-1]
+        if round_size <= 0 or round_size > len(self._auto_residency_applied):
+            return []
+        return self._auto_residency_applied[-round_size:]
+
+    def _latest_auto_residency_round_is_resident_only(self) -> bool:
+        """Whether validation follows only execution-monotonic promotions."""
+        changes = self._latest_auto_residency_round()
+        return all(
+            adjustment.residency_mode != RESIDENT
+            and self.server_args.residency_mode(adjustment.component_name) == RESIDENT
+            for adjustment in changes
+        ) and bool(changes)
+
+    def _latest_auto_residency_round_supports_short_validation(self) -> bool:
+        """Whether one full-shape step covers every changed execution path."""
+        changes = self._latest_auto_residency_round()
+        return self._latest_auto_residency_round_is_resident_only() and all(
+            not is_dit_component_name(change.component_name) for change in changes
+        )
 
     def _rollback_applied_residency_changes(
         self, *, latest_round_only: bool = False

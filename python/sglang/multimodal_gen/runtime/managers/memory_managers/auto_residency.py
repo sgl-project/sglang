@@ -101,6 +101,7 @@ POST_ADJUSTMENT_REGRESSION_FRACTION = 0.05
 
 PLACEMENT_STATUS_SKIPPED = "skipped"
 PLACEMENT_STATUS_ADJUSTED = "adjusted"
+PLACEMENT_STATUS_VALIDATED = "validated"
 PLACEMENT_STATUS_ROLLED_BACK = "rolled_back"
 PLACEMENT_STATUS_ROLLBACK_FAILED = "rollback_failed"
 
@@ -2568,7 +2569,12 @@ def _format_candidate_summary(candidate: ResidencyTarget) -> str:
     return f"{candidate.component_name}({target_mode}{details})"
 
 
-def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
+def plan_summary_payload(
+    *,
+    plan: AutoResidencyPlan,
+    status: str,
+    short_validation: bool = False,
+) -> dict:
     """Minimal decision payload for the warmup orchestrator.
 
     The orchestrator only branches on ``status``; the human-readable detail
@@ -2577,4 +2583,5 @@ def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
     return {
         "status": status,
         "changed": [candidate.component_name for candidate in plan.changes],
+        "short_validation": short_validation,
     }

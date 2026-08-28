@@ -14,24 +14,41 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     PLACEMENT_STATUS_ADJUSTED,
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
-    PLACEMENT_STATUS_SKIPPED,
+    PLACEMENT_STATUS_VALIDATED,
     AppliedResidencyChange,
     AutoResidencyPlan,
     DefaultWorkload,
     RankResidencyReport,
+    ResidencyTarget,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
 class TestAutoResidencyWarmup(unittest.TestCase):
+    def test_rewarm_step_limit_keeps_full_shape_but_shortens_denoising(self):
+        req = SimpleNamespace(is_warmup=True, extra={}, num_inference_steps=4)
+        with mock.patch.object(server_warmup, "build_warmup_reqs", return_value=[req]):
+            result = server_warmup.build_client_warmup_reqs(
+                SimpleNamespace(warmup_resolutions=None),
+                rewarm=True,
+                step_limit=1,
+            )
+
+        self.assertEqual(result, [req])
+        self.assertEqual(req.num_inference_steps, 1)
+        self.assertTrue(req.extra["server_warmup_rewarm"])
+
     def test_worker_rolls_back_a_materially_slower_calibrated_round(self):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
         worker.is_output_rank = False
-        worker.server_args = SimpleNamespace()
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
         worker._auto_residency_warmup_records = [object()]
         worker._auto_residency_round_sizes = [1]
         report = RankResidencyReport(
@@ -49,16 +66,19 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         )
         worker._rollback_everywhere = mock.Mock(return_value=rolled_back)
 
-        with mock.patch.object(
-            gpu_worker_module,
-            "resolve_default_workload",
-            return_value=SimpleNamespace(),
-        ), mock.patch.object(
-            gpu_worker_module,
-            "resolve_measured_default_workload",
-            return_value=SimpleNamespace(),
+        with (
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_measured_default_workload",
+                return_value=SimpleNamespace(),
+            ),
         ):
-            response = worker.apply_auto_residency()
+            response = worker.apply_auto_residency(validate_only=True)
 
         self.assertIs(response, rolled_back)
         worker._rollback_everywhere.assert_called_once()
@@ -72,7 +92,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker.rank = 0
         worker.is_output_rank = False
         worker.pipeline = SimpleNamespace(modules={})
-        worker.server_args = SimpleNamespace()
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
         worker._auto_residency_warmup_records = []
         worker._auto_residency_round_sizes = [1]
         worker._build_auto_residency_report = mock.Mock(
@@ -112,6 +134,71 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             latest_round_only=True,
         )
 
+    def test_worker_validation_does_not_apply_a_second_candidate_plan(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.rank = 0
+        worker.is_output_rank = False
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
+        worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_round_sizes = [1]
+        report = RankResidencyReport(
+            rank=0,
+            budget_bytes=1,
+            estimated_peak_bytes=1,
+            estimated_request_duration_ns=10_000_000_000,
+            measured_request_duration_ns=10_000_000_000,
+        )
+        worker._build_auto_residency_report = mock.Mock(return_value=report)
+        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        candidate = ResidencyTarget(
+            component_name="vae",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=1,
+            h2d_bytes_per_request=1,
+        )
+
+        with (
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_measured_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "plan_auto_residency",
+                return_value=AutoResidencyPlan(changes=[candidate]),
+            ),
+            mock.patch.object(gpu_worker_module, "apply_residency_changes") as apply,
+        ):
+            response = worker.apply_auto_residency(validate_only=True)
+
+        self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
+        apply.assert_not_called()
+
+    def test_aux_resident_promotion_uses_short_validation_but_dit_does_not(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.server_args = SimpleNamespace(residency_mode=lambda _name: RESIDENT)
+        worker._auto_residency_round_sizes = [1]
+
+        worker._auto_residency_applied = [
+            AppliedResidencyChange("text_encoder", COMPONENT_OFFLOAD)
+        ]
+        self.assertTrue(worker._latest_auto_residency_round_supports_short_validation())
+
+        worker._auto_residency_applied = [
+            AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
+        ]
+        self.assertFalse(
+            worker._latest_auto_residency_round_supports_short_validation()
+        )
+
     def test_worker_rollback_response_rewarms_the_restored_layout(self):
         actions = []
 
@@ -140,16 +227,20 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         rewarm.assert_awaited_once_with(
             server_args,
             forward,
-            fail_open=True,
+            fail_open=False,
             rewarm=True,
         )
 
-    def test_replans_until_the_calibrated_layout_reaches_a_fixed_point(self):
+    def test_successful_adjustment_runs_one_validation_without_replanning(self):
         responses = iter(
             [
-                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
-                OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
-                OutputBatch(output={"status": PLACEMENT_STATUS_SKIPPED}),
+                OutputBatch(
+                    output={
+                        "status": PLACEMENT_STATUS_ADJUSTED,
+                        "short_validation": True,
+                    }
+                ),
+                OutputBatch(output={"status": PLACEMENT_STATUS_VALIDATED}),
             ]
         )
         actions = []
@@ -172,8 +263,14 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
-        self.assertEqual(actions, ["apply", "apply", "apply"])
-        self.assertEqual(rewarm.await_count, 2)
+        self.assertEqual(actions, ["apply", "validate"])
+        rewarm.assert_awaited_once_with(
+            server_args,
+            forward,
+            fail_open=False,
+            rewarm=True,
+            step_limit=1,
+        )
 
     def test_failed_first_calibration_rolls_back_and_rewarms(self):
         actions = []
@@ -228,12 +325,13 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
-    def test_apply_rpc_failure_after_calibration_aborts_without_rollback(self):
+    def test_validation_rpc_failure_rolls_back_and_rewarms(self):
         actions = []
         responses = iter(
             [
                 OutputBatch(output={"status": PLACEMENT_STATUS_ADJUSTED}),
                 RuntimeError("rpc failed"),
+                OutputBatch(output={"status": PLACEMENT_STATUS_ROLLED_BACK}),
             ]
         )
 
@@ -255,15 +353,11 @@ class TestAutoResidencyWarmup(unittest.TestCase):
                 server_warmup, "auto_residency_skip_reason", return_value=None
             ),
             mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
-            self.assertRaisesRegex(
-                RuntimeError,
-                "auto residency apply failed after a calibrated adjustment",
-            ),
         ):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
-        self.assertEqual(actions, ["apply", "apply"])
-        self.assertEqual(rewarm.await_count, 1)
+        self.assertEqual(actions, ["apply", "validate", "rollback"])
+        self.assertEqual(rewarm.await_count, 2)
 
     def test_failed_later_round_keeps_earlier_calibrated_promotions(self):
         first_round = AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)

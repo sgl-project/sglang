@@ -139,6 +139,7 @@ async def maybe_apply_auto_residency(
         PLACEMENT_STATUS_ADJUSTED,
         PLACEMENT_STATUS_ROLLBACK_FAILED,
         PLACEMENT_STATUS_ROLLED_BACK,
+        PLACEMENT_STATUS_VALIDATED,
     )
 
     skip_reason = auto_residency_skip_reason(server_args)
@@ -156,7 +157,6 @@ async def maybe_apply_auto_residency(
     # Same fail-open contract as the warmup itself: implicit warmups must
     # never abort startup, explicit --warmup-resolutions ones must succeed.
     fail_open = server_args.warmup_resolutions is None
-    adjusted_any = False
 
     async def rollback_and_rewarm(error: Exception) -> None:
         logger.warning(
@@ -172,78 +172,82 @@ async def maybe_apply_auto_residency(
                 f"auto residency rollback failed: {rollback.error}"
             ) from error
         # Restore warm caches for the previous calibrated placement before
-        # turning ready, keeping the caller's fail-open contract.
+        # turning ready. Once placement was mutated, failure to revalidate the
+        # restored state is unsafe to ignore.
         await run_async_client_warmup(
-            server_args, forward, fail_open=fail_open, rewarm=True
+            server_args, forward, fail_open=False, rewarm=True
         )
 
-    for _ in range(MAX_AUTO_RESIDENCY_ROUNDS):
-        try:
-            response = await forward(AutoResidencyReq(action="apply"))
-        except Exception as e:
-            if adjusted_any:
-                # The worker-side apply is transactional, but an RPC failure
-                # does not tell us whether its response was lost after commit.
-                # Do not mistake the last validated round for an unvalidated
-                # one and roll it back; abort startup rather than serve a
-                # placement whose calibration state is unknown.
-                raise RuntimeError(
-                    "auto residency apply failed after a calibrated adjustment"
-                ) from e
-            if not fail_open:
-                raise
-            logger.warning(
-                "Auto residency apply request failed; continuing on the original "
-                "strategy: %s",
-                e,
-            )
-            return
-        status = _auto_residency_status(response)
-        if status == PLACEMENT_STATUS_ROLLBACK_FAILED:
-            raise RuntimeError(f"auto residency rollback failed: {response.error}")
-        if response.error is not None:
-            if status == PLACEMENT_STATUS_ROLLED_BACK:
-                await run_async_client_warmup(
-                    server_args, forward, fail_open=fail_open, rewarm=True
-                )
-            retained = (
-                "the last calibrated placement"
-                if adjusted_any
-                else "the original strategy"
-            )
-            logger.warning(
-                "Auto residency adjustment not applied; continuing on %s: %s",
-                retained,
-                response.error,
-            )
-            return
-        if status != PLACEMENT_STATUS_ADJUSTED:
-            return
-
-        adjusted_any = True
-        # This pass physically realizes the selected placement and measures
-        # phases that overlap under it. The next round can then use that new
-        # evidence instead of permanently charging components twice.
-        try:
+    try:
+        response = await forward(AutoResidencyReq(action="apply"))
+    except Exception as e:
+        if not fail_open:
+            raise
+        logger.warning(
+            "Auto residency apply request failed; continuing on the original "
+            "strategy: %s",
+            e,
+        )
+        return
+    status = _auto_residency_status(response)
+    if status == PLACEMENT_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {response.error}")
+    if response.error is not None:
+        if status == PLACEMENT_STATUS_ROLLED_BACK:
             await run_async_client_warmup(
                 server_args, forward, fail_open=False, rewarm=True
             )
-        except Exception as e:
-            await rollback_and_rewarm(e)
-            return
+        logger.warning(
+            "Auto residency adjustment not applied; continuing on the original "
+            "strategy: %s",
+            response.error,
+        )
+        return
+    if status != PLACEMENT_STATUS_ADJUSTED:
+        return
 
-    logger.warning(
-        "Auto residency stopped after %d adjustment rounds; keeping the last "
-        "successfully calibrated placement.",
-        MAX_AUTO_RESIDENCY_ROUNDS,
+    short_validation = bool(
+        isinstance(response.output, dict) and response.output.get("short_validation")
     )
+    try:
+        validation_options = {"step_limit": 1} if short_validation else {}
+        await run_async_client_warmup(
+            server_args,
+            forward,
+            fail_open=False,
+            rewarm=True,
+            **validation_options,
+        )
+    except Exception as e:
+        await rollback_and_rewarm(e)
+        return
+
+    try:
+        validation = await forward(AutoResidencyReq(action="validate"))
+    except Exception as e:
+        await rollback_and_rewarm(e)
+        return
+    validation_status = _auto_residency_status(validation)
+    if validation_status == PLACEMENT_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {validation.error}")
+    if validation_status == PLACEMENT_STATUS_ROLLED_BACK:
+        await run_async_client_warmup(
+            server_args, forward, fail_open=False, rewarm=True
+        )
+        return
+    if validation.error is not None or validation_status != PLACEMENT_STATUS_VALIDATED:
+        await rollback_and_rewarm(
+            RuntimeError(
+                validation.error
+                or "post-adjustment calibration returned no validation result"
+            )
+        )
 
 
 # Enough to clear a probe that overshot the card, few enough that a failure
 # which is not about probe size gives up quickly instead of walking the
 # workload down to nothing.
 MAX_WARMUP_DEGRADE_ATTEMPTS = 3
-MAX_AUTO_RESIDENCY_ROUNDS = 8
 
 
 def _is_out_of_memory(error: Any) -> bool:
@@ -304,6 +308,7 @@ def build_client_warmup_reqs(
     *,
     warmup_input_path: str | None = None,
     rewarm: bool = False,
+    step_limit: int | None = None,
 ) -> list[Req]:
     warmup_reqs = build_warmup_reqs(
         server_args,
@@ -316,6 +321,8 @@ def build_client_warmup_reqs(
     for req in warmup_reqs:
         if req.is_warmup:
             req.extra["warmup_total"] = warmup_total
+            if step_limit is not None:
+                req.num_inference_steps = min(req.num_inference_steps, step_limit)
         if rewarm:
             # a repeat pass after an auto-residency change: keep it out of
             # the scheduler's warmup progress accounting (already at N/N)
@@ -329,6 +336,7 @@ async def run_async_client_warmup(
     *,
     fail_open: bool = False,
     rewarm: bool = False,
+    step_limit: int | None = None,
 ) -> None:
     try:
         warmup_input_path = None
@@ -336,7 +344,10 @@ async def run_async_client_warmup(
             warmup_input_path = prepare_warmup_image_path(server_args)
 
         for req in build_client_warmup_reqs(
-            server_args, warmup_input_path=warmup_input_path, rewarm=rewarm
+            server_args,
+            warmup_input_path=warmup_input_path,
+            rewarm=rewarm,
+            step_limit=step_limit,
         ):
             response = await forward(req)
             for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):

@@ -209,7 +209,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return OutputBatch(error="auto residency requires a GPU worker")
         if req.action == "rollback":
             return self.worker.rollback_auto_residency()
-        return self.worker.apply_auto_residency()
+        return self.worker.apply_auto_residency(validate_only=req.action == "validate")
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status

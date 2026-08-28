@@ -57,4 +57,4 @@ class AutoResidencyReq(msgspec.Struct, frozen=True):
     requests finish and before the server reports ready.
     """
 
-    action: str = "apply"  # "apply" | "rollback"
+    action: str = "apply"  # "apply" | "validate" | "rollback"
