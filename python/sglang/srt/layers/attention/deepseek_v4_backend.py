@@ -205,13 +205,21 @@ class DSV4AttnMetadata:
     trtllm_c4_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
-    # trtllm prefill: per-chunk caches built lazily by _forward_trtllm_prefill
-    # (prefill runs eagerly). qmeta = (cum_seq_lens_q, max_q_len, sum_q,
-    # seq_lens_int32); c128 = (table, lens).
+    # trtllm prefill: per-chunk tables built once, before the indexer runs.
+    # qmeta remains lazy because it also needs ForwardBatch's host extend
+    # lengths. qmeta = (sum_q, per-token seq_lens_int32); c128 = (table,
+    # lens).
     trtllm_prefill_qmeta: Optional[tuple] = None
+    trtllm_prefill_swa_indices: Optional[torch.Tensor] = None
     trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
+    trtllm_prefill_c4_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
+    # Uniform target-verify / draft-extend query metadata. These are explicit
+    # tensor fields (rather than a lazily-created tuple) so CUDA-graph metadata
+    # refresh copies their contents without replacing captured tensor objects.
+    trtllm_seq_lens_req: Optional[torch.Tensor] = None
+    trtllm_cum_seq_lens_q: Optional[torch.Tensor] = None
     # Backend-owned persistent storage backing the trtllm tables above
     # (TrtllmSparseTablePool; duck-typed to avoid an import cycle). Shared by
     # every metadata object the backend creates; never copied.
@@ -270,6 +278,8 @@ class DSV4AttnMetadata:
                 "trtllm_c4_lens",
                 "trtllm_c128_indices",
                 "trtllm_c128_lens",
+                "trtllm_seq_lens_req",
+                "trtllm_cum_seq_lens_q",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -282,8 +292,10 @@ class DSV4AttnMetadata:
                 # are None on every metadata that reaches a graph replay; two
                 # of them are tuples, which content-copy cannot handle.
                 "trtllm_prefill_qmeta",
+                "trtllm_prefill_swa_indices",
                 "trtllm_prefill_swa_lens",
                 "trtllm_prefill_c4_indices",
+                "trtllm_prefill_c4_lens",
                 "trtllm_prefill_c128",
                 # Shared backend-owned pool object; same reference on both
                 # sides, never content-copied.
@@ -315,6 +327,8 @@ class DSV4AttnMetadata:
             "trtllm_c4_lens",
             "trtllm_c128_indices",
             "trtllm_c128_lens",
+            "trtllm_seq_lens_req",
+            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
@@ -330,8 +344,10 @@ class DSV4AttnMetadata:
             # replay refresh, or a reused metadata object serves stale
             # sum_q/tables to a different batch shape.
             "trtllm_prefill_qmeta",
+            "trtllm_prefill_swa_indices",
             "trtllm_prefill_swa_lens",
             "trtllm_prefill_c4_indices",
+            "trtllm_prefill_c4_lens",
             "trtllm_prefill_c128",
         ]
         # Keep graph-captured tensor objects alive for fields that captured
@@ -445,7 +461,11 @@ class DSV4AttnMetadata:
                 f"!= num_tokens={num_tokens} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self, is_prefill: bool = False):
+    def init_flashmla_related(
+        self,
+        is_prefill: bool = False,
+        create_flashmla_metadata: bool = True,
+    ) -> None:
         # c4_sparse_topk is set from model_config.index_topk per-model
         # (small model: 512, large model: 1024).
         assert self.c4_sparse_topk in (512, 1024), (
@@ -465,9 +485,79 @@ class DSV4AttnMetadata:
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
         if is_prefill:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
-        self.c1_flashmla_metadata = _create_flashmla_metadata()
-        self.c4_flashmla_metadata = _create_flashmla_metadata()
-        self.c128_flashmla_metadata = _create_flashmla_metadata()
+        if create_flashmla_metadata:
+            self.c1_flashmla_metadata = _create_flashmla_metadata()
+            self.c4_flashmla_metadata = _create_flashmla_metadata()
+            self.c128_flashmla_metadata = _create_flashmla_metadata()
+        else:
+            self.c1_flashmla_metadata = None
+            self.c4_flashmla_metadata = None
+            self.c128_flashmla_metadata = None
+
+    def init_trtllm_prefill_sparse_buffers(self, num_tokens: int) -> None:
+        """Build layer-invariant prefill tables before the indexer runs.
+
+        Besides removing the repeated SWA/c128/lens fills from every layer,
+        doing this before indexer execution lets topk_v2 write c4 indices
+        directly into the combined table's strided tail.
+        """
+
+        num_metadata_rows = self.seq_lens_casual.shape[0]
+        assert 0 < num_tokens <= num_metadata_rows
+        pool = self.trtllm_table_pool
+        assert pool is not None, "trtllm metadata requires the table pool"
+
+        swa_indices = pool.view(
+            "p_swa",
+            num_metadata_rows,
+            fill=-1,
+            src=self.swa_page_indices,
+            width=SWA_WINDOW,
+        )
+        self.trtllm_prefill_swa_indices = swa_indices[:num_tokens]
+        self.trtllm_prefill_swa_lens = pool.view(
+            "p_swa_lens", num_tokens, fill=SWA_WINDOW
+        )
+
+        if self.c4_sparse_page_indices is not None:
+            w4 = self.c4_sparse_page_indices.shape[-1]
+            assert w4 % 4 == 0, f"{w4=}"
+            full_table = pool.view(
+                "p_c4", num_metadata_rows, fill=-1, width=SWA_WINDOW + w4
+            )
+            full_table[:, :SWA_WINDOW].copy_(swa_indices)
+            self.trtllm_prefill_c4_indices = full_table[:num_tokens]
+            self.trtllm_prefill_c4_lens = pool.view(
+                "p_c4_lens",
+                num_tokens,
+                fill=SWA_WINDOW,
+                src=(self.c4_sparse_topk_lengths[:num_tokens] + SWA_WINDOW).to(
+                    torch.int32
+                ),
+            )
+            if self.trtllm_topk_writes_table and self.c4_sparse_raw_indices is None:
+                # The indexer still sees DP-padded metadata rows, whereas
+                # attention consumes only the real-token prefix.
+                self.c4_sparse_page_indices = full_table[:, SWA_WINDOW:]
+
+        if self.c128_page_indices is not None:
+            w128 = self.c128_page_indices.shape[-1]
+            assert w128 % 4 == 0, f"{w128=}"
+            table = pool.view("p_c128", num_tokens, fill=-1)
+            assert table.shape[1] >= SWA_WINDOW + w128, f"{table.shape=} {w128=}"
+            table[:, :SWA_WINDOW].copy_(self.trtllm_prefill_swa_indices)
+            table[:, SWA_WINDOW : SWA_WINDOW + w128].copy_(
+                self.c128_page_indices[:num_tokens]
+            )
+            lens = pool.view(
+                "p_c128_lens",
+                num_tokens,
+                fill=SWA_WINDOW,
+                src=(self.c128_topk_lengths_clamp1[:num_tokens] + SWA_WINDOW).to(
+                    torch.int32
+                ),
+            )
+            self.trtllm_prefill_c128 = (table, lens)
 
     def init_trtllm_sparse_buffers(self) -> None:
         """Build the trtllm per-ratio combined sparse tables (decode).
@@ -546,6 +636,7 @@ class DSV4AttnMetadata:
                 # (prefill / indexer capture) reroutes the indexer to the
                 # stride-unaware v1 kernel, so never alias when it exists.
                 self.c4_sparse_page_indices = self.trtllm_c4_indices[:, SWA_WINDOW:]
+
         if self.c128_page_indices is not None:
             w128 = self.c128_page_indices.shape[-1]
             assert w128 % 4 == 0, f"{w128=}"
@@ -563,6 +654,26 @@ class DSV4AttnMetadata:
                 fill=SWA_WINDOW,
                 src=(self.c128_topk_lengths_clamp1 + SWA_WINDOW).to(torch.int32),
             )
+
+    def init_trtllm_uniform_qmeta(self, q_len: int) -> None:
+        """Build uniform multi-token query metadata once per forward step."""
+
+        assert q_len > 1
+        num_tokens = self.seq_lens_casual.shape[0]
+        assert num_tokens > 0 and num_tokens % q_len == 0, (
+            f"uniform trtllm query layout requires whole request groups: "
+            f"{num_tokens=} {q_len=}"
+        )
+        num_reqs = num_tokens // q_len
+        # Per-request KV totals are the causal length of each request's last
+        # token. contiguous() is intentionally paid once here, not per layer.
+        self.trtllm_seq_lens_req = self.seq_lens_casual[q_len - 1 :: q_len].contiguous()
+        self.trtllm_cum_seq_lens_q = torch.arange(
+            0,
+            (num_reqs + 1) * q_len,
+            q_len,
+            **self.cuda_int32_kwargs,
+        )
 
 
 @dataclass
@@ -965,6 +1076,7 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        trtllm_prefill_tables: bool = True,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_v2_active = forward_batch is not None and is_cp_v2_active(forward_batch)
@@ -993,6 +1105,9 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
             dspark_block_size=dspark_block_size,
             num_tokens=num_tokens if cp_v2_active else None,
+            trtllm_prefill_num_tokens=(
+                num_tokens if self.trtllm_attn and trtllm_prefill_tables else None
+            ),
         )
         if cp_v2_active:
             core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
@@ -1154,7 +1269,7 @@ class DeepseekV4AttnBackend(
         extend_start_loc = lengths.extend_start_loc
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
-        return self.init_forward_metadata_prefill(
+        metadata = self.init_forward_metadata_prefill(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -1167,7 +1282,13 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             online_c128_state_slot_offset=online_c128_state_slot_offset,
+            trtllm_prefill_tables=False,
         )
+        if self.trtllm_attn and ragged_layout is None:
+            metadata.core_attn_metadata.init_trtllm_uniform_qmeta(
+                self.speculative_num_draft_tokens
+            )
+        return metadata
 
     def init_forward_metadata_dspark_draft_block(
         self,
@@ -1201,6 +1322,7 @@ class DeepseekV4AttnBackend(
             need_compress=False,
             use_prefill_cuda_graph=False,
             dspark_block_size=block_size,
+            trtllm_prefill_tables=False,
         )
 
     def make_forward_metadata_from_raw_verify(
@@ -1250,6 +1372,8 @@ class DeepseekV4AttnBackend(
             out_loc=out_cache_loc,
             need_compress=True,
         )
+        if self.trtllm_attn and not is_ragged:
+            core_attn_metadata.init_trtllm_uniform_qmeta(num_draft_tokens)
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
         create = functools.partial(
             create_paged_compressor_data,
@@ -1353,6 +1477,8 @@ class DeepseekV4AttnBackend(
             need_compress=False,
             is_prefill=True,
         )
+        if self.trtllm_attn:
+            core_attn_metadata.init_trtllm_uniform_qmeta(num_tokens_per_req)
         if swa_out_cache_loc is not None:
             # Captures store_cache's cached path instead of a per-layer
             # in-graph mapping translate.
@@ -1961,8 +2087,10 @@ class DeepseekV4AttnBackend(
 
     def on_after_cuda_graph_warmup(self):
         metadata = self.forward_metadata
-        if isinstance(metadata, DSV4Metadata) and isinstance(
-            metadata.core_attn_metadata, DSV4AttnMetadata
+        if (
+            not self.trtllm_attn
+            and isinstance(metadata, DSV4Metadata)
+            and isinstance(metadata.core_attn_metadata, DSV4AttnMetadata)
         ):
             core = metadata.core_attn_metadata
             core.c1_flashmla_metadata = _create_flashmla_metadata()
@@ -2570,6 +2698,7 @@ class DeepseekV4AttnBackend(
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        trtllm_prefill_num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
 
@@ -2629,17 +2758,32 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata(num_tokens)
-            core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
-            if self.trtllm_attn:
+            core_attn_metadata.init_flashmla_related(
+                is_prefill=is_prefill and not self.trtllm_attn,
+                create_flashmla_metadata=not self.trtllm_attn,
+            )
+            if trtllm_prefill_num_tokens is not None:
+                assert self.trtllm_attn
+                core_attn_metadata.init_trtllm_prefill_sparse_buffers(
+                    trtllm_prefill_num_tokens
+                )
+            elif self.trtllm_attn:
                 core_attn_metadata.init_trtllm_sparse_buffers()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
             core_attn_metadata.c4_sparse_raw_indices = None
-            core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
+            core_attn_metadata.c1_flashmla_metadata = (
+                None if self.trtllm_attn else _create_flashmla_metadata()
+            )
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
-            if self.trtllm_attn:
+            if trtllm_prefill_num_tokens is not None:
+                assert self.trtllm_attn
+                core_attn_metadata.init_trtllm_prefill_sparse_buffers(
+                    trtllm_prefill_num_tokens
+                )
+            elif self.trtllm_attn:
                 # SWA-only capacity (draft-extend metadata skips compression).
                 core_attn_metadata.init_trtllm_sparse_buffers()
         return core_attn_metadata

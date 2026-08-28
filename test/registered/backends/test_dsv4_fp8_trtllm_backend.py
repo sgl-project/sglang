@@ -1,17 +1,17 @@
 """DeepSeek-V4 uniform-FP8 trtllm backend (SM100/SM103 Blackwell only).
 
 Validates --dsv4-attn-backend trtllm — DSv4 decode and sparse
-varlen prefill through flashinfer's ``trtllm_batch_decode_sparse_mla_dsv4``
+dense per-token prefill through flashinfer's
+``trtllm_batch_decode_sparse_mla_dsv4``
 on a uniform 512-dim FP8-e4m3 KV cache with an FP8 query — against the
 default packed-FP8 FlashMLA path:
 
 1. A short greedy-output baseline is collected from a FlashMLA server, then
    the same prompts are replayed on a trtllm server and compared (output-level).
-2. Long multi-k-token prompts do the same comparison for the varlen prefill
-   path (mixed lengths fired concurrently to exercise cum_seq_lens_q
-   packing; a repeat run exercises the radix-cache-hit / cached-prefix
-   extend, and the longest prompt exceeds --chunked-prefill-size so chunked
-   prefill is exercised too).
+2. Long multi-k-token prompts do the same comparison for mixed-length dense
+   prefill (a repeat run exercises the radix-cache-hit / cached-prefix extend,
+   and the longest prompt exceeds --chunked-prefill-size so chunked prefill is
+   exercised too).
 3. Decode-correctness probes + a GSM8K sanity eval run on the trtllm
    server.
 4. A CUDA-graph capture/replay smoke: concurrent decode batches of varying
@@ -78,10 +78,10 @@ COMPARE_MAX_NEW_TOKENS = 64
 # strong average prefix similarity rather than exact equality.
 COMPARE_MIN_MEAN_SIMILARITY = 0.6
 
-# Long multi-k-token prompts that exercise the trtllm-gen varlen
+# Long multi-k-token prompts that exercise the trtllm-gen dense per-token
 # prefill: real c4 indexer top-k selection needs >~2k tokens of context and
-# the c128 far tier needs whole 128-token pages; the mixed lengths also
-# exercise cum_seq_lens_q packing when fired concurrently, and the longest
+# the c128 far tier needs whole 128-token pages. The mixed lengths guard
+# against regressing to the unsafe rectangular varlen launch, and the longest
 # exceeds --chunked-prefill-size (4096) so it prefills in multiple chunks.
 _FILLER_SENTENCES = [
     "The expedition recorded water temperature, salinity, and current speed "
@@ -212,11 +212,11 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
         )
 
     def test_long_prompt_prefill_matches_flashmla(self):
-        """Varlen trtllm-gen prefill vs FlashMLA on multi-k-token prompts.
+        """Dense trtllm-gen prefill vs FlashMLA on multi-k-token prompts.
 
         The three prompts are fired concurrently (mixed extend lengths in
-        one batch exercise cum_seq_lens_q packing and per-token sparse-table
-        construction), then the longest is re-sent alone (radix-cache hit →
+        one batch exercise per-token sparse-table construction), then the
+        longest is re-sent alone (radix-cache hit →
         cached-prefix extend, where seq_lens > extend len). The longest
         prompt also exceeds --chunked-prefill-size, covering chunked
         prefill.
@@ -243,7 +243,7 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
         self.assertGreater(
             mean_sim,
             LONG_MIN_MEAN_SIMILARITY,
-            f"trtllm long-prompt (varlen prefill) outputs diverge from "
+            f"trtllm long-prompt (dense prefill) outputs diverge from "
             f"flashmla: mean similarity {mean_sim:.3f}, per-prompt {similarities}",
         )
 

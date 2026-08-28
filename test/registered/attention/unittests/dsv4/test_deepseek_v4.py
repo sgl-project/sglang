@@ -365,6 +365,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
+        metadata.trtllm_seq_lens_req = torch.tensor(
+            [base + 41, base + 42], dtype=torch.int32
+        )
+        metadata.trtllm_cum_seq_lens_q = torch.tensor(
+            [0, base + 1, base + 2], dtype=torch.int32
+        )
         metadata.c1_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
@@ -412,6 +418,26 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             backend.shared_read_ends(ForwardMode.EXTEND),
             SharedReadEnds.PRE_REPLAY,
         )
+
+    def test_trtllm_warmup_does_not_create_flashmla_scheduler_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.trtllm_attn = True
+        backend.forward_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        backend._current_capture_raw = None
+
+        with mock.patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend._create_flashmla_metadata"
+        ) as create:
+            backend.on_after_cuda_graph_warmup()
+
+        create.assert_not_called()
 
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
@@ -512,6 +538,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            "trtllm_seq_lens_req",
+            "trtllm_cum_seq_lens_q",
         ]
         reference_assign_fields = [
             "page_table",
