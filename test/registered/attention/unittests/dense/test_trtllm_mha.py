@@ -1,9 +1,8 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import (
@@ -11,10 +10,6 @@ from sglang.srt.utils.common import (
     is_sm100_supported,
     is_sm120_supported,
 )
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
@@ -28,6 +23,10 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner i
     run_dense_eagle_draft_cuda_graph_runner_case,
     run_dense_frozen_kv_mtp_cuda_graph_runner_case,
 )
+from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
+    run_dense_split_op_extend_case,
+)
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -125,6 +124,21 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(31, 32),
         ),
     )
+    SPLIT_OP_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_split_op_trtllm_mha_extend_ragged",
+                backend="trtllm_mha",
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(0, 8, 16),
+                extend_lens=(15, 8, 1),
+            ),
+            32,
+        ),
+    )
 
     # EAGLE draft CG runner — chain only (topk=1). trtllm_mha is constrained
     # to topk=1 via `trtllm_mha_backend.py:459,492` so tree-mode tests don't
@@ -163,8 +177,11 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
     )
 
     def test_projected_dense_decode_cases(self):
-        for case in self.DECODE_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+        for case_index, case in enumerate(self.DECODE_CASES):
+            splits = 2 if case_index == 0 else 1
+            with self.subTest(
+                case=case.name, backend=case.backend
+            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(splits):
                 run_dense_attention_case(
                     self,
                     case,
@@ -182,6 +199,23 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
                     hidden_size=self.HIDDEN_SIZE,
                 )
 
+    @unittest.skipUnless(
+        is_sm100_supported(), "TRT-LLM context attention requires SM100"
+    )
+    def test_runner_mode_split_op_extend_cases(self):
+        for case, static_num_tokens in self.SPLIT_OP_CASES:
+            for breakable in (False, True):
+                runner = "bcg" if breakable else "pcg"
+                with self.subTest(case=case.name, backend=case.backend, runner=runner):
+                    run_dense_split_op_extend_case(
+                        self,
+                        case,
+                        breakable=breakable,
+                        static_num_tokens=static_num_tokens,
+                        head_dim=self.HEAD_DIM,
+                        hidden_size=self.HIDDEN_SIZE,
+                    )
+
     def test_runner_mode_eagle_draft_cuda_graph_runner_cases(self):
         for case, topk, num_draft_tokens in self.EAGLE_DRAFT_RUNNER_CASES:
             with self.subTest(case=case.name, backend=case.backend, topk=topk):
@@ -196,7 +230,9 @@ class TestTRTLLMMHADenseAttentionBackendCorrectness(CustomTestCase):
 
     def test_runner_mode_frozen_kv_mtp_cuda_graph_runner_cases(self):
         for case in self.FROZEN_KV_MTP_RUNNER_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
+            with self.subTest(
+                case=case.name, backend=case.backend
+            ), envs.SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS.override(2):
                 run_dense_frozen_kv_mtp_cuda_graph_runner_case(
                     self,
                     case,

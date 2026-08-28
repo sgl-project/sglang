@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_ring_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
@@ -196,10 +195,10 @@ def tail_attn_meta(
         return None
     seq = shard.sp_size * (shard.local_len + image_seq_len)
     valid = seq - shard.num_pad
-    row = torch.tensor([valid, shard.num_pad], dtype=torch.int32, device=device)
-    seglens = row.repeat(batch_size)
+    row_starts = torch.arange(batch_size, dtype=torch.int32, device=device) * seq
     cu_seqlens = torch.zeros(2 * batch_size + 1, dtype=torch.int32, device=device)
-    cu_seqlens[1:] = torch.cumsum(seglens, dim=0)
+    cu_seqlens[1::2] = row_starts + valid
+    cu_seqlens[2::2] = row_starts + seq
     return {
         "pad_start": valid,
         "pad_end": seq,
@@ -218,7 +217,10 @@ def plan_text_strategy(txt_len: int) -> str:
     sp_size = get_sp_world_size()
     if sp_size <= 1:
         return "replicate"
-    if txt_len % sp_size != 0 and get_ring_parallel_world_size() > 1:
+    local_len = (txt_len + sp_size - 1) // sp_size
+    num_pad = local_len * sp_size - txt_len
+    # padding must fit in the final shard to remain one global-tail block
+    if num_pad > local_len:
         return "replicate"
     if txt_len < _TEXT_SHARD_MIN:
         return "replicate"

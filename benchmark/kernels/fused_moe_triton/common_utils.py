@@ -82,6 +82,7 @@ def get_model_config(
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
@@ -136,6 +137,7 @@ def get_model_config(
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV3ForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok

@@ -105,6 +105,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -135,8 +136,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
                 }
                 if not is_mhc:
+                    # Only Kimi K3 supplies num_blocks: its PP bank is token-major
+                    # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                    residual_shape = (
+                        (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
+                        if pp_proxy_residual_num_blocks is not None
+                        else (max_bs, hidden_size)
+                    )
                     pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
+                        residual_shape, dtype=dtype
                     )
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
@@ -334,6 +342,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
 
     @classmethod
     def create(
@@ -347,6 +356,10 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_size: int,
+        hc_hidden_size: Optional[int] = None,
+        pp_proxy_topk_size: Optional[int] = None,
+        pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -374,6 +387,30 @@ class PrefillInputBuffers(ForwardInputBuffers):
                 input_embeds = None
                 mrope_positions = None
 
+            if pp_size > 1:
+                is_mhc = hc_hidden_size is not None
+                pp_hidden_size = hc_hidden_size if is_mhc else hidden_size
+                pp_proxy_tensors = {
+                    "hidden_states": torch.zeros(
+                        (max_num_tokens, pp_hidden_size), dtype=dtype
+                    )
+                }
+                if not is_mhc:
+                    residual_shape = (
+                        (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size)
+                        if pp_proxy_residual_num_blocks is not None
+                        else (max_num_tokens, hidden_size)
+                    )
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        residual_shape, dtype=dtype
+                    )
+                if pp_proxy_topk_size is not None:
+                    pp_proxy_tensors["topk_indices"] = torch.zeros(
+                        (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
+                    )
+            else:
+                pp_proxy_tensors = None
+
         return cls(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
@@ -384,6 +421,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def populate_from_forward_batch(
@@ -413,21 +451,20 @@ class PrefillInputBuffers(ForwardInputBuffers):
         self.positions[:raw_num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:raw_num_tokens].copy_(forward_batch.out_cache_loc)
 
-        if (
-            self.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            self.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            self.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+        if self.mamba_track_indices is not None:
+            if forward_batch.mamba_track_indices is not None:
+                self.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
+            self.mamba_track_indices[bs:].zero_()
+        if self.mamba_track_mask is not None:
+            if forward_batch.mamba_track_mask is not None:
+                self.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
+            else:
+                self.mamba_track_mask[:bs].zero_()
+            self.mamba_track_mask[bs:].zero_()
+        if self.mamba_track_seqlens is not None:
+            if forward_batch.mamba_track_seqlens is not None:
+                self.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+            self.mamba_track_seqlens[bs:].zero_()
 
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_tokens].copy_(

@@ -1,5 +1,7 @@
+import argparse
 import asyncio
 import base64
+import functools
 import io
 import json
 import pickle
@@ -7,11 +9,15 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from PIL import Image
@@ -47,13 +53,63 @@ from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
+    _finite_positive_float,
     async_request_openai_embeddings,
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=46, suite="base-c-test-cpu")
+
+
+_BENCH_SERVING_CLI_CASES = {
+    "help": ["--help"],
+    "invalid_distribution": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "invalid_name",
+    ],
+    "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
+    "zipf_without_alpha": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "zipf",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+    "uniform_with_alpha": [
+        "--dataset-name",
+        "generated-shared-prefix",
+        "--gsp-group-distribution",
+        "uniform",
+        "--gsp-zipf-alpha",
+        "1.0",
+        "--ready-check-timeout-sec",
+        "0",
+    ],
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _bench_serving_cli_results():
+    def run(args):
+        return subprocess.run(
+            [sys.executable, "-m", "sglang.benchmark.serving", *args],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(_BENCH_SERVING_CLI_CASES)) as pool:
+        futures = {
+            name: pool.submit(run, args)
+            for name, args in _BENCH_SERVING_CLI_CASES.items()
+        }
+    return {name: future.result() for name, future in futures.items()}
 
 
 class _DummyTokenTensor:
@@ -95,7 +151,7 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
     return hf_tokenizer
 
 
-class TestEmbeddingBenchmarkBackends(unittest.TestCase):
+class TestEmbeddingBenchmarkBackends(CustomTestCase):
     def test_vllm_embedding_reuses_the_openai_embedding_request_path(self):
         self.assertIn("vllm-embedding", _EMBEDDING_BACKENDS)
         self.assertIs(
@@ -103,7 +159,10 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
         )
         self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
 
-    def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
+
+class TestBenchmarkCacheFlush(CustomTestCase):
+    def test_cache_flush_uses_the_backend_specific_request(self):
+        """SGLang forwards its timeout without changing other backend requests."""
         with (
             patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
             patch("sglang.benchmark.serving.requests.post") as post,
@@ -112,14 +171,78 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
 
             flush_server_cache("http://127.0.0.1:8000", "vllm-embedding")
             post.assert_called_once_with(
-                "http://127.0.0.1:8000/reset_prefix_cache", headers={}
+                "http://127.0.0.1:8000/reset_prefix_cache",
+                headers={},
             )
             post.reset_mock()
 
-            flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
+            flush_server_cache("http://127.0.0.1:30000", "sglang")
             post.assert_called_once_with(
-                "http://127.0.0.1:30000/flush_cache", headers={}
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 60.0},
             )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:23333", "lmdeploy")
+            post.assert_called_once_with(
+                "http://127.0.0.1:23333/flush_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache(
+                "http://127.0.0.1:30000",
+                "sglang-embedding",
+                flush_cache_timeout=7.5,
+            )
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 7.5},
+            )
+
+    def test_sglang_cache_flush_waits_for_idle(self):
+        """A busy server can become idle before the benchmark's flush times out."""
+        request_received = threading.Event()
+        server_idle = threading.Event()
+
+        class DeferredFlushHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                url = urlparse(self.path)
+                timeout = float(parse_qs(url.query).get("timeout", ["0"])[0])
+                if timeout <= 0:
+                    status = 400
+                    request_received.set()
+                else:
+                    request_received.set()
+                    status = 200 if server_idle.wait(timeout) else 400
+                self.send_response(status)
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), DeferredFlushHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                flush = executor.submit(
+                    flush_server_cache,
+                    base_url,
+                    "sglang",
+                    5.0,
+                )
+                self.assertTrue(request_received.wait(timeout=5))
+                self.assertFalse(flush.done())
+                server_idle.set()
+                flush.result(timeout=5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
 
 
 class DummyProcessor:
@@ -214,7 +337,7 @@ def make_args(**overrides):
     return SimpleNamespace(**args)
 
 
-class TestBenchmarkDatasetsAPI(unittest.TestCase):
+class TestBenchmarkDatasetsAPI(CustomTestCase):
     def setUp(self):
         self.tokenizer = create_lightweight_tokenizer()
         self.processor = DummyProcessor(self.tokenizer)
@@ -1289,12 +1412,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         # Subprocess-driven coverage of the live CLI: --help advertises both
         # flags with the rank-based Zipf formula and the alpha constraint,
         # and argparse rejects an unknown distribution choice.
-        help_res = subprocess.run(
-            [sys.executable, "-m", "sglang.benchmark.serving", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        help_res = _bench_serving_cli_results()["help"]
         self.assertEqual(help_res.returncode, 0, help_res.stderr)
         out = help_res.stdout
         # Both new flags appear.
@@ -1306,43 +1424,26 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertIn("finite float", out)
 
         # Argparse rejects unknown distribution choice.
-        bad_choice_res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "invalid_name",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        bad_choice_res = _bench_serving_cli_results()["invalid_distribution"]
         self.assertNotEqual(bad_choice_res.returncode, 0)
         self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
+
+    def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
+        """Invalid timeouts fail before the benchmark contacts a server or hangs."""
+        res = _bench_serving_cli_results()["flush_cache_timeout"]
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("expected a finite float > 0", res.stderr)
+
+        for value in ("1e999", "0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    _finite_positive_float(value)
 
     def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
         # Malformed CLI combinations (zipf with no alpha) must fail at
         # argparse time so users see the GSP-flag error directly, not a
         # downstream connection or model-fetch failure.
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "zipf",
-                "--ready-check-timeout-sec",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["zipf_without_alpha"]
         # parser.error() exits with code 2 (argparse convention).
         self.assertEqual(res.returncode, 2, res.stderr)
         stderr = res.stderr + res.stdout
@@ -1362,24 +1463,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
     def test_bench_serving_cli_rejects_uniform_with_alpha_before_server(self):
         # The complementary malformation: uniform distribution with an
         # explicit alpha value. Must also fail at argparse time.
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sglang.benchmark.serving",
-                "--dataset-name",
-                "generated-shared-prefix",
-                "--gsp-group-distribution",
-                "uniform",
-                "--gsp-zipf-alpha",
-                "1.0",
-                "--ready-check-timeout-sec",
-                "0",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        res = _bench_serving_cli_results()["uniform_with_alpha"]
         self.assertEqual(res.returncode, 2, res.stderr)
         stderr = res.stderr + res.stdout
         self.assertIn("--gsp-group-distribution", stderr)

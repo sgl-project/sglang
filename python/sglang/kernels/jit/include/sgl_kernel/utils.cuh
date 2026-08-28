@@ -15,7 +15,6 @@
 
 #pragma once
 
-#include <sgl_kernel/ffi.h>
 #include <sgl_kernel/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -52,6 +51,8 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
+
+namespace sglang {
 
 #ifndef USE_ROCM
 using fp32_t = float;
@@ -235,20 +236,13 @@ namespace host {
 inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
   if (error != ::cudaSuccess) {
     [[unlikely]];
-    ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }
 
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
-}
-
-inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
-  if (required_bytes == 0) return {};
-  DLDataType u8 = {kDLUInt, 8, 1};
-  int64_t shape[] = {static_cast<int64_t>(required_bytes)};
-  return ffi::empty(tvm::ffi::ShapeView(shape, 1), u8, device);
 }
 
 /**
@@ -384,6 +378,8 @@ struct LaunchKernel {
 #define CHECK_CUDA(COND)                                              \
   if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
   } else                                                              \
-    ::host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+    host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
 
 }  // namespace host
+
+}  // namespace sglang

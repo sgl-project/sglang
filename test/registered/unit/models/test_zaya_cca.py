@@ -21,7 +21,6 @@ GPU dependency. State is stored in a mock centralized pool that mirrors the
 ``HybridReqToTokenPool`` / ``MambaPool`` interface used at serving time.
 """
 
-import os
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,56 +29,24 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _ensure_dist_initialized() -> None:
-    """Set up a minimal single-rank gloo distributed environment plus the
-    SGLang model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
-    ``get_tensor_model_parallel_rank()`` / ``get_tensor_model_parallel_world_size()``
-    inside ``__init__`` to size its head-parallel projections, so the world
-    group and model parallel groups must both be initialized before any CCA
-    construction.
+def _ensure_dist_initialized(cls) -> None:
+    """CCA reads the TP rank / world size inside ``__init__`` to size its
+    head-parallel projections. The rank is the live group's, so the groups must
+    exist before construction; the size answers from the published ``parallel``
+    bag, so the case has to publish a context as well.
     """
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29632")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
-
-    from sglang.srt.distributed.parallel_state import (
-        init_distributed_environment,
-        initialize_model_parallel,
-        model_parallel_is_initialized,
-    )
-
-    if not torch.distributed.is_initialized():
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            backend="gloo",
-        )
-
-    if not model_parallel_is_initialized():
-        # Pass arguments as kwargs because ``ensure_model_parallel_initialized``
-        # forwards positional ``backend`` into the ``attention_data_parallel_size``
-        # slot of ``initialize_model_parallel``, which then explodes on
-        # ``int // str``. Using kwargs avoids that footgun.
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend="gloo",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Mock centralized pool
-# ---------------------------------------------------------------------------
+    init_single_process_dist()
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    cls.addClassCleanup(override.restore)
 
 
 @dataclass(frozen=True)
@@ -202,11 +169,6 @@ def _mock_pool_context(pool: _MockReqToTokenPool):
         set_forward_context(prev)
 
 
-# ---------------------------------------------------------------------------
-# Helper factories
-# ---------------------------------------------------------------------------
-
-
 def _make_forward_batch(
     *,
     is_decode: bool,
@@ -288,7 +250,7 @@ def _make_tiny_cca(
 class TestZayaCCA(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def test_single_chunk_matches_reference(self):
         """A single-chunk extend with empty prefix matches the no-state path."""
@@ -585,7 +547,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
         """Copy the reference's full weights into the per-rank CCA, using the

@@ -13,17 +13,18 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
-``get_parallel()`` returns a ``ParallelContext`` whose attributes — tp / dcp / pp /
-moe / attn size and rank, plus the process-group handles — each delegate live to
-the canonical getter in ``distributed.parallel_state`` / ``layers.dp_attention``.
-Returned values are exactly what those getters return; this is a read-through
-wrapper, not a cache. It gives call-sites one import and one naming scheme in
-place of a dozen free functions, plus a test-only ``override()`` hook to force a
+``get_parallel()`` returns a ``ParallelContext``. Ranks and process-group handles
+read through **live** to the canonical getter in ``distributed.parallel_state`` /
+``layers.dp_attention`` — exactly what those getters return, a read-through
+wrapper and not a cache. Every other name, the sizes included, is a leaf of the
+published ``parallel`` bag. It gives call-sites one import and one naming scheme
+in place of a dozen free functions, plus an ``override()`` hook to force a
 topology without monkeypatching the underlying getters.
 
-``get_server_args()`` returns the process-wide ``ServerArgs``. This is the pristine / resolved-at-startup **read-only** record kept
-for debug and reproduction; business code reads resolved config from the
-namespace bags below, not from this object. The context owns the storage:
+``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
+user's raw input, kept **read-only** for debug and reproduction; what
+resolution decided lives in the declarations (``resolution_result``) and, for
+business code, in the namespace bags below -- never on this object's fields. The context owns the storage:
 publishing goes through ``RuntimeContext.set_server_args`` (the legacy
 ``set_global_server_args_for_scheduler`` / ``get_global_server_args`` are thin
 shims over this slot).
@@ -47,6 +48,9 @@ test-only ``override(**kw)``.
 from __future__ import annotations
 
 import dataclasses
+import functools
+import logging
+import math
 import os
 import sys
 from contextlib import contextmanager
@@ -54,6 +58,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 # Imported lazily so this module has no import-time dependencies: any module can
@@ -68,6 +74,23 @@ def _dp():
     from sglang.srt.layers import dp_attention
 
     return dp_attention
+
+
+@functools.lru_cache(maxsize=1)
+def _parallel_config_leaves() -> frozenset:
+    """Names under the ``parallel`` namespace, for the unpublished error path.
+
+    Read from the field metadata rather than the bag, which is what does not
+    exist yet when this is needed.
+    """
+    from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.server_args import ServerArgs
+
+    return frozenset(
+        field
+        for field, path in namespace_of(ServerArgs).items()
+        if path.split(".")[0] == "parallel"
+    )
 
 
 _PARALLEL_FIELDS = frozenset(
@@ -109,14 +132,26 @@ _PARALLEL_FIELDS = frozenset(
 
 
 class ParallelContext:
-    """Parallel-topology namespace.
+    """Parallel-topology namespace: one spelling per name.
 
-    Live topology (size / rank / group) is read-through via ``@property`` (the
-    canonical getters). Parallel **config** leaves (``nccl_port``,
-    ``pp_max_micro_batch_size``, ``enable_dp_attention``, …) come from the
-    published ``parallel`` config bag via ``__getattr__``. Where a config leaf
-    shares a name with a live property (``tp_size`` …), the property (the live
-    fact) wins; the same-name==same-value invariant holds once dist is up.
+    Ranks and group handles are read-through ``@property`` over the canonical
+    getters, so they answer with the **live** process groups and raise before
+    distributed init. Every other name — ``tp_size`` and its size siblings
+    included, alongside config-only leaves such as ``nccl_port`` — is answered
+    from the published ``parallel`` bag, in any process at any point after
+    publish.
+
+    A size is read from the configuration because the groups are built at
+    exactly the configured widths. Two things do not follow that rule and are
+    asked of the group itself: ``initialize_model_parallel`` aliases ``_MOE_DP``
+    to ``_ATTN_CP`` when ``attn_cp_size > moe_dp_size``, so a reader that means
+    the MoE communicator's width calls ``get_moe_cp_size()``; and
+    ``patch_tensor_parallel_group`` runs a scope under a different TP group,
+    which it declares by overriding ``tp_size``, ``tp_rank`` and ``tp_group``
+    for its duration. Elastic EP is a third case, and it needs no rule here: it
+    scales ``ep_size`` / ``dp_size`` on the published bag while the group
+    coordinators keep the width they were constructed with, so the two are
+    different names rather than two answers to one name.
     """
 
     __slots__ = ("_overrides", "_config")
@@ -126,27 +161,21 @@ class ParallelContext:
         self._config = None  # parallel config bag, wired at publish
 
     def __getattr__(self, name):
-        # Reached only for names that are neither a live @property nor a slot:
-        # serve parallel config leaves from the published bag. The body must
-        # stay dynamo-traceable — config-leaf reads such as
-        # ``get_parallel().moe_dense_tp_size`` run inside compiled model
-        # forwards, and ``object.__getattribute__`` graph-breaks.
         if name.startswith("_"):
-            # No config leaf is underscored; this also breaks the recursion
-            # when the ``_config`` slot itself is still unset (pickle/copy
-            # protocols probe attributes before __init__ runs).
+            # This also breaks the recursion when the ``_config`` slot itself is
+            # still unset (pickle/copy protocols probe attributes before
+            # __init__ runs).
             raise AttributeError(name)
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
         config = self._config
-        # ``_fields`` is a plain ``__dict__`` entry on the bag; ``in`` on the
-        # dict avoids ``_ConfigBag.__contains__`` (not traceable).
-        if config is not None and name in config._fields:
-            return getattr(config, name)
-        detail = (
-            "not a published parallel config leaf"
-            if config is not None
-            else "config not published"
-        )
-        raise AttributeError(f"ParallelContext has no {name!r} ({detail})")
+        if config is not None:
+            if name in config._fields:
+                return getattr(config, name)
+        elif name in _parallel_config_leaves():
+            raise ValueError("config namespace 'parallel' not published")
+        raise AttributeError(f"ParallelContext has no {name!r}")
 
     def _v(self, name, getter):
         overrides = self._overrides
@@ -175,16 +204,8 @@ class ParallelContext:
         return self._v("world_rank", _ps().get_world_rank)
 
     @property
-    def tp_size(self) -> int:
-        return self._v("tp_size", _ps().get_tensor_model_parallel_world_size)
-
-    @property
     def tp_rank(self) -> int:
         return self._v("tp_rank", _ps().get_tensor_model_parallel_rank)
-
-    @property
-    def pp_size(self) -> int:
-        return self._v("pp_size", _ps().get_pipeline_model_parallel_world_size)
 
     @property
     def pp_rank(self) -> int:
@@ -197,10 +218,6 @@ class ParallelContext:
     @property
     def moe_ep_rank(self) -> int:
         return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
-
-    @property
-    def moe_dp_size(self) -> int:
-        return self._v("moe_dp_size", _ps().get_moe_data_parallel_world_size)
 
     @property
     def moe_dp_rank(self) -> int:
@@ -223,16 +240,8 @@ class ParallelContext:
         return self._v("attn_tp_rank", _ps().get_attn_tensor_model_parallel_rank)
 
     @property
-    def attn_cp_size(self) -> int:
-        return self._v("attn_cp_size", _ps().get_attn_context_model_parallel_world_size)
-
-    @property
     def attn_cp_rank(self) -> int:
         return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
-
-    @property
-    def dcp_size(self) -> int:
-        return self._v("dcp_size", _ps().get_dcp_world_size)
 
     @property
     def dcp_rank(self) -> int:
@@ -243,14 +252,15 @@ class ParallelContext:
         def getter():
             if _ps().get_dcp_group_no_assert() is None:
                 return False
-            return self.dcp_size > 1
+            return _ps().get_dcp_world_size() > 1
 
         return self._v("dcp_enabled", getter)
 
     @property
     def attn_dcp_size(self) -> int:
         return self._v(
-            "attn_dcp_size", lambda: self.dcp_size if self.dcp_enabled else 1
+            "attn_dcp_size",
+            lambda: _ps().get_dcp_world_size() if self.dcp_enabled else 1,
         )
 
     @property
@@ -376,6 +386,20 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
+    # The shared-experts-fusion decision, per runner — the runner_backend /
+    # speculative_runner_backend shape. Both leaves are seeded from the config
+    # intent by ``initialize_moe_config``; each MoE model's gate
+    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
+    # before its layers build and read it. ``speculative_moe_backend_context``
+    # brackets a draft's build: on exit the draft's effective decision is
+    # persisted onto the speculative leaf (inspectable afterwards) and the
+    # target's ACTIVE value returns.
+    disable_shared_experts_fusion: bool | None = None
+    speculative_disable_shared_experts_fusion: bool | None = None
+    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
+    # speculative_moe_backend_context is active, so a draft gate's write also
+    # lands on the speculative leaf.
+    in_speculative_scope: bool = False
 
 
 @dataclasses.dataclass
@@ -402,8 +426,8 @@ class DpFlags(_FlagGroupBase):
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
-    Resolved configuration lives on ``server_args`` fields (materialized at
-    the end of ``__post_init__``) — this tier only carries genuine runtime
+    Resolved configuration lives in the config bags below (projected from the
+    declarations at publish) — this tier only carries genuine runtime
     state whose value is not a function of the configuration alone, grouped
     by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
     """
@@ -636,8 +660,13 @@ class _ConfigBag:
 
     @contextmanager
     def override(self, **kwargs):
-        """Scoped, transactional test-only override of this bag's own leaves
-        (keys validated before any write; restored on exit)."""
+        """Scoped, transactional override of this bag's own leaves (keys
+        validated before any write; restored on exit).
+
+        For a window where one runner's value differs from the process's — a
+        draft model loading under ``--speculative-draft-load-format`` while the
+        target keeps ``--load-format`` — and for tests forcing a code path.
+        A permanent change goes through ``get_context().override``."""
         fields = object.__getattribute__(self, "_fields")
         unknown = set(kwargs) - set(fields)
         if unknown:
@@ -654,18 +683,21 @@ class _ConfigBag:
 
 
 def _build_config_bags(server_args: Any) -> dict:
-    """Snapshot resolved ``server_args`` into the namespace bag tree, driven by
-    the ``NS(...)`` metadata on the dataclass fields. Returns
+    """Snapshot the resolution result into the namespace bag tree, driven by
+    the ``NS(...)`` metadata on the dataclass fields. Each leaf comes from
+    ``resolution_result`` -- the declaration if resolution made one, else what
+    the caller supplied. Returns
     ``{top_level_name: _ConfigBag}``, arbitrarily nested (``exec.moe.eplb.…``).
     Only dataclass fields carry ``NS`` markers, so derived properties/methods are
     naturally excluded (they stay on the bag). A name used as both a leaf and a
     subgroup at the same level is a hard error — no silent shadowing."""
     from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.arg_groups.overrides import resolution_result
 
     _MISSING = object()
     tops: dict = {}
     for field, path in namespace_of(type(server_args)).items():
-        value = getattr(server_args, field, _MISSING)
+        value = resolution_result(server_args, field, _MISSING)
         if value is _MISSING:
             # Every NS-declared field is a dataclass field, so a resolved config
             # always carries it; a miss means a malformed/partial config object
@@ -701,34 +733,6 @@ def _build_config_bags(server_args: Any) -> dict:
     return tops
 
 
-def _snapshot_bag_values(bags: dict | None) -> dict | None:
-    """Per-leaf value snapshot of a config-bag tree (bags are mutated in
-    place by ``override``, so reference snapshots alias live state)."""
-    if bags is None:
-        return None
-    snap: dict = {}
-
-    def walk(prefix: str, bag) -> None:
-        snap[prefix] = dict(object.__getattribute__(bag, "_fields"))
-        for name, sub in object.__getattribute__(bag, "_subs").items():
-            walk(f"{prefix}.{name}", sub)
-
-    for name, bag in bags.items():
-        walk(name, bag)
-    return snap
-
-
-def _restore_bag_values(bags: dict, snap: dict) -> None:
-    def walk(prefix: str, bag) -> None:
-        for key, value in snap[prefix].items():
-            bag._set(key, value)
-        for name, sub in object.__getattribute__(bag, "_subs").items():
-            walk(f"{prefix}.{name}", sub)
-
-    for name, bag in bags.items():
-        walk(name, bag)
-
-
 class RuntimeContext:
     """Container for the structured runtime accessors; exposes ``parallel``,
     ``server_args``, the resolved config namespace bags, ``flags``,
@@ -756,7 +760,7 @@ class RuntimeContext:
         self.forward = ForwardFlags()
 
     def get_stream(self, name: str) -> Any:
-        """Named process-level CUDA side stream: get-or-create, shared by
+        """Named process-level side stream: get-or-create, shared by
         name (the keyed-lazy pattern of the persistent buffers). Creation is
         a driver call that must stay outside cuda-graph capture — call sites
         lease their stream at init/warmup time."""
@@ -764,7 +768,14 @@ class RuntimeContext:
         if stream is None:
             import torch
 
-            stream = torch.cuda.Stream()
+            from sglang.srt.arg_groups.overrides import resolution_result
+
+            device = (
+                resolution_result(self._server_args, "device")
+                if self._server_args
+                else "cuda"
+            )
+            stream = torch.get_device_module(device).Stream()
             self.resources.streams[name] = stream
         return stream
 
@@ -799,8 +810,8 @@ class RuntimeContext:
         Overwrite-allowed: a re-publish replaces the slot (test kits re-publish
         per test; production ordering discipline lives at the call-sites, e.g.
         the draft-worker guard in ``ModelRunner.__init__``). The published
-        object already carries the resolved configuration (declarations
-        materialize at the end of ``__post_init__``).
+        object is the raw input; the resolution it carries is its declaration
+        stash, which is what the bags are projected from.
         """
         # Seed the capture tier for the new lifecycle (defaults for sentinel
         # and mock publishes, which carry no config).
@@ -808,13 +819,17 @@ class RuntimeContext:
             server_args, "enable_torch_compile", False
         )
         self._server_args = server_args
+        # The adaptive draft-token bound memoizes on the config *path*, so a new
+        # publication that reuses the path must not inherit the bound computed
+        # from the file's previous contents.
+        _adaptive_draft_token_bound.cache_clear()
         # Snapshot resolved config into the namespace bags (the single source of
         # truth for config reads). Driven by NS(...) metadata; a mock/partial
         # config with no NS markers yields an empty tree (no bags projected).
         self._config_bags = _build_config_bags(server_args)
-        # Wire the parallel config leaves onto the live wrapper (config-only
-        # leaves like pp_max_micro_batch_size are served via ParallelContext
-        # __getattr__; live topology properties still win by name).
+        # Wire the published `parallel` bag onto the live wrapper: it is the slot
+        # the `config` property reads, which is how config-only leaves like
+        # pp_max_micro_batch_size are spelled.
         self.parallel._config = self._config_bags.get("parallel")
         # A direct install is roleless; ``publish`` assigns the role afterwards.
         self._overrides_log = []
@@ -831,6 +846,11 @@ class RuntimeContext:
         if _ROLE_NS_MODE != "off":
             self._check_role_namespace(name)
         return bags[name]
+
+    def is_config_namespace_published(self, name: str) -> bool:
+        """Return whether a config namespace exists in the current context."""
+        bags = self._config_bags
+        return bags is not None and name in bags
 
     def _check_role_namespace(self, name: str) -> None:
         # Out of line so the mode gate above stays one dead-branch-prunable
@@ -901,6 +921,29 @@ class RuntimeContext:
             bag._set(name, value)
         self._overrides_log.append((source, dict(fields)))
 
+    def config_leaf(self, name: str):
+        """One resolved config leaf by field name — the read side of ``override``.
+
+        Callers that hold a field name rather than a namespace (a readback
+        endpoint, a control-plane handler) would otherwise have to know which
+        bag it lives in.
+        """
+        bags = self._config_bags
+        if bags is None:
+            raise ValueError("config not published; cannot read a config leaf")
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+
+        path = namespace_of(type(self._server_args)).get(name)
+        if path is None:
+            raise ValueError(f"{name!r} is not a config leaf (no NS namespace)")
+        parts = path.split(".")
+        bag = self.config_bag(parts[0])
+        for seg in parts[1:]:
+            bag = object.__getattribute__(bag, "_subs").get(seg)
+            if bag is None:
+                raise ValueError(f"subgroup {seg!r} missing under {path!r}")
+        return getattr(bag, name)
+
     def overrides_log(self) -> list:
         """Provenance of post-publish ``override`` calls: ``[(source, {field: value})]``.
 
@@ -917,20 +960,23 @@ class RuntimeContext:
         in a readback: HiCache attach/detach, the generated forward-pass-metrics
         endpoint, tunables set via ``/set_internal_state``.
 
-        ``base`` defaults to ``dict(vars(server_args))`` (matching the legacy
-        ``vars`` dump); pass ``dataclasses.asdict(server_args)`` when nested
-        dataclass fields must be expanded first. Override leaves are flat
-        ``ServerArgs`` field names, so overlaying them onto the top level of
-        either base is exact.
+        ``base`` defaults to ``server_args.resolved_dict()`` -- the record's
+        fields as resolution decided them, nested dataclasses expanded. (It used
+        to be ``dict(vars(server_args))``, which carried the private resolution
+        bookkeeping and the ``model_config`` memo into the readback.) Override
+        leaves are flat ``ServerArgs`` field names, so overlaying them onto the
+        top level of the base is exact.
 
-        This covers the process-global bags only. Per-engine control-plane
-        changes (weight version, model path, the tokenizer's HiCache mirror)
-        live on the tokenizer manager — several ``Engine``s can share one
-        process — and ``TokenizerManager.resolved_config_dict`` overlays those
-        for the top-level ``/server_info`` body. The two are separate logs, not
-        one merged dict.
+        The log is per process: it carries what *this* process overrode. A
+        weight reload records ``model_path`` and ``load_format`` from the
+        scheduler process (``ModelRunner.update_model_fields``); the tokenizer
+        process records only ``load_format`` and keeps ``model_path`` /
+        ``served_model_name`` as ``TokenizerManager`` attributes, which
+        ``TokenizerManager.resolved_config_dict`` overlays on top of this dump.
+        The top-level ``/server_info`` fields are the startup record, not this
+        dump.
         """
-        d = dict(vars(self.server_args)) if base is None else dict(base)
+        d = self.server_args.resolved_dict() if base is None else dict(base)
         for _source, fields in self._overrides_log:
             d.update(fields)
         return d
@@ -945,41 +991,17 @@ class RuntimeContext:
         dummy-boundary ``ServerArgs`` carrying ``fields`` and returns it;
         ``restore()`` (or exiting) reinstates whatever the slot held before.
 
-        Transitional — to be deprecated: it exists because production code
-        still branches on raw ``server_args`` fields at runtime, so forcing a
-        path needs a full config in the slot. As those readers migrate onto
-        the named runtime tiers (flags / resources / forward), prefer the
-        finer-grained overrides; once they cover the branching surface this
-        override loses its clients and goes away.
+        This is the sanctioned way for a test to get a published context, and
+        it stays. The transitional reason it was introduced for — production
+        code branching on raw ``server_args`` fields at runtime — is gone (the
+        read ratchet pins business reads at zero), but a test that exercises
+        bag readers still needs bags, and the bag tree is projected *from an
+        instance*: something has to publish one. Prefer the finer-grained
+        scoped overrides (``get_exec().override(...)``, the flag groups'
+        ``override``) on top of a published context when a test only needs to
+        force one leaf.
         """
         return _ServerArgsOverride(self, fields)
-
-    @contextmanager
-    def preserve_config(self):
-        """Snapshot the full config lifecycle and reinstate it verbatim on exit.
-
-        For nested construction steps that publish a private ``ServerArgs``
-        copy (e.g. a draft-worker build) and must leave the enclosing
-        lifecycle — including its post-publish overrides — untouched.
-        """
-        prev_server_args = self._server_args
-        prev_bags = self._config_bags
-        prev_bag_values = _snapshot_bag_values(prev_bags)
-        prev_overrides_log = list(self._overrides_log)
-        prev_publish_role = self._publish_role
-        prev_parallel_config = self.parallel._config
-        prev_capture = self.flags.capture.enable_torch_compile
-        try:
-            yield
-        finally:
-            self._server_args = prev_server_args
-            self._config_bags = prev_bags
-            if prev_bags is not None:
-                _restore_bag_values(prev_bags, prev_bag_values)
-            self._overrides_log = prev_overrides_log
-            self._publish_role = prev_publish_role
-            self.parallel._config = prev_parallel_config
-            self.flags.capture.enable_torch_compile = prev_capture
 
 
 class _ServerArgsOverride:
@@ -1011,8 +1033,7 @@ class _ServerArgsOverride:
 
     def install(self) -> ServerArgs:
         """Publish a fresh dummy-boundary ``ServerArgs`` carrying the
-        overrides (written through ``ServerArgs.override`` for provenance);
-        returns the published instance."""
+        overrides; returns the published instance."""
         from sglang.srt.server_args import ServerArgs
 
         assert not self._installed, "override_server_args already installed"
@@ -1023,14 +1044,36 @@ class _ServerArgsOverride:
         self._prev_publish_role = ctx._publish_role
         self._prev_parallel_config = ctx.parallel._config
         self._prev_capture = ctx.flags.capture.enable_torch_compile
+        from sglang.srt.arg_groups.overrides import (
+            _apply_fields,
+            declare_late_resolution,
+        )
+
         server_args = ServerArgs(model_path="dummy")
-        if self._fields:
-            server_args.override(source="test-override", **self._fields)
-        # The dummy boundary skips materialization, which would leave the
-        # strict mutation guard unarmed on the published object — mark it
-        # materialized so bare post-publish writes raise like they do on a
-        # fully resolved config.
-        object.__setattr__(server_args, "_declarations_materialized", True)
+        server_args.resolve_once()
+        # Underscore names seed private property caches (the strict guard
+        # exempts them); everything else must be a real config field.
+        unknown = {name for name in self._fields if not name.startswith("_")} - set(
+            type(server_args).__dataclass_fields__
+        )
+        if unknown:
+            raise ValueError(
+                f"override_server_args: unknown ServerArgs field(s): {sorted(unknown)}"
+            )
+        # Declared so the projection sees it; late, because the record is
+        # resolved already and not yet published.
+        # Underscore names are not fields at all (they seed private property
+        # caches), so they stay a direct write.
+        declared = {
+            name: value for name, value in self._fields.items() if name[0] != "_"
+        }
+        if declared:
+            declare_late_resolution(server_args, "override_server_args", **declared)
+        # This hook stands in for a launch: the caller's values are both what
+        # the operator passed and what resolution decided, so they go on the
+        # record as well as into the stash. Production late resolution declares
+        # only -- there the record stays the operator's input.
+        _apply_fields(server_args, self._fields)
         ctx.set_server_args(server_args)
         self._installed = True
         return server_args
@@ -1090,8 +1133,8 @@ def get_forward() -> ForwardFlags:
 # --- Resolved config namespaces -------------------------
 # Each returns the top-level snapshot bag; reads are `get_exec().moe.field` etc.
 # All fail with ValueError("... not published") until publish has projected them.
-# ``parallel`` config leaves are served by ``get_parallel()`` (live wrapper);
-# their config-bag wiring is a scoped follow-up.
+# ``parallel`` has no bag getter: ``get_parallel()`` answers its leaves
+# directly, alongside the live topology they belong to.
 def get_device() -> _ConfigBag:
     return _CONTEXT.config_bag("device")
 
@@ -1142,8 +1185,8 @@ def get_observability() -> _ConfigBag:
 # table declares which top-level config namespaces each role reads. ``None``
 # means the full tree — either the role genuinely needs everything (scheduler)
 # or its deployment shape has not been audited yet (restrict only what smoke
-# coverage can verify). ``parallel`` is served by ``get_parallel()`` and every
-# process legitimately reads topology config, so it is not part of this table.
+# coverage can verify). ``parallel`` is served by ``get_parallel()`` and
+# every process legitimately reads topology config, so it is not in this table.
 #
 # ``SGLANG_ROLE_NAMESPACES`` selects the mode (read once at import):
 #   off      (default) no bookkeeping, zero overhead;
@@ -1156,20 +1199,26 @@ def get_observability() -> _ConfigBag:
 ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Reads (almost) everything by design — the model-executing process.
     "scheduler": None,
-    "launcher": None,
     "test": None,
-    # Audited (record-mode smokes, plain + DP-attention): the DP controller
-    # reads only the elastic-EP gate; its module's static read set agrees.
-    "dp_controller": frozenset({"exec"}),
-    # Zero bag reads observed (per-instance managers read self.server_args by
-    # design). Keep full: it may need namespaces (e.g. disagg) once tokenizer
-    # paths migrate off self.server_args, and restricting on a zero-read
-    # audit would be guesswork.
+    # The DP controller's static read set, checked against the module: the
+    # elastic-EP gate, the load-balance method, the watchdog timeout, and the
+    # disaggregation mode.
+    "dp_controller": frozenset({"exec", "parallel", "device", "disagg"}),
+    # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
+    # /v1/models): reads exactly {"serving"} — the per-instance managers read
+    # self.server_args by design. Still declared full, because that run did not
+    # exercise the multimodal processors, LoRA/score endpoints, the disagg
+    # roles, or the gRPC bridge; narrowing needs those shapes audited too, and
+    # a wrong set fails a request rather than a test.
     "tokenizer": None,
     # Deployment shapes not exercised locally; audit before restricting.
+    "detokenizer": None,
     "encoder": None,
     "expert_backup": None,
     "weight_cache_daemon": None,
+    # The diffusion GPU worker runs a model and publishes a placeholder so
+    # shared SRT reads do not fail closed; declared full for that reason.
+    "diffusion_gpu_worker": None,
 }
 
 
@@ -1201,9 +1250,12 @@ _RECORD_DUMP_REGISTERED = False
 def _is_compiling() -> bool:
     # Recording has Python side effects (set mutation, file I/O, atexit) that
     # must never run under tracing; torch.compiler.is_compiling() is dynamo's
-    # sanctioned probe. The lazy lookup keeps this module import-light.
-    torch = sys.modules.get("torch")
-    return torch is not None and torch.compiler.is_compiling()
+    # sanctioned probe. The function-level import keeps this module
+    # import-light; a sys.modules lookup here breaks fullgraph tracing (dynamo
+    # enumerates the dict, which other imports mutate mid-trace).
+    import torch
+
+    return torch.compiler.is_compiling()
 
 
 def _ensure_record_dump_registered() -> None:
@@ -1271,23 +1323,18 @@ def _dump_recorded_namespace_reads() -> None:
 def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
     """Install process-wide config for this OS process.
 
-    Records the process ``role`` (``tokenizer`` / ``scheduler`` /
-    ``dp_controller`` / ``encoder`` / ``expert_backup`` /
-    ``weight_cache_daemon`` / ``launcher`` / ``test``) and
+    Records the process ``role`` — one of the ``ROLE_NAMESPACE_SETS`` keys,
+    which is the one place the roles are enumerated — and
     projects the config bags. Draft workers skip publish (they must not clobber
     the target). ``role`` is provenance, and — when ``SGLANG_ROLE_NAMESPACES``
     is ``enforce`` — the key into ``ROLE_NAMESPACE_SETS`` for fail-closed
     namespace-read enforcement (``record`` audits the reads instead).
     ``hf_config`` is accepted for forward-compat and currently unused.
 
-    Normally one call per process, but re-publish is allowed and is
-    **last-publish-wins** (bags re-projected, provenance reset, role
-    overwritten). Two sanctioned multi-publish shapes exist: the in-process
-    Engine builds its ``TokenizerManager`` inside the launcher process (the
-    process ends up with the tokenizer publish), and multiple Engines in one
-    process publish in sequence — which is exactly why per-instance managers
-    must read ``self.server_args`` for anything engine-specific rather than
-    the process-global bags.
+    A process holds at most one live config: the bags always describe the
+    engine running now. Re-publish is allowed and is **last-publish-wins**
+    (bags re-projected, provenance reset, role overwritten), which is what
+    lets one process rebuild an engine after shutting the previous one down.
     """
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
@@ -1295,7 +1342,19 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    server_args.resolve_once()
+    discarded = _CONTEXT.overrides_log()
     _CONTEXT.set_server_args(server_args)
+    if discarded:
+        logger.warning(
+            "publish(role=%s) re-projected the config bags and dropped %d "
+            "override(s) taken since the last publish: %s",
+            role,
+            len(discarded),
+            ", ".join(
+                f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
+            ),
+        )
     _CONTEXT._publish_role = role
     if _ROLE_NS_MODE == "record":
         # The '-' marker distinguishes a zero-read role from a process where
@@ -1309,6 +1368,40 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             flush=True,
         )
     return _CONTEXT
+
+
+def assert_published(server_args, *, role: str) -> RuntimeContext:
+    """This record, under this role, is already published -- or fail loud.
+
+    Publishing is the process entry's job: `run_scheduler_process`,
+    `init_multi_tokenizer`, a spawned encoder worker, the benchmark work
+    functions. A constructor arriving here unpublished means one of those
+    entries is missing.
+
+    A `publish` at this point re-projects the bags over a live process,
+    discarding every `override()` taken since and the provenance log with it,
+    so this raises.
+    """
+    if _CONTEXT._server_args is server_args and _CONTEXT._publish_role == role:
+        return _CONTEXT
+    if _CONTEXT._server_args is None:
+        detail = "nothing is published in this process"
+    elif _CONTEXT._server_args is not server_args:
+        detail = (
+            "a different record is published "
+            f"(role={_CONTEXT._publish_role!r}); this constructor was handed "
+            "one the process never published"
+        )
+    else:
+        detail = (
+            f"this record is published under role "
+            f"{_CONTEXT._publish_role!r}, not {role!r}"
+        )
+    raise RuntimeError(
+        f"config not published for role {role!r}: {detail}. The process entry "
+        "publishes -- add publish(server_args, role=...) there rather than "
+        "publishing from a constructor."
+    )
 
 
 def publish_role() -> str | None:
@@ -1340,6 +1433,81 @@ def set_global_dwdp_manager(manager: Any) -> None:
     _GLOBAL_DWDP_MANAGER = manager
 
 
+def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
+    """The leaf values of a flag group, recursively."""
+    leaves: dict[str, Any] = {}
+    for name in type(group).__dataclass_fields__:
+        value = getattr(group, name)
+        if isinstance(value, _FlagGroupBase):
+            leaves[name] = _group_leaves(value)
+        elif isinstance(value, (dict, list)):
+            leaves[name] = type(value)(value)
+        else:
+            leaves[name] = value
+    return leaves
+
+
+def _restore_leaves(group: _FlagGroupBase, leaves: dict[str, Any]) -> None:
+    for name, value in leaves.items():
+        current = getattr(group, name)
+        if isinstance(current, _FlagGroupBase):
+            _restore_leaves(current, value)
+        elif isinstance(current, dict):
+            current.clear()
+            current.update(value)
+        elif isinstance(current, list):
+            current[:] = value
+        else:
+            setattr(group, name, value)
+
+
+def snapshot_context() -> dict[str, Any]:
+    """Everything a publish replaces, so a failed launch can put it back.
+
+    Enumerated from ``__slots__`` rather than listed by hand: a hand-picked copy
+    of context state is one field behind the day a slot is added, and the copy
+    that silently drops one is worse than none. Flag groups are snapshotted by
+    leaf, not by reference: publish writes *into* the same ``Flags`` object
+    (``capture.enable_torch_compile``), so a reference held here would already
+    carry the failed launch's value by the time it is put back.
+    """
+    state: dict[str, Any] = {}
+    for name in RuntimeContext.__slots__:
+        if name == "parallel":
+            continue
+        value = getattr(_CONTEXT, name)
+        if isinstance(value, _FlagGroupBase):
+            state[name] = (value, _group_leaves(value))
+        elif isinstance(value, list):
+            state[name] = list(value)
+        else:
+            state[name] = value
+    state["__parallel__"] = {
+        name: getattr(_CONTEXT.parallel, name)
+        for name in type(_CONTEXT.parallel).__slots__
+    }
+    state["__dwdp__"] = get_global_dwdp_manager()
+    return state
+
+
+def restore_context(state: dict[str, Any]) -> None:
+    """Put back what ``snapshot_context`` captured."""
+    for name in RuntimeContext.__slots__:
+        if name == "parallel":
+            continue
+        value = state[name]
+        if isinstance(value, tuple) and isinstance(value[0], _FlagGroupBase):
+            group, leaves = value
+            setattr(_CONTEXT, name, group)
+            _restore_leaves(group, leaves)
+        else:
+            setattr(_CONTEXT, name, value)
+    for name, value in state["__parallel__"].items():
+        setattr(_CONTEXT.parallel, name, value)
+    _adaptive_draft_token_bound.cache_clear()
+    set_global_dwdp_manager(state["__dwdp__"])
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
@@ -1348,6 +1516,7 @@ def reset_context() -> None:
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
+    _adaptive_draft_token_bound.cache_clear()
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
@@ -1355,3 +1524,225 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     set_global_dwdp_manager(None)
+
+
+def mamba_extra_buffer_enabled() -> bool:
+    """Whether the mamba radix cache keeps its extra state buffer.
+
+    A predicate over two published leaves (``memory.disable_radix_cache`` and
+    ``exec.mamba.mamba_radix_cache_strategy``), so it reads the bags rather
+    than the startup record — the ``ServerArgs`` member of the same name is the
+    pre-publish equivalent used inside the resolution pipeline.
+    """
+    return (
+        get_memory().disable_radix_cache is False
+        and get_exec().mamba.mamba_radix_cache_strategy
+        in ("extra_buffer", "extra_buffer_lazy")
+    )
+
+
+def mamba_extra_buffer_lazy_enabled() -> bool:
+    """The lazy variant of :func:`mamba_extra_buffer_enabled`."""
+    return (
+        get_memory().disable_radix_cache is False
+        and get_exec().mamba.mamba_radix_cache_strategy == "extra_buffer_lazy"
+    )
+
+
+def remote_instance_transfer_engine_enabled(load_format: str | None = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    Every input is a ``model`` leaf, so this derives from the bags and follows a
+    post-publish override; ``ServerArgs.remote_instance_weight_loader_use_transfer_engine``
+    is the pre-publish equivalent, and both go through the same helper.
+    ``load_format`` is the caller's own (a draft runner loading under
+    ``--speculative-draft-load-format`` has one the process record does not).
+    """
+    from sglang.srt.arg_groups.overrides import remote_instance_transfer_engine_of
+
+    return remote_instance_transfer_engine_of(get_model(), load_format)
+
+
+def max_prefill_buffer_tokens() -> int:
+    """The prefill-buffer ceiling: ``chunked_prefill_size``, except PP dynamic
+    chunking can grow chunks toward ``max_prefill_tokens`` and probe at 1.25x.
+
+    Every input is a published leaf (``schedule`` plus the configured PP size),
+    so this derives from the bags and follows a post-publish override;
+    ``ServerArgs.max_prefill_buffer_tokens`` is the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    import math
+
+    schedule = get_schedule()
+    chunked = (
+        schedule.chunked_prefill_size
+        if schedule.chunked_prefill_size and schedule.chunked_prefill_size > 0
+        else 0
+    )
+    tokens = chunked
+    if schedule.enable_dynamic_chunking and get_parallel().pp_size > 1 and chunked:
+        tokens = max(
+            tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
+        )
+    return tokens
+
+
+def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
+    """The activation working-set reserve held back before cuda-graph capture.
+
+    Derived from published leaves across four bags (``disagg`` / ``schedule`` /
+    ``exec.graph`` / ``spec``) plus the configured parallel sizes, so it follows
+    a post-publish override; ``ServerArgs.pre_capture_activation_reserve_mb`` is
+    the pre-publish equivalent and
+    ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
+    """
+    schedule = get_schedule()
+    if get_disagg().disaggregation_mode == "decode":
+        running_requests = (
+            schedule.max_running_requests
+            or get_exec().graph.cuda_graph_config.decode.max_bs
+            or 1
+        )
+        activation_tokens = max(
+            running_requests * (get_spec().speculative_num_draft_tokens or 1), 2048
+        )
+    elif schedule.chunked_prefill_size > 0:
+        activation_tokens = max(schedule.chunked_prefill_size, 2048)
+    else:
+        activation_tokens = max(schedule.max_prefill_tokens, 2048)
+    parallel = get_parallel()
+    reserved_mem = (
+        512 + activation_tokens * 1.5 + parallel.tp_size * parallel.pp_size / 8 * 1024
+    )
+    if gpu_mem is not None and gpu_mem > 60 * 1024:
+        reserved_mem = max(reserved_mem, 10 * 1024)
+    return reserved_mem
+
+
+# --- Derived config accessors ------------------------------------------------
+#
+# A few values are computed from several config fields plus the HF config, so
+# they are ``ServerArgs`` members rather than namespace leaves. Business code
+# must not reach for the startup record to get them: these accessors are the
+# named home, and this module — which owns the slot — is the only place that
+# reads it. Each one keeps the member's exact semantics, including which model
+# config it derives from (always the process's, i.e. the target's).
+
+
+def mamba_cache_chunk_size() -> int:
+    """The caching point granularity for mamba state: ``max(the model's mamba
+    chunk size, page_size)``. Cached on the config after the first call."""
+    return get_server_args().mamba_cache_chunk_size
+
+
+def mamba_checkpoint_grid(tree_page: int) -> int:
+    """The granularity a donated mamba checkpoint's depth must land on so the
+    radix tree can name it. Pass the page the tree actually allocates on: DCP
+    widens it past ``mamba_cache_chunk_size``, and deriving that here would be a
+    second copy of a predicate that already lives in the cache builder."""
+    return math.lcm(mamba_cache_chunk_size(), tree_page)
+
+
+def mamba_track_grid(tree_page: int) -> int:
+    """The same granularity for a decode-donated checkpoint, which additionally
+    has to land on the requested ``mamba_track_interval``."""
+    return math.lcm(
+        mamba_checkpoint_grid(tree_page), get_exec().mamba.mamba_track_interval
+    )
+
+
+def max_speculative_num_draft_tokens() -> int | None:
+    """The largest draft-token count speculative decoding may use.
+
+    All three inputs are ``spec`` leaves, so this derives from the bags and
+    follows a post-publish override; ``ServerArgs.max_speculative_num_draft_tokens``
+    is the pre-publish equivalent. Adaptive spec resolves the count from its
+    candidate-step table instead of the flat field.
+    """
+    spec = get_spec()
+    if spec.speculative_num_draft_tokens is None:
+        return None
+    if not spec.speculative_adaptive:
+        return spec.speculative_num_draft_tokens
+    # The adaptive branch parses a JSON config, and this is called per decode
+    # batch (`spec_prepare_for_decode`), so memoize on the inputs -- keyed, not
+    # cached once, so a post-publish override still recomputes.
+    return _adaptive_draft_token_bound(spec.speculative_adaptive_config)
+
+
+@functools.lru_cache(maxsize=8)
+def _adaptive_draft_token_bound(cfg_path: str | None) -> int:
+    from sglang.srt.speculative.adaptive_spec_params import (
+        resolve_candidate_steps_from_config,
+    )
+
+    candidate_steps = resolve_candidate_steps_from_config(cfg_path=cfg_path)
+    # Adaptive spec requires topk=1 today, so each runtime state needs
+    # steps + 1 draft-token slots (mirrors the ServerArgs member).
+    return max(candidate_steps) + 1
+
+
+def uses_mla_backend() -> bool:
+    """Whether this process's model runs the MLA attention path."""
+    return get_server_args().use_mla_backend()
+
+
+def attention_backends() -> tuple:
+    """The configured ``(prefill, decode)`` backend pair, split fields falling
+    back to ``attention_backend``.
+
+    All three inputs are ``exec.kernel`` leaves, so this derives from the bags
+    and follows a post-publish override; ``ServerArgs.get_attention_backends``
+    is the pre-publish equivalent the resolution pipeline uses. A built runner
+    stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
+    read that when there is a runner in hand.
+    """
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    # All three leaves live in the same bag, so the resolution pipeline's own
+    # helper applies directly -- one definition of the fallback rule.
+    return attention_backends_of(get_exec().kernel)
+
+
+def process_model_config():
+    """The process's ``ModelConfig`` (built once from the published config)."""
+    return get_server_args().get_model_config()
+
+
+def cutedsl_moe_max_num_tokens() -> int:
+    """The CuteDSL A2A per-rank token budget.
+
+    Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
+    this derives from the bags and follows a post-publish override;
+    ``ServerArgs.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
+    resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
+    capture, and the decode/verify bound.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    spec = get_spec()
+    num_tokens_per_req = (
+        (spec.speculative_num_draft_tokens or 1) if spec.speculative_algorithm else 1
+    )
+    prefill_tokens = get_schedule().max_prefill_tokens
+    cg_config = get_exec().graph.cuda_graph_config
+    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
+        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
+    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    return max(prefill_tokens, decode_max_bs * num_tokens_per_req)
+
+
+def is_ep_joiner() -> bool:
+    """True in a process launched as an elastic-EP joiner (scale or recover).
+
+    A predicate over the published ``exec.moe.ep_join_mode`` leaf, so it follows
+    a post-publish override; the same-named ``ServerArgs`` property is the
+    pre-publish equivalent.
+    """
+    return get_exec().moe.ep_join_mode in ("scale", "recover")
+
+
+def is_ep_scale_joiner() -> bool:
+    """True in a process launched as an elastic-EP scale-up joiner."""
+    return get_exec().moe.ep_join_mode == "scale"

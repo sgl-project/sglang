@@ -1,7 +1,29 @@
 import copy
 import unittest
+import weakref
+from array import array
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+import msgspec
+import numpy as np
+import torch
+
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+    MultimodalProcessorOutput,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -15,7 +37,329 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
+
+
+class TestTokenizedReqInputMsgpack(unittest.TestCase):
+    def _make_mm_inputs(self, device="cpu"):
+        return MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(0, 1)],
+                    format=MultimodalInputFormat.NORMAL,
+                    feature=torch.tensor(
+                        [[1.0, 2.0]], dtype=torch.float32, device=device
+                    ),
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor(
+                            [[1, 1, 2]], dtype=torch.int64, device=device
+                        ),
+                        "patch_counts": np.array([2], dtype=np.int32),
+                        "names": ["image0"],
+                        "count": np.int64(2),
+                        "enabled": np.bool_(True),
+                        "size": (336, 336),
+                    },
+                )
+            ],
+            input_ids=[1, 2],
+            padded_input_ids=[10, 10],
+            im_token_id=10,
+            mrope_positions=torch.tensor([[0, 1]], dtype=torch.int64, device=device),
+            token_type_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+        )
+
+    def _round_trip(self, req):
+        req.wrap_pickle_fields()
+        decoded = msgpack_decode(msgpack_encode(req))
+        decoded.unwrap_pickle_fields()
+        return decoded
+
+    def _round_trip_mm_inputs(self, mm_inputs):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+        return decoded.mm_inputs
+
+    def test_generate_mm_inputs_round_trip_without_pickle_wrapper(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=self._make_mm_inputs(),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        self.assertIsInstance(decoded.mm_inputs, MultimodalProcessorOutput)
+        item = decoded.mm_inputs.mm_items[0]
+        self.assertIsInstance(item, MultimodalDataItem)
+        self.assertEqual(item.modality, Modality.IMAGE)
+        self.assertEqual(item.offsets, [(0, 1)])
+        self.assertTrue(
+            torch.equal(item.feature, torch.tensor([[1.0, 2.0]], device="cpu"))
+        )
+        self.assertTrue(
+            torch.equal(
+                item.model_specific_data["image_grid_thw"],
+                torch.tensor([[1, 1, 2]], dtype=torch.int64, device="cpu"),
+            )
+        )
+        np.testing.assert_array_equal(
+            item.model_specific_data["patch_counts"],
+            np.array([2], dtype=np.int32),
+        )
+        self.assertEqual(item.model_specific_data["count"], 2)
+        self.assertIs(item.model_specific_data["enabled"], True)
+        self.assertEqual(item.model_specific_data["size"], [336, 336])
+        self.assertTrue(
+            torch.equal(
+                decoded.mm_inputs.mrope_positions,
+                torch.tensor([[0, 1]], dtype=torch.int64, device="cpu"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(decoded.mm_inputs.token_type_ids, torch.tensor([0, 0]))
+        )
+
+    def test_dynamic_model_specific_attribute_round_trip(self):
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].audio_feature_lens = torch.tensor([2])
+
+        decoded = self._round_trip_mm_inputs(mm_inputs)
+
+        self.assertTrue(
+            torch.equal(decoded.mm_items[0].audio_feature_lens, torch.tensor([2]))
+        )
+        self.assertIn("audio_feature_lens", decoded.mm_items[0].model_specific_data)
+
+    def test_multimodal_hash_is_normalized_to_uint64(self):
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].hash = (1 << 256) - 1
+        constructed = MultimodalDataItem(modality=Modality.IMAGE, hash=(1 << 128) - 1)
+
+        decoded = self._round_trip_mm_inputs(mm_inputs)
+
+        self.assertEqual(decoded.mm_items[0].hash, (1 << 64) - 1)
+        self.assertEqual(constructed.hash, (1 << 64) - 1)
+
+    def test_multimodal_processor_output_supports_weakrefs(self):
+        mm_inputs = self._make_mm_inputs()
+
+        ref = weakref.ref(mm_inputs)
+
+        self.assertIs(ref(), mm_inputs)
+
+    def test_unknown_ext_payload_is_preserved_without_decoding(self):
+        ext = msgspec.msgpack.Ext(99, b"not msgpack")
+
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(ext), ext_hook=ext_hook)
+
+        self.assertEqual(decoded, ext)
+
+    def test_malformed_known_buffer_ext_is_rejected(self):
+        with self.assertRaisesRegex(msgspec.DecodeError, "missing metadata"):
+            ext_hook(3, memoryview(b"bad"))
+
+    def test_embedding_mm_inputs_round_trip_without_pickle_wrapper(self):
+        decoded = self._round_trip(
+            TokenizedEmbeddingReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                mm_inputs=self._make_mm_inputs(),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+            )
+        )
+
+        self.assertIsInstance(decoded.mm_inputs, MultimodalProcessorOutput)
+        self.assertTrue(
+            torch.equal(
+                decoded.mm_inputs.mm_items[0].feature,
+                torch.tensor([[1.0, 2.0]], device="cpu"),
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_generate_mm_inputs_round_trip_preserves_cuda_tensor_device(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=self._make_mm_inputs(device="cuda:0"),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        item = decoded.mm_inputs.mm_items[0]
+        self.assertEqual(item.feature.device.type, "cuda")
+        self.assertEqual(item.model_specific_data["image_grid_thw"].device.type, "cuda")
+        self.assertEqual(decoded.mm_inputs.mrope_positions.device.type, "cuda")
+
+    def test_cuda_ipc_proxy_state_round_trip_preserves_tuple_types(self):
+        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+        proxy.proxy_state = {
+            "ipc_extra": {
+                "shape": torch.Size([2, 3]),
+                "stride": (3, 1),
+                "dtype": torch.float16,
+                "nested": [(1, 2), torch.Size([4])],
+            },
+            "tensor_data": None,
+        }
+        proxy.reconstruct_tensor = None
+        proxy.sync_data_meta = {
+            "handle": "dummy",
+            "shape": torch.Size([1]),
+            "dtype": np.dtype("float32"),
+        }
+        proxy.sync_buffer = None
+
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
+        ipc_extra = decoded_proxy.proxy_state["ipc_extra"]
+        self.assertIsInstance(ipc_extra["shape"], torch.Size)
+        self.assertEqual(ipc_extra["shape"], torch.Size([2, 3]))
+        self.assertIsInstance(ipc_extra["stride"], tuple)
+        self.assertEqual(ipc_extra["stride"], (3, 1))
+        self.assertIsInstance(ipc_extra["nested"][0], tuple)
+        self.assertIsInstance(ipc_extra["nested"][1], torch.Size)
+        self.assertIsInstance(decoded_proxy.sync_data_meta["shape"], torch.Size)
+        self.assertIsInstance(decoded_proxy.sync_data_meta["dtype"], np.dtype)
+        self.assertFalse(decoded_proxy._consumer_acknowledged)
+
+    def test_cuda_ipc_proxy_tensor_fallback_round_trip(self):
+        proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+        proxy.proxy_state = {
+            "ipc_extra": None,
+            "tensor_data": torch.tensor([1.0, 2.0], device="cpu"),
+        }
+        proxy.reconstruct_tensor = None
+        proxy.sync_data_meta = {
+            "handle": "dummy",
+            "shape": (1,),
+            "dtype": np.dtype("uint8"),
+        }
+        proxy.sync_buffer = None
+
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].model_specific_data["ipc_proxy"] = proxy
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_proxy = decoded.mm_inputs.mm_items[0].model_specific_data["ipc_proxy"]
+        self.assertTrue(
+            torch.equal(
+                decoded_proxy.proxy_state["tensor_data"],
+                torch.tensor([1.0, 2.0], device="cpu"),
+            )
+        )
+
+    def test_evs_model_specific_data_round_trip(self):
+        mm_inputs = self._make_mm_inputs()
+        item = mm_inputs.mm_items[0]
+        item.modality = Modality.VIDEO
+        item.model_specific_data.update(
+            {
+                "thw_grids": [(2, 3, 4)],
+                "pre_chunked_input_ids": [1, 2, 3],
+            }
+        )
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_item = decoded.mm_inputs.mm_items[0]
+        self.assertEqual(decoded_item.thw_grids, [[2, 3, 4]])
+        self.assertEqual(decoded_item.pre_chunked_input_ids, [1, 2, 3])
+
+    def test_torch_tensor_ext_wire_format(self):
+        ext = enc_hook(torch.tensor([1, 2], dtype=torch.int16, device="cpu"))
+        self.assertIsInstance(ext, msgspec.msgpack.Ext)
+        self.assertEqual(ext.code, 2)
+        self.assertEqual(
+            bytes(ext.data).hex(),
+            "0000000d939102a5696e743136a363707501000200",
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_empty_cpu_tensor_restore_ignores_default_device(self):
+        previous_device = torch.get_default_device()
+        try:
+            torch.set_default_device("cuda")
+            tensor = _restore_torch_tensor((0,), "float32", b"", "cpu")
+            self.assertEqual(tensor.device.type, "cpu")
+        finally:
+            torch.set_default_device(previous_device)
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
@@ -305,6 +649,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_preserves_reasoning_controls(self):
+        single = GenerateReqInput(
+            text="Hello",
+            rid="single",
+            sampling_params={"n": 3},
+            require_reasoning=True,
+            max_thinking_tokens=128,
+        )
+        single.normalize_batch_and_arguments()
+
+        self.assertEqual(single.rid, ["single_0", "single_1", "single_2"])
+        self.assertEqual(
+            [single[i].rid for i in range(3)],
+            ["single_0", "single_1", "single_2"],
+        )
+        self.assertTrue(all(single[i].require_reasoning for i in range(3)))
+        self.assertEqual(
+            [single[i].max_thinking_tokens for i in range(3)],
+            [128] * 3,
+        )
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            rid="batch",
+            sampling_params={"n": 2},
+        )
+        batch.normalize_batch_and_arguments()
+
+        self.assertEqual(batch.rid, ["batch_0", "batch_1", "batch_2", "batch_3"])
+        self.assertEqual(
+            [batch[i].rid for i in range(4)],
+            ["batch_0", "batch_1", "batch_2", "batch_3"],
+        )
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
@@ -485,6 +863,53 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.extra_key, "solo")
 
+    def test_cache_salt_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["tenant-A", ""],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["tenant-A", None])
+        self.assertEqual(req[0].cache_salt, "tenant-A")
+        self.assertIsNone(req[1].cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt="shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["shared", "shared"] * 2)
+
+        req = GenerateReqInput(text="Hello", cache_salt="")
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_cache_key_normalization_rejects_invalid_types(self):
+        for field_name in ("extra_key", "cache_salt"):
+            with self.subTest(field_name=field_name, mode="single"):
+                req = GenerateReqInput(text="Hello", **{field_name: ["value"]})
+                with self.assertRaisesRegex(ValueError, "single request"):
+                    req.normalize_batch_and_arguments()
+
+            with self.subTest(field_name=field_name, mode="batch"):
+                req = GenerateReqInput(
+                    text=["Hello", "World"],
+                    sampling_params=[{}, {}],
+                    **{field_name: ["value", 1]},
+                )
+                with self.assertRaisesRegex(ValueError, "should be a string"):
+                    req.normalize_batch_and_arguments()
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example
@@ -660,6 +1085,83 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             req = GenerateReqInput(
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
+            req.normalize_batch_and_arguments()
+
+    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
+        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 2)
+        self.assertIsNone(req.data_parallel_rank)
+
+    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
+        req = GenerateReqInput(
+            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.routed_dp_rank, 1)
+
+    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            data_parallel_rank=3,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_dp_rank, 3)
+        self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestEmbeddingReqInputGetItem(CustomTestCase):
+    """Test EmbeddingReqInput.__getitem__."""
+
+    def test_priority_is_preserved(self):
+        """Priority must survive the batch split, in both __getitem__ branches."""
+        req = EmbeddingReqInput(text=["Hello", "World"], priority=7)
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].priority, req[1].priority], [7, 7])
+
+        cross_encoder_req = EmbeddingReqInput(
+            text=[["query 1", "doc 1"], ["query 2", "doc 2"]],
+            is_cross_encoder_request=True,
+            priority=3,
+        )
+        cross_encoder_req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
+        )
+
+    def test_lora_identity_survives_batch_split(self):
+        """Each embedding subrequest must retain its adapter path and resolved ID."""
+        cases = (
+            (["Hello", "World"], False),
+            (
+                [["query 1", "document 1"], ["query 2", "document 2"]],
+                True,
+            ),
+        )
+        for text, is_cross_encoder_request in cases:
+            with self.subTest(cross_encoder=is_cross_encoder_request):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder_request,
+                    lora_path="adapter",
+                    lora_id=["id-0", "id-1"],
+                )
+                req.normalize_batch_and_arguments()
+
+                self.assertEqual(req.lora_path, ["adapter", "adapter"])
+                self.assertEqual(
+                    [(req[i].lora_path, req[i].lora_id) for i in range(2)],
+                    [("adapter", "id-0"), ("adapter", "id-1")],
+                )
+
+    def test_lora_path_count_must_match_embedding_batch(self):
+        """A partial adapter list must not silently route remaining items to base."""
+        req = EmbeddingReqInput(
+            text=["first", "second"], lora_path=["only-one-adapter"]
+        )
+        with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
 
 

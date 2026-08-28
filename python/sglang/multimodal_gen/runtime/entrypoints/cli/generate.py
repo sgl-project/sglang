@@ -177,6 +177,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
+    if sampling_params_kwargs.get("use_diffusion_decoder", False):
+        server_args.load_diffusion_decoder = True
 
     # Handle diffusers-specific kwargs passed via CLI
     if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:

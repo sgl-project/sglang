@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
@@ -21,7 +22,6 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -675,7 +675,7 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         return cache
 
 
-class DualChunkRotaryEmbedding(MultiPlatformOp):
+class DualChunkRotaryEmbedding(BaseFusedOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
     def __init__(
@@ -752,6 +752,11 @@ class DualChunkRotaryEmbedding(MultiPlatformOp):
             (q_inter_freqs.cos(), q_inter_freqs.sin()), dim=-1
         ).to(dtype=self.dtype, device=self.device)
         return q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache
+
+    def forward_native(self, *args, **kwargs):
+        # This op overrides forward() directly; there is no separate
+        # pure-torch reference path.
+        raise NotImplementedError("DualChunkRotaryEmbedding has no native path")
 
     def forward(
         self,

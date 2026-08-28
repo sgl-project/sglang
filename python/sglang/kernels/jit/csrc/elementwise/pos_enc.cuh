@@ -11,7 +11,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sglang {
 
 template <typename scalar_t, bool IS_NEOX>
 inline __device__ void apply_token_rotary_embedding(
@@ -310,4 +310,4 @@ struct RotaryEmbeddingKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

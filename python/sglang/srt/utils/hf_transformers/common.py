@@ -27,6 +27,7 @@ from sglang.srt.configs import (
     ChatGLMConfig,
     DbrxConfig,
     DeepseekVL2Config,
+    Dots3Config,
     DotsOCRConfig,
     DotsVLMConfig,
     ExaoneConfig,
@@ -36,19 +37,25 @@ from sglang.srt.configs import (
     InklingMMConfig,
     InklingModelConfig,
     InklingVisionConfig,
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK3Config,
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
     LagunaConfig,
     LocateAnythingConfig,
     LongcatFlashConfig,
+    MiniCPMHybridConfig,
     MiniCPMV4_6Config,
     MiniCPMV4_6VisionConfig,
     MiniMaxM3VLConfig,
     MultiModalityConfig,
+    MuseGlimmerAssistantConfig,
+    MuseGlimmerConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -59,6 +66,7 @@ from sglang.srt.configs import (
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3NextConfig,
+    Spark2_5Config,
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
@@ -95,15 +103,20 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         LocateAnythingConfig,
         InternVLChatConfig,
         LagunaConfig,
+        Spark2_5Config,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
+        MuseGlimmerConfig,
+        MuseGlimmerAssistantConfig,
+        KimiK3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
         FalconH1Config,
         GraniteMoeHybridConfig,
         DotsVLMConfig,
         DotsOCRConfig,
+        Dots3Config,
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
@@ -114,11 +127,14 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Qwen3_5TextConfig,
         Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
+        InternS2MobiusConfig,
+        InternS2MobiusTextConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
         Step3p5Config,
         Step3p7Config,
+        MiniCPMHybridConfig,
         MiniCPMV4_6Config,
         MiniCPMV4_6VisionConfig,
         InklingModelConfig,
@@ -128,6 +144,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MiniMaxM3VLConfig,
     ]
 }
+
 
 # DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
 # transformers class with each model_type so AutoConfig.register passes its
@@ -278,6 +295,94 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     return header == b"GGUF"
 
 
+def resolve_hf_gguf_reference(
+    model: str, revision: Optional[str] = None
+) -> Optional[str]:
+    """Download a .gguf named by Hub reference and return its local path.
+
+    owner/repo/path/inside/repo.gguf   -> exactly that file
+    owner/repo:QUANT_TYPE              -> the only matching quantization
+    owner/repo                         -> the only .gguf in the repo
+    """
+    from sglang.srt.utils import is_remote_url
+
+    if not model or os.path.exists(model) or is_remote_url(model):
+        return None
+
+    from huggingface_hub import hf_hub_download
+
+    if ":" in model:
+        repo_id, _, quant_type = model.rpartition(":")
+        if repo_id.count("/") != 1 or not quant_type:
+            return None
+
+        from huggingface_hub import HfApi
+
+        files = [
+            sibling.rfilename
+            for sibling in HfApi().repo_info(repo_id, revision=revision).siblings
+        ]
+        suffix = f"-{quant_type}.gguf"
+        candidates = [filename for filename in files if filename.endswith(suffix)]
+        if not candidates:
+            available = sorted(
+                filename for filename in files if filename.endswith(".gguf")
+            )
+            raise ValueError(
+                f"No file matching quant type {quant_type!r} in {repo_id}. "
+                f"Available GGUF files: {available}"
+            )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Quant type {quant_type!r} is ambiguous in {repo_id}: "
+                f"{sorted(candidates)}. Pass the full owner/repo/path/file.gguf "
+                "reference instead."
+            )
+        return hf_hub_download(repo_id, candidates[0], revision=revision)
+
+    parts = model.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+
+    if len(parts) > 2 and model.endswith(".gguf"):
+        repo_id = "/".join(parts[:2])
+        filename = "/".join(parts[2:])
+        return hf_hub_download(repo_id, filename, revision=revision)
+
+    if len(parts) != 2:
+        return None
+
+    from huggingface_hub import HfApi
+
+    try:
+        files = [
+            s.rfilename for s in HfApi().repo_info(model, revision=revision).siblings
+        ]
+    except Exception:
+        return None
+    if any(f == "config.json" for f in files):
+        return None
+
+    candidates = [f for f in files if f.endswith(".gguf")]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        listing = "\n  ".join(f"{model}/{f}" for f in sorted(candidates))
+        raise ValueError(
+            f"{model} contains {len(candidates)} .gguf files; name the one to "
+            f"serve:\n  {listing}"
+        )
+    return hf_hub_download(model, candidates[0], revision=revision)
+
+
+def gguf_sidecar_dir(
+    gguf_path: Union[str, os.PathLike], sentinel: str
+) -> Optional[Path]:
+    """Directory containing *sentinel* next to a .gguf file, if there is one."""
+    directory = Path(gguf_path).parent
+    return directory if (directory / sentinel).is_file() else None
+
+
 # ---------------------------------------------------------------------------
 # Rope / text config helpers
 # ---------------------------------------------------------------------------
@@ -297,7 +402,8 @@ def get_rope_config(config):
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
-        return rope_params["rope_theta"], rope_params
+        rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
+        return rope_theta, rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
 
@@ -485,16 +591,30 @@ def get_generation_config(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    if check_gguf_file(model):
+        sidecar = gguf_sidecar_dir(model, "generation_config.json")
+        if sidecar is not None:
+            model = str(sidecar)
+        else:
+            from .gguf_native import (
+                build_gguf_generation_config,
+                has_native_gguf_support,
+            )
+
+            if has_native_gguf_support(model):
+                return build_gguf_generation_config(model)
+
     try:
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    except FileNotFoundError:
-        return None
-    except OSError as e:
-        logger.warning(
-            "Failed to load generation config for %s: %s. "
-            "Proceeding without generation config.",
+    except (FileNotFoundError, OSError) as e:
+        # A missing generation_config.json is normal for many checkpoints and
+        # is surfaced by HF as a generic OSError (not FileNotFoundError). Treat
+        # it as benign — proceed without a generation config, at DEBUG level so
+        # normal startup logs stay quiet.
+        logger.debug(
+            "No generation config for %s: %s. Proceeding without it.",
             model,
             e,
         )

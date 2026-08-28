@@ -6,17 +6,8 @@ from dataclasses import dataclass, field
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
-def _is_conditioner_block(name: str, module) -> bool:
-    """Check if module is a ConditionalCrossAttentionBlock."""
-    return "ConditionalCrossAttentionBlock" in type(module).__name__
-
-
 @dataclass
 class MOVADualTowerArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_conditioner_block]
-    )
-
     # Model architecture parameters
     visual_layers: int = 40
     audio_layers: int = 30

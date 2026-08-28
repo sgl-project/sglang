@@ -22,13 +22,18 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
-    model: nn.Module,
+    model: nn.Module | None,
     model_dtype: torch.dtype,
     is_draft_worker: bool,
     is_dflash: bool,
     speculative_draft_attention_backend: str,
+    speculative_draft_kv_cache_dtype: Optional[str] = None,
 ) -> tuple[Optional[str], torch.dtype]:
     resolved_kv_cache_dtype: Optional[str] = None
+    if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
+        server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
+        if server_args_kv_cache_dtype != "auto":
+            resolved_kv_cache_dtype = server_args_kv_cache_dtype
     if server_args_kv_cache_dtype == "auto":
         quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -90,5 +95,7 @@ def configure_kv_cache_dtype(
             model_dtype,
         )
         kv_cache_dtype = model_dtype
+        # "auto" is the tag for an unquantized pool; backends gate descale on it.
+        resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype

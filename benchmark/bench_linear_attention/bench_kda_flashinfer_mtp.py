@@ -28,6 +28,9 @@ import argparse
 
 import torch
 
+from sglang.kernels.ops.attention.helion.kda_decode import (
+    helion_fused_recurrent_kda_packed_decode,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 
 
@@ -59,6 +62,9 @@ def make_decode_inputs(B, H, HV, K, V, pool_size, device, dtype, seed=42):
     ssm = torch.randn(pool_size, HV, V, K, device=device, dtype=dtype) * 0.01
     cache_indices = torch.arange(B, device=device, dtype=torch.int32)
     qsl = torch.arange(B + 1, device=device, dtype=torch.int32)
+    mixed_qkv = torch.cat(
+        (q.reshape(B, H * K), k.reshape(B, H * K), v.reshape(B, HV * V)), dim=-1
+    )
     return dict(
         q=q.contiguous(),
         k=k.contiguous(),
@@ -70,6 +76,7 @@ def make_decode_inputs(B, H, HV, K, V, pool_size, device, dtype, seed=42):
         ssm=ssm.contiguous(),
         cache_indices=cache_indices,
         qsl=qsl,
+        mixed_qkv=mixed_qkv.contiguous(),
         B=B,
         H=H,
         HV=HV,
@@ -139,6 +146,23 @@ def call_decode(kernel, inp, ssm):
     return out.reshape(inp["B"], inp["HV"], inp["V"]).float()
 
 
+def call_helion(inp, ssm):
+    out = inp["mixed_qkv"].new_empty(inp["B"], 1, inp["HV"], inp["V"])
+    helion_fused_recurrent_kda_packed_decode(
+        mixed_qkv=inp["mixed_qkv"],
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        scale=inp["K"] ** -0.5,
+        initial_state=ssm,
+        out=out,
+        ssm_state_indices=inp["cache_indices"],
+        use_qk_l2norm_in_kernel=True,
+    )
+    return out.reshape(inp["B"], inp["HV"], inp["V"]).float()
+
+
 def call_verify(kernel, inp, ssm, intermediate_states):
     out = kernel.target_verify(
         A_log=inp["A_log"],
@@ -186,11 +210,14 @@ def run(task, fi, tri, device, dtype, args):
     )
     print("=" * 92)
     hdr = "B" if not is_verify else "B(xT)"
-    print(
+    header = (
         f"  {hdr:>6}  {'H':>3}  {'HV':>3} | {'triton(us)':>11} | "
         f"{'flashinfer(us)':>14} | {'speedup':>8} | {'out_max_diff':>12}"
     )
-    print("  " + "-" * 86)
+    if not is_verify:
+        header += f" | {'helion(us)':>11} | {'FI/H':>8} | {'H max diff':>10}"
+    print(header)
+    print("  " + "-" * (124 if not is_verify else 86))
 
     for B in args.batch_sizes:
         for H in args.num_q_heads:
@@ -235,10 +262,23 @@ def run(task, fi, tri, device, dtype, args):
                 )
                 fi_us = f"{ms_fi * 1000:>14.1f}" if fi is not None else f"{'skip':>14}"
                 sp = f"{speed:>7.2f}x" if fi is not None else f"{'-':>8}"
-                print(
+                line = (
                     f"  {B:>6}  {H:>3}  {HV:>3} | {ms_tri * 1000:>11.1f} | "
                     f"{fi_us} | {sp} | {diff:>12}"
                 )
+                if not is_verify:
+                    helion_state = inp["ssm"].clone()
+                    o_helion = call_helion(inp, helion_state)
+                    helion_diff = (o_helion - o_tri).abs().max().item()
+                    ms_helion = _time(lambda: call_helion(inp, helion_state))
+                    fi_helion = (
+                        f"{ms_fi / ms_helion:>7.2f}x" if fi is not None else f"{'-':>8}"
+                    )
+                    line += (
+                        f" | {ms_helion * 1000:>11.1f} | {fi_helion} | "
+                        f"{helion_diff:>10.2e}"
+                    )
+                print(line)
 
 
 def main():

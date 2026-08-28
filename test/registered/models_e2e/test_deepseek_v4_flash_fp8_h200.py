@@ -5,7 +5,7 @@ with FP4 experts disabled via SGLANG_DSV4_FP4_EXPERTS=0.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used by TP=4)
+Registry: extra-b-test-8-gpu-h200 (label-gated, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=560, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=560, stage="extra-b", runner_config="8-gpu-h200")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -140,9 +140,6 @@ class TestDSV4FlashFP8H200MegaMoE(
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
-                "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
-                "SGLANG_OPT_USE_JIT_EP_ACTIVATION": "1",
                 # INVARIANT: this per-rank cap MUST equal
                 # chunked_prefill_size / dp_size (= 8192 / 4 = 2048), the per-rank
                 # prefill bound under --enable-dp-attention. If you change

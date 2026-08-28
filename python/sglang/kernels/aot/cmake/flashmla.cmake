@@ -2,8 +2,8 @@
 # sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
-    URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/c1dee569a494b184811a08171a690ece21420262.tar.gz
+    URL_HASH SHA256=77d3f1714b5903dc8f7a99fbc3a5d9a2b886e449f994b6c4b1d2feeacb467b1e
 )
 FetchContent_Populate(repo-flashmla)
 
@@ -35,8 +35,9 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
     )
 endif()
 if(${CUDA_VERSION} VERSION_GREATER 12.8)
+    # sm_100f is compatible with all sm_10x
     list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_100f,code=sm_100f"
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
@@ -89,10 +90,6 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     else()
         message(STATUS "cutlass/arch/config.h already patched for SM103a")
     endif()
-
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_103a,code=sm_103a"
-    )
 endif()
 
 

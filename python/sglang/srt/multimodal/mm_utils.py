@@ -544,6 +544,12 @@ def run_dp_sharded_vision_model(
     return vision_embeddings
 
 
+def concat_or_single(tensors: Sequence[torch.Tensor], dim: int = 0) -> torch.Tensor:
+    """Concatenate multiple tensors without copying a singleton input."""
+
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=dim)
+
+
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
@@ -551,9 +557,11 @@ def run_dp_sharded_mrope_vision_model(
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d", "rope_2d_packed"],
+    pool_temporal_dimension: bool = False,
     load_local_pixel_values: Optional[Callable[[list[int]], torch.Tensor]] = None,
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
+    pass_grid_thw_list: bool = False,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -570,6 +578,11 @@ def run_dp_sharded_mrope_vision_model(
                    "rope_2d" for packed 2D rope outputs (e.g., Kimi-VL)
                    "rope_2d_packed" for packed 2D rope outputs that accept
                    ``grid_thws`` positionally (e.g., Kimi-K2.5/K2.7)
+        pool_temporal_dimension: Whether the vision model pools away the temporal
+                   grid dimension. Its output length is then h * w divided by
+                   the spatial merge area instead of t * h * w divided by it.
+        pass_grid_thw_list: Forward the existing host grid list to the vision
+            model so graph-aware towers do not materialize it from a CUDA tensor.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -608,21 +621,23 @@ def run_dp_sharded_mrope_vision_model(
             device=pixel_values.device if rope_type == "rope_2d" else None,
         )
         if rope_type == "rope_2d":
-            image_embeds = vision_model(
-                pixel_values,
-                grid_hw=grid_thw,
-                max_seqlen=max(math.prod(grid) for grid in grid_thw_list),
-            )
+            kwargs = {
+                "grid_hw": grid_thw,
+                "max_seqlen": max(math.prod(grid) for grid in grid_thw_list),
+            }
+            if pass_grid_thw_list:
+                kwargs["grid_thw_list"] = grid_thw_list
+            image_embeds = vision_model(pixel_values, **kwargs)
             # MoonViT returns one tensor per image. The multi-GPU path below
             # already concatenates these tensors before returning, so keep the
             # TP=1 DP-encoder path on the same projector-facing contract.
             if isinstance(image_embeds, list):
-                return torch.cat(image_embeds, dim=0)
+                return concat_or_single(image_embeds, dim=0)
             return image_embeds
         if rope_type == "rope_2d_packed":
             image_embeds = vision_model(pixel_values, grid_thw)
             if isinstance(image_embeds, list):
-                return torch.cat(image_embeds, dim=0)
+                return concat_or_single(image_embeds, dim=0)
             return image_embeds
         return vision_model(pixel_values, grid_thw=grid_thw)
 
@@ -681,7 +696,9 @@ def run_dp_sharded_mrope_vision_model(
         )
 
     output_tokens_per_image = [
-        math.prod(grid) // embed_dim_reduction_factor for grid in grid_thw_list
+        math.prod(grid[1:] if pool_temporal_dimension else grid)
+        // embed_dim_reduction_factor
+        for grid in grid_thw_list
     ]
     grouped_output_lengths = []
     assignment_offset = 0
@@ -711,15 +728,17 @@ def run_dp_sharded_mrope_vision_model(
                 device=(pixel_values_local.device if rope_type == "rope_2d" else None),
             )
             if rope_type == "rope_2d":
-                image_embeds_local = vision_model(
-                    pixel_values_local,
-                    grid_hw=local_grid_thw,
-                    max_seqlen=max(math.prod(grid) for grid in local_grid_thw_list),
-                )
+                kwargs = {
+                    "grid_hw": local_grid_thw,
+                    "max_seqlen": max(math.prod(grid) for grid in local_grid_thw_list),
+                }
+                if pass_grid_thw_list:
+                    kwargs["grid_thw_list"] = local_grid_thw_list
+                image_embeds_local = vision_model(pixel_values_local, **kwargs)
             else:
                 image_embeds_local = vision_model(pixel_values_local, local_grid_thw)
             if isinstance(image_embeds_local, list):
-                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+                image_embeds_local = concat_or_single(image_embeds_local, dim=0)
         else:
             out_dim = getattr(vision_model.config, "hidden_size", None)
             image_embeds_local = torch.empty(
@@ -734,7 +753,7 @@ def run_dp_sharded_mrope_vision_model(
                 pixel_values_local, torch.tensor(local_grid_thw_list)
             )
             if isinstance(image_embeds_local, list):
-                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+                image_embeds_local = concat_or_single(image_embeds_local, dim=0)
         else:
             # Handle empty case
             out_dim = getattr(vision_model, "out_hidden_size", None)

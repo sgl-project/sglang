@@ -30,6 +30,7 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -85,6 +86,7 @@ def fused_sigmoid_gating_delta_rule_update(
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        lower_bound=lower_bound if lower_bound is not None else 0.0,
         q=q,
         k=k,
         v=v,
@@ -121,6 +123,7 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
