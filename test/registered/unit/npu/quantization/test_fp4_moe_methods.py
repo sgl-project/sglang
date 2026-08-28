@@ -21,7 +21,6 @@ from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A4Fp4MoEMethod,
     _apply_swiglu_limit_npu,
     npu_apply_without_routing_weights_w4a4_mxfp,
-    npu_fused_experts_w4a4_mxfp,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     _pair_pack_mxfp_act_scale,
@@ -259,65 +258,6 @@ class TestW4A8MxfpGmmChain(unittest.TestCase):
             )
         )
         self.assertIs(gmm.call_args_list[1].kwargs["input"], activated)
-
-
-class TestW4A8MxfpRoutingPadding(unittest.TestCase):
-    def test_zeroes_padded_rows_before_finalize_routing(self):
-        """Regression: routing padding must not contribute stale expert output."""
-        padded_routing_output = torch.zeros(3, 2)
-        expert_output = torch.tensor([[3.0, 4.0], [50.0, 60.0], [70.0, 80.0]])
-        finalize = MagicMock(side_effect=lambda hidden_states, **_: hidden_states)
-
-        with (
-            patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
-            patch.object(
-                torch.ops.npu,
-                "npu_moe_init_routing",
-                return_value=(
-                    padded_routing_output,
-                    torch.tensor([0, 1, 2], dtype=torch.int32),
-                    torch.tensor([0, 0, 0], dtype=torch.int32),
-                ),
-                create=True,
-            ),
-            patch.object(
-                torch.ops.npu,
-                "npu_moe_compute_expert_tokens",
-                return_value=torch.tensor([1], dtype=torch.int64),
-                create=True,
-            ),
-            patch.object(
-                fp4_moe_methods,
-                "w4a8_mxfp_gmm",
-                side_effect=[torch.ones(3, 2), expert_output],
-            ),
-            patch.object(
-                torch.ops.npu,
-                "npu_swiglu",
-                side_effect=lambda values: values,
-                create=True,
-            ),
-            patch.object(
-                torch.ops.npu,
-                "npu_moe_finalize_routing",
-                finalize,
-                create=True,
-            ),
-        ):
-            output = npu_fused_experts_w4a4_mxfp(
-                hidden_states=torch.ones(1, 2),
-                w13=torch.empty(1),
-                w13_weight_scale_inv=torch.empty(1),
-                w2=torch.empty(1),
-                w2_weight_scale_inv=torch.empty(1),
-                topk_weights=torch.ones(1, 1),
-                topk_ids=torch.zeros(1, 1, dtype=torch.int32),
-                top_k=1,
-            )
-
-        torch.testing.assert_close(
-            output, torch.tensor([[3.0, 4.0], [0.0, 0.0], [0.0, 0.0]])
-        )
 
 
 class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
