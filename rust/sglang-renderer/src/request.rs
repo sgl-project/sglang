@@ -44,38 +44,6 @@ pub struct GenerationOptions {
     pub return_text_in_logprobs: Option<bool>,
 }
 
-/// One transport-neutral textual completion after wire-level normalization.
-///
-/// Protocol adapters expand batches and multiple choices before constructing
-/// this request. Token-ID inputs use [`TokenIdsRequest`] instead.
-#[derive(Debug, Clone)]
-pub struct CompletionRequest {
-    pub rid: String,
-    pub prompt: String,
-    pub options: GenerationOptions,
-    pub metadata: GenerateRequestMetadata,
-}
-
-impl CompletionRequest {
-    pub fn new(
-        rid: impl Into<String>,
-        prompt: impl Into<String>,
-        options: GenerationOptions,
-    ) -> Self {
-        Self {
-            rid: rid.into(),
-            prompt: prompt.into(),
-            options,
-            metadata: GenerateRequestMetadata::default(),
-        }
-    }
-
-    pub fn with_metadata(mut self, metadata: GenerateRequestMetadata) -> Self {
-        self.metadata = metadata;
-        self
-    }
-}
-
 #[derive(Debug, Clone)]
 /// Internal text-only generation request before tokenization.
 ///

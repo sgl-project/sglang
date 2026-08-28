@@ -2,23 +2,25 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationStream,
-    MatchedStop,
+    GenerationFinishReason, GenerationOutput, GenerationStream, MatchedStop, ResponseError,
 };
 
 use super::openai::completions::SubmittedChoice;
 
 fn submission() -> (
     GenerationStream,
-    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
+    mpsc::Sender<Result<GenerationOutput, ResponseError>>,
 ) {
-    let (tx, rx) = mpsc::channel(8);
+    let (tx, rx) = mpsc::channel::<Result<GenerationOutput, ResponseError>>(8);
     let events = futures::stream::unfold((rx, false), |(mut rx, finished)| async move {
         if finished {
             return None;
         }
         rx.recv().await.map(|item| {
-            let finished = matches!(item, Ok(GenerationEvent::Done(_)) | Err(_));
+            let finished = match &item {
+                Ok(output) => output.finish_reason.is_some(),
+                Err(_) => true,
+            };
             (item, (rx, finished))
         })
     })
@@ -30,7 +32,7 @@ pub(super) fn chat_submitted(
     index: usize,
 ) -> (
     (usize, GenerationStream),
-    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
+    mpsc::Sender<Result<GenerationOutput, ResponseError>>,
 ) {
     let (events, tx) = submission();
     ((index, events), tx)
@@ -41,7 +43,7 @@ pub(super) fn submitted(
     prompt_index: usize,
 ) -> (
     SubmittedChoice,
-    mpsc::Sender<Result<GenerationEvent, FrontendError>>,
+    mpsc::Sender<Result<GenerationOutput, ResponseError>>,
 ) {
     let (events, tx) = submission();
     (
@@ -55,7 +57,7 @@ pub(super) fn submitted(
     )
 }
 
-pub(super) fn chunk(text: &str, done: bool) -> Result<GenerationEvent, FrontendError> {
+pub(super) fn chunk(text: &str, done: bool) -> Result<GenerationOutput, ResponseError> {
     let output = GenerationOutput {
         text: text.to_owned(),
         token_ids: vec![1],
@@ -65,9 +67,5 @@ pub(super) fn chunk(text: &str, done: bool) -> Result<GenerationEvent, FrontendE
         completion_tokens: 1,
         extras: None,
     };
-    Ok(if done {
-        GenerationEvent::Done(output)
-    } else {
-        GenerationEvent::Frame(output)
-    })
+    Ok(output)
 }

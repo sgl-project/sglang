@@ -25,28 +25,33 @@ mod types;
 mod regex;
 
 pub(crate) use chat::ChatPreprocessor;
-pub use chat::{ChatRequest, LoweredChat};
+pub use chat::ChatRequest;
+pub(crate) use chat::LoweredChat;
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
 #[cfg(feature = "http")]
 pub(crate) use generation::{
-    FrontendError, GenerationEvent, GenerationFinishReason, GenerationOutput,
-    GenerationOutputExtras, GenerationStream, MatchedStop,
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream, MatchedStop,
 };
 #[cfg(feature = "http")]
 pub use http::{RendererRuntimeConfig, serve};
 pub use output::{
-    ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
-    ChatResponseProcessor, ChatToolCall, ChatToolCallDelta, DecodedChatEvent, ParsedChatChoice,
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
+    ResponseError,
 };
 pub use request::{
-    CompletionRequest, GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams,
-    GenerationOptions, TextRequest, TokenIdsRequest,
+    GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
+    TextRequest, TokenIdsRequest,
 };
 pub use sampling::SamplingParams;
 #[cfg(feature = "http")]
 pub(crate) use sampling::SamplingParamsOverrides;
-pub use service::{PreparedChat, RendererService, TokenizationBackend};
+pub(crate) use service::TokenizationBackend;
+pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
-pub use tokenizer::{DynamoTokenizer, NoTokenizer, PooledTokenizer, TextTokenizer, load_tokenizer};
+#[cfg(test)]
+pub(crate) use tokenizer::NoTokenizer;
+#[cfg(test)]
+pub(crate) use tokenizer::PooledTokenizer;
+pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 pub use types::{OneOrMany, OneOrManyItem, TokenIds};

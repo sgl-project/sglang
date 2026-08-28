@@ -1,12 +1,12 @@
 //! OpenAI Chat Completions endpoint.
 
-use std::convert::Infallible;
 use std::sync::Arc;
+use std::{collections::BTreeMap, convert::Infallible};
 
 use crate::{
-    ChatEvent, ChatFinishReason, ChatResponseError, ChatResponseInput, ChatResponseItem,
-    ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent, GenerationEvent,
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
+    ResponseError,
 };
 use axum::{
     Json, Router,
@@ -32,9 +32,9 @@ use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
     ChatCompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
-    submission::{collect_output, merge_indexed, submit_generate_requests},
+    submission::{merge_indexed, submit_generate_requests},
 };
-use crate::protocol::openai::lower_chat_request_with_template_args;
+use crate::protocol::openai::lower_chat_request;
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -59,25 +59,10 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if let Err(error) = extended.extensions.validate() {
-        return openai_error(StatusCode::BAD_REQUEST, error, false);
-    }
-    let parts = match extended.into_parts() {
-        Ok(parts) => parts,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-    };
-    let crate::http::ChatRequestParts {
-        request,
-        chat_template_kwargs,
-        continue_final_message,
-        sampling_overrides,
-        extensions,
-    } = parts;
-    let response_id = extensions.response_id("chatcmpl");
-    let stream = request.stream.unwrap_or(false);
-    let model = request.model.clone();
-    let want_logprobs = request.logprobs.unwrap_or(false);
-    let include_usage = request
+    let stream = extended.stream.unwrap_or(false);
+    let model = extended.model.clone();
+    let want_logprobs = extended.logprobs.unwrap_or(false);
+    let include_usage = extended
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
@@ -85,31 +70,14 @@ async fn chat_completions(
             .renderer
             .config()
             .stream_response_default_include_usage;
-    let service_tier = request.service_tier.clone();
-    let request_metadata = match extensions.expand(model.clone(), 1, 1, &response_id) {
-        Ok(mut contexts) => {
-            contexts
-                .pop()
-                .expect("one chat prompt produces one metadata context")
-                .metadata
-        }
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-    };
-    let mut chat_request = match lower_chat_request_with_template_args(
-        state.renderer.config(),
-        request,
-        &response_id,
-        chat_template_kwargs,
-        continue_final_message,
-    ) {
+    let service_tier = extended.service_tier.clone();
+    let (response_id, chat_request) = match lower_chat_request(state.renderer.config(), extended) {
         Ok(request) => request,
         Err(error) => {
             let status = renderer_status(&error);
             return openai_error(status, error.to_string(), false);
         }
     };
-    sampling_overrides.apply(&mut chat_request.sampling_params);
-    chat_request.metadata = request_metadata;
     let chat = match state.renderer.prepare_chat(chat_request).await {
         Ok(chat) => chat,
         Err(error) => {
@@ -156,73 +124,106 @@ async fn chat_completions(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
     submitted: Vec<(usize, GenerationStream)>,
-    mut response_processor: ChatResponseProcessor,
+    response_processor: ChatResponseProcessor,
     response_id: String,
     model: String,
     created: u32,
     want_logprobs: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
-    let mut choices = Vec::with_capacity(submitted.len());
-    let mut prompt_tokens = 0;
+    let choice_count = submitted.len();
+    let mut accumulated = (0..choice_count)
+        .map(|_| UnaryChatChoice::default())
+        .collect::<Vec<_>>();
+    let mut prompt_tokens = 0u32;
     let mut completion_tokens = 0u64;
-
-    for (index, submission) in submitted {
-        let output = match collect_output(submission).await {
-            Ok(output) => output,
+    let parsed = semantic_chat_stream(submitted, response_processor, want_logprobs);
+    futures::pin_mut!(parsed);
+    while let Some(item) = parsed.next().await {
+        match item {
+            Ok(ChatEvent::Role { .. }) => {}
+            Ok(ChatEvent::Delta {
+                choice,
+                content,
+                reasoning_content,
+                tool_calls,
+                finish_reason,
+                logprobs,
+            }) => {
+                let Some(choice) = accumulated.get_mut(choice) else {
+                    return openai_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "chat response choice is out of range",
+                        false,
+                    );
+                };
+                if let Some(content) = content {
+                    choice.content.push_str(&content);
+                }
+                if let Some(reasoning) = reasoning_content {
+                    choice.reasoning_content.push_str(&reasoning);
+                }
+                if let Some(tool_calls) = tool_calls {
+                    choice.extend_tool_calls(tool_calls);
+                }
+                if finish_reason.is_some() {
+                    choice.finish_reason = finish_reason;
+                }
+                merge_chat_logprobs(&mut choice.logprobs, logprobs);
+            }
+            Ok(ChatEvent::Usage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+            }) => {
+                prompt_tokens = prompt;
+                completion_tokens = completion;
+            }
             Err(error) => {
                 let status = StatusCode::from_u16(error.status_code)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return openai_error(status, error.message, false);
             }
-        };
-
-        if prompt_tokens == 0 {
-            prompt_tokens = output.prompt_tokens;
         }
-        completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-        let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-        let finish_reason = chat_finish_reason(&output).map(openai_finish_reason);
-        let parsed = response_processor
-            .process_unary(output.text, &output.token_ids)
-            .await;
-        let finish_reason = if parsed.tool_calls.is_some() {
-            Some(OpenAIFinishReason::ToolCalls)
-        } else {
-            finish_reason
-        };
-        #[allow(deprecated)]
-        let message = ChatCompletionResponseMessage {
-            content: (!parsed.content.is_empty())
-                .then_some(ChatCompletionMessageContent::Text(parsed.content)),
-            refusal: None,
-            tool_calls: parsed.tool_calls.map(|calls| {
-                calls
-                    .into_iter()
-                    .map(|call| ChatCompletionMessageToolCall {
-                        id: call.id,
-                        r#type: FunctionType::Function,
-                        function: FunctionCall {
-                            name: call.name,
-                            arguments: call.arguments,
-                        },
-                    })
-                    .collect()
-            }),
-            role: Role::Assistant,
-            function_call: None,
-            audio: None,
-            // Python: `reasoning_text if reasoning_text else None`.
-            reasoning_content: (!parsed.reasoning_content.is_empty())
-                .then_some(parsed.reasoning_content),
-        };
-        choices.push(ChatChoice {
-            index: u32::try_from(index).unwrap_or(u32::MAX),
-            message,
-            finish_reason,
-            logprobs,
-        });
     }
+
+    let choices = accumulated
+        .into_iter()
+        .enumerate()
+        .map(|(index, parsed)| {
+            #[allow(deprecated)]
+            let message = ChatCompletionResponseMessage {
+                content: (!parsed.content.is_empty())
+                    .then_some(ChatCompletionMessageContent::Text(parsed.content)),
+                refusal: None,
+                tool_calls: (!parsed.tool_calls.is_empty()).then(|| {
+                    parsed
+                        .tool_calls
+                        .into_values()
+                        .map(|call| ChatCompletionMessageToolCall {
+                            id: call.id,
+                            r#type: FunctionType::Function,
+                            function: FunctionCall {
+                                name: call.name,
+                                arguments: call.arguments,
+                            },
+                        })
+                        .collect()
+                }),
+                role: Role::Assistant,
+                function_call: None,
+                audio: None,
+                // Python: `reasoning_text if reasoning_text else None`.
+                reasoning_content: (!parsed.reasoning_content.is_empty())
+                    .then_some(parsed.reasoning_content),
+            };
+            ChatChoice {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                message,
+                finish_reason: parsed.finish_reason.map(openai_finish_reason),
+                logprobs: parsed.logprobs,
+            }
+        })
+        .collect();
 
     Json(CreateChatCompletionResponse {
         id: response_id,
@@ -240,6 +241,58 @@ pub(super) async fn unary_chat(
     .into_response()
 }
 
+#[derive(Default)]
+struct UnaryChatChoice {
+    content: String,
+    reasoning_content: String,
+    tool_calls: BTreeMap<u32, UnaryToolCall>,
+    finish_reason: Option<ChatFinishReason>,
+    logprobs: Option<ChatChoiceLogprobs>,
+}
+
+#[derive(Default)]
+struct UnaryToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl UnaryChatChoice {
+    fn extend_tool_calls(&mut self, deltas: Vec<ChatToolCallDelta>) {
+        for delta in deltas {
+            let call = self.tool_calls.entry(delta.index).or_default();
+            if let Some(id) = delta.id {
+                call.id = id;
+            }
+            if let Some(name) = delta.name {
+                call.name = name;
+            }
+            if let Some(arguments) = delta.arguments {
+                call.arguments.push_str(&arguments);
+            }
+        }
+    }
+}
+
+fn merge_chat_logprobs(
+    collected: &mut Option<ChatChoiceLogprobs>,
+    delta: Option<ChatChoiceLogprobs>,
+) {
+    let Some(mut delta) = delta else {
+        return;
+    };
+    let collected = collected.get_or_insert_with(|| ChatChoiceLogprobs {
+        content: Some(Vec::new()),
+        refusal: None,
+    });
+    if let Some(content) = delta.content.take() {
+        collected
+            .content
+            .get_or_insert_with(Vec::new)
+            .extend(content);
+    }
+}
+
 fn chat_event_stream(
     submitted: Vec<(usize, GenerationStream)>,
     response_processor: ChatResponseProcessor,
@@ -251,7 +304,7 @@ fn chat_event_stream(
         futures::pin_mut!(parsed);
         while let Some(item) = parsed.next().await {
             match item {
-                ChatResponseItem::Event(ChatEvent::Role { choice }) => {
+                Ok(ChatEvent::Role { choice }) => {
                     yield serialize_chat_stream_response(chat_stream_response(
                         &context.response_id,
                         &context.model,
@@ -266,7 +319,7 @@ fn chat_event_stream(
                         None,
                     ));
                 }
-                ChatResponseItem::Event(ChatEvent::Delta {
+                Ok(ChatEvent::Delta {
                     choice,
                     content,
                     reasoning_content,
@@ -295,7 +348,7 @@ fn chat_event_stream(
                         None,
                     ));
                 }
-                ChatResponseItem::Event(ChatEvent::Usage {
+                Ok(ChatEvent::Usage {
                     prompt_tokens,
                     completion_tokens,
                 }) if context.include_usage => {
@@ -308,8 +361,8 @@ fn chat_event_stream(
                         Some((prompt_tokens, completion_tokens)),
                     ));
                 }
-                ChatResponseItem::Event(ChatEvent::Usage { .. }) => {}
-                ChatResponseItem::Error(error) => {
+                Ok(ChatEvent::Usage { .. }) => {}
+                Err(error) => {
                     let status = StatusCode::from_u16(error.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     yield error_payload(status, error.message).to_string();
@@ -324,24 +377,21 @@ fn semantic_chat_stream(
     submitted: Vec<(usize, GenerationStream)>,
     response_processor: ChatResponseProcessor,
     want_logprobs: bool,
-) -> impl futures::Stream<Item = ChatResponseItem> {
+) -> impl futures::Stream<Item = Result<ChatEvent, ResponseError>> {
     let raw = async_stream::stream! {
         let streams = submitted.into_iter().map(|(_, events)| events).collect();
         let mut events = merge_indexed(streams);
         while let Some((index, item)) = events.next().await {
             let output = match item {
-                Ok(GenerationEvent::Frame(output) | GenerationEvent::Done(output)) => output,
+                Ok(output) => output,
                 Err(error) => {
-                    yield ChatResponseInput::Error(ChatResponseError {
-                        status_code: error.status_code,
-                        message: error.message,
-                    });
+                    yield Err(error);
                     continue;
                 }
             };
             let finish_reason = chat_finish_reason(&output);
             let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
-            yield ChatResponseInput::Decoded(DecodedChatEvent {
+            yield Ok(DecodedChatEvent {
                 choice: index,
                 text: output.text,
                 token_ids: output.token_ids,
@@ -503,19 +553,18 @@ mod tests {
 
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::http::test_utils::{chat_submitted, chunk};
+    use crate::protocol::openai::ChatCompletionRequest;
     use crate::protocol::openai::{
-        ChatSamplingDefaults as SamplingDefaults, chat_sampling_params,
-        lower_chat_request_with_template_args,
+        ChatSamplingDefaults as SamplingDefaults, chat_sampling_params, lower_chat_request,
     };
     use crate::{
         GenerationOutputExtras, NoTokenizer, RendererConfig, RendererLimits, RendererService,
         SamplingDefaults as ModelSamplingDefaults,
     };
     use axum::http::StatusCode;
-    use dynamo_protocols::types::CreateChatCompletionRequest;
     use futures::StreamExt;
 
-    fn request() -> CreateChatCompletionRequest {
+    fn request() -> ChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hi"}]
@@ -549,16 +598,14 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hi"}],
             "n": choices
         }))
         .unwrap();
-        let chat =
-            lower_chat_request_with_template_args(&config, request, "chatcmpl-test", None, false)
-                .unwrap();
-        RendererService::new(config, Arc::new(NoTokenizer))
+        let (_, chat) = lower_chat_request(&config, request).unwrap();
+        RendererService::with_backend(config, Arc::new(NoTokenizer))
             .preprocess_chat(chat)
             .unwrap()
             .response_processor
@@ -623,7 +670,7 @@ mod tests {
     /// no terminal default is imposed.
     #[test]
     fn chat_without_a_token_limit_stays_unbounded() {
-        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hello"}]
         }))

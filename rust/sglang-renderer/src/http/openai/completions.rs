@@ -14,8 +14,7 @@ use crate::http::{
 };
 use crate::protocol::openai::{lower_text_completion_request, lower_token_ids_completion_request};
 use crate::{
-    GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
-    GenerationStream, MatchedStop,
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream, MatchedStop,
 };
 use axum::{
     Json, Router,
@@ -76,14 +75,7 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if let Err(error) = extended.extensions.validate() {
-        return openai_error(StatusCode::BAD_REQUEST, error, false);
-    }
-    let (request, sampling_overrides, extensions) = match extended.into_parts() {
-        Ok(parts) => parts,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-    };
-    let response_id = extensions.response_id("cmpl");
+    let request = extended;
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -103,34 +95,22 @@ async fn completions(
     let want_logprobs = request.logprobs.is_some();
     let created = unix_seconds_u32();
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
-    let submitted = if text_prompt {
-        let mut completion_requests =
-            match lower_text_completion_request(state.renderer.config(), &request, &response_id) {
+    let (response_id, submitted) = if text_prompt {
+        let (response_id, completion_requests) =
+            match lower_text_completion_request(state.renderer.config(), &request) {
                 Ok(requests) => requests,
                 Err(error) => {
                     let status = renderer_status(&error);
                     return openai_error(status, error.to_string(), false);
                 }
             };
-        let prompt_count = completion_requests.len() / n;
-        let contexts = match extensions.expand(model.clone(), prompt_count, n, &response_id) {
-            Ok(contexts) => contexts,
-            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-        };
-        for (completion, context) in completion_requests.iter_mut().zip(contexts) {
-            sampling_overrides
-                .clone()
-                .apply(&mut completion.options.sampling_params);
-            completion.rid = context.request_id;
-            completion.metadata = context.metadata;
-        }
         let metadata = completion_requests
             .iter()
             .enumerate()
             .map(|(index, request)| {
                 let prompt_index = index / n;
                 let prompt_echo = if echo {
-                    request.prompt.clone()
+                    request.prompt.as_str().to_owned()
                 } else {
                     String::new()
                 };
@@ -141,31 +121,16 @@ async fn completions(
             Ok(streams) => streams,
             Err(response) => return response,
         };
-        attach_streams(metadata, streams)
+        (response_id, attach_streams(metadata, streams))
     } else {
-        let mut token_requests = match lower_token_ids_completion_request(
-            state.renderer.config(),
-            &request,
-            &response_id,
-        ) {
-            Ok(requests) => requests,
-            Err(error) => {
-                let status = renderer_status(&error);
-                return openai_error(status, error.to_string(), false);
-            }
-        };
-        let prompt_count = token_requests.len() / n;
-        let contexts = match extensions.expand(model.clone(), prompt_count, n, &response_id) {
-            Ok(contexts) => contexts,
-            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-        };
-        for (token_request, context) in token_requests.iter_mut().zip(contexts) {
-            sampling_overrides
-                .clone()
-                .apply(&mut token_request.options.sampling_params);
-            token_request.rid = context.request_id;
-            token_request.metadata = context.metadata;
-        }
+        let (response_id, token_requests) =
+            match lower_token_ids_completion_request(state.renderer.config(), &request) {
+                Ok(requests) => requests,
+                Err(error) => {
+                    let status = renderer_status(&error);
+                    return openai_error(status, error.to_string(), false);
+                }
+            };
         let mut metadata = Vec::with_capacity(token_requests.len());
         let mut prompt_echo = String::new();
         for (index, request) in token_requests.iter().enumerate() {
@@ -193,7 +158,7 @@ async fn completions(
             Ok(streams) => streams,
             Err(response) => return response,
         };
-        attach_streams(metadata, streams)
+        (response_id, attach_streams(metadata, streams))
     };
 
     if stream {
@@ -406,7 +371,7 @@ pub(super) fn completion_event_stream(
 
         while let Some((index, item)) = events.next().await {
             let output = match item {
-                Ok(GenerationEvent::Frame(output) | GenerationEvent::Done(output)) => output,
+                Ok(output) => output,
                 Err(error) => {
                     yield error_payload(StatusCode::from_u16(error.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), error.message).to_string();
                     continue;
@@ -584,7 +549,7 @@ mod tests {
     use futures::StreamExt;
 
     #[test]
-    fn dynamo_completion_request_deserializes_directly() {
+    fn completion_request_deserializes_directly() {
         let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m",
             "prompt": ["a", "b"],

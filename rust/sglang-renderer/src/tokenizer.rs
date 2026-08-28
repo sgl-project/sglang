@@ -35,12 +35,14 @@ impl Drop for TokenizerPoolInner {
 
 /// Bounded CPU tokenizer pool owned by renderer state.
 #[derive(Clone)]
-pub struct PooledTokenizer {
+pub(crate) struct PooledTokenizer {
     inner: Arc<TokenizerPoolInner>,
 }
 
-pub struct NoTokenizer;
+#[cfg(test)]
+pub(crate) struct NoTokenizer;
 
+#[cfg(test)]
 impl TokenizationBackend for NoTokenizer {
     fn tokenize(
         &self,

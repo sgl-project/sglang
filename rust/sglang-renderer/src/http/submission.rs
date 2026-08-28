@@ -2,8 +2,8 @@ use axum::{http::StatusCode, response::Response};
 use futures::{StreamExt, stream::BoxStream};
 
 use crate::{
-    CompletionRequest, FrontendError, GenerateRequest, GenerationEvent, GenerationOutput,
-    GenerationStream, TokenIdsRequest,
+    GenerateRequest, GenerationOutput, GenerationStream, ResponseError, TextRequest,
+    TokenIdsRequest,
 };
 
 use super::{OpenAIHttpFrontend, error::openai_error};
@@ -14,23 +14,22 @@ use super::{OpenAIHttpFrontend, error::openai_error};
 /// preserving concurrent engine execution without introducing a backend trait.
 pub(super) async fn submit_completion_inputs(
     frontend: &OpenAIHttpFrontend,
-    inputs: Vec<CompletionRequest>,
+    inputs: Vec<TextRequest>,
     stream_response: bool,
 ) -> Result<Vec<GenerationStream>, Response> {
     let mut streams = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let generate_request =
-            frontend
-                .renderer
-                .prepare_completion(input)
-                .await
-                .map_err(|error| {
-                    openai_error(
-                        super::error::renderer_status(&error),
-                        error.to_string(),
-                        false,
-                    )
-                })?;
+        let generate_request = frontend
+            .renderer
+            .prepare_text_request(input)
+            .await
+            .map_err(|error| {
+                openai_error(
+                    super::error::renderer_status(&error),
+                    error.to_string(),
+                    false,
+                )
+            })?;
         let events = frontend
             .generate_client
             .generate(generate_request)
@@ -112,7 +111,7 @@ pub(super) async fn submit_generate_requests(
 
 pub(super) fn merge_indexed(
     streams: Vec<GenerationStream>,
-) -> BoxStream<'static, (usize, Result<GenerationEvent, FrontendError>)> {
+) -> BoxStream<'static, (usize, Result<GenerationOutput, ResponseError>)> {
     let streams = streams
         .into_iter()
         .enumerate()
@@ -122,18 +121,17 @@ pub(super) fn merge_indexed(
 
 pub(super) async fn collect_output(
     mut events: GenerationStream,
-) -> Result<GenerationOutput, FrontendError> {
+) -> Result<GenerationOutput, ResponseError> {
     let mut collected = GenerationOutput::default();
     while let Some(item) = events.next().await {
-        match item? {
-            GenerationEvent::Frame(output) => fold_output(&mut collected, output),
-            GenerationEvent::Done(output) => {
-                fold_output(&mut collected, output);
-                return Ok(collected);
-            }
+        let output = item?;
+        let finished = output.finish_reason.is_some();
+        fold_output(&mut collected, output);
+        if finished {
+            return Ok(collected);
         }
     }
-    Err(FrontendError {
+    Err(ResponseError {
         status_code: 500,
         message: "response truncated before completion".into(),
     })
@@ -191,7 +189,7 @@ mod tests {
     use futures::{StreamExt, stream};
 
     use super::{fold_output, merge_indexed};
-    use crate::{GenerationEvent, GenerationOutput, GenerationOutputExtras};
+    use crate::{GenerationOutput, GenerationOutputExtras};
 
     #[test]
     fn unary_output_appends_generated_logprobs_and_replaces_prompt_logprobs() {
@@ -219,20 +217,20 @@ mod tests {
     #[tokio::test]
     async fn merged_stream_preserves_choice_indexes() {
         let choice0 = stream::iter([
-            Ok(GenerationEvent::Frame(GenerationOutput {
+            Ok(GenerationOutput {
                 text: "a".into(),
                 ..Default::default()
-            })),
-            Ok(GenerationEvent::Done(GenerationOutput {
+            }),
+            Ok(GenerationOutput {
                 text: "b".into(),
                 ..Default::default()
-            })),
+            }),
         ])
         .boxed();
-        let choice1 = stream::iter([Ok(GenerationEvent::Done(GenerationOutput {
+        let choice1 = stream::iter([Ok(GenerationOutput {
             text: "x".into(),
             ..Default::default()
-        }))])
+        })])
         .boxed();
 
         let events = merge_indexed(vec![choice0, choice1])
@@ -240,12 +238,7 @@ mod tests {
             .await;
         let mut observed = events
             .into_iter()
-            .map(|(index, event)| {
-                let output = match event.unwrap() {
-                    GenerationEvent::Frame(output) | GenerationEvent::Done(output) => output,
-                };
-                (index, output.text)
-            })
+            .map(|(index, event)| (index, event.unwrap().text))
             .collect::<Vec<_>>();
         observed.sort();
         assert_eq!(

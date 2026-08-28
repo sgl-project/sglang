@@ -91,7 +91,7 @@ impl OAIChatLikeRequest for ChatRequest {
 }
 
 /// Chat-to-text result plus the state needed to interpret generated output.
-pub struct LoweredChat {
+pub(crate) struct LoweredChat {
     pub text_requests: Vec<TextRequest>,
     pub response_processor: ChatResponseProcessor,
 }

@@ -227,7 +227,7 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        routes(Arc::new(RendererService::new(
+        routes(Arc::new(RendererService::with_backend(
             config,
             Arc::new(PooledTokenizer::new(Arc::new(PrefixTokenizer), 2, 2)),
         )))

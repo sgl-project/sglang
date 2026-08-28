@@ -7,18 +7,18 @@ use futures::future::{BoxFuture, try_join_all};
 
 use crate::template::load_chat_formatter;
 use crate::tokenizer::{
-    check_total_tokens, resolve_chat_template_file, resolve_model_file, validate_text_request,
-    validate_token_ids_request,
+    PooledTokenizer, TextTokenizer, check_total_tokens, resolve_chat_template_file,
+    resolve_model_file, validate_text_request, validate_token_ids_request,
 };
 use crate::{
-    ChatFormatter, ChatPreprocessor, ChatRequest, ChatResponseProcessor, CompletionRequest,
-    GenerateRequest, LoweredChat, RendererConfig, RendererError, TextRequest, TokenIdsRequest,
+    ChatFormatter, ChatPreprocessor, ChatRequest, ChatResponseProcessor, GenerateRequest,
+    LoweredChat, RendererConfig, RendererError, TextRequest, TokenIdsRequest,
 };
 
-/// Host-provided tokenizer-dependent CPU execution for one model-facing text
-/// request. Validation, sampling normalization, and context checks remain
-/// owned by `RendererService`.
-pub trait TokenizationBackend: Send + Sync {
+/// Internal asynchronous boundary around tokenizer-dependent CPU work.
+/// Validation, sampling normalization, and context checks remain owned by
+/// `RendererService`.
+pub(crate) trait TokenizationBackend: Send + Sync {
     fn tokenize(
         &self,
         request: TextRequest,
@@ -40,7 +40,26 @@ pub struct PreparedChat {
 }
 
 impl RendererService {
-    pub fn new(config: RendererConfig, backend: Arc<dyn TokenizationBackend>) -> Self {
+    pub fn with_tokenizer(
+        config: RendererConfig,
+        tokenizer: Arc<dyn TextTokenizer>,
+        worker_count: usize,
+        queue_capacity: usize,
+    ) -> Self {
+        Self::with_backend(
+            config,
+            Arc::new(PooledTokenizer::new(
+                tokenizer,
+                worker_count,
+                queue_capacity,
+            )),
+        )
+    }
+
+    pub(crate) fn with_backend(
+        config: RendererConfig,
+        backend: Arc<dyn TokenizationBackend>,
+    ) -> Self {
         let (formatter, formatter_error) = load_chat_support(&config);
         let chat_preprocessor =
             ChatPreprocessor::new(&config, formatter).with_formatter_error(formatter_error);
@@ -55,14 +74,10 @@ impl RendererService {
         &self.config
     }
 
-    /// Lower one transport-neutral textual completion into the tokenizer input
-    /// shared with rendered chat requests.
-    pub fn lower_completion(&self, request: CompletionRequest) -> TextRequest {
-        TextRequest::text(request.rid, request.prompt, true, request.options)
-            .with_metadata(request.metadata)
-    }
-
-    pub fn preprocess_chat(&self, request: ChatRequest) -> Result<LoweredChat, RendererError> {
+    pub(crate) fn preprocess_chat(
+        &self,
+        request: ChatRequest,
+    ) -> Result<LoweredChat, RendererError> {
         self.chat_preprocessor.preprocess(request)
     }
 
@@ -76,20 +91,20 @@ impl RendererService {
 
     pub async fn prepare_completion(
         &self,
-        request: CompletionRequest,
+        request: TextRequest,
     ) -> Result<GenerateRequest, RendererError> {
-        self.prepare_text_request(self.lower_completion(request))
-            .await
+        self.prepare_text_request(request).await
     }
 
     pub async fn prepare_completions(
         &self,
-        requests: Vec<CompletionRequest>,
+        requests: Vec<TextRequest>,
     ) -> Result<Vec<GenerateRequest>, RendererError> {
-        try_join_all(requests.into_iter().map(|request| {
-            let request = self.lower_completion(request);
-            async move { self.prepare_text(request).await.map(GenerateRequest::from) }
-        }))
+        try_join_all(
+            requests
+                .into_iter()
+                .map(|request| async move { self.prepare_text(request).await.map(Into::into) }),
+        )
         .await
     }
 
@@ -360,7 +375,7 @@ mod tests {
             metadata: GenerateRequestMetadata::default(),
         };
 
-        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
+        let service = RendererService::with_backend(config, Arc::new(UnexpectedTokenizer));
         let chat = service.preprocess_chat(request).unwrap();
         let text_request = &chat.text_requests[0];
 
@@ -484,7 +499,7 @@ mod tests {
             parallel_tool_calls: true,
             metadata: GenerateRequestMetadata::default(),
         };
-        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
+        let service = RendererService::with_backend(config, Arc::new(UnexpectedTokenizer));
 
         let chat = service.preprocess_chat(request).unwrap();
 
@@ -538,7 +553,7 @@ mod tests {
             parallel_tool_calls: true,
             metadata: GenerateRequestMetadata::default(),
         };
-        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
+        let service = RendererService::with_backend(config, Arc::new(UnexpectedTokenizer));
 
         let chat = service.preprocess_chat(request.clone()).unwrap();
         assert_eq!(chat.text_requests[0].prompt.as_str(), "request|max");
@@ -577,7 +592,7 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
+        let service = RendererService::with_backend(config, Arc::new(UnexpectedTokenizer));
         let request = TokenIdsRequest::new(
             "cmpl-test-0",
             vec![11, 12, 13],

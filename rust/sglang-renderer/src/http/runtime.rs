@@ -5,10 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    DynamoTokenizer, PooledTokenizer, RendererConfig, RendererService, TextTokenizer,
-    load_tokenizer,
-};
+use crate::{DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer};
 
 use super::{HttpGenerateClient, OpenAIHttpFrontend, standalone_routes};
 
@@ -49,12 +46,12 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
         tokenizer_without_specials.clone(),
         tokenizer_with_specials,
     ));
-    let tokenizer_backend = Arc::new(PooledTokenizer::new(
+    let renderer = Arc::new(RendererService::with_tokenizer(
+        config.renderer,
         encode_tokenizer,
         config.tokenizer_workers,
         config.queue_capacity,
     ));
-    let renderer = Arc::new(RendererService::new(config.renderer, tokenizer_backend));
     let generate_client = HttpGenerateClient::new(config.engine_url, tokenizer_without_specials)?;
     let listener = tokio::net::TcpListener::bind(config.http_addr)
         .await

@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use crate::RendererService;
 use crate::protocol::openai::{
-    lower_chat_request_with_template_args, lower_text_completion_request,
-    lower_token_ids_completion_request,
+    lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
 };
 use axum::{
     Json, Router,
@@ -21,17 +20,12 @@ use super::{
     error::{openai_error, renderer_status},
 };
 
-#[derive(Clone)]
-struct RenderState {
-    renderer: Arc<RendererService>,
-}
-
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
     Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions/render", post(render_chat))
         .route("/v1/completions/render", post(render_completions))
-        .with_state(RenderState { renderer })
+        .with_state(renderer)
 }
 
 async fn health() -> StatusCode {
@@ -39,7 +33,7 @@ async fn health() -> StatusCode {
 }
 
 async fn render_chat(
-    State(state): State<RenderState>,
+    State(renderer): State<Arc<RendererService>>,
     body: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let extended = match body {
@@ -48,53 +42,20 @@ async fn render_chat(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if let Err(error) = extended.extensions.validate() {
-        return openai_error(StatusCode::BAD_REQUEST, error, false);
-    }
-    let parts = match extended.into_parts() {
-        Ok(parts) => parts,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-    };
-    let crate::http::ChatRequestParts {
-        request,
-        chat_template_kwargs,
-        continue_final_message,
-        sampling_overrides,
-        extensions,
-    } = parts;
-    if request.n.is_some_and(|n| n > 1) {
+    if extended.n.is_some_and(|n| n > 1) {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "the standalone chat renderer currently requires n=1",
             false,
         );
     }
-    let model = request.model.clone();
-    let response_id = extensions.response_id("chatcmpl");
-    let metadata = match extensions.expand(model, 1, 1, &response_id) {
-        Ok(mut contexts) => {
-            contexts
-                .pop()
-                .expect("one chat prompt produces one metadata context")
-                .metadata
-        }
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-    };
-    let mut chat_request = match lower_chat_request_with_template_args(
-        state.renderer.config(),
-        request,
-        &response_id,
-        chat_template_kwargs,
-        continue_final_message,
-    ) {
+    let (_, chat_request) = match lower_chat_request(renderer.config(), extended) {
         Ok(request) => request,
         Err(error) => {
             return openai_error(renderer_status(&error), error.to_string(), false);
         }
     };
-    sampling_overrides.apply(&mut chat_request.sampling_params);
-    chat_request.metadata = metadata;
-    match state.renderer.prepare_chat(chat_request).await {
+    match renderer.prepare_chat(chat_request).await {
         Ok(mut chat) => Json(
             chat.requests
                 .pop()
@@ -106,7 +67,7 @@ async fn render_chat(
 }
 
 async fn render_completions(
-    State(state): State<RenderState>,
+    State(renderer): State<Arc<RendererService>>,
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
     let extended = match body {
@@ -115,62 +76,24 @@ async fn render_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
-    if let Err(error) = extended.extensions.validate() {
-        return openai_error(StatusCode::BAD_REQUEST, error, false);
-    }
-    let (request, sampling_overrides, extensions) = match extended.into_parts() {
-        Ok(parts) => parts,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-    };
-    let model = request.model.clone();
-    let response_id = extensions.response_id("cmpl");
-    let n = request.n.unwrap_or(1) as usize;
+    let request = extended;
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let requests = if text_prompt {
-        let mut requests =
-            match lower_text_completion_request(state.renderer.config(), &request, &response_id) {
-                Ok(requests) => requests,
-                Err(error) => {
-                    return openai_error(renderer_status(&error), error.to_string(), false);
-                }
-            };
-        let prompt_count = requests.len() / n;
-        let contexts = match extensions.expand(model.clone(), prompt_count, n, &response_id) {
-            Ok(contexts) => contexts,
-            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
-        };
-        for (request, context) in requests.iter_mut().zip(contexts) {
-            sampling_overrides
-                .clone()
-                .apply(&mut request.options.sampling_params);
-            request.rid = context.request_id;
-            request.metadata = context.metadata;
-        }
-        state.renderer.prepare_completions(requests).await
-    } else {
-        let mut requests = match lower_token_ids_completion_request(
-            state.renderer.config(),
-            &request,
-            &response_id,
-        ) {
+        let (_, requests) = match lower_text_completion_request(renderer.config(), &request) {
             Ok(requests) => requests,
             Err(error) => {
                 return openai_error(renderer_status(&error), error.to_string(), false);
             }
         };
-        let prompt_count = requests.len() / n;
-        let contexts = match extensions.expand(model, prompt_count, n, &response_id) {
-            Ok(contexts) => contexts,
-            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        renderer.prepare_completions(requests).await
+    } else {
+        let (_, requests) = match lower_token_ids_completion_request(renderer.config(), &request) {
+            Ok(requests) => requests,
+            Err(error) => {
+                return openai_error(renderer_status(&error), error.to_string(), false);
+            }
         };
-        for (request, context) in requests.iter_mut().zip(contexts) {
-            sampling_overrides
-                .clone()
-                .apply(&mut request.options.sampling_params);
-            request.rid = context.request_id;
-            request.metadata = context.metadata;
-        }
-        state.renderer.prepare_token_ids_requests(requests)
+        renderer.prepare_token_ids_requests(requests)
     };
     match requests {
         Ok(requests) => Json(requests).into_response(),
@@ -239,7 +162,7 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        routes(Arc::new(RendererService::new(
+        routes(Arc::new(RendererService::with_backend(
             config,
             Arc::new(WordTokenizer),
         )))

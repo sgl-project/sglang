@@ -13,7 +13,6 @@ use dynamo_parsers::reasoning::{
     ReasoningParser as _, ReasoningParserType, ReasoningParserWrapper,
 };
 use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
-use dynamo_parsers::try_tool_call_parse_aggregate_finalize;
 use dynamo_protocols::types::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
@@ -46,15 +45,9 @@ pub struct DecodedChatEvent {
 
 /// A host error carried through semantic processing without interpreting it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatResponseError {
+pub struct ResponseError {
     pub status_code: u16,
     pub message: String,
-}
-
-/// Input to the response processor. Errors are passed through unchanged.
-pub enum ChatResponseInput {
-    Decoded(DecodedChatEvent),
-    Error(ChatResponseError),
 }
 
 /// One semantic tool-call delta, independent of HTTP or gRPC framing.
@@ -64,14 +57,6 @@ pub struct ChatToolCallDelta {
     pub id: Option<String>,
     pub name: Option<String>,
     pub arguments: Option<String>,
-}
-
-/// One completed semantic tool call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
 }
 
 /// Semantic chat output. Protocol adapters add response metadata and wire
@@ -93,20 +78,6 @@ pub enum ChatEvent {
         prompt_tokens: u32,
         completion_tokens: u64,
     },
-}
-
-/// Output from semantic processing. Request lifecycle errors remain owned by
-/// the host and are merely preserved while parser streams are running.
-pub enum ChatResponseItem {
-    Event(ChatEvent),
-    Error(ChatResponseError),
-}
-
-/// Parsed response semantics for one completed non-streaming choice.
-pub struct ParsedChatChoice {
-    pub content: String,
-    pub reasoning_content: String,
-    pub tool_calls: Option<Vec<ChatToolCall>>,
 }
 
 /// Mutable parser state for one generated choice.
@@ -152,29 +123,6 @@ impl ChatResponseProcessor {
         }
     }
 
-    /// Interpret one completed generation using the same parser selection that
-    /// affected request lowering.
-    pub async fn process_unary(&mut self, text: String, token_ids: &[i32]) -> ParsedChatChoice {
-        let reasoning_parser = self
-            .choices
-            .first()
-            .and_then(|choice| choice.reasoning.name.as_deref());
-        let (reasoning_content, content) =
-            split_reasoning_unary(reasoning_parser, &text, token_ids);
-        let (content, tool_calls) = parse_chat_tool_calls(
-            content,
-            self.tool_parser.as_deref(),
-            self.tools.as_deref(),
-            self.parallel_tool_calls,
-        )
-        .await;
-        ParsedChatChoice {
-            content,
-            reasoning_content,
-            tool_calls,
-        }
-    }
-
     /// Interpret decoded output and emit semantic chat events.
     ///
     /// OpenAI-shaped values are used only as a private adapter to Dynamo's
@@ -184,9 +132,9 @@ impl ChatResponseProcessor {
     pub fn process_stream<S>(
         mut self,
         input: S,
-    ) -> Pin<Box<dyn Stream<Item = ChatResponseItem> + Send>>
+    ) -> Pin<Box<dyn Stream<Item = Result<ChatEvent, ResponseError>> + Send>>
     where
-        S: Stream<Item = ChatResponseInput> + Send + 'static,
+        S: Stream<Item = Result<DecodedChatEvent, ResponseError>> + Send + 'static,
     {
         let count = self.choices.len();
         let raw = async_stream::stream! {
@@ -205,8 +153,8 @@ impl ChatResponseProcessor {
             futures::pin_mut!(input);
             while let Some(item) = input.next().await {
                 let decoded = match item {
-                    ChatResponseInput::Decoded(decoded) => decoded,
-                    ChatResponseInput::Error(error) => {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
                         yield Annotated {
                             data: None,
                             id: None,
@@ -229,7 +177,7 @@ impl ChatResponseProcessor {
                         id: None,
                         event: None,
                         comment: None,
-                        error: serde_json::to_string(&ChatResponseError {
+                        error: serde_json::to_string(&ResponseError {
                             status_code: 500,
                             message: format!("output choice {} is out of range", decoded.choice),
                         }).ok(),
@@ -317,7 +265,7 @@ impl ChatResponseProcessor {
                     if response.choices.is_empty()
                         && let Some(usage) = response.usage
                     {
-                        yield ChatResponseItem::Event(ChatEvent::Usage {
+                        yield Ok(ChatEvent::Usage {
                             prompt_tokens: usage.prompt_tokens,
                             completion_tokens: u64::from(usage.completion_tokens),
                         });
@@ -352,10 +300,10 @@ impl ChatResponseProcessor {
                             && tool_calls.is_none()
                             && choice.finish_reason.is_none()
                         {
-                            yield ChatResponseItem::Event(ChatEvent::Role { choice: index });
+                            yield Ok(ChatEvent::Role { choice: index });
                             continue;
                         }
-                        yield ChatResponseItem::Event(ChatEvent::Delta {
+                        yield Ok(ChatEvent::Delta {
                             choice: index,
                             content,
                             reasoning_content: choice.delta.reasoning_content,
@@ -365,11 +313,11 @@ impl ChatResponseProcessor {
                         });
                     }
                 } else if let Some(error) = item.error {
-                    let error = serde_json::from_str(&error).unwrap_or(ChatResponseError {
+                    let error = serde_json::from_str(&error).unwrap_or(ResponseError {
                         status_code: 500,
                         message: error,
                     });
-                    yield ChatResponseItem::Error(error);
+                    yield Err(error);
                 }
             }
         })
@@ -473,39 +421,6 @@ fn from_dynamo_finish_reason(reason: FinishReason) -> ChatFinishReason {
     }
 }
 
-async fn parse_chat_tool_calls(
-    content: String,
-    parser: Option<&str>,
-    tools: Option<&[ToolDefinition]>,
-    parallel_tool_calls: bool,
-) -> (String, Option<Vec<ChatToolCall>>) {
-    let Some(parser) = parser else {
-        return (content, None);
-    };
-    let parser = dynamo_parser_name(parser);
-    match try_tool_call_parse_aggregate_finalize(&content, Some(parser), tools).await {
-        Ok((mut calls, normal)) if !calls.is_empty() => {
-            if !parallel_tool_calls {
-                calls.truncate(1);
-            }
-            (
-                normal.unwrap_or_default(),
-                Some(
-                    calls
-                        .into_iter()
-                        .map(|call| ChatToolCall {
-                            id: call.id,
-                            name: call.function.name,
-                            arguments: call.function.arguments,
-                        })
-                        .collect(),
-                ),
-            )
-        }
-        _ => (content, None),
-    }
-}
-
 fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
     let name = match server_name {
         "deepseek-r1" | "step3p5" => "deepseek_r1",
@@ -517,19 +432,6 @@ fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
         _ => server_name,
     };
     ReasoningParserType::get_reasoning_parser_from_name(name)
-}
-
-fn split_reasoning_unary(name: Option<&str>, text: &str, token_ids: &[i32]) -> (String, String) {
-    let Some(name) = name else {
-        return (String::new(), text.to_owned());
-    };
-    let mut parser = build_reasoning_parser(name);
-    let token_ids = token_ids
-        .iter()
-        .filter_map(|&id| u32::try_from(id).ok())
-        .collect::<Vec<_>>();
-    let split = parser.detect_and_parse_reasoning(text, &token_ids);
-    (split.reasoning_text, split.normal_text)
 }
 
 struct ReasoningStreamSplitter {
@@ -590,8 +492,8 @@ mod tests {
         )
     }
 
-    fn chunk(choice: usize, text: &str, done: bool) -> ChatResponseInput {
-        ChatResponseInput::Decoded(DecodedChatEvent {
+    fn chunk(choice: usize, text: &str, done: bool) -> Result<DecodedChatEvent, ResponseError> {
+        Ok(DecodedChatEvent {
             choice,
             text: text.into(),
             token_ids: vec![],
@@ -600,19 +502,6 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 1,
         })
-    }
-
-    #[test]
-    fn unary_processor_owns_reasoning_and_tool_interpretation() {
-        let parsed = futures::executor::block_on(
-            processor(Some("llama3"), Some("deepseek-r1"), 1).process_unary(
-                r#"<think>check</think><|python_tag|>{"name":"weather","parameters":{}}"#.into(),
-                &[],
-            ),
-        );
-        assert_eq!(parsed.reasoning_content, "check");
-        assert!(parsed.content.is_empty());
-        assert_eq!(parsed.tool_calls.unwrap()[0].name, "weather");
     }
 
     #[test]
@@ -628,7 +517,7 @@ mod tests {
         let reasoning = events
             .iter()
             .filter_map(|event| match event {
-                ChatResponseItem::Event(ChatEvent::Delta {
+                Ok(ChatEvent::Delta {
                     reasoning_content: Some(text),
                     ..
                 }) => Some(text.as_str()),
@@ -638,13 +527,13 @@ mod tests {
         assert_eq!(reasoning, "because");
         assert!(events.iter().any(|event| matches!(
             event,
-            ChatResponseItem::Event(ChatEvent::Delta {
+            Ok(ChatEvent::Delta {
                 content: Some(text), ..
             }) if text == "Paris"
         )));
         assert!(matches!(
             events.last(),
-            Some(ChatResponseItem::Event(ChatEvent::Usage {
+            Some(Ok(ChatEvent::Usage {
                 prompt_tokens: 5,
                 completion_tokens: 2
             }))
@@ -664,7 +553,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let deltas = events.iter().filter_map(|event| match event {
-            ChatResponseItem::Event(ChatEvent::Delta {
+            Ok(ChatEvent::Delta {
                 choice,
                 content: Some(content),
                 ..

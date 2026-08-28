@@ -8,8 +8,8 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    FrontendError, GenerateRequest, GenerationEvent, GenerationFinishReason, GenerationOutput,
-    GenerationOutputExtras, GenerationStream, MatchedStop, TokenIds,
+    GenerateRequest, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
+    GenerationStream, MatchedStop, ResponseError, TokenIds,
 };
 
 #[derive(Clone)]
@@ -51,7 +51,7 @@ impl HttpGenerateClient {
     pub async fn generate(
         &self,
         mut request: GenerateRequest,
-    ) -> Result<GenerationStream, FrontendError> {
+    ) -> Result<GenerationStream, ResponseError> {
         let mut stop_matcher = take_text_stops(&mut request)?;
 
         let prompt_ids = request
@@ -82,7 +82,7 @@ impl HttpGenerateClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(FrontendError {
+            return Err(ResponseError {
                 status_code: status.as_u16(),
                 message: engine_error_message(&body)
                     .unwrap_or_else(|| format!("engine returned HTTP {status}")),
@@ -141,15 +141,11 @@ impl HttpGenerateClient {
                         output.finish_reason = Some(GenerationFinishReason::Stop(Some(
                             MatchedStop::Text(matched_stop),
                         )));
-                        yield Ok(GenerationEvent::Done(output));
+                        yield Ok(output);
                         return;
                     }
                     terminal = output.finish_reason.is_some();
-                    if terminal {
-                        yield Ok(GenerationEvent::Done(output));
-                    } else {
-                        yield Ok(GenerationEvent::Frame(output));
-                    }
+                    yield Ok(output);
                 }
             }
             if !terminal {
@@ -161,7 +157,7 @@ impl HttpGenerateClient {
         Ok(events)
     }
 
-    pub fn detokenize(&self, token_ids: TokenIds) -> Result<String, FrontendError> {
+    pub fn detokenize(&self, token_ids: TokenIds) -> Result<String, ResponseError> {
         let ids = token_ids
             .into_iter()
             .map(u32::try_from)
@@ -176,7 +172,7 @@ impl HttpGenerateClient {
 
 fn take_text_stops(
     request: &mut GenerateRequest,
-) -> Result<Option<StopStringMatcher>, FrontendError> {
+) -> Result<Option<StopStringMatcher>, ResponseError> {
     let params = &mut request.sampling_params;
     let matcher = StopStringMatcher::new(std::mem::take(&mut params.stop), params.no_stop_trim);
     Ok(matcher)
@@ -259,7 +255,7 @@ fn decode_output(
     decoder: &mut dynamo_tokenizers::DecodeStream,
     output: &mut GenerationOutput,
     mut stop_matcher: Option<&mut StopStringMatcher>,
-) -> Result<Option<String>, FrontendError> {
+) -> Result<Option<String>, ResponseError> {
     let mut text = String::new();
     for index in 0..output.token_ids.len() {
         let id = output.token_ids[index];
@@ -290,7 +286,7 @@ fn decode_output(
     Ok(None)
 }
 
-fn truncate_output(output: &mut GenerationOutput, kept_tokens: usize) -> Result<(), FrontendError> {
+fn truncate_output(output: &mut GenerationOutput, kept_tokens: usize) -> Result<(), ResponseError> {
     output.token_ids.truncate(kept_tokens);
     output.completion_tokens = u64::try_from(kept_tokens).unwrap_or(u64::MAX);
     let Some(extras) = output.extras.as_deref_mut() else {
@@ -319,7 +315,7 @@ fn truncate_output(output: &mut GenerationOutput, kept_tokens: usize) -> Result<
     let alternatives =
         extras.output_top_logprob_lengths[..kept_tokens]
             .iter()
-            .try_fold(0usize, |total, &length| -> Result<usize, FrontendError> {
+            .try_fold(0usize, |total, &length| -> Result<usize, ResponseError> {
                 total
                     .checked_add(usize::try_from(length).map_err(|_| {
                         internal("engine top-logprob count exceeds addressable memory")
@@ -348,7 +344,7 @@ fn truncate_optional<T>(
     values: &mut Vec<T>,
     length: usize,
     description: &str,
-) -> Result<(), FrontendError> {
+) -> Result<(), ResponseError> {
     if values.is_empty() {
         return Ok(());
     }
@@ -504,9 +500,9 @@ fn default_error_code() -> u16 {
     500
 }
 
-fn parse_engine_frame(payload: &str) -> Result<GenerationOutput, FrontendError> {
+fn parse_engine_frame(payload: &str) -> Result<GenerationOutput, ResponseError> {
     if let Ok(error) = serde_json::from_str::<EngineErrorEnvelope>(payload) {
-        return Err(FrontendError {
+        return Err(ResponseError {
             status_code: error.error.code,
             message: error.error.message,
         });
@@ -572,7 +568,7 @@ fn parse_engine_frame(payload: &str) -> Result<GenerationOutput, FrontendError> 
 fn normalize_engine_output(
     output: &mut GenerationOutput,
     emitted_tokens: &mut u64,
-) -> Result<(), FrontendError> {
+) -> Result<(), ResponseError> {
     let total = output.completion_tokens;
     let delta = total.checked_sub(*emitted_tokens).ok_or_else(|| {
         internal(format!(
@@ -603,7 +599,7 @@ fn normalize_engine_output(
 fn trim_cumulative_output_extras(
     extras: &mut GenerationOutputExtras,
     prefix: usize,
-) -> Result<(), FrontendError> {
+) -> Result<(), ResponseError> {
     drain_optional_prefix(&mut extras.output_logprobs, prefix, "output logprobs")?;
     drain_optional_prefix(
         &mut extras.output_logprob_token_ids,
@@ -627,7 +623,7 @@ fn trim_cumulative_output_extras(
     }
     let alternatives = extras.output_top_logprob_lengths[..prefix]
         .iter()
-        .try_fold(0usize, |total, &length| -> Result<usize, FrontendError> {
+        .try_fold(0usize, |total, &length| -> Result<usize, ResponseError> {
             let length = usize::try_from(length)
                 .map_err(|_| internal("engine top-logprob count exceeds addressable memory"))?;
             total
@@ -656,7 +652,7 @@ fn drain_prefix<T>(
     values: &mut Vec<T>,
     prefix: usize,
     description: &str,
-) -> Result<(), FrontendError> {
+) -> Result<(), ResponseError> {
     if values.len() < prefix {
         return Err(internal(format!(
             "engine returned {} {description} values for a {prefix}-token cumulative prefix",
@@ -671,7 +667,7 @@ fn drain_optional_prefix<T>(
     values: &mut Vec<T>,
     prefix: usize,
     description: &str,
-) -> Result<(), FrontendError> {
+) -> Result<(), ResponseError> {
     if values.is_empty() {
         return Ok(());
     }
@@ -713,22 +709,22 @@ fn engine_error_message(body: &str) -> Option<String> {
         .map(|error| error.error.message)
 }
 
-fn invalid(message: impl Into<String>) -> FrontendError {
-    FrontendError {
+fn invalid(message: impl Into<String>) -> ResponseError {
+    ResponseError {
         status_code: 400,
         message: message.into(),
     }
 }
 
-fn unavailable(message: impl Into<String>) -> FrontendError {
-    FrontendError {
+fn unavailable(message: impl Into<String>) -> ResponseError {
+    ResponseError {
         status_code: 503,
         message: message.into(),
     }
 }
 
-fn internal(message: impl Into<String>) -> FrontendError {
-    FrontendError {
+fn internal(message: impl Into<String>) -> ResponseError {
+    ResponseError {
         status_code: 500,
         message: message.into(),
     }
@@ -1070,10 +1066,8 @@ mod tests {
             metadata: Default::default(),
         };
         let mut events = client.generate(request.into()).await.unwrap();
-        let output = match events.next().await.unwrap().unwrap() {
-            GenerationEvent::Done(output) => output,
-            GenerationEvent::Frame(_) => panic!("mock engine returned a terminal frame"),
-        };
+        let output = events.next().await.unwrap().unwrap();
+        assert!(output.finish_reason.is_some());
 
         let mut expected_decoder = tokenizer.decode_stream(&[65], true);
         let mut expected = String::new();
@@ -1121,16 +1115,12 @@ mod tests {
             .unwrap();
 
         let first = events.next().await.unwrap().unwrap();
-        let GenerationEvent::Frame(first) = first else {
-            panic!("first engine delta must be non-terminal");
-        };
+        assert!(first.finish_reason.is_none());
         assert_eq!(first.token_ids, [104]);
         assert_eq!(first.completion_tokens, 1);
 
         let second = events.next().await.unwrap().unwrap();
-        let GenerationEvent::Done(second) = second else {
-            panic!("second engine delta must be terminal");
-        };
+        assert!(second.finish_reason.is_some());
         assert_eq!(second.token_ids, [104]);
         assert_eq!(second.completion_tokens, 1);
         assert!(events.next().await.is_none());

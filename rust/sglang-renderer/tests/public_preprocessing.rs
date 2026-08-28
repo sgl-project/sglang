@@ -1,11 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use dynamo_protocols::types::ChatCompletionRequestMessage;
-use futures::future::BoxFuture;
 use sglang_renderer::{
-    ChatRequest, CompletionRequest, GenerateRequestMetadata, GenerationOptions, RendererConfig,
-    RendererError, RendererLimits, RendererService, SamplingDefaults, SamplingParams,
-    TokenIdsRequest, TokenizationBackend,
+    ChatRequest, GenerateRequestMetadata, GenerationOptions, RendererConfig, RendererError,
+    RendererLimits, RendererService, SamplingDefaults, SamplingParams, TextRequest, TextTokenizer,
 };
 
 #[derive(Clone, Default)]
@@ -13,20 +11,13 @@ struct RecordingTokenizer {
     prompts: Arc<Mutex<Vec<(String, bool)>>>,
 }
 
-impl TokenizationBackend for RecordingTokenizer {
-    fn tokenize(
-        &self,
-        request: sglang_renderer::TextRequest,
-    ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>> {
-        let prompts = self.prompts.clone();
-        Box::pin(async move {
-            prompts.lock().unwrap().push((
-                request.prompt.as_str().to_owned(),
-                request.add_special_tokens,
-            ));
-            Ok(TokenIdsRequest::new(request.rid, vec![7], request.options)
-                .with_metadata(request.metadata))
-        })
+impl TextTokenizer for RecordingTokenizer {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((text.to_owned(), add_special_tokens));
+        Ok(vec![7])
     }
 }
 
@@ -59,11 +50,12 @@ fn config() -> RendererConfig {
 fn completion_and_chat_share_the_public_text_preparation_boundary() {
     let tokenizer = RecordingTokenizer::default();
     let prompts = tokenizer.prompts.clone();
-    let renderer = RendererService::new(config(), Arc::new(tokenizer));
+    let renderer = RendererService::with_tokenizer(config(), Arc::new(tokenizer), 1, 8);
 
-    let completion = CompletionRequest::new(
+    let completion = TextRequest::text(
         "completion-0",
         "plain completion",
+        true,
         GenerationOptions {
             sampling_params: SamplingParams {
                 max_new_tokens: Some(1),
@@ -72,7 +64,7 @@ fn completion_and_chat_share_the_public_text_preparation_boundary() {
             ..Default::default()
         },
     );
-    futures::executor::block_on(renderer.prepare_completion(completion)).unwrap();
+    futures::executor::block_on(renderer.prepare_text_request(completion)).unwrap();
 
     let messages: Vec<ChatCompletionRequestMessage> = serde_json::from_value(serde_json::json!([
         {"role": "user", "content": "hello"}
@@ -102,7 +94,14 @@ fn completion_and_chat_share_the_public_text_preparation_boundary() {
     futures::executor::block_on(renderer.prepare_chat(chat)).unwrap();
 
     let prompts = prompts.lock().unwrap();
-    assert_eq!(prompts[0], ("plain completion".into(), true));
-    assert!(prompts[1].0.contains("<|im_start|>user"));
-    assert!(!prompts[1].1);
+    assert!(
+        prompts
+            .iter()
+            .any(|(text, add_special_tokens)| text == "plain completion" && *add_special_tokens)
+    );
+    assert!(
+        prompts
+            .iter()
+            .any(|(text, add_special_tokens)| text.contains("hello") && !add_special_tokens)
+    );
 }

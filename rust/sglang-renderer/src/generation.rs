@@ -2,7 +2,7 @@
 
 use futures::stream::BoxStream;
 
-use crate::TokenIds;
+use crate::{ResponseError, TokenIds};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchedStop {
@@ -49,15 +49,4 @@ pub struct GenerationOutput {
     pub extras: Option<Box<GenerationOutputExtras>>,
 }
 
-pub enum GenerationEvent {
-    Frame(GenerationOutput),
-    Done(GenerationOutput),
-}
-
-#[derive(Debug, Clone)]
-pub struct FrontendError {
-    pub status_code: u16,
-    pub message: String,
-}
-
-pub type GenerationStream = BoxStream<'static, Result<GenerationEvent, FrontendError>>;
+pub type GenerationStream = BoxStream<'static, Result<GenerationOutput, ResponseError>>;
