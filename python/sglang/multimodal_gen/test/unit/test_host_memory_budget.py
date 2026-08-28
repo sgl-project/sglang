@@ -239,6 +239,26 @@ class TestModuleWeightBytes:
         module.register_buffer("b", backing[512:])
         assert module_weight_bytes(module) == 4096
 
+    def test_invalid_storage_is_skipped(self):
+        """Offloaded models may expose a tensor whose storage cannot be queried."""
+
+        class InvalidStorage:
+            def data_ptr(self):
+                raise RuntimeError("invalid python storage")
+
+        class InvalidStorageTensor:
+            def untyped_storage(self):
+                return InvalidStorage()
+
+        class ModuleWithInvalidStorage:
+            def parameters(self):
+                return iter((torch.ones(4), InvalidStorageTensor()))
+
+            def buffers(self):
+                return iter(())
+
+        assert module_weight_bytes(ModuleWithInvalidStorage()) == 4 * 4
+
 
 class TestPinBenefit:
     def test_a_stepped_component_counts_every_step(self):

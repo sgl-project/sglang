@@ -222,6 +222,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Paired interleaved RoPE with fp64 Diffusers semantics.",
     ),
     (
+        "diffusion.helios_qk_rope",
+        KernelBackend.JIT,
+        "rope.helios_qk_rope_jit:fused_inplace_helios_qk_rope",
+        _CUDA,
+        "Paired in-place Helios transposed Q/K RoPE.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
@@ -345,6 +352,7 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "load_extension_with_recovery": "ext.loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
@@ -409,6 +417,8 @@ _EXPORTS: dict[str, str] = {
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
     "can_use_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
+    "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
+    "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
     # Activation-function fusions
     "can_use_fused_bias_glu": "activation.sana_conv_post_triton",
@@ -469,6 +479,11 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "lingbot_video_rmsnorm_active": "sites.lingbot_video_rmsnorm_site",
+    "mark_lingbot_video_rmsnorm_site": "sites.lingbot_video_rmsnorm_site",
+    "mount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "try_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
+    "unmount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
     "mark_sana_video_linear_attention_site": "sites.sana_video_linear_attention_site",
     "mount_sana_video_linear_attention": "sites.sana_video_linear_attention_site",
     "sana_video_linear_attention_active": "sites.sana_video_linear_attention_site",

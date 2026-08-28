@@ -203,6 +203,7 @@ def _make_sparse_prefill_case(
         ),
         page_size=page_size,
     )
+    backend.token_to_kv_pool = token_to_kv_pool
 
     generator = torch.Generator(device=device)
     generator.manual_seed(11)

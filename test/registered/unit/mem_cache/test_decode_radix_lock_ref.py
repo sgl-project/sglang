@@ -144,7 +144,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         error = queue._reclaim_swa_tail_capacity(129, "req-1")
 
         self.assertIsNone(error)
-        params = queue.tree_cache.evict.call_args.args[0]
+        params = queue.tree_cache.evict_for_alloc.call_args.args[0]
         self.assertEqual(params.num_tokens, 0)
         self.assertEqual(params.swa_num_tokens, 128)
 
