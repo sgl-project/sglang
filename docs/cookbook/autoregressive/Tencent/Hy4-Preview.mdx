@@ -1,6 +1,6 @@
 ---
-title: Hy4-Preview
-description: "Deploy Tencent Hy4-Preview with SGLang — launch recipes for the 770B-parameter Mixture-of-Experts model with MLA, DeepSeek Sparse Attention (DSA), and MTP speculative decoding, in BF16 on H200/B200/B300/GB300 and MXFP8 on Blackwell GPUs."
+title: Hy4 preview
+description: "Deploy Tencent Hy4 preview with SGLang — launch recipes for the 770B-parameter Mixture-of-Experts model with MLA, DeepSeek Sparse Attention (DSA), and MTP speculative decoding, in BF16 on H200/B200/B300/GB300 and MXFP8 on Blackwell GPUs."
 tag: NEW
 ---
 
@@ -78,7 +78,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Hy4-Preview** is Tencent's next-generation flagship Mixture-of-Experts language model: 770B total parameters with 49B active per token, pairing a DeepSeek-style MLA + sparse-attention stack with Hunyuan's own residual control, MoE routing, and attention gating. It is a **text-only** model (vocab 120,832; the endpoint rejects image input by design), released under **Apache-2.0**.
+**Hy4 preview** is Tencent's next-generation flagship Mixture-of-Experts language model: 770B total parameters with 49B active per token, pairing a DeepSeek-style MLA + sparse-attention stack with Hunyuan's own residual control, MoE routing, and attention gating. It is a **text-only** model (vocab 120,832; the endpoint rejects image input by design), released under **Apache-2.0**.
 
 **Key architecture:**
 
@@ -98,7 +98,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Resources:** [HuggingFace](https://huggingface.co/tencent/Hy4-preview) · [GitHub](https://github.com/Tencent-Hunyuan/Hy4-preview).
 
-**Special tokens.** The Hy4-Preview tokenizer's structural tokens are suffix-bearing (`<think:opensource>`, `<tool_calls:opensource>`, `<tool_call:opensource>`, `<arg_key:opensource>`, `<arg_value:opensource>`). SGLang's Hunyuan reasoning/tool-call parsers resolve the real token strings from the tokenizer vocab at runtime, so `--reasoning-parser auto --tool-call-parser auto` work out of the box.
+**Special tokens.** The Hy4 preview tokenizer's structural tokens are suffix-bearing (`<think:opensource>`, `<tool_calls:opensource>`, `<tool_call:opensource>`, `<arg_key:opensource>`, `<arg_value:opensource>`). SGLang's Hunyuan reasoning/tool-call parsers resolve the real token strings from the tokenizer vocab at runtime, so `--reasoning-parser auto --tool-call-parser auto` work out of the box.
 
 ## 2. Configuration Tips
 
@@ -163,7 +163,7 @@ On H200 (BF16, TP16 → ~95GB of weights per rank) the per-rank pool holds rough
 
 ### 3.1 Reasoning (`reasoning_effort`)
 
-Hy4-Preview is a hybrid-thinking model: reasoning defaults to `high` (deep chain-of-thought — suits math, coding, and agentic tasks). The top-level OpenAI `reasoning_effort` field accepts the standard tiers (e.g. `high`); for direct responses, pass the model-specific `no_think` through `extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}}`. The Deploy recipes enable the reasoning parser (`--reasoning-parser auto`) so thinking is separated into `reasoning_content` and the final answer into `content`:
+Hy4 preview is a hybrid-thinking model: reasoning defaults to `high` (deep chain-of-thought — suits math, coding, and agentic tasks). The top-level OpenAI `reasoning_effort` field accepts the standard tiers (e.g. `high`); for direct responses, pass the model-specific `no_think` through `extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}}`. The Deploy recipes enable the reasoning parser (`--reasoning-parser auto`) so thinking is separated into `reasoning_content` and the final answer into `content`:
 
 <Accordion title="Example: thinking (reasoning_effort=high) (Python)">
 
@@ -191,7 +191,7 @@ print(msg.content)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — will be captured verbatim from a live Hy4-Preview server.
+Pending update — will be captured verbatim from a live Hy4 preview server.
 ```
 
 </Accordion>
@@ -218,14 +218,14 @@ print("Content:", response.choices[0].message.content)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — will be captured verbatim from a live Hy4-Preview server.
+Pending update — will be captured verbatim from a live Hy4 preview server.
 ```
 
 </Accordion>
 
 ### 3.2 Tool Calling
 
-Hy4-Preview emits tool calls through suffixed structural tokens with an `arg_key` / `arg_value` argument format; SGLang's Hunyuan tool-call parser reassembles them into OpenAI-compatible `message.tool_calls` with schema-aware type coercion, for both streaming and non-streaming requests. The Deploy recipes enable both parsers together (`--reasoning-parser auto --tool-call-parser auto`) — the reasoning parser strips thinking tokens before the tool-call parser runs.
+Hy4 preview emits tool calls through suffixed structural tokens with an `arg_key` / `arg_value` argument format; SGLang's Hunyuan tool-call parser reassembles them into OpenAI-compatible `message.tool_calls` with schema-aware type coercion, for both streaming and non-streaming requests. The Deploy recipes enable both parsers together (`--reasoning-parser auto --tool-call-parser auto`) — the reasoning parser strips thinking tokens before the tool-call parser runs.
 
 <Note>
 Tool-call output is parsed, not grammar-constrained: `tool_choice: "required"` / named-function forcing is not enforced with structural-tag guided decoding on the current implementation.
@@ -275,7 +275,7 @@ for tc in msg.tool_calls or []:
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — will be captured verbatim from a live Hy4-Preview server.
+Pending update — will be captured verbatim from a live Hy4 preview server.
 ```
 
 </Accordion>
