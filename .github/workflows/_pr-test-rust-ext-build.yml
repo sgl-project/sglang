@@ -99,8 +99,10 @@ jobs:
         id: cache
         uses: actions/cache/restore@v4
         with:
-          path: python/sglang/srt/rust_extensions/_*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          path: |
+            python/sglang/srt/rust_extensions/_*.so
+            python/sglang/srt/rust_extensions/sglang-renderer
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
       - name: Report cache lookup
@@ -134,7 +136,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          # Archive holds rust_extensions/_*.so, so it unpacks into python/sglang/srt/.
+          # Archive holds rust_extensions/, so it unpacks into python/sglang/srt/.
           path: rust-ext-staging/
           if-no-files-found: error
           retention-days: 1
@@ -226,8 +228,10 @@ jobs:
       - name: Save built modules
         uses: actions/cache/save@v4
         with:
-          path: python/sglang/srt/rust_extensions/_*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
+          path: |
+            python/sglang/srt/rust_extensions/_*.so
+            python/sglang/srt/rust_extensions/sglang-renderer
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4

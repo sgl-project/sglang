@@ -1,10 +1,10 @@
 #!/bin/bash
-# Copy the built PyO3 extension modules into rust-ext-staging/rust_extensions/ for
+# Copy the built Rust artifacts into rust-ext-staging/rust_extensions/ for
 # upload-artifact. Shared by both jobs of _pr-test-rust-ext-build.yml, so the
-# archive layout and the module-count check cannot drift between them.
+# archive layout and checks cannot drift.
 #
-# MAX_GLIBC (optional): also reject a module requiring a newer GLIBC symbol
-# version than the test runners have. Only set where the modules were just
+# MAX_GLIBC (optional): also reject an artifact requiring a newer GLIBC symbol
+# version than the test runners have. Only set where the artifacts were just
 # compiled - on a cache hit these are the same bytes that already passed.
 set -euo pipefail
 shopt -s nullglob
@@ -32,6 +32,25 @@ for module in server grpc multimodal; do
     cp "${found[@]}" rust-ext-staging/rust_extensions/
     built+=("${found[@]}")
 done
+
+# RustBin writes executables to build/scripts-*. Keep one beside the modules so
+# the cache and artifact use the same layout.
+renderer=python/sglang/srt/rust_extensions/sglang-renderer
+if [ ! -f "${renderer}" ]; then
+    renderers=(python/build/scripts-*/sglang-renderer)
+    if [ ${#renderers[@]} -eq 0 ]; then
+        echo "::error::no sglang-renderer executable found"
+        exit 1
+    fi
+    cp "${renderers[0]}" "${renderer}"
+fi
+if [ ! -x "${renderer}" ]; then
+    echo "::error::sglang-renderer is not executable: ${renderer}"
+    exit 1
+fi
+cp "${renderer}" rust-ext-staging/rust_extensions/
+built+=("${renderer}")
+
 max_allowed="${MAX_GLIBC:-}"
 [ -n "${max_allowed}" ] || exit 0
 
