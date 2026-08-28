@@ -536,7 +536,8 @@ def apply_cuda_graph_disaggregation_roles(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.disaggregation_mode == "prefill":
         if (Phase.DECODE, "backend") not in server_args._cuda_graph_config_locked:
-            server_args._declare(
+            declare_resolution(
+                server_args,
                 "_apply_cuda_graph_disaggregation_roles",
                 cuda_graph_config=with_phase(
                     cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
@@ -544,7 +545,8 @@ def apply_cuda_graph_disaggregation_roles(server_args: Any):
             )
     elif cfg.disaggregation_mode == "decode":
         if (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked:
-            server_args._declare(
+            declare_resolution(
+                server_args,
                 "_apply_cuda_graph_disaggregation_roles",
                 cuda_graph_config=with_phase(
                     cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED

@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import EnvField, envs
 from sglang.srt.server_args import ServerArgs
@@ -128,7 +129,8 @@ class TestTheModelConfigCache(CustomTestCase):
         first = server_args.get_model_config()
         self.assertEqual(first.model_path, first_checkpoint)
 
-        server_args._declare(
+        declare_resolution(
+            server_args,
             "test_a_declared_model_path_rebuilds_the_configuration",
             model_path=second_checkpoint,
         )

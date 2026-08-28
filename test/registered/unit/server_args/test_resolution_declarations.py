@@ -146,7 +146,7 @@ def _late_resolvers():
                     if isinstance(node.func, ast.Attribute)
                     else getattr(node.func, "id", None)
                 )
-                if called in ("declare_late_resolution", "_late_resolution"):
+                if called == "declare_late_resolution":
                     return True
                 if called and reaches(called, seen):
                     return True

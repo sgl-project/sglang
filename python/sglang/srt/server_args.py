@@ -3752,16 +3752,6 @@ class ServerArgs:
         object.__setattr__(replacement, "_resolution_finished", True)
         return replacement
 
-    def _declare(self, source: str, **fields: Any) -> None:
-        """This record's handlers declaring their resolution writes.
-
-        See ``arg_groups.overrides.declare_resolution``, which the hooks these
-        handlers call reach directly.
-        """
-        from sglang.srt.arg_groups.overrides import declare_resolution
-
-        declare_resolution(self, source, **fields)
-
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
@@ -4285,24 +4275,6 @@ class ServerArgs:
                 model_config.hf_config.architectures,
             )
         return model_config
-
-    def _resolved(self):
-        """Read-only view of the resolving configuration: declared fields
-        resolve from the declaration stash."""
-
-        return resolved_view(self)
-
-    def _late_resolution(self, source: str, **fields) -> None:
-        """Resolve fields at the launcher's validation stage (pre-publish).
-
-        See ``arg_groups.overrides.declare_late_resolution``: the decision goes
-        to this instance's declaration stash, so every holder of it carries the
-        decision and publishes bags that answer with it. Refused outright once
-        the config is published.
-        """
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
-
-        declare_late_resolution(self, source, **fields)
 
     def __setattr__(self, name, value):
         # Once resolution has finished the record is the READ-ONLY raw input

@@ -285,7 +285,7 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         reserved_mem += decode_cuda_graph_config.max_bs * 2
 
     if (
-        server_args._resolved().enable_dp_attention
+        resolved_view(server_args).enable_dp_attention
         and cfg.disaggregation_mode != "prefill"
     ):
         # DP attention needs more padding for some operations, and much more for large
@@ -364,7 +364,8 @@ def adjust_mem_fraction_for_vlm(server_args: Any, model_config):
     dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
 
     final_overall_factor = base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
-    server_args._declare(
+    declare_resolution(
+        server_args,
         "adjust_mem_fraction_for_vlm",
         mem_fraction_static=original_server_arg_mem_fraction * final_overall_factor,
     )
