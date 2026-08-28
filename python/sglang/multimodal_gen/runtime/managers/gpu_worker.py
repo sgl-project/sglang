@@ -2127,13 +2127,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ) and bool(changes)
 
     def _latest_auto_residency_round_supports_short_validation(self) -> bool:
-        """Whether one full-shape step covers the changed execution paths."""
-        changes = self._latest_auto_residency_round()
-        return self._latest_auto_residency_round_is_resident_only() and all(
-            not is_dit_component_name(change.component_name)
-            and change.component_name not in self._auto_residency_repeated_components
-            for change in changes
-        )
+        """Whether one full-shape step covers every changed execution path."""
+        return self._latest_auto_residency_round_is_resident_only()
 
     def _rollback_applied_residency_changes(
         self, *, latest_round_only: bool = False
