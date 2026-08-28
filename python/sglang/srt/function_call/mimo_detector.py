@@ -16,12 +16,16 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    ToolCallItem,
+    _GetInfoFunc,
+)
 from sglang.srt.function_call.utils import safe_literal_eval
 
 logger = logging.getLogger(__name__)
@@ -156,6 +160,21 @@ class MiMoDetector(BaseFormatDetector):
             r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL
         )
 
+        # Streaming state. MiMo emits XML-like tool calls, while the OpenAI API
+        # expects a JSON argument string. Keep completed parameters plus the
+        # currently open string parameter so we can expose a stable JSON prefix
+        # before the closing </tool_call> arrives.
+        self.function_start_token = "<function="
+        self.function_end_token = "</function>"
+        self.parameter_start_token = "<parameter="
+        self.parameter_end_token = "</parameter>"
+        self._in_tool_call = False
+        self._reject_current_tool = False
+        self._raw_tool_prefix = ""
+        self._streaming_tool_name: Optional[str] = None
+        self._completed_args: Dict[str, Any] = {}
+        self._streamed_json_len = 0
+
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
 
@@ -195,57 +214,255 @@ class MiMoDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming parsing: buffer until complete tool call block.
-        """
+        """Incrementally parse MiMo tool calls into OpenAI JSON deltas."""
         self._buffer += new_text
-        current_text = self._buffer
+        normal_parts: List[str] = []
+        calls = []
 
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            if self.current_tool_id > 0:
-                # Already processing tool calls, keep buffering
-                # (more tool calls might come, don't discard text yet)
-                return StreamingParseResult(normal_text="")
-            else:
-                # No tool calls seen yet, return as normal text
-                self._buffer = ""
-                return StreamingParseResult(normal_text=current_text)
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
 
-        # Find end token AFTER the start token
-        end = current_text.find(self.eot_token, start)
+        while True:
+            if not self._in_tool_call:
+                start = self._buffer.find(self.bot_token)
+                if start == -1:
+                    partial_len = self._ends_with_partial_token(
+                        self._buffer, self.bot_token
+                    )
+                    if partial_len:
+                        normal_parts.append(self._buffer[:-partial_len])
+                        self._buffer = self._buffer[-partial_len:]
+                    else:
+                        normal_parts.append(self._buffer)
+                        self._buffer = ""
+                    break
+
+                normal_parts.append(self._buffer[:start])
+                self._buffer = self._buffer[start + len(self.bot_token) :]
+                self._in_tool_call = True
+                self._raw_tool_prefix = self.bot_token
+
+            if self._reject_current_tool:
+                if not self._forward_rejected_tool(normal_parts):
+                    break
+                continue
+
+            if self._streaming_tool_name is None:
+                function_start = self._buffer.find(self.function_start_token)
+                if function_start == -1:
+                    # A closed block with no function is malformed. Preserve the
+                    # legacy behavior and forward it as normal text.
+                    if self.eot_token in self._buffer:
+                        self._reject_current_tool = True
+                        if not self._forward_rejected_tool(normal_parts):
+                            break
+                        continue
+                    break
+
+                name_end = self._buffer.find(
+                    ">", function_start + len(self.function_start_token)
+                )
+                if name_end == -1:
+                    break
+
+                function_name = self._buffer[
+                    function_start + len(self.function_start_token) : name_end
+                ].strip()
+                consumed_header = self._buffer[: name_end + 1]
+                self._buffer = self._buffer[name_end + 1 :]
+
+                if (
+                    function_name not in self._tool_indices
+                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
+                    logger.warning("Unknown function: %s", function_name)
+                    self._raw_tool_prefix += consumed_header
+                    self._reject_current_tool = True
+                    if not self._forward_rejected_tool(normal_parts):
+                        break
+                    continue
+
+                self.current_tool_id += 1
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                self._streaming_tool_name = function_name
+                self.current_tool_name_sent = True
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": function_name,
+                    "arguments": {},
+                }
+                self._raw_tool_prefix = ""
+                calls.append(
+                    self._make_tool_call_item(
+                        name=function_name,
+                        parameters="",
+                    )
+                )
+
+            calls.extend(self._stream_arguments(tools))
+            if self._in_tool_call:
+                break
+
+        return StreamingParseResult(
+            normal_text="".join(normal_parts),
+            calls=calls,
+        )
+
+    def _make_tool_call_item(
+        self, parameters: str, name: Optional[str] = None
+    ) -> ToolCallItem:
+        return ToolCallItem(
+            tool_index=self.current_tool_id,
+            name=name,
+            parameters=parameters,
+        )
+
+    def _forward_rejected_tool(self, normal_parts: List[str]) -> bool:
+        """Forward an unknown or malformed complete tool block as normal text."""
+        end = self._buffer.find(self.eot_token)
         if end == -1:
-            # Incomplete tool call, return text before start and keep buffering
-            normal_text = current_text[:start]
-            self._buffer = current_text[start:]
-            return StreamingParseResult(normal_text=normal_text)
+            return False
 
-        # Parse the complete tool call block
-        result = self.detect_and_parse(current_text[: end + len(self.eot_token)], tools)
+        normal_parts.append(
+            self._raw_tool_prefix + self._buffer[: end + len(self.eot_token)]
+        )
+        self._buffer = self._buffer[end + len(self.eot_token) :]
+        self._reset_streaming_state()
+        return True
 
-        if result.calls:
-            # Valid tool call - initialize tracking if first one
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
+    @staticmethod
+    def _is_streamable_string_param(
+        function_name: str, param_name: str, tools: List[Tool]
+    ) -> bool:
+        return _get_param_type(function_name, param_name, tools).lower() in {
+            "string",
+            "str",
+            "text",
+            "varchar",
+            "char",
+            "enum",
+        }
 
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
+    @staticmethod
+    def _without_incomplete_html_entity(value: str) -> str:
+        """Hold a trailing entity that html.unescape could change next chunk."""
+        match = re.search(
+            r"&(?:#[xX][0-9a-fA-F]*|#[0-9]*|[A-Za-z][A-Za-z0-9]*)?$", value
+        )
+        return value[: match.start()] if match else value
 
-            call = result.calls[0]
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": call.name,
-                "arguments": json.loads(call.parameters) if call.parameters else {},
-            }
-            self.streamed_args_for_tool[self.current_tool_id] = call.parameters
-            call.tool_index = self.current_tool_id
-            self.current_tool_id += 1
+    def _stream_arguments(self, tools: List[Tool]) -> List[ToolCallItem]:
+        """Emit the stable JSON prefix for the current MiMo tool call."""
+        calls = []
+        is_complete = self.eot_token in self._buffer
+        end = self._buffer.find(self.eot_token) if is_complete else len(self._buffer)
+        args_text = self._buffer[:end]
 
-        self._buffer = current_text[end + len(self.eot_token) :]
-        return result
+        function_end = args_text.find(self.function_end_token)
+        if function_end != -1:
+            args_text = args_text[:function_end]
+
+        last_closed_end = 0
+        for match in self.param_regex.finditer(args_text):
+            param_name = match.group(1).strip()
+            if param_name not in self._completed_args:
+                self._completed_args[param_name] = _convert_param_value(
+                    match.group(2),
+                    param_name,
+                    self._streaming_tool_name or "",
+                    tools,
+                )
+            last_closed_end = match.end()
+
+        partial_name: Optional[str] = None
+        partial_value: Optional[str] = None
+        tail = args_text[last_closed_end:]
+        parameter_start = tail.find(self.parameter_start_token)
+        if parameter_start != -1:
+            name_end = tail.find(">", parameter_start + len(self.parameter_start_token))
+            if name_end != -1:
+                candidate_name = tail[
+                    parameter_start + len(self.parameter_start_token) : name_end
+                ].strip()
+                raw_value = tail[name_end + 1 :]
+                if self._is_streamable_string_param(
+                    self._streaming_tool_name or "", candidate_name, tools
+                ):
+                    marker_hold = self._ends_with_partial_token(
+                        raw_value, self.parameter_end_token
+                    )
+                    if marker_hold:
+                        raw_value = raw_value[:-marker_hold]
+                    raw_value = self._without_incomplete_html_entity(raw_value)
+                    decoded_value = html.unescape(raw_value)
+
+                    # _convert_param_value treats the exact literal "null" as
+                    # JSON null even for string schemas. Do not commit to an
+                    # opening JSON string until the value diverges from it.
+                    if not "null".startswith(decoded_value.lower()):
+                        partial_name = candidate_name
+                        partial_value = decoded_value
+
+        # Do not emit a lone opening brace before any argument content is
+        # stable. This also lets the literal "null" remain undecided until its
+        # parameter closes.
+        if not is_complete and not self._completed_args and partial_value is None:
+            return []
+
+        snapshot_parts = [
+            f"{json.dumps(key, ensure_ascii=False)}: "
+            f"{json.dumps(value, ensure_ascii=False)}"
+            for key, value in self._completed_args.items()
+        ]
+        if partial_name is not None and partial_value is not None:
+            key_json = json.dumps(partial_name, ensure_ascii=False)
+            escaped_value = json.dumps(partial_value, ensure_ascii=False)[1:-1]
+            snapshot_parts.append(f'{key_json}: "{escaped_value}')
+
+        snapshot = "{" + ", ".join(snapshot_parts) + "}"
+        argument_diff: Optional[str] = None
+
+        if is_complete:
+            final_json = json.dumps(self._completed_args, ensure_ascii=False)
+            streamed = self.streamed_args_for_tool[self.current_tool_id]
+            if final_json.startswith(streamed):
+                argument_diff = final_json[len(streamed) :]
+            else:
+                logger.warning(
+                    "MiMo streamed arguments are not a prefix of final arguments "
+                    "for tool '%s'",
+                    self._streaming_tool_name,
+                )
+
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = dict(
+                self._completed_args
+            )
+            self._buffer = self._buffer[end + len(self.eot_token) :]
+        else:
+            # The final brace is not stable until all parameters are known.
+            stable_end = len(snapshot) - 1
+            if stable_end > self._streamed_json_len:
+                argument_diff = snapshot[self._streamed_json_len : stable_end]
+                self._streamed_json_len = stable_end
+
+        if argument_diff:
+            self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+            calls.append(self._make_tool_call_item(parameters=argument_diff))
+        if is_complete:
+            self._reset_streaming_state()
+        return calls
+
+    def _reset_streaming_state(self):
+        self._in_tool_call = False
+        self._reject_current_tool = False
+        self._raw_tool_prefix = ""
+        self._streaming_tool_name = None
+        self._completed_args = {}
+        self._streamed_json_len = 0
+        self.current_tool_name_sent = False
 
     def _parse_tool_call(
         self, tool_call_body: str, tools: List[Tool]
