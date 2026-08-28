@@ -3302,9 +3302,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.weight_versions,
                 num_output_tokens=len(state.output_ids),
             )
-        if recv_obj.prefill_weight_versions:
+        if prefill_spans := recv_obj.prefill_weight_versions:
             meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
-                recv_obj.prefill_weight_versions
+                prefill_spans
             )
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
