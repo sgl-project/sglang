@@ -174,7 +174,7 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        use crate::api_server::http::{HttpBody, empty, text_response};
+        use crate::api_server::http::response::{HttpBody, empty, text_response};
 
         let app = || {
             ApiKeyAuthLayer::new("sk-1").layer(tower::service_fn(
@@ -219,7 +219,8 @@ mod tests {
     /// trailers-only UNAUTHENTICATED on gRPC.
     #[test]
     fn rejection_shapes() {
-        let http_reject: http::Response<crate::api_server::http::HttpBody> = reject(false);
+        let http_reject: http::Response<crate::api_server::http::response::HttpBody> =
+            reject(false);
         assert_eq!(http_reject.status(), http::StatusCode::UNAUTHORIZED);
         let grpc_reject: http::Response<tonic::body::Body> = reject(true);
         assert_eq!(grpc_reject.status(), http::StatusCode::OK);

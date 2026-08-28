@@ -9,6 +9,8 @@ use futures::StreamExt;
 use http::StatusCode;
 use http_body_util::BodyExt;
 
+use crate::api_server::core::frame::error_value;
+
 /// One boxed body type for every response: full buffers and SSE streams
 /// alike (unsync-boxed, the same shape axum's own Body wrapped). Infallible
 /// error: our streams never fail, they end.
@@ -130,12 +132,6 @@ fn json_content_type(headers: &http::HeaderMap) -> bool {
     };
     mime.type_() == "application"
         && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
-}
-
-/// The native error body — the same `{"error": {...}}` object every native
-/// path emits, not bare text, which a client parsing JSON chokes on.
-pub fn error_value(code: u16, message: &str) -> serde_json::Value {
-    serde_json::json!({ "error": { "message": message, "code": code } })
 }
 
 /// Unary native-shape error response: `code` + [`error_value`] body.

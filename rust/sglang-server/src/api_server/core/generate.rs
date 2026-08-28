@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 
 use crate::api_server::core::error::ApiError;
 use crate::api_server::core::frame::{
-    OutputAccumulator, cumulative_frame_string, frame_value, stream_frame_string,
-    stream_frame_value, tag_value,
+    OutputAccumulator, cumulative_frame_string, error_value, frame_typed, stream_frame_typed,
+    tag_value, typed_frame_string,
 };
 use crate::api_server::core::guard::AbortGuard;
 use crate::api_server::core::state::CoreState;
@@ -18,7 +18,6 @@ use crate::api_server::core::submit::submit;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateBody, RequestKind};
 use crate::message::response::{ChunkEvent, ResponseItem};
-use crate::utils::response::error_value;
 
 /// API-local timing for one request.
 ///
@@ -114,21 +113,25 @@ pub(crate) async fn generate_start(
     })
 }
 
-/// One folded unary result: the HTTP status code to answer with, the result or
-/// `{"error": …}` body, and whether a real terminal item arrived (`false` =
-/// truncation; the caller keeps the abort guard armed).
-pub(crate) struct NativeUnary {
-    pub(crate) code: u16,
-    pub(crate) body: serde_json::Value,
-    pub(crate) terminal: bool,
+/// One folded unary result, transport-neutral: each transport renders
+/// `Complete` in its own frame shape, maps `Error`'s HTTP-numbered code into
+/// its own status space, and keeps the abort guard armed on `Truncated`.
+pub(crate) enum UnaryOutcome {
+    /// A real terminal item: the folded output and its finished timing.
+    Complete(ChunkEvent, RequestTiming),
+    /// Validation abort or pipeline error.
+    Error { code: u16, message: String },
+    /// Sender dropped without a terminal item: the shard dropped this request
+    /// (a truncation — a client disconnect would have dropped the handler
+    /// future).
+    Truncated,
 }
 
-/// Fold a unary request to its terminal [`NativeUnary`]. Shared by single + batch.
+/// Fold a unary request to its terminal [`UnaryOutcome`]. Shared by single + batch.
 pub(crate) async fn drain_unary(
     rx: &mut mpsc::Receiver<ResponseItem>,
-    rid_str: &str,
     mut timing: RequestTiming,
-) -> NativeUnary {
+) -> UnaryOutcome {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
         match item {
@@ -147,39 +150,24 @@ pub(crate) async fn drain_unary(
                     .as_ref()
                     .and_then(|f| f.abort_status())
                 {
-                    return NativeUnary {
+                    return UnaryOutcome::Error {
                         code,
-                        body: error_value(code, message),
-                        terminal: true,
+                        message: message.to_string(),
                     };
                 }
-                let mut value = frame_value(&final_out, rid_str);
-                add_e2e_latency(&mut value, &timing);
-                return NativeUnary {
-                    code: 200,
-                    body: value,
-                    terminal: true,
-                };
+                return UnaryOutcome::Complete(final_out, timing);
             }
             ResponseItem::Error(e) => {
                 timing.finish();
-                let code = e.http_status();
-                return NativeUnary {
-                    code,
-                    body: error_value(code, &e.to_string()),
-                    terminal: true,
+                return UnaryOutcome::Error {
+                    code: e.http_status(),
+                    message: e.to_string(),
                 };
             }
             ResponseItem::Control(_) | ResponseItem::Data(_) => continue, // never on `/generate`
         }
     }
-    // Sender dropped without a terminal item: the shard dropped this request (a
-    // truncation — a client disconnect would have dropped the handler future).
-    NativeUnary {
-        code: 500,
-        body: error_value(500, "response truncated before completion"),
-        terminal: false,
-    }
+    UnaryOutcome::Truncated
 }
 
 /// Await the next item from `rx`, then drain whatever queued behind it (so the caller
@@ -237,8 +225,9 @@ pub(crate) trait FrameShaper {
     fn item_error(&mut self, code: u16, message: &str, index: Option<usize>) -> Self::Frame;
 }
 
-/// The HTTP rendering: complete JSON frame strings, delegating 1:1 to the
-/// byte-pinned frame.rs paths (incl. the memoized cumulative fast path).
+/// The HTTP rendering: complete JSON frame strings — the serialized typed
+/// frame, except cumulative intermediate frames, which keep the memoized fast
+/// path (byte-pinned against the typed serialization).
 pub(crate) struct JsonFrameShaper;
 
 impl FrameShaper for JsonFrameShaper {
@@ -250,7 +239,7 @@ impl FrameShaper for JsonFrameShaper {
         rid: &str,
         index: Option<usize>,
     ) -> String {
-        stream_frame_string(out, acc, true, rid, index)
+        typed_frame_string(stream_frame_typed(out, acc, true, rid), index)
     }
     fn coalesced(&mut self, acc: &OutputAccumulator, rid: &str, index: Option<usize>) -> String {
         cumulative_frame_string(acc, rid, index)
@@ -271,24 +260,18 @@ impl FrameShaper for JsonFrameShaper {
     }
 }
 
-/// The gRPC rendering: typed `GenerateStreamItem`s, derived from the same
-/// byte-pinned JSON shaping (`stream_frame_value` etc.) and converted through
-/// the generated type, so both transports shape frames from one source.
-// TODO(perf): hand-build the typed frames if the per-frame Value round-trip
-// ever shows up in gRPC streaming profiles.
+/// The gRPC rendering: the same typed frames HTTP serializes
+/// (`frame_typed` / `stream_frame_typed`), shipped as `GenerateStreamItem`s —
+/// one shaping source, so the two transports cannot drift.
 pub(crate) struct PbFrameShaper;
 
 impl PbFrameShaper {
-    fn typed_frame(
-        mut value: serde_json::Value,
+    fn item(
+        mut frame: sglang_api_types::api::v1::GenerateResponse,
         index: Option<usize>,
     ) -> sglang_api_types::api::v1::GenerateStreamItem {
         use sglang_api_types::api::v1 as genapi;
-        if let Some(i) = index {
-            value["index"] = serde_json::json!(i);
-        }
-        let frame: genapi::GenerateResponse = serde_json::from_value(value)
-            .expect("frame_value output parses into the generated GenerateResponse");
+        frame.index = index.map(|i| u32::try_from(i).unwrap_or(u32::MAX));
         genapi::GenerateStreamItem {
             item: Some(genapi::generate_stream_item::Item::Frame(frame)),
         }
@@ -304,7 +287,7 @@ impl FrameShaper for PbFrameShaper {
         rid: &str,
         index: Option<usize>,
     ) -> Self::Frame {
-        Self::typed_frame(stream_frame_value(out, acc, true, rid), index)
+        Self::item(stream_frame_typed(out, acc, true, rid), index)
     }
     fn coalesced(
         &mut self,
@@ -312,7 +295,7 @@ impl FrameShaper for PbFrameShaper {
         rid: &str,
         index: Option<usize>,
     ) -> Self::Frame {
-        Self::typed_frame(frame_value(acc.snapshot(), rid), index)
+        Self::item(frame_typed(acc.snapshot(), rid), index)
     }
     fn terminal(
         &mut self,
@@ -323,9 +306,9 @@ impl FrameShaper for PbFrameShaper {
         index: Option<usize>,
         timing: &RequestTiming,
     ) -> Self::Frame {
-        let mut value = stream_frame_value(out, acc, incremental, rid);
-        add_e2e_latency(&mut value, timing);
-        Self::typed_frame(value, index)
+        let mut frame = stream_frame_typed(out, acc, incremental, rid);
+        add_e2e_latency(&mut frame, timing);
+        Self::item(frame, index)
     }
     fn item_error(&mut self, code: u16, message: &str, index: Option<usize>) -> Self::Frame {
         use sglang_api_types::api::v1 as genapi;
@@ -463,17 +446,23 @@ pub(crate) fn generation_event_stream_with<S: FrameShaper>(
 /// attached only when the request finishes. The Rust native API owns the same
 /// lifecycle boundary, so it adds the value while handling the terminal egress
 /// item rather than putting API-only timing onto every scheduler `ChunkEvent`.
-fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
+pub(crate) fn add_e2e_latency(
+    frame: &mut sglang_api_types::api::v1::GenerateResponse,
+    timing: &RequestTiming,
+) {
     let (time_to_first_token, e2e_latency) = timing
         .terminal_latencies()
         .expect("a successful terminal output has complete request timing");
     debug_assert!(time_to_first_token <= e2e_latency);
-    value["meta_info"]["e2e_latency"] = serde_json::json!(e2e_latency.as_secs_f64());
+    frame
+        .meta_info
+        .get_or_insert_with(Default::default)
+        .e2e_latency = Some(e2e_latency.as_secs_f64());
 }
 
 /// Render a terminal streaming frame. Intermediate cumulative frames keep the
-/// memoized fast path; the one terminal frame uses the Value path so it can carry
-/// the request-local `e2e_latency`, exactly as Python does.
+/// memoized fast path; the one terminal frame serializes the typed frame so it
+/// can carry the request-local `e2e_latency`, exactly as Python does.
 fn terminal_stream_frame_string(
     out: ChunkEvent,
     acc: &OutputAccumulator,
@@ -482,10 +471,9 @@ fn terminal_stream_frame_string(
     index: Option<usize>,
     timing: &RequestTiming,
 ) -> String {
-    let mut value =
-        crate::api_server::core::frame::stream_frame_value(out, acc, incremental, rid_str);
-    add_e2e_latency(&mut value, timing);
-    tag_value(value, index)
+    let mut frame = stream_frame_typed(out, acc, incremental, rid_str);
+    add_e2e_latency(&mut frame, timing);
+    typed_frame_string(frame, index)
 }
 
 #[cfg(test)]
@@ -604,10 +592,12 @@ mod tests {
             time_to_first_token: None,
             e2e_latency: None,
         };
-        let unary = drain_unary(&mut rx, "client-rid", timing).await;
-        assert_eq!(unary.code, 200);
-        assert!(unary.terminal);
-        let value = unary.body;
+        let UnaryOutcome::Complete(out, timing) = drain_unary(&mut rx, timing).await else {
+            panic!("a Done item folds to Complete");
+        };
+        let mut frame = frame_typed(&out, "client-rid");
+        add_e2e_latency(&mut frame, &timing);
+        let value = serde_json::to_value(&frame).expect("a generated frame serializes");
         assert_eq!(value["meta_info"]["id"], "client-rid");
         assert_eq!(value["meta_info"]["prompt_tokens"], 5);
         assert_eq!(value["meta_info"]["completion_tokens"], 2);

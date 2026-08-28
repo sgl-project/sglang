@@ -10,18 +10,54 @@ use std::sync::Arc;
 use http::StatusCode;
 
 use super::app::AppState;
+use super::response::error_response;
 use super::response::sse_encode;
-use super::response::{HttpResponse, json_response, read_json, status_response};
+use super::response::{HttpResponse, bytes_response, read_json, status_response};
+use crate::api_server::core::frame::{error_value, frame_typed};
 use crate::api_server::core::generate::{
-    GeneratePlan, drain_unary, generate_start, generation_event_stream,
+    GeneratePlan, UnaryOutcome, add_e2e_latency, drain_unary, generate_start,
+    generation_event_stream,
 };
 use crate::api_server::core::health::{HealthStatus, health_probe};
-use super::response::{error_response, error_value};
 
 /// native api error response: unary → `code` plus the JSON `body`,
 /// streaming → 200 with one SSE error frame + `[DONE]`.
 pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> HttpResponse {
     error_response(code, error_value(code.as_u16(), message), stream)
+}
+
+/// One rendered unary response: the HTTP status code, the serialized result or
+/// `{"error": …}` JSON body, and whether a real terminal item arrived (`false`
+/// = truncation; the caller keeps the abort guard armed).
+struct NativeUnary {
+    code: u16,
+    body: String,
+    terminal: bool,
+}
+
+/// The HTTP JSON rendering of a folded [`UnaryOutcome`].
+fn render_unary(outcome: UnaryOutcome, rid: &str) -> NativeUnary {
+    match outcome {
+        UnaryOutcome::Complete(out, timing) => {
+            let mut frame = frame_typed(&out, rid);
+            add_e2e_latency(&mut frame, &timing);
+            NativeUnary {
+                code: 200,
+                body: serde_json::to_string(&frame).expect("a generated frame always serializes"),
+                terminal: true,
+            }
+        }
+        UnaryOutcome::Error { code, message } => NativeUnary {
+            code,
+            body: error_value(code, &message).to_string(),
+            terminal: true,
+        },
+        UnaryOutcome::Truncated => NativeUnary {
+            code: 500,
+            body: error_value(500, "response truncated before completion").to_string(),
+            terminal: false,
+        },
+    }
 }
 
 /// `GET /health_generate` — 200 if the response heartbeat advances within
@@ -94,12 +130,13 @@ pub(super) async fn generate<B: http_body::Body>(
             .expect("into_requests yields >=1 payload");
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let unary = drain_unary(&mut rx, rid_str.client_facing(), timing).await;
+        let outcome = drain_unary(&mut rx, timing).await;
+        let unary = render_unary(outcome, rid_str.client_facing());
         if unary.terminal {
             guard.disarm(&rid_str);
         }
         let status = StatusCode::from_u16(unary.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        json_response(status, &unary.body)
+        bytes_response(status, "application/json", unary.body.into_bytes())
     } else {
         // Unary batch: poll every item concurrently, as Python's gather does.
         // `join_all` preserves input order for the final JSON array, while each
@@ -108,8 +145,8 @@ pub(super) async fn generate<B: http_body::Body>(
         // entry; the batch response is 200.
         let drained = futures::future::join_all(receivers.into_iter().map(
             |(rid_str, mut rx, request_timing)| async move {
-                let client_rid = rid_str.client_facing().to_owned();
-                let unary = drain_unary(&mut rx, &client_rid, request_timing).await;
+                let outcome = drain_unary(&mut rx, request_timing).await;
+                let unary = render_unary(outcome, rid_str.client_facing());
                 (rid_str, unary)
             },
         ))
@@ -121,6 +158,12 @@ pub(super) async fn generate<B: http_body::Body>(
             }
             results.push(unary.body);
         }
-        json_response(StatusCode::OK, &serde_json::Value::Array(results))
+        // Comma-joined pre-serialized bodies: the bytes `serde_json` writes for
+        // an array of the same documents.
+        bytes_response(
+            StatusCode::OK,
+            "application/json",
+            format!("[{}]", results.join(",")).into_bytes(),
+        )
     }
 }
