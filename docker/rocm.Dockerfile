@@ -525,6 +525,9 @@ RUN set -eux; \
       *rocm1000*) \
         echo "ROCm 10.0.0 (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
         ;; \
+      *rocm7_14*) \
+        echo "ROCm 7.14 (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
+        ;; \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
         curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key \
@@ -1026,6 +1029,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
   if [ "${GPU_ARCH##*-}" = "rocm1000" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
     export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
+    export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
+    export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
+    echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
+    ldconfig; \
+    echo "[MORI] rocm_sysdeps prefix: ${ROCM_SYSDEPS}"; \
+  elif [ "${GPU_ARCH##*-}" = "rocm7_14" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
+    export PATH="${ROCM_HOME}/bin:${PATH}"; \
+    export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}/lib/cmake:${ROCM_SYSDEPS}:${ROCM_HOME}/lib/cmake:${ROCM_HOME}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
     export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
     export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
     echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
