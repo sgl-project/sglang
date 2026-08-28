@@ -77,6 +77,7 @@ class DFlashVerifyInput(SpecInput):
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
         batch.input_ids = self.draft_token
+        batch.positions = self.positions
         batch.spec_info = self
         if _is_npu and not batch.forward_mode.is_idle():
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (

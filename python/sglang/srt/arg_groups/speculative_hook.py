@@ -314,20 +314,24 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     if server_args.speculative_algorithm == "DFLASH_CONFIDENCE":
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+            logger.warning(
+                "DFLASH_CONFIDENCE needs compact ragged target verification; "
+                "SGLANG_RAGGED_VERIFY_MODE=static captures no token-keyed CUDA "
+                "Graph buckets, so every verify step falls back to the "
+                "lossless full-width path and no dynamic scheduling happens. "
+                "Set SGLANG_RAGGED_VERIFY_MODE=compact to enable it."
+            )
         threshold = float(server_args.speculative_dflash_confidence_threshold)
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(
                 "--speculative-dflash-confidence-threshold must be in [0, 1], "
                 f"got {threshold}."
-            )
-        min_verify_len = int(server_args.speculative_dflash_confidence_min_verify_len)
-        block_size = int(server_args.speculative_num_draft_tokens)
-        # Anchor-only verification still commits the target bonus token.
-        if not 1 <= min_verify_len <= block_size:
-            raise ValueError(
-                "--speculative-dflash-confidence-min-verify-len must be in "
-                f"[1, {block_size}] (1 means anchor-only / bonus-only), got "
-                f"{min_verify_len}."
             )
         target_tokens = int(server_args.speculative_dflash_confidence_target_verify_tokens)
         if target_tokens < 0:
@@ -341,13 +345,16 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "--speculative-dflash-confidence-sps-table-path must point to an "
                 f"existing SPS table JSON file, got {sps_table_path!r}."
             )
-        sts_path = server_args.speculative_dflash_confidence_sts_path
-        if sts_path and not os.path.isfile(sts_path):
-            raise ValueError(
-                "--speculative-dflash-confidence-sts-path must point to an "
-                f"existing STS calibration JSON file, got {sts_path!r}."
+        if (
+            server_args.speculative_dflash_confidence_align_verify_tokens_to_graph_tier
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+        ):
+            logger.warning(
+                "--speculative-dflash-confidence-align-verify-tokens-to-graph-tier "
+                "only takes effect with SGLANG_RAGGED_VERIFY_MODE=compact (got %r); "
+                "it will be a no-op.",
+                read_ragged_verify_mode().value,
             )
-
     _resolve_dflash_draft_attention_backend(server_args)
 
     if server_args.max_running_requests is None:

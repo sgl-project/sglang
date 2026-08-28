@@ -4478,6 +4478,7 @@ class Scheduler(
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
+                "dflash_confidence_force_budget_frac",
                 "dspark_clear_info_records",
                 "dflash_confidence_clear_info_records",
             ]
@@ -4509,6 +4510,23 @@ class Scheduler(
                 if v is not None and not (0.0 < float(v) <= 1.0):
                     logging.warning(
                         f"dspark_force_budget_frac must be in (0, 1] or null, got {v}."
+                    )
+                    if_success = False
+                    break
+            elif k == "dflash_confidence_force_budget_frac":
+                if not self.spec_algorithm.is_dflash_confidence() or not hasattr(
+                    self.draft_worker, "set_dflash_confidence_forced_budget_frac"
+                ):
+                    logging.warning(
+                        "dflash_confidence_force_budget_frac requires a "
+                        "DFLASH_CONFIDENCE draft worker."
+                    )
+                    if_success = False
+                    break
+                if v is not None and not (0.0 < float(v) <= 1.0):
+                    logging.warning(
+                        "dflash_confidence_force_budget_frac must be in (0, 1] "
+                        f"or null, got {v}."
                     )
                     if_success = False
                     break
@@ -4552,6 +4570,13 @@ class Scheduler(
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
                     None if frac is None else float(frac)
+                )
+            confidence_frac = remaining.pop(
+                "dflash_confidence_force_budget_frac", None
+            )
+            if "dflash_confidence_force_budget_frac" in server_args_dict:
+                self.draft_worker.set_dflash_confidence_forced_budget_frac(
+                    None if confidence_frac is None else float(confidence_frac)
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()

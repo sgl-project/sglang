@@ -53,7 +53,11 @@ except ImportError as exc:
     profile_sps_table = _table_module.profile_sps_table
     get_tokenizer = None
 
-DEFAULT_TIMEOUT = 60
+# Initial whole-batch prefill can exceed a minute on a cold model even though
+# the measured decode steps are short.  A client disconnect retracts one request
+# and invalidates the strict full-batch steady-state gate, so keep load requests
+# alive for the complete profiling-round budget.
+DEFAULT_TIMEOUT = 360
 
 DEFAULT_OUT = "dspark_sps.json"
 DEFAULT_MAX_BATCH_SIZE = 256
@@ -108,6 +112,7 @@ INFO_RECORD_ENABLE_HINT = (
 
 class ServerContext(msgspec.Struct, frozen=True):
     base_url: str
+    speculative_algorithm: str
     tokenizer_path: str
     tp_size: int
     dp_size: int
@@ -200,7 +205,10 @@ def run_profile(
     context = fetch_server_context(
         base_url=base_url,
         local_tokenizer_path=local_tokenizer_path,
-        allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        # DFLASH_CONFIDENCE starts in its normal fixed-width state and switches
+        # to compact only when each profiling cell pins its optional budget.
+        # DSpark's compact server is already in compact mode at connection time.
+        allowed_modes=("static", "compact", "cap-accept") if offdiag else ("static",),
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
@@ -511,6 +519,7 @@ def fetch_server_context(
 
     return ServerContext(
         base_url=base_url,
+        speculative_algorithm=speculative_algorithm,
         tokenizer_path=tokenizer_path,
         tp_size=int(info.get("tp_size", 1) or 1),
         dp_size=dp_size,
@@ -643,7 +652,11 @@ def run_one_round(
         return None
 
     if frac is not None:
-        set_forced_budget_frac(base_url=context.base_url, frac=frac)
+        set_forced_budget_frac(
+            base_url=context.base_url,
+            frac=frac,
+            speculative_algorithm=context.speculative_algorithm,
+        )
 
     flush_cache(base_url=context.base_url)
     watermarks = [
@@ -838,10 +851,17 @@ def flush_cache(*, base_url: str) -> None:
         logger.warning("POST /flush_cache failed; continuing.", exc_info=True)
 
 
-def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
+def set_forced_budget_frac(
+    *, base_url: str, frac: Optional[float], speculative_algorithm: str
+) -> None:
+    force_key = (
+        "dflash_confidence_force_budget_frac"
+        if speculative_algorithm == "DFLASH_CONFIDENCE"
+        else "dspark_force_budget_frac"
+    )
     response = requests.post(
         base_url + "/set_internal_state",
-        json={"server_args": {"dspark_force_budget_frac": frac}},
+        json={"server_args": {force_key: frac}},
         timeout=DEFAULT_TIMEOUT,
     ).json()
     outs = response if isinstance(response, list) else [response]
@@ -851,7 +871,7 @@ def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
 
     if not outs or not all(_ok(out) for out in outs):
         raise RuntimeError(
-            f"set dspark_force_budget_frac={frac} rejected by server: {response}"
+            f"set {force_key}={frac} rejected by server: {response}"
         )
 
 
@@ -994,15 +1014,22 @@ def postprocess_round(
                 "records."
             )
         graph_tier = aligned_verify_tokens.pop()
-        budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
-        batch_tokens = batch_size_per_rank + budget
-        if graph_tier < batch_tokens:
+        requested_budget = int(
+            frac * batch_size_per_rank * (verify_num_draft_tokens - 1)
+        )
+        requested_tokens = batch_size_per_rank + requested_budget
+        if graph_tier < requested_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "
-                f"{graph_tier} is smaller than the pinned M={batch_tokens} "
+                f"{graph_tier} is smaller than the pinned M={requested_tokens} "
                 f"(= {batch_size_per_rank} + int({frac} * {batch_size_per_rank} "
                 f"* {verify_num_draft_tokens - 1})); the budget pin did not take."
             )
+        # Runtime is charged by the replayed CUDA-graph tier, including its
+        # padding, rather than the useful requested token count.  Fitting with
+        # requested_tokens would assign several differently rounded replays to
+        # one M and make the scheduler systematically underprice compact verify.
+        batch_tokens = graph_tier
     else:
         batch_tokens = expected_tokens
 

@@ -1083,7 +1083,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # passes its own positions (uniform num_draft_tokens per request).
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+        ragged_layout = getattr(batch.spec_info, "ragged_verify_layout", None)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
             mrope_delta_tensor = torch.zeros(
@@ -1099,9 +1099,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for i in range(batch_size)
             ]
             mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-        )
+
+        if ragged_layout is None:
+            seq_positions = seq_positions.view(batch_size, -1)
+            adjusted_positions = (seq_positions + mrope_delta_tensor).flatten()
+        else:
+            # Compact target verify packs variable-length request rows into one
+            # token bucket. Its padded tail has no owning request, so preserve
+            # its zero position and apply each request's MRoPE delta only to
+            # its materialized verify rows. This also avoids the rectangular
+            # `view(batch_size, -1)` assumption for a bucket such as 8 tokens
+            # across three requests.
+            packed_deltas = torch.repeat_interleave(
+                mrope_delta_tensor.flatten(), ragged_layout.verify_lens
+            )
+            adjusted_positions = seq_positions.flatten()
+            if packed_deltas.numel() < adjusted_positions.numel():
+                packed_deltas = torch.nn.functional.pad(
+                    packed_deltas,
+                    (0, adjusted_positions.numel() - packed_deltas.numel()),
+                )
+            adjusted_positions = adjusted_positions + packed_deltas[
+                : adjusted_positions.numel()
+            ]
+        next_input_positions = adjusted_positions.unsqueeze(0).repeat(3, 1)
 
         self.mrope_positions = next_input_positions
 

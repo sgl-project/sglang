@@ -358,6 +358,17 @@ class FusedKVMaterializeHelper:
             cos_sin_cache = cos_sin_cache.to(self.device)
         return cos_sin_cache
 
+    def reserve_workspace(self, max_tokens: int) -> None:
+        """Reserve static workspaces before CUDA graph capture.
+
+        Compact verification always materializes at most ``max_tokens`` rows.
+        Reserving with the draft projection dtype makes subsequent graph replays
+        allocation-free even when the compact scheduler changes active lengths.
+        """
+        if max_tokens < 0:
+            raise ValueError(f"max_tokens must be non-negative, got {max_tokens}.")
+        self._ensure_workspace(max_tokens, self.flat_kv_weight_t.dtype)
+
     def _ensure_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
         if (
             self._workspace_capacity >= total_ctx
@@ -423,6 +434,16 @@ class FusedKVMaterializeHelper:
         )
         cos_sin_cache = self._ensure_rope_cache(max_position)
 
+        if torch.cuda.is_current_stream_capturing() and (
+            self._workspace_capacity < total_ctx
+            or self._workspace_dtype != ctx_hidden.dtype
+            or self._proj_workspace is None
+            or self._k_workspace is None
+            or self._v_workspace is None
+        ):
+            raise RuntimeError(
+                "DFLASH fused KV workspace must be reserved before CUDA graph capture."
+            )
         self._ensure_workspace(total_ctx, ctx_hidden.dtype)
         assert self._proj_workspace is not None
         assert self._k_workspace is not None

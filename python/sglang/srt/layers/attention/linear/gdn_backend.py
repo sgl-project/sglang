@@ -127,6 +127,28 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
         )
 
 
+def _ragged_verify_dense_scatter_indices(
+    *,
+    query_start_loc: torch.Tensor,
+    seq_len: int,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
+
+    Rows never exceed draft_token_num under either layout variant (cap for
+    graph replay, planner construction for eager), so in-row offsets stay
+    in-row; tokens past the layout's coverage collapse into one ghost row at
+    index bs * draft_token_num.
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -370,6 +392,12 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    # The recurrent verify kernel is varlen (cu_seqlens=query_start_loc) and the
+    # conv path scatters ragged tokens to its dense [bs, draft_token_num] layout
+    # before the per-step conv update, so compact ragged verify graphs are
+    # supported (mirrors KDAAttnBackend).
+    supports_ragged_verify_graph: bool = True
+
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, model_runner: ModelRunner):
@@ -577,11 +605,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
             state_cache_indices = cache_indices
 
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
+            ragged_layout = forward_batch.spec_info.ragged_verify_layout
+            if ragged_layout is None:
+                # Uniform-width verify: every request verifies the full window.
+                batch_size = seq_len // draft_token_num
+                mixed_qkv_reshaped = mixed_qkv.view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+            else:
+                # Compact ragged verify: per-request verify lens vary, so the
+                # packed tokens are not uniformly batch_size x draft_token_num.
+                # The conv update and its per-step scratch want the dense
+                # [bs, draft_token_num] layout; scatter ragged tokens to their
+                # step slots and gather back after (pad steps are never
+                # committed). Uncovered tier-leftover tokens land in a ghost
+                # row whose values are discarded downstream.
+                batch_size = query_start_loc.shape[0] - 1
+                num_dense_tokens = batch_size * draft_token_num
+                dense_token_indices = _ragged_verify_dense_scatter_indices(
+                    query_start_loc=query_start_loc,
+                    seq_len=seq_len,
+                    draft_token_num=draft_token_num,
+                )
+                dense = mixed_qkv.new_zeros(
+                    num_dense_tokens + 1, mixed_qkv.shape[-1]
+                )
+                dense.index_copy_(0, dense_token_indices, mixed_qkv)
+                mixed_qkv_reshaped = dense[:num_dense_tokens].view(
+                    batch_size, draft_token_num, -1
+                ).transpose(1, 2)
+
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states,
@@ -595,7 +649,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            if ragged_layout is None:
+                mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            else:
+                mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
+                    batch_size * draft_token_num, -1
+                )
+                # Ghost row (zeros) so uncovered tail tokens gather finite values.
+                padded_flat = mixed_qkv_flat.new_zeros(
+                    batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+                )
+                padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
+                mixed_qkv = padded_flat[dense_token_indices]
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

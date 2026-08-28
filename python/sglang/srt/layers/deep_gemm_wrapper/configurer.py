@@ -1,3 +1,4 @@
+import importlib
 import logging
 
 from sglang.srt.environ import envs
@@ -25,8 +26,15 @@ def _compute_enable_deep_gemm():
         return False
 
     try:
-        import deep_gemm  # noqa: F401
-    except ImportError:
+        # An importable top-level package is insufficient: older DeepGEMM
+        # wheels lack the layout helpers needed by the current FP8 runner.
+        # Treat an incomplete or broken installation exactly like no optional
+        # dependency, so unquantized models do not require an environment
+        # variable merely to start.
+        importlib.import_module("deep_gemm")
+        importlib.import_module("deep_gemm.utils.layout")
+    except (ImportError, ModuleNotFoundError) as error:
+        logger.info("Disabling optional JIT DeepGEMM: %s", error)
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()

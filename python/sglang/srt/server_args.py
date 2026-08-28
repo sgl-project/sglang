@@ -2167,24 +2167,14 @@ class ServerArgs:
         "DFLASH_CONFIDENCE only. Selector survival threshold used for diagnostics and verify-prefix planning.",
         NS("spec"),
     ] = 0.5
-    speculative_dflash_confidence_min_verify_len: A[
-        int,
-        "DFLASH_CONFIDENCE only. Per-request target-verify floor including the anchor token; 1 means anchor-only verification and a bonus-only commit step.",
-        NS("spec"),
-    ] = 1
     speculative_dflash_confidence_target_verify_tokens: A[
         int,
-        "DFLASH_CONFIDENCE only. Fixed total target-verify token target; zero preserves full verification without an SPS table.",
+        "DFLASH_CONFIDENCE only. Fixed per-request target-verify width including the anchor; zero preserves full verification without an SPS table.",
         NS("spec"),
     ] = 0
     speculative_dflash_confidence_sps_table_path: A[
         Optional[str],
         "DFLASH_CONFIDENCE only. Path to a DSpark-format pre-profiled SPS cost table JSON.",
-        NS("spec"),
-    ] = None
-    speculative_dflash_confidence_sts_path: A[
-        Optional[str],
-        "DFLASH_CONFIDENCE only. Path to a DSpark-format per-position sequential temperature scaling calibration JSON for the trained confidence head.",
         NS("spec"),
     ] = None
     speculative_dflash_confidence_align_verify_tokens_to_graph_tier: A[
@@ -5514,14 +5504,27 @@ class ServerArgs:
                 + list(range(512, max_bs + 1, 32))
             )
         else:
-            # Spec decoding case: less padding for smaller batch sizes
-            capture_bs = (
-                list(range(1, 9, 1))
-                + list(range(10, 33, 2))
-                + list(range(40, 65, 4))
-                + list(range(72, 257, 8))
-                + list(range(272, max_bs + 1, 16))
-            )
+            # DFLASH_CONFIDENCE packs variable-length target-verify rows into a
+            # token bucket.  A decode batch tier is therefore also a ragged
+            # token tier (bs * verify_width).  Capture a denser set than the
+            # generic speculative policy so replay does not pay excessive
+            # packed-token padding at larger concurrent batch sizes.
+            if self.speculative_algorithm == "DFLASH_CONFIDENCE":
+                capture_bs = (
+                    list(range(1, 17, 1))
+                    + list(range(18, 65, 2))
+                    + list(range(68, 257, 4))
+                    + list(range(264, max_bs + 1, 8))
+                )
+            else:
+                # Generic speculative decoding: less padding for smaller batch sizes.
+                capture_bs = (
+                    list(range(1, 9, 1))
+                    + list(range(10, 33, 2))
+                    + list(range(40, 65, 4))
+                    + list(range(72, 257, 8))
+                    + list(range(272, max_bs + 1, 16))
+                )
 
         capture_bs = [bs for bs in capture_bs if bs <= max_bs]
 

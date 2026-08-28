@@ -1138,7 +1138,9 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
-    SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # Compact is the default for DFLASH_CONFIDENCE/DSPARK. Algorithms that do
+    # not opt into ragged verify continue to use their existing rectangular path.
+    SGLANG_RAGGED_VERIFY_MODE = EnvStr("compact")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift

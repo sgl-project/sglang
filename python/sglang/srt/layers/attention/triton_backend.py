@@ -531,14 +531,35 @@ class TritonAttnBackend(AttentionBackend):
             and getattr(spec_info, "draft_token_num", None) is not None
         ):
             num_draft_tokens = int(spec_info.draft_token_num)
-        qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * num_draft_tokens,
-            step=num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
+
+        ragged_layout = (
+            getattr(spec_info, "ragged_verify_layout", None)
+            if spec_info is not None
+            else None
         )
+        if ragged_layout is not None and ragged_layout.bs != bs:
+            # CUDA-graph replay uses the captured slot count. Cover every
+            # token in the graph tier with padded request rows, exactly as the
+            # graph runner's staged capture layout does.
+            ragged_layout = ragged_layout.padded_to_bucket(
+                padded_bs=bs, cap=num_draft_tokens
+            )
+
+        qo_indptr = self.qo_indptr[: bs + 1]
+        if ragged_layout is None:
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * num_draft_tokens,
+                step=num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            # Compact ragged verify: each request has a different verify length.
+            # Use the pre-computed ragged qo_indptr that matches the packed token
+            # layout (qo_indptr[i+1] - qo_indptr[i] == verify_lens[i]).
+            qo_indptr[: bs + 1].copy_(ragged_layout.qo_indptr_device[: bs + 1])
+
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
@@ -572,7 +593,14 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
+
+        if ragged_layout is None:
+            seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
+        else:
+            # Per-request verify lengths: mask_len[i] = verify_lens[i] * (seq_lens[i] + verify_lens[i])
+            verify_lens = ragged_layout.verify_lens[:bs].to(seq_lens.dtype)
+            seq_mask_len = verify_lens * (seq_lens + verify_lens)
+
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
