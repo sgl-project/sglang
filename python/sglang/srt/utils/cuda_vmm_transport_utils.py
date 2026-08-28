@@ -162,9 +162,9 @@ def _contains_tensor_container(value) -> bool:
 
 
 def get_vmm_feature_consumer_count() -> int:
-    if get_parallel().config.enable_dp_attention:
-        return get_parallel().config.tp_size // get_parallel().config.dp_size
-    return get_parallel().config.tp_size
+    if get_parallel().enable_dp_attention:
+        return get_parallel().tp_size // get_parallel().dp_size
+    return get_parallel().tp_size
 
 
 class CudaVmmMemoryPool:
