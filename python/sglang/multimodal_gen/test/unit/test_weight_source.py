@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from sglang.multimodal_gen.runtime.weights.source import (
+    NoSafetensorsWeightsError,
     is_explicit_weight_file_reference,
     materialize_weight,
     materialize_weight_set,
@@ -149,6 +150,24 @@ def test_safetensors_index_rejects_non_weight_shard(tmp_path):
     )
 
     with pytest.raises(ValueError, match="non-safetensors shard"):
+        resolve_safetensors_weight_set(str(tmp_path))
+
+
+def test_safetensors_index_missing_shard_is_not_no_weights_fallback(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        '{"weight_map":{"a":"missing.safetensors"}}'
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing shard") as error:
+        resolve_safetensors_weight_set(str(tmp_path))
+
+    assert not isinstance(error.value, NoSafetensorsWeightsError)
+
+
+def test_source_without_safetensors_has_distinct_error(tmp_path):
+    (tmp_path / "pytorch_model.bin").write_bytes(b"bin")
+
+    with pytest.raises(NoSafetensorsWeightsError):
         resolve_safetensors_weight_set(str(tmp_path))
 
 

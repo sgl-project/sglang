@@ -51,6 +51,10 @@ class ResolvedWeightSet:
     index_file: str | None = None
 
 
+class NoSafetensorsWeightsError(FileNotFoundError):
+    """The source has no safetensors payload to resolve as a weight set."""
+
+
 def is_explicit_weight_file_reference(source: str) -> bool:
     """Whether a component override names one weight file, not a component root."""
     expanded = os.path.expanduser(source)
@@ -447,7 +451,7 @@ def resolve_safetensors_weight_set(
     if len(weights) == 1:
         return ResolvedWeightSet(inventory, weights)
     if not weights:
-        raise FileNotFoundError("Source contains no safetensors weights")
+        raise NoSafetensorsWeightsError("Source contains no safetensors weights")
     if select_unindexed_weight is not None:
         selected = select_unindexed_weight(weights)
         if selected is not None:
