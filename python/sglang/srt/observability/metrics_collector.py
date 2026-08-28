@@ -208,11 +208,7 @@ def resolve_collector_class(role: str, default_cls: type) -> type:
     """Return the subclass registered for `role` in the published
     ``observability`` bag, or `default_cls` if none is registered.
 
-    Asks the bag rather than a record handed in: every caller runs after
-    publish, and the three that had one were reaching for
-    ``get_server_args()`` to pass it straight back. An unpublished config --
-    a fixture, a collector built before a record exists -- answers with the
-    default, which is what `server_args=None` used to mean.
+    An unpublished ``observability`` namespace answers with the default.
     """
     from sglang.srt.runtime_context import get_context, get_observability
 

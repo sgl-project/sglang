@@ -69,11 +69,7 @@ class TestCollectorClassAttrs(unittest.TestCase):
 
 
 class TestResolveCollectorClass(unittest.TestCase):
-    """The role table is read from the published `observability` bag.
-
-    Forced through `override_server_args`, not a record stand-in: the function
-    asks the bag, so a stand-in would prove nothing about what it reads.
-    """
+    """The role table is read from the published `observability` bag."""
 
     def _resolve(self, role, default_cls, **fields):
         if not fields:
