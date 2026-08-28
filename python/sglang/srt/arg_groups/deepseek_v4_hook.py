@@ -138,7 +138,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         from sglang.srt.utils.common import is_sm100_supported
 
         assert (
-            server_args.device == "cuda" and is_sm100_supported()
+            cfg.device == "cuda" and is_sm100_supported()
         ), "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
         # "auto" is declared-but-unmaterialized here; the resolution pipeline
         # (_deepseek_v4_kv_cache_dtype above) turns it into fp8_e4m3 on cuda.
@@ -165,15 +165,15 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.max_running_requests is None:
-            declare_resolution(
-                server_args,
-                "apply_deepseek_v4_defaults",
-                max_running_requests=256,
-            )
-            logger.warning(
-                f"Setting max_running_requests to {cfg.max_running_requests} for {model_arch}."
-            )
-    
+        declare_resolution(
+            server_args,
+            "apply_deepseek_v4_defaults",
+            max_running_requests=256,
+        )
+        logger.warning(
+            f"Setting max_running_requests to {cfg.max_running_requests} for {model_arch}."
+        )
+
     if cfg.speculative_algorithm is not None:
         assert cfg.speculative_algorithm in (
             "EAGLE",
