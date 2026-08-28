@@ -2022,6 +2022,39 @@ def _vram_reserve_bytes(budget_bytes: int, *, target_workload_measured: bool) ->
     return max(int(budget_bytes * reserve_fraction), capped_floor)
 
 
+def current_placement_reserve_shortfall_bytes(
+    reports: Iterable[RankResidencyReport],
+) -> int:
+    """Return the largest reserve deficit of the measured placement.
+
+    This checks the placement that just executed without regenerating a
+    candidate frontier or running the optimizer. It is therefore suitable for
+    the single post-adjustment validation pass.
+    """
+    reports = list(reports)
+    if not reports:
+        return 0
+    target_workload_measured = any(
+        report.target_workload_measured for report in reports
+    )
+    shortfalls = []
+    for report in reports:
+        if report.estimated_peak_bytes is None:
+            continue
+        reserve = _vram_reserve_bytes(
+            report.budget_bytes,
+            target_workload_measured=target_workload_measured,
+        )
+        measured_peak = max(
+            [
+                report.estimated_peak_bytes,
+                *report.estimated_peak_bytes_by_phase.values(),
+            ]
+        )
+        shortfalls.append(measured_peak + reserve - report.budget_bytes)
+    return max(0, max(shortfalls, default=0))
+
+
 def _binding_phase_constraints(
     report: RankResidencyReport,
     candidate_component_names: set[str],
@@ -2372,20 +2405,9 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         for report in reports
     }
     reserve = max(reserves_by_rank.values())
-    current_placement_reserve_shortfall = max(
-        (
-            max(
-                [
-                    report.estimated_peak_bytes or 0,
-                    *report.estimated_peak_bytes_by_phase.values(),
-                ]
-            )
-            + reserves_by_rank[report.rank]
-            - report.budget_bytes
-        )
-        for report in reports
+    current_placement_reserve_shortfall = current_placement_reserve_shortfall_bytes(
+        reports
     )
-    current_placement_reserve_shortfall = max(0, current_placement_reserve_shortfall)
 
     candidates = _consensus_candidates(reports)
     if not candidates:

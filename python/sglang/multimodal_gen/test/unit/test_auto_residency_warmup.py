@@ -309,58 +309,14 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             worker._latest_auto_residency_round_supports_short_validation()
         )
 
-    def test_worker_validation_does_not_apply_a_second_candidate_plan(self):
-        worker = GPUWorker.__new__(GPUWorker)
-        worker.rank = 0
-        worker.is_output_rank = False
-        worker.server_args = SimpleNamespace()
-        worker._auto_residency_warmup_records = [object()]
-        worker._auto_residency_applied = []
-        worker._auto_residency_round_sizes = [1]
-        report = RankResidencyReport(
-            rank=0,
-            budget_bytes=1,
-            estimated_peak_bytes=1,
-            estimated_request_duration_ns=10_000_000_000,
-            measured_request_duration_ns=10_000_000_000,
-        )
-        worker._build_auto_residency_report = mock.Mock(return_value=report)
-        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
-        candidate = ResidencyTarget(
-            component_name="vae",
-            residency_mode=COMPONENT_OFFLOAD,
-            target_resident_weight_bytes=1,
-            h2d_bytes_per_request=1,
-        )
-        plan = AutoResidencyPlan(changes=[candidate])
-
-        with (
-            mock.patch.object(
-                gpu_worker_module,
-                "resolve_default_workload",
-                return_value=SimpleNamespace(),
-            ),
-            mock.patch.object(
-                gpu_worker_module,
-                "resolve_measured_default_workload",
-                return_value=SimpleNamespace(),
-            ),
-            mock.patch.object(
-                gpu_worker_module, "plan_auto_residency", return_value=plan
-            ),
-            mock.patch.object(gpu_worker_module, "apply_residency_changes") as apply,
-        ):
-            response = worker.apply_auto_residency(validate_only=True)
-
-        self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
-        apply.assert_not_called()
-
     def test_new_placement_that_spends_the_reserve_rolls_back(self):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
         worker.is_output_rank = False
         worker.pipeline = SimpleNamespace(modules={})
-        worker.server_args = SimpleNamespace()
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
         worker._auto_residency_warmup_records = []
         worker._auto_residency_applied = []
         worker._auto_residency_round_sizes = [1]
@@ -410,6 +366,65 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             worker._auto_residency_budget_correction_bytes,
             2 * GIB_BYTES,
         )
+
+    def test_worker_validation_does_not_apply_a_second_candidate_plan(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.rank = 0
+        worker.is_output_rank = False
+        worker.pipeline = SimpleNamespace(modules={})
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
+        worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_applied = []
+        worker._auto_residency_round_sizes = [1]
+        report = RankResidencyReport(
+            rank=0,
+            budget_bytes=10 * GIB_BYTES,
+            estimated_peak_bytes=1 * GIB_BYTES,
+            estimated_request_duration_ns=10_000_000_000,
+            measured_request_duration_ns=10_000_000_000,
+        )
+        worker._build_auto_residency_report = mock.Mock(return_value=report)
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
+        candidate = ResidencyTarget(
+            component_name="vae",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=1,
+            h2d_bytes_per_request=1,
+        )
+        worker._auto_residency_last_applied_plan = AutoResidencyPlan(
+            changes=[candidate]
+        )
+
+        with (
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_measured_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "plan_auto_residency",
+            ) as plan,
+            mock.patch.object(gpu_worker_module, "apply_residency_changes") as apply,
+        ):
+            response = worker.apply_auto_residency(validate_only=True)
+
+        self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
+        self.assertIsNone(worker._auto_residency_last_applied_plan)
+        worker._build_auto_residency_report.assert_called_once_with(
+            workload=mock.ANY,
+            records=[mock.ANY],
+            include_candidates=False,
+        )
+        plan.assert_not_called()
+        apply.assert_not_called()
 
     def test_worker_rollback_response_rewarms_the_restored_layout(self):
         actions = []
