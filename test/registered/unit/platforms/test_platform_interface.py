@@ -5,10 +5,11 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang import _platform_stubs
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
@@ -19,6 +20,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -209,6 +211,32 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_legacy_oot_device_lifecycle_uses_generic_module_defaults(self):
+        """OOT plugins need not immediately reimplement the new active hooks."""
+
+        class LegacyOotPlatform(SRTPlatform):
+            _enum = PlatformEnum.OOT
+            device_name = "privateuseone"
+            device_type = "privateuseone"
+
+        module = MagicMock()
+        stream = object()
+        module.Stream.return_value = stream
+        platform = LegacyOotPlatform()
+        device = platform.get_device(3)
+
+        with patch(
+            "sglang.srt.platforms.device_mixin.torch.get_device_module",
+            return_value=module,
+        ) as mock_get_module:
+            platform.set_device(device)
+            self.assertIs(platform.create_stream(device), stream)
+
+        self.assertEqual(device, torch.device("privateuseone", 3))
+        self.assertEqual(mock_get_module.call_args_list, [((device,),), ((device,),)])
+        module.set_device.assert_called_once_with(3)
+        module.Stream.assert_called_once_with()
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
@@ -373,6 +401,121 @@ class TestCpuDeviceMixin(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
+class TestMpsDeviceMixin(CustomTestCase):
+    """Tests for the built-in Apple MPS platform contract."""
+
+    def test_identity_and_backend_defaults(self):
+        base = MpsSRTPlatform()
+        self.assertTrue(base.is_mps())
+        self.assertEqual(base.get_device(), torch.device("mps"))
+        self.assertEqual(base.get_default_attention_backend(), "torch_native")
+        self.assertEqual(base.get_torch_distributed_backend_str(), "gloo")
+        self.assertFalse(base.is_pin_memory_available())
+
+    def test_single_device_contract(self):
+        base = MpsSRTPlatform()
+        base.set_device(torch.device("mps"))
+        with self.assertRaisesRegex(ValueError, "one device"):
+            base.get_device(1)
+        with self.assertRaisesRegex(ValueError, "cannot select"):
+            base.set_device(torch.device("cpu"))
+
+    @patch("sglang.srt.platforms.mps.torch.mps.driver_allocated_memory")
+    @patch("sglang.srt.platforms.mps.torch.mps.recommended_max_memory")
+    @patch(
+        "sglang.srt.platforms.mps.torch.mps.current_allocated_memory",
+        side_effect=AssertionError("device budget must use driver allocation"),
+    )
+    @patch("sglang.srt.platforms.mps.psutil.virtual_memory")
+    def test_unified_memory_contract(
+        self, mock_vm, mock_current, mock_recommended, mock_driver
+    ):
+        mock_vm.return_value.total = 1024
+        mock_vm.return_value.available = 640
+        mock_recommended.return_value = 800
+        mock_driver.return_value = 350
+        base = MpsSRTPlatform()
+        self.assertEqual(base.get_device_total_memory(), 800)
+        self.assertEqual(base.get_current_memory_usage(), 350.0)
+        self.assertEqual(base.get_available_memory(), (450, 800))
+
+        # Host pressure can be tighter than the remaining Metal budget.
+        mock_vm.return_value.available = 300
+        mock_driver.return_value = 100
+        self.assertEqual(base.get_available_memory(), (300, 800))
+
+        # Never report negative memory if the driver is already over budget.
+        mock_driver.return_value = 900
+        self.assertEqual(base.get_available_memory(), (0, 800))
+        mock_current.assert_not_called()
+
+        mock_recommended.return_value = 0
+        with self.assertRaisesRegex(RuntimeError, "non-positive Metal working-set"):
+            base.get_device_total_memory()
+
+    @patch("torch.mps.recommended_max_memory")
+    def test_stub_device_properties_use_metal_working_set(self, mock_recommended):
+        mock_recommended.return_value = 800
+        with patch.object(_platform_stubs, "_cached_props", None):
+            self.assertEqual(_platform_stubs.get_device_properties().total_memory, 800)
+
+    def test_device_metadata_contract(self):
+        base = MpsSRTPlatform()
+        self.assertEqual(base.get_device_count(), 1)
+        self.assertEqual(base.get_device_core_count(), 0)
+        self.assertIsNone(base.get_device_capability())
+
+    def test_common_device_helpers_route_to_mps_platform(self):
+        from sglang.srt.utils import common
+
+        base = MagicMock(spec=MpsSRTPlatform)
+        base.is_out_of_tree.return_value = False
+        base.is_mps.return_value = True
+        base.get_device_total_memory.return_value = 8 << 30
+        base.get_device_name.return_value = "Apple MPS (arm64)"
+        base.get_device_count.return_value = 1
+        base.get_device_core_count.return_value = 0
+        base.get_device_capability.return_value = None
+        base.get_device.return_value = torch.device("mps")
+        base.get_available_memory.return_value = (3 << 30, 8 << 30)
+        base.get_compile_backend.return_value = "eager"
+
+        with (
+            patch.object(common, "current_platform", base),
+            patch.object(common, "is_mps", return_value=True),
+        ):
+            common.get_device_count.cache_clear()
+            common.get_device.cache_clear()
+            try:
+                self.assertEqual(common.get_device_memory_capacity("mps"), 8192)
+                self.assertEqual(common.get_device_name(), "Apple MPS (arm64)")
+                self.assertEqual(common.get_device_count(), 1)
+                self.assertEqual(common.get_device_core_count(), 0)
+                self.assertEqual(common.get_device_capability(), (None, None))
+                self.assertEqual(common.get_device(), "mps")
+                self.assertEqual(common.get_available_gpu_memory("mps", 0), 3.0)
+                base.empty_cache.assert_called_once_with()
+                base.empty_cache.reset_mock()
+                self.assertEqual(
+                    common.get_available_gpu_memory("mps", 0, empty_cache=False),
+                    3.0,
+                )
+                base.empty_cache.assert_not_called()
+                self.assertEqual(common.get_compiler_backend(), "eager")
+            finally:
+                common.get_device_count.cache_clear()
+                common.get_device.cache_clear()
+
+        base.get_device_total_memory.assert_called_once_with()
+        base.get_device_name.assert_called_once_with(0)
+        base.get_device_count.assert_called_once_with()
+        base.get_device_core_count.assert_called_once_with(0)
+        base.get_device_capability.assert_called_once_with(0)
+        base.get_device.assert_called_once_with(0)
+        self.assertEqual(base.get_available_memory.call_args_list, [call(0)] * 2)
+        base.get_compile_backend.assert_called_once_with(None)
+
+
 class TestPinMemoryAvailability(CustomTestCase):
     """Tests for common pin-memory helper dispatch through platforms."""
 
@@ -513,7 +656,7 @@ class TestResolvePlatformWithEnv(CustomTestCase):
         mock_envs.SGLANG_PLATFORM.get.return_value = "nonexistent"
         mock_ep.return_value = []
         with self.assertRaises(RuntimeError):
-            _resolve_platform()
+            result = _resolve_platform()
 
     @patch("sglang.srt.platforms.entry_points")
     @patch("sglang.srt.platforms.envs")
@@ -593,10 +736,11 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         self.assertIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mps_available", return_value=False)
     @patch("sglang.srt.platforms._is_cuda_available")
     @patch("sglang.srt.platforms.envs")
     def test_no_plugin_no_cuda_activates_base_fallback(
-        self, mock_envs, mock_is_cuda_available, mock_load
+        self, mock_envs, mock_is_cuda_available, _mock_is_mps_available, mock_load
     ):
         """When no plugin or CUDA is available, return the abstract base platform."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
@@ -605,6 +749,27 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         result = _resolve_platform()
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_mps_available", return_value=True)
+    @patch("sglang.srt.platforms._is_xpu_available", return_value=False)
+    @patch("sglang.srt.platforms._is_rocm_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cuda_available", return_value=False)
+    @patch("sglang.srt.platforms._is_cpu_available", return_value=False)
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_activates_mps_fallback(
+        self,
+        mock_envs,
+        _mock_is_cpu,
+        _mock_is_cuda,
+        _mock_is_rocm,
+        _mock_is_xpu,
+        _mock_is_mps,
+        mock_load,
+    ):
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_load.return_value = {}
+        self.assertIsInstance(_resolve_platform(), MpsSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.torch")

@@ -80,7 +80,6 @@ class SchedulerBatchResultProcessor:
     is_generation: bool
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
-    enable_overlap_mlx: bool
     model_config: ModelConfig
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
@@ -932,9 +931,7 @@ class SchedulerBatchResultProcessor:
                 )
                 continue
 
-            if (self.enable_overlap or self.enable_overlap_mlx) and (
-                req.finished() or req.is_retracted
-            ):
+            if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
@@ -1021,7 +1018,7 @@ class SchedulerBatchResultProcessor:
         if not batch.spec_algorithm.is_none():
             next_token_ids = self._resolve_spec_v2_tokens(result, batch)
         else:
-            # CUDA workers return a device tensor, MLX a host list[int]; both -> list.
+            # Normalize either a tensor or a host-side list to Python values.
             ids = (
                 next_token_ids.tolist()
                 if torch.is_tensor(next_token_ids)

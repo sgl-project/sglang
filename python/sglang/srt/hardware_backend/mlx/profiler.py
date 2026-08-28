@@ -12,7 +12,6 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.io_struct import ProfileReqOutput
 
 logger = logging.getLogger(__name__)
@@ -24,24 +23,6 @@ class MetalCaptureProfiler:
     trace_path: Path
     stop_capture: Callable[[], None]
     standalone: bool
-
-    @classmethod
-    def start_mlx(cls, trace_path: Path):
-        trace_path.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            import mlx.core as mx
-
-            mx.metal.start_capture(str(trace_path))
-        except RuntimeError as e:
-            return None, _capture_error("MLX", e)
-
-        return cls._started(
-            label="MLX",
-            trace_path=trace_path,
-            stop_capture=mx.metal.stop_capture,
-            standalone=True,
-        )
 
     @classmethod
     def start_mps(cls, trace_path: Path):
@@ -159,11 +140,6 @@ def apply_metal_profiler_patches() -> None:
         activities = _get_activities(args, kwargs)
         if not _has_cuda_activity(activities):
             return original_profile(*args, **kwargs)
-
-        if use_mlx():
-            return MetalTorchProfiler(
-                start_metal_capture=MetalCaptureProfiler.start_mlx
-            )
 
         torch_activities = [
             activity for activity in activities if not _is_cuda_activity(activity)

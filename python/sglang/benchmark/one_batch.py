@@ -72,7 +72,6 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -114,15 +113,6 @@ def start_profile(
     Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None).
     """
-    if use_mlx():
-        import mlx.core as mx
-
-        if trace_filename:
-            mlx_trace_filename = trace_filename.replace(".trace.json.gz", ".gputrace")
-            mx.metal.start_capture(mlx_trace_filename)
-            rank_print(f"MLX Metal capture started directly to {mlx_trace_filename}")
-        return "mlx"
-
     if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStart()
@@ -161,19 +151,6 @@ def stop_profile(
     Abstracted function to stop profiling based on profile_activities.
     Optionally saves trace results and prints completion messages.
     """
-    if profiler == "mlx":
-        import mlx.core as mx
-
-        mx.metal.stop_capture()
-
-        if save_trace and trace_filename:
-            # Change SGLang's default torch extension to Apple's .gputrace extension
-            mlx_trace_filename = trace_filename.replace(".trace.json.gz", ".gputrace")
-
-            stage_desc = f"for {stage}" if stage else ""
-            rank_print(f"MLX Metal gputrace {stage_desc} saved to {mlx_trace_filename}")
-        return
-
     if "CUDA_PROFILER" in profile_activities:
         try:
             torch.cuda.cudart().cudaProfilerStop()
@@ -347,22 +324,14 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         server_args=server_args,
     )
 
-    _use_mlx = use_mlx()
-    if _use_mlx:
-        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
-            MlxModelRunnerStub,
-        )
-
-        model_runner = MlxModelRunnerStub(**runner_kwargs)
-    else:
-        model_runner = ModelRunner(**runner_kwargs)
-        if cfg.is_startup_weight_load_overlap:
-            model_runner.start_startup_weight_load()
-        model_runner.alloc_memory_pool()
-        model_runner.init_attention_backends()
-        model_runner.init_cuda_graphs()
-        if cfg.is_startup_weight_load_overlap:
-            model_runner.finalize_startup_weight_load()
+    model_runner = ModelRunner(**runner_kwargs)
+    if cfg.is_startup_weight_load_overlap:
+        model_runner.start_startup_weight_load()
+    model_runner.alloc_memory_pool()
+    model_runner.init_attention_backends()
+    model_runner.init_cuda_graphs()
+    if cfg.is_startup_weight_load_overlap:
+        model_runner.finalize_startup_weight_load()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         cfg.tokenizer_path,
@@ -372,12 +341,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     if cfg.tp_size > 1:
         dist.barrier()
 
-    if _use_mlx:
-        model_runner = _MlxBenchRunner(model_runner, server_args)
-    else:
-        model_runner = _TorchBenchRunner(model_runner)
-
-    return model_runner, tokenizer
+    return _TorchBenchRunner(model_runner), tokenizer
 
 
 def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
@@ -584,63 +548,6 @@ class _TorchBenchRunner:
 
     def max_batch_size(self, input_len, output_len):
         return self.torch_runner.max_total_num_tokens // (input_len + output_len)
-
-
-class _MlxBenchRunner:
-    """Wraps MlxModelRunner for the MLX benchmark path."""
-
-    def __init__(self, model_runner, server_args):
-        cfg = resolving_view(server_args)
-        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
-
-        # Radix cache requires the scheduler's allocator/trie; disable in
-        # standalone bench mode where no scheduler is present.
-        init_kwargs = dict(
-            model_path=cfg.model_path,
-            trust_remote_code=cfg.trust_remote_code,
-            disable_radix_cache=True,
-            mem_fraction_static=cfg.mem_fraction_static,
-            quantization=cfg.quantization,
-        )
-        if cfg.max_total_tokens is not None:
-            init_kwargs["pool_size"] = cfg.max_total_tokens
-        self.mlx_runner = MlxModelRunner(**init_kwargs)
-        self.mlx_runner.init_cache_pools(req_to_token_pool=None)
-        self.fake_torch_runner = model_runner
-
-    def clear(self):
-        self.mlx_runner.clear()
-
-    def extend(self, reqs):
-        req_ids = [str(req.rid) for req in reqs]
-        results = []
-        for rid, req in zip(req_ids, reqs):
-            token_ids = [int(t) for t in req.get_fill_ids()]
-            next_token = self.mlx_runner.prefill(
-                req_id=rid,
-                new_token_ids=token_ids,
-                full_token_ids=token_ids,
-                prefix_slot_ids=[],
-                new_slot_ids=[],
-                req_pool_idx=0,
-            )
-            results.append(next_token)
-        return torch.tensor(results), None, req_ids
-
-    def decode(self, next_token_ids, req_ids):
-        next_token_ids = self.mlx_runner.decode_batch(req_ids)
-        return torch.tensor(next_token_ids), None
-
-    def cleanup(self, batch):
-        if isinstance(batch, list):
-            for req_id in batch:
-                self.mlx_runner.remove_request(req_id)
-
-    def synchronize(self):
-        pass
-
-    def max_batch_size(self, input_len, output_len):
-        return self.fake_torch_runner.max_total_num_tokens // (input_len + output_len)
 
 
 def _read_prompts_from_file(prompt_file, rank_print):
