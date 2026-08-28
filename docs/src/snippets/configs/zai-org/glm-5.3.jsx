@@ -694,7 +694,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -715,25 +715,8 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--quantization modelopt_fp4",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--chunked-prefill-size 32768",
-        "--mem-fraction-static 0.92",
-        "--max-running-requests 512",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

@@ -113,6 +113,8 @@ export const benchmarks = [
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "main @ 26fd7fdaa273",
+    accuracy: { gsm8k_pct: 97.42 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 281, tpot_ms: 1.48, tokens_per_sec_per_gpu: 640 },
@@ -121,7 +123,9 @@ export const benchmarks = [
     ],
   },
   {
-    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
+    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "main @ 26fd7fdaa273",
+    accuracy: { gsm8k_pct: 97.42 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
         ttft_ms: 5227, tpot_ms: 12.40, tokens_per_sec_per_gpu: 3748 },
@@ -129,8 +133,17 @@ export const benchmarks = [
         ttft_ms: 17513, tpot_ms: 29.97, tokens_per_sec_per_gpu: 5416 },
     ],
   },
-  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
+  {
+    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "main @ 26fd7fdaa273",
+    accuracy: { gsm8k_pct: 97.42 },
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 307, tpot_ms: 1.71, tokens_per_sec_per_gpu: 1113 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 2132, tpot_ms: 6.18, tokens_per_sec_per_gpu: 3979 },
+    ],
+  },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
 
