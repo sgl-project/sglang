@@ -248,6 +248,14 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 
 
 def _gdn_input_proj_stacked_mapping(model: nn.Module):
+    separate = [
+        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+        ("in_proj_qkvz.", "in_proj_z.", 3),
+        ("in_proj_ba.", "in_proj_b.", 0),
+        ("in_proj_ba.", "in_proj_a.", 1),
+    ]
+    if not _fuse_gdn_qkvzba:
+        return separate
     if any("in_proj_qkvzba." in name for name, _ in model.named_parameters()):
         return [
             ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
@@ -255,12 +263,7 @@ def _gdn_input_proj_stacked_mapping(model: nn.Module):
             ("in_proj_qkvzba.", "in_proj_b.", 4),
             ("in_proj_qkvzba.", "in_proj_a.", 5),
         ]
-    return [
-        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-        ("in_proj_qkvz.", "in_proj_z.", 3),
-        ("in_proj_ba.", "in_proj_b.", 0),
-        ("in_proj_ba.", "in_proj_a.", 1),
-    ]
+    return separate
 
 
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
@@ -338,16 +341,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.ba_width = (2 * self.num_v_heads) // self.attn_tp_size
         self.in_proj_qkvz = None
         self.in_proj_ba = None
-        self.in_proj_qkvzba = self.create_qkvzba_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
-            num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
-            prefix=add_prefix("in_proj_qkvzba", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-        )
+        self.in_proj_qkvzba = None
+        if _fuse_gdn_qkvzba:
+            self.in_proj_qkvzba = self.create_qkvzba_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                num_v_heads=self.num_v_heads,
+                quant_config=quant_config,
+                prefix=add_prefix("in_proj_qkvzba", prefix),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
         if self.in_proj_qkvzba is None:
             self.in_proj_qkvz = self.create_qkvz_proj(
                 hidden_size=self.hidden_size,
@@ -377,6 +382,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
+                and self.in_proj_qkvz is not None
+                and self.in_proj_ba is not None
                 and self.in_proj_qkvz.weight.dtype == torch.bfloat16
                 and self.in_proj_ba.weight.dtype == torch.bfloat16
                 and self.in_proj_qkvz.bias is None
@@ -1472,7 +1479,18 @@ class Qwen3_5ForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        "in_proj_qkvzba": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
+        **(
+            {
+                "in_proj_qkvzba": [
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                ]
+            }
+            if _is_hip
+            else {}
+        ),
     }
 
     supported_lora_modules = [
