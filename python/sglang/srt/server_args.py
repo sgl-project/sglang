@@ -1130,6 +1130,7 @@ class ServerArgs:
                 "total_requests",
                 "total_tokens",
                 "active_tokens",
+                "router_hint_active_tokens",
             ],
         ),
         NS("parallel"),

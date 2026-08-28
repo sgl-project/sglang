@@ -93,6 +93,7 @@ class LoadBalanceMethod(Enum):
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
     ACTIVE_TOKENS = auto()
+    ROUTER_HINT_ACTIVE_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -123,7 +124,17 @@ class DPBudget:
             self.total_tokens[load.dp_rank] = load.num_total_tokens
             self.active_tokens[load.dp_rank] = load.num_active_tokens
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def account_dispatch(self, target_rank: int, estimated_tokens: int = 0):
+        self.total_requests[target_rank] += 1
+        self.total_tokens[target_rank] += estimated_tokens
+        self.active_tokens[target_rank] += estimated_tokens
+
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        max_requests: Optional[int] = None,
+    ):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method in (
@@ -135,17 +146,23 @@ class DPBudget:
                 if method == LoadBalanceMethod.TOTAL_TOKENS
                 else self.active_tokens
             )
+            candidates = (
+                range(self.dp_size)
+                if max_requests is None
+                else (
+                    rank
+                    for rank in range(self.dp_size)
+                    if self.total_requests[rank] < max_requests
+                )
+            )
             target_rank = min(
-                range(self.dp_size),
+                candidates,
                 key=lambda i: (tokens[i], self.total_requests[i]),
             )
         else:
             return None
 
-        # Increment the load of that worker by one as a heuristic
-        self.total_requests[target_rank] += 1
-        self.total_tokens[target_rank] += estimated_tokens
-        self.active_tokens[target_rank] += estimated_tokens
+        self.account_dispatch(target_rank, estimated_tokens)
         return target_rank
 
 
@@ -181,12 +198,14 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
             LoadBalanceMethod.ACTIVE_TOKENS: self.active_tokens_scheduler,
+            LoadBalanceMethod.ROUTER_HINT_ACTIVE_TOKENS: self.active_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
             LoadBalanceMethod.ACTIVE_TOKENS,
+            LoadBalanceMethod.ROUTER_HINT_ACTIVE_TOKENS,
         )
 
         self.launch_dp_size: int = get_parallel().dp_size
@@ -767,7 +786,24 @@ class DataParallelController:
                 or self.workers[rank] is None
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
-            logger.debug(f"Direct routing to DP rank {rank}")
+            if self.load_balance_method == LoadBalanceMethod.ROUTER_HINT_ACTIVE_TOKENS:
+                request_counts = self.dp_budget.total_requests
+                request_cap = max(
+                    (sum(request_counts) + self.dp_budget.dp_size)
+                    // self.dp_budget.dp_size,
+                    max(request_counts),
+                )
+                if request_counts[rank] >= request_cap:
+                    rank = self.dp_budget.dispatch(
+                        LoadBalanceMethod.ACTIVE_TOKENS,
+                        estimated_tokens=len(req.input_ids),
+                        max_requests=request_cap,
+                    )
+                else:
+                    self.dp_budget.account_dispatch(rank, len(req.input_ids))
+                logger.debug(f"Routing with DP rank hint to rank {rank}")
+            else:
+                logger.debug(f"Direct routing to DP rank {rank}")
             sock_send(self.workers[rank], req)
             return True
         return False

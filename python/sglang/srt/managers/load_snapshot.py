@@ -76,7 +76,12 @@ def should_use_zmq() -> bool:
 
 
 _LOAD_AWARE_METHODS = frozenset(
-    {"total_requests", "total_tokens", "active_tokens"}
+    {
+        "total_requests",
+        "total_tokens",
+        "active_tokens",
+        "router_hint_active_tokens",
+    }
 )
 
 

@@ -51,6 +51,7 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl._active_workers = list(range(dp_size))
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
+    ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     return ctl
 
 
@@ -277,6 +278,26 @@ class TestTotalRequestsScheduler(CustomTestCase):
             [5, 3, 1, 4],
             "external routing must not mutate DPBudget state",
         )
+
+
+class TestRouterHintActiveTokensScheduler(CustomTestCase):
+    def test_honors_hint_below_fair_request_cap(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.load_balance_method = LoadBalanceMethod.ROUTER_HINT_ACTIVE_TOKENS
+        ctl.dp_budget.total_requests = [3, 4, 4, 4]
+        ctl.active_tokens_scheduler(_req(routed_dp_rank=0, input_ids=[1, 2]))
+        ctl.workers[0].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.dp_budget.total_requests, [4, 4, 4, 4])
+
+    def test_relaxes_hint_at_fair_request_cap(self):
+        ctl = _make_controller(dp_size=4)
+        ctl.load_balance_method = LoadBalanceMethod.ROUTER_HINT_ACTIVE_TOKENS
+        ctl.dp_budget.total_requests = [3, 4, 4, 4]
+        ctl.dp_budget.active_tokens = [30, 40, 40, 40]
+        ctl.active_tokens_scheduler(_req(routed_dp_rank=1, input_ids=[1, 2]))
+        ctl.workers[0].send_pyobj.assert_called_once()
+        ctl.workers[1].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_requests, [4, 4, 4, 4])
 
 
 class TestStatusAwarenessInconsistency(CustomTestCase):
