@@ -3,22 +3,9 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
-
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils.common import torch_release
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -28,12 +15,18 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -51,14 +44,17 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     offloader,
 )
+from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
@@ -418,6 +414,26 @@ if flashinfer_per_tensor_fp8_supported():
         ).view(m, n)
 
 
+def _fake_flashinfer_mxfp8_quantize(
+    input: torch.Tensor,
+    _is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
+    backend: str = "cute-dsl",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    m = input.numel() // input.shape[-1]
+    k_aligned = ((input.shape[-1] + alignment - 1) // alignment) * alignment
+    q_input = input.new_empty((m, k_aligned), dtype=torch.float8_e4m3fn)
+    sf_columns = k_aligned // 32
+    if _is_sf_swizzled_layout:
+        padded_rows = ((m + 127) // 128) * 128
+        padded_sf_columns = ((sf_columns + 3) // 4) * 4
+        scale_size = padded_rows * padded_sf_columns
+    else:
+        scale_size = m * sf_columns
+    scale = input.new_empty((scale_size,), dtype=torch.uint8)
+    return q_input, scale
+
+
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
@@ -479,21 +495,6 @@ if is_blackwell_supported() and is_flashinfer_available():
 
     # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
     # flashinfer's JIT compilation path (filesystem checks/cubin loader).
-    def _fake_flashinfer_mxfp8_quantize(
-        input: torch.Tensor,
-        _is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-        backend: str = "cute-dsl",
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode only needs dtypes and output rank to propagate compile graph.
-        # The scale tensor shape is not consumed before the following fake mm op.
-        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
-        q_input = input.new_empty(
-            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
-        )
-        scale = input.new_empty((1,), dtype=torch.uint8)
-        return q_input, scale
-
     @register_custom_op(
         op_name="flashinfer_mxfp8_quantize",
         mutates_args=[],
@@ -792,11 +793,11 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+def initialize_fp8_gemm_config() -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
-    backend = server_args.fp8_gemm_runner_backend
+    backend = get_exec().kernel.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
         backend = "cutlass"
 
@@ -1881,7 +1882,9 @@ def apply_fp8_linear(
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
-        if channelwise_cutlass:
+        if channelwise_cutlass or (_is_xpu and weight_scale.numel() == weight.shape[1]):
+            # On XPU, sgl-kernel-xpu's native quant kernels require output_q
+            # to exactly match input's shape; padded output isn't supported.
             num_token_padding = None
         # For static per-tensor activation scales when using inductor compiler,
         # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
@@ -2145,7 +2148,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    tp_size = getattr(layer, "tp_size", get_parallel().tp_size)
+    # Lazy: a ``getattr`` default would read the published bag even for a
+    # layer that carries its own tp_size.
+    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

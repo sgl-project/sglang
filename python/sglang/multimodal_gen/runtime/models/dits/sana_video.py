@@ -27,7 +27,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.sana import SanaAdaLayerNormSingle
+from sglang.multimodal_gen.runtime.models.dits.sana import (
+    SanaAdaLayerNormSingle,
+    sana_conv_bias_glu,
+    sana_conv_bias_silu,
+    sana_ln_modulate,
+    sana_residual_gate_add,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -180,7 +186,6 @@ class GLUMBTempConv(nn.Module):
     def __init__(self, channels: int, expand_ratio: float) -> None:
         super().__init__()
         hidden_channels = int(expand_ratio * channels)
-        self.nonlinearity = nn.SiLU()
         self.conv_inverted = nn.Conv2d(channels, hidden_channels * 2, 1)
         self.conv_depth = nn.Conv2d(
             hidden_channels * 2,
@@ -203,10 +208,8 @@ class GLUMBTempConv(nn.Module):
         hidden_states = hidden_states.reshape(
             batch_size * num_frames, height, width, channels
         ).permute(0, 3, 1, 2)
-        hidden_states = self.nonlinearity(self.conv_inverted(hidden_states))
-        hidden_states = self.conv_depth(hidden_states)
-        hidden_states, gate = hidden_states.chunk(2, dim=1)
-        hidden_states = hidden_states * self.nonlinearity(gate)
+        hidden_states = sana_conv_bias_silu(self.conv_inverted, hidden_states)
+        hidden_states = sana_conv_bias_glu(self.conv_depth, hidden_states)
         hidden_states = self.conv_point(hidden_states)
 
         temporal = hidden_states.reshape(
@@ -397,20 +400,24 @@ class SanaVideoTransformerBlock(nn.Module):
             + timestep.reshape(batch_size, timestep.shape[1], 6, -1)
         ).unbind(dim=2)
 
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
-        hidden_states = hidden_states + gate_msa * self.attn1(
-            norm_hidden_states.to(hidden_states.dtype), rotary_emb
+        norm_hidden_states = sana_ln_modulate(
+            self.norm1, hidden_states, scale_msa, shift_msa
+        )
+        hidden_states = sana_residual_gate_add(
+            hidden_states,
+            self.attn1(norm_hidden_states.to(hidden_states.dtype), rotary_emb),
+            gate_msa,
         )
         hidden_states = hidden_states + self.attn2(
             hidden_states, encoder_hidden_states, encoder_attention_mask
         )
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        norm_hidden_states = sana_ln_modulate(
+            self.norm2, hidden_states, scale_mlp, shift_mlp
+        )
         norm_hidden_states = norm_hidden_states.unflatten(1, (frames, height, width))
         ff_output = self.ff(norm_hidden_states).flatten(1, 3)
-        return hidden_states + gate_mlp * ff_output
+        return sana_residual_gate_add(hidden_states, ff_output, gate_mlp)
 
 
 class SanaVideoModulatedNorm(nn.Module):
@@ -427,7 +434,7 @@ class SanaVideoModulatedNorm(nn.Module):
         shift, scale = (
             scale_shift_table[None, None] + embedded_timestep[:, :, None]
         ).unbind(dim=2)
-        return self.norm(hidden_states) * (1 + scale) + shift
+        return sana_ln_modulate(self.norm, hidden_states, scale, shift)
 
 
 class SanaVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):

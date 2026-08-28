@@ -179,13 +179,15 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
                     with self.assertRaisesRegex(RuntimeError, "stable Torch 2.13.x"):
                         from sglang.srt.server_args import ServerArgs
 
-                        ServerArgs(model_path="dummy")
+                        # The check runs in the pipeline, and the pipeline runs
+                        # at the gate -- still ahead of the dummy short circuit.
+                        ServerArgs(model_path="dummy").resolve_once()
 
                 runtime.use_mlx.cache_clear()
                 runtime._validate_runtime.cache_clear()
                 with mock.patch.object(mx, "__version__", "0.31.0"):
                     with self.assertRaisesRegex(RuntimeError, "MLX >= 0.32.0"):
-                        ServerArgs(model_path="dummy")
+                        ServerArgs(model_path="dummy").resolve_once()
         finally:
             runtime.use_mlx.cache_clear()
             runtime._validate_runtime.cache_clear()
