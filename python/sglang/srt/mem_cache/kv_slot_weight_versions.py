@@ -4,27 +4,26 @@ from typing import TYPE_CHECKING, Dict, List
 
 import torch
 
-from sglang.srt.utils.weight_versions import (
-    UNKNOWN_WEIGHT_VERSION,
-    WeightVersionSpan,
-    WeightVersionSpans,
-)
+from sglang.srt.utils.weight_versions import WeightVersionSpan, WeightVersionSpans
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
+_UNWRITTEN_VERSION_ID = -1
+
+
 class KvSlotWeightVersions:
     def __init__(
         self, *, num_slots: int, device: str, req_to_token_pool: ReqToTokenPool
     ):
-        self._slot_version_ids = torch.zeros(
-            (num_slots,), dtype=torch.int32, device=device
+        self._slot_version_ids = torch.full(
+            (num_slots,), _UNWRITTEN_VERSION_ID, dtype=torch.int32, device=device
         )
         self._req_to_token_pool = req_to_token_pool
-        self._version_str_by_id: List[str] = [UNKNOWN_WEIGHT_VERSION]
-        self._version_id_by_str: Dict[str, int] = {UNKNOWN_WEIGHT_VERSION: 0}
+        self._version_str_by_id: List[str] = []
+        self._version_id_by_str: Dict[str, int] = {}
 
     def record(self, *, slot_indices: torch.Tensor, version: str) -> None:
         self._slot_version_ids[slot_indices] = self._intern(version=version)
@@ -48,6 +47,11 @@ class KvSlotWeightVersions:
         run_bounds = torch.cat([run_starts, run_starts.new_tensor([len(version_ids)])])
         run_version_ids = version_ids[run_starts].tolist()
         run_bounds_list = run_bounds.tolist()
+        if _UNWRITTEN_VERSION_ID in run_version_ids:
+            raise ValueError(
+                "KV slots without a recorded weight version were looked up: "
+                f"{slot_indices[version_ids == _UNWRITTEN_VERSION_ID].tolist()}"
+            )
 
         return [
             WeightVersionSpan(

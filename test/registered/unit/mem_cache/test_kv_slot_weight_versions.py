@@ -43,12 +43,10 @@ def _slots(*indices: int) -> torch.Tensor:
 
 
 class TestKvSlotWeightVersions(CustomTestCase):
-    def test_never_written_slots_report_unknown(self):
-        """A fresh table attributes every slot to the unknown version."""
-        self.assertEqual(
-            _table().lookup_spans(_slots(0, 1, 2)),
-            [WeightVersionSpan(version="unknown", start=0, end=3)],
-        )
+    def test_never_written_slots_fail_the_lookup(self):
+        """Looking up a slot no forward ever stamped is a bug, not a version."""
+        with self.assertRaisesRegex(ValueError, r"\[0, 1, 2\]"):
+            _table().lookup_spans(_slots(0, 1, 2))
 
     def test_single_version_collapses_into_one_span(self):
         """Slots written by one version compress into a single span."""
@@ -74,19 +72,13 @@ class TestKvSlotWeightVersions(CustomTestCase):
             ],
         )
 
-    def test_unwritten_slots_interleave_as_unknown_spans(self):
-        """A slot that no forward ever wrote breaks a run into three spans."""
+    def test_one_unwritten_slot_among_written_ones_fails_the_lookup(self):
+        """A single never-stamped slot inside a prompt is reported by index."""
         table = _table()
         table.record(slot_indices=_slots(1, 3), version="v0")
 
-        self.assertEqual(
-            table.lookup_spans(_slots(1, 2, 3)),
-            [
-                WeightVersionSpan(version="v0", start=0, end=1),
-                WeightVersionSpan(version="unknown", start=1, end=2),
-                WeightVersionSpan(version="v0", start=2, end=3),
-            ],
-        )
+        with self.assertRaisesRegex(ValueError, r"\[2\]"):
+            table.lookup_spans(_slots(1, 2, 3))
 
     def test_non_adjacent_slots_with_the_same_version_merge(self):
         """Compression follows lookup order, not slot order, so the same version merges."""
@@ -105,7 +97,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
         table.record(slot_indices=_slots(1), version="v1")
         table.record(slot_indices=_slots(2), version="v0")
 
-        self.assertEqual(table._version_str_by_id, ["unknown", "v0", "v1"])
+        self.assertEqual(table._version_str_by_id, ["v0", "v1"])
         self.assertEqual(
             table.lookup_spans(_slots(0, 2, 1)),
             [
@@ -118,7 +110,9 @@ class TestKvSlotWeightVersions(CustomTestCase):
         """Looking up an empty prompt yields an empty span list."""
         self.assertEqual(_table().lookup_spans(_slots()), [])
 
-    def test_record_req_resolves_the_prompt_slots_onto_the_request(self):
+    def test_record_req_resolves_the_prompt_slots_onto_the_request(
+        self,
+    ):
         """The prompt's KV slots resolve to the versions that computed them."""
         table = _table(slots_of_req=[4, 5, 6, 7, 8])
         table.record(slot_indices=_slots(4, 5), version="v0")
@@ -135,7 +129,9 @@ class TestKvSlotWeightVersions(CustomTestCase):
             ],
         )
 
-    def test_record_req_is_clamped_to_the_committed_kv_length(self):
+    def test_record_req_is_clamped_to_the_committed_kv_length(
+        self,
+    ):
         """A prompt whose KV is only partially committed reports only the committed tokens."""
         table = _table(slots_of_req=[4, 5])
         table.record(slot_indices=_slots(4, 5), version="v0")
