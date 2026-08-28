@@ -390,8 +390,9 @@ class SamplingParams:
     def video_request_extra_fields(cls) -> frozenset[str]:
         """Declare model-owned JSON or multipart fields accepted by the video API.
 
-        Every returned name must be an init field on ``cls``. Aliases and value
-        lowering also belong on the subclass, in ``lower_video_request_kwargs``.
+        Dataclass-backed names are forwarded to ``cls``. Transport-only aliases
+        may also be declared so multipart parsing preserves them, but the
+        subclass must consume those aliases in ``lower_video_request_kwargs``.
         """
 
         return frozenset()

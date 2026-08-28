@@ -146,24 +146,30 @@ def get_declared_request_extra_fields(
     sampling_params_cls: type[SamplingParams],
     api: Literal["image", "video"],
 ) -> frozenset[str]:
-    """Return and validate the active model's API extension declaration."""
+    """Return the active model's accepted fields, including transport aliases."""
 
     if api == "image":
-        declared = sampling_params_cls.image_request_extra_fields()
-    else:
-        declared = sampling_params_cls.video_request_extra_fields()
+        return sampling_params_cls.image_request_extra_fields()
+    return sampling_params_cls.video_request_extra_fields()
 
+
+@cache
+def get_sampling_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return declared extension fields that can initialize SamplingParams.
+
+    A video declaration may also contain transport-only aliases. Those remain
+    on the request for the model's lowering hook instead of being passed to the
+    dataclass constructor.
+    """
+
+    declared = get_declared_request_extra_fields(sampling_params_cls, api)
     init_fields = {
         field.name for field in dataclasses.fields(sampling_params_cls) if field.init
     }
-    missing = declared - init_fields
-    if missing:
-        missing_names = ", ".join(sorted(missing))
-        raise TypeError(
-            f"{sampling_params_cls.__name__}.{api}_request_extra_fields() "
-            f"declares non-init field(s): {missing_names}"
-        )
-    return declared
+    return declared & init_fields
 
 
 @contextmanager

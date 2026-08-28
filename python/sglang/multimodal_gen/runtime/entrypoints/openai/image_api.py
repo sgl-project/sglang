@@ -36,7 +36,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    get_declared_request_extra_fields,
+    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
@@ -71,7 +71,7 @@ def _image_request_model_kwargs(
     """Extract fields owned and declared by the active model contract."""
 
     kwargs = {}
-    for field_name in get_declared_request_extra_fields(sampling_params_cls, "image"):
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "image"):
         value = _get_extra_field(request, field_name)
         if value is not None:
             kwargs[field_name] = value

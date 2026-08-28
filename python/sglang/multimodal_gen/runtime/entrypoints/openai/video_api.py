@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     flatten_extra_params,
     get_declared_request_extra_fields,
+    get_sampling_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
@@ -110,7 +111,7 @@ def _video_request_model_kwargs(
     """Extract fields owned and declared by the active model contract."""
 
     kwargs = {}
-    for field_name in get_declared_request_extra_fields(sampling_params_cls, "video"):
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, "video"):
         value = _extra_value(request, field_name)
         if value is not None:
             kwargs[field_name] = value
