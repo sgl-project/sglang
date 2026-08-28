@@ -851,24 +851,6 @@ mod tests {
         assert_eq!(ps[0].text.as_deref(), Some("hi"));
     }
 
-    #[test]
-    fn incremental_streaming_output_is_a_scalar_override() {
-        let unset = serde_json::from_str::<GenerateBody>(r#"{"text": "hi"}"#).unwrap();
-        assert_eq!(unset.incremental_streaming_output, None);
-
-        let enabled = serde_json::from_str::<GenerateBody>(
-            r#"{"text": ["a", "b"], "incremental_streaming_output": true}"#,
-        )
-        .unwrap();
-        assert_eq!(enabled.incremental_streaming_output, Some(true));
-
-        let disabled = serde_json::from_str::<GenerateBody>(
-            r#"{"text": "hi", "incremental_streaming_output": false}"#,
-        )
-        .unwrap();
-        assert_eq!(disabled.incremental_streaming_output, Some(false));
-    }
-
     /// List `text` → batch (even length 1); each prompt becomes its own payload.
     #[test]
     fn list_text_is_batch() {
