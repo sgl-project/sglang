@@ -369,14 +369,22 @@ class HybridCacheController(BaseHiCacheController):
     def _alloc_shared_host_requests_with_reclaim(
         self, requests: list[tuple[PoolName, int]]
     ) -> Optional[list[torch.Tensor]]:
-        allocated = self.mem_pool_host.alloc_shared(requests)
+        entries = [self.mem_pool_host.entry_map[name] for name, _ in requests]
+        domain = entries[0].host_pool.shared_allocation_domain
+        if domain is None or any(
+            entry.host_pool.shared_allocation_domain is not domain for entry in entries
+        ):
+            raise ValueError("Host pools do not share one allocation domain.")
+        domain_requests = [
+            (entry.host_pool.pool_label, need_size)
+            for entry, (_, need_size) in zip(entries, requests, strict=True)
+        ]
+
+        allocated = domain.alloc_many(domain_requests)
         if allocated is not None:
             return allocated
 
-        pools = [self.mem_pool_host.entry_map[name].host_pool for name, _ in requests]
-        domain = self.mem_pool_host.entry_map[
-            requests[0][0]
-        ].host_pool.shared_allocation_domain
+        pools = [entry.host_pool for entry in entries]
         requested_bytes = sum(
             need_size * pool.size_per_token
             for pool, (_, need_size) in zip(pools, requests, strict=True)
@@ -418,7 +426,7 @@ class HybridCacheController(BaseHiCacheController):
                 if entry.host_evict_fn(tokens) <= 0:
                     continue
                 made_progress = True
-                allocated = self.mem_pool_host.alloc_shared(requests)
+                allocated = domain.alloc_many(domain_requests)
                 if allocated is not None:
                     return allocated
             if not made_progress:

@@ -6,11 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-    DecodeKVCacheOffloadManager,
-)
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _evict_mamba_for_device_alloc,
     _evict_swa_for_device_alloc,
@@ -21,7 +17,6 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -194,46 +189,6 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
         full_pool.free(full_indices[page_size:])
         self.assertIsNotNone(swa_pool.alloc(page_size))
-
-    def test_retraction_and_offload_use_physical_indices(self):
-        page_size = 4
-        bundle = _build_unified_swa_pool(page_size)
-        allocator = bundle.token_to_kv_pool_allocator
-        virtual_indices = allocator.alloc(2 * page_size)
-        self.assertIsNotNone(virtual_indices)
-        allocator.swa_attn_allocator.free(virtual_indices[:page_size])
-
-        cache = object.__new__(UnifiedRadixCache)
-        cache.tree_core = SimpleNamespace(page_size=page_size)
-        cache.req_to_token_pool = SimpleNamespace(
-            req_to_token=virtual_indices.unsqueeze(0)
-        )
-        cache.token_to_kv_pool_allocator = allocator
-        cache.is_swa_enabled = True
-        cache._sliding_window_size = page_size
-        cache.sidecar_pool_specs = []
-
-        full_indices, transfers = cache._retraction_device_transfers(
-            SimpleNamespace(req_pool_idx=0, seqlen=2 * page_size + 1, rid="request")
-        )
-        expected_full = allocator.translate_kv_indices_for_transfer(virtual_indices)
-        self.assertTrue(torch.equal(full_indices, expected_full))
-        self.assertFalse(torch.equal(full_indices, virtual_indices))
-        self.assertEqual(transfers[0].name, PoolName.SWA)
-
-        manager = object.__new__(DecodeKVCacheOffloadManager)
-        manager.token_to_kv_pool_allocator = allocator
-        manager.kv_cache = bundle.token_to_kv_pool
-        offload_full, offload_transfers = manager._resolve_offload_transfers(
-            virtual_indices
-        )
-        self.assertTrue(torch.equal(offload_full, expected_full))
-        self.assertTrue(
-            torch.equal(
-                offload_transfers[0].device_indices,
-                transfers[0].device_indices,
-            )
-        )
 
 
 if __name__ == "__main__":

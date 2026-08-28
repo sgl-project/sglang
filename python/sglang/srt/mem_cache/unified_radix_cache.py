@@ -1245,6 +1245,11 @@ class UnifiedRadixCache(BasePrefixCache):
             allocation = self.cache_controller.allocate_shared_host_transfers(
                 device_indices, extra_transfers or None
             )
+            if allocation is None and anchor_entry.host_evict_fn is None:
+                self._reclaim_retraction_host(len(device_indices))
+                allocation = self.cache_controller.allocate_shared_host_transfers(
+                    device_indices, extra_transfers or None
+                )
             if allocation is None:
                 return None
             host_indices, resolved = allocation

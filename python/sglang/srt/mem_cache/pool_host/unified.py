@@ -5,11 +5,7 @@ from collections.abc import Sequence
 
 import torch
 
-from sglang.srt.mem_cache.pool_host.base import (
-    HostKVCache,
-    host_memory_budget_bytes,
-    sync_fixed_hicache_size,
-)
+from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -28,26 +24,14 @@ class _SharedPageEnvelopeHostBacking:
         def __init__(
             self,
             *,
-            name: str,
             page_size: int,
             page_bytes: int,
             page_num: int,
         ):
-            self.name = name
             self.page_size = page_size
             self.page_bytes = page_bytes
             self.page_num = page_num
             self.allocated_pages: set[int] = set()
-
-        @property
-        def view_bytes(self) -> int:
-            return self.page_num * self.page_bytes
-
-        def clear(self) -> None:
-            self.allocated_pages.clear()
-
-        def available_pages(self) -> int:
-            return self.page_num - len(self.allocated_pages)
 
     def __init__(
         self,
@@ -81,9 +65,7 @@ class _SharedPageEnvelopeHostBacking:
         page_bytes = [int(buffer.shape[1]) for buffer in device_buffers]
         if host_size > 0:
             token_capacities = [
-                sync_fixed_hicache_size(
-                    int(host_size * 1e9 * pool.page_size // item_bytes), host_size
-                )
+                int(host_size * 1e9 * pool.page_size // item_bytes)
                 for pool, item_bytes in zip(device_pools, page_bytes, strict=True)
             ]
         else:
@@ -119,9 +101,8 @@ class _SharedPageEnvelopeHostBacking:
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        sides = [
-            self._Side(
-                name=name,
+        self.sides = {
+            name: self._Side(
                 page_size=pool.page_size,
                 page_bytes=item_bytes,
                 page_num=total_bytes // item_bytes,
@@ -129,13 +110,12 @@ class _SharedPageEnvelopeHostBacking:
             for pool, name, item_bytes in zip(
                 device_pools, pool_names, page_bytes, strict=True
             )
-        ]
-        if any(side.page_num == 0 for side in sides):
+        }
+        if any(side.page_num == 0 for side in self.sides.values()):
             raise ValueError(
                 "Unified host backing must fit at least one page from every pool."
             )
 
-        self.total_bytes = total_bytes
         self.pin_memory = pin_memory
         self.allocator = get_allocator_from_storage(allocator_type)
         self.lock = threading.RLock()
@@ -148,7 +128,6 @@ class _SharedPageEnvelopeHostBacking:
             allocator=self.allocator,
         )
         self.fd = getattr(self.allocator, "fd", None)
-        self.sides = {side.name: side for side in sides}
         self._free_extents = [(0, total_bytes)]
         self.registration_owner = pool_names[0]
         self._users: set[str] = set()
@@ -175,40 +154,63 @@ class _SharedPageEnvelopeHostBacking:
 
     def page_buffer(self, name: str) -> torch.Tensor:
         side = self.sides[name]
-        return self.raw[: side.view_bytes].view(side.page_num, side.page_bytes)
+        return self.raw[: side.page_num * side.page_bytes].view(
+            side.page_num, side.page_bytes
+        )
 
     @staticmethod
     def _align_up(value: int, alignment: int) -> int:
         return (value + alignment - 1) // alignment * alignment
 
     @classmethod
-    def _reserve_extent(cls, extents: list[tuple[int, int]], size: int) -> int | None:
-        best = None
+    def _reserve_pages(
+        cls, extents: list[tuple[int, int]], page_bytes: int, page_count: int
+    ) -> list[int] | None:
+        if page_count == 0:
+            return []
+
+        candidates = []
         for index, (start, end) in enumerate(extents):
-            aligned_start = cls._align_up(start, size)
-            if aligned_start + size > end:
+            aligned_start = cls._align_up(start, page_bytes)
+            capacity = (end - aligned_start) // page_bytes
+            if capacity <= 0:
                 continue
-            candidate = (end - start, aligned_start - start, index, aligned_start)
-            if best is None or candidate < best:
-                best = candidate
-        if best is None:
+            candidates.append(
+                (end - start, aligned_start - start, index, aligned_start, capacity)
+            )
+
+        remaining = page_count
+        offsets = []
+        replacements: dict[int, list[tuple[int, int]]] = {}
+        for _, _, index, aligned_start, capacity in sorted(candidates):
+            take = min(remaining, capacity)
+            used_end = aligned_start + take * page_bytes
+            start, end = extents[index]
+            replacement = []
+            if start < aligned_start:
+                replacement.append((start, aligned_start))
+            if used_end < end:
+                replacement.append((used_end, end))
+            replacements[index] = replacement
+            offsets.extend(range(aligned_start, used_end, page_bytes))
+            remaining -= take
+            if remaining == 0:
+                break
+
+        if remaining:
             return None
 
-        _, _, index, start = best
-        old_start, old_end = extents[index]
-        replacement = []
-        if old_start < start:
-            replacement.append((old_start, start))
-        if start + size < old_end:
-            replacement.append((start + size, old_end))
-        extents[index : index + 1] = replacement
-        return start
+        extents[:] = [
+            replacement
+            for index, extent in enumerate(extents)
+            for replacement in replacements.get(index, (extent,))
+        ]
+        return offsets
 
     def _plan_allocations(
         self, requests: Sequence[tuple[str, int]]
     ) -> tuple[list[tuple[int, int]], list[list[int]]] | None:
-        page_requests = []
-        requested_pages: dict[str, int] = {}
+        request_groups = []
         for request_index, (name, need_size) in enumerate(requests):
             side = self.sides[name]
             if need_size % side.page_size != 0:
@@ -216,25 +218,21 @@ class _SharedPageEnvelopeHostBacking:
                     "The requested size should be a multiple of the page size."
                 )
             page_count = need_size // side.page_size
-            requested_pages[name] = requested_pages.get(name, 0) + page_count
-            for page_index in range(page_count):
-                page_requests.append(
-                    (-side.page_bytes, request_index, page_index, name)
-                )
-
-        for name, page_count in requested_pages.items():
-            if page_count > self.sides[name].available_pages():
-                return None
+            request_groups.append((side.page_bytes, request_index, page_count, name))
 
         # Place large page envelopes first. Planning uses a copy so an allocation
         # is all-or-nothing even when the two sides need different page sizes.
         extents = list(self._free_extents)
         offsets = [[] for _ in requests]
-        for _, request_index, _, name in sorted(page_requests):
-            offset = self._reserve_extent(extents, self.sides[name].page_bytes)
-            if offset is None:
+        for _, request_index, page_count, name in sorted(
+            request_groups, key=lambda group: group[0], reverse=True
+        ):
+            request_offsets = self._reserve_pages(
+                extents, self.sides[name].page_bytes, page_count
+            )
+            if request_offsets is None:
                 return None
-            offsets[request_index].append(offset)
+            offsets[request_index] = request_offsets
         return extents, offsets
 
     @staticmethod
@@ -268,7 +266,7 @@ class _SharedPageEnvelopeHostBacking:
                 max(0, end - self._align_up(start, side.page_bytes)) // side.page_bytes
                 for start, end in self._free_extents
             )
-            return min(physical_pages, side.available_pages()) * side.page_size
+            return physical_pages * side.page_size
 
     def free_bytes(self) -> int:
         with self.lock:
@@ -328,7 +326,7 @@ class _SharedPageEnvelopeHostBacking:
                 for page in side.allocated_pages
             )
             self._free_extents = self._merge_extents(extents)
-            side.clear()
+            side.allocated_pages.clear()
 
 
 class UnifiedPageEnvelopeHostPool(HostKVCache):
@@ -489,13 +487,6 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             return [self._shared_backing.raw]
         return []
 
-    def get_contiguous_buf_infos(self):
-        view = self._host_page_buffer()
-        return [view.data_ptr()], [view.nbytes], [self.item_bytes]
-
-    def _host_page_buffer(self) -> torch.Tensor:
-        return self._host_page_buffer_view
-
     def clear(self) -> None:
         self._shared_backing.clear(self.pool_label)
 
@@ -550,15 +541,6 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             )
         return host_indices.numel() > 0
 
-    def _copy_cpu_pages(
-        self,
-        src: torch.Tensor,
-        dst: torch.Tensor,
-        src_pages: torch.Tensor,
-        dst_pages: torch.Tensor,
-    ) -> None:
-        dst.index_copy_(0, dst_pages, src.index_select(0, src_pages))
-
     def _transfer_pages(
         self,
         src: torch.Tensor,
@@ -570,7 +552,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if io_backend not in {"kernel", "direct"}:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
         if self._device_page_buffer.device.type == "cpu":
-            self._copy_cpu_pages(src, dst, src_pages, dst_pages)
+            dst.index_copy_(0, dst_pages, src.index_select(0, src_pages))
             return
 
         if not (_is_cuda or _is_hip):
@@ -601,7 +583,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             return
         self._transfer_pages(
             self._device_page_buffer,
-            self._host_page_buffer(),
+            self._host_page_buffer_view,
             self._to_page_indices(device_indices),
             self._to_page_indices(host_indices),
             io_backend,
@@ -626,7 +608,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         ):
             return
         self._transfer_pages(
-            self._host_page_buffer(),
+            self._host_page_buffer_view,
             self._device_page_buffer,
             self._to_page_indices(host_indices),
             self._to_page_indices(device_indices),
@@ -634,7 +616,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        page = self._host_page_buffer()[int(index) // self.page_size]
+        page = self._host_page_buffer_view[int(index) // self.page_size]
         return page.flatten() if flat else page.view(1, self.item_bytes)
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
@@ -647,16 +629,16 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         page = data_page.view(self.dtype).reshape(self.item_bytes)
-        self._host_page_buffer()[int(index) // self.page_size].copy_(page)
+        self._host_page_buffer_view[int(index) // self.page_size].copy_(page)
 
     def get_page_buffer_meta(self, indices):
         pages = self._to_page_indices(indices).tolist()
-        base_ptr = self._host_page_buffer().data_ptr()
+        base_ptr = self._host_page_buffer_view.data_ptr()
         ptrs = [base_ptr + int(page) * self.item_bytes for page in pages]
         return ptrs, [self.item_bytes] * len(ptrs)
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        buffer = self._host_page_buffer()
+        buffer = self._host_page_buffer_view
         return (
             buffer.data_ptr() % page_size_bytes == 0
             and self.item_bytes % page_size_bytes == 0

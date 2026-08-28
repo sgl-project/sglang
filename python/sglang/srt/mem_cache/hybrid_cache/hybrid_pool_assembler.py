@@ -256,6 +256,15 @@ def build_kv_only_group(
     )
 
 
+def _uses_unified_page_envelope_host(
+    full_kv_pool: Any, swa_kv_pool: Any, use_mla: bool
+) -> bool:
+    return not use_mla and all(
+        get_mha_host_pool_cls(pool) is UnifiedPageEnvelopeHostPool
+        for pool in (full_kv_pool, swa_kv_pool)
+    )
+
+
 def build_hybrid_swa_group(
     *,
     page_size: int,
@@ -274,16 +283,7 @@ def build_hybrid_swa_group(
 ) -> HostPoolGroup:
     """Anchor (full) + SWA host pool group for a hybrid-SWA device pool."""
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
-    full_host_pool_cls = (
-        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(full_kv_pool)
-    )
-    swa_host_pool_cls = (
-        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(swa_kv_pool)
-    )
-    if (
-        full_host_pool_cls is UnifiedPageEnvelopeHostPool
-        and swa_host_pool_cls is UnifiedPageEnvelopeHostPool
-    ):
+    if _uses_unified_page_envelope_host(full_kv_pool, swa_kv_pool, use_mla):
         memory = get_memory()
         if memory.hicache_host_memory_mode == "buffer_only":
             raise ValueError(
@@ -428,18 +428,12 @@ def build_hybrid_swa_stack(
 
     kv_host_size = swa_host_size = None
     memory = get_memory()
-    if memory.hicache_size > 0:
-        from sglang.srt.mem_cache.unified_memory_pool import (
-            UnifiedMHATokenToKVPool,
+    if memory.hicache_size > 0 and not _uses_unified_page_envelope_host(
+        full_kv_pool, swa_kv_pool, use_mla
+    ):
+        kv_host_size, swa_host_size = _split_hicache_size(
+            memory.hicache_size, (full_kv_pool, swa_kv_pool)
         )
-
-        is_unified_pair = isinstance(
-            full_kv_pool, UnifiedMHATokenToKVPool
-        ) and isinstance(swa_kv_pool, UnifiedMHATokenToKVPool)
-        if not is_unified_pair:
-            kv_host_size, swa_host_size = _split_hicache_size(
-                memory.hicache_size, (full_kv_pool, swa_kv_pool)
-            )
 
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,

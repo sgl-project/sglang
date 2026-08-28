@@ -175,10 +175,21 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         cache = env.cache
 
         req, source_indices = self._admit_req(env, self.num_tokens)
+        virtual_to_physical = torch.roll(
+            torch.arange(self.pool_size, device=self.device),
+            shifts=self.pool_size // 2,
+        )
+        allocator.translate_kv_indices_for_transfer = (
+            lambda indices: virtual_to_physical[indices]
+        )
+        source_physical_indices = allocator.translate_kv_indices_for_transfer(
+            source_indices
+        )
+        self.assertFalse(torch.equal(source_indices, source_physical_indices))
 
-        self._seed_pool(target_pool, source_indices, base=1000)
+        self._seed_pool(target_pool, source_physical_indices, base=1000)
         self._seed_pool(draft_pool, source_indices, base=3000)
-        target_expected = self._snapshot_pool(target_pool, source_indices)
+        target_expected = self._snapshot_pool(target_pool, source_physical_indices)
         draft_expected = self._snapshot_pool(draft_pool, source_indices)
 
         host_free_before = cache.host_pool_group.available_size()
@@ -203,55 +214,21 @@ class TestDecodeRetractionBackup(unittest.TestCase):
         req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(0, self.num_tokens)), destination_indices
         )
+        destination_physical_indices = allocator.translate_kv_indices_for_transfer(
+            destination_indices
+        )
 
         cache.retraction_restore(req, backup)
 
-        self._assert_pool_equal(target_pool, destination_indices, target_expected)
+        self._assert_pool_equal(
+            target_pool, destination_physical_indices, target_expected
+        )
         self._assert_pool_equal(draft_pool, destination_indices, draft_expected)
         self.assertEqual(cache.host_pool_group.available_size(), host_free_before)
 
         allocator.free(blocker_indices)
         allocator.free(destination_indices)
         req_to_token_pool.free(req)
-
-    def test_restores_draft_kv_with_nonidentity_target_mapping(self):
-        env = self._build_cache(hicache_ratio=1.0)
-        source_virtual = torch.tensor([20, 21], device=self.device)
-        source_physical = torch.tensor([5, 6], device=self.device)
-        destination_virtual = torch.tensor([24, 25], device=self.device)
-        destination_physical = torch.tensor([8, 9], device=self.device)
-        virtual_to_physical = torch.arange(self.pool_size, device=self.device)
-        virtual_to_physical[source_virtual] = source_physical
-        virtual_to_physical[destination_virtual] = destination_physical
-        env.allocator.translate_kv_indices_for_transfer = (
-            lambda indices: virtual_to_physical[indices]
-        )
-
-        req = SimpleNamespace(rid="request", req_pool_idx=None, seqlen=3)
-        self.assertIsNotNone(env.req_to_token_pool.alloc([req]))
-        env.req_to_token_pool.write((req.req_pool_idx, slice(0, 2)), source_virtual)
-
-        self._seed_pool(env.target_pool, source_physical, base=1000)
-        self._seed_pool(env.draft_pool, source_virtual, base=3000)
-        target_expected = self._snapshot_pool(env.target_pool, source_physical)
-        draft_expected = self._snapshot_pool(env.draft_pool, source_virtual)
-
-        backup = env.cache.retraction_backup(req)
-        self.assertIsNotNone(backup)
-
-        for buffer in (*env.target_pool.k_buffer, *env.target_pool.v_buffer):
-            buffer.fill_(-1)
-        for buffer in (*env.draft_pool.k_buffer, *env.draft_pool.v_buffer):
-            buffer.fill_(-2)
-        env.req_to_token_pool.write(
-            (req.req_pool_idx, slice(0, 2)), destination_virtual
-        )
-
-        env.cache.retraction_restore(req, backup)
-
-        self._assert_pool_equal(env.target_pool, destination_physical, target_expected)
-        self._assert_pool_equal(env.draft_pool, destination_virtual, draft_expected)
-        env.req_to_token_pool.free(req)
 
 
 if __name__ == "__main__":
