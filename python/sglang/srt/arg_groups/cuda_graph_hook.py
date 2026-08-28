@@ -110,6 +110,8 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
         return
@@ -124,7 +126,7 @@ def apply_cuda_graph_compatibility(server_args: Any):
         and not server_args.get_model_config().is_multimodal_breakable_cuda_graph_supported
         # Keep trtllm_mla on the preferred breakable path, which now serves
         # MLA by falling back to the flashinfer MLA impl for extend.
-        and server_args._resolved_attention_backends()[0] != "trtllm_mla"
+        and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
     ):
         logger.info(
             "Using tc_piecewise CUDA graph for validated multimodal " "decoder prefill."
@@ -319,6 +321,8 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     cfg = resolving_view(server_args)
 
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
@@ -330,7 +334,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
         not in server_args.get_model_config().hf_config.architectures
     ):
         return
-    prefill_attention_backend, _ = server_args._resolved_attention_backends()
+    prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_attention_backend != "trtllm_mla":
         return
     logger.warning(

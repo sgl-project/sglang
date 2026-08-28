@@ -74,7 +74,12 @@ def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
     if get_parallel().dcp_enabled and get_spec().speculative_algorithm is not None:
-        _, decode_backend = runner.server_args.get_attention_backends()
+        from sglang.srt.arg_groups.overrides import (
+            attention_backends_of,
+            resolved_view,
+        )
+
+        _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
         if decode_backend == "trtllm_mla":
             raise ValueError(
                 "trtllm_mla cannot serve decode context parallelism with speculative "

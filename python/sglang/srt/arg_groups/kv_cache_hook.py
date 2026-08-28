@@ -37,13 +37,15 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
 
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
+    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+
     cfg = resolving_view(server_args)
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return
 
-    use_mla_backend = server_args.use_mla_backend()
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
+    uses_mla = use_mla_backend(server_args)
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend
 
     if is_cuda():
@@ -64,7 +66,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             )
         else:
             if prefill_backend == "fa4":
-                if use_mla_backend:  # FA4 + MLA
+                if uses_mla:  # FA4 + MLA
                     KV4_FA4_MLA_BACKEND_CHOICES = [
                         "cutlass_mla",
                         "flashinfer",
@@ -85,7 +87,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                         f"{KV4_FA4_MHA_BACKEND_CHOICES}, but got {decode_backend}"
                     )
             else:
-                if use_mla_backend:  # !FA4 + MLA
+                if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
                         "cutlass_mla",
                         "flashinfer",
@@ -120,6 +122,8 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     still None, backends haven't settled yet and the resolved (prefill,
     decode) pair would be a stale (None, None).
     """
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     cfg = resolving_view(server_args)
 
     if not cfg.prefill_only_disable_kv_cache:
@@ -130,7 +134,7 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
         "_handle_attention_backend_compatibility() so the prefill backend is resolved."
     )
 
-    prefill_backend, _ = server_args._resolved_attention_backends()
+    prefill_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_backend not in ("fa3", "fa4"):
         raise ValueError(
             "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
@@ -194,6 +198,8 @@ def handle_cache_compatibility(server_args: Any) -> None:
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
@@ -236,7 +242,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         # Both roles: verify routes to either backend depending on
         # --speculative-attention-mode.
         spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(server_args._resolved_attention_backends())
+        spec_backends = set(attention_backends_of(resolved_view(server_args)))
         spec_backends.discard(None)
         assert spec_backends <= spec_allowed, (
             "--enable-unified-memory + DSPARK requires spec-verify-audited "
@@ -273,6 +279,8 @@ def handle_page_major_kv_layout(server_args: Any):
     # The unified pool stores state in the page-major envelope-strided layout, so
     # enabling it implies --enable-page-major-kv-layout — routing it through the
     # single page-major path + stride-aware Triton asserts (set before the guard).
+    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
         declare_resolution(
@@ -294,7 +302,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # page_table (in-kernel for captured decode, one funnel for eager).
     # flashmla / cutlass_mla share the create_flashmla block-table path and
     # can be added the same way once exercised.
-    if cfg.enable_unified_memory and server_args.use_mla_backend():
+    if cfg.enable_unified_memory and use_mla_backend(server_args):
         allowed_full = {
             "triton",
             "fa3",
@@ -305,7 +313,7 @@ def handle_page_major_kv_layout(server_args: Any):
         }
     else:
         allowed_full = {"triton"}
-    backends = set(server_args._resolved_attention_backends())
+    backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout requires the Triton attention backend "
@@ -327,7 +335,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
     decode_allowed = {"triton", "flashinfer"}
     prefill_allowed = {"triton", "flashkda"}
-    if server_args.use_mla_backend():
+    if use_mla_backend(server_args):
         decode_allowed.update({"cutedsl", "helion"})
         prefill_allowed.update({"cutedsl", "helion"})
     resolved_linear_decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend

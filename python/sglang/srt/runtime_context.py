@@ -1788,7 +1788,9 @@ def _adaptive_draft_token_bound(cfg_path: str | None) -> int:
 
 def uses_mla_backend() -> bool:
     """Whether this process's model runs the MLA attention path."""
-    return get_server_args().use_mla_backend()
+    from sglang.srt.arg_groups.overrides import use_mla_backend
+
+    return use_mla_backend(get_server_args())
 
 
 def attention_backends() -> tuple:

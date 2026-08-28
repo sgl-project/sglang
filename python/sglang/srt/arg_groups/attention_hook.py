@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 def handle_attention_backend_compatibility(server_args: Any):
+    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+
     cfg = resolving_view(server_args)
     model_config = server_args.get_model_config()
 
@@ -127,7 +129,7 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     run_post_process_pass(server_args, _cutedsl_prefill_backend_fill)
 
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     if "trtllm_mha" in (prefill_backend, decode_backend):
         if prefill_backend == "trtllm_mha" and not (
             is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
@@ -184,8 +186,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
-    if server_args.use_mla_backend() and prefill_backend == "intel_xpu":
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    if use_mla_backend(server_args) and prefill_backend == "intel_xpu":
         raise ValueError(
             "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
         )
@@ -451,6 +453,8 @@ def handle_multi_item_scoring(server_args: Any):
     changing it silently could surprise users who intentionally picked
     a non-flashinfer backend.
     """
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
     cfg = resolving_view(server_args)
     if not cfg.enable_mis:
         return
@@ -488,7 +492,7 @@ def handle_multi_item_scoring(server_args: Any):
             chunked_prefill_size=-1,
         )
 
-    prefill_backend, decode_backend = server_args._resolved_attention_backends()
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     assert prefill_backend == "flashinfer" and decode_backend == "flashinfer", (
         "Multi-item scoring requires flashinfer attention backend for custom attention mask support. "
         f"Please set --attention-backend flashinfer when using --enable-mis. "

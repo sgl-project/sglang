@@ -43,11 +43,11 @@ if TYPE_CHECKING:
 
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     """Return whether the selected prefill-CP configuration supports BCG."""
-    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.overrides import attention_backends_of, resolving_view
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
-    prefill_attention_backend, _ = server_args._resolved_attention_backends()
+    prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
     return (
         cfg.enable_prefill_cp
         and resolved.attn_cp_size == cfg.tp_size
