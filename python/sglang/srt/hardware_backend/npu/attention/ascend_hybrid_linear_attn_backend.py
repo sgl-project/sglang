@@ -143,20 +143,28 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             num_padding = torch.count_nonzero(
                 seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
             )
-        # Make sure forward metadata is correctly handled for padding reqs
-        req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = 0
-        self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        # Write the gather directly into the graph-stable buffer. The old
+        # advanced-index + copy_ sequence launched two tiny kernels per replay.
+        if num_padding:
+            req_pool_indices[bs - num_padding :] = 0
+        state_indices = self.state_indices_list[bs - 1]
+        torch.index_select(
+            self.req_to_token_pool.req_index_to_mamba_index_mapping,
+            0,
+            req_pool_indices,
+            out=state_indices,
+        )
+        if num_padding:
+            state_indices[bs - num_padding :] = 0
         track_buf = None
         if mamba_track_indices is not None:
             track_buf = mamba_track_indices
         if forward_mode.is_decode_or_idle():
-            if num_padding == 0:
+            if in_capture:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
                 )
-            else:
+            elif num_padding:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
                 )
@@ -164,17 +172,19 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            ssm_state_indices = torch.arange(
-                bs * spec_info.draft_token_num,
-                dtype=torch.int32,
-                device=mamba_indices.device,
-            )
-            self.state_indices_list_gdn[bs - 1].copy_(ssm_state_indices)
-            if num_padding == 0:
+            # These tensors depend only on the captured shape. Initialize them
+            # once; replay only repairs the padded suffix when one exists.
+            if in_capture:
+                torch.arange(
+                    bs * spec_info.draft_token_num,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                    out=self.state_indices_list_gdn[bs - 1],
+                )
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
                 )
-            else:
+            elif num_padding:
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
                 )
