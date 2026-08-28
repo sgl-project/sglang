@@ -3,8 +3,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl as cutedsl_runner
 import torch
+
+import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl as cutedsl_runner
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
