@@ -1,5 +1,7 @@
+import os
 import unittest
-from unittest.mock import MagicMock
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -16,6 +18,12 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestCheckTreeCacheGate(CustomTestCase):
+    @contextmanager
+    def _without_explicit_sanity_check_setting(self):
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.clear()
+            yield
+
     def _make_checker(self):
         tree_cache = MagicMock()
         tree_cache.is_tree_cache.return_value = True
@@ -37,19 +45,44 @@ class TestCheckTreeCacheGate(CustomTestCase):
         )
 
     def test_disabled_by_default(self):
-        checker = self._make_checker()
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            self._without_explicit_sanity_check_setting(),
+        ):
+            checker = self._make_checker()
 
-        checker._check_tree_cache()
-
-        checker.tree_cache.sanity_check.assert_not_called()
-
-    def test_runs_when_enabled(self):
-        checker = self._make_checker()
-
-        with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
             checker._check_tree_cache()
 
-        checker.tree_cache.sanity_check.assert_called_once()
+            checker.tree_cache.sanity_check.assert_not_called()
+
+    def test_enabled_by_default_in_ci(self):
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            self._without_explicit_sanity_check_setting(),
+        ):
+            checker = self._make_checker()
+
+            checker._check_tree_cache()
+
+            checker.tree_cache.sanity_check.assert_called_once()
+
+    def test_explicitly_disabled_in_ci(self):
+        with envs.SGLANG_IS_IN_CI.override(True):
+            checker = self._make_checker()
+
+            with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(False):
+                checker._check_tree_cache()
+
+            checker.tree_cache.sanity_check.assert_not_called()
+
+    def test_runs_when_enabled(self):
+        with envs.SGLANG_IS_IN_CI.override(False):
+            checker = self._make_checker()
+
+            with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
+                checker._check_tree_cache()
+
+            checker.tree_cache.sanity_check.assert_called_once()
 
 
 if __name__ == "__main__":
