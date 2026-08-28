@@ -4119,7 +4119,7 @@ def parse_lscpu_topology():
                 logger.warning("Skipping malformed lscpu line: %s", line.strip())
                 continue
             # (cpu, core, socket, node, L3)
-            cpu_info.append(parts[: 4] + [parts[-1]])
+            cpu_info.append(parts[:4] + [parts[-1]])
 
     # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
@@ -4167,7 +4167,11 @@ def get_physical_cpus_by_numa_or_block():
         allowed_cpus = set(cpus).intersection(cpus_allowed_list)
         block_to_cpus[block] = allowed_cpus
 
-    return (1, block_to_cpus) if len(block_to_cpus) > len(node_to_cpus) else (0, node_to_cpus)
+    return (
+        (1, block_to_cpus)
+        if len(block_to_cpus) > len(node_to_cpus)
+        else (0, node_to_cpus)
+    )
 
 
 # Only physical cores are used. Logical cores are excluded.
