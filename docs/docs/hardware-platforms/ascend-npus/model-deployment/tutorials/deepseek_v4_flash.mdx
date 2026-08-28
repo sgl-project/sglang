@@ -65,8 +65,8 @@ For multi-node deployment, download the weights to a shared directory accessible
 - [DeepSeek-V4-Flash-w8a8-mtp](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp) (W8A8 quantized version, 300GB)
 
 <Info>
-The W8A8 variant (300GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full
-A3 node (8 cards, 16 dies) or two A2 nodes.
+The W8A8 variant (300GB) can be deployed on 8 × 64GB of device memory (`--tp-size 8`), which corresponds to one full A2
+node or 8 dies on A3 (4 cards).
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
@@ -163,38 +163,33 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 ### Single-node PD mixed deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. The recommended configuration below was validated on a single Atlas 800I A3 node (8
-cards, 16 dies).
+with limited hardware resources. In such scenarios, DeepSeek-V4-Flash can be launched with half of an Atlas 800I A3
+node (4 cards, 8 dies) or a full Atlas 800I A2 node (8 cards). The configuration below was validated on Atlas 800I A3
+(4 cards, 8 dies) with `--tp-size 8`.
 
 ```bash Command
 # ============================================================
-# Before running, update the following variables:
+# Before running, update the following variable:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export FORCE_DRAFT_MODEL_NON_QUANT=1
-export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=8
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_OP_EXPANSION_MODE=AIV
 export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
-export SGLANG_DISABLE_DRAFT_EXTEND_GRAPH=1
 export SGLANG_DSV4_FP4_EXPERTS=False
-export SGLANG_DSV4_NPU_FUSED_COMPRESSOR=1
-export SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL=0
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_NPU_USE_MULTI_STREAM=1
 export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
 export SGLANG_OPT_FP8_WO_A_GEMM=0
@@ -203,42 +198,31 @@ export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
 export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
 export SGLANG_OPT_USE_TILELANG_MHC_POST=False
 export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
-export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=61000
+export SGLANG_SET_CPU_AFFINITY=1
+export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:14699"
+export SGLANG_ZBAL_LOCAL_MEM_SIZE=62084
 export STREAMS_PER_DEVICE=32
-export USE_FUSED_HC_PRE_ASCENDC=1
-export USE_NPU_MOE_GATING_TOP_K=1
 export ZBAL_ENABLE_GRAPH=1
 export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
 python3 -m sglang.launch_server \
-    --model-path $MODEL_PATH \
-    --host 127.0.0.1 --port 6688 \
+    --model-path "${MODEL_PATH}" \
     --page-size 128 \
-    --tp-size 16 \
+    --tp-size 8 \
     --trust-remote-code \
     --device npu \
-    --prefill-max-requests 32 \
     --attention-backend dsv4 \
     --watchdog-timeout 9000 \
-    --mem-fraction-static 0.7 \
+    --host 127.0.0.1 --port 6688 \
+    --mem-fraction-static 0.8 \
+    --prefill-max-requests 160 \
+    --max-prefill-tokens 80000 \
     --chunked-prefill-size 131072 \
-    --max-running-requests 64 \
-    --dp-size 16 \
-    --enable-dp-attention \
-    --moe-a2a-backend deepep \
-    --deepep-mode auto \
-    --quantization modelslim \
-    --enable-dp-lm-head \
-    --kv-cache-dtype auto \
-    --skip-server-warmup \
-    --cuda-graph-bs 1 2 4 8 \
-    --speculative-algorithm EAGLE \
-    --speculative-num-steps 2 \
-    --speculative-eagle-topk 1 \
-    --speculative-num-draft-tokens 3 \
-    --ep-size 16 \
-    --disable-radix-cache
+    --max-running-requests 160 \
+    --dp-size 8 --enable-dp-attention \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --quantization modelslim --enable-dp-lm-head \
+    --kv-cache-dtype bfloat16
 ```
 
 For the complete benchmark data and additional single-node configurations, see
@@ -262,14 +246,11 @@ After the service is started, you can invoke the model by sending a prompt:
 #   PORT: the server port number (e.g., 6688)
 # ============================================================
 
-curl http://${HOST}:${PORT}/generate \
+curl http://${HOST}:${PORT}/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
-        "text": "What is the capital of France?",
-        "sampling_params": {
-            "max_new_tokens": 64,
-            "temperature": 0
-        }
+        "model": "deepseek-v4-flash",
+        "messages": [{"role": "user", "content": "What is the capital of France?"}]
     }'
 ```
 
