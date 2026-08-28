@@ -291,7 +291,7 @@ def handle_a2a_moe(server_args: Any):
         # Skip validation if disaggregation mode is decode.
         if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
-                server_args._required_mori_dispatch_tokens_per_rank()
+                required_mori_dispatch_tokens_per_rank(server_args)
             ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
                 "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
                 "must be >= the per-rank MoRI dispatch tokens "
@@ -339,7 +339,7 @@ def handle_a2a_moe(server_args: Any):
         # Skip validation if disaggregation mode is decode
         if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
-                server_args._required_pplx_dispatch_tokens_per_rank()
+                required_pplx_dispatch_tokens_per_rank(server_args)
             ) <= envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
                 "SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 128) "
                 "must be >= the per-rank pplx dispatch tokens "
@@ -481,3 +481,18 @@ def validate_cutedsl_a2a_token_budget(server_args: Any):
             f"{required_per_rank}` or lower the relevant limit "
             f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
         )
+
+
+def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Max tokens a single rank dispatches through MoRI in one forward."""
+    cfg = resolving_view(server_args)
+    return cfg.chunked_prefill_size
+
+
+def required_pplx_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Max tokens a single rank dispatches through pplx in one forward."""
+    cfg = resolving_view(server_args)
+    required = cfg.chunked_prefill_size
+    if cfg.cuda_graph_max_bs_decode is not None:
+        required = max(required, cfg.cuda_graph_max_bs_decode)
+    return required

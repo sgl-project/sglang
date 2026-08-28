@@ -19,7 +19,14 @@ HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 
 def _is_hip() -> bool:
-    from sglang.srt.server_args import is_hip
+    """The one place this family asks about ROCm, and the seam the tests patch.
+
+    Imported here rather than at module scope, and asked of `utils.common`
+    rather than of `server_args`: the record re-exported it only so a patch
+    target would stay put, which made a configuration module the home of a
+    platform probe.
+    """
+    from sglang.srt.utils.common import is_hip
 
     return is_hip()
 

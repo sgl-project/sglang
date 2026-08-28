@@ -362,7 +362,7 @@ def apply_deepep_adjustments(server_args: Any):
         if bs is None:
             # 2048 = documented prefill default; max_bs unresolved here.
             max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
-            bs = server_args._generate_prefill_cuda_graph_batch_sizes(max_bs)
+            bs = generate_prefill_cuda_graph_batch_sizes(server_args, max_bs)
         aligned = sorted({((b + 7) // 8) * 8 for b in bs})
         if aligned != sorted(bs):
             logger.info(
@@ -430,7 +430,7 @@ def handle_cuda_graph_config(server_args: Any):
     parse_cuda_graph_config(server_args)
     apply_cuda_graph_compatibility(server_args)
     apply_deepep_adjustments(server_args)
-    server_args._apply_cuda_graph_disaggregation_roles()
+    apply_cuda_graph_disaggregation_roles(server_args)
     validate_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
     # that path is skipped when the user explicitly sets the backend,
@@ -452,4 +452,101 @@ def validate_cuda_graph_config(server_args: Any):
             raise ValueError(
                 f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                 f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
+            )
+
+
+def generate_prefill_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
+    """
+    Generate the list of batch sizes for prefill CUDA graph capture
+    based on max_bs. For tc_piecewise prefill, bs carries the
+    captured token count (one shape knob per phase).
+    """
+    capture_sizes = (
+        list(range(4, 33, 4))
+        + list(range(48, 257, 16))
+        + list(range(288, 513, 32))
+        + list(range(576, 1024 + 1, 64))
+        + list(range(1280, 4096 + 1, 256))
+        + list(range(4608, max_bs + 1, 512))
+    )
+
+    capture_sizes = [s for s in capture_sizes if s <= max_bs]
+
+    return capture_sizes
+
+
+def generate_decode_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
+    """
+    Generate the list of batch sizes for CUDA graph capture based on max_bs.
+    This integrates the logic from cuda_graph_runner.py.
+    """
+    cfg = resolving_view(server_args)
+    # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
+    if cfg.disable_cuda_graph_padding:
+        capture_bs = list(range(1, max_bs + 1))
+    elif cfg.speculative_algorithm is None:
+        # Normal case:
+        capture_bs = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + list(range(512, max_bs + 1, 32))
+        )
+    else:
+        # Spec decoding case: less padding for smaller batch sizes
+        capture_bs = (
+            list(range(1, 9, 1))
+            + list(range(10, 33, 2))
+            + list(range(40, 65, 4))
+            + list(range(72, 257, 8))
+            + list(range(272, max_bs + 1, 16))
+        )
+
+    capture_bs = [bs for bs in capture_bs if bs <= max_bs]
+
+    if max_bs not in capture_bs:
+        capture_bs.append(max_bs)
+
+    return capture_bs
+
+
+def generate_cpu_graph_batch_sizes(server_args: Any):
+    """
+    Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.disable_cuda_graph_padding:
+        capture_bs = list(range(1, cfg.torch_compile_max_bs + 1))
+    else:
+        capture_bs = sorted(
+            set().union(
+                range(1, 17),
+                range(18, 31, 2),
+                range(32, 81, 4),
+                range(84, cfg.torch_compile_max_bs + 1, 8),
+                {cfg.torch_compile_max_bs},
+            )
+        )
+    capture_bs = [bs for bs in capture_bs if bs <= cfg.torch_compile_max_bs]
+
+    return capture_bs
+
+
+def apply_cuda_graph_disaggregation_roles(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_mode == "prefill":
+        if (Phase.DECODE, "backend") not in server_args._cuda_graph_config_locked:
+            server_args._declare(
+                "_apply_cuda_graph_disaggregation_roles",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+    elif cfg.disaggregation_mode == "decode":
+        if (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked:
+            server_args._declare(
+                "_apply_cuda_graph_disaggregation_roles",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
             )

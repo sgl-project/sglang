@@ -203,10 +203,14 @@ def handle_model_specific_adjustments(server_args: Any):
                 import torch
 
                 major, _ = torch.cuda.get_device_capability()
-                server_args._set_default_dsa_kv_cache_dtype(
-                    major, resolved_view(server_args).quantization
+                from sglang.srt.arg_groups.overrides import (
+                    _dsa_kv_cache_dtype_default,
+                    _dsa_split_backend_resolution,
+                    run_post_process_pass,
                 )
-                server_args._set_default_dsa_backends(major)
+
+                run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
+                run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
             if cfg.enable_prefill_cp:
                 assert (
@@ -585,6 +589,9 @@ def handle_model_specific_adjustments(server_args: Any):
 
 
 def handle_model_capability_adjustments(server_args: Any):
+    from sglang.srt.arg_groups.cuda_graph_hook import (
+        generate_prefill_cuda_graph_batch_sizes,
+    )
     from sglang.srt.arg_groups.kv_cache_hook import (
         validate_prefill_only_disable_kv_cache_args,
     )
@@ -768,8 +775,8 @@ def handle_model_capability_adjustments(server_args: Any):
                     )
                 }
                 if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
-                    sizing["bs"] = server_args._generate_prefill_cuda_graph_batch_sizes(
-                        sizing["max_bs"]
+                    sizing["bs"] = generate_prefill_cuda_graph_batch_sizes(
+                        server_args, sizing["max_bs"]
                     )
                 declare_resolution(
                     server_args,
