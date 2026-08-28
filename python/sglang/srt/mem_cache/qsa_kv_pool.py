@@ -1,18 +1,25 @@
 """KV pools carrying the QSA sparse-attention indexer caches.
 
-``QSATokenToKVPool`` (compressed, Qwen4-Exp) adds the per-token BF16 index-key
-state, its RoPE coordinates, and the paged compressed-K cache on top of the
-hybrid full/linear KV pool. ``QwenDSATokenToKVPool`` (tokenwise,
+``QSATokenToKVPool`` (compressed, Qwen4-Exp) adds the per-request pending
+index-key/RoPE ring and the paged compressed-K cache on top of the hybrid
+full/linear KV pool. ``QwenDSATokenToKVPool`` (tokenwise,
 Qwen3Next-DSA) adds only the flat per-token index-K cache.
 """
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+
+# State layer IDs are serialized as uint32 by the disaggregation protocols.
+# Reserve the value below PLE's request-wide sentinel for QSA's request-wide
+# RoPE ring, which is shared by all full-attention layers.
+QSA_ROPE_STATE_LAYER_ID = (1 << 32) - 2
 
 
 def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
@@ -51,7 +58,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
             kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
         )
         return index_k_bytes // compress_ratio * num_layers
-
 
     def __init__(
         self,
@@ -145,32 +151,46 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
         self.qsa_num_request_slots = int(num_request_slots)
         ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
-        self.qsa_key_state_buffer_pool = [
-            torch.zeros(
-                (ring_slots, self.qsa_index_kv_heads, self.qsa_index_head_dim),
+        # These buffers participate in Mooncake PD transfer just like the base
+        # KV and Mamba pools.  Keep their allocation in the same memory-saver
+        # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
+        # ordinary CUDA allocation when the first QSA state page is sent.
+        allocation_pool = self.full_kv_pool
+        with allocation_pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE), (
+            torch.cuda.use_mem_pool(allocation_pool.custom_mem_pool)
+            if allocation_pool.enable_custom_mem_pool
+            else nullcontext()
+        ):
+            self.qsa_key_state_buffer_pool = [
+                torch.zeros(
+                    (
+                        ring_slots,
+                        self.qsa_index_kv_heads,
+                        self.qsa_index_head_dim,
+                    ),
+                    dtype=self.index_state_dtype,
+                    device=device,
+                )
+                for _ in full_attention_layer_ids
+            ]
+            # RoPE coordinates are layer-independent. Keep the exact Qwen4-Exp
+            # MRoPE position of every incomplete key so compression can rotate
+            # the pooled key with the group's real starting coordinate.
+            self.qsa_rope_position_buffer = torch.zeros(
+                (ring_slots, 3), dtype=torch.int64, device=device
+            )
+            # One contiguous allocation behind per-layer views: every layer's
+            # compressed pages are addressable from a single base pointer.
+            self.qsa_compressed_flat = torch.zeros(
+                (
+                    len(full_attention_layer_ids),
+                    self.qsa_compressed_capacity
+                    * self.qsa_index_kv_heads
+                    * self.qsa_index_head_dim,
+                ),
                 dtype=self.index_state_dtype,
                 device=device,
             )
-            for _ in full_attention_layer_ids
-        ]
-        # RoPE coordinates are layer-independent.  Keep the exact Qwen4-Exp MRoPE
-        # position of every pending key so compression can rotate the pooled
-        # key with the group's real starting coordinate.
-        self.qsa_rope_position_buffer = torch.zeros(
-            (ring_slots, 3), dtype=torch.int64, device=device
-        )
-        # One contiguous allocation behind per-layer views: every layer's
-        # compressed pages are addressable from a single base pointer.
-        self.qsa_compressed_flat = torch.zeros(
-            (
-                len(full_attention_layer_ids),
-                self.qsa_compressed_capacity
-                * self.qsa_index_kv_heads
-                * self.qsa_index_head_dim,
-            ),
-            dtype=self.index_state_dtype,
-            device=device,
-        )
         self.qsa_compressed_k_buffer_pool = [
             self.qsa_compressed_flat[layer_offset].view(
                 self.qsa_compressed_capacity,
@@ -218,6 +238,45 @@ class QSATokenToKVPool(HybridLinearKVPool):
     ) -> None:
         buffer = self.get_qsa_compressed_k_buffer(layer_id)
         buffer[loc.long()] = compressed_k.to(buffer.dtype)
+
+    @staticmethod
+    def _get_paged_state_buf_infos(tensors, page_size: int):
+        return (
+            [tensor.data_ptr() for tensor in tensors],
+            [tensor.nbytes for tensor in tensors],
+            [tensor[0].nbytes * page_size for tensor in tensors],
+        )
+
+    def get_qsa_pending_state_buf_infos(self):
+        """Per-request pending key-state and RoPE ring transfer buffers."""
+        tensors = [*self.qsa_key_state_buffer_pool, self.qsa_rope_position_buffer]
+        return (
+            [tensor.data_ptr() for tensor in tensors],
+            [tensor.nbytes for tensor in tensors],
+            [tensor[0].nbytes * self.qsa_compress_ratio for tensor in tensors],
+        )
+
+    def get_qsa_pending_state_layer_ids(self):
+        """Global layer metadata for the compact QSA pending-state list."""
+        return [
+            *self.full_attention_layer_id_mapping.keys(),
+            QSA_ROPE_STATE_LAYER_ID,
+        ]
+
+    def get_qsa_compressed_state_layer_ids(self):
+        """Global layer metadata for the compact compressed-K list."""
+        return list(self.full_attention_layer_id_mapping.keys())
+
+    def get_qsa_compressed_state_buf_infos(self):
+        """Per-full-page compressed-K transfer buffers.
+
+        One full KV page maps to one compressed page because the full page size
+        is an integer multiple of the compression ratio.
+        """
+        return self._get_paged_state_buf_infos(
+            self.qsa_compressed_k_buffer_pool,
+            self.qsa_compressed_page_size,
+        )
 
     def get_kv_size_bytes(self):
         k_size, v_size = super().get_kv_size_bytes()

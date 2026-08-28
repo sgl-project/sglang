@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.utils import (
     resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.ple_state_pool import PLE_NGRAM_STATE_LAYER_ID
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 
@@ -1470,6 +1471,8 @@ class NixlKVManager(CommonKVManager):
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
         bypass_prepped: bool = False,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1531,17 +1534,31 @@ class NixlKVManager(CommonKVManager):
         logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend or force_flat:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs, state_type)
-            )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    len(src_data_ptrs),
+                    len(dst_data_ptrs),
+                    allow_positional_fallback=self.pp_size == 1,
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+                layers_params = [
+                    (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
+                ]
+            else:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(
+                        src_data_ptrs, dst_data_ptrs, state_type
+                    )
+                )
+                layers_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
@@ -2289,6 +2306,11 @@ class NixlKVManager(CommonKVManager):
 
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
+                    if PLE_NGRAM_STATE_LAYER_ID in src_lids:
+                        raise RuntimeError(
+                            "Qwen4 PLE PD state transfer currently requires matching "
+                            "prefill/decode attention TP sizes"
+                        )
                     h = self._send_mamba_state_slice(
                         peer_name,
                         src_indices,
@@ -2324,6 +2346,8 @@ class NixlKVManager(CommonKVManager):
             elif st in (
                 StateType.SWA,
                 StateType.DSA,
+                StateType.QSA_PENDING,
+                StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,
                 StateType.C128_STATE,
             ):
@@ -2352,6 +2376,9 @@ class NixlKVManager(CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     notif=comp_notif,
                     state_type=st,
+                    force_flat=st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
                 )
             elif st == StateType.MINIMAX_INDEX_K:
                 # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer

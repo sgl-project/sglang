@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
+    should_send_replicated_state,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -1253,13 +1254,20 @@ class MooncakeKVManager(CommonKVManager):
         return st in (
             StateType.SWA,
             StateType.DSA,
+            StateType.QSA_PENDING,
+            StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.C128_STATE,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         """State types whose page lists are positional and must not be truncated."""
-        return st in (StateType.SWA_RING, StateType.C128_STATE)
+        return st in (
+            StateType.QSA_PENDING,
+            StateType.QSA_COMPRESSED,
+            StateType.SWA_RING,
+            StateType.C128_STATE,
+        )
 
     def maybe_send_extra(
         self,
@@ -1377,15 +1385,62 @@ class MooncakeKVManager(CommonKVManager):
                         or rc
                     )
             elif self._is_generic_kvcache_state_type(st):
-                if (
+                is_qwen4_qsa_state = st in (
+                    StateType.QSA_PENDING,
+                    StateType.QSA_COMPRESSED,
+                )
+                has_heterogeneous_attn_tp = (
                     target_rank_registration_info is not None
-                    and not self.is_mla_backend
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
+                )
+                if (
+                    has_heterogeneous_attn_tp
+                    and not self.is_mla_backend
+                    and not is_qwen4_qsa_state
                 ):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
+                if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
+                    if len(src_item_lens) != len(src_data_ptrs) or len(
+                        dst_item_lens
+                    ) != len(dst_data_ptrs):
+                        raise RuntimeError(
+                            f"Replicated {st.upper()} pointer/item-length metadata "
+                            "is inconsistent: "
+                            f"src ptrs={len(src_data_ptrs)} lens={len(src_item_lens)}, "
+                            f"dst ptrs={len(dst_data_ptrs)} lens={len(dst_item_lens)}"
+                        )
+                    qsa_entry_pairs = build_transfer_entry_pairs(
+                        src_state_layer_ids,
+                        dst_state_layer_ids,
+                        len(src_data_ptrs),
+                        len(dst_data_ptrs),
+                        allow_positional_fallback=self.pp_size == 1,
+                    )
+                    layout_mismatches = [
+                        (i, j, src_item_lens[i], dst_item_lens[j])
+                        for i, j in qsa_entry_pairs
+                        if src_item_lens[i] != dst_item_lens[j]
+                    ]
+                    if layout_mismatches:
+                        raise RuntimeError(
+                            f"Replicated {st.upper()} layout differs between mapped "
+                            "prefill and decode entries: "
+                            f"{layout_mismatches}"
+                        )
+                    local_tp_rank_in_group = (
+                        self.kv_args.engine_rank % self.attn_tp_size
+                    )
+                    if not should_send_replicated_state(
+                        src_attn_tp_size=self.attn_tp_size,
+                        dst_attn_tp_size=(
+                            target_rank_registration_info.dst_attn_tp_size
+                        ),
+                        local_tp_rank_in_group=local_tp_rank_in_group,
+                    ):
+                        continue
                 src_indices = list(indices)
                 dst_indices_local = list(dst_indices)
                 if (
@@ -1421,6 +1476,10 @@ class MooncakeKVManager(CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        force_flat=st
+                        in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED),
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )
@@ -1522,8 +1581,8 @@ class MooncakeKVManager(CommonKVManager):
         ``src_state_conv_shard_groups`` (see compute_mamba_state_slice_blocks).
         """
         logger.warning_once(
-            "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
-            f"Prefill attn_tp_size={self.attn_tp_size}, Decode attn_tp_size={dst_attn_tp_size}. "
+            "Using Mamba state slice transfer for different runtime attention TP "
+            f"sizes: prefill={self.attn_tp_size}, decode={dst_attn_tp_size}. "
             "Performance may be affected."
         )
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"

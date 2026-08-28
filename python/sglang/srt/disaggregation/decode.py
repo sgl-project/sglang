@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -109,6 +110,22 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _flush_gpudirect_writes_to_cuda_owner() -> None:
+    """Make completed third-party GPU writes visible to CUDA on this device."""
+    from cuda.bindings import runtime as cuda_rt
+
+    target_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesTarget
+    scope_enum = cuda_rt.cudaFlushGPUDirectRDMAWritesScope
+    flush_target = target_enum.cudaFlushGPUDirectRDMAWritesTargetCurrentDevice
+    flush_scope = scope_enum.cudaFlushGPUDirectRDMAWritesToOwner
+    (err,) = cuda_rt.cudaDeviceFlushGPUDirectRDMAWrites(flush_target, flush_scope)
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        raise RuntimeError(
+            "Failed to flush GPUDirect RDMA writes before QSA decode: "
+            f"CUDA error {int(err)}"
+        )
 
 
 class DecodeReqToTokenPool(ReqToTokenPool):
@@ -214,6 +231,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -261,12 +282,15 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            short_conv_layer_ids=short_conv_layer_ids,
+            short_conv_state_shape=short_conv_state_shape,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=ngram_eos_token_id,
         )
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.mamba_allocator.clear()
-
 
 
 @dataclass
@@ -1199,6 +1223,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _qsa_pending_payload():
+                # Match the prefill request-pool row positionally; the two
+                # req_pool_idx values need not be equal.
+                return np.array([decode_req.req.req_pool_idx], dtype=np.int32)
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1231,6 +1260,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # as main KV on the same page_size.
             payloads = {
                 StateType.MAMBA: _mamba_payload,
+                StateType.QSA_PENDING: _qsa_pending_payload,
+                StateType.QSA_COMPRESSED: _dsa_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _dsa_payload,
                 StateType.MINIMAX_INDEX_K: _dsa_payload,
@@ -1805,6 +1836,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.tp_rank = tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
+        self.token_to_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2028,6 +2060,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
+        qsa_success_indices = {
+            i
+            for i, (decode_req, poll) in enumerate(zip(self.queue, polls))
+            if poll == KVPoll.Success
+            and (rids_to_check is None or decode_req.req.rid in rids_to_check)
+            and not (
+                self.scheduler.enable_decode_hicache
+                and decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
+            )
+        }
+        if isinstance(self.token_to_kv_pool, QSATokenToKVPool) and qsa_success_indices:
+            # A single blocking flush covers every QSA request completed by this
+            # poll. The CUDA visibility operation is sufficient; a subsequent
+            # device-wide synchronize would unnecessarily wait on unrelated work.
+            _flush_gpudirect_writes_to_cuda_owner()
+
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
