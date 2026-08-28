@@ -2559,6 +2559,109 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
+            # Context-chunk prefill (extend batches WITH a prefix) via the
+            # gfx950 ASM fp8 varlen fmha. The ck_tile paged batch_prefill runs
+            # at ~15% FP8 MFU at these shapes while the ASM kernel is ~3.5x
+            # faster; gathering the paged fp8 KV into a contiguous varlen
+            # buffer costs only ~20 us per layer at 70k context. The no-prefix
+            # first chunk already takes the ASM branch below.
+            if (
+                is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and any(forward_batch.extend_prefix_lens_cpu)
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == 256
+                and layer.v_head_dim == 256
+                and self.kv_cache_dtype == fp8_dtype
+                and not self.kv_cache_is_vectorized_5d
+                and self.forward_metadata.max_kv_len is not None
+            ):
+                bs = forward_batch.batch_size
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                page = self.page_size
+                kv_indptr = self.forward_metadata.kv_indptr[: bs + 1]
+                kv_pages = self.forward_metadata.kv_indices
+                seq_lens = forward_batch.seq_lens[:bs].to(torch.long)
+                # kvlen must not exceed the pages this batch actually has in
+                # kv_indices (metadata is page-granular for plain extend, but
+                # can disagree with seq_lens in mixed/spec batches -> OOB
+                # gather). Clamp per-seq kvlen to pages*page and fall back to
+                # the paged kernel on any inconsistency.
+                pages_per_seq = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.long)
+                kvlen_cap = pages_per_seq * page
+                seq_lens = torch.minimum(seq_lens, kvlen_cap)
+                total_k = int(seq_lens.sum().item())
+                cu_k = torch.zeros(bs + 1, dtype=torch.long, device=q.device)
+                torch.cumsum(seq_lens, 0, out=cu_k[1:])
+                seq_ids = torch.repeat_interleave(
+                    torch.arange(bs, device=q.device), seq_lens
+                )
+                pos_in_seq = torch.arange(total_k, device=q.device) - cu_k[seq_ids]
+                page_slot = kv_indptr[seq_ids].to(torch.long) + pos_in_seq // page
+                asm_cp_ok = bool(int(page_slot.max().item()) < kv_pages.numel())
+                if not asm_cp_ok:
+                    logger.warning(
+                        "[asm-context-prefill] metadata mismatch, falling back:"
+                        " mode=%s bs=%s page_slot_max=%s kv_pages=%s seq_lens=%s"
+                        " kv_indptr=%s",
+                        forward_batch.forward_mode,
+                        bs,
+                        int(page_slot.max().item()),
+                        kv_pages.numel(),
+                        seq_lens.tolist(),
+                        kv_indptr.tolist(),
+                    )
+                if asm_cp_ok:
+                    tok_idx = (
+                        kv_pages[page_slot].to(torch.long) * page + pos_in_seq % page
+                    )
+                    asm_cp_ok = int(tok_idx.max().item()) < (
+                        self.token_to_kv_pool.get_key_buffer(layer.layer_id).shape[0]
+                    )
+                if asm_cp_ok:
+                    hk = layer.tp_k_head_num * layer.qk_head_dim
+                    hv = layer.tp_v_head_num * layer.v_head_dim
+                    # uint8 view: index_select is not implemented for fp8.
+                    k_gather = (
+                        k_cache.view(-1, hk)
+                        .view(torch.uint8)
+                        .index_select(0, tok_idx)
+                        .view(k_cache.dtype)
+                        .view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                    )
+                    v_gather = (
+                        v_cache.view(-1, hv)
+                        .view(torch.uint8)
+                        .index_select(0, tok_idx)
+                        .view(v_cache.dtype)
+                        .view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                    )
+                    fp8_q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
+                    o = flash_attn_varlen_fp8_pertensor_func(
+                        q.contiguous()
+                        .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                        .to(fp8_dtype),
+                        k_gather,
+                        v_gather,
+                        fp8_q_descale.reshape(1),
+                        k_descale.reshape(1),
+                        v_descale.reshape(1),
+                        self.qo_indptr[:bs0],
+                        cu_k.to(torch.int32),
+                        self.forward_metadata.max_q_len,
+                        int(self.forward_metadata.max_kv_len),
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                    )
+                    if o.dtype != self.input_dtype:
+                        o = o.to(self.input_dtype)
+                    return o.view(-1, layer.tp_q_head_num * layer.qk_head_dim)
+
             if (
                 is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()

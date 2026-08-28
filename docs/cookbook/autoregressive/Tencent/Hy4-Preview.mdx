@@ -1,6 +1,6 @@
 ---
 title: Hy4-Preview
-description: "Deploy Tencent Hy4-Preview with SGLang — launch recipes for the 760B-parameter Mixture-of-Experts model with MLA, DeepSeek Sparse Attention (DSA), and MTP speculative decoding, in BF16 on H200/B200/B300/GB300 and MXFP8 on Blackwell GPUs."
+description: "Deploy Tencent Hy4-Preview with SGLang — launch recipes for the 770B-parameter Mixture-of-Experts model with MLA, DeepSeek Sparse Attention (DSA), and MTP speculative decoding, in BF16 on H200/B200/B300/GB300 and MXFP8 on Blackwell GPUs."
 tag: NEW
 ---
 
@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
+For all methods and hardware platforms, see the [official SGLang installation guide](/docs/get-started/install). The Docker path below matches the **Docker** framing in the command panel.
 
 <Tabs>
 
@@ -50,7 +50,7 @@ import { benchmarks } from "/src/snippets/configs/tencent/hy4-preview-benchmarks
     <li style={{marginBottom: "0.2rem"}}><strong>⧉ Copy</strong> — copies the current command (with whichever framing is active) to your clipboard.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>$ cURL</strong> — a sample request against <code>localhost:30000</code> to confirm the server is up.</li>
     <li style={{marginBottom: "0.2rem"}}><strong>⚙ Env</strong> — edits the placeholders (<code>HOST_IP</code>, <code>PORT</code>, <code>HF_TOKEN</code>, <code>NODE_RANK</code>, <code>NODE0_IP</code>) the command and cURL share. Persists in localStorage across cookbooks.</li>
-    <li><strong>Badge</strong> — every Hy4-Preview recipe currently shows <strong>In Progress</strong>: the B300 MXFP8 and H200 BF16 anchors have been served end-to-end, the remaining cells are sized from them by VRAM and architecture, and each cell flips to green <strong>Verified</strong> as its end-to-end verification lands.</li>
+    <li><strong>Badge</strong> — single-node recipes show green <strong>Verified</strong> (run end-to-end on real hardware); the 2-node BF16 recipes show <strong>In Progress</strong> and flip to <strong>Verified</strong> as their multi-node verification lands.</li>
   </ul>
 </div>
 
@@ -60,10 +60,10 @@ The Playground lets you turn on additional knobs on top of whichever Deploy cell
 
 The knobs come in two flavors:
 
-- **Built-in SGLang features** — parallelism overrides (TP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
-- **Hy4 specific** — `--reasoning-parser auto` / `--tool-call-parser auto` resolve to the suffix-aware `hunyuan` parsers and read the real structural-token strings from the tokenizer vocab at runtime.
+- **Built-in SGLang features** — parallelism overrides (TP / DP-Attention), the MoE a2a backend (DeepEP, which sets EP = TP), reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
+- **Hy4 specific** — `--reasoning-parser auto` / `--tool-call-parser auto` resolve to the suffix-aware Hunyuan parsers and read the real structural-token strings from the tokenizer vocab at runtime.
 
-Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the base recipe but stripped by an override. Parallelism combinations beyond the listed recipes (DP-Attention, DeepEP/EP, other TP degrees) are experimentation territory — any override flips the badge to **Not Verified** until the configuration is run end-to-end and submitted back.
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the base recipe but stripped by an override. Parallelism combinations beyond the listed recipes (DP-Attention, DeepEP, other TP degrees) are experimentation territory — any override flips the badge to **Not Verified** until the configuration is run end-to-end and submitted back.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -78,7 +78,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Hy4-Preview** is Tencent's next-generation flagship Mixture-of-Experts language model: ~760B total parameters with ~40B active per token, pairing a DeepSeek-style MLA + sparse-attention stack with Hunyuan's own residual control, MoE routing, and attention gating. It is a **text-only** model (vocab 120,832; the endpoint rejects image input by design).
+**Hy4-Preview** is Tencent's next-generation flagship Mixture-of-Experts language model: 770B total parameters with 49B active per token, pairing a DeepSeek-style MLA + sparse-attention stack with Hunyuan's own residual control, MoE routing, and attention gating. It is a **text-only** model (vocab 120,832; the endpoint rejects image input by design), released under **Apache-2.0**.
 
 **Key architecture:**
 
@@ -86,7 +86,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **MLA + DSA on every layer**: Multi-head Latent Attention (`q_lora_rank` 2048, `kv_lora_rank` 512, 192 nope + 64 rope head dims, `v_head_dim` 256) under DeepSeek Sparse Attention — indexer top-k 2048 with 32 index heads, indexers alternating full/shared (one full indexer every 4 layers), and an FP8 index cache.
 - **iHC residual control**: Hunyuan's own inter-layer residual gating (`enable_ihc`, `hc_mult` 4) with pre- and post-residual gate groups. Semantically distinct from DeepSeek-V4's mHC (no combination step, no Sinkhorn) — the implementations are not interchangeable.
 - **Gated MLA + attention sink**: element-wise attention output gating evaluated in fp32, plus a learnable per-head attention sink propagated through all attention backends.
-- **MTP (NextN)**: one built-in multi-token-prediction draft layer (`model.mtp_layers.0`, present in both checkpoints) enabling speculative decoding out of the box.
+- **MTP (NextN)**: one built-in multi-token-prediction draft layer (`model.mtp_layers.0`, 10B parameters with ~0.7B active, present in both checkpoints) enabling speculative decoding out of the box.
 - **Long context**: 1M max positions (RoPE theta 1e7). Size `--context-length` to your KV budget — the sizing table in §2 suggests 262,144 (131,072 on H200).
 
 **Available models:**
@@ -94,9 +94,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - [tencent/Hy4-preview](https://huggingface.co/tencent/Hy4-preview) — BF16 (~1.5TB weights)
 - [tencent/Hy4-preview-FP8](https://huggingface.co/tencent/Hy4-preview-FP8) — MXFP8 (ModelOpt recipe, UE8M0 group-32 weight scales, dynamic activations; ~760GB weights)
 
-**Recommended generation:** SGLang applies the checkpoint's `generation_config.json` defaults — don't hardcode sampling parameters in client code. Thinking depth is controlled per request via OpenAI-standard `reasoning_effort` (`none` / `low` / `high`; see §3.1).
+**Recommended generation:** `temperature=0.9`, `top_p=1.0` (informational — SGLang applies the checkpoint's `generation_config.json` defaults; don't hardcode sampling parameters in client code). Thinking depth is controlled per request via `reasoning_effort` (defaults to `high`; `no_think` for direct responses — see §3.1).
 
-**Special tokens.** The Hy4-Preview tokenizer's structural tokens are suffix-bearing (`<think:opensource>`, `<tool_calls:opensource>`, `<tool_call:opensource>`, `<arg_key:opensource>`, `<arg_value:opensource>`). SGLang's `hunyuan` reasoning/tool-call parsers resolve the real token strings from the tokenizer vocab at runtime, so `--reasoning-parser auto --tool-call-parser auto` work out of the box — auto-detection resolves both to the `hunyuan` parsers.
+**Resources:** [HuggingFace](https://huggingface.co/tencent/Hy4-preview) · [GitHub](https://github.com/Tencent-Hunyuan/Hy4-preview).
+
+**Special tokens.** The Hy4-Preview tokenizer's structural tokens are suffix-bearing (`<think:opensource>`, `<tool_calls:opensource>`, `<tool_call:opensource>`, `<arg_key:opensource>`, `<arg_value:opensource>`). SGLang's Hunyuan reasoning/tool-call parsers resolve the real token strings from the tokenizer vocab at runtime, so `--reasoning-parser auto --tool-call-parser auto` work out of the box.
 
 ## 2. Configuration Tips
 
@@ -143,13 +145,13 @@ On H200 (BF16, TP16 → ~95GB of weights per rank) the per-rank pool holds rough
 
 **DSA attention backend.** Every layer runs DeepSeek Sparse Attention; SGLang auto-selects the DSA backend for HYV4 (`--attention-backend dsa` with `flashmla_sparse` prefill/decode and an FP8 indexer cache over a bf16 KV pool), so the recipes don't pass attention flags. Override only with a kernel-specific reason.
 
-**MXFP8 kernel stack.** The MXFP8 checkpoint self-describes via its ModelOpt `hf_quant_config` (dynamic activations, UE8M0 group-32 weight scales) — no `--quantization` flag needed; the recipes pin `--fp8-gemm-backend deep_gemm` with the `deep_gemm` MoE runner on B300/GB300 and the `triton` MoE runner on B200. The MXFP8 kernel path requires SM100+ (Blackwell); H200 (SM90) cannot serve the MXFP8 checkpoint — use BF16 there.
+**MXFP8 kernel stack.** The MXFP8 checkpoint self-describes via its ModelOpt `hf_quant_config` (dynamic activations, UE8M0 group-32 weight scales) — no `--quantization` flag needed; the recipes pin `--moe-runner-backend deep_gemm --fp8-gemm-backend deep_gemm`, the validated HYV4 MXFP8 path (the runtime also defaults both to `deep_gemm` for HYV4 when the flags are left unset). The MXFP8 kernel path requires SM100+ (Blackwell); H200 (SM90) cannot serve the MXFP8 checkpoint — use BF16 there.
 
 **CUDA graph decode vs eager.** Decode CUDA-graph capture is on by default; long-duration soak validation of the graph path on Hy4 is still in progress. If you hit instability under long mixed agentic workloads, pass `--disable-cuda-graph` to fall back to eager decode (a restart recovers cleanly either way).
 
 **MTP (NextN) speculative decoding.** Both checkpoints ship one draft layer; the preset is `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-num-draft-tokens 4` (top-k 1). Speculative decoding reserves 4 draft-token slots per request, so the effective request budget is `prompt_tokens + max_tokens + 4 ≤ context length` — requests at the exact context boundary are rejected with the reservation accounted for.
 
-**Fail-fast guardrails.** The model rejects pipeline parallelism and `--enable-prefill-cp` before allocation. The recipes run pure TP; EP, DP-Attention, and other TP degrees are Playground experimentation territory.
+**Fail-fast guardrails.** The model rejects pipeline parallelism and `--enable-prefill-cp` before allocation. The recipes run pure TP; DP-Attention, DeepEP (which sets EP = TP at runtime), and other TP degrees are Playground experimentation territory.
 
 **Multi-node BF16.** The BF16 weights don't fit a single H200/B200/GB300 host, so those cells are 2-node TP recipes — run the generated command on every node (the panel injects `--nnodes 2 --node-rank --dist-init-addr`) and keep the weights on storage shared across ranks.
 
@@ -161,7 +163,7 @@ On H200 (BF16, TP16 → ~95GB of weights per rank) the per-rank pool holds rough
 
 ### 3.1 Reasoning (`reasoning_effort`)
 
-Hy4-Preview is a hybrid-thinking model driven by the OpenAI-standard `reasoning_effort` field (`none` / `low` / `high` — note `none`, not `no_think`). Invalid values (including float efforts) are rejected with HTTP 400. The Deploy recipes enable the reasoning parser (`--reasoning-parser auto`) so thinking is separated into `reasoning_content` and the final answer into `content`:
+Hy4-Preview is a hybrid-thinking model: reasoning defaults to `high` (deep chain-of-thought — suits math, coding, and agentic tasks). The top-level OpenAI `reasoning_effort` field accepts the standard tiers (e.g. `high`); for direct responses, pass the model-specific `no_think` through `extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}}`. The Deploy recipes enable the reasoning parser (`--reasoning-parser auto`) so thinking is separated into `reasoning_content` and the final answer into `content`:
 
 <Accordion title="Example: thinking (reasoning_effort=high) (Python)">
 
@@ -194,7 +196,7 @@ Pending update — will be captured verbatim from a live Hy4-Preview server.
 
 </Accordion>
 
-<Accordion title="Example: instant mode (reasoning_effort=none) (Python)">
+<Accordion title="Example: instant mode (reasoning_effort=no_think) (Python)">
 
 ```python Example
 from openai import OpenAI
@@ -204,7 +206,7 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="tencent/Hy4-preview-FP8",
     messages=[{"role": "user", "content": "Give me a one-line summary of relativity."}],
-    reasoning_effort="none",
+    extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}},
     max_tokens=256,
 )
 
@@ -223,7 +225,7 @@ Pending update — will be captured verbatim from a live Hy4-Preview server.
 
 ### 3.2 Tool Calling
 
-Hy4-Preview emits tool calls through suffixed structural tokens with an `arg_key` / `arg_value` argument format; SGLang's `hunyuan` tool-call parser reassembles them into OpenAI-compatible `message.tool_calls` with schema-aware type coercion, for both streaming and non-streaming requests. The Deploy recipes enable both parsers together (`--reasoning-parser auto --tool-call-parser auto`) — the reasoning parser strips thinking tokens before the tool-call parser runs.
+Hy4-Preview emits tool calls through suffixed structural tokens with an `arg_key` / `arg_value` argument format; SGLang's Hunyuan tool-call parser reassembles them into OpenAI-compatible `message.tool_calls` with schema-aware type coercion, for both streaming and non-streaming requests. The Deploy recipes enable both parsers together (`--reasoning-parser auto --tool-call-parser auto`) — the reasoning parser strips thinking tokens before the tool-call parser runs.
 
 <Note>
 Tool-call output is parsed, not grammar-constrained: `tool_choice: "required"` / named-function forcing is not enforced with structural-tag guided decoding on the current implementation.
