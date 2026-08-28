@@ -641,7 +641,8 @@ class QwenImageCrossAttention(nn.Module):
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
-        # Scaled dot product attention
+        # Despite the historical class name, this is joint text-image
+        # self-attention: Q/K/V are concatenated before the kernel call.
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self.head_dim,

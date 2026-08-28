@@ -1,0 +1,270 @@
+---
+title: GLM-5.3-Flash
+description: "Deploy GLM-5.3-Flash with SGLang using NVIDIA CUDA and AMD ROCm recipes, with MTP and multimodal serving where validated."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+Use an SGLang build that includes GLM-5.3-Flash support. The AMD ROCm recipes also require [the ROCm engine changes in PR #36607](https://github.com/sgl-project/sglang/pull/36607) until they are available in a published SGLang image.
+
+```bash Command
+docker pull lmsysorg/sglang:glm-5.3-flash
+```
+
+The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
+
+</Accordion>
+
+Choose your hardware, then choose the operating point that matches your workload:
+
+- **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
+- **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
+
+NVIDIA platforms expose both strategies. AMD ROCm currently exposes only the non-speculative High Throughput recipe because MTP has not been validated there. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+
+The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
+import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<Note>
+Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
+</Note>
+
+## Playground
+
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model introduction
+
+GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a hybrid attention architecture — 320B total parameters with 18B active. Its 45 text layers combine MLA attention, DSA sparse attention, and KDA linear attention, and a 24-layer vision encoder handles image and video input. The checkpoint uses 288 routed experts with 8 active experts per token and includes a native MTP draft layer for speculative decoding. See the [GLM-5.3-Flash blog](https://z.ai/blog/glm-5.3-flash) and the [GLM-5 technical report](https://arxiv.org/abs/2602.15763) for training details.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "28%"}} />
+    <col style={{width: "72%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Attribute</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Architecture</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE with hybrid attention (MLA, DSA, KDA), mHC, and MTP — 320B total / 18B active parameters</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Precision</td>
+      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100, H200, and the AMD ROCm recipes</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1M tokens</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Inputs</td>
+      <td style={{padding: "9px 12px"}}>Text, image, and video</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Generation defaults</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>temperature=1.0</code>, <code>top_p=0.95</code>, thinking enabled</td>
+    </tr>
+  </tbody>
+</table>
+
+The deployment recipes use the checkpoint's generation configuration. Override sampling only when your application has its own evaluated settings.
+
+## 2. Configuration tips
+
+### Choose a strategy
+
+Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE` (upstream folds the older NEXTN spelling into EAGLE), so generated commands use that flag value.
+
+Strategy labels describe the workload goal. Both strategies stay available on NVIDIA GPUs; the AMD ROCm recipes expose only High Throughput until MTP speculative decoding is validated there.
+
+### Change the speculative algorithm
+
+The **Speculative** card in the Playground changes the algorithm without leaving the selected strategy:
+
+- **EAGLE / Adaptive MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
+- **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
+- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
+
+Neither algorithm runs with DP-Attention, and neither is available on the AMD ROCm recipes; the card disables the affected chips and names the reason.
+
+### Size both memory pools
+
+GLM-5.3-Flash maintains a paged KV pool for attention and a separate KDA state pool. The KDA state pool can limit concurrency before the KV pool is full. If startup reduces `max_running_requests` because of KDA state capacity, increase `--mamba-full-memory-ratio` or set `--max-mamba-cache-size` for the expected concurrency, then tune `--max-running-requests` to the workload.
+
+Keep the prefix cache enabled for every strategy.
+
+Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not override `linear_lower_bound` through `--json-model-override-args`.
+
+### Keep the KV and DSA backends paired
+
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
+
+On AMD ROCm, use BF16 KV cache with TileLang DSA, set `SGLANG_USE_AITER=1`, keep the MoE runner on Triton, and disable CUDA graphs. The ROCm recipe uses TP8 on a single eight-GPU node. MI300X and MI325X both use gfx942, but the MI325X entry remains explicitly unverified because it is inferred from MI300X rather than measured directly. AMD validation covers text generation and GSM8K only; multimodal serving remains unverified.
+
+### Decode context parallelism
+
+Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
+
+### Extend the cache hierarchy
+
+Keep **HiCache** off when GPU memory is sufficient. Select **L1 + L2** to spill reusable cache entries into host memory. Select **+ L3** only after configuring Mooncake on every serving node; the generated command exposes the required configuration path. These options remain selectable but are marked **Not Verified** until the resulting command is validated on the chosen hardware.
+
+### Multimodal memory
+
+All strategies enable multimodal serving. The processor samples video at 2 FPS and caps video input at 240,000 visual tokens. Install `torchcodec` in the serving environment before sending video requests. For very long videos on 4x GB300, use encoder disaggregation to isolate the vision encoder's memory spikes from language decoding.
+
+The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
+
+## 3. Advanced usage
+
+### 3.1 Reasoning
+
+Thinking is enabled by the checkpoint's generation configuration, and generated commands enable `--reasoning-parser glm45` by default. The OpenAI-compatible API then places thinking in `message.reasoning_content` and the final answer in `message.content`. You can disable **Reasoning Parser** in the Playground when an integration needs the raw response format.
+
+To disable thinking for a request, pass `chat_template_kwargs: {"thinking": false}` in the request body.
+
+### 3.2 Tool calling
+
+Generated commands enable `--tool-call-parser glm47` by default, so structured calls are returned in `message.tool_calls`. You can disable **Tool Call Parser** in the Playground when tool calling is not needed. On follow-up turns, read both `reasoning_content` and `content` because a thinking model can use either field around tool execution.
+
+### 3.3 Multimodal serving
+
+The base recipes accept image and video content through the OpenAI-compatible chat API. Keep the processor defaults unless you have measured a different sampling or resize policy. Inputs above the video token budget are clamped to the processor's limit rather than rejected.
+
+### 3.4 Encoder disaggregation
+
+Encoder disaggregation separates vision preprocessing from language inference. The verified topology uses one 4x GB300 node shared by an encoder-only TP4 process on port 30001 and a language-only TP4/EP4 process on port 30000. Start the encoder first.
+
+<Accordion title="Encoder server (GB300)">
+
+```bash Command
+sglang serve \
+  --model-path zai-org/GLM-5.3-Flash \
+  --tp-size 4 \
+  --encoder-only \
+  --host 0.0.0.0 \
+  --port 30001
+```
+
+</Accordion>
+
+<Accordion title="Language server (GB300)">
+
+```bash Command
+sglang serve \
+  --model-path zai-org/GLM-5.3-Flash \
+  --tp-size 4 \
+  --ep-size 4 \
+  --attention-backend dsa \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --linear-attn-backend triton \
+  --kv-cache-dtype bfloat16 \
+  --quantization fp8 \
+  --moe-runner-backend deep_gemm \
+  --max-running-requests 64 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --disable-shared-experts-fusion \
+  --disable-prefill-cuda-graph \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-adaptive \
+  --language-only \
+  --encoder-urls http://localhost:30001 \
+  --mem-fraction-static 0.78 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+</Accordion>
+
+This topology served image requests and videos up to 238,080 visual tokens. In a concurrent long-video workload, the largest observed decode gap fell from 5.53 seconds in unified serving to 1.79 seconds with encoder disaggregation. Keep `--mem-fraction-static 0.78` on the language process so the encoder retains room for vision workspaces.
+
+Install `torchcodec` for video and see the [encoder disaggregation guide](/docs/advanced_features/epd_disaggregation) for the generic architecture and operational model.
+
+### 3.5 PD disaggregation (preview)
+
+PD splits prefill and decode into separate server groups behind a router. For this hybrid model, the transfer moves both the paged DSA KV and the KDA recurrent state.
+
+<Warning>
+PD serving is mechanically validated with dummy weights only — startup, bootstrap, state transfer, and request flow all work on 4x GB300. It has not been load- or accuracy-tested. Treat it as a preview until the real-weight gate completes.
+</Warning>
+
+<Accordion title="PD serving on 4x GB300 (single node)">
+
+```bash Prefill (GPU 0-1)
+sglang serve \
+  --model-path zai-org/GLM-5.3-Flash \
+  --tp-size 2 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --kv-cache-dtype bfloat16 \
+  --moe-runner-backend triton \
+  --disaggregation-mode prefill \
+  --disaggregation-bootstrap-port 8998 \
+  --disaggregation-transfer-backend nixl \
+  --host 0.0.0.0 \
+  --port 31000
+```
+
+```bash Decode (GPU 2-3)
+sglang serve \
+  --model-path zai-org/GLM-5.3-Flash \
+  --tp-size 2 \
+  --base-gpu-id 2 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --kv-cache-dtype bfloat16 \
+  --moe-runner-backend triton \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend nixl \
+  --host 0.0.0.0 \
+  --port 32000
+```
+
+```bash Router
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --mini-lb \
+  --prefill http://127.0.0.1:31000 8998 \
+  --decode http://127.0.0.1:32000 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+The positional `8998` after `--prefill` must equal the prefill server's `--disaggregation-bootstrap-port`.
+
+</Accordion>
+
+Operational notes:
+
+- Give each role a distinct `--nccl-port` when both share one node.
+- Single-node NIXL needs `UCX_NET_DEVICES=lo` and `UCX_TLS=tcp,cuda_copy,cuda_ipc,self,sm` in both server environments.
+- The validated arm used the triton MoE runner; deep_gemm under PD is untested.
+
+Known limitations:
+
+- Speculative decoding does not start under PD at the current cut (draft-graph capture width assert on the prefill role; decode-side memory pressure at TP2). Run PD without speculative flags.
+- Prefill and decode with different TP sizes transfer state through slice paths, but numeric correctness is unverified. Keep both roles at the same TP size.

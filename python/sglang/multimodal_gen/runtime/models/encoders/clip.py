@@ -17,12 +17,12 @@ from sglang.multimodal_gen.configs.models.encoders import (
     CLIPTextConfig,
     CLIPVisionConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.vision import (
     resolve_visual_encoder_outputs,
 )
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.clip import (
     CLIPEncoder,
     CLIPTextEmbeddings,
@@ -337,6 +337,9 @@ class CLIPVisionModel(ImageEncoder):
     config_class = CLIPVisionConfig
     main_input_name = "pixel_values"
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    # CLIPEncoder and its linears come from SRT, so their serialized checkpoint
+    # format must use the matching SRT quantization implementation.
+    checkpoint_quantization_backend = "srt"
 
     def __init__(self, config: CLIPVisionConfig) -> None:
         super().__init__(config)
