@@ -45,6 +45,10 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.beam_search.output import (
+    build_beam_search_out,
+    try_build_beam_search_out_dict,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
@@ -123,7 +127,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_context,
     get_device,
     get_disagg,
@@ -409,7 +413,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
-        ensure_published(server_args, role="tokenizer")
+        assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
         self.elastic_pending_ep_size = None
@@ -486,7 +490,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
-            _processor = get_processor_wrapper(server_args)
+            _processor = get_processor_wrapper()
             transport_mode = determine_tensor_transport_mode()
 
             # We want to parallelize the image pre-processing so we create an executor for it
@@ -663,9 +667,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = (
-            start_disagg_service(self.server_args)
-            if start_pd_bootstrap_service
-            else None
+            start_disagg_service() if start_pd_bootstrap_service else None
         )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
@@ -761,7 +763,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
             ]
         )
-        self.init_communicators(self.server_args)
+        self.init_communicators()
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
@@ -1743,6 +1745,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 out["text"] = state.get_text()
 
+            # Flattened so the downstream finished/logging/metrics logic is shared.
+            if out.get("beam_results"):
+                if not finished:
+                    # Intermediate beam output; skip until finished.
+                    continue
+                out = build_beam_search_out(out)
+
             if finished:
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2040,7 +2049,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return self.resolved_config_dict(dataclasses.asdict(self.server_args))
+            return self.resolved_config_dict(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
             return None
@@ -2307,7 +2316,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
-            if isinstance(recv_obj, BatchStrOutput):
+
+            # Must run after meta_info is fully populated.
+            beam_out_dict = try_build_beam_search_out_dict(recv_obj, i, meta_info)
+
+            if beam_out_dict is not None:
+                out_dict = beam_out_dict
+            elif isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
@@ -3151,7 +3166,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
-        kill_process_tree(os.getpid(), include_parent=True)
+        kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         sys.exit(0)
 
     def force_exit_handler(self):
@@ -3587,13 +3602,13 @@ async def print_exception_wrapper(func):
         sys.exit(1)
 
 
-def get_processor_wrapper(server_args):
+def get_processor_wrapper():
     return get_processor(
         get_serving().tokenizer_path,
         tokenizer_mode=get_serving().tokenizer_mode,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_model().revision,
-        image_processor_backend=resolve_image_processor_backend(server_args),
+        image_processor_backend=resolve_image_processor_backend(get_mm()),
         tokenizer_backend=get_serving().tokenizer_backend,
         model_name=get_model().model_path,
     )
