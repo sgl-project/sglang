@@ -2747,6 +2747,12 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "cache"
+    enable_mla_hicache_host_dedup: A[
+        bool,
+        "Deduplicate MLA/DSA HiCache host KV across attention-TP ranks. "
+        "Disabled by default.",
+        NS("memory"),
+    ] = False
     hicache_ratio: A[
         Optional[float],
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
@@ -8269,6 +8275,11 @@ class ServerArgs:
         2) Storage <-> layout compatibility (may rewrite layout).
         """
         cfg = resolving_view(self)
+        if cfg.enable_mla_hicache_host_dedup and cfg.enable_dsa_cache_layer_split:
+            raise ValueError(
+                "--enable-mla-hicache-host-dedup cannot be used with "
+                "--enable-dsa-cache-layer-split."
+            )
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             cfg.enable_hierarchical_cache
