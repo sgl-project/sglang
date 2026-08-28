@@ -20,10 +20,13 @@ from sglang.srt.hardware_backend.npu.quantization import fp4_moe_methods
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A4Fp4MoEMethod,
     _apply_swiglu_limit_npu,
-    _pair_pack_mxfp_act_scale,
-    _reshape_mxfp4_scale_for_npu,
     npu_apply_without_routing_weights_w4a4_mxfp,
     npu_fused_experts_w4a4_mxfp,
+)
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    _pair_pack_mxfp_act_scale,
+    prepare_w4a8_mxfp_weight,
+    reshape_w4a8_mxfp_weight_scale_for_npu,
     w4a8_mxfp_gmm,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -72,13 +75,35 @@ class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):
         # [E, N, K/32] -> [E, K/64, N, 2] is the packed-pair layout the GMM reads;
         # getting the transpose axis wrong silently dequantizes with the wrong scale.
         scale = torch.arange(8, dtype=torch.uint8).view(1, 2, 4)
-        out = _reshape_mxfp4_scale_for_npu(scale)
+        out = reshape_w4a8_mxfp_weight_scale_for_npu(scale)
         self.assertEqual(tuple(out.shape), (1, 2, 2, 2))
         self.assertTrue(torch.equal(out, scale.view(1, 2, 2, 2).transpose(1, 2)))
 
     def test_rejects_odd_k_dim(self):
         with self.assertRaises(ValueError):
-            _reshape_mxfp4_scale_for_npu(torch.zeros(1, 2, 3, dtype=torch.uint8))
+            reshape_w4a8_mxfp_weight_scale_for_npu(
+                torch.zeros(1, 2, 3, dtype=torch.uint8)
+            )
+
+
+class TestPrepareW4A8MxfpWeight(unittest.TestCase):
+    def test_uses_shared_weight_and_scale_layout(self):
+        # A wrong transpose or scale packing makes both ModelSlim W4A8 and
+        # DeepSeek-V4 W4A8 read different blocks from the same checkpoint.
+        weight = torch.arange(16, dtype=torch.uint8).view(1, 2, 8)
+        scale = torch.arange(8, dtype=torch.uint8).view(1, 2, 4)
+        formatted_weight = torch.arange(16, dtype=torch.uint8).view(1, 2, 8)
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.quantization.moe_methods.npu_format_cast",
+            return_value=formatted_weight,
+        ):
+            prepared_weight, prepared_scale = prepare_w4a8_mxfp_weight(weight, scale)
+
+        self.assertTrue(torch.equal(prepared_weight, formatted_weight.transpose(1, 2)))
+        self.assertTrue(
+            torch.equal(prepared_scale, scale.view(1, 2, 2, 2).transpose(1, 2))
+        )
 
 
 class TestMxfp4ScaleWeightLoader(unittest.TestCase):

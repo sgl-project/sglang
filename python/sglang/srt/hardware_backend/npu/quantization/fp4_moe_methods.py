@@ -9,9 +9,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    _get_float4_e2m1fn_x2_dtype,
-    _get_float8_e8m0fnu_dtype,
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    prepare_w4a8_mxfp_weight,
+    w4a8_mxfp_gmm,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
@@ -116,7 +116,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         self._fp8.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
+        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
 
         if layer.w13_weight_scale_inv.data.max() == 0:
             raise RuntimeError(
@@ -131,26 +131,19 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
                 "not match w2_weight_scale_inv."
             )
 
-        nz_kwargs = {
-            "customize_dtype": torch.float8_e4m3fn,
-            "input_dtype": _get_float4_e2m1fn_x2_dtype(),
-        }
         nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
-        layer.w13_weight.data = npu_format_cast(
-            layer.w13_weight.data.view(torch.uint8), nz_format, **nz_kwargs
-        ).transpose(1, 2)
-        layer.w2_weight.data = npu_format_cast(
-            layer.w2_weight.data.view(torch.uint8), nz_format, **nz_kwargs
-        ).transpose(1, 2)
-
-        layer.w13_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
-            requires_grad=False,
+        layer.w13_weight.data, w13_scale = prepare_w4a8_mxfp_weight(
+            layer.w13_weight.data.view(torch.uint8),
+            layer.w13_weight_scale_inv.data,
+            npu_format=nz_format,
         )
-        layer.w2_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
-            requires_grad=False,
+        layer.w2_weight.data, w2_scale = prepare_w4a8_mxfp_weight(
+            layer.w2_weight.data.view(torch.uint8),
+            layer.w2_weight_scale_inv.data,
+            npu_format=nz_format,
         )
+        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
@@ -191,19 +184,6 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             swiglu_limit=moe_runner_config.swiglu_limit,
         )
         return StandardCombineInput(hidden_states=output)
-
-
-def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
-    """``[E, N, K/32] -> [E, K/64, N, 2]``, the packed-pair layout the GMM wants."""
-    if scale.dim() != 3:
-        return scale
-    num_experts, n, k32 = scale.shape
-    if k32 % 2 != 0:
-        raise ValueError(
-            "MXFP4 scale K dimension must be divisible by 2 for the "
-            f"[E, K/64, N, 2] layout, got {tuple(scale.shape)}."
-        )
-    return scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
 
 
 def _apply_swiglu_limit_npu(
@@ -478,61 +458,3 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-
-
-def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
-    """``[M, K/32] -> [M, K/64, 2]`` MX per-token scale layout for the A5 GMM."""
-    if scale.ndim != 2:
-        return scale
-    if scale.shape[-1] % 2 != 0:
-        raise ValueError(f"Invalid MXFP per-token scale shape: {tuple(scale.shape)}")
-    return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
-
-
-def w4a8_mxfp_gmm(
-    *,
-    input: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_list_type: int,
-    group_list: torch.Tensor,
-    output_dtype: torch.dtype,
-    scale_alg=None,
-) -> torch.Tensor:
-    """FP4 weight x FP8-e4m3 activation (the checkpoint's W4A8_MXFP scheme).
-
-    W4A8MXFP GMM call: FP8 ``x_dtype``, FP4
-    ``weight_dtype``, and the weight block scales fed through ``antiquant_scale``
-    with ``scale=None`` — the ``scale=`` + ``scale_dtype=`` form belongs to
-    W4A4_MXFP4 and dequantizes differently.
-    """
-    group_list = group_list.to(torch.int64)
-    if input_scale is None:
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            input,
-            axis=1,
-            round_mode="rint",
-            dst_type=torch.float8_e4m3fn,
-            block_size=MXFP4_BLOCK_SIZE,
-            scale_alg=scale_alg,
-        )
-    else:
-        x, x_scale = input, input_scale
-
-    return torch.ops.npu.npu_grouped_matmul(
-        [x],
-        [weight],
-        scale=None,
-        antiquant_scale=[weight_scale],
-        scale_dtype=None,
-        per_token_scale=[_pair_pack_mxfp_act_scale(x_scale)],
-        split_item=2,
-        group_type=0,
-        group_list=group_list,
-        group_list_type=group_list_type,
-        output_dtype=output_dtype,
-        x_dtype=torch.float8_e4m3fn,
-        weight_dtype=_get_float4_e2m1fn_x2_dtype(),
-        per_token_scale_dtype=_get_float8_e8m0fnu_dtype(),
-    )[0]
