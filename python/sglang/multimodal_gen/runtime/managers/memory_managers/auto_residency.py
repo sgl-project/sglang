@@ -1775,13 +1775,15 @@ def _unconfigured_layerwise_targets(
     coarse_savings = max(0, maximum_transfer_work - coarse_transfer_work)
     current_resident = current_mode == RESIDENT
     current_inactive_bytes = full_weight_bytes if current_resident else 0
-    host_materialize_scratch = max(
-        (
-            weight_bytes
-            for manager in managers
-            for weight_bytes in manager.layer_host_store_bytes().values()
-        ),
-        default=0,
+    layer_host_store_bytes = [
+        weight_bytes
+        for manager in managers
+        for weight_bytes in manager.layer_host_store_bytes().values()
+    ]
+    host_materialize_scratch = (
+        sum(layer_host_store_bytes)
+        if current_resident
+        else max(layer_host_store_bytes, default=0)
     )
     targets = []
     for resident_layers in _layerwise_resident_targets(managers, layer_uses=layer_uses):

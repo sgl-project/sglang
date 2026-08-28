@@ -3761,6 +3761,14 @@ class TestCollectResidencyTargets:
             for candidate in candidates
             if candidate.target_mode() == LAYERWISE_OFFLOAD
         )
+        resident = next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        )
+        assert {
+            candidate.host_materialize_scratch_bytes
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        } == {resident.target_device_weight_bytes}
 
     def test_resident_seed_preserves_unconfigured_layerwise_frontier(self):
         module = _FakeLazyLayerwiseDit(num_layers=3)
@@ -3803,6 +3811,14 @@ class TestCollectResidencyTargets:
         )
         assert streamed.device_transition_delta_bytes == 0
         assert streamed.active_device_delta_bytes < 0
+        resident = next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        )
+        assert (
+            0
+            < streamed.host_materialize_scratch_bytes
+            < resident.target_device_weight_bytes
+        )
 
     def test_virtual_layerwise_frontier_includes_host_pin_prefixes(self):
         module = _FakeLazyLayerwiseDit(num_layers=3)
