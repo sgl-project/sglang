@@ -149,6 +149,13 @@ def _uses_modelopt_fp8_pb_wo(
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
 
 
+def _uses_split_gguf_kv_b(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether a K3 checkpoint stores MLA K/V as separate GGUF tensors."""
+    return bool(getattr(quant_config, "supports_kimi_k3_split_gguf_kv_b", False))
+
+
 def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
     """Map ModelOpt FP8_PB_WO scale keys to SGLang block-FP8 params."""
     if name.endswith(".weight_scale"):
@@ -524,15 +531,17 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends (megamoe / DeepEP / MoRI) move each row to its
-        # experts directly, so the MoE region can consume whatever rows this
-        # rank holds — an SP-MoE token shard (attn_tp > 1) or the DP-local
-        # batch (DP attention) — with every global token dispatched exactly
-        # once. No DP gather and no TP reduce is needed anywhere in the region.
+        # EP a2a backends (megamoe / DeepEP / Mooncake / Ascend-FuseEP / MoRI)
+        # move each row to its experts directly, so the MoE region can consume
+        # whatever rows this rank holds — an SP-MoE token shard (attn_tp > 1) or
+        # the DP-local batch (DP attention) — with every global token dispatched
+        # exactly once. No DP gather and no TP reduce is needed anywhere in the
+        # region.
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
             or _a2a_backend.is_deepep()
+            or _a2a_backend.is_mooncake()
             or _a2a_backend.is_ascend_fuseep()
             or _a2a_backend.is_mori()
         )
@@ -1898,9 +1907,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        split_gguf_kv_b = getattr(
-            quant_config, "supports_kimi_k3_quantized_latent_projections", False
-        )
+        # ModelSlim can quantize K3 latent projections while still storing
+        # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
+        split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
@@ -2155,8 +2164,9 @@ class KimiK3DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        # SP-MoE (EP a2a backend — megamoe, DeepEP or MoRI): o_proj defers its
-        # attention-TP reduction; this layer completes it as a reduce-scatter
+        # SP-MoE (EP a2a backend — megamoe, DeepEP, Mooncake, Ascend-FuseEP or
+        # MoRI): o_proj defers its attention-TP reduction; this layer completes
+        # it as a reduce-scatter
         # so the whole MoE region (agg2, norms, gate, latent projs, tp1
         # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
         # then all-gathers rows back after the MoE tail add. RS+AG moves the
@@ -2177,6 +2187,7 @@ class KimiK3DecoderLayer(nn.Module):
             (
                 _a2a_backend.is_megamoe()
                 or _a2a_backend.is_deepep()
+                or _a2a_backend.is_mooncake()
                 or _a2a_backend.is_ascend_fuseep()
                 or _a2a_backend.is_mori()
             )
