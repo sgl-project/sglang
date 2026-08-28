@@ -4007,6 +4007,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.update_full_coexisting_host_tracking_(node_id);
     }
 
+    /// Advance one suspended insert walk step without flushing its pending actions.
+    pub fn inspect_advance_insert_walk_once(&mut self) -> Result<(), &'static str> {
+        let Some(mut state) = self.ongoing_insert_walk_state.take() else {
+            return Err("no in-flight insert");
+        };
+        if !matches!(state.phase, InsertPhase::Walk) {
+            self.ongoing_insert_walk_state = Some(state);
+            return Err("in-flight insert is not in walk phase");
+        }
+        self.insert_walk_step_(&mut state);
+        self.ongoing_insert_walk_state = Some(state);
+        Ok(())
+    }
+
     /// Evict one component layer and detach the corresponding LRU entry.
     pub fn inspect_evict_component(
         &mut self,

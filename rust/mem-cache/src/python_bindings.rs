@@ -1897,6 +1897,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().inspect_update_duplicate_tracking(node_id));
     }
 
+    fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.core().inspect_advance_insert_walk_once())
+            .map_err(PyRuntimeError::new_err)
+    }
+
     fn inspect_evict_component(
         &self,
         py: Python<'_>,
@@ -2776,6 +2781,10 @@ macro_rules! tree_core_binding {
 
             fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) {
                 self.inner.inspect_update_duplicate_tracking(py, node_id)
+            }
+
+            fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
+                self.inner.inspect_advance_insert_walk_once(py)
             }
 
             fn inspect_evict_component(

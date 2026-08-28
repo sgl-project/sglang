@@ -659,9 +659,7 @@ class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
             },
         )
 
-        self.assertEqual(
-            _device_value(cache, shared, ComponentType.SWA).tolist(), [20]
-        )
+        self.assertEqual(_device_value(cache, shared, ComponentType.SWA).tolist(), [20])
         self.assertTrue(
             any(isinstance(action, RebuildFullToSWAMapping) for action in actions)
         )
@@ -1918,9 +1916,7 @@ class UnifiedRadixCacheSuite:
         skipped = cache.inc_lock_ref(
             node_a, skip_lock_components=(ComponentType.MAMBA,)
         )
-        self.assertEqual(
-            skipped.skip_lock_node_ids, {ComponentType.MAMBA: {node_a}}
-        )
+        self.assertEqual(skipped.skip_lock_node_ids, {ComponentType.MAMBA: {node_a}})
         self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
 
         cache.dec_swa_lock_only(
@@ -3885,8 +3881,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
         cons.pop_prefetch_loaded_tokens(req_id)
@@ -6733,12 +6731,8 @@ class TestMambaCheckpointGrid(CustomTestCase):
         leaf = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         ).last_device_node
-        cache.tree_core.set_component_device_value_raw(
-            leaf, ComponentType.MAMBA, None
-        )
-        result = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)))
-        )
+        cache.tree_core.set_component_device_value_raw(leaf, ComponentType.MAMBA, None)
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
         self.assertEqual(result.full_kv_hit_length, full_hit_length)
         self.assertEqual(len(result.device_indices), tree_page_size)
         return result.mamba_branching_seqlen
@@ -7297,26 +7291,34 @@ class TestResumableInsertWalk(_InsertWalkSuite):
     def test_insert_abort_drains_pending_deferred_frees(self):
         """A mid-insert failure after a deferred dup-free accumulated must still
         return those slots to the allocator via the end_insert drain."""
-        if _selected_tree_core_test_backend() == "rust":
-            # TODO(Jialin): Remove this skip in a later commit in this PR once
-            # the Rust backend can exercise the same insert-abort path.
-            self.skipTest("patches the Python Full component implementation")
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        cache.write_through_threshold = sys.maxsize
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
+        self._insert(cache, allocator, req_to_token_pool, [1, 2])
 
-        # The overlap walk defers a 4-slot dup-free; the commit hook then raises.
+        (parent,) = _node_children(cache, cache.root_node_handle())
+        cache.write_through_threshold = cache.tree_core.get_node_hit_count(parent) + 1
+
+        # The parent emits a backup barrier. The injected failure advances the
+        # next overlap step, leaving its duplicate free pending in TreeCore.
         available = allocator.available_size()
-        full_comp = cache.components[ComponentType.FULL]
+
+        def fail_after_one_walk_step():
+            cache.tree_core.advance_insert_walk_once()
+            raise RuntimeError("boom")
+
         with mock.patch.object(
-            full_comp, "commit_insert_component_data", side_effect=RuntimeError("boom")
+            cache.tree_core, "resume_insert", fail_after_one_walk_step
         ):
             with self.assertRaises(RuntimeError):
-                self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
+                self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
 
-        # 8 alloc'd for the insert, 4 dup slots drained back on abort.
-        self.assertEqual(allocator.available_size(), available - 4)
+        # All four duplicate slots are returned: two at the barrier, then two
+        # from end_insert after the injected abort.
+        self.assertEqual(allocator.available_size(), available)
         self.assertFalse(cache.tree_core.has_ongoing_insert())
+        cache.writing_check()
+        cache.sanity_check()
 
     def test_deferrable_actions_ride_final_step_without_suspension(self):
         """A walk whose only actions are deferrable frees completes in a single

@@ -167,6 +167,9 @@ class RustUnifiedTreeCoreInspector(
     def update_duplicate_tracking(self, node_id: NodeId) -> None:
         self._binding.inspect_update_duplicate_tracking(node_id)
 
+    def advance_insert_walk_once(self) -> None:
+        self._binding.inspect_advance_insert_walk_once()
+
     def evict_component(
         self,
         node_id: NodeId,
