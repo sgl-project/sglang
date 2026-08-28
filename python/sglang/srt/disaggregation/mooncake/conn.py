@@ -1853,12 +1853,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             )
                             if ret != 0:
                                 with self.session_lock:
-                                    self.session_failures[
-                                        req.mooncake_session_id
-                                    ] += 1
-                                    self.failed_sessions.add(
-                                        req.mooncake_session_id
-                                    )
+                                    self.session_failures[req.mooncake_session_id] += 1
+                                    self.failed_sessions.add(req.mooncake_session_id)
                                 self.record_failure(
                                     kv_chunk.room,
                                     f"Failed to send aux data of {kv_chunk.room} to "
@@ -1874,9 +1870,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 )
                                 break
 
-                        kv_chunk.staging_completed_sessions.add(
-                            req.mooncake_session_id
-                        )
+                        kv_chunk.staging_completed_sessions.add(req.mooncake_session_id)
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -1900,15 +1894,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                if kv_chunk.is_last_chunk and self.check_status(
-                    kv_chunk.room
-                ) != KVPoll.Failed:
+                if (
+                    kv_chunk.is_last_chunk
+                    and self.check_status(kv_chunk.room) != KVPoll.Failed
+                ):
                     non_dummy_reqs = [
                         req for req in reqs_to_be_processed if not req.is_dummy
                     ]
-                    if len(kv_chunk.staging_completed_sessions) == len(
-                        non_dummy_reqs
-                    ):
+                    if len(kv_chunk.staging_completed_sessions) == len(non_dummy_reqs):
                         self.update_status(kv_chunk.room, KVPoll.Success)
                         for req in non_dummy_reqs:
                             self.sync_status_to_decode_endpoint(

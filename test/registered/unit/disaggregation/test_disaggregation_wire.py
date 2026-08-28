@@ -10,13 +10,13 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.staging_buffer import (
+    StagingAllocator,
+)
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     handle_staging_req,
     is_watermark_ready,
-)
-from sglang.srt.disaggregation.common.staging_buffer import (
-    StagingAllocator,
 )
 from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
@@ -233,9 +233,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         bootstrap_info = {"host": "prefill", "port": 7200}
         receiver = SimpleNamespace(
             bootstrap_infos=[bootstrap_info],
-            _connect_to_bootstrap_server=Mock(
-                return_value=(sock, threading.Lock())
-            ),
+            _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
         )
         handler = object.__new__(DecodeStagingHandler)
         handler.staging_allocator = SimpleNamespace(
@@ -346,9 +344,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         manager._staging_ctx = SimpleNamespace(
             prefetch_requested=set(), prefetched_rooms=set()
         )
-        manager.transfer_infos = {
-            room: {req.mooncake_session_id: req for req in reqs}
-        }
+        manager.transfer_infos = {room: {req.mooncake_session_id: req for req in reqs}}
         manager.req_to_decode_prefix_len = {room: 0}
         manager.request_status = status
         manager.check_status = lambda checked_room: status[checked_room]
@@ -373,9 +369,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         manager.pp_rank = 0
         manager.bootstrap_port = 7200
         manager._try_create_staging_strategy = Mock(return_value=object())
-        manager._get_dsa_cache_transfer_skip_flags = Mock(
-            return_value=(False, False)
-        )
+        manager._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
         manager.send_aux = Mock(return_value=0)
         manager.record_failure = Mock()
 
@@ -394,12 +388,8 @@ class TestMooncakePPStaging(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
             manager.transfer_worker(queue, Mock(), staging_buffer=object())
 
-        self.assertEqual(
-            transfer_calls, ["session-0", "session-1", "session-1"]
-        )
-        self.assertEqual(
-            chunk.staging_completed_sessions, {"session-0", "session-1"}
-        )
+        self.assertEqual(transfer_calls, ["session-0", "session-1", "session-1"])
+        self.assertEqual(chunk.staging_completed_sessions, {"session-0", "session-1"})
         self.assertEqual(manager.send_aux.call_count, 2)
         self.assertEqual(manager.sync_status_to_decode_endpoint.call_count, 2)
         self.assertEqual(status[room], KVPoll.Success)

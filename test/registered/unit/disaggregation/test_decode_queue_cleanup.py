@@ -268,17 +268,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
 
         self.assertFalse(
-            SchedulerDisaggregationDecodeMixin._stage_completed_decode_poll(
-                scheduler
-            )
+            SchedulerDisaggregationDecodeMixin._stage_completed_decode_poll(scheduler)
         )
         self.assertTrue(scheduler.disagg_decode_poll_pending)
         self.assertIsNone(scheduler.disagg_decode_poll_result)
 
         self.assertTrue(
-            SchedulerDisaggregationDecodeMixin._stage_completed_decode_poll(
-                scheduler
-            )
+            SchedulerDisaggregationDecodeMixin._stage_completed_decode_poll(scheduler)
         )
         self.assertFalse(scheduler.disagg_decode_poll_pending)
         self.assertEqual(scheduler.disagg_decode_poll_result["tensor"].tolist(), [1])
@@ -429,9 +425,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(scheduler.disagg_decode_poll_pending)
 
     @patch("sglang.srt.disaggregation.decode.get_disagg")
-    def test_last_empty_poll_immediately_submits_next_epoch(
-        self, mock_get_disagg
-    ):
+    def test_last_empty_poll_immediately_submits_next_epoch(self, mock_get_disagg):
         mock_get_disagg.return_value = SimpleNamespace(
             disaggregation_decode_enable_offload_kvcache=False,
             disaggregation_decode_polling_interval=1,

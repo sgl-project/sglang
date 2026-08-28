@@ -196,9 +196,7 @@ class DecodePollCoordinator:
             get_parallel().tp_rank,
             task["sequence"],
             task["done"].is_set(),
-            None
-            if current is None
-            else (current["sequence"], current["kind"]),
+            None if current is None else (current["sequence"], current["kind"]),
             self._inputs.qsize(),
             scheduler.disagg_decode_poll_pending,
             scheduler.disagg_decode_poll_result is not None,
