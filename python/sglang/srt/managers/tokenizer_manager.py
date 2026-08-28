@@ -1341,7 +1341,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         vocab_size = self.model_config.vocab_size
         for v in values:
-            if not isinstance(v, int):
+            # bool is an int subclass; JSON true/false must not pass as 1/0.
+            if not isinstance(v, int) or isinstance(v, bool):
                 raise ValueError(
                     "top_logprobs_num must be an integer or a list of integers."
                 )
@@ -1362,14 +1363,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if isinstance(input_ids[0], list):
             # Batch of sequences
             for seq in input_ids:
-                if any(not (0 <= id < vocab_size) for id in seq):
+                # bool is an int subclass; JSON true/false must not pass as 1/0.
+                if any(
+                    isinstance(id, bool) or not (0 <= id < vocab_size) for id in seq
+                ):
                     raise ValueError(
                         f"The input_ids {seq} contains values outside the vocab "
                         f"range [0, {vocab_size})."
                     )
         else:
             # Single sequence
-            if any(not (0 <= id < vocab_size) for id in input_ids):
+            if any(
+                isinstance(id, bool) or not (0 <= id < vocab_size) for id in input_ids
+            ):
                 raise ValueError(
                     f"The input_ids {input_ids} contains values outside the vocab "
                     f"range [0, {vocab_size})."

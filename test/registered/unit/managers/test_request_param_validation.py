@@ -82,6 +82,15 @@ class TestTopLogprobsNumValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"top_logprobs_num must be in \[0, 100\]"):
             self.tm._validate_top_logprobs_num(req)
 
+    def test_boolean_top_logprobs_num_rejected(self):
+        # bool is an int subclass; JSON true/false must not pass as 1/0.
+        for bad in (True, False, [1, True]):
+            req = GenerateReqInput(
+                text="hi", return_logprob=True, top_logprobs_num=bad
+            )
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                self.tm._validate_top_logprobs_num(req)
+
     def test_valid_top_logprobs_num_accepted(self):
         req = GenerateReqInput(text="hi", return_logprob=True, top_logprobs_num=10)
         # Should not raise.
@@ -103,6 +112,13 @@ class TestInputIdsInVocabValidation(unittest.TestCase):
     def test_nested_batch_input_ids_rejected(self):
         with self.assertRaisesRegex(ValueError, r"outside the vocab range"):
             self.tm._validate_input_ids_in_vocab([[1, 2], [3, -5]], vocab_size=100)
+
+    def test_boolean_input_ids_rejected(self):
+        # bool is an int subclass; JSON true/false must not pass as 1/0.
+        with self.assertRaisesRegex(ValueError, r"outside the vocab range"):
+            self.tm._validate_input_ids_in_vocab([1, True], vocab_size=100)
+        with self.assertRaisesRegex(ValueError, r"outside the vocab range"):
+            self.tm._validate_input_ids_in_vocab([[False, 2]], vocab_size=100)
 
     def test_valid_input_ids_accepted(self):
         # Should not raise.
