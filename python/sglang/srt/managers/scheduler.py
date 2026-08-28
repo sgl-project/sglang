@@ -292,7 +292,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.runtime_context import get_context, publish
+from sglang.srt.runtime_context import get_context, get_spec, publish
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
@@ -1382,8 +1382,8 @@ class Scheduler(
             # identical on every rank.
             draft_model_config = ModelConfig.from_server_args(
                 self.server_args,
-                model_path=self.server_args.speculative_draft_model_path,
-                model_revision=self.server_args.speculative_draft_model_revision,
+                model_path=get_spec().speculative_draft_model_path,
+                model_revision=get_spec().speculative_draft_model_revision,
                 is_draft_model=True,
             )
             disagg_hidden_size, disagg_hidden_states_dtype = (

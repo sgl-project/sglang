@@ -23,6 +23,7 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     hybrid_lightning_config,
@@ -79,7 +80,7 @@ def get_draft_kv_pool(
     if draft_worker.draft_worker is None:
         return None
 
-    if server_args.enable_multi_layer_eagle:
+    if resolving_view(server_args).enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner

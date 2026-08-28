@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.communicator import (
     CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
@@ -32,7 +33,7 @@ def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
 
 def resolve_max_m(model_runner) -> int:
     """Use framework token bounds as the workspace-capacity source of truth."""
-    server_args = model_runner.server_args
+    server_args = resolving_view(model_runner.server_args)
     decode_config = server_args.cuda_graph_config.decode
     prefill_config = server_args.cuda_graph_config.prefill
     candidates = [

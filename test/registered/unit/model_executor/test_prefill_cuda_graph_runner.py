@@ -89,6 +89,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             server_args=SimpleNamespace(),
             model=SimpleNamespace(),
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
+            layer_info=SimpleNamespace(start_layer=0, end_layer=1),
             req_to_token_pool=SimpleNamespace(size=1),
         )
         language_model = SimpleNamespace(layers=[object()])
@@ -101,7 +102,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             patch.object(
                 graph_setup,
                 "compute_attention_and_moe_layers",
-                return_value=([object()], [], [], [], []),
+                return_value=([object()], [], [], [], [None]),
             ),
             patch.object(
                 graph_setup,
