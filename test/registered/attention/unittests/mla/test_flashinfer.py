@@ -1,5 +1,6 @@
 import unittest
 
+import pytest
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -29,11 +30,87 @@ MLA_SHAPE_KWARGS = dict(
     hidden_size=1024,
 )
 
+pytestmark = [
+    pytest.mark.filterwarnings(
+        "error:Legacy MLA metadata and split tensor arguments are deprecated:DeprecationWarning"
+    ),
+    pytest.mark.filterwarnings(
+        "error:Deprecated MLA planning arguments:DeprecationWarning"
+    ),
+    pytest.mark.filterwarnings(
+        "error:Positional MLA arguments are deprecated:DeprecationWarning"
+    ),
+]
+
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+
+
+class _RecordingMlaPlanModule:
+    def __init__(self):
+        self.args = None
+
+    def plan(self, *args):
+        self.args = args
+
+
+class TestFastMlaPrefillPlan(unittest.TestCase):
+    def test_refreshes_all_bound_buffers_from_csr_metadata(self):
+        from flashinfer.mla import MLAPlanMetadata
+
+        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+            fast_mla_prefill_plan,
+        )
+
+        qo_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
+        kv_indptr = torch.tensor([0, 3, 7], dtype=torch.int32)
+        kv_indices = torch.tensor([9, 2, 4, 8, 6, 1, 5], dtype=torch.int32)
+        kv_len_arr = torch.tensor([3, 4], dtype=torch.int32)
+        metadata = MLAPlanMetadata.csr(qo_indptr, kv_indptr, kv_indices, kv_len_arr)
+        cached_module = _RecordingMlaPlanModule()
+        wrapper = type(
+            "Wrapper",
+            (),
+            {
+                "_causal": None,
+                "_page_size": None,
+                "_sm_scale": None,
+                "_float_workspace_buffer": torch.empty(1),
+                "_int_workspace_buffer": torch.empty(1, dtype=torch.int32),
+                "_pin_memory_int_workspace_buffer": torch.empty(1, dtype=torch.int32),
+                "_qo_indptr_buf": torch.full_like(qo_indptr, -1),
+                "_kv_indptr_buf": torch.full_like(kv_indptr, -1),
+                "_kv_indices_buf": torch.full((9,), -1, dtype=torch.int32),
+                "_kv_len_arr_buf": torch.full_like(kv_len_arr, -1),
+                "_cached_module": cached_module,
+            },
+        )()
+
+        fast_mla_prefill_plan(
+            wrapper,
+            metadata=metadata,
+            num_heads=4,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=1,
+            causal=True,
+            sm_scale=0.125,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            query_layout="split",
+            kv_cache_layout="packed",
+        )
+
+        self.assertTrue(torch.equal(wrapper._qo_indptr_buf, qo_indptr))
+        self.assertTrue(torch.equal(wrapper._kv_indptr_buf, kv_indptr))
+        self.assertTrue(
+            torch.equal(wrapper._kv_indices_buf[: len(kv_indices)], kv_indices)
+        )
+        self.assertTrue(torch.equal(wrapper._kv_len_arr_buf, kv_len_arr))
+        self.assertTrue(torch.all(wrapper._kv_indices_buf[len(kv_indices) :] == -1))
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")

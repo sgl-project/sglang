@@ -373,7 +373,7 @@ class TestInPlaceKvIndicesTranslate(unittest.TestCase):
 
     Under cuda-graph replay the `kv_indices` it is handed IS the capture-stable
     buffer the captured wrapper reads (`fast_decode_kwargs["kv_indices"]`), and
-    `fast_mla_decode_plan` ignores its `kv_indices` argument -- so rebinding the
+    `fast_mla_decode_plan` ignores `metadata.kv_indices` -- so rebinding the
     local name to a fresh translated tensor leaves the graph reading VIRTUAL ids.
     These pin the write-back contract that fix relies on.
     """
