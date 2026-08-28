@@ -1,5 +1,5 @@
 /// Generated client implementations.
-pub mod sglang_api_client {
+pub mod sglang_service_client {
     #![allow(
         unused_variables,
         dead_code,
@@ -10,10 +10,10 @@ pub mod sglang_api_client {
     use tonic::codegen::http::Uri;
     use tonic::codegen::*;
     #[derive(Debug, Clone)]
-    pub struct SglangApiClient<T> {
+    pub struct SglangServiceClient<T> {
         inner: tonic::client::Grpc<T>,
     }
-    impl SglangApiClient<tonic::transport::Channel> {
+    impl SglangServiceClient<tonic::transport::Channel> {
         /// Attempt to create a new client by connecting to a given endpoint.
         pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
         where
@@ -24,7 +24,7 @@ pub mod sglang_api_client {
             Ok(Self::new(conn))
         }
     }
-    impl<T> SglangApiClient<T>
+    impl<T> SglangServiceClient<T>
     where
         T: tonic::client::GrpcService<tonic::body::Body>,
         T::Error: Into<StdError>,
@@ -42,7 +42,7 @@ pub mod sglang_api_client {
         pub fn with_interceptor<F>(
             inner: T,
             interceptor: F,
-        ) -> SglangApiClient<InterceptedService<T, F>>
+        ) -> SglangServiceClient<InterceptedService<T, F>>
         where
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
@@ -55,7 +55,7 @@ pub mod sglang_api_client {
             <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
                 Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            SglangApiClient::new(InterceptedService::new(inner, interceptor))
+            SglangServiceClient::new(InterceptedService::new(inner, interceptor))
         }
         /// Compress requests with the given encoding.
         ///
@@ -102,10 +102,11 @@ pub mod sglang_api_client {
                 tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
             })?;
             let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangApi/Generate");
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/Generate");
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("sglang.api.v1.SglangApi", "Generate"));
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Generate"));
             self.inner.server_streaming(req, path, codec).await
         }
         /// `/health_generate`: fires a 1-token probe and watches the response
@@ -119,10 +120,13 @@ pub mod sglang_api_client {
                 tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
             })?;
             let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangApi/HealthCheck");
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/HealthCheck");
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("sglang.api.v1.SglangApi", "HealthCheck"));
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "HealthCheck",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// `/get_model_info`: static model metadata, no scheduler round-trip.
@@ -136,10 +140,12 @@ pub mod sglang_api_client {
             })?;
             let codec = tonic_prost::ProstCodec::default();
             let path =
-                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangApi/GetModelInfo");
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/GetModelInfo");
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("sglang.api.v1.SglangApi", "GetModelInfo"));
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetModelInfo",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// `/server_info`: one control round-trip, shaped through the runtime-metric
@@ -154,16 +160,18 @@ pub mod sglang_api_client {
             })?;
             let codec = tonic_prost::ProstCodec::default();
             let path =
-                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangApi/GetServerInfo");
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/GetServerInfo");
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("sglang.api.v1.SglangApi", "GetServerInfo"));
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GetServerInfo",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
 }
 /// Generated server implementations.
-pub mod sglang_api_server {
+pub mod sglang_service_server {
     #![allow(
         unused_variables,
         dead_code,
@@ -172,9 +180,9 @@ pub mod sglang_api_server {
         clippy::let_unit_value
     )]
     use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with SglangApiServer.
+    /// Generated trait containing gRPC methods that should be implemented for use with SglangServiceServer.
     #[async_trait]
-    pub trait SglangApi: std::marker::Send + std::marker::Sync + 'static {
+    pub trait SglangService: std::marker::Send + std::marker::Sync + 'static {
         /// Server streaming response type for the Generate method.
         type GenerateStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::GenerateStreamItem, tonic::Status>,
@@ -206,14 +214,14 @@ pub mod sglang_api_server {
         ) -> std::result::Result<tonic::Response<super::GetServerInfoResponse>, tonic::Status>;
     }
     #[derive(Debug)]
-    pub struct SglangApiServer<T> {
+    pub struct SglangServiceServer<T> {
         inner: Arc<T>,
         accept_compression_encodings: EnabledCompressionEncodings,
         send_compression_encodings: EnabledCompressionEncodings,
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     }
-    impl<T> SglangApiServer<T> {
+    impl<T> SglangServiceServer<T> {
         pub fn new(inner: T) -> Self {
             Self::from_arc(Arc::new(inner))
         }
@@ -261,9 +269,9 @@ pub mod sglang_api_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for SglangApiServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for SglangServiceServer<T>
     where
-        T: SglangApi,
+        T: SglangService,
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
@@ -278,10 +286,11 @@ pub mod sglang_api_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/sglang.api.v1.SglangApi/Generate" => {
+                "/sglang.api.v1.SglangService/Generate" => {
                     #[allow(non_camel_case_types)]
-                    struct GenerateSvc<T: SglangApi>(pub Arc<T>);
-                    impl<T: SglangApi> tonic::server::ServerStreamingService<super::GenerateRequest>
+                    struct GenerateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::GenerateRequest>
                         for GenerateSvc<T>
                     {
                         type Response = super::GenerateStreamItem;
@@ -293,8 +302,9 @@ pub mod sglang_api_server {
                             request: tonic::Request<super::GenerateRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
-                            let fut =
-                                async move { <T as SglangApi>::generate(&inner, request).await };
+                            let fut = async move {
+                                <T as SglangService>::generate(&inner, request).await
+                            };
                             Box::pin(fut)
                         }
                     }
@@ -320,10 +330,12 @@ pub mod sglang_api_server {
                     };
                     Box::pin(fut)
                 }
-                "/sglang.api.v1.SglangApi/HealthCheck" => {
+                "/sglang.api.v1.SglangService/HealthCheck" => {
                     #[allow(non_camel_case_types)]
-                    struct HealthCheckSvc<T: SglangApi>(pub Arc<T>);
-                    impl<T: SglangApi> tonic::server::UnaryService<super::HealthCheckRequest> for HealthCheckSvc<T> {
+                    struct HealthCheckSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::HealthCheckRequest>
+                        for HealthCheckSvc<T>
+                    {
                         type Response = super::HealthCheckResponse;
                         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
@@ -332,7 +344,7 @@ pub mod sglang_api_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as SglangApi>::health_check(&inner, request).await
+                                <T as SglangService>::health_check(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -359,10 +371,12 @@ pub mod sglang_api_server {
                     };
                     Box::pin(fut)
                 }
-                "/sglang.api.v1.SglangApi/GetModelInfo" => {
+                "/sglang.api.v1.SglangService/GetModelInfo" => {
                     #[allow(non_camel_case_types)]
-                    struct GetModelInfoSvc<T: SglangApi>(pub Arc<T>);
-                    impl<T: SglangApi> tonic::server::UnaryService<super::GetModelInfoRequest> for GetModelInfoSvc<T> {
+                    struct GetModelInfoSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::GetModelInfoRequest>
+                        for GetModelInfoSvc<T>
+                    {
                         type Response = super::GetModelInfoResponse;
                         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
@@ -371,7 +385,7 @@ pub mod sglang_api_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as SglangApi>::get_model_info(&inner, request).await
+                                <T as SglangService>::get_model_info(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -398,10 +412,10 @@ pub mod sglang_api_server {
                     };
                     Box::pin(fut)
                 }
-                "/sglang.api.v1.SglangApi/GetServerInfo" => {
+                "/sglang.api.v1.SglangService/GetServerInfo" => {
                     #[allow(non_camel_case_types)]
-                    struct GetServerInfoSvc<T: SglangApi>(pub Arc<T>);
-                    impl<T: SglangApi> tonic::server::UnaryService<super::GetServerInfoRequest>
+                    struct GetServerInfoSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::GetServerInfoRequest>
                         for GetServerInfoSvc<T>
                     {
                         type Response = super::GetServerInfoResponse;
@@ -412,7 +426,7 @@ pub mod sglang_api_server {
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as SglangApi>::get_server_info(&inner, request).await
+                                <T as SglangService>::get_server_info(&inner, request).await
                             };
                             Box::pin(fut)
                         }
@@ -455,7 +469,7 @@ pub mod sglang_api_server {
             }
         }
     }
-    impl<T> Clone for SglangApiServer<T> {
+    impl<T> Clone for SglangServiceServer<T> {
         fn clone(&self) -> Self {
             let inner = self.inner.clone();
             Self {
@@ -468,8 +482,8 @@ pub mod sglang_api_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "sglang.api.v1.SglangApi";
-    impl<T> tonic::server::NamedService for SglangApiServer<T> {
+    pub const SERVICE_NAME: &str = "sglang.api.v1.SglangService";
+    impl<T> tonic::server::NamedService for SglangServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

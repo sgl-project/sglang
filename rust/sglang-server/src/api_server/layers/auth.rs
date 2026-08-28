@@ -74,7 +74,7 @@ fn exempt(method: &http::Method, path: &str) -> bool {
     method == http::Method::OPTIONS
         || path.starts_with("/health")
         || path.starts_with("/metrics")
-        || path == "/sglang.api.v1.SglangApi/HealthCheck"
+        || path == "/sglang.api.v1.SglangService/HealthCheck"
 }
 
 fn reject<RB: RejectionBody>(is_grpc: bool) -> http::Response<RB> {
@@ -157,13 +157,13 @@ mod tests {
         assert!(exempt(&http::Method::OPTIONS, "/generate"));
         assert!(exempt(
             &http::Method::POST,
-            "/sglang.api.v1.SglangApi/HealthCheck"
+            "/sglang.api.v1.SglangService/HealthCheck"
         ));
         assert!(!exempt(&get, "/generate"));
         assert!(!exempt(&get, "/v1/chat/completions"));
         assert!(!exempt(
             &http::Method::POST,
-            "/sglang.api.v1.SglangApi/Generate"
+            "/sglang.api.v1.SglangService/Generate"
         ));
     }
 

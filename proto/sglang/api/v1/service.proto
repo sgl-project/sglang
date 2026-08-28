@@ -11,7 +11,7 @@ package sglang.api.v1;
 import "sglang/api/v1/generate.proto";
 import "sglang/json/v1/options.proto";
 
-service Service {
+service SglangService {
   // `/generate`: always server-streaming (a unary request is a one-frame
   // stream); per-batch-item failures ride the stream as GenerateStreamItem
   // errors, pre-submit failures end the RPC with a gRPC status.

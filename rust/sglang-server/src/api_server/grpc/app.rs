@@ -1,4 +1,4 @@
-//! The gRPC transport (tonic), serving `sglang.api.v1.SglangApi` over the
+//! The gRPC transport (tonic), serving `sglang.api.v1.SglangService` over the
 //! same `api_server::core` the HTTP transport mounts — one core, two wire formats.
 //! Only this module knows tonic; endpoint logic stays in `api_server::core`.
 //!
@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use sglang_api_types::api::v1 as genapi;
-use sglang_api_types::api::v1::sglang_api_server::{SglangApi, SglangApiServer};
+use sglang_api_types::api::v1::sglang_service_server::{SglangService, SglangServiceServer};
 use tonic::{Request, Response, Status};
 
 use crate::api_server::core::error::ApiError;
@@ -54,7 +54,7 @@ struct GrpcApi {
 }
 
 #[tonic::async_trait]
-impl SglangApi for GrpcApi {
+impl SglangService for GrpcApi {
     type GenerateStream =
         Pin<Box<dyn futures::Stream<Item = Result<genapi::GenerateStreamItem, Status>> + Send>>;
 
@@ -156,7 +156,7 @@ pub async fn serve(
     let serve = tonic::transport::Server::builder()
         .layer(tower::util::option_layer(access_log))
         .layer(tower::util::option_layer(auth))
-        .add_service(SglangApiServer::new(api))
+        .add_service(SglangServiceServer::new(api))
         .serve_with_incoming(incoming);
     tokio::select! {
         r = serve => {
@@ -176,7 +176,7 @@ mod tests {
     use crate::api_server::core::openai::test_utils::senders;
     use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
     use crate::tokenizer_manager::wiring::{Senders, TmEvent};
-    use sglang_api_types::api::v1::sglang_api_client::SglangApiClient;
+    use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
 
     fn test_state_with_key(senders: Senders, api_key: Option<&str>) -> Arc<CoreState> {
         Arc::new(CoreState {
@@ -270,7 +270,7 @@ mod tests {
             tx.try_send(frame("lo", true)).unwrap();
         });
         let (url, _shutdown) = serve_on_ephemeral(test_state(senders)).await;
-        let mut client = SglangApiClient::connect(url).await.unwrap();
+        let mut client = SglangServiceClient::connect(url).await.unwrap();
         let request = genapi::GenerateRequest {
             text: Some(genapi::StringOrList {
                 value: Some(genapi::string_or_list::Value::One("hi".into())),
@@ -303,7 +303,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn submit_failure_maps_to_unavailable() {
         let (url, _shutdown) = serve_on_ephemeral(test_state(senders())).await;
-        let mut client = SglangApiClient::connect(url).await.unwrap();
+        let mut client = SglangServiceClient::connect(url).await.unwrap();
         let err = client
             .generate(genapi::GenerateRequest {
                 text: Some(genapi::StringOrList {
@@ -324,7 +324,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn model_info_round_trips() {
         let (url, _shutdown) = serve_on_ephemeral(test_state(senders())).await;
-        let mut client = SglangApiClient::connect(url).await.unwrap();
+        let mut client = SglangServiceClient::connect(url).await.unwrap();
         let info = client
             .get_model_info(genapi::GetModelInfoRequest {})
             .await
@@ -342,7 +342,7 @@ mod tests {
     async fn auth_gates_rpcs_but_not_health() {
         let (url, _shutdown) =
             serve_on_ephemeral(test_state_with_key(senders(), Some("sk-1"))).await;
-        let mut client = SglangApiClient::connect(url).await.unwrap();
+        let mut client = SglangServiceClient::connect(url).await.unwrap();
 
         let denied = client
             .get_model_info(genapi::GetModelInfoRequest {})
