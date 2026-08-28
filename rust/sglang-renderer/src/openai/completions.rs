@@ -24,10 +24,9 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CreateCompletionResponse, Logprobs, Prompt,
-};
+use dynamo_protocols::types::{CompletionUsage, Prompt};
 use futures::StreamExt;
+use serde::Serialize;
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/completions", post(completions))
@@ -55,12 +54,41 @@ fn attach_streams(
         })
         .collect()
 }
-#[derive(Debug, Default)]
-pub(super) struct ChoiceExtensions {
-    matched_stop: Option<serde_json::Value>,
-    /// Dynamo's enum covers the standard values. Python additionally exposes
-    /// `abort`, and native unknown finish types are preserved rather than lost.
-    finish_reason_override: Option<String>,
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MatchedStopWire {
+    Token(i64),
+    Text(String),
+    Tokens(Vec<i64>),
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct CompletionLogprobsWire {
+    tokens: Vec<String>,
+    token_logprobs: Vec<Option<f32>>,
+    top_logprobs: Vec<Option<BTreeMap<String, f32>>>,
+    text_offset: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChoiceWire {
+    text: String,
+    index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<CompletionLogprobsWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
+    matched_stop: Option<MatchedStopWire>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionResponseWire {
+    id: String,
+    choices: Vec<CompletionChoiceWire>,
+    created: u32,
+    model: String,
+    object: &'static str,
+    usage: Option<CompletionUsage>,
 }
 
 async fn completions(
@@ -105,19 +133,23 @@ async fn completions(
         let metadata = completion_requests
             .iter()
             .enumerate()
-            .map(|(index, request)| {
-                let prompt_index = index / n;
+            .flat_map(|(prompt_index, request)| {
                 let prompt_echo = if echo {
                     request.prompt.as_str().to_owned()
                 } else {
                     String::new()
                 };
-                (index, prompt_index, prompt_echo)
+                request
+                    .requests
+                    .iter()
+                    .map(move |_| (prompt_index, prompt_echo.clone()))
             })
+            .enumerate()
+            .map(|(index, (prompt_index, prompt_echo))| (index, prompt_index, prompt_echo))
             .collect();
         let generate_requests = match state
             .renderer
-            .prepare_text_requests(completion_requests)
+            .prepare_text_request_groups(completion_requests)
             .await
         {
             Ok(requests) => requests,
@@ -207,7 +239,6 @@ pub(super) async fn unary_completion(
     // serialize generation. The non-streaming native path sends one terminal
     // result, and the accumulator also tolerates intermediate frames.
     let mut choices = Vec::with_capacity(submitted.len());
-    let mut extensions = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
     let mut completion_tokens = 0u64;
 
@@ -225,7 +256,7 @@ pub(super) async fn unary_completion(
             .entry(choice.prompt_index)
             .or_insert(output.prompt_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-        let (response_choice, extension) = completion_choice(
+        let response_choice = completion_choice(
             choice.index,
             if echo {
                 choice.echo + &output.text
@@ -237,7 +268,6 @@ pub(super) async fn unary_completion(
             echo,
         );
         choices.push(response_choice);
-        extensions.push(extension);
     }
 
     let prompt_tokens = prompt_tokens
@@ -249,18 +279,14 @@ pub(super) async fn unary_completion(
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
     );
 
-    Json(completion_response_value(
-        CreateCompletionResponse {
-            id: response_id,
-            choices,
-            created,
-            model,
-            system_fingerprint: None,
-            object: "text_completion".into(),
-            usage: Some(usage),
-        },
-        &extensions,
-    ))
+    Json(CompletionResponseWire {
+        id: response_id,
+        choices,
+        created,
+        model,
+        object: "text_completion",
+        usage: Some(usage),
+    })
     .into_response()
 }
 
@@ -270,19 +296,15 @@ fn completion_choice(
     output: &GenerationOutput,
     want_logprobs: bool,
     include_input_logprobs: bool,
-) -> (Choice, ChoiceExtensions) {
+) -> CompletionChoiceWire {
     let reason = output.finish_reason.as_ref();
-    let (finish_reason, finish_reason_override) = {
-        match reason {
-            Some(GenerationFinishReason::Stop(_)) => (Some(CompletionFinishReason::Stop), None),
-            Some(GenerationFinishReason::Length) => (Some(CompletionFinishReason::Length), None),
-            Some(GenerationFinishReason::ContentFilter) => {
-                (Some(CompletionFinishReason::ContentFilter), None)
-            }
-            Some(GenerationFinishReason::Abort) => (None, Some("abort".into())),
-            Some(GenerationFinishReason::Other(other)) => (None, Some(other.clone())),
-            None => (None, None),
-        }
+    let finish_reason = match reason {
+        Some(GenerationFinishReason::Stop(_)) => Some("stop".into()),
+        Some(GenerationFinishReason::Length) => Some("length".into()),
+        Some(GenerationFinishReason::ContentFilter) => Some("content_filter".into()),
+        Some(GenerationFinishReason::Abort) => Some("abort".into()),
+        Some(GenerationFinishReason::Other(other)) => Some(other.clone()),
+        None => None,
     };
     let matched_stop = reason
         .and_then(|reason| match reason {
@@ -290,72 +312,20 @@ fn completion_choice(
             _ => None,
         })
         .map(|matched| match matched {
-            MatchedStop::Token(id) => serde_json::json!(id),
-            MatchedStop::Text(value) => serde_json::json!(value),
+            MatchedStop::Token(id) => MatchedStopWire::Token(*id),
+            MatchedStop::Text(value) => MatchedStopWire::Text(value.clone()),
             // Python's OpenAI schema supports an integer or string here, not a
             // multi-token list. Preserve the native value rather than dropping it.
-            MatchedStop::Tokens(ids) => serde_json::json!(ids),
+            MatchedStop::Tokens(ids) => MatchedStopWire::Tokens(ids.clone()),
         });
-    (
-        Choice {
-            text,
-            index: u32::try_from(index).unwrap_or(u32::MAX),
-            logprobs: want_logprobs
-                .then(|| completion_logprobs(output.extras.as_deref(), include_input_logprobs)),
-            finish_reason,
-        },
-        ChoiceExtensions {
-            matched_stop,
-            finish_reason_override,
-        },
-    )
-}
-
-/// Serialize Dynamo's standard response and add only SGLang/Python fields that
-/// its schema cannot represent. `text_offset` is corrected here because Dynamo
-/// types it as `u32`, while Python deliberately emits `-1`.
-pub(super) fn completion_response_value(
-    response: CreateCompletionResponse,
-    extensions: &[ChoiceExtensions],
-) -> serde_json::Value {
-    let mut value = serde_json::to_value(response).expect("OpenAI response must serialize");
-    let Some(root) = value.as_object_mut() else {
-        return value;
-    };
-    // Python's Completion response does not expose this OpenAI field.
-    root.remove("system_fingerprint");
-    let Some(choices) = root
-        .get_mut("choices")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return value;
-    };
-    for (choice, extension) in choices.iter_mut().zip(extensions) {
-        let Some(choice) = choice.as_object_mut() else {
-            continue;
-        };
-        if let Some(reason) = &extension.finish_reason_override {
-            choice.insert("finish_reason".into(), serde_json::json!(reason));
-        }
-        choice.insert(
-            "matched_stop".into(),
-            extension
-                .matched_stop
-                .clone()
-                .unwrap_or(serde_json::Value::Null),
-        );
-        if let Some(logprobs) = choice
-            .get_mut("logprobs")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            let count = logprobs
-                .get("tokens")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, Vec::len);
-            logprobs.insert("text_offset".into(), serde_json::json!(vec![-1; count]));
-        }
+    CompletionChoiceWire {
+        text,
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        logprobs: want_logprobs
+            .then(|| completion_logprobs(output.extras.as_deref(), include_input_logprobs)),
+        finish_reason,
+        matched_stop,
     }
-    value
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -411,23 +381,22 @@ pub(super) fn completion_event_stream(
                     u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
                 )
             });
-            let (choice, extension) = completion_choice(
+            let choice = completion_choice(
                 index,
                 text,
                 &output,
                 want_logprobs,
                 echo && first,
             );
-            let chunk = CreateCompletionResponse {
+            let chunk = CompletionResponseWire {
                 id: response_id.clone(),
                 choices: vec![choice],
                 created,
                 model: model.clone(),
-                system_fingerprint: None,
-                object: "text_completion".into(),
+                object: "text_completion",
                 usage: chunk_usage,
             };
-            yield completion_response_value(chunk, &[extension]).to_string();
+            yield serde_json::to_string(&chunk).expect("OpenAI response must serialize");
         }
 
         if include_usage {
@@ -438,29 +407,28 @@ pub(super) fn completion_event_stream(
             let completion_tokens = completion_tokens_by_choice
                 .into_iter()
                 .fold(0u64, u64::saturating_add);
-            let final_chunk = CreateCompletionResponse {
+            let final_chunk = CompletionResponseWire {
                 id: response_id,
                 choices: vec![],
                 created,
                 model,
-                system_fingerprint: None,
-                object: "text_completion".into(),
+                object: "text_completion",
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
                 )),
             };
-            yield completion_response_value(final_chunk, &[]).to_string();
+            yield serde_json::to_string(&final_chunk).expect("OpenAI response must serialize");
         }
         yield "[DONE]".to_string();
     }
 }
 
-pub(super) fn completion_logprobs(
+fn completion_logprobs(
     extras: Option<&GenerationOutputExtras>,
     include_input: bool,
-) -> Logprobs {
-    let mut result = Logprobs {
+) -> CompletionLogprobsWire {
+    let mut result = CompletionLogprobsWire {
         tokens: Vec::new(),
         token_logprobs: Vec::new(),
         top_logprobs: Vec::new(),
@@ -476,7 +444,7 @@ pub(super) fn completion_logprobs(
     result
 }
 
-fn append_logprobs(result: &mut Logprobs, positions: &[crate::PositionLogprobs]) {
+fn append_logprobs(result: &mut CompletionLogprobsWire, positions: &[crate::PositionLogprobs]) {
     for position in positions {
         let selected = &position.token;
         result.tokens.push(
@@ -486,11 +454,9 @@ fn append_logprobs(result: &mut Logprobs, positions: &[crate::PositionLogprobs])
                 .unwrap_or_else(|| format!("token_id:{}", selected.token_id)),
         );
         result.token_logprobs.push(selected.logprob);
-        // Dynamo's field is `u32`; Python's `-1` sentinel is applied once at
-        // final wire shaping in `completion_response_value`.
-        result.text_offset.push(0);
+        result.text_offset.push(-1);
         if position.top.is_empty() {
-            result.top_logprobs.push(serde_json::Value::Null);
+            result.top_logprobs.push(None);
             continue;
         }
         let mut top = BTreeMap::new();
@@ -506,21 +472,17 @@ fn append_logprobs(result: &mut Logprobs, positions: &[crate::PositionLogprobs])
                 logprob,
             );
         }
-        result.top_logprobs.push(serde_json::json!(top));
+        result.top_logprobs.push(Some(top));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ChoiceExtensions, completion_event_stream, completion_logprobs, completion_response_value,
-        unary_completion,
-    };
+    use super::{completion_event_stream, completion_logprobs, unary_completion};
     use crate::GenerationOutputExtras;
     use crate::openai::test_utils::{chunk, submitted};
     use crate::{PositionLogprobs, TokenLogprob};
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{Choice, CreateCompletionResponse};
     use futures::StreamExt;
 
     #[test]
@@ -539,29 +501,8 @@ mod tests {
         let logprobs = completion_logprobs(Some(&extras), false);
         assert_eq!(logprobs.tokens, ["x"]);
         assert_eq!(logprobs.token_logprobs, [Some(-0.25)]);
-        assert_eq!(logprobs.top_logprobs, [serde_json::Value::Null]);
-
-        let value = completion_response_value(
-            CreateCompletionResponse {
-                id: "cmpl-test".into(),
-                choices: vec![Choice {
-                    text: "x".into(),
-                    index: 0,
-                    logprobs: Some(logprobs),
-                    finish_reason: None,
-                }],
-                created: 1,
-                model: "model".into(),
-                system_fingerprint: None,
-                object: "text_completion".into(),
-                usage: None,
-            },
-            &[ChoiceExtensions::default()],
-        );
-        assert_eq!(
-            value["choices"][0]["logprobs"]["text_offset"],
-            serde_json::json!([-1])
-        );
+        assert_eq!(logprobs.top_logprobs, [None]);
+        assert_eq!(logprobs.text_offset, [-1]);
     }
 
     #[tokio::test]
@@ -590,6 +531,7 @@ mod tests {
         assert_eq!(value["choices"][0]["text"], "ab");
         assert_eq!(value["choices"][1]["text"], "xy");
         assert_eq!(value["choices"][0]["matched_stop"], "</s>");
+        assert!(value.get("system_fingerprint").is_none());
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 4);
     }

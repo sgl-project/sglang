@@ -85,7 +85,7 @@ async fn render_completions(
                 return openai_error(renderer_status(&error), error.to_string(), false);
             }
         };
-        renderer.prepare_text_requests(requests).await
+        renderer.prepare_text_request_groups(requests).await
     } else {
         let (_, requests) = match lower_token_ids_completion_request(renderer.config(), &request) {
             Ok(requests) => requests,

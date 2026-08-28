@@ -1,9 +1,13 @@
 use axum::{http::StatusCode, response::Response};
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 
 use crate::{GenerateRequest, GenerationOutput, GenerationStream, ResponseError};
 
 use super::{OpenAIHttpFrontend, error::openai_error};
+
+// Bound one OpenAI request's pending HTTP handshakes without duplicating the
+// engine scheduler's aggregate admission policy.
+const CONCURRENT_ENGINE_SUBMISSIONS: usize = 32;
 
 /// Submit prepared token-only requests in input order.
 ///
@@ -14,9 +18,8 @@ pub(super) async fn submit_generate_requests(
     inputs: Vec<GenerateRequest>,
     stream_response: bool,
 ) -> Result<Vec<GenerationStream>, Response> {
-    let mut streams = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let events = frontend
+    futures::stream::iter(inputs.into_iter().map(|input| async move {
+        frontend
             .generate_client
             .generate(input)
             .await
@@ -27,10 +30,11 @@ pub(super) async fn submit_generate_requests(
                     error.message,
                     stream_response,
                 )
-            })?;
-        streams.push(events);
-    }
-    Ok(streams)
+            })
+    }))
+    .buffered(CONCURRENT_ENGINE_SUBMISSIONS)
+    .try_collect()
+    .await
 }
 
 pub(super) fn merge_indexed(

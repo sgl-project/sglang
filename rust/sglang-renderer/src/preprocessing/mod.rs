@@ -14,6 +14,7 @@ pub use request::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,
 };
+pub(crate) use request::{GenerateRequestIdentity, TextRequestGroup};
 pub use sampling::SamplingParams;
 #[cfg(feature = "http")]
 pub(crate) use sampling::SamplingParamsOverrides;

@@ -414,7 +414,7 @@ pub fn validate_token_ids_request(
     )
 }
 
-fn validate_request_id(rid: &str) -> Result<(), Error> {
+pub(crate) fn validate_request_id(rid: &str) -> Result<(), Error> {
     if rid.len() > 128 {
         return Err(Error::Validation(format!(
             "rid is {} bytes, over the 128-byte limit",

@@ -24,6 +24,8 @@ use crate::{
     RendererError, SamplingParams, TextRequest,
 };
 
+use super::{GenerateRequestIdentity, TextRequestGroup};
+
 /// SGLang reasoning effort, including Inkling's fine-grained numeric form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReasoningEffort {
@@ -188,7 +190,7 @@ impl OAIChatLikeRequest for ChatRequest {
 
 /// Chat-to-text result plus the state needed to interpret generated output.
 pub(crate) struct LoweredChat {
-    pub text_requests: Vec<TextRequest>,
+    pub text_requests: Vec<TextRequestGroup>,
     pub response_processor: ChatResponseProcessor,
 }
 
@@ -241,26 +243,28 @@ impl ChatPreprocessor {
         let prompt = self.render(&request)?;
         let uses_tool_call_structural_tag = request.sampling_params.structural_tag.is_some();
 
-        let mut text_requests = Vec::with_capacity(request.choice_count);
+        let options = GenerationOptions {
+            sampling_params: request.sampling_params.clone(),
+            stream: request.stream,
+            return_logprob: request.return_logprob,
+            logprob_start_len: -1,
+            top_logprobs_num: request.top_logprobs_num,
+            return_text_in_logprobs: request.return_logprob.then_some(true),
+            ..Default::default()
+        };
+        let mut choices = Vec::with_capacity(request.choice_count);
         for index in 0..request.choice_count {
-            text_requests.push(
-                TextRequest::rendered(
-                    format!("{}-{index}", request.rid),
-                    prompt.clone(),
-                    false,
-                    GenerationOptions {
-                        sampling_params: request.sampling_params.clone(),
-                        stream: request.stream,
-                        return_logprob: request.return_logprob,
-                        logprob_start_len: -1,
-                        top_logprobs_num: request.top_logprobs_num,
-                        return_text_in_logprobs: request.return_logprob.then_some(true),
-                        ..Default::default()
-                    },
-                )
-                .with_metadata(request.metadata.clone()),
-            );
+            choices.push(GenerateRequestIdentity {
+                rid: format!("{}-{index}", request.rid),
+                metadata: request.metadata.clone(),
+            });
         }
+        let text_requests = vec![TextRequestGroup {
+            prompt,
+            add_special_tokens: false,
+            options,
+            requests: choices,
+        }];
 
         let response_processor = ChatResponseProcessor::new(
             parser,

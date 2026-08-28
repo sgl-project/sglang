@@ -21,12 +21,14 @@ use axum::{
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta, ChatCompletionTokenLogprob,
+    ChatCompletionResponseMessage, ChatCompletionStreamResponseDelta,
+    ChatCompletionStreamResponseDeltaFunctionCall, ChatCompletionTokenLogprob, CompletionUsage,
     CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType, Role,
     ServiceTier as ChatServiceTier, TopLogprobs,
 };
 use futures::StreamExt;
+use serde::Serialize;
 
 use super::{
     ChatCompletionRequest, OpenAIHttpFrontend, completion_usage,
@@ -520,16 +522,89 @@ fn openai_tool_call_delta(call: ChatToolCallDelta) -> ChatCompletionMessageToolC
 }
 
 fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
-    let mut response = serde_json::to_value(response).expect("OpenAI response must serialize");
-    if let Some(delta) = response
-        .pointer_mut("/choices/0/delta")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        delta
-            .entry("reasoning_content")
-            .or_insert(serde_json::Value::Null);
+    serde_json::to_string(&ChatStreamResponseWire::from(&response))
+        .expect("OpenAI response must serialize")
+}
+
+/// The Dynamo response type omits an absent `reasoning_content`. SGLang's
+/// streaming contract emits it explicitly as `null`, so use a borrowed wire
+/// view instead of building and patching a `serde_json::Value` tree.
+#[derive(Serialize)]
+struct ChatStreamResponseWire<'a> {
+    id: &'a str,
+    choices: Vec<ChatChoiceStreamWire<'a>>,
+    created: u32,
+    model: &'a str,
+    service_tier: &'a Option<ChatServiceTier>,
+    system_fingerprint: &'a Option<String>,
+    object: &'a str,
+    usage: &'a Option<CompletionUsage>,
+}
+
+impl<'a> From<&'a CreateChatCompletionStreamResponse> for ChatStreamResponseWire<'a> {
+    fn from(response: &'a CreateChatCompletionStreamResponse) -> Self {
+        Self {
+            id: &response.id,
+            choices: response
+                .choices
+                .iter()
+                .map(ChatChoiceStreamWire::from)
+                .collect(),
+            created: response.created,
+            model: &response.model,
+            service_tier: &response.service_tier,
+            system_fingerprint: &response.system_fingerprint,
+            object: &response.object,
+            usage: &response.usage,
+        }
     }
-    response.to_string()
+}
+
+#[derive(Serialize)]
+struct ChatChoiceStreamWire<'a> {
+    index: u32,
+    delta: ChatDeltaWire<'a>,
+    finish_reason: &'a Option<OpenAIFinishReason>,
+    logprobs: &'a Option<ChatChoiceLogprobs>,
+}
+
+impl<'a> From<&'a ChatChoiceStream> for ChatChoiceStreamWire<'a> {
+    fn from(choice: &'a ChatChoiceStream) -> Self {
+        Self {
+            index: choice.index,
+            delta: ChatDeltaWire::from(&choice.delta),
+            finish_reason: &choice.finish_reason,
+            logprobs: &choice.logprobs,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ChatDeltaWire<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a ChatCompletionMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_call: Option<&'a ChatCompletionStreamResponseDeltaFunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<&'a Vec<ChatCompletionMessageToolCallChunk>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<&'a Role>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<&'a String>,
+    reasoning_content: Option<&'a str>,
+}
+
+impl<'a> From<&'a ChatCompletionStreamResponseDelta> for ChatDeltaWire<'a> {
+    fn from(delta: &'a ChatCompletionStreamResponseDelta) -> Self {
+        Self {
+            content: delta.content.as_ref(),
+            function_call: delta.function_call.as_ref(),
+            tool_calls: delta.tool_calls.as_ref(),
+            role: delta.role.as_ref(),
+            refusal: delta.refusal.as_ref(),
+            reasoning_content: delta.reasoning_content.as_deref(),
+        }
+    }
 }
 
 #[cfg(test)]

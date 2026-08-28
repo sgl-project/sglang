@@ -11,10 +11,11 @@ use dynamo_protocols::types::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::preprocessing::{GenerateRequestIdentity, TextRequestGroup};
 use crate::{
     ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, ReasoningEffort,
     RendererConfig, RendererError, SamplingDefaults, SamplingParams, SamplingParamsOverrides,
-    TextRequest, TokenIds, TokenIdsRequest,
+    TokenIds, TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -544,15 +545,14 @@ pub fn chat_sampling_params(
 pub(crate) fn lower_text_completion_request(
     config: &RendererConfig,
     request: &CompletionRequest,
-) -> Result<(String, Vec<TextRequest>), RendererError> {
+) -> Result<(String, Vec<TextRequestGroup>), RendererError> {
     // Accepted OpenAI request attribution does not affect generation.
     let _ = &request.user;
     reject_unsupported_fields(&request.unsupported_fields)?;
     request.extensions.validate()?;
     let prompts = text_completion_prompts(&request.prompt)?;
     let prompt_count = prompts.len();
-    let (mut sampling, n, choice_count) =
-        completion_lowering_context(config, request, prompt_count)?;
+    let (mut sampling, n, _) = completion_lowering_context(config, request, prompt_count)?;
     request.sampling_overrides.clone().apply(&mut sampling);
     let response_id = request.extensions.response_id("cmpl");
     let mut contexts = request
@@ -560,22 +560,24 @@ pub(crate) fn lower_text_completion_request(
         .clone()
         .expand(request.model.clone(), prompt_count, n, &response_id)?
         .into_iter();
-    let mut requests = Vec::with_capacity(choice_count);
+    let mut requests = Vec::with_capacity(prompt_count);
     for prompt in prompts {
+        let mut choices = Vec::with_capacity(n);
         for _ in 0..n {
             let context = contexts
                 .next()
                 .expect("metadata expansion matches completion choice count");
-            requests.push(
-                TextRequest::text(
-                    context.request_id,
-                    prompt.clone(),
-                    true,
-                    completion_generation_options(request, sampling.clone()),
-                )
-                .with_metadata(context.metadata),
-            );
+            choices.push(GenerateRequestIdentity {
+                rid: context.request_id,
+                metadata: context.metadata,
+            });
         }
+        requests.push(TextRequestGroup {
+            prompt: dynamo_renderer::RenderedPrompt::text(prompt),
+            add_special_tokens: true,
+            options: completion_generation_options(request, sampling.clone()),
+            requests: choices,
+        });
     }
     Ok((response_id, requests))
 }

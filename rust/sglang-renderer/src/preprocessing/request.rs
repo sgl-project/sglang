@@ -57,6 +57,39 @@ pub struct TextRequest {
     pub metadata: GenerateRequestMetadata,
 }
 
+/// One textual prompt shared by one or more generation choices.
+///
+/// OpenAI `n` fan-out changes request identity, not the prompt or generation
+/// options. Keeping those identities alongside one prompt lets preprocessing
+/// tokenize the prompt once before producing the individual engine requests.
+#[derive(Debug, Clone)]
+pub(crate) struct TextRequestGroup {
+    pub prompt: RenderedPrompt,
+    pub add_special_tokens: bool,
+    pub options: GenerationOptions,
+    pub requests: Vec<GenerateRequestIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GenerateRequestIdentity {
+    pub rid: String,
+    pub metadata: GenerateRequestMetadata,
+}
+
+impl From<TextRequest> for TextRequestGroup {
+    fn from(request: TextRequest) -> Self {
+        Self {
+            prompt: request.prompt,
+            add_special_tokens: request.add_special_tokens,
+            options: request.options,
+            requests: vec![GenerateRequestIdentity {
+                rid: request.rid,
+                metadata: request.metadata,
+            }],
+        }
+    }
+}
+
 impl TextRequest {
     pub fn text(
         rid: impl Into<String>,

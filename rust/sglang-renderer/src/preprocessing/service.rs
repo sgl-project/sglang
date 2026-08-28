@@ -10,12 +10,14 @@ use futures::future::try_join_all;
 use super::template::{DeepSeekV4Profile, load_chat_formatter};
 use super::tokenizer::{
     PooledTokenizer, TextTokenizer, check_total_tokens, resolve_chat_template_file,
-    resolve_model_file, validate_text_request, validate_token_ids_request,
+    resolve_model_file, validate_request_id, validate_text_request, validate_token_ids_request,
 };
 use crate::{
     ChatFormatter, ChatPreprocessor, ChatRequest, ChatResponseProcessor, GenerateRequest,
     LoweredChat, RendererConfig, RendererError, TextRequest, TokenIdsRequest,
 };
+
+use super::TextRequestGroup;
 
 /// Shared preprocessing used by inference and render-only frontends.
 pub struct RendererService {
@@ -62,7 +64,9 @@ impl RendererService {
     pub async fn prepare_chat(&self, request: ChatRequest) -> Result<PreparedChat, RendererError> {
         let lowered = self.preprocess_chat(request)?;
         Ok(PreparedChat {
-            requests: self.prepare_text_requests(lowered.text_requests).await?,
+            requests: self
+                .prepare_text_request_groups(lowered.text_requests)
+                .await?,
             response_processor: lowered.response_processor,
         })
     }
@@ -71,12 +75,21 @@ impl RendererService {
         &self,
         requests: Vec<TextRequest>,
     ) -> Result<Vec<GenerateRequest>, RendererError> {
-        try_join_all(
-            requests
+        self.prepare_text_request_groups(requests.into_iter().map(Into::into).collect())
+            .await
+    }
+
+    pub(crate) async fn prepare_text_request_groups(
+        &self,
+        groups: Vec<TextRequestGroup>,
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        let groups = try_join_all(
+            groups
                 .into_iter()
-                .map(|request| async move { self.prepare_text(request).await.map(Into::into) }),
+                .map(|group| async move { self.prepare_text_request_group(group).await }),
         )
-        .await
+        .await?;
+        Ok(groups.into_iter().flatten().collect())
     }
 
     pub async fn tokenize_prompt(
@@ -118,6 +131,48 @@ impl RendererService {
         let mut request = self.tokenizer.tokenize(request).await?;
         check_total_tokens(&mut request, &self.config.limits)?;
         Ok(request)
+    }
+
+    async fn prepare_text_request_group(
+        &self,
+        group: TextRequestGroup,
+    ) -> Result<Vec<GenerateRequest>, RendererError> {
+        let TextRequestGroup {
+            prompt,
+            add_special_tokens,
+            options,
+            requests,
+        } = group;
+        for request in &requests {
+            validate_request_id(&request.rid)?;
+        }
+        let mut requests = requests.into_iter();
+        let first = requests
+            .next()
+            .ok_or_else(|| RendererError::from("text request group must contain a request"))?;
+        let tokenized = self
+            .prepare_text(TextRequest {
+                rid: first.rid,
+                prompt,
+                add_special_tokens,
+                options,
+                metadata: first.metadata,
+            })
+            .await?;
+        let additional = requests
+            .map(|request| {
+                GenerateRequest::from(TokenIdsRequest {
+                    rid: request.rid,
+                    input_ids: tokenized.input_ids.clone(),
+                    options: tokenized.options.clone(),
+                    metadata: request.metadata,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut prepared = Vec::with_capacity(1 + additional.len());
+        prepared.push(tokenized.into());
+        prepared.extend(additional);
+        Ok(prepared)
     }
 
     fn prepare_token_ids(
@@ -446,11 +501,13 @@ fn python_dict_keys(source: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preprocessing::GenerateRequestIdentity;
     use crate::{
         GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererLimits, SamplingDefaults,
         SamplingParams,
     };
     use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn model_config(model_path: String) -> RendererConfig {
         RendererConfig {
@@ -484,6 +541,74 @@ mod tests {
         ) -> Result<crate::TokenIds, RendererError> {
             panic!("token-ID input must not enter the tokenizer")
         }
+    }
+
+    struct CountingTokenizer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TextTokenizer for CountingTokenizer {
+        fn encode(
+            &self,
+            text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<crate::TokenIds, RendererError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(text.split_whitespace().map(|_| 7).collect())
+        }
+    }
+
+    #[test]
+    fn text_choices_tokenize_once_per_prompt() {
+        futures::executor::block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let service = RendererService::with_tokenizer(
+                model_config(String::new()),
+                Arc::new(CountingTokenizer {
+                    calls: calls.clone(),
+                }),
+                2,
+                4,
+            );
+            let group = |prompt: &str, ids: &[&str]| TextRequestGroup {
+                prompt: dynamo_renderer::RenderedPrompt::text(prompt.to_owned()),
+                add_special_tokens: true,
+                options: GenerationOptions {
+                    sampling_params: SamplingParams {
+                        max_new_tokens: Some(4),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                requests: ids
+                    .iter()
+                    .map(|rid| GenerateRequestIdentity {
+                        rid: (*rid).to_owned(),
+                        metadata: GenerateRequestMetadata::default(),
+                    })
+                    .collect(),
+            };
+
+            let prepared = service
+                .prepare_text_request_groups(vec![
+                    group("one two", &["a-0", "a-1", "a-2"]),
+                    group("three", &["b-0", "b-1"]),
+                ])
+                .await
+                .unwrap();
+
+            assert_eq!(calls.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                prepared
+                    .iter()
+                    .map(|request| request.rid.as_str())
+                    .collect::<Vec<_>>(),
+                ["a-0", "a-1", "a-2", "b-0", "b-1"]
+            );
+            assert_eq!(prepared[0].input_ids, [7, 7]);
+            assert_eq!(prepared[2].input_ids, [7, 7]);
+            assert_eq!(prepared[3].input_ids, [7]);
+        });
     }
 
     #[test]

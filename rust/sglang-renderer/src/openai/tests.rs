@@ -2,7 +2,11 @@
 
 mod suite {
     use std::convert::Infallible;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     use axum::{
         Json, Router,
@@ -12,6 +16,7 @@ mod suite {
         response::sse::{Event, Sse},
         routing::post,
     };
+    use tokio::sync::Barrier;
     use tower::ServiceExt;
 
     use super::super::{
@@ -179,18 +184,25 @@ mod suite {
         assert_eq!(
             requests
                 .iter()
+                .flat_map(|request| request.requests.iter())
                 .map(|request| request.rid.as_str())
                 .collect::<Vec<_>>(),
             ["prompt-a-0", "prompt-a-1", "prompt-b-0", "prompt-b-1"]
         );
-        assert_eq!(requests[0].metadata.cache_salt.as_deref(), Some("tenant-a"));
-        assert_eq!(requests[1].metadata.extra_key, None);
-        assert_eq!(requests[2].metadata.extra_key.as_deref(), Some("batch"));
-        assert_eq!(requests[0].metadata.bootstrap_port, Some(8998));
-        assert_eq!(requests[2].metadata.bootstrap_port, None);
-        assert_eq!(requests[1].metadata.bootstrap_room, Some(41));
-        assert_eq!(requests[3].metadata.bootstrap_room, Some(52));
-        assert_eq!(requests[3].metadata.routed_dp_rank, Some(2));
+        assert_eq!(
+            requests[0].requests[0].metadata.cache_salt.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(requests[0].requests[1].metadata.extra_key, None);
+        assert_eq!(
+            requests[1].requests[0].metadata.extra_key.as_deref(),
+            Some("batch")
+        );
+        assert_eq!(requests[0].requests[0].metadata.bootstrap_port, Some(8998));
+        assert_eq!(requests[1].requests[0].metadata.bootstrap_port, None);
+        assert_eq!(requests[0].requests[1].metadata.bootstrap_room, Some(41));
+        assert_eq!(requests[1].requests[1].metadata.bootstrap_room, Some(52));
+        assert_eq!(requests[1].requests[1].metadata.routed_dp_rank, Some(2));
     }
 
     #[test]
@@ -225,6 +237,7 @@ mod suite {
         assert_eq!(
             requests
                 .iter()
+                .flat_map(|request| request.requests.iter())
                 .map(|request| request.metadata.bootstrap_room)
                 .collect::<Vec<_>>(),
             [Some(90), Some(90), Some(91), Some(91)]
@@ -295,6 +308,46 @@ mod suite {
                 "prompt_tokens": 1,
                 "completion_tokens": 1,
                 "finish_reason": {"type": "stop", "matched": null}
+            }
+        })
+        .to_string();
+        Sse::new(futures::stream::iter([
+            Ok(Event::default().data(frame)),
+            Ok(Event::default().data("[DONE]")),
+        ]))
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentEngineState {
+        rendezvous: Arc<Barrier>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    async fn concurrent_generate(
+        State(state): State<ConcurrentEngineState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_active.fetch_max(active, Ordering::SeqCst);
+        state.rendezvous.wait().await;
+
+        let choice = body["rid"]
+            .as_str()
+            .and_then(|rid| rid.rsplit('-').next())
+            .and_then(|choice| choice.parse::<u32>().ok())
+            .unwrap();
+        if choice == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        state.active.fetch_sub(1, Ordering::SeqCst);
+
+        let frame = serde_json::json!({
+            "output_ids": [104],
+            "meta_info": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "finish_reason": {"type": "stop", "matched": choice + 10}
             }
         })
         .to_string();
@@ -469,5 +522,59 @@ mod suite {
             serde_json::Value::Null
         );
         assert_eq!(engine_requests[3]["bootstrap_room"], 52);
+    }
+
+    #[tokio::test]
+    async fn completion_choices_establish_engine_streams_concurrently_in_input_order() {
+        let engine_state = ConcurrentEngineState {
+            rendezvous: Arc::new(Barrier::new(2)),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let engine = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/generate", post(concurrent_generate))
+                    .with_state(engine_state.clone()),
+            )
+            .into_future(),
+        );
+        let renderer = Arc::new(RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+            2,
+            2,
+        ));
+        let client =
+            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
+        let app = standalone_routes(OpenAIHttpFrontend::new(renderer, client));
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            post_request(
+                app,
+                "/v1/completions",
+                &serde_json::json!({
+                    "model": "model",
+                    "prompt": "hello",
+                    "n": 2
+                }),
+            ),
+        )
+        .await
+        .expect("both engine requests must be submitted before either responds");
+        engine.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(engine_state.max_active.load(Ordering::SeqCst), 2);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["choices"][0]["index"], 0);
+        assert_eq!(body["choices"][0]["matched_stop"], 10);
+        assert_eq!(body["choices"][1]["index"], 1);
+        assert_eq!(body["choices"][1]["matched_stop"], 11);
     }
 }
