@@ -43,6 +43,16 @@ register_amd_ci(
     nightly=True,
 )
 
+# The checkpoint declares model_type "qwen4_exp", which only resolves once the
+# model-support PR has landed. Without this guard the nightly turns red every
+# night on a missing dependency rather than on an accuracy regression.
+try:
+    from sglang.srt.configs import Qwen4ExpConfig  # noqa: F401
+
+    QWEN4_EXP_SUPPORTED = True
+except ImportError:
+    QWEN4_EXP_SUPPORTED = False
+
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next-FP8"
 MODEL_PATH = os.environ.get("QWEN38_FLASH_NEXT_FP8_MODEL_PATH", MODEL_ID)
 MODEL_REVISION = "bcd9f01ddc9cff2316eb84281bebcd5b058bddce"
@@ -103,6 +113,11 @@ SERVER_ENV = {
 }
 
 
+@unittest.skipUnless(
+    QWEN4_EXP_SUPPORTED,
+    "Qwen3.8-Flash-Next model support is not in this build "
+    "(sglang.srt.configs.Qwen4ExpConfig is missing)",
+)
 class TestQwen38FlashNextFP8AMD(CustomTestCase):
     """Gate Qwen3.8-Flash-Next FP8 accuracy on the graph fallback path."""
 
