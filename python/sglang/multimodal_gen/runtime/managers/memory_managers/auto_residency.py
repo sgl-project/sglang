@@ -132,6 +132,7 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     baseline_allocated_bytes: int
     peak_allocated_bytes: int
     succeeded: bool
+    peak_reserved_bytes: int = 0
     phase_peak_allocated_bytes: dict[str, int] = {}
     phase_active_components: dict[str, tuple[str, ...]] = {}
     phase_used_components: dict[str, tuple[str, ...]] = {}
@@ -240,6 +241,7 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     budget_bytes: int
     estimated_peak_bytes: int | None
     target_workload_measured: bool = False
+    observed_reserved_bytes: int = 0
     estimated_peak_bytes_by_phase: dict[str, int] = {}
     active_components_by_phase: dict[str, tuple[str, ...]] = {}
     used_components_by_phase: dict[str, tuple[str, ...]] = {}
@@ -2056,7 +2058,12 @@ def current_placement_reserve_shortfall_bytes(
                 *report.estimated_peak_bytes_by_phase.values(),
             ]
         )
-        shortfalls.append(measured_peak + reserve - report.budget_bytes)
+        # Candidate deltas are intentionally solved against live allocated
+        # bytes, so reclaimable allocator cache is not charged twice. Once a
+        # placement has actually run, however, its mapped allocator footprint
+        # must still leave the same reserve for the next request.
+        realized_footprint = max(measured_peak, report.observed_reserved_bytes)
+        shortfalls.append(realized_footprint + reserve - report.budget_bytes)
     return max(0, max(shortfalls, default=0))
 
 

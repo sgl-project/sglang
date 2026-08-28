@@ -63,6 +63,8 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
     task_type = server_args.pipeline_config.task_type
     if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
         return "no synthetic server warmup to calibrate from"
+    if not server_args.pipeline_config.supports_auto_residency:
+        return "pipeline does not support post-warmup residency changes"
     if has_realtime_model_adapter(server_args):
         return "realtime serving has no representative synthetic warmup"
     if server_args.backend == "diffusers":

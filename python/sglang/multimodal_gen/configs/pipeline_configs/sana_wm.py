@@ -56,6 +56,9 @@ class SanaWMPipelineConfig(PipelineConfig):
     optional 6-DoF camera trajectory, optional Stage-2 LTX-2 refiner)."""
 
     task_type: ModelTaskType = ModelTaskType.TI2V
+    # The current two-stage path is not numerically invariant when its primary
+    # transformer and connectors are promoted after warmup.
+    supports_auto_residency: bool = False
 
     # SanaWMBeforeDenoisingStage._splice_first_frame handles condition-image
     # resize + VAE-encode itself, so bypass the framework's generic TI2V

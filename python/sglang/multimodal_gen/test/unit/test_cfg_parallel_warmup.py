@@ -836,6 +836,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.is_arg_explicitly_set.return_value = False
         server_args.pipeline_config = SimpleNamespace(
             task_type=ModelTaskType.I2M,
+            supports_auto_residency=True,
             vae_stride=None,
             vae_scale_factor=None,
             vae_config=None,

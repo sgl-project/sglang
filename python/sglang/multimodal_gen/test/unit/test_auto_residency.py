@@ -62,6 +62,7 @@ def _record(
     num_frames=17,
     baseline_gib=10,
     peak_gib=12,
+    peak_reserved_gib=0,
     succeeded=True,
     num_inference_steps=1,
     total_duration_ms=0.0,
@@ -82,6 +83,7 @@ def _record(
         baseline_allocated_bytes=baseline_gib * GIB_BYTES,
         peak_allocated_bytes=peak_gib * GIB_BYTES,
         succeeded=succeeded,
+        peak_reserved_bytes=peak_reserved_gib * GIB_BYTES,
         num_inference_steps=num_inference_steps,
         total_duration_ms=total_duration_ms,
         stage_duration_ms=stage_duration_ms or {},
@@ -686,6 +688,7 @@ def _report(
     rank: int = 0,
     budget_gib: int = 100,
     estimated_gib: int | None = 50,
+    observed_reserved_gib: int = 0,
     candidates: list[ResidencyTarget] | None = None,
     skip_reason: str | None = None,
     phase_peaks_gib: dict[str, int] | None = None,
@@ -710,6 +713,7 @@ def _report(
             None if estimated_gib is None else estimated_gib * GIB_BYTES
         ),
         target_workload_measured=target_workload_measured,
+        observed_reserved_bytes=observed_reserved_gib * GIB_BYTES,
         estimated_peak_bytes_by_phase={
             name: value * GIB_BYTES for name, value in (phase_peaks_gib or {}).items()
         },
@@ -1357,6 +1361,16 @@ class TestPlanAutoResidency:
             estimated_gib=20,
             target_workload_measured=True,
             phase_peaks_gib={"decode": 28},
+        )
+
+        assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
+
+    def test_validation_preserves_reserve_beyond_allocator_mapped_footprint(self):
+        report = _report(
+            budget_gib=80,
+            estimated_gib=60,
+            observed_reserved_gib=78,
+            target_workload_measured=True,
         )
 
         assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
@@ -3352,7 +3366,10 @@ class TestAutoResidencySkipReason:
             transformer_weights_path=None,
             nunchaku_config=None,
             direct_gpu_weight_loading=False,
-            pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V),
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                supports_auto_residency=True,
+            ),
         )
         for key, value in overrides.items():
             setattr(args, key, value)
@@ -3388,6 +3405,15 @@ class TestAutoResidencySkipReason:
             # resident aux components on CPU): its peaks are not serving peaks
             ({"enable_torch_compile": True}, "stripped memory layout"),
             ({"batching_max_size": 4}, "batching"),
+            (
+                {
+                    "pipeline_config": SimpleNamespace(
+                        task_type=ModelTaskType.T2V,
+                        supports_auto_residency=False,
+                    )
+                },
+                "post-warmup residency changes",
+            ),
         ],
     )
     def test_excluded_paths(self, monkeypatch, overrides, expected_fragment):
