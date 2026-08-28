@@ -138,10 +138,8 @@ def init_torch_distributed(
         host=server_args.host, port=server_args.gated_launch_port
     )
 
-    # The draft worker reuses the target's resolved memory_pool_config, so its own
-    # pre_model_load_memory feeds nothing cross-rank. Keep the WORLD reduction on the
-    # target only: a draft that exists on a subset of ranks (prefill-side PP builds it
-    # on the last stage) would otherwise enter a collective the other ranks never join.
+    # Draft workers reuse the target pool config and may exist on only one PP stage;
+    # including them in this WORLD reduction would deadlock on absent peers.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,

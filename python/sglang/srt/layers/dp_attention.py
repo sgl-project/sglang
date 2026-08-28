@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_widths,
     get_device,
@@ -107,12 +108,9 @@ class DpPaddingMode(IntEnum):
         if moe_a2a_backend.is_pplx():
             return DpPaddingMode.MAX_LEN
 
-        # Diagnostic gate for DeepEP v2 ElasticBuffer on ragged DP batches.
-        # Keeping this behind an environment variable makes the A/B change
-        # strictly limited to padding: communication mode, kernels, model and
-        # request payload remain identical.
-        if moe_a2a_backend.is_deepep_v2() and get_bool_env_var(
-            "SGLANG_DEEPEP_V2_FORCE_MAX_LEN"
+        if (
+            moe_a2a_backend.is_deepep_v2()
+            and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get()
         ):
             return DpPaddingMode.MAX_LEN
 
@@ -598,8 +596,6 @@ _dp_gather_fp8_bufs: dict = {}
 
 @functools.lru_cache(maxsize=1)
 def _use_dp_gather_fp8() -> bool:
-    from sglang.srt.environ import envs
-
     return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
 
 

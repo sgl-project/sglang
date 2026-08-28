@@ -1025,9 +1025,8 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
-        # The draft extend only runs on the last stage, but every rank needs its
-        # output: process_batch_result_disagg_prefill reads it off the relayed
-        # result to fill the PD aux buffers.
+        # Draft extend runs only on the last stage, but every rank needs its relayed
+        # output to fill PD auxiliary buffers.
         draft_input = result.next_draft_input
         if draft_input is not None and draft_input.topk_p is not None:
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
@@ -1182,9 +1181,8 @@ class SchedulerPPMixin:
                 logits_output.auxiliary_device_output = auxiliary_output
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
 
-        # Rebuild the draft proposal the last stage put on the ring. Rebinding
-        # batch.spec_info to the same object keeps the identity check in
-        # process_batch_result_disagg_prefill true on every rank.
+        # Rebind the last stage's ring proposal as batch.spec_info so the PD result
+        # processor sees the same object on every rank.
         next_draft_input = None
         if "draft_topk_p" in pp_outputs.tensors:
             from sglang.srt.speculative.eagle_info import EagleDraftInput

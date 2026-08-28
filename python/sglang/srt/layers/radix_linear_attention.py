@@ -122,12 +122,8 @@ class RadixLinearAttention(nn.Module):
             else None
         )
         if real_num_tokens is not None and real_num_tokens < mixed_qkv.shape[0]:
-            # Eager DP/attention-TP synchronization may append physical token rows
-            # while extend_seq_lens/query_start_loc keep the logical sequence
-            # lengths. Varlen linear-attention kernels require their packed input
-            # length to agree with those logical lengths. Compute only the real
-            # prefix, then restore the physical shape expected by the following
-            # residual, MLP, and collective operations.
+            # DP synchronization may append physical rows beyond the logical varlen
+            # layout; compute its real prefix, then restore the downstream shape.
             output = torch.empty(
                 (1, mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim),
                 dtype=mixed_qkv.dtype,

@@ -1,5 +1,6 @@
 import pytest
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import (
     _FLASHINFER_PR4266_TUNED_TACTICS,
     Bf16GemmBackend,
@@ -39,19 +40,20 @@ def test_flashinfer_pr4266_backend_is_explicit():
     assert Bf16GemmBackend.FLASHINFER_PR4266.value == "flashinfer_pr4266"
 
 
-def test_bf16_splitk_is_enabled_by_default(monkeypatch):
-    monkeypatch.delenv("SGLANG_ENABLE_BF16_SPLITK_GEMM", raising=False)
-    assert should_enable_bf16_splitk_gemm(Bf16GemmBackend.CUTEDSL)
+def test_bf16_splitk_is_enabled_by_default():
+    assert envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.default is True
+    with envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.override(True):
+        assert should_enable_bf16_splitk_gemm(Bf16GemmBackend.CUTEDSL)
 
 
-def test_bf16_splitk_env_kill_switch(monkeypatch):
-    monkeypatch.setenv("SGLANG_ENABLE_BF16_SPLITK_GEMM", "0")
-    assert not should_enable_bf16_splitk_gemm(Bf16GemmBackend.CUTEDSL)
+def test_bf16_splitk_env_kill_switch():
+    with envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.override(False):
+        assert not should_enable_bf16_splitk_gemm(Bf16GemmBackend.CUTEDSL)
 
 
-def test_bf16_splitk_does_not_override_torch_backend(monkeypatch):
-    monkeypatch.setenv("SGLANG_ENABLE_BF16_SPLITK_GEMM", "1")
-    assert not should_enable_bf16_splitk_gemm(Bf16GemmBackend.TORCH)
+def test_bf16_splitk_does_not_override_torch_backend():
+    with envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.override(True):
+        assert not should_enable_bf16_splitk_gemm(Bf16GemmBackend.TORCH)
 
 
 if __name__ == "__main__":

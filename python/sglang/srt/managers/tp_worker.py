@@ -385,10 +385,8 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Elastic joiners cannot enter the launch-time WORLD broadcast. Neither can a
-        # draft worker that exists on a subset of ranks (prefill-side PP builds it on
-        # the last stage only); it takes the seed the target already broadcast, which
-        # keeps the value identical to today's re-broadcast on every other setup.
+        # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
+        # broadcast, so they reuse the target's already-broadcast seed.
         if random_seed is not None:
             self.random_seed = random_seed
         elif server_args.is_ep_joiner:

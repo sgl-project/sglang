@@ -19,7 +19,6 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
-import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -546,7 +545,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        trace_e2e = os.getenv("SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E", "0") == "1"
+        trace_e2e = envs.SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E.get()
 
         def trace_sync(stage: str):
             if not trace_e2e:
@@ -682,10 +681,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         current_stream = torch.cuda.current_stream()
 
         if defer_finalize:
-            # Keep routed FC2 on the current stream so the following finalize
-            # kernel can be its PDL dependent. The shared branch only reads the
-            # same live input and writes a fresh gated output; no D2D clone is
-            # introduced on this path.
+            # Keep routed FC2 on the current stream as finalize's PDL dependency;
+            # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
                 hidden_states, defer_finalize=True

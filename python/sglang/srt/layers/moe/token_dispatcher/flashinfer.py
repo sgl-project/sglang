@@ -52,19 +52,14 @@ logger = logging.getLogger(__name__)
 
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 
-# FlashInfer caches MoeAlltoAll's MNNVL allocation by workspace size.  A tiny,
-# aligned tail padding gives concurrently live target/draft and decode/prefill
-# paths distinct cache keys without changing the usable token geometry.  MNNVL
-# rounds allocations to its own mapping granularity, so this does not add any
-# dispatch/combine work; it only leases a separate persistent workspace.
+# FlashInfer keys MNNVL allocations by workspace size; aligned tail padding gives
+# concurrently live paths distinct persistent workspaces without extra token work.
 _WORKSPACE_NAMESPACE_ALIGNMENT = 128
 
 
 def _max_tokens_per_scattered_source(
     dp_global_num_tokens: list[int], attn_tp_size: int
 ) -> int:
-    """Return the largest token shard owned by one physical EP source rank."""
-
     assert attn_tp_size > 0
     max_dp_tokens = max(dp_global_num_tokens)
     return (max_dp_tokens + attn_tp_size - 1) // attn_tp_size
@@ -73,8 +68,6 @@ def _max_tokens_per_scattered_source(
 def _scattered_source_token_counts(
     dp_global_num_tokens: list[int], attn_tp_size: int
 ) -> list[int]:
-    """Expand DP token counts into the physical source-rank tensor splits."""
-
     assert attn_tp_size > 0
     counts = []
     for num_tokens in dp_global_num_tokens:
@@ -86,8 +79,6 @@ def _scattered_source_token_counts(
 
 
 def _workspace_size_for_namespace(workspace_size: int, *, speculative: bool) -> int:
-    """Return distinct FlashInfer cache keys for target and draft decode."""
-
     slot = int(speculative)
     return workspace_size + slot * _WORKSPACE_NAMESPACE_ALIGNMENT
 
@@ -232,9 +223,8 @@ class FlashinferDispatcher(BaseDispatcher):
         is_speculative_model = get_flags().moe.speculative_context
 
         def make_moe_a2a() -> MoeAlltoAll:
-            # Target and draft decode graphs can coexist. Prefill and mixed
-            # extend use AG+RS below and therefore do not lease an MNNVL A2A
-            # workspace at all.
+            # Target and draft decode graphs can coexist; prefill/mixed extend use
+            # AG+RS and do not lease MNNVL A2A workspaces.
             workspace_size = _workspace_size_for_namespace(
                 self.workspace_size,
                 speculative=is_speculative_model,
@@ -257,14 +247,8 @@ class FlashinferDispatcher(BaseDispatcher):
     def _dispatch_prefill_allgather(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
-        """Use exact-size BF16 AG for prefill and mixed extend.
-
-        FlashInfer one-sided A2A owns the pure-decode CUDA Graph fast path.
-        Eager extend can overlap a preceding graph on another stream, and the
-        one-sided transport's signal state is not safe to reuse across those
-        streams.  A conventional all-gatherv here avoids that communicator
-        race without adding synchronization to decode.
-        """
+        # Eager extend can overlap another stream, so use BF16 all-gatherv instead
+        # of reusing pure-decode A2A signal state across streams.
 
         if hidden_states.dtype != torch.bfloat16:
             raise TypeError(
@@ -316,12 +300,8 @@ class FlashinferDispatcher(BaseDispatcher):
         if get_is_extend_in_batch():
             return self._dispatch_prefill_allgather(hidden_states, topk_output)
         self.active_moe_a2a = self.moe_a2a
-        # Block-wise FP8 expert runners quantize activations locally immediately
-        # before GEMM.  Keep the one-sided dispatch wire format in BF16 so both
-        # TRT-LLM Gen MoE and DeepGEMM consume the same lossless payload and the
-        # combine reduction also stays BF16.  FP4 dispatch is intentionally
-        # excluded: it advertises input_global_scale and uses its existing
-        # packed payload path below.
+        # Block-wise FP8 runners quantize before GEMM, so keep dispatch/combine BF16;
+        # FP4 retains its packed wire path keyed by input_global_scale.
         runner_backend = get_moe_runner_backend()
         weight_dtype = self.quant_config.get("weight_dtype")
         uses_bf16_fp8_payload = weight_dtype in (
@@ -377,18 +357,8 @@ class FlashinferDispatcher(BaseDispatcher):
         # CUDA-graph *capture*; on *replay* dispatch() is not re-executed and the
         # value baked at capture is reused. Two cases, both rank-invariant:
         #
-        # Case 1 — DP attention feeding EP. The scheduler all-gathers the token
-        #   count for every DP replica into dp_global (identical on every rank).
-        #   Before MoE, LayerCommunicator token-scatters each replica across its
-        #   attention-TP group, so a physical EP source rank owns at most
-        #   ceil(max(dp_global) / attn_tp_size) tokens. Using max(dp_global)
-        #   directly is safe but can create attn_tp_size times too much padding
-        #   and MoE work for DPxTP layouts. FlashInfer A2A forces
-        #   require_mlp_tp_gather=True (see require_mlp_tp_gather()), so eager
-        #   reads the live list; capture sees a uniform bucket list; replay uses
-        #   the same baked geometry on all ranks. Without the cross-rank max,
-        #   ranks could replay different-sized graphs -> geometry mismatch ->
-        #   illegal memory access (issue #30242).
+        # Each EP source owns ceil(max(dp_global) / attn_tp_size) tokens; the
+        # shared maximum keeps graph geometry rank-uniform (issue #30242).
         #
         # Case 2 — x.shape[0]: no per-rank DP list (dp_global absent or scalar).
         #   This is SP attention feeding EP (tokens are sequence-parallel scattered
@@ -416,10 +386,8 @@ class FlashinferDispatcher(BaseDispatcher):
             )
             self.runtime_max_tokens_per_rank = x.shape[0]
 
-        # MoeAlltoAll's workspace is allocated once from max_num_tokens. Passing
-        # a larger runtime geometry does not resize it and can otherwise turn a
-        # mixed prefill/speculative batch into a delayed illegal memory access.
-        # Fail at the dispatch boundary with the exact required capacity.
+        # MoeAlltoAll does not resize its max_num_tokens workspace; reject larger
+        # runtime geometry here before it becomes an illegal memory access.
         assert self.runtime_max_tokens_per_rank <= self.max_num_tokens, (
             "FlashInfer A2A runtime token geometry exceeds its fixed workspace: "
             f"runtime_max_tokens_per_rank={self.runtime_max_tokens_per_rank} > "

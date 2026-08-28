@@ -82,10 +82,8 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertIsNone(checkpoints)
 
     def test_ratio8_bs1_split_view_reproduces_under_alignment(self):
-        # A TP-sharded ratio-8 projection packs [b_local(8) | a_local(8)] in
-        # BF16. The a view begins 16 bytes after the storage base. At BS=1
-        # PyTorch considers the strided view contiguous, so contiguous() is a
-        # no-op and cannot satisfy FlashInfer's stricter 32-byte ABI.
+        # In a BF16 [b_local(8)|a_local(8)] projection, a begins 16 bytes in;
+        # contiguous() is a no-op at BS=1 and cannot meet FlashInfer's 32-byte ABI.
         projected_ba = torch.empty((2, 16), dtype=torch.bfloat16)
         _, a = projected_ba.split((8, 8), dim=-1)
 

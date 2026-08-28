@@ -15,7 +15,6 @@
 
 import dataclasses
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -28,6 +27,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -83,8 +83,7 @@ _autotune_run_lm_head: Optional[bool] = None
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:
-    """Opt-in stage trace for diagnosing post-MoE DP-attention stalls."""
-    if os.getenv("SGLANG_TRACE_LOGITS_E2E", "0") != "1":
+    if not envs.SGLANG_TRACE_LOGITS_E2E.get():
         return
     try:
         parallel = get_parallel()
@@ -111,9 +110,8 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
         return False
 
-    # Some draft models share an unquantized target lm_head tensor while still
-    # carrying the draft model's stale ModelOpt quant_method. Only use the
-    # ModelOpt lm_head kernel when the runtime quantization state matches it.
+    # A shared target lm_head can retain the draft's stale ModelOpt method; use it
+    # only when the runtime tensor layout matches that method.
     if method_name == "ModelOptFp4LinearMethod":
         if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
             lm_head,
@@ -156,11 +154,8 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     return True
 
 
-# When set, LogitsProcessor.forward returns an empty output and skips the
-# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
-# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
-# and its [batch * dp_size, vocab] output OOMs under DP attention with a
-# tight mem_fraction_static.
+# FlashInfer autotune skips the unprofiled LM-head all-gather; its
+# [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
 
 
@@ -766,7 +761,7 @@ class LogitsProcessor(nn.Module):
             local_shape=tuple(local_hidden_states.shape),
         )
 
-        if os.getenv("SGLANG_TRACE_LOGITS_E2E_SYNC", "0") == "1":
+        if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("pre_lm_head_sync_enter")
             torch.cuda.synchronize()
             _trace_e2e_logits("pre_lm_head_sync_returned")
@@ -774,7 +769,7 @@ class LogitsProcessor(nn.Module):
         _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
-        if os.getenv("SGLANG_TRACE_LOGITS_E2E_SYNC", "0") == "1":
+        if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
             torch.cuda.synchronize()
             _trace_e2e_logits("post_lm_head_sync_returned")

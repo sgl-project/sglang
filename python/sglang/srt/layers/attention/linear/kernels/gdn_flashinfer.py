@@ -36,7 +36,6 @@ _FLASHINFER_GDN_ALIGNMENT = 32
 def _empty_aligned_like(
     tensor: torch.Tensor, alignment: int = _FLASHINFER_GDN_ALIGNMENT
 ) -> torch.Tensor:
-    """Return an uninitialized contiguous tensor with an aligned data pointer."""
     element_size = tensor.dtype.itemsize
     alignment_elements = max(1, alignment // element_size)
     storage = torch.empty(
@@ -197,9 +196,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ] = {}
         self._verify_intermediate_buffers: dict[tuple, torch.Tensor] = {}
         self._alignment_fallback_warned = False
-        # Mutable state/workspace cannot be repaired with a temporary copy:
-        # FlashInfer writes through those pointers. Triton has no 32-byte ABI
-        # requirement and is therefore the semantics-preserving fallback.
+        # FlashInfer writes through mutable state/workspace pointers, so misaligned
+        # inputs must fall back to Triton rather than use temporary copies.
         from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
             TritonGDNKernel,
         )
@@ -248,14 +246,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         logger.info("Using FlashInfer GDN kernels")
 
     def _prepare_dynamic_input(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
-        """Repair an under-aligned read-only input using reusable scratch.
-
-        The normal producer path returns aligned tensors and takes the zero-cost
-        branch. The scratch path is a safety net for other models or view
-        layouts. A buffer is allocated once per argument/shape/stream and then
-        reused, avoiding allocator churn in eager decode and providing stable
-        addresses for CUDA Graph capture.
-        """
+        # Reuse per-stream aligned scratch for uncommon read-only views; stable
+        # addresses avoid allocator churn and remain safe for CUDA graph capture.
         if tensor.data_ptr() % _FLASHINFER_GDN_ALIGNMENT == 0:
             return tensor
 
@@ -285,7 +277,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         *,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        """Return a stable aligned view/copy of an immutable kernel parameter."""
         key = (
             name,
             id(tensor),
@@ -325,11 +316,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
     def _mutable_inputs_are_aligned(
         self, *named_tensors: tuple[str, Optional[torch.Tensor]]
     ) -> bool:
-        """Return whether mutable buffers satisfy FlashInfer's ABI.
-
-        Copying a state or workspace into temporary storage would lose kernel
-        writeback. The caller falls back to Triton instead.
-        """
         for name, tensor in named_tensors:
             if tensor is None or tensor.data_ptr() % _FLASHINFER_GDN_ALIGNMENT == 0:
                 continue
@@ -350,16 +336,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         intermediate_states_buffer: torch.Tensor,
         batch_size: int,
     ) -> tuple[torch.Tensor, bool]:
-        """Return FlashInfer's exact-batch verify workspace.
-
-        SGLang owns a pool-scoped speculative-state buffer, while the SM100
-        FlashInfer MTP kernel requires its workspace dim 0 to equal the
-        captured batch size exactly. CUDA Graph capture can pad the batch past
-        the speculative pool (for example, pool rows 7 and capture B=8). Keep
-        the normal path zero-copy and use a stable, stream-local aligned
-        scratch only for that padded capture tier. The caller copies the rows
-        owned by the pool back after FlashInfer writes them.
-        """
+        # FlashInfer requires exact capture B, which may exceed the pool-scoped
+        # buffer; padded tiers use stable scratch and copy owned rows back.
         direct = intermediate_states_buffer[:batch_size]
         if direct.shape[0] == batch_size:
             return direct, False
@@ -643,9 +621,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self.use_state_pool and intermediate_states_buffer is not None:
             # The SM100 bf16 MTP kernel indexes this scratch buffer by the
             # per-call batch id, while SGLang's speculative state cache is
-            # pool-scoped. Graph capture can pad B beyond that pool, so use a
-            # stable exact-B scratch for the padded tier and copy owned rows
-            # back before post-verify commit reads the pool.
+            # Graph padding can exceed the pool-scoped scratch; use exact-B storage
+            # and copy owned rows back before post-verify commit reads the pool.
             (
                 intermediate_states_buffer_mtp,
                 copy_verify_intermediate_back,

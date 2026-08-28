@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -318,9 +317,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
-        trace_deepep_v2_contig = os.environ.get(
-            "SGLANG_DEEPEP_V2_TRACE_CONTIG"
-        ) == "1" and running_state.get("deepep_v2_expanded", False)
+        trace_deepep_v2_contig = (
+            envs.SGLANG_DEEPEP_V2_TRACE_CONTIG.get()
+            and running_state.get("deepep_v2_expanded", False)
+        )
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
@@ -604,7 +604,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_scale = quant_info.w2_scale
 
         hidden_states_device = running_state["hidden_states_device"]
-        trace_deepep_v2_masked = os.environ.get("SGLANG_DEEPEP_V2_TRACE_MASKED") == "1"
+        trace_deepep_v2_masked = envs.SGLANG_DEEPEP_V2_TRACE_MASKED.get()
         if trace_deepep_v2_masked:
             logger.warning(
                 "DeepEP v2 masked runner enter: hidden=%s hidden_stride=%s "

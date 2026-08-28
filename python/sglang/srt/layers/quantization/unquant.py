@@ -107,10 +107,8 @@ _flashinfer_pr4266_prefer_direct = None
 _flashinfer_pr4266_run_direct_dense = None
 _enable_bf16_splitk_gemm = False
 
-# Oakhaven-Max TP16 tactics measured on GB300 under CUDA graph replay with PDL
-# and L2-defeating weight rotation. Every entry passed the strict correctness
-# gate and beat SGLang's existing dispatch by at least 1.26x. Unlisted M/N/K,
-# including M=64, retain SGLang's existing TGV/cuBLAS path.
+# GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
+# Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
 _FLASHINFER_PR4266_TUNED_TACTICS = {
     (1, 256, 8192): (64, 8, 4, 11),
     (2, 256, 8192): (64, 8, 4, 11),
@@ -144,7 +142,6 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
 
 
 def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
-    """Return whether the PR #4266 low-M kernel is selected for this shape."""
     return (m, n, k) in _FLASHINFER_PR4266_TUNED_TACTICS
 
 

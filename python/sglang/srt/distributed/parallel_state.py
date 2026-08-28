@@ -2722,9 +2722,8 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
-    # A single-member pipeline group per rank. The speculative draft is one layer
-    # and never spans stages, so it is built and run against this group instead of
-    # the real one. new_group is collective, so every rank creates all of them.
+    # The one-layer draft uses a singleton PP group; every rank creates all groups
+    # because new_group is collective.
     global _SELF_PP
     if _SELF_PP is None:
         _SELF_PP = init_model_parallel_group(

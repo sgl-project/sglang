@@ -1376,10 +1376,8 @@ class Scheduler(
         )
 
         if self.spec_algorithm.carries_draft_hidden_states():
-            # Derive from the draft config, not the draft runner: the runner does
-            # not exist on ranks that do not host the draft (prefill-side PP builds
-            # it only on the last stage), and the PD metadata wire schema has to be
-            # identical on every rank.
+            # Derive the rank-uniform PD wire schema from config because only the
+            # last prefill PP stage owns a draft runner.
             draft_model_config = ModelConfig.from_server_args(
                 self.server_args,
                 model_path=get_spec().speculative_draft_model_path,
@@ -4005,12 +4003,8 @@ class Scheduler(
                         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
-                # Sync D2H so the result processor can read CPU tensors. A non-last
-                # PP rank produced only proxy tensors, so there is nothing to copy.
-                # Under PP this result is not the one that gets processed -- every
-                # rank consumes the copy rebuilt from the output ring -- and the
-                # ring carries device tensors, so copying here would only move
-                # next_token_ids to the host behind the ring's back.
+                # Only the last PP rank owns real results requiring D2H; other ranks
+                # consume device tensors rebuilt from the output ring.
                 batch_result.copy_done = self.device_module.Event()
                 if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
                     batch_result.copy_to_cpu(

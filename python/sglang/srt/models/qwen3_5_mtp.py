@@ -154,10 +154,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        # Under prefill-side pipeline parallelism the target's embed lives on the
-        # first stage and its lm_head on the last, so only one of them reaches a
-        # draft that sits on the last stage. Keep whatever the draft loaded itself
-        # for the half the target cannot share.
+        # A last-stage draft can share only the target lm_head under PP; retain its
+        # own embedding for the first-stage half it cannot receive.
         if embed is not None:
             del self.model.embed_tokens.weight
             self.model.embed_tokens.weight = embed
@@ -218,10 +216,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            # A captured prefill graph hands the model its static token slot, so
-            # input_embeds is the padded height while the target's hidden states
-            # arrive at this chunk's real height. Place the real rows into a slot
-            # of the same height; the padding rows are never read downstream.
+            # Captured prefill gives padded embeddings but real-height target states;
+            # place the real rows in an equal-height slot whose padding stays unread.
             if hidden_states.shape[0] != input_embeds.shape[0]:
                 rows = min(hidden_states.shape[0], input_embeds.shape[0])
                 slot = hidden_states.new_zeros(

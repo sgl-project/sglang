@@ -53,7 +53,6 @@ def _import_kernel_backend():
 
 
 def _with_early_finalize_shared_load(config):
-    """Copy a provider config and opt its LL/BT finalize presets into overlap."""
     profiles = []
     updated_presets = 0
     for profile in config.profiles:
@@ -124,10 +123,8 @@ class FlashInferMNNVLCuteDSLARFusion:
 
         with torch.cuda.device(self.device):
             self.device = torch.device("cuda", torch.cuda.current_device())
-            # The CuTe DSL provider obtains its NVLS workspace from PyTorch
-            # symmetric memory. This selects PyTorch's allocation/rendezvous
-            # backend, not the FlashInfer fusion provider implemented below.
-            # It is process-local setup and must precede workspace construction.
+            # CuTe DSL obtains NVLS storage through PyTorch symmetric memory, whose
+            # process-local backend must be selected before workspace construction.
             import torch.distributed._symmetric_memory as symm_mem
 
             symmetric_memory_backend = symm_mem.get_backend(self.device)
@@ -150,19 +147,15 @@ class FlashInferMNNVLCuteDSLARFusion:
                 self._patterns,
                 default_config,
             ) = _import_kernel_backend()
-            # Qwen's shared-expert handoff is complete before this fused finalize
-            # launch. Opt only finalize kernels into FlashInfer's faster early
-            # shared load; standalone AllReduce kernels retain the safe ordering.
+            # Only fused finalize launches have a completed shared-expert handoff;
+            # standalone AllReduce kernels retain the safe load ordering.
             from sglang.srt.runtime_context import get_spec
 
             if get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(default_config)
             else:
-                # The early shared load lets the fused finalize PDL-preload
-                # the shared-expert buffer before its predecessor completes.
-                # That is only safe for the single looping decode graph;
-                # speculative decoding alternates draft/verify graph replays
-                # and intermittently reads a not-yet-ready buffer.
+                # Early shared load is safe only for a single looping decode graph;
+                # alternating draft/verify replays can read an unfinished buffer.
                 logger.info(
                     "Speculative decoding active: keeping the FlashInfer MNNVL "
                     "CuTe DSL finalize presets on the safe (non-early-load) "
@@ -186,11 +179,8 @@ class FlashInferMNNVLCuteDSLARFusion:
                 config=self.workspace_config,
             )
 
-            # Defensive publish barrier: current workspace classes already
-            # synchronize + barrier at the end of __init__, but an older
-            # upstream FlashInfer workspace may not, and publishing an
-            # incompletely initialized mailbox desynchronizes the Lamport
-            # stages permanently.
+            # Publish only after the mailbox barrier; older FlashInfer workspace
+            # classes may not provide it and would desynchronize Lamport stages.
             torch.cuda.synchronize(self.device)
             dist.barrier(group=process_group)
 

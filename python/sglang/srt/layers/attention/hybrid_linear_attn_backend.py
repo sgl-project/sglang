@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -15,6 +14,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
-    os.environ.get("SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES", "0") == "1"
+    envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
 
 
@@ -606,9 +606,8 @@ class MambaAttnBackendBase(AttentionBackend):
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if _validate_mamba_replay_state_indices and not in_capture:
-            # This function runs before graph replay.  The diagnostic CPU copy
-            # deliberately synchronizes here so malformed live/padded indices
-            # fail before any captured indexed state update can consume them.
+            # This pre-replay diagnostic intentionally syncs to reject malformed
+            # live or padded indices before a captured state update uses them.
             valid_bs = bs - int(num_padding)
             validate_replay_state_indices_cpu(
                 mamba_indices.detach().cpu(),

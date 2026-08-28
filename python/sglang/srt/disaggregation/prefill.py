@@ -103,16 +103,8 @@ def should_force_retry(req: Req) -> bool:
 
 
 def _transfer_start_layer(*, pool, hf_text_config) -> int:
-    """Offset of this stage's first KV entry inside the peer's dense KV list.
-
-    A hybrid-linear pool stores KV only for its full-attention layers, but its
-    ``start_layer`` is a global layer index that also counts linear layers. The
-    decode peer's pointer list is dense over full-attention layers, so the global
-    index over-shoots it. Translate to a full-attention-relative offset.
-
-    The pool only knows this stage's own layer ids, so the count has to come from
-    the model-wide layer table.
-    """
+    # Hybrid pools count all layers in start_layer, but peer KV lists contain only
+    # full-attention layers, so translate to a full-attention-relative offset.
     if not isinstance(pool, HybridLinearKVPool):
         return pool.start_layer
     return sum(

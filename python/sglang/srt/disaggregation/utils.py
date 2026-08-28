@@ -952,7 +952,6 @@ def build_kv_layer_ids(
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
-    """One draft-local layer id per registered draft KV entry."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if isinstance(pool, HybridLinearKVPool):

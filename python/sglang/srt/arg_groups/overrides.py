@@ -2276,9 +2276,8 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
     }:
-        # The Qwen-specific backend owns one workspace for both ordinary AR
-        # and MoE finalize patterns. Do not allocate the legacy FlashInfer
-        # TRTLLM/MNNVL workspace or let it become a graph-path fallback.
+        # The Qwen backend owns one workspace for ordinary AR and MoE finalize;
+        # do not allocate or fall back to the legacy TRTLLM/MNNVL workspace.
         if view.flashinfer_allreduce_fusion_backend is not None:
             logger.warning(
                 "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION owns both Qwen3.5 "

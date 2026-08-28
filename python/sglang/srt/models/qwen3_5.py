@@ -136,8 +136,8 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
-_gdn_decode_fused_proj_conv = _is_cuda and get_bool_env_var(
-    "SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV", "True"
+_gdn_decode_fused_proj_conv = (
+    _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -285,7 +285,6 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
-    """Preserve the ordinary marker or validate the real deferred handoff."""
     if not expect_deferred:
         if not isinstance(hidden_states, torch.Tensor):
             from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
@@ -789,9 +788,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
         if use_fused_decode_proj_conv:
-            # The GDN backend owns the indexed Conv1D state and therefore owns
-            # the safe unpack+Conv fusion boundary. B/A are passed as temporary
-            # placeholders and replaced by the backend before recurrent GDN.
+            # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
+            # it replaces these temporary B/A placeholders before recurrence.
             mixed_qkv = (projected_states_qkvz, projected_states_ba)
             z = None
             b = projected_states_ba
@@ -1000,9 +998,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             and self.layer_communicator.is_last_layer
             and not defer_moe_finalize
         ):
-            # The last layer has no following prepare_attn to consume the
-            # ordinary deferred-AllReduce marker. Fall back before the MLP so
-            # postprocess_layer performs the collective instead of dropping it.
+            # The last layer has no prepare_attn consumer for deferred AllReduce;
+            # fall back before MLP so postprocess_layer performs the collective.
             fuse_mlp_allreduce = False
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
@@ -1737,12 +1734,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 }
             )
 
-        # Apply final normalization. The final decoder layer has no following
-        # layer to consume its deferred MoE tail, so consume it here with the
-        # model's own GemmaRMSNorm gamma. Preserve the sam/dev native-final-norm
-        # diagnostic path for the ordinary (non-deferred) case.
-        trace_final_norm = os.getenv("SGLANG_TRACE_QWEN35_FINAL_NORM", "0") == "1"
-        use_native_final_norm = os.getenv("SGLANG_QWEN35_NATIVE_FINAL_NORM", "0") == "1"
+        # The final layer has no successor to consume its deferred MoE tail.
+        trace_final_norm = envs.SGLANG_TRACE_QWEN35_FINAL_NORM.get()
+        use_native_final_norm = envs.SGLANG_QWEN35_NATIVE_FINAL_NORM.get()
         is_deferred_finalize = False
         if self.flashinfer_mnnvl_cutedsl_fusion is not None:
             from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (

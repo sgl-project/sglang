@@ -542,9 +542,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         local_bytes = per_layer_bytes * num_layers * 2
 
         if self.pp_size > 1:
-            # Pair staging slots, not kv_data_ptrs entries: the gather lays out
-            # [every k_buffer, every v_buffer], which stops matching kv_layer_ids
-            # once draft KV buffers are appended.
+            # Pair staging slots in [all K, all V] order; draft buffers make
+            # kv_data_ptrs diverge from this layout.
             src_slot_ids = (
                 self.kv_buffer_tensors.get("slot_layer_ids")
                 or self.kv_args.kv_layer_ids
@@ -676,9 +675,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        # When both peers publish layer ids the pairing is exact, so prefer it
-        # over positional slicing regardless of backend; a plain-MHA model
-        # publishes no ids and is unaffected.
+        # Published layer IDs give exact pairing; plain-MHA peers publish none
+        # and keep positional slicing.
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
         if (
             self.is_mla_backend
@@ -1057,9 +1055,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_data_ptrs = self.kv_args.kv_data_ptrs
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
-            # Pair by layer id. Required once draft KV buffers are appended: the
-            # flat list is then no longer [K block, V block], so the half-split
-            # in get_mha_kv_ptrs_with_pp mislabels entries.
+            # Draft buffers break the flat [K block, V block] layout, so pair by
+            # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
             if any(l != src_kv_item_len for l in self.kv_args.kv_item_lens):
                 logger.error(
                     f"[{mooncake_session_id}] head-sliced transfer assumes one item "

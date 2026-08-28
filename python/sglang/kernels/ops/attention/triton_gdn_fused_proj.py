@@ -330,14 +330,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     return mixed_qkv, z, b, a
 
 
-# =============================================================================
-# Decode-only Qwen3.5 contiguous projection unpack + causal Conv1D update.
-#
-# This deliberately leaves the quantized projection GEMMs unchanged. The safe
-# fusion boundary begins at their activation outputs:
-#   qkvz = [all_q | all_k | all_v | all_z]
-#   ba   = [all_b | all_a]
-# =============================================================================
+# Fusion begins after the quantized GEMMs: qkvz=[q|k|v|z], ba=[b|a].
+# This tail unpacks both projections and updates the causal Conv1D state.
 
 
 @triton.jit
@@ -386,9 +380,8 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     state_slot = tl.load(conv_state_indices + batch_idx * stride_state_indices).to(
         tl.int64
     )
-    # Treat every out-of-range index as padding.  Replay metadata normally uses
-    # exactly PAD_SLOT_ID, but this extra bound prevents malformed/stale graph
-    # metadata from turning an indexed state update into an OOB access.
+    # Treat every out-of-range index as padding so stale replay metadata cannot
+    # turn an indexed state update into an OOB access.
     valid_slot = (
         (state_slot != PAD_SLOT_ID) & (state_slot >= 0) & (state_slot < NUM_STATE_SLOTS)
     )

@@ -1,4 +1,3 @@
-import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -9,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -44,11 +44,9 @@ _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
-_fused_decode_log_layer_hits = (
-    os.environ.get("SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS", "0") == "1"
-)
+_fused_decode_log_layer_hits = envs.SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS.get()
 _fused_decode_verify_real_tensors = (
-    os.environ.get("SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS", "0") == "1"
+    envs.SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS.get()
 )
 
 if is_cuda():
@@ -513,11 +511,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     )
                     _fused_decode_proj_conv_layers_logged.add(layer.layer_id)
 
-                # Diagnostic-only real-tensor oracle. It consumes the actual
-                # projection activations and selected pre-update cache rows,
-                # but runs the deployed direct-Triton update on a compact
-                # state copy so the live cache is mutated only by the
-                # candidate. Any mismatch aborts at the first GDN layer.
+                # Compare real activations against the direct-Triton update on a
+                # compact state copy, leaving the live cache to the candidate.
                 verify_real_tensors = (
                     _fused_decode_verify_real_tensors
                     and layer.layer_id not in _fused_decode_real_tensor_verified_layers

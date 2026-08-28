@@ -1,5 +1,4 @@
 import logging
-import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -9,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -70,8 +70,7 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
 def _trace_e2e_sampler(stage: str, **fields) -> None:
-    """Opt-in sampler stage trace for DP-attention E2E diagnostics."""
-    if os.getenv("SGLANG_TRACE_SAMPLER_E2E", "0") != "1":
+    if not envs.SGLANG_TRACE_SAMPLER_E2E.get():
         return
     try:
         parallel = get_parallel()

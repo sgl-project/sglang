@@ -1081,10 +1081,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             get_spec().speculative_algorithm
         )
 
-        # The draft runs where the target's last-layer hidden states and sampled
-        # tokens exist, i.e. only on the last pipeline stage. Other stages keep an
-        # EAGLEWorkerV2 that forwards the target and returns proxy tensors, so the
-        # scheduler's dispatch and run_batch branching stay rank-uniform.
+        # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
+        # return proxies so scheduler dispatch remains rank-uniform.
         self._hosts_draft = get_pp_group().is_last_rank
         self._draft_worker = (
             EagleDraftWorker(

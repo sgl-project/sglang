@@ -579,7 +579,6 @@ def _mnnvl_cutedsl_allreduce_fusion(
     raise AssertionError("unreachable")
 
 
-# SGLang-public name for the backend entry point. The underscore original is
-# kept verbatim for re-syncs against upstream, where a public
-# flashinfer.comm.allreduce_fusion dispatcher fronts it.
+# Keep the upstream private name intact while exposing SGLang's backend entry point;
+# upstream exports it through flashinfer.comm.allreduce_fusion.
 mnnvl_cutedsl_allreduce_fusion = _mnnvl_cutedsl_allreduce_fusion

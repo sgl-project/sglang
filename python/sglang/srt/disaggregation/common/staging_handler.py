@@ -543,9 +543,8 @@ class StagingRegisterInfo:
 
     base_ptr: int = 0
     total_size: int = 0
-    # Staging slot order is [all K layers, all V layers], which differs from the
-    # kv_data_ptrs order once draft KV buffers are appended. Empty when the peer
-    # predates this field; callers then fall back to kv_layer_ids.
+    # Staging slots stay [all K, all V] after draft buffers alter kv_data_ptrs order;
+    # older peers leave this empty and callers fall back to kv_layer_ids.
     slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
 
     @classmethod

@@ -128,9 +128,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
     def get_embed_and_head(self):
-        # Under PP the embedding lives on the first stage and the lm_head on the
-        # last, so a stage holds at most one of them; the draft keeps its own
-        # copy for the half it does not receive.
+        # PP splits embedding and lm_head across first/last stages; the draft keeps
+        # its own copy of whichever half its stage cannot receive.
         embed = (
             None
             if isinstance(self.model.embed_tokens, PPMissingLayer)
@@ -193,13 +192,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
-        # Keep the upstream checkpoint iterator lazy.  Materializing all body
-        # tensors in a list retains every mmap-backed CPU tensor until the
-        # complete Oakhaven checkpoint has been scanned.  With four model
-        # processes per Grace node that transient host-RSS peak exceeds the
-        # Slurm memory allocation before the tensors can be copied to GPU.
-        # The body loader already consumes an Iterable one tensor at a time,
-        # so prefix stripping can remain a streaming generator.
+        # Keep prefix stripping lazy: materializing mmap-backed checkpoint tensors
+        # across model processes can exceed host memory before GPU copies finish.
         def body_weights():
             for name, loaded_weight in weights:
                 if name.startswith(_MODEL_PREFIX):

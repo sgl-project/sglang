@@ -939,11 +939,8 @@ def build_prefill_registry(
                 )
         reg.register_slot(slot, bind=bind)
 
-    # Pipeline-parallel stage inputs are token-axis tensors carried outside
-    # ForwardBatch.  Adopt the runner-owned backing buffers so capture and
-    # replay use the same addresses, copy the live stage input through
-    # FillContext, and clear bucket padding because prefill graphs execute
-    # every padded token.
+    # PP stage inputs live outside ForwardBatch; adopt runner-owned buffers for
+    # stable addresses and clear padding because prefill executes every bucket row.
     if source is not None:
         pp = getattr(source, "pp_proxy_tensors", None)
         if pp is not None:

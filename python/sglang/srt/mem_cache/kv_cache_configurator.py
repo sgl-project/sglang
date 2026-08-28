@@ -168,13 +168,8 @@ def _pp_local_per_request_bytes(
     start_layer: int,
     end_layer: int,
 ) -> int:
-    """Scale a layer-linear state cost to the current PP stage.
-
-    ``BaseLinearStateParams`` reports bytes for every linear-attention layer in
-    the model config, while the PP memory pools below allocate only layers in
-    ``[start_layer, end_layer)``.  Budgeting the global value makes the error
-    grow with PP size and can reject configurations whose real local pools fit.
-    """
+    # BaseLinearStateParams reports global bytes, but PP pools allocate only local
+    # layers; charge this stage its proportional per-request share.
     if not layer_ids:
         return 0
     if total_bytes % len(layer_ids) != 0:

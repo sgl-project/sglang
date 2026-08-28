@@ -1580,9 +1580,8 @@ def fused_moe_dispatch_index_triton_kernel(
     expert_safe = tl.where(valid, expert, 0)
     offset = tl.atomic_add(masked_m_ptr + expert_safe, 1, mask=valid)
     dst = expert_safe * m_max + offset
-    # post_reorder checks src2dst rather than topk_ids.  Explicitly initialize
-    # padding/non-local lanes to -1 in this same kernel so they cannot consume
-    # an uninitialized positive offset and add a bogus expert contribution.
+    # post_reorder checks src2dst, so mark padding/non-local lanes -1 here to
+    # prevent uninitialized offsets from adding bogus expert contributions.
     tl.store(src2dst_ptr + offs, tl.where(valid, dst, -1), mask=mask)
 
 

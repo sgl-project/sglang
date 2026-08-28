@@ -1568,10 +1568,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             else forward_batch.global_forward_mode
         )
 
-        # The eager tail of the draft model concatenates spec hidden states
-        # with embeddings of the padded input_ids, so the batch must carry the
-        # bucket-sized static buffer view rather than the raw-length live
-        # tensor. The buffer prefix is refreshed from the live tensor below.
+        # The draft tail concatenates hidden states with padded input embeddings;
+        # expose the bucket-sized static view and refresh its live prefix below.
         padded_spec_info = forward_batch.spec_info
         if (
             self.static_draft_hidden_states is not None
@@ -1634,11 +1632,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
-            # Multimodal embedding preparation consumes ``mm_inputs`` and keeps
-            # the composed embeddings on the live ForwardBatch for later MTP
-            # draft-extend forwards.  Preserve that side channel when BCG/Full
-            # builds its replay view; otherwise a subsequent graph invocation
-            # sees neither the consumed inputs nor their embeddings.
+            # Multimodal preparation consumes mm_inputs but retains embeddings for
+            # later MTP draft extend, so copy that side channel into the replay view.
             mm_input_embeds=forward_batch.mm_input_embeds,
             temperature=forward_batch.temperature,
             top_p=forward_batch.top_p,

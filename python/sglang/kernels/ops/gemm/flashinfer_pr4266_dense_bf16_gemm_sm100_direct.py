@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# Vendored from flashinfer-ai/flashinfer PR #4266, as shipped in the
-# 0.6.18.dev20260807 nightly, pending a FlashInfer release that ships it.
+# Vendored from flashinfer-ai/flashinfer@629147317d4149a12e53bcef27808bac380c283f.
 """Register-prefetch BF16 GEMM for low-M, long-K decode shapes.
 
 The kernel keeps a complete output dot product inside one CTA and reuses each

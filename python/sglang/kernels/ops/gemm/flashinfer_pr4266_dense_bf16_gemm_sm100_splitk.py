@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-# Vendored from flashinfer-ai/flashinfer PR #4266 at 629147317d4149a12e53bcef27808bac380c283f.
+# Vendored from flashinfer-ai/flashinfer@629147317d4149a12e53bcef27808bac380c283f.
 """Blackwell low-M BF16/FP16 GEMM with an in-kernel cluster split-K reduction.
 
 Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
