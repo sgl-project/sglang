@@ -86,7 +86,6 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         specs, entries = build_full_draft_pools(
             draft_kv_pool=draft_kv_pool,
             tree_cache=None,
-            server_args=None,
         )
 
         self.assertEqual(specs, [])
@@ -124,7 +123,6 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
             specs, entries = build_full_draft_pools(
                 draft_kv_pool=draft_kv_pool,
                 tree_cache=tree_cache,
-                server_args=server_args,
             )
 
         self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)

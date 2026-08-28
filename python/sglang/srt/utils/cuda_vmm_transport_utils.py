@@ -161,10 +161,10 @@ def _contains_tensor_container(value) -> bool:
     )
 
 
-def get_vmm_feature_consumer_count(server_args) -> int:
-    if get_parallel().config.enable_dp_attention:
-        return get_parallel().config.tp_size // get_parallel().config.dp_size
-    return get_parallel().config.tp_size
+def get_vmm_feature_consumer_count() -> int:
+    if get_parallel().enable_dp_attention:
+        return get_parallel().tp_size // get_parallel().dp_size
+    return get_parallel().tp_size
 
 
 class CudaVmmMemoryPool:
@@ -947,7 +947,7 @@ class CudaVmmFeatureTransport:
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             base_gpu_id=server_args.base_gpu_id,
-            consumer_count=get_vmm_feature_consumer_count(server_args),
+            consumer_count=get_vmm_feature_consumer_count(),
             allow_posix_fallback=server_args.nnodes == 1,
         )
 
