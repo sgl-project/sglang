@@ -46,7 +46,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         ), mock.patch(
             # Keep the test runnable on CPU-only hosts: the platform assert is
             # not what is under test here.
-            "sglang.srt.server_args.is_cuda",
+            "sglang.srt.arg_groups.mamba_hook.is_cuda",
             return_value=True,
         ):
             ServerArgs._validate_mamba_extra_buffer(
@@ -67,6 +67,27 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         with self.assertRaises(AssertionError):
             self._validate(
                 _lazy_view(speculative_num_draft_tokens=512, mamba_track_interval=256)
+            )
+
+    def test_the_chunk_size_is_not_read_before_the_page_size_resolves(self):
+        """`mamba_cache_chunk_size` is derived from `page_size`, which the
+        pipeline writes *after* `_handle_model_specific_adjustments` runs this
+        validator. The read has to stay inside the `page_size is not None`
+        guard: evaluating it at the call site raises `TypeError` on the
+        unresolved `None` (hit by Qwen3-Next under PD disaggregation)."""
+        from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
+
+        def _must_not_be_read():
+            raise AssertionError("the chunk size was read before page_size resolved")
+
+        with mock.patch(
+            "sglang.srt.arg_groups.overrides.supports_mamba_cache_extra_buffer",
+            return_value=True,
+        ), mock.patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=True):
+            validate_mamba_extra_buffer(
+                _lazy_view(page_size=None),
+                "Qwen3NextForCausalLM",
+                mamba_cache_chunk_size_of=_must_not_be_read,
             )
 
 

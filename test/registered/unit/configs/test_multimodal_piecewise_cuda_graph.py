@@ -184,7 +184,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         with (
             patch.object(args, "get_model_config", return_value=args._model_config),
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch("sglang.srt.arg_groups.model_hook.is_cuda", return_value=True),
         ):
             args._handle_model_capability_adjustments()
 
