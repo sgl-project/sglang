@@ -110,12 +110,48 @@ def resolve_chat_encoding_spec(
     hf_config: Any,
     tokenizer: Any,
     tool_call_parser: Optional[str] = None,
+    explicit_chat_template: bool = False,
 ) -> Optional[str]:
     """Return the chat encoding spec for a model.
 
     None means the default path (HF chat template); any non-None spec also owns
     reasoning-history rendering (:func:`spec_owns_reasoning_history`).
+
+    ``explicit_chat_template`` is True when the operator passed
+    ``--chat-template``: an explicitly supplied template overrides the
+    built-in Python chat encoders for prompt rendering (output parsing --
+    reasoning / tool-call parsers -- is unaffected). Inkling is the one
+    exception: it cannot render through ``apply_chat_template`` at all.
     """
+    spec = _resolve_chat_encoding_spec_for_model(
+        hf_config=hf_config, tokenizer=tokenizer, tool_call_parser=tool_call_parser
+    )
+    if spec is not None and explicit_chat_template:
+        if spec == "inkling":
+            logger.warning(
+                "--chat-template is not supported for Inkling (no Jinja-renderable "
+                "tokenizer); keeping the built-in '%s' chat encoder.",
+                spec,
+            )
+            return spec
+        logger.warning(
+            "--chat-template was given, so the built-in '%s' chat encoder is "
+            "bypassed for prompt rendering; chat requests now render through the "
+            "user-specified template (reasoning/tool-call output parsers are "
+            "unaffected). Remove --chat-template to restore the built-in encoder.",
+            spec,
+        )
+        return None
+    return spec
+
+
+def _resolve_chat_encoding_spec_for_model(
+    *,
+    hf_config: Any,
+    tokenizer: Any,
+    tool_call_parser: Optional[str] = None,
+) -> Optional[str]:
+    """Model-derived encoding spec, ignoring any user-supplied chat template."""
     if tool_call_parser == "deepseekv4":
         return "dsv4"
     if tool_call_parser == "deepseekv32":
