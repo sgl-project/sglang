@@ -3,6 +3,7 @@
 //! refcount bump, not a copy.
 
 pub mod config;
+pub mod convert;
 pub mod detok;
 pub mod finish_reason;
 pub mod ids;

@@ -91,6 +91,8 @@ impl Server {
     #[pyo3(signature = (
         server_args,
         http_addr = None,
+        grpc_port = None,
+        api_key = None,
         to_scheduler_cap = 8192,
         from_scheduler_cap = 8192,
         channel_cap = 8192,
@@ -102,6 +104,8 @@ impl Server {
     fn start(
         server_args: ServerArgs,
         http_addr: Option<String>,
+        grpc_port: Option<u16>,
+        api_key: Option<String>,
         to_scheduler_cap: usize,
         from_scheduler_cap: usize,
         channel_cap: usize,
@@ -120,10 +124,15 @@ impl Server {
             .unwrap_or_else(|| server_args.bind())
             .parse()
             .map_err(|e| value_error("bad http_addr", e))?;
+        // The gRPC transport listens on the HTTP host with its own port; dark
+        // unless configured (`--rust-grpc-port`).
+        let grpc_addr = grpc_port.map(|port| SocketAddr::new(http_addr.ip(), port));
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr,
+                grpc_addr,
+                api_key,
                 http_api_worker_num: server_args.http_api_worker_num(),
                 to_scheduler_cap,
                 from_scheduler_cap,

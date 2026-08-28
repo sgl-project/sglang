@@ -8,16 +8,9 @@
 //! body shape). The OpenAI error payload and the PD bootstrap registry's
 //! plain-text bodies are protocol-owned and deliberately not unified here.
 
-use std::convert::Infallible;
+use http::StatusCode;
 
-use axum::{
-    Json,
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-};
+use crate::api_server::http::{HttpResponse, json_response, sse_response};
 
 /// The native error body — the same `{"error": {...}}` object every native
 /// path emits, not bare text, which a client parsing JSON chokes on.
@@ -26,7 +19,7 @@ pub fn error_value(code: u16, message: &str) -> serde_json::Value {
 }
 
 /// Unary native-shape error response: `code` + [`error_value`] body.
-pub fn json_error(code: StatusCode, message: &str) -> Response {
+pub fn json_error(code: StatusCode, message: &str) -> HttpResponse {
     error_response(code, error_value(code.as_u16(), message), false)
 }
 
@@ -35,9 +28,9 @@ pub fn json_error(code: StatusCode, message: &str) -> Response {
 /// client is already reading a stream — Python answers in-stream too, from
 /// `stream_results()`). The `body` is caller-shaped: native [`error_value`]
 /// or the OpenAI error payload.
-pub fn error_response(code: StatusCode, body: serde_json::Value, stream: bool) -> Response {
+pub fn error_response(code: StatusCode, body: serde_json::Value, stream: bool) -> HttpResponse {
     if !stream {
-        return (code, Json(body)).into_response();
+        return json_response(code, &body);
     }
     sse_error_response(body)
 }
@@ -46,12 +39,11 @@ pub fn error_response(code: StatusCode, body: serde_json::Value, stream: bool) -
 /// client is already committed to reading reports a failure. Shared by every
 /// endpoint family: the native API and the OpenAI
 /// frontend's `openai_error_response`.
-pub fn sse_error_response(body: serde_json::Value) -> Response {
-    let frames = [body.to_string(), "[DONE]".to_string()];
-    Sse::new(futures::stream::iter(
-        frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
-    ))
-    .into_response()
+pub fn sse_error_response(body: serde_json::Value) -> HttpResponse {
+    sse_response(futures::stream::iter([
+        body.to_string(),
+        "[DONE]".to_string(),
+    ]))
 }
 
 #[cfg(test)]
@@ -70,9 +62,10 @@ mod tests {
             false,
         );
         assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+        let body = http_body_util::BodyExt::collect(unary.into_body())
             .await
-            .unwrap();
+            .unwrap()
+            .to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
         assert_eq!(v["error"]["message"], "bad input");
         assert_eq!(v["error"]["code"], 400);
@@ -83,9 +76,10 @@ mod tests {
             StatusCode::OK,
             "the stream itself is 200"
         );
-        let body = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+        let body = http_body_util::BodyExt::collect(streamed.into_body())
             .await
-            .unwrap();
+            .unwrap()
+            .to_bytes();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
             text.contains(r#""code":400"#),
