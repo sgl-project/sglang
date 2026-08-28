@@ -29,11 +29,15 @@ def _batch_info(*, permutation=None):
 
 class _TorchSegmentedBackend(BaseLoRABackend):
     name = "test"
+    supports_grouped_sgemm_batch_info = True
 
     def __init__(self, batch_info):
         self.batch_info = batch_info
+        self._grouped_sgemm_batch_info_cache = {}
         self.a_input_shapes = []
         self.b_weight_shapes = []
+        self.a_batch_infos = []
+        self.b_batch_infos = []
 
     def _adapter_per_row(self, batch_info, num_rows):
         adapters = torch.empty(num_rows, dtype=torch.long)
@@ -49,16 +53,20 @@ class _TorchSegmentedBackend(BaseLoRABackend):
             adapters[physical_rows] = batch_info.weight_indices[segment].long()
         return adapters
 
-    def run_lora_a_sgemm(self, x, weights, **_kwargs):
+    def run_lora_a_sgemm(self, x, weights, pruned_batch_info=None, **_kwargs):
         self.a_input_shapes.append(tuple(x.shape))
-        adapters = self._adapter_per_row(self.batch_info, x.shape[0])
+        batch_info = pruned_batch_info or self.batch_info
+        self.a_batch_infos.append(batch_info)
+        adapters = self._adapter_per_row(batch_info, x.shape[0])
         return torch.bmm(x.unsqueeze(1), weights[adapters].transpose(1, 2)).squeeze(1)
 
-    def run_lora_b_sgemm(self, x, weights, **_kwargs):
+    def run_lora_b_sgemm(self, x, weights, pruned_batch_info=None, **_kwargs):
         self.b_weight_shapes.append(tuple(weights.shape))
-        adapters = self._adapter_per_row(self.batch_info, x.shape[0])
+        batch_info = pruned_batch_info or self.batch_info
+        self.b_batch_infos.append(batch_info)
+        adapters = self._adapter_per_row(batch_info, x.shape[0])
         output = torch.bmm(x.unsqueeze(1), weights[adapters].transpose(1, 2)).squeeze(1)
-        return output * self.batch_info.scalings[adapters].unsqueeze(1)
+        return output * batch_info.scalings[adapters].unsqueeze(1)
 
 
 def _layer(backend, lora_a, lora_b):
@@ -114,8 +122,29 @@ def test_grouped_wo_a_preserves_backend_segments_and_chunk_size():
     torch.testing.assert_close(
         info.seg_indptr, torch.tensor([0, 1, 3], dtype=torch.int32)
     )
-    assert backend.a_input_shapes == [(3, 4)] * groups
-    assert backend.b_weight_shapes == [(2, 5, 3)] * groups
+    assert backend.a_input_shapes == [(12, 4)]
+    assert backend.b_weight_shapes == [(8, 5, 3)]
+
+    a_info = backend.a_batch_infos[0]
+    b_info = backend.b_batch_infos[0]
+    assert a_info.max_len == b_info.max_len == 2
+    assert a_info.expected_tokens == b_info.expected_tokens == 12
+    torch.testing.assert_close(
+        a_info.seg_indptr,
+        torch.tensor([0, 1, 3, 4, 6, 7, 9, 10, 12], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        a_info.permutation,
+        torch.tensor([2, 0, 1, 5, 3, 4, 8, 6, 7, 11, 9, 10], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        a_info.weight_indices,
+        torch.tensor([0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        b_info.weight_indices,
+        torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32),
+    )
 
 
 def test_grouped_wo_a_rejects_incompatible_b_layout():

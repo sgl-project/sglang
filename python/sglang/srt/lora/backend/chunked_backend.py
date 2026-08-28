@@ -34,6 +34,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     name = "csgmv"
     supports_prefill_cuda_graph = True
+    supports_grouped_sgemm_batch_info = True
 
     def __init__(
         self,
@@ -275,6 +276,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         use_cuda_graph: bool,
         use_prefill_cuda_graph: bool = False,
     ):
+        self._reset_grouped_sgemm_batch_info()
         chunk_size = self._determine_chunk_size(forward_batch)
 
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
