@@ -184,6 +184,8 @@ class DraftBlockProposer:
         self._dp_moe_sync = dp_moe_sync
         self._reuse_static_inputs = str(draft_model_runner.device).startswith("npu")
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        self._dp_sync_metadata_cache_key = None
+        self._dp_sync_metadata_cache_value = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -364,7 +366,14 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
+            # DP-MoE fills this field together with the two global token
+            # tensors below.  Avoid creating an NPU scalar here only to
+            # overwrite it a few lines later.
+            num_token_non_padded=(
+                None
+                if self._reuse_static_inputs and self._dp_moe_sync
+                else _make_num_token_non_padded(draft_num_tokens, device)
+            ),
             num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
@@ -428,16 +437,42 @@ class DraftBlockProposer:
         device = self.draft_model_runner.device
         forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         num_tokens = forward_batch.input_ids.numel()
-        if enable_num_token_non_padded():
-            forward_batch.num_token_non_padded = torch.tensor(
-                num_tokens, dtype=torch.int32, device=device
+        needs_num_token_non_padded = enable_num_token_non_padded()
+        if getattr(self, "_reuse_static_inputs", False):
+            cache_key = (
+                num_tokens,
+                tuple(gnt),
+                tuple(gnt_logprob),
+                str(device),
+                needs_num_token_non_padded,
             )
+            if self._dp_sync_metadata_cache_key != cache_key:
+                self._dp_sync_metadata_cache_key = cache_key
+                self._dp_sync_metadata_cache_value = (
+                    (
+                        torch.tensor(num_tokens, dtype=torch.int32, device=device)
+                        if needs_num_token_non_padded
+                        else None
+                    ),
+                    torch.tensor(gnt, dtype=torch.int64, device=device),
+                    torch.tensor(gnt_logprob, dtype=torch.int64, device=device),
+                )
+            (
+                forward_batch.num_token_non_padded,
+                forward_batch.global_num_tokens_gpu,
+                forward_batch.global_num_tokens_for_logprob_gpu,
+            ) = self._dp_sync_metadata_cache_value
+        else:
+            if needs_num_token_non_padded:
+                forward_batch.num_token_non_padded = torch.tensor(
+                    num_tokens, dtype=torch.int32, device=device
+                )
+            forward_batch.global_num_tokens_gpu = torch.tensor(
+                gnt, dtype=torch.int64
+            ).to(device, non_blocking=True)
+            forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+                gnt_logprob, dtype=torch.int64
+            ).to(device, non_blocking=True)
         forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
-        forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
-            device, non_blocking=True
-        )
-        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
-            gnt_logprob, dtype=torch.int64
-        ).to(device, non_blocking=True)

@@ -86,6 +86,52 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
         self.assertTrue(forward_batch.can_run_dp_cuda_graph)
 
+    def test_npu_static_inputs_are_reused_and_invalidated_by_counts(self):
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._dp_moe_sync = True
+        proposer._reuse_static_inputs = True
+        proposer._dp_sync_metadata_cache_key = None
+        proposer._dp_sync_metadata_cache_value = None
+        proposer._draft_block_spec_info = SimpleNamespace(
+            num_tokens_per_req=6,
+            num_tokens_for_logprob_per_req=1,
+        )
+        proposer.draft_model_runner = SimpleNamespace(device="cpu")
+
+        forward_batch = SimpleNamespace(input_ids=torch.arange(6))
+        batch = SimpleNamespace(
+            global_num_tokens=[1, 3, 0, 2],
+            global_num_tokens_for_logprob=[1, 3, 0, 2],
+            can_run_dp_cuda_graph=True,
+        )
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+            return_value=True,
+        ):
+            proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
+            first = (
+                forward_batch.num_token_non_padded,
+                forward_batch.global_num_tokens_gpu,
+                forward_batch.global_num_tokens_for_logprob_gpu,
+            )
+            proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
+            second = (
+                forward_batch.num_token_non_padded,
+                forward_batch.global_num_tokens_gpu,
+                forward_batch.global_num_tokens_for_logprob_gpu,
+            )
+            self.assertTrue(all(x is y for x, y in zip(first, second)))
+
+            batch.global_num_tokens = [2, 3, 0, 2]
+            proposer._fill_dp_moe_sync_metadata(forward_batch, batch)
+            third = (
+                forward_batch.num_token_non_padded,
+                forward_batch.global_num_tokens_gpu,
+                forward_batch.global_num_tokens_for_logprob_gpu,
+            )
+            self.assertTrue(all(x is not y for x, y in zip(second, third)))
+
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):
     def test_busy_and_idle_floors_agree_on_random_topologies(self):
