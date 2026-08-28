@@ -84,7 +84,7 @@ def resolve_flashinfer_allreduce_fusion_backend() -> Optional[str]:
     backend = get_exec().comm.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
-    return _resolve_backend(backend, get_parallel().config.nnodes > 1)
+    return _resolve_backend(backend, get_parallel().nnodes > 1)
 
 
 if is_flashinfer_available():
