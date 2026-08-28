@@ -222,7 +222,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             measured_request_duration_ns=20_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
-        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
         rolled_back = OutputBatch(
             error="request duration regressed",
             output={"status": PLACEMENT_STATUS_ROLLED_BACK},
@@ -269,8 +269,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             measured_request_duration_ns=20_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
-        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
         worker._rollback_everywhere = mock.Mock()
+        self.assertTrue(worker._latest_auto_residency_round_supports_short_validation())
 
         with (
             mock.patch.object(
@@ -293,7 +294,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
 
         self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
         worker._rollback_everywhere.assert_not_called()
-        self.assertTrue(worker._latest_auto_residency_round_supports_short_validation())
+        self.assertEqual(worker._auto_residency_round_sizes, [])
 
     def test_dit_residency_keeps_multi_step_validation(self):
         worker = GPUWorker.__new__(GPUWorker)
@@ -324,7 +325,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             measured_request_duration_ns=10_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
-        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
         candidate = ResidencyTarget(
             component_name="vae",
             residency_mode=COMPONENT_OFFLOAD,
