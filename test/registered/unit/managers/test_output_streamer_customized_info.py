@@ -400,6 +400,19 @@ class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
             ],
         )
 
+    def test_an_unfinished_request_withholds_its_prefill_spans(self):
+        """Spans of a request still generating must not ship before its finishing chunk."""
+        streaming_req = _FakeReq("r0", [10, 11])
+        streaming_req.prefill_weight_versions = [
+            WeightVersionSpan(version="v0", start=0, end=4)
+        ]
+
+        accumulator = _accumulator(current_weight_version="v1")
+        accumulator.accept(req=streaming_req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertIsNone(payload.prefill_weight_versions)
+
     def test_payload_omits_prefill_spans_when_the_flag_is_off(self):
         """With tracking disabled every request contributes None, so nothing goes on the wire."""
         accumulator = _accumulator(current_weight_version="v1")
