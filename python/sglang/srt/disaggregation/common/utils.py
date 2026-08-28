@@ -32,6 +32,12 @@ class TransferKVChunk:
     # Set when the staging worker first counts this chunk toward the per-room
     # outstanding count; stays set across re-enqueue on a watermark defer.
     staging_counted: bool = False
+    # A heterogeneous-TP chunk fans out to multiple decode sessions. Their
+    # staging watermarks advance independently, so one worker pass can finish
+    # only a prefix of the fan-out before another destination defers. Keep the
+    # completed sessions on the re-enqueued chunk: replaying them can write into
+    # a staging slot that decode has already scattered and recycled.
+    staging_completed_sessions: set[str] = dataclasses.field(default_factory=set)
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
 

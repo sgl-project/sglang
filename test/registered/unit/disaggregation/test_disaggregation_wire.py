@@ -1,13 +1,14 @@
 import struct
 import threading
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
@@ -18,6 +19,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
 from sglang.srt.disaggregation.common.utils import (
+    TransferKVChunk,
     group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
@@ -284,6 +286,123 @@ class TestMooncakePPStaging(unittest.TestCase):
                 offset + 70,
             )
         )
+
+    def test_deferred_fanout_does_not_replay_completed_staging_destination(self):
+        class FiniteQueue:
+            def __init__(self, item):
+                self.items = [item]
+
+            def get(self):
+                if not self.items:
+                    raise StopIteration
+                return self.items.pop(0)
+
+            def put(self, item):
+                self.items.append(item)
+
+        manager = object.__new__(MooncakeKVManager)
+        room = 7
+        chunk = TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array([1], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=True,
+            prefill_aux_index=0,
+            state_indices=None,
+        )
+        queue = FiniteQueue(chunk)
+        reqs = [
+            SimpleNamespace(
+                room=room,
+                endpoint="127.0.0.1",
+                dst_port=9000 + i,
+                mooncake_session_id=f"session-{i}",
+                dst_kv_indices=np.array([1], dtype=np.int32),
+                dst_device_kv_indices=None,
+                required_dst_info_num=2,
+                is_dummy=False,
+                decode_prefix_len=0,
+            )
+            for i in range(2)
+        ]
+        registrations = {
+            req.mooncake_session_id: SimpleNamespace(
+                requires_dcp_relayout=False,
+                dst_kv_ptrs=[0x1000],
+                dst_aux_ptrs=[0x2000],
+                dst_attn_tp_size=8,
+                dst_kv_item_len=128,
+                dst_kv_layer_ids=[],
+                staging_base_ptr=0x3000,
+                staging_total_size=4096,
+            )
+            for req in reqs
+        }
+        status = {room: KVPoll.WaitingForInput}
+        manager.enable_trace = False
+        manager.enable_staging = True
+        manager.enable_deferred_decode_kv_release = False
+        manager._staging_outstanding = defaultdict(int)
+        manager._staging_ctx = SimpleNamespace(
+            prefetch_requested=set(), prefetched_rooms=set()
+        )
+        manager.transfer_infos = {
+            room: {req.mooncake_session_id: req for req in reqs}
+        }
+        manager.req_to_decode_prefix_len = {room: 0}
+        manager.request_status = status
+        manager.check_status = lambda checked_room: status[checked_room]
+        manager.update_status = Mock(
+            side_effect=lambda checked_room, value: status.__setitem__(
+                checked_room, value
+            )
+        )
+        manager.sync_status_to_decode_endpoint = Mock()
+        manager.session_lock = threading.Lock()
+        manager.failed_sessions = set()
+        manager.session_failures = defaultdict(int)
+        manager.decode_kv_args_table = registrations
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x4000])
+        manager.is_mla_backend = False
+        manager.is_hybrid_mla_backend = False
+        manager.attn_tp_size = 1
+        manager.attn_tp_rank = 0
+        manager.attn_cp_size = 1
+        manager.attn_cp_rank = 0
+        manager.pp_size = 1
+        manager.pp_rank = 0
+        manager.bootstrap_port = 7200
+        manager._try_create_staging_strategy = Mock(return_value=object())
+        manager._get_dsa_cache_transfer_skip_flags = Mock(
+            return_value=(False, False)
+        )
+        manager.send_aux = Mock(return_value=0)
+        manager.record_failure = Mock()
+
+        transfer_calls = []
+
+        def transfer_side_effect(*args):
+            req = args[2]
+            transfer_calls.append(req.mooncake_session_id)
+            if transfer_calls == ["session-0", "session-1"]:
+                queue.put(chunk)
+                return -1, True
+            return 0, False
+
+        manager._do_staging_transfer = Mock(side_effect=transfer_side_effect)
+
+        with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
+            manager.transfer_worker(queue, Mock(), staging_buffer=object())
+
+        self.assertEqual(
+            transfer_calls, ["session-0", "session-1", "session-1"]
+        )
+        self.assertEqual(
+            chunk.staging_completed_sessions, {"session-0", "session-1"}
+        )
+        self.assertEqual(manager.send_aux.call_count, 2)
+        self.assertEqual(manager.sync_status_to_decode_endpoint.call_count, 2)
+        self.assertEqual(status[room], KVPoll.Success)
 
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()

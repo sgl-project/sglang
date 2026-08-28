@@ -1628,13 +1628,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
-                reqs_to_be_processed = (
+                reqs_to_be_processed = list(
                     self.transfer_infos[kv_chunk.room].values()
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
-                polls = []
-                dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
                 prefill_unique_rank = (
                     self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
@@ -1647,6 +1645,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
+                        if (
+                            req.mooncake_session_id
+                            in kv_chunk.staging_completed_sessions
+                        ):
+                            continue
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
@@ -1848,23 +1851,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
-                            polls.append(True if ret == 0 else False)
-                            dst_ranks_infos.append(
-                                (req.endpoint, req.dst_port, req.room)
-                            )
-
-                            # Only sync status when all the dst ranks have received the kvcache
-                            if len(polls) == req.required_dst_info_num:
-                                status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                self.update_status(req.room, status)
-                                for endpoint, dst_port, room in dst_ranks_infos:
-                                    self.sync_status_to_decode_endpoint(
-                                        endpoint,
-                                        dst_port,
-                                        room,
-                                        status,
-                                        prefill_unique_rank,
+                            if ret != 0:
+                                with self.session_lock:
+                                    self.session_failures[
+                                        req.mooncake_session_id
+                                    ] += 1
+                                    self.failed_sessions.add(
+                                        req.mooncake_session_id
                                     )
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Failed to send aux data of {kv_chunk.room} to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                )
+                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                )
+                                break
+
+                        kv_chunk.staging_completed_sessions.add(
+                            req.mooncake_session_id
+                        )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -1887,6 +1899,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                 if staging_deferred:
                     continue
+
+                if kv_chunk.is_last_chunk and self.check_status(
+                    kv_chunk.room
+                ) != KVPoll.Failed:
+                    non_dummy_reqs = [
+                        req for req in reqs_to_be_processed if not req.is_dummy
+                    ]
+                    if len(kv_chunk.staging_completed_sessions) == len(
+                        non_dummy_reqs
+                    ):
+                        self.update_status(kv_chunk.room, KVPoll.Success)
+                        for req in non_dummy_reqs:
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Success,
+                                prefill_unique_rank,
+                            )
 
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
