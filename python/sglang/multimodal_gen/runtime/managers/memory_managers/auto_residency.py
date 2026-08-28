@@ -2764,6 +2764,9 @@ def apply_residency_changes(
         target_modules: dict[str, nn.Module] = {}
         snapshots: dict[str, AppliedResidencyChange] = {}
         previous_pins_by_component: dict[str, tuple[tuple[int, ...], ...]] = {}
+        resident_only = bool(ordered_changes) and all(
+            candidate.target_mode() == RESIDENT for candidate in ordered_changes
+        )
         if rank is not None and rank in plan.host_pin_target_bytes_by_rank:
             previous_host_pin_budget_state = (
                 server_args.host_pin_budget().set_spendable_capacity(
@@ -2872,6 +2875,7 @@ def apply_residency_changes(
             candidate
             for candidate in ordered_changes
             if snapshots[candidate.component_name].previous_layerwise_configured
+            if not (resident_only and candidate.target_mode() == RESIDENT)
             if candidate.target_layerwise_pinned_layers is not None
             and candidate.target_layerwise_pinned_layers
             != previous_pins_by_component[candidate.component_name]
@@ -2948,9 +2952,10 @@ def apply_residency_changes(
                             f"residency target {candidate.component_name!r} "
                             "did not configure any layerwise groups"
                         )
-                module.set_layerwise_pinned_layers(
-                    candidate.target_layerwise_pinned_layers or ()
-                )
+                if not (resident_only and target_mode == RESIDENT):
+                    module.set_layerwise_pinned_layers(
+                        candidate.target_layerwise_pinned_layers or ()
+                    )
                 if target_mode == COMPONENT_OFFLOAD:
                     module.remove_layerwise_offload(to_cpu=True)
                     server_args.set_auto_residency_mode(
@@ -2961,6 +2966,7 @@ def apply_residency_changes(
                         candidate.component_name, RESIDENT
                     )
                     if is_layerwise_offloaded_module(module):
+                        module.restore_non_layer_weights()
                         module.disable_offload()
                 else:
                     if not is_layerwise_offloaded_module(module):
@@ -3016,6 +3022,32 @@ def apply_residency_changes(
             ) from apply_error
         raise
     return applied
+
+
+def commit_residency_changes(
+    *,
+    applied: Iterable[AppliedResidencyChange],
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+) -> None:
+    """Release rollback-only stores after post-adjustment validation succeeds."""
+    for adjustment in applied:
+        if (
+            not adjustment.previous_layerwise_configured
+            or server_args.residency_mode(adjustment.component_name) != RESIDENT
+        ):
+            continue
+        module = (
+            adjustment.module_ref
+            if adjustment.module_ref is not None
+            else modules.get(adjustment.component_name)
+        )
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            raise RuntimeError(
+                f"residency target {adjustment.component_name!r} lost its "
+                "layerwise offload capability before commit"
+            )
+        module.finalize_resident_layerwise_placement()
 
 
 def rollback_residency_changes(

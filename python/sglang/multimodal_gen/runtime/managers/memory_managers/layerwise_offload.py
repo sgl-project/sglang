@@ -1267,7 +1267,45 @@ class LayerwiseOffloadManager:
 
         for layer_idx in range(self.num_layers):
             if layer_idx not in self._gpu_layers:
-                self.prefetch_layer(layer_idx, non_blocking=False)
+                # Anonymous host stores can fill the copy stream without a
+                # per-layer host wait. Checkpoint mappings still use the
+                # synchronous path: the mapped courier has a bounded slot ring
+                # intended to overlap one forward, not materialize a whole
+                # model at once.
+                self.prefetch_layer(
+                    layer_idx,
+                    non_blocking=not bool(self._mapped_cpu_weights.get(layer_idx)),
+                )
+        if self.copy_stream is not None:
+            torch.get_device_module().current_stream().wait_stream(self.copy_stream)
+
+    def release_host_stores(self) -> None:
+        """Drop rollback stores after a resident placement is validated.
+
+        The real device tensors must already be materialized and the manager
+        disabled. Repacking pinned stores as pageable here would copy the full
+        checkpoint for data that will never be streamed again.
+        """
+        if self.enabled:
+            raise RuntimeError("cannot release host stores while offload is enabled")
+        if self._mapped_courier is not None:
+            self._mapped_courier.close()
+            self._mapped_courier = None
+        if self._courier_inflight:
+            raise RuntimeError(
+                "cannot release host stores with mapped copies in flight"
+            )
+
+        self._pin_budget.release(self.pinned_host_weight_bytes())
+        self._consolidated_cpu_weights.clear()
+        self._strided_cpu_weights.clear()
+        self._mapped_cpu_weights.clear()
+        self._mps_cpu_weights.clear()
+        self._weight_metadata.clear()
+        self._layer_hosting.clear()
+        self._prefetch_events.clear()
+        self._mapped_bytes = 0
+        self._configured = False
 
     @torch.compiler.disable
     def sync_layer_to_cpu(self, layer_idx: int) -> None:
@@ -2292,22 +2330,32 @@ class LayerwiseOffloadableModuleMixin:
         """
         if self.layerwise_offload_managers is None:
             return
-        for manager in self.layerwise_offload_managers:
-            if not manager.enabled:
-                continue
-            manager.remove_forward_hooks()
-            try:
-                manager.load_all_layers()
-            except Exception:
-                # Loading every layer is the step most likely to OOM. Re-arm
-                # this manager before re-raising: leaving it hook-less with
-                # enabled=True would let release_all() swap weights for (1,)
-                # placeholders that nothing ever streams back in, and
-                # enable_offload()'s already-armed guard would skip repair.
+        disabled: list[LayerwiseOffloadManager] = []
+        try:
+            for manager in self.layerwise_offload_managers:
+                if not manager.enabled:
+                    continue
+                manager.remove_forward_hooks()
+                try:
+                    manager.load_all_layers()
+                except Exception:
+                    # Loading every layer is the step most likely to OOM. Re-arm
+                    # this manager before re-raising: leaving it hook-less with
+                    # enabled=True would let release_all() swap weights for (1,)
+                    # placeholders that nothing ever streams back in.
+                    manager.release_all()
+                    manager.register_forward_hooks()
+                    raise
+                manager.enabled = False
+                disabled.append(manager)
+        except Exception:
+            # A module may own multiple layer groups. Do not leave earlier
+            # groups resident and later groups streaming when one group fails.
+            for manager in reversed(disabled):
+                manager.enabled = True
                 manager.release_all()
                 manager.register_forward_hooks()
-                raise
-            manager.enabled = False
+            raise
 
     def enable_offload(self) -> None:
         """Re-enable layerwise offload: sync weights to CPU, release layers, and restore hooks."""
@@ -2374,6 +2422,22 @@ class LayerwiseOffloadableModuleMixin:
         self.layerwise_offload_managers = []
         self._parked_non_layer_weights.clear()
         self._park_placeholders.clear()
+
+    def finalize_resident_layerwise_placement(self) -> None:
+        """Discard offload stores once a resident placement has passed validation."""
+        managers = list(self.layerwise_offload_managers or ())
+        if not managers:
+            return
+        if any(manager.enabled for manager in managers):
+            raise RuntimeError(
+                "cannot finalize a resident placement while offload is enabled"
+            )
+        for manager in managers:
+            manager.release_host_stores()
+        self.layerwise_offload_managers = []
+        self._parked_non_layer_weights.clear()
+        self._park_placeholders.clear()
+        release_unused_pinned_memory()
 
 
 def iter_materialized_weights(module: torch.nn.Module):
