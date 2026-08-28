@@ -29,6 +29,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
@@ -36,10 +37,16 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _ensure_dist_initialized() -> None:
+def _ensure_dist_initialized(cls) -> None:
     """CCA reads the TP rank / world size inside ``__init__`` to size its
-    head-parallel projections, so the groups must exist before construction."""
+    head-parallel projections. The rank is the live group's, so the groups must
+    exist before construction; the size answers from the published ``parallel``
+    bag, so the case has to publish a context as well.
+    """
     init_single_process_dist()
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    cls.addClassCleanup(override.restore)
 
 
 @dataclass(frozen=True)
@@ -243,7 +250,7 @@ def _make_tiny_cca(
 class TestZayaCCA(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def test_single_chunk_matches_reference(self):
         """A single-chunk extend with empty prefix matches the no-state path."""
@@ -540,7 +547,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
         """Copy the reference's full weights into the per-rank CCA, using the
