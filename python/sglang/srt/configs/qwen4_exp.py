@@ -81,7 +81,11 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     def layers_block_type(self):
         if self.layer_types is not None:
             return [
-                "attention" if layer_type == "full_attention" else layer_type
+                (
+                    "attention"
+                    if layer_type in ("full_attention", "qwen_sparse_attention")
+                    else layer_type
+                )
                 for layer_type in self.layer_types
             ]
         return super().layers_block_type
