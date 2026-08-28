@@ -281,6 +281,7 @@ class JITPersistentCache(JITCache):
         """
         sha256_hex = self._key_to_hash(key)
         obj_path = self.cache_path / f"{sha256_hex}.o"
+        invalid_inode = None
         with FileLock(
             self._lock_path(sha256_hex),
             exclusive=False,
@@ -295,14 +296,43 @@ class JITPersistentCache(JITCache):
                     )
                 except Exception as error:
                     logger.warning("Invalid cache object %s: %s", obj_path, error)
-                    # The shared lock excludes writers, so this is the failed object.
-                    obj_path.unlink(missing_ok=True)
+                    try:
+                        invalid_inode = obj_path.stat().st_ino
+                    except OSError:
+                        pass
                 else:
                     JITCache.__setitem__(self, key, fn)
                     return True
             else:
                 logger.debug("Cache miss on disk for key hash %s", sha256_hex)
+        if invalid_inode is not None:
+            self._discard_invalid_object(sha256_hex, obj_path, invalid_inode)
         return False
+
+    def _discard_invalid_object(
+        self, sha256_hex: str, obj_path: Path, invalid_inode: int
+    ) -> None:
+        """Unlink a failed object under an exclusive lock.
+
+        The shared load lock is released first (flock cannot upgrade), so a
+        writer may republish in the gap; the inode check keeps a fresh object
+        intact. Eviction is best-effort: on lock timeout the object is left
+        for the next process.
+        """
+        try:
+            with FileLock(
+                self._lock_path(sha256_hex),
+                exclusive=True,
+                timeout=self.LOCK_TIMEOUT_SECONDS,
+                label=sha256_hex,
+            ):
+                try:
+                    if obj_path.stat().st_ino == invalid_inode:
+                        obj_path.unlink()
+                except OSError:
+                    return
+        except RuntimeError as error:
+            logger.warning("Could not evict invalid object %s: %s", obj_path, error)
 
     def _try_export_to_storage(self, key: CompileKeyType, fn: CallableFunction) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""

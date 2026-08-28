@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import types
 
@@ -153,6 +154,25 @@ def test_failed_export_does_not_publish_partial_object(tmp_path, enable_tvm_ffi)
 
     assert not (tmp_path / f"{key_hash}.o").exists()
     assert not temp_path.exists()
+
+
+def test_discard_spares_republished_object(tmp_path):
+    cache = cute_aot_cache.JITPersistentCache(tmp_path, enable_tvm_ffi=True)
+    obj_path = tmp_path / "key.o"
+    obj_path.write_bytes(b"invalid")
+    invalid_inode = obj_path.stat().st_ino
+
+    # A writer republishes between the failed load and the eviction. Creating
+    # the new file while the old still exists guarantees a distinct inode.
+    fresh_path = tmp_path / ".key.tmp.o"
+    fresh_path.write_bytes(b"fresh")
+    os.replace(fresh_path, obj_path)
+
+    cache._discard_invalid_object("key", obj_path, invalid_inode)
+    assert obj_path.read_bytes() == b"fresh"
+
+    cache._discard_invalid_object("key", obj_path, obj_path.stat().st_ino)
+    assert not obj_path.exists()
 
 
 def test_failed_load_discards_invalid_object(monkeypatch, tmp_path):
