@@ -1041,9 +1041,9 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
-        assert self.dllm_config is None or not self.dllm_config.needs_full_prefill, (
-            "A full-generation dLLM canvas cannot use chunked prefill"
-        )
+        assert (
+            self.dllm_config is None or not self.dllm_config.needs_full_prefill
+        ), "A full-generation dLLM canvas cannot use chunked prefill"
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
