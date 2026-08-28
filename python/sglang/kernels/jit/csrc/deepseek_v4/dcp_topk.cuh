@@ -92,8 +92,7 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
     const float score = canonicalize_dcp_score(score_ptr[local_index]);
     if (ordered_dcp_score(score) > threshold_key) {
       const uint32_t output_pos = atomicAdd(&output_count, 1u);
-      const int32_t global_index =
-          static_cast<int32_t>(local_index * params.dcp_size + params.dcp_rank);
+      const int32_t global_index = static_cast<int32_t>(local_index * params.dcp_size + params.dcp_rank);
       candidate_ptr[output_pos] = pack_dcp_candidate(score, global_index);
     }
   }
@@ -102,8 +101,7 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
   for (uint32_t tile_start = 0; tile_start < local_len; tile_start += kTopKBlockSize) {
     if (output_count >= params.topk) break;
     const uint32_t local_index = tile_start + tx;
-    const bool is_threshold =
-        local_index < local_len && ordered_dcp_score(score_ptr[local_index]) == threshold_key;
+    const bool is_threshold = local_index < local_len && ordered_dcp_score(score_ptr[local_index]) == threshold_key;
     selected[tx] = is_threshold ? 1 : 0;
     if (tx == 0) tile_base = output_count;
     __syncthreads();
@@ -117,10 +115,8 @@ __global__ void dcp_topk_candidates_kernel(const __grid_constant__ DCPTopKCandid
 
     const uint32_t position = tile_base + static_cast<uint32_t>(selected[tx]);
     if (is_threshold && position <= params.topk) {
-      const int32_t global_index =
-          static_cast<int32_t>(local_index * params.dcp_size + params.dcp_rank);
-      candidate_ptr[position - 1] =
-          pack_dcp_candidate(canonicalize_dcp_score(score_ptr[local_index]), global_index);
+      const int32_t global_index = static_cast<int32_t>(local_index * params.dcp_size + params.dcp_rank);
+      candidate_ptr[position - 1] = pack_dcp_candidate(canonicalize_dcp_score(score_ptr[local_index]), global_index);
     }
     __syncthreads();
     if (tx == 0) {
@@ -175,8 +171,7 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
   for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
     const uint32_t source_rank = candidate_id / params.topk;
     const uint32_t local_id = candidate_id - source_rank * params.topk;
-    const int64_t candidate =
-        params.candidates[(source_rank * params.batch_size + batch_idx) * params.topk + local_id];
+    const int64_t candidate = params.candidates[(source_rank * params.batch_size + batch_idx) * params.topk + local_id];
     const int32_t global_index = unpack_dcp_candidate_index(candidate);
     candidate_scores[candidate_id] = canonicalize_dcp_score(unpack_dcp_candidate_score(candidate));
     candidate_indices[candidate_id] = global_index;
@@ -220,11 +215,9 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
     if (tie_count == 1) {
       // Random model scores almost always have one item at the top-k boundary.
       // Avoid a second full radix selection in that common case.
-      for (uint32_t candidate_id = tx; candidate_id < candidate_count;
-           candidate_id += kTopKBlockSize) {
+      for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
         const int32_t global_index = candidate_indices[candidate_id];
-        if (global_index >= 0 &&
-            ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key) {
+        if (global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key) {
           atomicMin(&tie_min_index, static_cast<uint32_t>(global_index));
         }
       }
@@ -238,8 +231,7 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
         }
       }
     } else if (tie_count > 1) {
-      for (uint32_t candidate_id = tx; candidate_id < candidate_count;
-           candidate_id += kTopKBlockSize) {
+      for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
         const int32_t global_index = candidate_indices[candidate_id];
         const bool is_threshold =
             global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key;
@@ -300,11 +292,7 @@ struct DCPTopKKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLGPU>();
 
-    TensorMatcher({B, -1})
-        .with_strides({S, 1})
-        .with_dtype<float>()
-        .with_device(device)
-        .verify(scores);
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(scores);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(local_lens);
     TensorMatcher({B, K}).with_dtype<int64_t>().with_device(device).verify(candidates);
 
@@ -329,13 +317,11 @@ struct DCPTopKKernel {
   }
 
   template <uint32_t kDCPSize>
-  static void launch_merge(
-      const DCPTopKMergeParams& params, uint32_t batch_size, DLDevice device) {
+  static void launch_merge(const DCPTopKMergeParams& params, uint32_t batch_size, DLDevice device) {
     constexpr auto kernel = dcp_topk_merge_kernel<kUsePDL, kDCPSize>;
     constexpr auto kDynamicSMEM = kSMEM + sizeof(int32_t);
     setup_kernel_smem_once<kernel, kDynamicSMEM>();
-    host::LaunchKernel(batch_size, kTopKBlockSize, device, kDynamicSMEM)
-        .enable_pdl(kUsePDL)(kernel, params);
+    host::LaunchKernel(batch_size, kTopKBlockSize, device, kDynamicSMEM).enable_pdl(kUsePDL)(kernel, params);
   }
 
   static void merge(
@@ -356,11 +342,7 @@ struct DCPTopKKernel {
     device.set_options<kDLGPU>();
 
     TensorMatcher({C, K}).with_dtype<int64_t>().with_device(device).verify(candidates);
-    TensorMatcher({B, -1})
-        .with_strides({P, 1})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(local_page_table);
+    TensorMatcher({B, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device).verify(local_page_table);
     TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device).verify(page_indices);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(local_lens);
 
