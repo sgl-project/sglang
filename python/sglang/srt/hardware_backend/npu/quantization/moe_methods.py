@@ -115,51 +115,6 @@ def reshape_mxfp_activation_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
 
 
-def w4a8_mxfp_gmm(
-    *,
-    input: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_list_type: int,
-    group_list: torch.Tensor,
-    output_dtype: torch.dtype,
-    scale_alg=None,
-    dynamic_quant_kwargs: Optional[Dict[str, Any]] = None,
-) -> torch.Tensor:
-    """Run the shared A5 FP4-weight × FP8-activation grouped matmul."""
-    group_list = group_list.to(torch.int64)
-    if input_scale is None:
-        if dynamic_quant_kwargs is None:
-            dynamic_quant_kwargs = {
-                "axis": 1,
-                "round_mode": "rint",
-                "dst_type": torch.float8_e4m3fn,
-                "block_size": 32,
-                "scale_alg": scale_alg,
-            }
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(input, **dynamic_quant_kwargs)
-    else:
-        x, x_scale = input, input_scale
-
-    return torch.ops.npu.npu_grouped_matmul(
-        [x],
-        [weight],
-        scale=None,
-        antiquant_scale=[weight_scale],
-        scale_dtype=None,
-        per_token_scale=[reshape_mxfp_activation_scale_for_npu(x_scale)],
-        split_item=2,
-        group_type=0,
-        group_list=group_list,
-        group_list_type=group_list_type,
-        output_dtype=output_dtype,
-        x_dtype=torch.float8_e4m3fn,
-        weight_dtype=_get_float4_e2m1fn_x2_dtype(),
-        per_token_scale_dtype=_require_e8m0_dtype(),
-    )[0]
-
-
 # DEPRECATED METHOD
 # TODO: Remove in future realeses
 def fused_moe_npu(
@@ -327,16 +282,35 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         if dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT:
             dynamic_quant_kwargs = {"dst_type": torch.float8_e4m3fn}
 
-        return w4a8_mxfp_gmm(
-            input=hidden_states,
-            input_scale=pertoken_scale,
-            weight=getattr(quant_info, f"{weight_prefix}_weight"),
-            weight_scale=getattr(quant_info, f"{weight_prefix}_weight_scale"),
+        if pertoken_scale is None:
+            if dynamic_quant_kwargs is None:
+                dynamic_quant_kwargs = {
+                    "axis": 1,
+                    "round_mode": "rint",
+                    "dst_type": torch.float8_e4m3fn,
+                    "block_size": 32,
+                    "scale_alg": None,
+                }
+            hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                hidden_states, **dynamic_quant_kwargs
+            )
+
+        return torch.ops.npu.npu_grouped_matmul(
+            [hidden_states],
+            [getattr(quant_info, f"{weight_prefix}_weight")],
+            scale=None,
+            antiquant_scale=[getattr(quant_info, f"{weight_prefix}_weight_scale")],
+            scale_dtype=None,
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_type=0,
+            group_list=expert_tokens.to(torch.int64),
             group_list_type=group_list_type,
-            group_list=expert_tokens,
             output_dtype=output_dtype,
-            dynamic_quant_kwargs=dynamic_quant_kwargs,
-        )
+            x_dtype=torch.float8_e4m3fn,
+            weight_dtype=_get_float4_e2m1fn_x2_dtype(),
+            per_token_scale_dtype=_require_e8m0_dtype(),
+        )[0]
 
 
 def _wrap_mxfp4_scale_weight_loader(weight_loader):
