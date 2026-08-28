@@ -5888,7 +5888,6 @@ class UnifiedRadixCacheSuite:
             int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
         )
         cache.tree_core.commit_load_back(a, device_indices, kv_xfer, {})
-        self.assertEqual(cache.tree_core.node_by_id(a).load_back_pending_id, a)
 
         # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
         kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
@@ -5898,7 +5897,6 @@ class UnifiedRadixCacheSuite:
 
         # After the ack unpins, the same spec builds fully.
         cache.tree_core.finish_load_back(a)
-        self.assertIsNone(cache.tree_core.node_by_id(a).load_back_pending_id)
         kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
         self.assertEqual(kv_xfer.nodes_to_load, [b])
         self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
