@@ -15,6 +15,41 @@
 // Adapted from DeepSeek-AI/LPLB's `minilp.cu`. Templated on (NC, NV,
 // BLOCK_DIM, SM_VER, NUM_ITERS) so each unique shape is compiled once via
 // sglang's tvm-ffi load_jit cache.
+//
+// ---------------------------------------------------------------------
+// Static-shape / zero-padding contract (CUDA-graph safety)
+// ---------------------------------------------------------------------
+// The LP's natural size depends on the current expert placement, which
+// changes on every EPLB rebalance. Recompiling and reallocating per
+// placement breaks captured CUDA graphs (they bake in both the kernel and
+// the buffer addresses), so LPLBSolver instead compiles this kernel ONCE
+// at the placement-independent worst case (NC_MAX, NV_MAX) and zero-pads
+// every smaller instance up to it.
+//
+// This kernel therefore needs no notion of the "real" size: padding is
+// expressed purely as data, and is inert by construction.
+//
+//   Padded column j:  A[:, j] = 0 and c[j] = 0.
+//     => j contributes nothing to ax2a or ax2c
+//     => r[j] = 0 and d[j] = x[j] * (0 - 0) = 0
+//     => x[j] stays at its 1.0 init for every iteration.
+//     d_max gains an extra 0 candidate, which cannot change the outcome:
+//     if the real d_max > 1e-9 the max is unchanged, and if it is <= 1e-9
+//     both the padded and unpadded solve take the alpha = 1.0 fallback.
+//
+//   Padded row i:  A[i, :] = 0 and b[i] = 0.
+//     => row i and column i of ax2a are exactly zero, so the Cholesky
+//        pivot clamps to 1e-12, its off-diagonals stay 0, and ax2c[i] = 0
+//        survives both substitutions as delta[i] = 0 -- no contamination
+//        of the real rows regardless of where the padded rows sit.
+//     => the residual check picks up |0 - 0| = 0.
+//
+// The one thing the caller MUST preserve is that the Big-M variable stays
+// the last column, since the convergence test below reads x[NV - 1]. See
+// LPLBSolver for the block layout that guarantees this.
+//
+// Padding is not bit-identical to the unpadded solve: the larger reductions
+// reassociate their accumulation. The difference is fp-reassociation only.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

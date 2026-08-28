@@ -168,9 +168,12 @@ def _post_module(
     max_copies: int,
     num_single: int,
     num_red_phy: int,
+    num_phy: int,
     block_dim: int,
 ) -> Module:
-    args = make_cpp_args(num_logical, max_copies, num_single, num_red_phy, block_dim)
+    args = make_cpp_args(
+        num_logical, max_copies, num_single, num_red_phy, num_phy, block_dim
+    )
     return load_jit(
         "lplb_lp_post",
         *args,
@@ -186,16 +189,23 @@ def extract_log2phy_prob(
     phy_single: torch.Tensor,
     phy_replicated: torch.Tensor,
     log2phy: torch.Tensor,
+    num_phy: int,
 ) -> None:
     """Replace the 5 torch ops that turned the IPM output into log2phy_prob
     with one CUDA kernel. Writes into the caller-provided ``log2phy_prob``
     buffer of shape ``(num_logical, max_copies)``.
+
+    ``phy_single`` / ``phy_replicated`` may be zero-padded with -1 in their
+    tail (see :mod:`sglang.srt.eplb.lplb_solver`); those slots are skipped.
+    ``num_phy`` is the true physical-expert count and must be passed
+    explicitly -- it is no longer recoverable from the padded tensor shapes,
+    and the kernel's -1-wraps-to-sink trick depends on it being exact.
     """
     num_logical, max_copies = log2phy_prob.shape
     num_single = phy_single.shape[0]
     num_red_phy = phy_replicated.shape[0]
     module = _post_module(
-        num_logical, max_copies, num_single, num_red_phy, DEFAULT_BLOCK_DIM
+        num_logical, max_copies, num_single, num_red_phy, num_phy, DEFAULT_BLOCK_DIM
     )
     module.lp_post(log2phy_prob, x, t1, phy_single, phy_replicated, log2phy)
 
