@@ -463,7 +463,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
-        if on_publish is not None:
+        if on_publish is not None and batch_output.mm_embedding_errors is None:
             on_publish(batch_output.new_seq_lens)
 
         if logits_output.hidden_states is None:

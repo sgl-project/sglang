@@ -61,6 +61,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import (
+    complete_mm_embedding_validations,
+    decode_mm_embedding_errors,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -679,6 +683,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        mm_embedding_error_tensor = getattr(result, "mm_embedding_errors", None)
+        if mm_embedding_error_tensor is not None:
+            complete_mm_embedding_validations(batch.reqs, mm_embedding_error_tensor)
+        decoded_mm_embedding_errors = decode_mm_embedding_errors(
+            mm_embedding_error_tensor
+        )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -691,7 +701,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
-        assert batch.spec_info is result.next_draft_input
+        assert decoded_mm_embedding_errors or batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
@@ -709,9 +719,32 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        mm_embedding_errors = {
+            req_idx: (expected, actual)
+            for req_idx, expected, actual in decoded_mm_embedding_errors
+        }
+        failed_reqs = []
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            mm_embedding_error = mm_embedding_errors.get(i)
+            if mm_embedding_error is not None:
+                self.defer_mm_embedding_abort(req, *mm_embedding_error)
+            if mm_embedding_error is not None or getattr(
+                req, "mm_embedding_abort_pending", False
+            ):
+                advance_logprob_pt(i, req)
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                if (
+                    req.inflight_middle_chunks <= 0
+                    and req.mm_embedding_validation_count == 0
+                ):
+                    self.finish_disagg_mm_embedding_abort(req)
+                    failed_reqs.append(req)
+                continue
+
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -829,6 +862,12 @@ class SchedulerDisaggregationPrefillMixin:
                 auxiliary_output_starts,
             )
 
+        if failed_reqs:
+            self.output_streamer.stream_output(
+                failed_reqs,
+                any(req.return_logprob for req in failed_reqs),
+            )
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
@@ -836,6 +875,18 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def finish_disagg_mm_embedding_abort(self: Scheduler, req: Req) -> None:
+        if req.disagg_kv_sender is not None:
+            req.disagg_kv_sender.clear()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        self.disagg_prefill_inflight_queue = [
+            inflight_req
+            for inflight_req in self.disagg_prefill_inflight_queue
+            if inflight_req is not req
+        ]
+        self.batch_result_processor._finish_deferred_mm_embedding_abort(req)
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -1072,7 +1123,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif req.mm_embedding_validation_count == 0:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1090,6 +1141,8 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if req.mm_embedding_validation_count > 0:
+            return
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 

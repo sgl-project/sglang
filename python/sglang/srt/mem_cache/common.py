@@ -107,7 +107,10 @@ def free_swa_out_of_window_slots(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    if (
+        getattr(req, "skip_radix_cache_insert", False)
+        or getattr(req, "mm_embedding_validation_count", 0) > 0
+    ):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
@@ -218,7 +221,11 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     effective_kv_committed_len = req.effective_kv_committed_len()
     tree_cache.cache_finished_req(
         req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+        is_insert=(
+            is_insert
+            and not getattr(req, "skip_radix_cache_insert", False)
+            and getattr(req, "mm_embedding_validation_count", 0) == 0
+        ),
         kv_len_to_handle=effective_kv_committed_len,
     )
 
