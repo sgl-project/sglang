@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
+import dataclasses
 import importlib.util
 import json
 import types
@@ -38,10 +39,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
-    _cosmos3_sampling_param_kwargs,
     _multipart_video_extras,
-    _resolve_sound_duration,
     _resolve_video_path,
+    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -887,6 +887,10 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
     """Verify Cosmos3 modality knobs stay model-specific video extras."""
 
     def test_cosmos3_template_fields_remain_extra_fields(self):
+        base_fields = {field.name for field in dataclasses.fields(SamplingParams)}
+        cosmos_fields = {
+            field.name for field in dataclasses.fields(Cosmos3SamplingParams)
+        }
         for request_cls in (ImageGenerationsRequest, VideoGenerationsRequest):
             with self.subTest(request_cls=request_cls.__name__):
                 self.assertIn("max_sequence_length", request_cls.model_fields)
@@ -895,6 +899,15 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
                 self.assertNotIn("use_resolution_template", request_cls.model_fields)
                 self.assertNotIn("use_system_prompt", request_cls.model_fields)
                 self.assertNotIn("use_guardrails", request_cls.model_fields)
+        for field_name in (
+            "sound_duration",
+            "use_duration_template",
+            "use_resolution_template",
+            "use_system_prompt",
+            "use_guardrails",
+        ):
+            self.assertNotIn(field_name, base_fields)
+            self.assertIn(field_name, cosmos_fields)
 
     def test_cosmos3_modal_fields_are_model_specific_video_extras(self):
         for field_name in (
@@ -963,7 +976,9 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _cosmos3_sampling_param_kwargs(req, num_frames=48, fps=24)
+        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs.update(num_frames=48, fps=24)
+        kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
         self.assertEqual(kwargs["condition_frame_indexes"], [0, 2])
         self.assertEqual(kwargs["condition_video_keep"], "last")
@@ -1019,10 +1034,10 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        self.assertEqual(
-            _resolve_sound_duration(req, num_frames=48, fps=24),
-            0.0,
-        )
+        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs.update(num_frames=48, fps=24)
+        kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
+        self.assertEqual(kwargs["sound_duration"], 0.0)
 
 
 class TestCosmos3Guardrails(unittest.TestCase):
