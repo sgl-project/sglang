@@ -168,7 +168,7 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
                 comb_frag[j, k] = T.exp(comb_frag[j, k] - row_max[j])
             T.reduce_sum(comb_frag, row_sum, dim=1)
             for j, k in T.Parallel(hc, hc):
-                comb_frag[j, k] = comb_frag[j, k] / row_sum[j] + eps
+                comb_frag[j, k] = comb_frag[j, k] / (row_sum[j] + eps)
 
             T.reduce_sum(comb_frag, col_sum, dim=0)
             for j, k in T.Parallel(hc, hc):
