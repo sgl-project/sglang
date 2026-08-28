@@ -18,14 +18,12 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def decide_needs_cpu_seq_lens(
-    server_args: ServerArgs,
     attn_backends: Sequence[AttentionBackend],
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
@@ -53,7 +51,7 @@ def decide_needs_cpu_seq_lens(
     )
 
 
-def decide_needs_confidence_relay(server_args: ServerArgs) -> bool:
+def decide_needs_confidence_relay() -> bool:
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,

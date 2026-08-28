@@ -24,6 +24,7 @@ framework-specific optimization workflow.
 - `python/sglang/kernels/ops/diffusion/norm/native_bf16_rmsnorm_triton.py`
 - `python/sglang/kernels/ops/diffusion/norm/zimage_qk_rmsnorm_triton.py`
 - `python/sglang/kernels/ops/diffusion/rope/rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/helios_qk_rope_jit.py`
 - `python/sglang/kernels/ops/diffusion/rope/ltx2_rotary_triton.py`
 - `python/sglang/kernels/ops/diffusion/rope/ltx2_qknorm_split_rope_jit.py`
 - `python/sglang/kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py`
@@ -170,15 +171,15 @@ framework-specific optimization workflow.
 - Constraints: `cos` and `sin` shapes must match `[B, H, S, head_dim / 2]`, and `inner_dim == H * head_dim`.
 - Workflow rule: if LTX-2 traces show a large split-RoPE PyTorch chain, check whether the LTX2-specific Triton path was disabled by shape or dtype before proposing a new RoPE kernel.
 
-10. LTX2 residual-gate add fusion
+10. LTX2 and LongCat-Image residual-gate add fusion
 - Kernel: `diffusion_residual_gate_add`
-- Locations: `diffusion/residual_gate_add.py`, `csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`
-- Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates.
+- Locations: `kernels/ops/diffusion/modulate/residual_gate_add_jit.py`, `kernels/jit/csrc/diffusion/residual_gate_add.cuh`, `runtime/models/dits/ltx_2.py`, `runtime/models/dits/longcat_image.py`
+- Use case: `residual + update * gate` in LTX2 self-attention, prompt cross-attention, audio/video cross-attention, and feed-forward residual updates, plus LongCat-Image joint- and single-stream transformer residuals.
 - Constraints: `residual`, `update`, and `gate` must be CUDA tensors on the same device, contiguous, same dtype (`fp16`, `bf16`, or `fp32`), with `update.shape == residual.shape`; `gate` can match `residual` or be row-broadcast with the last dimension matching.
-- Behavior: LTX2 calls `residual_gate_add(...)` from the kernels package directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
-- Validation: `test/registered/kernels/ops/diffusion/test_residual_gate_add.py`.
+- Behavior: LTX2 and LongCat-Image call `residual_gate_add(...)` from the kernels package directly. The CUDA custom op is used while guards pass. On a runtime exception outside `torch.compile`, it logs once, disables the fast path for the process, and falls back to `residual + update * gate`.
+- Validation: `test/registered/kernels/ops/diffusion/test_modulate.py`, `python/sglang/multimodal_gen/test/unit/test_longcat_image_residual_gate.py`.
 - Microbench: `test/registered/kernels/benchmark/diffusion/bench_residual_gate_add.py`.
-- Workflow rule: if LTX2 traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
+- Workflow rule: if LTX2 or LongCat-Image traces show repeated elementwise `mul` + `add` ladders around attention or MLP residuals, check whether this existing CUDA path was disabled by shape, dtype, contiguity, or a prior runtime failure before proposing another elementwise fusion.
 
 11. MiniMax-H3 indexed AdaLN modulation and gated residual fusion
 - Kernels: `indexed_scale_shift_bf16_`, `indexed_gate_bf16_`
@@ -216,6 +217,30 @@ framework-specific optimization workflow.
   replacements and run independently of the `quality=high` Wan RMSNorm+SiLU
   path. Unsupported layouts or padding fall back to the aten chain.
 - Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`.
+
+15. Helios paired transposed RoPE
+- Kernel: `fused_inplace_helios_qk_rope`.
+- Locations: `rope/helios_qk_rope_jit.py`,
+  `csrc/diffusion/helios_qk_rope.cuh`, and
+  `runtime/models/dits/helios.py`.
+- Use case: apply Helios' transposed fp32 frequency table to already-normalized
+  contiguous Q/K together, in place, instead of launching the eager
+  unflatten/chunk/multiply/add/stack chain twice per attention block.
+- Constraints: CUDA fp16/bf16 Q/K with matching contiguous `[B, S, H, D]`
+  layouts, contiguous fp32 frequencies shaped `[B, S, 2 * D]`, even `D`, and
+  pair-aligned Q/K pointers. Tensor-parallel RMSNorm keeps the eager path.
+  Current real-model validation covers one H100; it is not a multi-GPU scaling
+  claim.
+- Numerical contract: explicit round-to-nearest fp32 operations reproduce the
+  eager elementwise rounding boundaries before the result is cast back to the
+  activation dtype. Correctness tests require `torch.equal`, including the
+  production `[8640, 40, 128]` shape.
+- Validation: `test/registered/kernels/ops/diffusion/test_helios_qk_rope.py`.
+- Microbench:
+  `test/registered/kernels/benchmark/diffusion/bench_helios_qk_rope.py`.
+- Workflow rule: if a Helios trace still shows two transposed-RoPE elementwise
+  ladders per block, check TP mode, dtype, shape, contiguity, and pointer
+  alignment before proposing another RoPE kernel.
 
 **Faster CUDA Kernel Usage Points**
 

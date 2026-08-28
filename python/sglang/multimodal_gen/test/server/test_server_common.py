@@ -45,7 +45,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
     get_model_task_type_for_server_args,
-    get_perf_baseline_path,
+    get_perf_baseline_update_path,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -246,7 +246,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             logger.error(
                 f'\n{"=" * 60}\n'
                 f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
-                f"File: {get_perf_baseline_path()}\n\n"
+                f"File: {get_perf_baseline_update_path()}\n\n"
                 f'    "{case.id}": {{\n'
                 f"        ...\n"
                 f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
@@ -445,7 +445,7 @@ class DiffusionServerBase:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
-                        f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
+                        f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
                     )
                 return
 
@@ -459,7 +459,7 @@ class DiffusionServerBase:
                     self._dump_baseline_for_testcase(case, summary, missing_scenario)
                     pytest.fail(
                         f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
-                        f"baseline in {get_perf_baseline_path()}"
+                        f"baseline in {get_perf_baseline_update_path()}"
                     )
                 try:
                     validator.validate_peak_vram(
@@ -521,7 +521,9 @@ class DiffusionServerBase:
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         if scenario is None:
-            pytest.fail(f"Testcase '{case.id}' not found in {get_perf_baseline_path()}")
+            pytest.fail(
+                f"Testcase '{case.id}' not found in {get_perf_baseline_update_path()}"
+            )
 
         validator = PerformanceValidator(
             scenario=scenario,
@@ -544,7 +546,7 @@ class DiffusionServerBase:
         if scenario.load_peak_vram_mb is None or scenario.runtime_peak_vram_mb is None:
             pytest.fail(
                 f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
-                f"baseline in {get_perf_baseline_path()}; measured "
+                f"baseline in {get_perf_baseline_update_path()}; measured "
                 f"load={summary.load_peak_vram_mb:.0f}MiB, "
                 f"runtime={summary.runtime_peak_vram_mb:.0f}MiB"
             )
@@ -689,7 +691,7 @@ class DiffusionServerBase:
                 )
         action = "add" if missing_scenario else "update"
         output = f"""
-{action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
+{action} this baseline in the "scenarios" section of {get_perf_baseline_update_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
