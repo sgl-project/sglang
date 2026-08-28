@@ -38,8 +38,6 @@ import copy
 import dataclasses
 import functools
 import glob
-import importlib
-import importlib.util
 import json
 import logging
 import math
@@ -66,15 +64,11 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
-from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-    parse_ib_device_config,
-)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
-    ALLOWED_BACKENDS_PER_PHASE,
     Backend,
     CudaGraphConfig,
     Phase,
@@ -89,22 +83,16 @@ from sglang.srt.utils.common import (
     SUPPORTED_LORA_TARGET_MODULES,
     get_device_memory_capacity,
     human_readable_int,
-    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
-    is_musa,
     is_no_spec_infer_or_topk_one,
-    is_npu,
     is_sm100_supported,
-    is_xpu,
     json_list_type,
     nullable_str,
-    torch_release,
 )
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
-from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
 
@@ -4181,16 +4169,9 @@ class ServerArgs:
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self)
 
     def _validate_cuda_graph_config(self):
-        cfg = resolving_view(self)
-        if cfg.cuda_graph_config is None:
-            return
-        for phase in Phase.ALL:
-            backend = getattr(cfg.cuda_graph_config, phase).backend
-            if backend not in ALLOWED_BACKENDS_PER_PHASE[phase]:
-                raise ValueError(
-                    f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
-                    f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
-                )
+        from sglang.srt.arg_groups.cuda_graph_hook import validate_cuda_graph_config
+
+        validate_cuda_graph_config(self)
 
     def _handle_multi_item_scoring(self):
         from sglang.srt.arg_groups.attention_hook import handle_multi_item_scoring
@@ -4448,50 +4429,18 @@ class ServerArgs:
         return supports_mamba_cache_extra_buffer(self, model_arch)
 
     def _validate_mamba_no_buffer(self, view, model_arch: str):
-        assert view.page_size in (1, None), "no_buffer only supports page_size=1."
-        assert (
-            view.disable_overlap_schedule
-        ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
-        assert (
-            view.attention_backend != "trtllm_mha"
-        ), "no_buffer do not support trtllm_mha attention backend."
+        from sglang.srt.arg_groups.mamba_hook import validate_mamba_no_buffer
+
+        validate_mamba_no_buffer(view, model_arch)
 
     def _validate_mamba_extra_buffer(self, view, model_arch: str):
-        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+        from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
 
-        assert supports_mamba_cache_extra_buffer(
-            view, model_arch
-        ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
-        assert (
-            is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
-        ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
-        if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
-            # The PD-disagg decode pool is not wired for lazy slots.
-            assert view.disaggregation_mode == "null", (
-                "extra_buffer_lazy unsupported under PD disaggregation; use "
-                "--mamba-radix-cache-strategy extra_buffer."
-            )
-            # eagle/ngram/dspark/dflash all verify through
-            # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
-            # the hook in DFlashVerifyInput.prepare_for_verify.
-        if view.speculative_num_draft_tokens is not None:
-            assert view.mamba_track_interval >= view.speculative_num_draft_tokens
-        if view.page_size is not None:
-            assert view.mamba_track_interval % view.page_size == 0
-            assert self.mamba_cache_chunk_size is not None
-
-            if (
-                view.chunked_prefill_size is not None
-                and 0 < view.chunked_prefill_size < self.mamba_cache_chunk_size
-            ):
-                logger.warning(
-                    "Mamba radix extra-buffer is enabled with chunked_prefill_size=%s "
-                    "smaller than mamba_cache_chunk_size=%s. This can make "
-                    "mamba_track_mask false for unfinished chunked-prefill handoff "
-                    "and skip Mamba state checkpoints.",
-                    view.chunked_prefill_size,
-                    self.mamba_cache_chunk_size,
-                )
+        validate_mamba_extra_buffer(
+            view,
+            model_arch,
+            mamba_cache_chunk_size_of=lambda: self.mamba_cache_chunk_size,
+        )
 
     def _handle_mamba_radix_cache(self, model_arch: str):
         # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
@@ -4756,16 +4705,11 @@ class ServerArgs:
         handle_elastic_ep(self)
 
     def _validate_experimental_sgl_marlin(self):
-        view = self._resolved()
-        if view.moe_runner_backend != "experimental_sgl_marlin":
-            return
-
-        # ===== TO BE REFACTORED ====
-        from sglang.srt.lora.marlin_lora_temp.policy import (
-            validate_experimental_sgl_marlin_server_args,
+        from sglang.srt.arg_groups.validation_hook import (
+            validate_experimental_sgl_marlin,
         )
 
-        validate_experimental_sgl_marlin_server_args(self, view)
+        validate_experimental_sgl_marlin(self)
         # ===== END TO BE REFACTORED ====
 
     def _handle_expert_distribution_metrics(self):
@@ -4786,79 +4730,11 @@ class ServerArgs:
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
     def _validate_prefill_only_disable_kv_cache_args(self):
-        """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
+        from sglang.srt.arg_groups.kv_cache_hook import (
+            validate_prefill_only_disable_kv_cache_args,
+        )
 
-        Backend resolution is checked separately by
-        _handle_prefill_only_disable_kv_cache after backends settle.
-        """
-        cfg = resolving_view(self)
-        if not cfg.prefill_only_disable_kv_cache:
-            return
-
-        # This flag is intentionally scoped to embedding mode for now. Other
-        # prefill-only paths (for example scoring and MIS) can benefit from
-        # the same idea later, but some of them still stage K/V through the
-        # paged cache today.
-        if not cfg.is_embedding:
-            raise ValueError(
-                "--prefill-only-disable-kv-cache currently requires --is-embedding. "
-                "Other prefill-only workloads may be supported in a future change once "
-                "their attention paths stop reading or writing the paged KV cache."
-            )
-        if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
-            raise ValueError(
-                "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
-                "the FP4 pool uses a separate allocation path."
-            )
-        if cfg.kv_cache_dtype == "mxfp8":
-            raise ValueError(
-                "--prefill-only-disable-kv-cache does not currently support "
-                "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
-                "scale-factor buffers."
-            )
-
-        # Structural preconditions for the FA backend's fa_skip_kv_cache path,
-        # which is the only embedding path that doesn't read or write the pool:
-        # - chunked_prefill_size == -1 keeps a request in a single forward,
-        #   so K/V never has to be reused across prefill chunks.
-        # - disable_radix_cache stops the prefix cache from indexing pool
-        #   slots that no longer hold real data.
-        if cfg.chunked_prefill_size != -1:
-            raise ValueError(
-                "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA "
-                "backend takes the fa_skip_kv_cache path; otherwise the pool would be touched "
-                "between prefill chunks."
-            )
-        if not cfg.disable_radix_cache:
-            raise ValueError(
-                "--prefill-only-disable-kv-cache requires --disable-radix-cache because the "
-                "radix cache indexes KV pool slots that no longer hold real data."
-            )
-
-        # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
-        # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
-        # raises on writes, so the engine would boot fine but fail on the first request.
-        if self._resolved().attn_cp_size > 1:
-            raise ValueError(
-                "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
-                "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
-                "which the no-op pool intentionally rejects."
-            )
-        if cfg.enable_prefill_cp:
-            raise ValueError(
-                "--prefill-only-disable-kv-cache is incompatible with "
-                "--enable-prefill-cp: the prefill-CP path stages K/V through "
-                "the paged cache, which the no-op pool does not support."
-            )
-
-        # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
-        # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
-        if cfg.enable_hisparse:
-            raise ValueError(
-                "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
-                "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
-            )
+        validate_prefill_only_disable_kv_cache_args(self)
 
     def _handle_prefill_only_disable_kv_cache(self):
         from sglang.srt.arg_groups.kv_cache_hook import (
@@ -4992,79 +4868,9 @@ class ServerArgs:
         handle_encoder_disaggregation(self)
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
-        """
-        Validate IB devices before passing to mooncake.
+        from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
-        Args:
-            device_str: Comma-separated IB device names, a per-GPU JSON mapping,
-                or a path to a JSON file containing that mapping.
-
-        Returns:
-            A normalized comma-separated string or per-GPU JSON mapping string, or None if input is None.
-        """
-        if device_str is None:
-            logger.warning(
-                "No IB devices specified for Mooncake backend, falling back to auto discovery."
-            )
-            return None
-
-        def _normalize_device_group(raw_value: str, context: str) -> str:
-            if not isinstance(raw_value, str):
-                raise ValueError(
-                    f"Invalid IB device format for {context}: expected a string. "
-                    f"Got {type(raw_value)}"
-                )
-            devices = [d.strip() for d in raw_value.split(",") if d.strip()]
-            if not devices:
-                raise ValueError(f"No valid IB devices specified for {context}")
-            unique_devices = list(dict.fromkeys(devices))
-            if len(unique_devices) != len(devices):
-                logger.warning(
-                    "Duplicate IB devices specified for %s: %s. Deduplicating to: %s",
-                    context,
-                    raw_value,
-                    ",".join(unique_devices),
-                )
-            invalid_devices = [d for d in unique_devices if d not in available_devices]
-            if len(invalid_devices) != 0:
-                raise ValueError(
-                    f"Invalid IB devices specified for {context}: {invalid_devices}. "
-                    f"Available devices: {sorted(available_devices)}"
-                )
-            return ",".join(unique_devices)
-
-        normalized_input = device_str.strip()
-        if not normalized_input:
-            raise ValueError("No valid IB devices specified")
-
-        # Get available IB devices from sysfs
-        ib_sysfs_path = "/sys/class/infiniband"
-        if not os.path.isdir(ib_sysfs_path):
-            raise RuntimeError(
-                f"InfiniBand sysfs path not found: {ib_sysfs_path}. "
-                "Please ensure InfiniBand drivers are installed."
-            )
-
-        available_devices = set(os.listdir(ib_sysfs_path))
-        if len(available_devices) == 0:
-            raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
-
-        parsed_config = parse_ib_device_config(normalized_input)
-        if isinstance(parsed_config, str):
-            return _normalize_device_group(normalized_input, "all GPUs")
-        assert parsed_config is not None
-
-        normalized_mapping: Dict[str, str] = {}
-        for gpu_key, gpu_devices in parsed_config.items():
-            normalized_key = str(gpu_key)
-            normalized_mapping[normalized_key] = _normalize_device_group(
-                gpu_devices, f"GPU {normalized_key}"
-            )
-
-        if not normalized_mapping:
-            raise ValueError("No valid GPU mappings found in IB device JSON")
-
-        return json.dumps(normalized_mapping, separators=(",", ":"))
+        return validate_ib_devices(self, device_str)
 
     def _handle_tokenizer_batching(self):
         from sglang.srt.arg_groups.serving_hook import handle_tokenizer_batching
@@ -5118,9 +4924,11 @@ class ServerArgs:
         handle_asr_validation(self)
 
     def _validate_prefill_decode_interval(self):
-        cfg = resolving_view(self)
-        if cfg.prefill_decode_interval < 0:
-            raise ValueError("--prefill-decode-interval must be non-negative.")
+        from sglang.srt.arg_groups.validation_hook import (
+            validate_prefill_decode_interval,
+        )
+
+        validate_prefill_decode_interval(self)
 
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.serving_hook import handle_other_validations
@@ -5677,521 +5485,34 @@ class ServerArgs:
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
-        cfg = resolving_view(self)
+        from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
 
-        cp_tbo = (
-            is_hip()
-            and cfg.enable_dsa_prefill_context_parallel
-            and cfg.dsa_prefill_cp_mode == "round-robin-split"
-        )
-        if (
-            cfg.enable_two_batch_overlap
-            and cfg.moe_a2a_backend == "none"
-            and not cfg.enable_dp_attention
-            and not cp_tbo
-        ):
-            raise ValueError(
-                "When enabling two batch overlap without an EP a2a backend "
-                "(moe_a2a_backend='none'), --enable-dp-attention is required "
-                "(DeepSeek-V4 non-EP DP TBO path)."
-            )
+        check_two_batch_overlap(self)
 
     def check_server_args(self):
-        cfg = resolving_view(self)
+        from sglang.srt.arg_groups.validation_hook import check_server_args
 
-        # Check parallel size constraints
-        if cfg.ep_join_mode != "scale":
-            assert (
-                cfg.tp_size * cfg.pp_size
-            ) % cfg.nnodes == 0, "tp_size must be divisible by number of nodes"
-
-        assert (
-            cfg.pp_max_micro_batch_size is None or cfg.pp_max_micro_batch_size >= 1
-        ), (
-            "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
-            f"Got: {cfg.pp_max_micro_batch_size}"
-        )
-
-        assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
-            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
-            "With padding disabled, every distinct batch size gets its own torch.compile + "
-            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
-            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
-            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
-        )
-
-        if cfg.pp_size > 1:
-            assert (
-                cfg.disable_overlap_schedule and cfg.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            assert cfg.min_free_slots_delay is None, (
-                "--min-free-slots-delay is not supported with pipeline "
-                "parallelism: allocatable slots per microbatch are bounded by "
-                "pp-max-micro-batch-size, so the threshold may never be reached"
-            )
-
-        assert not (
-            cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention
-        ), "multi-node data parallel is not supported unless dp attention!"
-
-        assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
-
-        assert cfg.moe_dense_tp_size in (
-            None,
-            1,
-            cfg.tp_size,
-        ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
-
-        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        if not is_runai_obj_uri(cfg.served_model_name):
-            assert ":" not in cfg.served_model_name, (
-                "served_model_name cannot contain a colon (':') character. "
-                "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-                f"Invalid value: '{cfg.served_model_name}'"
-            )
-
-        # Check LoRA
-        self.check_lora_server_args()
-
-        # Check speculative decoding
-        if cfg.speculative_algorithm is not None:
-            assert (
-                not cfg.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
-
-        # Check chunked prefill
-        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-        # Skip validation if disaggregation mode is decode.
-        if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
-            assert (
-                cfg.chunked_prefill_size % cfg.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
-
-        # Check pdmux
-        if cfg.enable_pdmux:
-            assert (
-                cfg.pp_size == 1
-            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-            assert (
-                cfg.chunked_prefill_size == -1
-            ), "PD-Multiplexing is not compatible with chunked prefill."
-            assert (
-                cfg.disaggregation_mode == "null"
-            ), "PD-Multiplexing is not compatible with disaggregation mode."
-            assert (
-                cfg.disable_overlap_schedule
-            ), "PD-Multiplexing is not compatible with overlap schedule."
-
-            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
-            import torch
-
-            if torch_release >= (2, 7):
-                logger.warning(
-                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
-                    f"  Current torch version is {torch.__version__}.\n"
-                    "  Please manually install torch 2.6.x."
-                )
-
-        assert cfg.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
-        assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
-        assert (
-            cfg.mm_processor_worker_num >= 0
-        ), "Multimodal processor worker num must >= 0"
-        assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
-        self.validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
-        self.validate_buckets_rule(
-            "--generation-tokens-buckets", cfg.generation_tokens_buckets
-        )
-
-        # Check scheduling policy
-        if cfg.enable_priority_scheduling:
-            assert cfg.schedule_policy in [
-                "fcfs",
-                "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
-            if cfg.default_priority_value is None:
-                logger.warning(
-                    "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
-                    "Requests without explicit priority will have priority=None, "
-                    "resulting in priority='None' string labels in Prometheus metrics."
-                )
-        else:
-            if cfg.disable_priority_preemption:
-                logger.warning(
-                    "--disable-priority-preemption has no effect without --enable-priority-scheduling"
-                )
-            if cfg.default_priority_value is not None:
-                logger.warning(
-                    "--default-priority-value has no effect without --enable-priority-scheduling"
-                )
-        if cfg.retraction_policy == "priority" and not cfg.enable_priority_scheduling:
-            raise ValueError(
-                "--retraction-policy priority requires --enable-priority-scheduling"
-            )
-
-        # Check hisparse
-        # Moved to the resolution pipeline (arg_groups/overrides.py:
-        # _hisparse_validation), invoked here at its legacy slot.
-        from sglang.srt.arg_groups.overrides import (
-            _hisparse_validation,
-            run_post_process_pass,
-        )
-
-        run_post_process_pass(self, _hisparse_validation)
-
-        assert (
-            cfg.schedule_conservativeness >= 0
-        ), "schedule_conservativeness must be non-negative"
-
-        if cfg.model_impl == "mindspore":
-            assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
-
-        # Check metrics labels
-        if (
-            not cfg.tokenizer_metrics_custom_labels_header
-            and cfg.tokenizer_metrics_allowed_custom_labels
-        ):
-            raise ValueError(
-                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-custom-labels."
-            )
-
-        # Check metrics exporters
-        if cfg.export_metrics_to_file and cfg.export_metrics_to_file_dir is None:
-            raise ValueError(
-                "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
-            )
-
-        # Check two batch overlap backend requirement.
-        self._check_two_batch_overlap()
-
-        # Check communications compression
-        if cfg.enable_quant_communications and cfg.tp_size == 1:
-            raise ValueError(
-                "Communications quantization is only used with tp_size != 1"
-            )
-
-        if cfg.enable_quant_communications and cfg.device != "npu":
-            raise ValueError(
-                "Communications quantization is only supported for NPU device"
-            )
-
-        # grpc_port is None for HTTP-only launches, so the == comparison is
-        # already False there; no explicit None check needed.
-        if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
-            raise ValueError(
-                f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
-            )
-
-        # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
-        # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
-        # and nccl_port have dynamic defaults that may not be resolved yet here.
-
-        if cfg.gc_threshold:
-            if not (1 <= len(cfg.gc_threshold) <= 3):
-                raise ValueError(
-                    "When setting gc_threshold, it must contain 1 to 3 integers."
-                )
-
-        if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
-            raise ValueError(
-                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
-            )
-
-        self.check_load_publish_args()
+        check_server_args(self)
 
     def check_load_publish_args(self):
-        """Fail fast at the entrypoint on a --load-publish-endpoint the
-        scheduler would decline (no active kv-events publisher to advertise
-        through, unbindable, overlapping the KV range, u16 overflow) rather
-        than only warning — or silently doing nothing — from a scheduler
-        subprocess. Routes through the same resolver the scheduler binds and
-        /server_info advertises with."""
-        mode = (self.load_publish_endpoint or "").strip()
-        if not mode or mode.lower() == "off":
-            return  # disabled; nothing to validate
+        from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 
-        server_cfg = resolving_view(self)
-
-        from sglang.srt.disaggregation.kv_events import (
-            KVEventsConfig,
-            resolve_load_pub_range,
-        )
-
-        if not self.kv_events_config:
-            raise ValueError(
-                "--load-publish-endpoint requires --kv-events-config: routers"
-                " discover the load range through /server_info's kv_events"
-                " block, absent without a publisher."
-            )
-        try:
-            cfg = KVEventsConfig.from_cli(self.kv_events_config)
-        except Exception as e:
-            raise ValueError(f"--kv-events-config is not parseable: {e}")
-        if cfg.publisher == "null" or not cfg.endpoint:
-            raise ValueError(
-                "--load-publish-endpoint needs an active --kv-events-config"
-                " publisher; got publisher='null' or an empty endpoint."
-            )
-        _, reason = resolve_load_pub_range(
-            kv_endpoint=cfg.endpoint,
-            replay_endpoint=cfg.replay_endpoint,
-            dp_size=server_cfg.dp_size,
-            load_publish_endpoint=mode,
-        )
-        if reason:
-            raise ValueError(reason)
+        check_load_publish_args(self)
 
     def check_lora_server_args(self):
-        cfg = resolving_view(self)
+        from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
-        assert cfg.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
-
-        # Enable LoRA if any LoRA paths are provided for backward compatibility.
-        if cfg.lora_paths:
-            if cfg.enable_lora is None:
-                self._late_resolution("check_lora_server_args", enable_lora=True)
-                logger.warning(
-                    "--enable-lora is set to True because --lora-paths is provided."
-                )
-            elif cfg.enable_lora is False:
-                logger.warning(
-                    "--enable-lora is set to False, any provided lora_paths will be ignored."
-                )
-
-        if cfg.enable_lora:
-            if cfg.enable_lora_overlap_loading is None:
-                self._late_resolution(
-                    "check_lora_server_args", enable_lora_overlap_loading=False
-                )
-
-            if cfg.enable_lora_overlap_loading:
-                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = cfg.max_loras_per_batch * 2
-                assert (
-                    cfg.max_loaded_loras is not None
-                    and cfg.max_loaded_loras <= max_loaded_loras_limit
-                ), (
-                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
-                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
-                )
-
-            # Validate compatibility with speculative decoding
-            self._check_lora_speculative_compatibility()
-
-            # Parse lora_paths
-            if isinstance(cfg.lora_paths, list):
-                parsed_lora_paths = []
-                for lora_path in cfg.lora_paths:
-                    if isinstance(lora_path, str):
-                        if "=" in lora_path:
-                            name, path = lora_path.split("=", 1)
-                            lora_ref = LoRARef(
-                                lora_id=LoRARef.deterministic_id(name, path),
-                                lora_name=name,
-                                lora_path=path,
-                                pinned=False,
-                            )
-                        else:
-                            lora_ref = LoRARef(
-                                lora_id=LoRARef.deterministic_id(lora_path, lora_path),
-                                lora_name=lora_path,
-                                lora_path=lora_path,
-                                pinned=False,
-                            )
-                    elif isinstance(lora_path, dict):
-                        assert (
-                            "lora_name" in lora_path and "lora_path" in lora_path
-                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
-                        lora_ref = LoRARef(
-                            lora_id=LoRARef.deterministic_id(
-                                lora_path["lora_name"], lora_path["lora_path"]
-                            ),
-                            lora_name=lora_path["lora_name"],
-                            lora_path=lora_path["lora_path"],
-                            pinned=lora_path.get("pinned", False),
-                        )
-                    else:
-                        raise ValueError(
-                            f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
-                            "Expected a string or a dictionary."
-                        )
-                    parsed_lora_paths.append(lora_ref)
-                self._late_resolution(
-                    "check_lora_server_args", lora_paths=parsed_lora_paths
-                )
-            elif isinstance(cfg.lora_paths, dict):
-                self._late_resolution(
-                    "check_lora_server_args",
-                    lora_paths=[
-                        LoRARef(
-                            lora_id=LoRARef.deterministic_id(k, v),
-                            lora_name=k,
-                            lora_path=v,
-                            pinned=False,
-                        )
-                        for k, v in cfg.lora_paths.items()
-                    ],
-                )
-            elif cfg.lora_paths is None:
-                self._late_resolution("check_lora_server_args", lora_paths=[])
-            else:
-                raise ValueError(
-                    f"Invalid type for --lora-paths: {type(cfg.lora_paths)}. "
-                    "Expected a list or a dictionary."
-                )
-
-            # Normalize target modules to a set; keep {"all"} as a sentinel
-            # that gets resolved model-awarely in lora_manager.init_lora_shapes().
-            if cfg.lora_target_modules:
-                self._late_resolution(
-                    "check_lora_server_args",
-                    lora_target_modules=set(cfg.lora_target_modules),
-                )
-                if "all" in cfg.lora_target_modules:
-                    assert (
-                        len(cfg.lora_target_modules) == 1
-                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
-
-            # Ensure sufficient information is provided for LoRA initialization.
-            assert cfg.lora_paths or (
-                cfg.max_lora_rank and cfg.lora_target_modules
-            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
-
-            # Validate max_loaded_loras
-            if cfg.max_loaded_loras is not None:
-                assert cfg.max_loaded_loras >= cfg.max_loras_per_batch, (
-                    "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
-                    f"max_loaded_loras={cfg.max_loaded_loras}, max_loras_per_batch={cfg.max_loras_per_batch}"
-                )
-                assert len(cfg.lora_paths) <= cfg.max_loaded_loras, (
-                    "The number of LoRA paths should not exceed max_loaded_loras. "
-                    f"max_loaded_loras={cfg.max_loaded_loras}, lora_paths={len(cfg.lora_paths)}"
-                )
-
-            if cfg.max_lora_chunk_size is not None:
-                assert (
-                    16 <= cfg.max_lora_chunk_size <= 128
-                    and (cfg.max_lora_chunk_size & (cfg.max_lora_chunk_size - 1)) == 0
-                ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
-
-            if cfg.lora_use_virtual_experts:
-                logger.info("Virtual expert computation enabled.")
-
-            assert (
-                cfg.lora_drain_wait_threshold >= 0.0
-            ), "--lora-drain-wait-threshold must be non-negative."
+        check_lora_server_args(self)
 
     def _check_lora_speculative_compatibility(self):
-        """Validate LoRA + speculative decoding combinations.
+        from sglang.srt.arg_groups.lora_hook import check_lora_speculative_compatibility
 
-        Adapters apply to the target only; a shared draft runs unadapted.
-        Matches resolved algorithm names (NEXTN has collapsed to EAGLE).
-        """
-        cfg = resolving_view(self)
-        if cfg.speculative_algorithm in ["NGRAM", None]:
-            return
-
-        # These algorithms present a uniform per-request token width during
-        # verify, which is what the LoRA segment layout assumes.
-        lora_spec_algorithms = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
-        if cfg.speculative_algorithm not in lora_spec_algorithms:
-            promoted = (
-                " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
-                "promoted to FROZEN_KV_MTP, which does not support LoRA)"
-                if cfg.speculative_algorithm == "FROZEN_KV_MTP"
-                else ""
-            )
-            raise ValueError(
-                "LoRA is only compatible with NGRAM, EAGLE, NEXTN, EAGLE3, "
-                "DFLASH, or DSPARK speculative decoding, not "
-                f"{cfg.speculative_algorithm}{promoted}."
-            )
-
-        ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get()
-
-        # Each entry: (is unsupported, why). Reasons are appended to a shared
-        # prefix so the message names the combination, not just the flag.
-        unsupported = [
-            (
-                cfg.speculative_algorithm == "DSPARK" and ragged_mode != "static",
-                f"does not support SGLANG_RAGGED_VERIFY_MODE={ragged_mode!r}: "
-                "the per-request verify lengths it schedules break the "
-                "uniform-width LoRA segment layout",
-            ),
-            (
-                cfg.speculative_adaptive,
-                "does not support --speculative-adaptive: the draft is built "
-                "from a static ServerArgs snapshot, and the runtime-state "
-                "swap does not rebuild LoRA cuda-graph metadata",
-            ),
-            (
-                "experimental_sgl_trtllm"
-                in (cfg.moe_runner_backend, cfg.speculative_moe_runner_backend),
-                "does not support the experimental_sgl_trtllm MoE runner: its "
-                "TopK reads the LoRA config per forward, which the draft "
-                "resolves against the target's after its own publish ended",
-            ),
-            (
-                envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get(),
-                "does not support SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1: LoRA "
-                "batch preparation would run on the plan stream, unordered "
-                "against in-flight forwards",
-            ),
-        ]
-        for is_unsupported, reason in unsupported:
-            if is_unsupported:
-                raise ValueError(
-                    f"LoRA with EAGLE/NEXTN/EAGLE3 speculative decoding {reason}."
-                )
+        check_lora_speculative_compatibility(self)
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
-        if not buckets_rule:
-            return
+        from sglang.srt.arg_groups.validation_hook import validate_buckets_rule
 
-        assert len(buckets_rule) > 0, f"{arg_name} cannot be empty list"
-        rule = buckets_rule[0]
-        assert rule in [
-            "tse",
-            "default",
-            "custom",
-        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
-
-        if rule == "tse":
-            assert (
-                len(buckets_rule) == 4
-            ), f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
-            try:
-                middle = float(buckets_rule[1])
-                base = float(buckets_rule[2])
-                count = int(buckets_rule[3])
-            except (ValueError, IndexError):
-                assert (
-                    False
-                ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
-            assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
-            assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
-            assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"
-
-        elif rule == "default":
-            assert (
-                len(buckets_rule) == 1
-            ), f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
-
-        elif rule == "custom":
-            assert (
-                len(buckets_rule) >= 2
-            ), f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
-            try:
-                bucket_values = [float(x) for x in buckets_rule[1:]]
-            except ValueError:
-                assert False, f"{arg_name} custom rule bucket values must be numeric"
-            assert len(set(bucket_values)) == len(
-                bucket_values
-            ), f"{arg_name} custom rule bucket values should not contain duplicates"
-            assert all(
-                val >= 0 for val in bucket_values
-            ), f"{arg_name} custom rule bucket values should be non-negative"
+        validate_buckets_rule(self, arg_name, buckets_rule)
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         cfg = resolving_view(self)
@@ -6234,23 +5555,9 @@ class ServerArgs:
         )
 
     def validate_transfer_engine(self):
-        cfg = resolving_view(self)
-        try:
-            mooncake_available = importlib.util.find_spec("mooncake.engine") is not None
-        except (ModuleNotFoundError, ValueError):
-            mooncake_available = False
-        if not mooncake_available:
-            logger.warning(
-                "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            return False
-        elif cfg.enable_memory_saver:
-            logger.warning(
-                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            return False
-        else:
-            return True
+        from sglang.srt.arg_groups.model_path_hook import validate_transfer_engine
+
+        return validate_transfer_engine(self)
 
     @property
     def _parsed_modelexpress_config(self) -> dict:

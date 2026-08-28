@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.model_executor.cuda_graph_config import (
+    ALLOWED_BACKENDS_PER_PHASE,
     Backend,
     CudaGraphConfig,
     Phase,
@@ -439,3 +440,16 @@ def handle_cuda_graph_config(server_args: Any):
             "cuda_graph_config[prefill].backend='full' is experimental. "
             "Use breakable or tc_piecewise for production workloads."
         )
+
+
+def validate_cuda_graph_config(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.cuda_graph_config is None:
+        return
+    for phase in Phase.ALL:
+        backend = getattr(cfg.cuda_graph_config, phase).backend
+        if backend not in ALLOWED_BACKENDS_PER_PHASE[phase]:
+            raise ValueError(
+                f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
+                f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
+            )

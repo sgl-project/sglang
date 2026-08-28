@@ -12,7 +12,11 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.utils.common import (
     is_cuda,
     is_flashinfer_available,
+    is_hip,
+    is_musa,
+    is_npu,
     is_sm100_supported,
+    is_xpu,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,3 +100,55 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             f"radix cache; --radix-cache-backend={cfg.radix_cache_backend!r} "
             "is not int8-aware. Omit --radix-cache-backend."
         )
+
+
+def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size_of):
+    from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+
+    assert supports_mamba_cache_extra_buffer(
+        view, model_arch
+    ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+    assert (
+        is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
+    ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
+    if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
+        # The PD-disagg decode pool is not wired for lazy slots.
+        assert view.disaggregation_mode == "null", (
+            "extra_buffer_lazy unsupported under PD disaggregation; use "
+            "--mamba-radix-cache-strategy extra_buffer."
+        )
+        # eagle/ngram/dspark/dflash all verify through
+        # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
+        # the hook in DFlashVerifyInput.prepare_for_verify.
+    if view.speculative_num_draft_tokens is not None:
+        assert view.mamba_track_interval >= view.speculative_num_draft_tokens
+    if view.page_size is not None:
+        assert view.mamba_track_interval % view.page_size == 0
+        # Called here and not passed in: `mamba_cache_chunk_size` derives from
+        # `page_size`, which resolution writes after this validator runs, so
+        # evaluating it at the call site raises on the unresolved `None`.
+        mamba_cache_chunk_size = mamba_cache_chunk_size_of()
+        assert mamba_cache_chunk_size is not None
+
+        if (
+            view.chunked_prefill_size is not None
+            and 0 < view.chunked_prefill_size < mamba_cache_chunk_size
+        ):
+            logger.warning(
+                "Mamba radix extra-buffer is enabled with chunked_prefill_size=%s "
+                "smaller than mamba_cache_chunk_size=%s. This can make "
+                "mamba_track_mask false for unfinished chunked-prefill handoff "
+                "and skip Mamba state checkpoints.",
+                view.chunked_prefill_size,
+                mamba_cache_chunk_size,
+            )
+
+
+def validate_mamba_no_buffer(view, model_arch: str):
+    assert view.page_size in (1, None), "no_buffer only supports page_size=1."
+    assert (
+        view.disable_overlap_schedule
+    ), "no_buffer do not support overlap schedule. Try to set disable_overlap_schedule=True."
+    assert (
+        view.attention_backend != "trtllm_mha"
+    ), "no_buffer do not support trtllm_mha attention backend."

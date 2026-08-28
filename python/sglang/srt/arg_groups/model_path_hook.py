@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from typing import Any, Optional
@@ -283,3 +284,23 @@ def handle_load_format(server_args: Any):
             "not export the draft model's weights. Disable one of them "
             "(--weight-cache-mode off) for this configuration."
         )
+
+
+def validate_transfer_engine(server_args: Any):
+    cfg = resolving_view(server_args)
+    try:
+        mooncake_available = importlib.util.find_spec("mooncake.engine") is not None
+    except (ModuleNotFoundError, ValueError):
+        mooncake_available = False
+    if not mooncake_available:
+        logger.warning(
+            "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
+        )
+        return False
+    elif cfg.enable_memory_saver:
+        logger.warning(
+            "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
+        )
+        return False
+    else:
+        return True

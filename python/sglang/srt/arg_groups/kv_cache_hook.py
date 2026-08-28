@@ -347,3 +347,79 @@ def handle_page_major_kv_layout(server_args: Any):
         f"the strided conv/SSM state; got {cfg.mamba_backend!r}. Pass "
         "--mamba-backend triton."
     )
+
+
+def validate_prefill_only_disable_kv_cache_args(server_args: Any):
+    """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
+
+    Backend resolution is checked separately by
+    _handle_prefill_only_disable_kv_cache after backends settle.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.prefill_only_disable_kv_cache:
+        return
+
+    # This flag is intentionally scoped to embedding mode for now. Other
+    # prefill-only paths (for example scoring and MIS) can benefit from
+    # the same idea later, but some of them still stage K/V through the
+    # paged cache today.
+    if not cfg.is_embedding:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache currently requires --is-embedding. "
+            "Other prefill-only workloads may be supported in a future change once "
+            "their attention paths stop reading or writing the paged KV cache."
+        )
+    if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
+        raise ValueError(
+            "--prefill-only-disable-kv-cache does not currently support "
+            "--kv-cache-dtype=nvfp4 or --kv-cache-dtype=fp4_mx_block16 because "
+            "the FP4 pool uses a separate allocation path."
+        )
+    if cfg.kv_cache_dtype == "mxfp8":
+        raise ValueError(
+            "--prefill-only-disable-kv-cache does not currently support "
+            "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
+            "scale-factor buffers."
+        )
+
+    # Structural preconditions for the FA backend's fa_skip_kv_cache path,
+    # which is the only embedding path that doesn't read or write the pool:
+    # - chunked_prefill_size == -1 keeps a request in a single forward,
+    #   so K/V never has to be reused across prefill chunks.
+    # - disable_radix_cache stops the prefix cache from indexing pool
+    #   slots that no longer hold real data.
+    if cfg.chunked_prefill_size != -1:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA "
+            "backend takes the fa_skip_kv_cache path; otherwise the pool would be touched "
+            "between prefill chunks."
+        )
+    if not cfg.disable_radix_cache:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache requires --disable-radix-cache because the "
+            "radix cache indexes KV pool slots that no longer hold real data."
+        )
+
+    # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
+    # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
+    # raises on writes, so the engine would boot fine but fail on the first request.
+    if server_args._resolved().attn_cp_size > 1:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
+            "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
+            "which the no-op pool intentionally rejects."
+        )
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache is incompatible with "
+            "--enable-prefill-cp: the prefill-CP path stages K/V through "
+            "the paged cache, which the no-op pool does not support."
+        )
+
+    # HiSparse selects a different pool class (HiSparseDSATokenToKVPool /
+    # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
+    if cfg.enable_hisparse:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
+            "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
+        )
