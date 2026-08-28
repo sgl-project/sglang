@@ -20,7 +20,7 @@ pub use sampling::SamplingParams;
 pub(crate) use sampling::SamplingParamsOverrides;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
-#[cfg(test)]
+#[cfg(all(test, feature = "http"))]
 pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
     template::load_chat_formatter(None, None, Some(name)).unwrap()
 }

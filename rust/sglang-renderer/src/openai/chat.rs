@@ -685,11 +685,17 @@ mod tests {
         let model = SamplingDefaults {
             temperature: Some(0.6),
             top_p: Some(0.9),
+            top_k: Some(32),
+            min_p: Some(0.1),
+            repetition_penalty: Some(1.1),
         };
         // Omitted → model defaults, not the 1.0 OpenAI terminals.
         let sampling = chat_sampling_params(&request(), &model).unwrap();
         assert_eq!(sampling.temperature, 0.6);
         assert_eq!(sampling.top_p, 0.9);
+        assert_eq!(sampling.top_k, 32);
+        assert_eq!(sampling.min_p, 0.1);
+        assert_eq!(sampling.repetition_penalty, 1.1);
         // Explicit request values win. `Option<f32>` loses precision in f64 —
         // compare with tolerance.
         let mut request = request();
@@ -708,6 +714,9 @@ mod tests {
         let sampling = chat_sampling_params(&request(), &openai_mode).unwrap();
         assert_eq!(sampling.temperature, 1.0);
         assert_eq!(sampling.top_p, 1.0);
+        assert_eq!(sampling.top_k, 1 << 30);
+        assert_eq!(sampling.min_p, 0.0);
+        assert_eq!(sampling.repetition_penalty, 1.0);
     }
 
     /// A request with no `max_tokens`/`max_completion_tokens` stays unbounded —

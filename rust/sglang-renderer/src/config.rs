@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct SamplingDefaults {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<i64>,
+    pub min_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

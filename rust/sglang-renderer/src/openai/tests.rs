@@ -76,6 +76,48 @@ mod suite {
     }
 
     #[test]
+    fn completion_sampling_defaults_follow_request_model_terminal_priority() {
+        let mut config = renderer_config();
+        config.default_sampling_params = SamplingDefaults {
+            temperature: Some(0.6),
+            top_p: Some(0.9),
+            top_k: Some(32),
+            min_p: Some(0.1),
+            repetition_penalty: Some(1.1),
+        };
+        let omitted: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "prompt": "hello"
+        }))
+        .unwrap();
+        let (_, requests) = lower_text_completion_request(&config, &omitted).unwrap();
+        let sampling = &requests[0].options.sampling_params;
+        assert_eq!(sampling.temperature, 0.6);
+        assert_eq!(sampling.top_p, 0.9);
+        assert_eq!(sampling.top_k, 32);
+        assert_eq!(sampling.min_p, 0.1);
+        assert_eq!(sampling.repetition_penalty, 1.1);
+
+        let explicit: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "prompt": "hello",
+            "temperature": 0.2,
+            "top_p": 0.5,
+            "top_k": 17,
+            "min_p": 0.2,
+            "repetition_penalty": 1.2
+        }))
+        .unwrap();
+        let (_, requests) = lower_text_completion_request(&config, &explicit).unwrap();
+        let sampling = &requests[0].options.sampling_params;
+        assert!((sampling.temperature - 0.2).abs() < 1e-6);
+        assert!((sampling.top_p - 0.5).abs() < 1e-6);
+        assert_eq!(sampling.top_k, 17);
+        assert_eq!(sampling.min_p, 0.2);
+        assert_eq!(sampling.repetition_penalty, 1.2);
+    }
+
+    #[test]
     fn unsupported_sglang_fields_are_rejected_instead_of_ignored() {
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",

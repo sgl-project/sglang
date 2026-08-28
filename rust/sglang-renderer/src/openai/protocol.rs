@@ -489,6 +489,7 @@ pub fn chat_sampling_params(
     request: &ChatCompletionRequest,
     model_defaults: &SamplingDefaults,
 ) -> Result<SamplingParams, String> {
+    let defaults = sampling_params_with_model_defaults(model_defaults);
     let mut stop = None;
     let mut stop_token_ids = None;
     match request.stop.as_ref() {
@@ -524,21 +525,30 @@ pub fn chat_sampling_params(
         temperature: request
             .temperature
             .map(f64::from)
-            .or(model_defaults.temperature)
-            .unwrap_or(1.0),
-        top_p: request
-            .top_p
-            .map(f64::from)
-            .or(model_defaults.top_p)
-            .unwrap_or(1.0),
+            .unwrap_or(defaults.temperature),
+        top_p: request.top_p.map(f64::from).unwrap_or(defaults.top_p),
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
         n: 1,
         logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
         sampling_seed: request.seed,
         json_schema,
-        ..Default::default()
+        ..defaults
     })
+}
+
+fn sampling_params_with_model_defaults(model_defaults: &SamplingDefaults) -> SamplingParams {
+    let terminals = SamplingParams::default();
+    SamplingParams {
+        temperature: model_defaults.temperature.unwrap_or(terminals.temperature),
+        top_p: model_defaults.top_p.unwrap_or(terminals.top_p),
+        top_k: model_defaults.top_k.unwrap_or(terminals.top_k),
+        min_p: model_defaults.min_p.unwrap_or(terminals.min_p),
+        repetition_penalty: model_defaults
+            .repetition_penalty
+            .unwrap_or(terminals.repetition_penalty),
+        ..terminals
+    }
 }
 
 /// Lower a textual OpenAI completion into text-only internal requests.
@@ -644,7 +654,7 @@ fn completion_lowering_context(
     if request.n == Some(0) {
         return Err("n must be at least 1".into());
     }
-    let sampling = completion_sampling_params(request)?;
+    let sampling = completion_sampling_params(request, &config.default_sampling_params)?;
     let n = request.n.unwrap_or(1) as usize;
     let choice_count = prompt_count
         .checked_mul(n)
@@ -720,7 +730,11 @@ fn token_prompt_ids(ids: &[u32]) -> Result<TokenIds, String> {
     Ok(input_ids)
 }
 
-pub fn completion_sampling_params(request: &CompletionRequest) -> Result<SamplingParams, String> {
+pub fn completion_sampling_params(
+    request: &CompletionRequest,
+    model_defaults: &SamplingDefaults,
+) -> Result<SamplingParams, String> {
+    let defaults = sampling_params_with_model_defaults(model_defaults);
     let mut stop = None;
     let mut stop_token_ids = None;
     match request.stop.as_ref() {
@@ -748,8 +762,11 @@ pub fn completion_sampling_params(request: &CompletionRequest) -> Result<Samplin
         max_new_tokens: Some(request.max_tokens.unwrap_or(16) as i64),
         stop,
         stop_token_ids,
-        temperature: request.temperature.unwrap_or(1.0) as f64,
-        top_p: request.top_p.unwrap_or(1.0) as f64,
+        temperature: request
+            .temperature
+            .map(f64::from)
+            .unwrap_or(defaults.temperature),
+        top_p: request.top_p.map(f64::from).unwrap_or(defaults.top_p),
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
         // OpenAI `n` is implemented by fan-out: every native request has one
@@ -757,6 +774,6 @@ pub fn completion_sampling_params(request: &CompletionRequest) -> Result<Samplin
         n: 1,
         logit_bias: (!logit_bias.is_empty()).then_some(logit_bias),
         sampling_seed: request.seed,
-        ..Default::default()
+        ..defaults
     })
 }
