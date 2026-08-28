@@ -20,7 +20,7 @@ use tower::util::ServiceExt;
 pub(super) use crate::api_server::core::openai::test_utils::senders;
 
 use super::super::app::HttpApi;
-use super::super::plumbing::{HttpBody, HttpResponse, empty, full};
+use super::super::response::{HttpBody, HttpResponse, empty, full};
 use super::openai_error;
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::wiring::Senders;

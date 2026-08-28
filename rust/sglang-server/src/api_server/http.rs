@@ -8,9 +8,8 @@
 pub(crate) mod app;
 mod common;
 mod disaggregation;
-mod encode;
 mod native_api;
 mod openai;
-pub(crate) mod plumbing;
+pub(crate) mod response;
 
-pub(crate) use self::plumbing::*;
+// pub(crate) use self::response::*;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use http::StatusCode;
 
-use super::super::plumbing::{HttpResponse, json_response};
+use super::super::response::{HttpResponse, json_response};
 use super::{AppState, openai_error};
 use crate::api_server::core::openai::models::model_card;
 

@@ -15,7 +15,7 @@ pub(super) use crate::api_server::core::openai::{
 };
 
 use super::app::AppState;
-use crate::utils::response::error_response;
+use super::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
 
@@ -30,7 +30,7 @@ pub(super) fn openai_error(
     code: StatusCode,
     message: impl Into<String>,
     stream: bool,
-) -> super::plumbing::HttpResponse {
+) -> super::response::HttpResponse {
     error_response(code, error_payload(code, message), stream)
 }
 
@@ -59,7 +59,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     use super::super::app::HttpApi;
-    use super::super::plumbing::{HttpBody, HttpResponse, empty, full};
+    use super::super::response::{HttpBody, HttpResponse, empty, full};
     use super::openai_error;
     use crate::api_server::core::openai::test_utils::senders;
     use crate::message::config::ServerArgs;

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use http::StatusCode;
 
 use super::app::AppState;
-use super::plumbing::{HttpResponse, bytes_response, text_response};
+use super::response::{HttpResponse, bytes_response, text_response};
 use crate::api_server::core::control::{model_info_value, server_info_json};
 
 /// `GET /get_model_info` (+ `/model_info` alias).

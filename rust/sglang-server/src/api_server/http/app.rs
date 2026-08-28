@@ -11,7 +11,7 @@ use std::time::Duration;
 use http::{Method, StatusCode};
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::plumbing::{HttpResponse, method_not_allowed, status_response};
+use super::response::{HttpResponse, method_not_allowed, status_response};
 use super::{common, native_api, openai};
 use crate::api_server::layers::Peer;
 use crate::api_server::layers::access_log::AccessLogLayer;

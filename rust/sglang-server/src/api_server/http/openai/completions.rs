@@ -6,8 +6,8 @@ use dynamo_protocols::types::CreateCompletionRequest;
 use futures::StreamExt;
 use http::StatusCode;
 
-use super::super::encode::sse_encode;
-use super::super::plumbing::{HttpResponse, json_response, read_json};
+use super::super::response::sse_encode;
+use super::super::response::{HttpResponse, json_response, read_json};
 use super::{AppState, MAX_OPENAI_CHOICES, openai_error, submit_generation, unix_seconds_u32};
 use crate::api_server::core::guard::AbortGuard;
 use crate::api_server::core::openai::completions::{

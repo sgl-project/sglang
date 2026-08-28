@@ -1,0 +1,68 @@
+// The native SGLang gRPC service served by rust/sglang-server's tonic
+// transport, over the same api_core the HTTP endpoints use. Covers exactly the
+// surface the native server implements (the legacy sglang.runtime.v1 bridge's
+// embed/classify/tokenize RPCs have no native backend here and are not
+// carried over).
+
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/generate.proto";
+import "sglang/json/v1/options.proto";
+
+service Service {
+  // `/generate`: always server-streaming (a unary request is a one-frame
+  // stream); per-batch-item failures ride the stream as GenerateStreamItem
+  // errors, pre-submit failures end the RPC with a gRPC status.
+  rpc Generate(GenerateRequest) returns (stream GenerateStreamItem);
+
+  // `/health_generate`: fires a 1-token probe and watches the response
+  // heartbeat. UNAVAILABLE on a stalled pipeline.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // `/get_model_info`: static model metadata, no scheduler round-trip.
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+
+  // `/server_info`: one control round-trip, shaped through the runtime-metric
+  // allowlist (never the raw server-args dump, which embeds keys).
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+}
+
+message GetModelInfoRequest {}
+
+message GetModelInfoResponse {
+  string model_path = 1;
+  string served_model_name = 2;
+  string tokenizer_path = 3;
+  bool is_generation = 4;
+  // Null on this server: RustServer.launch refuses to start when set (no
+  // per-request merge yet); the key keeps its shape.
+  optional string preferred_sampling_params = 5 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string weight_version = 6 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string load_format = 7 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string reasoning_parser = 8 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string tool_call_parser = 9 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  string model_path = 1;
+  string served_model_name = 2;
+  string tokenizer_path = 3;
+  uint32 max_context_length = 4;
+  optional uint64 max_total_num_tokens = 5;
+  string version = 6;
+  // The allowlisted runtime metrics (last_gen_throughput, memory_usage,
+  // effective_max_running_requests_per_dp, avg_spec_accept_length,
+  // step_time_dict), untyped because the scheduler owns their shapes; JSON
+  // passes them through verbatim.
+  repeated string internal_states = 7 [(sglang.json.v1.field_json).raw_json = true];
+}

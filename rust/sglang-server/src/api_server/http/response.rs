@@ -5,6 +5,8 @@
 //! axum edge exactly; `http_edge_wire_contract` pins them.
 
 use bytes::Bytes;
+use futures::StreamExt;
+use http::StatusCode;
 use http_body_util::BodyExt;
 
 /// One boxed body type for every response: full buffers and SSE streams
@@ -84,12 +86,21 @@ pub(crate) fn method_not_allowed(allow: &'static str) -> HttpResponse {
         .expect("static response builds")
 }
 
+/// Wrap a stream of complete JSON frame payloads as the SSE response the
+/// native and OpenAI endpoints share: one `data: {json}` event per frame,
+/// terminated by the `data: [DONE]` sentinel. The sentinel is transport
+/// framing, so it is appended here — core streams never yield it.
+pub(super) fn sse_encode(
+    frames: impl futures::Stream<Item = String> + Send + 'static,
+) -> HttpResponse {
+    sse_response(frames.chain(futures::stream::once(async { "[DONE]".to_string() })))
+}
+
 /// A committed SSE response: 200 + the headers axum's `Sse` set, each item
 /// framed as one `data: {payload}\n\n` event.
 pub(crate) fn sse_response(
     frames: impl futures::Stream<Item = String> + Send + 'static,
 ) -> HttpResponse {
-    use futures::StreamExt;
     let body = http_body_util::StreamBody::new(frames.map(|payload| {
         let mut event = String::with_capacity(payload.len() + 8);
         event.push_str("data: ");
@@ -119,6 +130,40 @@ fn json_content_type(headers: &http::HeaderMap) -> bool {
     };
     mime.type_() == "application"
         && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+}
+
+/// The native error body — the same `{"error": {...}}` object every native
+/// path emits, not bare text, which a client parsing JSON chokes on.
+pub fn error_value(code: u16, message: &str) -> serde_json::Value {
+    serde_json::json!({ "error": { "message": message, "code": code } })
+}
+
+/// Unary native-shape error response: `code` + [`error_value`] body.
+pub fn json_error(code: StatusCode, message: &str) -> HttpResponse {
+    error_response(code, error_value(code.as_u16(), message), false)
+}
+
+/// Form an error in the shape the client committed to: unary → `code` plus
+/// the JSON `body`; streaming → 200 with one SSE error frame + `[DONE]` (the
+/// client is already reading a stream — Python answers in-stream too, from
+/// `stream_results()`). The `body` is caller-shaped: native [`error_value`]
+/// or the OpenAI error payload.
+pub fn error_response(code: StatusCode, body: serde_json::Value, stream: bool) -> HttpResponse {
+    if !stream {
+        return json_response(code, &body);
+    }
+    sse_error_response(body)
+}
+
+/// A 200 SSE response carrying one error frame + `[DONE]` — how a stream the
+/// client is already committed to reading reports a failure. Shared by every
+/// endpoint family: the native API and the OpenAI
+/// frontend's `openai_error_response`.
+pub fn sse_error_response(body: serde_json::Value) -> HttpResponse {
+    sse_response(futures::stream::iter([
+        body.to_string(),
+        "[DONE]".to_string(),
+    ]))
 }
 
 /// axum-`JsonRejection` parity: the exact `body_text` clients saw, plus the
@@ -274,5 +319,63 @@ mod tests {
         );
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"data: {\"a\":1}\n\ndata: [DONE]\n\n");
+    }
+
+    /// The SSE wire shape: each frame is one `data:` event and the stream is
+    /// terminated by `data: [DONE]` — appended by the encoder, byte-compatible
+    /// with the Python server's streaming responses.
+    #[tokio::test]
+    async fn sse_encode_appends_done_sentinel() {
+        let resp = sse_encode(futures::stream::iter(vec![
+            "{\"text\":\"a\"}".to_string(),
+            "{\"text\":\"b\"}".to_string(),
+        ]));
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            text,
+            "data: {\"text\":\"a\"}\n\ndata: {\"text\":\"b\"}\n\ndata: [DONE]\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_responses_match_python_shape() {
+        let unary = error_response(
+            StatusCode::BAD_REQUEST,
+            error_value(400, "bad input"),
+            false,
+        );
+        assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
+        let body = http_body_util::BodyExt::collect(unary.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(v["error"]["message"], "bad input");
+        assert_eq!(v["error"]["code"], 400);
+
+        let streamed = error_response(StatusCode::BAD_REQUEST, error_value(400, "bad input"), true);
+        assert_eq!(
+            streamed.status(),
+            StatusCode::OK,
+            "the stream itself is 200"
+        );
+        let body = http_body_util::BodyExt::collect(streamed.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(r#""code":400"#),
+            "carries the status in-band: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "terminated: {text}"
+        );
     }
 }

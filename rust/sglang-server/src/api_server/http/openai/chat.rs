@@ -7,8 +7,8 @@ use dynamo_protocols::types::CreateChatCompletionRequest;
 use futures::StreamExt;
 use http::StatusCode;
 
-use super::super::encode::sse_encode;
-use super::super::plumbing::{HttpResponse, json_typed_response, read_json};
+use super::super::response::sse_encode;
+use super::super::response::{HttpResponse, json_typed_response, read_json};
 use super::{AppState, contains_media, openai_error, submit_generation, unix_seconds_u32};
 use crate::api_server::core::guard::AbortGuard;
 use crate::api_server::core::openai::chat::{

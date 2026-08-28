@@ -10,13 +10,13 @@ use std::sync::Arc;
 use http::StatusCode;
 
 use super::app::AppState;
-use super::encode::sse_encode;
-use super::plumbing::{HttpResponse, json_response, read_json, status_response};
+use super::response::sse_encode;
+use super::response::{HttpResponse, json_response, read_json, status_response};
 use crate::api_server::core::generate::{
     GeneratePlan, drain_unary, generate_start, generation_event_stream,
 };
 use crate::api_server::core::health::{HealthStatus, health_probe};
-use crate::utils::response::{error_response, error_value};
+use super::response::{error_response, error_value};
 
 /// native api error response: unary → `code` plus the JSON `body`,
 /// streaming → 200 with one SSE error frame + `[DONE]`.
