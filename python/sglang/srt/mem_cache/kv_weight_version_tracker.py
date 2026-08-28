@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 _UNWRITTEN_VERSION_ID = -1
 
 
-class KvSlotWeightVersions:
+class KvWeightVersionTracker:
     def __init__(
         self, *, num_slots: int, device: str, req_to_token_pool: ReqToTokenPool
     ):

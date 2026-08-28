@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.kv_slot_weight_versions import KvSlotWeightVersions
+    from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
     from sglang.srt.server_args import ServerArgs
@@ -86,7 +86,7 @@ class SchedulerBatchResultProcessor:
     tree_cache: BasePrefixCache
     hisparse_coordinator: Optional[HiSparseCoordinator]
     req_to_token_pool: ReqToTokenPool
-    kv_slot_weight_versions: Optional[KvSlotWeightVersions]
+    kv_weight_version_tracker: Optional[KvWeightVersionTracker]
     decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
     metrics_collector: SchedulerMetricsCollector
     metrics_reporter: SchedulerMetricsReporter
@@ -266,7 +266,7 @@ class SchedulerBatchResultProcessor:
 
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
-                    if (x := self.kv_slot_weight_versions) is not None:
+                    if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
 
                     # req output_ids are set here
@@ -352,7 +352,7 @@ class SchedulerBatchResultProcessor:
                     req.pooled_hidden_state = phs[i]
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
-                    if (x := self.kv_slot_weight_versions) is not None:
+                    if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
                     # Dummy output token for embedding models
                     req.output_ids.append(0)

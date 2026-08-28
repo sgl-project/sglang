@@ -3,7 +3,7 @@ from typing import List
 
 import torch
 
-from sglang.srt.mem_cache.kv_slot_weight_versions import KvSlotWeightVersions
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,8 +30,8 @@ class _ReqToTokenPoolStub:
         )
 
 
-def _table(slots_of_req: List[int] = ()) -> KvSlotWeightVersions:
-    return KvSlotWeightVersions(
+def _table(slots_of_req: List[int] = ()) -> KvWeightVersionTracker:
+    return KvWeightVersionTracker(
         num_slots=16,
         device="cpu",
         req_to_token_pool=_ReqToTokenPoolStub(list(slots_of_req)),
@@ -42,7 +42,7 @@ def _slots(*indices: int) -> torch.Tensor:
     return torch.tensor(indices, dtype=torch.int64)
 
 
-class TestKvSlotWeightVersions(CustomTestCase):
+class TestKvWeightVersionTracker(CustomTestCase):
     def test_equal_neighbours_merge_while_a_returning_version_starts_a_new_span(self):
         """Run-length compression merges adjacent equal versions and never merges across a change."""
         table = _table()
