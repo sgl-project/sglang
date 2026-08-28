@@ -274,6 +274,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )

@@ -1123,7 +1123,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif req.mm_embedding_validation_count == 0:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1141,6 +1141,8 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if req.mm_embedding_validation_count > 0:
+            return
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 

@@ -3386,6 +3386,12 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
+            self.chunked_req is not None
+            and self.chunked_req.mm_embedding_validation_count > 0
+        ):
+            return None, running_batch
+
+        if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None, running_batch
@@ -3863,15 +3869,16 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if batch.forward_mode.is_extend():
+            for req_idx in batch.mm_embedding_validation_indices():
+                batch.reqs[req_idx].mm_embedding_validation_count += 1
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
 
         # Run forward
-        if batch.forward_mode.is_extend():
-            for req_idx in batch.mm_embedding_validation_indices():
-                batch.reqs[req_idx].mm_embedding_validation_count += 1
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
