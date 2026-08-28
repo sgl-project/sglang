@@ -15,6 +15,17 @@ export const benchmarks = [
   { match: { hw: "b300",  variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" } },
   { match: { hw: "b300",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" } },
 
+  // NVIDIA NVFP4, single node (RadixArk/GLM-5.3-NVFP4).
+  { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
+  { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
+  { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
+  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
+  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
+  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
+
   // NVIDIA BF16.
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency",     nodes: "single" } },
   { match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced",        nodes: "single" } },
