@@ -26,6 +26,7 @@ placement to serve two different lifecycle objectives.
 from __future__ import annotations
 
 import statistics
+import time
 from itertools import chain, product
 from typing import TYPE_CHECKING, Callable, Collection, Iterable, Mapping, Sequence
 
@@ -1358,6 +1359,7 @@ def _layerwise_pin_targets(
     uses_per_streamed_layer: int,
     layer_uses: tuple[tuple[int, ...], ...] | None = None,
     constrain_host_transitions: bool = True,
+    maximum_utility_only: bool = False,
 ) -> list[tuple[tuple[int, ...], ...]]:
     """Pareto-optimal HostPin targets for one resident-layer placement.
 
@@ -1372,6 +1374,37 @@ def _layerwise_pin_targets(
         layer_uses=layer_uses,
         fallback_uses=uses_per_streamed_layer,
     )
+    if maximum_utility_only:
+        target = []
+        for manager, resident_count, policy, manager_uses in zip(
+            managers, resident_layers, policies, resolved_uses
+        ):
+            if not manager.pin_cpu_memory:
+                target.append(())
+                continue
+            streamed = set(
+                compute_streamed_layers(
+                    num_layers=manager.num_layers,
+                    resident_layers=resident_count,
+                    policy=policy,
+                )
+            )
+            transfer_bytes = manager.layer_weight_bytes()
+            target.append(
+                tuple(
+                    layer_idx
+                    for layer_idx in manager.pinnable_layer_indices()
+                    if (
+                        manager_uses[layer_idx]
+                        if layer_idx in streamed
+                        else min(1, manager_uses[layer_idx])
+                    )
+                    * transfer_bytes.get(layer_idx, 0)
+                    > 0
+                )
+            )
+        return [tuple(target)]
+
     current = [set(indices) for indices in current_pinned_layers]
     current_bytes = 0
     grouped: dict[tuple[int, int, int, bool], list[tuple[int, int]]] = {}
@@ -1921,6 +1954,9 @@ def collect_residency_targets(
     used_components: Iterable[str] | None = None,
     layerwise_layer_uses: Mapping[str, Mapping[str, tuple[int, ...]]] | None = None,
     host_transition_headroom_bytes: int | None = None,
+    host_pin_headroom_bytes: int | None = None,
+    request_duration_ns: int = 0,
+    latency_upper_bound_ns_by_component: Mapping[str, int] | None = None,
 ) -> list[ResidencyTarget]:
     """Build complete target-state frontiers for auto-managed components.
 
@@ -1928,6 +1964,12 @@ def collect_residency_targets(
     but its transfer utility is absolute within the component's frontier.
     Including the current and lower-memory states lets later calibration rounds
     replace an earlier choice instead of being limited to monotonic upgrades.
+
+    When both host constraints provably cannot bind and the component latency
+    cap cannot flatten transfer utility, every pin subset except the unique
+    maximum-utility one is dominated under the solver's latency-first ordering.
+    Only that exact condition permits collapsing the HostPin frontier; otherwise
+    every Pareto-relevant subset remains available to the joint optimizer.
     """
     custom_names = set(custom_strategy_names)
     mixed_dtype_names = set(mixed_dtype_components)
@@ -1936,7 +1978,11 @@ def collect_residency_targets(
     if baseline_residency_mode_of is None:
         baseline_residency_mode_of = residency_mode_of
     constrain_host_transitions = True
-    if host_transition_headroom_bytes is not None:
+    constrain_host_pin = True
+    if (
+        host_transition_headroom_bytes is not None
+        or host_pin_headroom_bytes is not None
+    ):
         seen_managers: set[int] = set()
         maximum_unpin_bytes = 0
         maximum_pin_bytes = 0
@@ -1958,9 +2004,12 @@ def collect_residency_targets(
                     for layer_idx in manager.pinnable_layer_indices()
                     if layer_idx not in pinned
                 )
-        constrain_host_transitions = max(maximum_unpin_bytes, maximum_pin_bytes) > max(
-            0, host_transition_headroom_bytes
-        )
+        if host_transition_headroom_bytes is not None:
+            constrain_host_transitions = max(
+                maximum_unpin_bytes, maximum_pin_bytes
+            ) > max(0, host_transition_headroom_bytes)
+        if host_pin_headroom_bytes is not None:
+            constrain_host_pin = maximum_pin_bytes > max(0, host_pin_headroom_bytes)
     candidates = []
     for name in sorted(modules):
         module = modules[name]
@@ -2186,6 +2235,20 @@ def collect_residency_targets(
         maximum_transfer_work = max(
             layerwise_maximum_transfer_work, component_transfer_work
         )
+        latency_upper_bound_ns = request_duration_ns
+        if latency_upper_bound_ns_by_component is not None:
+            latency_upper_bound_ns = latency_upper_bound_ns_by_component.get(
+                name, latency_upper_bound_ns
+            )
+        pin_utility_cannot_saturate = (
+            latency_upper_bound_ns > 0
+            and int(
+                maximum_transfer_work
+                / ESTIMATED_PINNED_H2D_BYTES_PER_SECOND
+                * 1_000_000_000
+            )
+            <= latency_upper_bound_ns
+        )
 
         empty_resident_layers = tuple(0 for _ in managers)
         empty_pinned_layers = tuple(() for _ in managers)
@@ -2252,10 +2315,24 @@ def collect_residency_targets(
                         uses_per_streamed_layer=uses_per_request,
                         layer_uses=layer_uses,
                         constrain_host_transitions=constrain_host_transitions,
+                        maximum_utility_only=(
+                            not constrain_host_transitions
+                            and not constrain_host_pin
+                            and pin_utility_cannot_saturate
+                        ),
                     )
                     if allow_host_pin_reallocation
                     else [current_pinned_layers]
                 )
+                if (
+                    target_resident_layers == current_resident_layers
+                    and target_policies == current_residency_policies
+                    and current_pinned_layers not in pin_targets
+                ):
+                    # relative utility is anchored to the measured placement;
+                    # keep that exact state when every other pin subset folds
+                    # into its maximum-utility representative
+                    pin_targets.append(current_pinned_layers)
                 for target_pinned_layers in pin_targets:
                     target_pinned_bytes = sum(
                         sum(
@@ -2965,6 +3042,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         and report.candidate_latency_savings_ns
     ]
     use_latency_utility = bool(timed_reports)
+    option_build_started = time.perf_counter()
     options = []
     for candidate in candidates:
         resource_deltas: dict[str, int] = {}
@@ -3105,6 +3183,13 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         any(candidate.current_placement for candidate in component_candidates)
         for component_candidates in candidates_by_component.values()
     )
+    logger.debug(
+        "Auto residency option vectors built in %.3fs: options=%d, resources=%d",
+        time.perf_counter() - option_build_started,
+        len(options),
+        len(resource_budgets),
+    )
+    solve_started = time.perf_counter()
     try:
         placement = optimize_placement(
             options,
@@ -3144,6 +3229,10 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 current_placement_reserve_shortfall
             ),
         )
+    logger.debug(
+        "Auto residency joint solve completed in %.3fs",
+        time.perf_counter() - solve_started,
+    )
     changed_candidates = []
     for selection in placement.selections:
         candidate = candidate_by_key[selection.option_key]

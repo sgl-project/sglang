@@ -1309,7 +1309,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             num_inference_steps=(
                 workload.num_inference_steps if workload is not None else 1
             ),
-            allow_host_pin_reallocation=self.server_args.num_gpus == 1,
+            # this hint only consumes permanent-residency targets; HostPin
+            # alternatives cannot change its answer
+            allow_host_pin_reallocation=False,
             mixed_dtype_components=self._mixed_dtype_residency_components(),
         )
 
@@ -1675,6 +1677,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         *,
         used_components: set[str] | None = None,
         layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
+        host_pin_headroom_bytes: int | None = None,
+        request_duration_ns: int = 0,
+        latency_upper_bound_ns_by_component: dict[str, int] | None = None,
     ) -> list[ResidencyTarget]:
         assert self.pipeline is not None
         modules = self._auto_residency_modules()
@@ -1710,6 +1715,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
                 // local_worker_count
             ),
+            host_pin_headroom_bytes=host_pin_headroom_bytes,
+            request_duration_ns=request_duration_ns,
+            latency_upper_bound_ns_by_component=(latency_upper_bound_ns_by_component),
         )
 
     def _build_pre_warmup_auto_residency_report(
@@ -1881,23 +1889,124 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
         )
+        (
+            measured_request_duration_ns,
+            measured_stage_duration_ns,
+            measured_component_stages,
+        ) = estimate_default_workload_timing(
+            records=records,
+            target_units=target_units,
+            target_num_inference_steps=workload.num_inference_steps,
+        )
+        explicitly_repeated_stages = {
+            stage_name
+            for record in records
+            if record.succeeded
+            for stage_name in record.stage_iterations
+        }
         repeated_components = {
             component_name
             for component_name in layerwise_layer_uses
             if is_dit_component_name(component_name)
         }
+        repeated_components.update(
+            component_name
+            for component_name, stage_names in measured_component_stages.items()
+            if any(
+                stage_name in explicitly_repeated_stages
+                or (
+                    stage_name.endswith("DenoisingStage")
+                    and not stage_name.endswith("BeforeDenoisingStage")
+                )
+                for stage_name in stage_names
+            )
+        )
+        if include_candidates:
+            self._auto_residency_repeated_components = repeated_components
+        reference_request_duration_ns = (
+            self._auto_residency_reference_request_duration_ns
+        )
+        if (
+            not warmup_oom
+            and reference_request_duration_ns is None
+            and measured_request_duration_ns > 0
+        ):
+            reference_request_duration_ns = measured_request_duration_ns
+            self._auto_residency_reference_request_duration_ns = (
+                reference_request_duration_ns
+            )
+            self._auto_residency_reference_stage_duration_ns = (
+                measured_stage_duration_ns
+            )
+            self._auto_residency_reference_component_stages = measured_component_stages
+        estimated_request_duration_ns = (
+            reference_request_duration_ns or measured_request_duration_ns
+        )
+        reference_stage_duration_ns = (
+            self._auto_residency_reference_stage_duration_ns
+            or measured_stage_duration_ns
+        )
+        reference_component_stages = (
+            self._auto_residency_reference_component_stages or measured_component_stages
+        )
+        latency_upper_bound_ns_by_component = {}
+        for component_name in modules:
+            component_stage_duration_ns = sum(
+                reference_stage_duration_ns.get(stage_name, 0)
+                for stage_name in reference_component_stages.get(component_name, ())
+            )
+            latency_upper_bound_ns_by_component[component_name] = (
+                estimated_request_duration_ns
+                if is_dit_component_name(component_name)
+                or component_name in repeated_components
+                else component_stage_duration_ns or estimated_request_duration_ns
+            )
         budget_bytes = self._auto_residency_budget_bytes()
-        candidates = (
-            self._collect_auto_residency_targets(
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
+        )
+        pin_budget = self.server_args.host_pin_budget()
+        host_transition_headroom_bytes = (
+            max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
+            // local_worker_count
+        )
+        pinned_host_bytes = (
+            layerwise_pinned_host_bytes(modules, pin_budget=pin_budget)
+            if include_candidates
+            else 0
+        )
+        host_pin_capacity_bytes = (
+            layerwise_host_pin_capacity_bytes(modules, pin_budget=pin_budget)
+            if include_candidates
+            else 0
+        )
+        candidates = []
+        if include_candidates:
+            candidate_started = time.perf_counter()
+            candidates = self._collect_auto_residency_targets(
                 workload,
                 used_components=(
                     measured_used_components if has_component_use_measurement else None
                 ),
                 layerwise_layer_uses=layerwise_layer_uses,
+                host_pin_headroom_bytes=max(
+                    0, host_pin_capacity_bytes - pinned_host_bytes
+                ),
+                request_duration_ns=estimated_request_duration_ns,
+                latency_upper_bound_ns_by_component=(
+                    latency_upper_bound_ns_by_component
+                ),
             )
-            if include_candidates
-            else []
-        )
+            candidates_by_component: dict[str, int] = {}
+            for candidate in candidates:
+                candidates_by_component[candidate.component_name] = (
+                    candidates_by_component.get(candidate.component_name, 0) + 1
+                )
+            logger.debug(
+                "Auto residency candidate frontier built in %.3fs: %s",
+                time.perf_counter() - candidate_started,
+                candidates_by_component,
+            )
         if warmup_oom:
             dit_candidate_deltas: dict[str, list[tuple[int, int, int]]] = {}
             for candidate in candidates:
@@ -1941,78 +2050,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 prefetched_components_by_phase,
                 candidate_summary,
             )
-        (
-            measured_request_duration_ns,
-            measured_stage_duration_ns,
-            measured_component_stages,
-        ) = estimate_default_workload_timing(
-            records=records,
-            target_units=target_units,
-            target_num_inference_steps=workload.num_inference_steps,
-        )
-        explicitly_repeated_stages = {
-            stage_name
-            for record in records
-            if record.succeeded
-            for stage_name in record.stage_iterations
-        }
-        repeated_components.update(
-            component_name
-            for component_name, stage_names in measured_component_stages.items()
-            if any(
-                stage_name in explicitly_repeated_stages
-                or (
-                    stage_name.endswith("DenoisingStage")
-                    and not stage_name.endswith("BeforeDenoisingStage")
-                )
-                for stage_name in stage_names
-            )
-        )
-        if include_candidates:
-            self._auto_residency_repeated_components = repeated_components
-        reference_request_duration_ns = (
-            self._auto_residency_reference_request_duration_ns
-        )
-        if (
-            not warmup_oom
-            and reference_request_duration_ns is None
-            and measured_request_duration_ns > 0
-        ):
-            reference_request_duration_ns = measured_request_duration_ns
-            self._auto_residency_reference_request_duration_ns = (
-                reference_request_duration_ns
-            )
-            self._auto_residency_reference_stage_duration_ns = (
-                measured_stage_duration_ns
-            )
-            self._auto_residency_reference_component_stages = measured_component_stages
-        estimated_request_duration_ns = (
-            reference_request_duration_ns or measured_request_duration_ns
-        )
         candidate_latency_savings_ns = (
             estimate_candidate_latency_savings_ns(
                 candidates=candidates,
                 request_duration_ns=estimated_request_duration_ns,
-                stage_duration_ns=(
-                    self._auto_residency_reference_stage_duration_ns
-                    or measured_stage_duration_ns
-                ),
-                component_stages=(
-                    self._auto_residency_reference_component_stages
-                    or measured_component_stages
-                ),
+                stage_duration_ns=reference_stage_duration_ns,
+                component_stages=reference_component_stages,
                 repeated_components=repeated_components,
             )
             if include_candidates
             else {}
-        )
-        local_worker_count = max(
-            1, self.server_args.num_gpus // self.server_args.nnodes
-        )
-        pin_budget = self.server_args.host_pin_budget()
-        host_transition_headroom_bytes = (
-            max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
-            // local_worker_count
         )
         return RankResidencyReport(
             rank=self.rank,
@@ -2037,16 +2084,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             current_active_weight_bytes_by_component=runtime_weights_by_component,
             node_rank=self.server_args.node_rank,
-            pinned_host_bytes=(
-                layerwise_pinned_host_bytes(modules, pin_budget=pin_budget)
-                if include_candidates
-                else 0
-            ),
-            host_pin_capacity_bytes=(
-                layerwise_host_pin_capacity_bytes(modules, pin_budget=pin_budget)
-                if include_candidates
-                else 0
-            ),
+            pinned_host_bytes=pinned_host_bytes,
+            host_pin_capacity_bytes=host_pin_capacity_bytes,
             host_transition_headroom_bytes=(
                 host_transition_headroom_bytes if include_candidates else 0
             ),

@@ -1716,6 +1716,42 @@ class TestPlanAutoResidency:
             "text_encoder",
         ]
 
+    def test_equal_latency_plan_avoids_strategy_repacking(self):
+        current = ResidencyTarget(
+            component_name="vae",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            current_placement=True,
+        )
+        component_offload = ResidencyTarget(
+            component_name="vae",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    candidates=[current, component_offload],
+                    estimated_request_duration_ns=1_000_000_000,
+                    candidate_latency_savings_ns={
+                        current.option_key(): 0,
+                        component_offload.option_key(): 0,
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == []
+
     def test_output_rank_timing_applies_to_untimed_peer_ranks(self):
         transformer = _candidate(
             "transformer",
@@ -3153,6 +3189,78 @@ class TestCollectResidencyTargets:
         )
 
         assert len(targets) == 41
+
+    def test_nonbinding_host_resources_keep_only_maximum_pin_utility(self):
+        manager = SimpleNamespace(
+            num_layers=3,
+            residency_policy="leading",
+            pin_cpu_memory=True,
+            layer_weight_bytes=lambda: {0: 6, 1: 4, 2: 4},
+            layer_host_store_bytes=lambda: {0: 6, 1: 4, 2: 4},
+            pinnable_layer_indices=lambda: (0, 1, 2),
+        )
+
+        targets = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(1,),
+            current_pinned_layers=((0, 1, 2),),
+            uses_per_streamed_layer=1,
+            layer_uses=((0, 3, 1),),
+            constrain_host_transitions=False,
+            maximum_utility_only=True,
+        )
+
+        assert targets == [((1, 2),)]
+
+    def test_collapsed_pin_frontier_retains_the_measured_state(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(3)}
+        )
+        manager._pinned_layers = (0,)
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: LAYERWISE_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=3,
+            used_components={"transformer"},
+            layerwise_layer_uses={"transformer": {"layers": (3, 3, 3)}},
+            host_transition_headroom_bytes=GIB_BYTES,
+            host_pin_headroom_bytes=GIB_BYTES,
+            request_duration_ns=1_000_000_000,
+        )
+
+        current = [candidate for candidate in candidates if candidate.current_placement]
+        assert len(candidates) <= 8
+        assert len(current) == 1
+        assert current[0].target_layerwise_pinned_layers == ((0,),)
+
+    def test_component_latency_cap_keeps_the_full_pin_frontier(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(3)}
+        )
+        layer_bytes = {index: GIB_BYTES for index in range(3)}
+        manager.layer_weight_bytes = lambda: layer_bytes
+        manager.layer_host_store_bytes = lambda: layer_bytes
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: LAYERWISE_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=3,
+            used_components={"transformer"},
+            layerwise_layer_uses={"transformer": {"layers": (3, 3, 3)}},
+            host_transition_headroom_bytes=16 * GIB_BYTES,
+            host_pin_headroom_bytes=16 * GIB_BYTES,
+            request_duration_ns=1_000_000_000,
+            latency_upper_bound_ns_by_component={"transformer": 1},
+        )
+
+        assert len(candidates) > 8
 
     def test_host_pin_frontier_drops_scratch_only_tradeoffs_when_nonbinding(self):
         manager = SimpleNamespace(

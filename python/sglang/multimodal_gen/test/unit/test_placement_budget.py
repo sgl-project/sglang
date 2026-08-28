@@ -642,7 +642,7 @@ def test_branch_and_bound_matches_exhaustive_multiresource_search():
                             name: rng.randint(-5, 8) for name in resource_names
                         },
                         estimated_latency_savings=rng.randint(-5, 20),
-                        preference_cost=(rng.randint(0, 10), rng.randint(0, 10)),
+                        preference_cost=tuple(rng.randint(-10, 10) for _ in range(5)),
                     )
                 )
         budgets = {name: rng.randint(-2, 12) for name in resource_names}
