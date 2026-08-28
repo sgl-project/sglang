@@ -163,6 +163,31 @@ class TestWatchdogRaw(CustomTestCase):
 
         self.assertEqual(calls, ["faulthandler", "pyspy"])
 
+    def test_traceback_failure_does_not_disable_hard_watchdog(self):
+        watchdog = WatchdogRaw.__new__(WatchdogRaw)
+        watchdog.debug_name = "test"
+        watchdog.get_counter = lambda: 0
+        watchdog.is_active = lambda: True
+        watchdog.watchdog_timeout = 1
+        watchdog.soft = False
+        watchdog.dump_info = None
+        watchdog.parent_process = unittest.mock.Mock()
+
+        with (
+            unittest.mock.patch(
+                "sglang.srt.utils.watchdog.time.perf_counter", side_effect=[0, 2]
+            ),
+            unittest.mock.patch("sglang.srt.utils.watchdog.time.sleep"),
+            unittest.mock.patch(
+                "sglang.srt.utils.watchdog.faulthandler.dump_traceback",
+                side_effect=RuntimeError("stderr unavailable"),
+            ),
+            unittest.mock.patch("sglang.srt.utils.watchdog.pyspy_dump_schedulers"),
+        ):
+            watchdog._watchdog_once()
+
+        watchdog.parent_process.send_signal.assert_called_once_with(signal.SIGQUIT)
+
 
 if __name__ == "__main__":
     import unittest

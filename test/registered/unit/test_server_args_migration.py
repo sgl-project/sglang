@@ -152,6 +152,10 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         sa = self._parse(["--stream-output"])
         self.assertTrue(sa.incremental_streaming_output)
 
+    def test_tokenizer_event_loop_watchdog_timeout(self):
+        sa = self._parse(["--tokenizer-event-loop-watchdog-timeout", "30"])
+        self.assertEqual(sa.tokenizer_event_loop_watchdog_timeout, 30.0)
+
     def test_combined_parse(self):
         """Multiple option types parsed together in one invocation."""
         sa = self._parse(

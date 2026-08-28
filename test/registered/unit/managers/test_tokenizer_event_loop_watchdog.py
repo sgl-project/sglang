@@ -13,6 +13,7 @@ class TestTokenizerEventLoopWatchdog(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_feeds_watchdog(self):
         manager = TokenizerManager.__new__(TokenizerManager)
         manager.event_loop_watchdog = Mock()
+        manager.event_loop_watchdog_timeout = 30
 
         with patch(
             "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
