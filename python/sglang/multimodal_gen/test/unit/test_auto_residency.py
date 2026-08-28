@@ -1232,7 +1232,8 @@ class TestPlanAutoResidency:
                     require_feasible_placement=True,
                     estimated_request_duration_ns=1,
                     candidate_latency_savings_ns={
-                        candidate.option_key(): 0 for candidate in candidates
+                        candidate.option_key(): int(candidate.current_placement)
+                        for candidate in candidates
                     },
                 )
             ]
@@ -1329,7 +1330,7 @@ class TestPlanAutoResidency:
         assert report.candidates == [current]
         assert report.skip_reason is None
         assert report.estimated_request_duration_ns == 1
-        assert report.candidate_latency_savings_ns == {current.option_key(): 0}
+        assert report.candidate_latency_savings_ns == {current.option_key(): 1}
 
     def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
         from sglang.multimodal_gen.runtime.managers import gpu_worker

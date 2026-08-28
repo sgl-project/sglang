@@ -1695,12 +1695,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             candidates=candidates,
             require_feasible_placement=True,
             # Static weight accounting establishes feasibility, but contains no
-            # latency observation. Tie utility so the solver preserves the
-            # current placement whenever it fits and only makes the minimum
-            # necessary demotion before the first target-shape probe.
+            # latency observation. Give each exact current state one synthetic
+            # unit so the solver preserves the maximum number of current
+            # placements and only demotes what is necessary before the first
+            # target-shape probe.
             estimated_request_duration_ns=1,
             candidate_latency_savings_ns={
-                candidate.option_key(): 0 for candidate in candidates
+                candidate.option_key(): int(candidate.current_placement)
+                for candidate in candidates
             },
         )
 
