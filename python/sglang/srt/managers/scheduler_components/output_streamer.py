@@ -308,6 +308,7 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
+    prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -460,8 +461,10 @@ class _GenerationStreamAccumulator:
                     num_output_tokens=len(output_ids_),
                 )
             )
+            self.prefill_weight_versions.append(req.prefill_weight_versions)
         else:
             self.weight_versions.append(None)
+            self.prefill_weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -708,6 +711,11 @@ class _GenerationStreamAccumulator:
             retraction_counts=self.retraction_counts,
             weight_versions=(
                 self.weight_versions if any(self.weight_versions) else None
+            ),
+            prefill_weight_versions=(
+                self.prefill_weight_versions
+                if any(self.prefill_weight_versions)
+                else None
             ),
             dp_ranks=dp_ranks,
         )

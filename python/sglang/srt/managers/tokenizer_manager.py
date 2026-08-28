@@ -163,7 +163,11 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.srt.utils.weight_versions import add_weight_versions_to_meta_info
+from sglang.srt.utils.weight_versions import (
+    add_weight_versions_to_meta_info,
+    compute_weight_version_spans,
+    weight_version_spans_to_json,
+)
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -2383,6 +2387,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         spans,
                         num_output_tokens=recv_obj.completion_tokens[i],
                     )
+                if recv_obj.prefill_weight_versions and (
+                    prefill_spans := recv_obj.prefill_weight_versions[i]
+                ):
+                    meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
+                        prefill_spans
+                    )
                 # Add detailed cache breakdown if available
                 if (
                     hasattr(recv_obj, "cached_tokens_details")
@@ -3292,6 +3302,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info,
                 recv_obj.weight_versions,
                 num_output_tokens=len(state.output_ids),
+            )
+        if recv_obj.prefill_weight_versions:
+            meta_info["prefill_weight_versions"] = weight_version_spans_to_json(
+                recv_obj.prefill_weight_versions
             )
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):

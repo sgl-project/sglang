@@ -1197,6 +1197,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             tree_cache=tree_cache,
             hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
             req_to_token_pool=None,
+            kv_slot_weight_versions=None,
             decode_offload_manager=None,
             metrics_collector=None,
             metrics_reporter=None,

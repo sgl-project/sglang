@@ -21,15 +21,32 @@ register_cuda_ci(
 
 _REQUEST_TIMEOUT = 180
 
+_SHARED_PREFIX = (
+    "You are a meticulous assistant. Follow every instruction to the letter, "
+    "explain your reasoning step by step, and never skip an intermediate result. "
+    "Here is the background material you must rely on for the whole conversation. "
+)
+
 
 def _assert_spans_contiguous(test, meta_info):
-    spans = meta_info["weight_versions"]
+    spans = _assert_contiguous(test, meta_info["weight_versions"])
+    test.assertEqual(meta_info["weight_version"], spans[-1]["version"])
+    return spans
+
+
+def _assert_prefill_spans_contiguous(test, meta_info, prompt_tokens=None):
+    spans = _assert_contiguous(test, meta_info["prefill_weight_versions"])
+    if prompt_tokens is not None:
+        test.assertEqual(spans[-1]["end"], prompt_tokens)
+    return spans
+
+
+def _assert_contiguous(test, spans):
     test.assertGreater(len(spans), 0)
     test.assertEqual(spans[0]["start"], 0)
     for prev, cur in zip(spans, spans[1:]):
         test.assertEqual(prev["end"], cur["start"])
         test.assertNotEqual(prev["version"], cur["version"])
-    test.assertEqual(meta_info["weight_version"], spans[-1]["version"])
     return spans
 
 
@@ -65,6 +82,7 @@ class TestWeightVersionSpans(CustomTestCase):
                 "32",
                 "--max-running-requests",
                 "8",
+                "--enable-prefill-weight-versions",
             ],
         )
 
@@ -107,6 +125,14 @@ class TestWeightVersionSpans(CustomTestCase):
             timeout=30,
         ).raise_for_status()
 
+    def _abort_all(self):
+        requests.post(
+            f"{self.base_url}/abort_request", json={"abort_all": True}, timeout=30
+        ).raise_for_status()
+
+    def _flush_cache(self):
+        requests.post(f"{self.base_url}/flush_cache", timeout=30).raise_for_status()
+
     def _set_weight_version(self, new_version: str, abort_all_requests: bool = False):
         response = requests.post(
             f"{self.base_url}/update_weight_version",
@@ -133,7 +159,7 @@ class TestWeightVersionSpans(CustomTestCase):
         num_requests: int,
         while_paused,
         mode: str = "retract",
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 4096,
     ):
         with ThreadPoolExecutor(max_workers=num_requests) as executor:
             futures = [
@@ -164,6 +190,11 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(spans[0]["version"], "base-v0")
         self.assertEqual(spans[0]["end"], meta_info["completion_tokens"])
         self.assertEqual(meta_info["weight_version"], "base-v0")
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(len(prefill_spans), 1)
+        self.assertEqual(prefill_spans[0]["version"], "base-v0")
 
     def test_02_update_weight_version_endpoint_applies_to_new_requests(self):
         """The endpoint returns only once every scheduler stamps new requests with the new version."""
@@ -181,6 +212,10 @@ class TestWeightVersionSpans(CustomTestCase):
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(len(spans), 1)
             self.assertEqual(spans[0]["version"], "endpoint-v1")
+            for prefill_span in _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            ):
+                self.assertIn(prefill_span["version"], ("base-v0", "endpoint-v1"))
 
     def test_03_spans_split_across_pause_update_continue(self):
         """Requests spanning pause -> update_weights_from_disk -> continue report one span per version."""
@@ -201,6 +236,11 @@ class TestWeightVersionSpans(CustomTestCase):
             versions = [span["version"] for span in spans]
             self.assertEqual(versions[0], base_version)
             self.assertIn(versions[-1], (base_version, "disk-v2"))
+            prefill_spans = _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            )
+            self.assertEqual(len(prefill_spans), 1)
+            self.assertEqual(prefill_spans[0]["version"], versions[-1])
             if len(spans) > 1:
                 multi_span_count += 1
                 self.assertEqual(versions, [base_version, "disk-v2"])
@@ -235,6 +275,9 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(metadata["weight_version"], self._current_version())
         self.assertEqual(spans[0]["start"], 0)
         self.assertEqual(spans[0]["end"], data["usage"]["completion_tokens"])
+        _assert_prefill_spans_contiguous(
+            self, metadata, prompt_tokens=data["usage"]["prompt_tokens"]
+        )
 
     def test_04b_openai_metadata_reports_the_first_choice_when_n_is_greater_than_one(
         self,
@@ -265,14 +308,7 @@ class TestWeightVersionSpans(CustomTestCase):
     def test_05_aborted_retracted_requests_report_spans(self):
         """Requests aborted while retracted in the waiting queue still report their spans."""
 
-        def abort_all():
-            requests.post(
-                f"{self.base_url}/abort_request",
-                json={"abort_all": True},
-                timeout=30,
-            ).raise_for_status()
-
-        results = self._run_while_paused(num_requests=4, while_paused=abort_all)
+        results = self._run_while_paused(num_requests=4, while_paused=self._abort_all)
 
         aborted_with_spans = 0
         for data in results:
@@ -299,7 +335,6 @@ class TestWeightVersionSpans(CustomTestCase):
             num_requests=4,
             while_paused=lambda: self._set_weight_version("inplace-v3"),
             mode="in_place",
-            max_new_tokens=1024,
         )
         self.assertEqual(self._current_version(), "inplace-v3")
 
@@ -310,6 +345,10 @@ class TestWeightVersionSpans(CustomTestCase):
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
             self.assertEqual(spans[0]["version"], previous_version)
+            for prefill_span in _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            ):
+                self.assertNotEqual(prefill_span["version"], "inplace-v3")
             if len(spans) > 1:
                 split_count += 1
                 self.assertEqual(
@@ -339,9 +378,15 @@ class TestWeightVersionSpans(CustomTestCase):
             self.assertEqual(len(spans), 1)
             self.assertEqual(spans[0]["version"], version)
             self.assertEqual(spans[0]["end"], meta_info["completion_tokens"])
+            prefill_spans = _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            )
+            self.assertEqual(len(prefill_spans), 1)
+            self.assertEqual(prefill_spans[0]["version"], version)
 
     def test_08_reannouncing_current_version_is_a_noop(self):
         """Re-announcing the version the server already has must not split anything."""
+        self._flush_cache()
         version = self._current_version()
 
         results = self._run_while_paused(
@@ -353,9 +398,14 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(self._current_version(), version)
 
         for data in results:
-            spans = _assert_spans_contiguous(self, data["meta_info"])
+            meta_info = data["meta_info"]
+            spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(len(spans), 1)
             self.assertEqual(spans[0]["version"], version)
+            for prefill_span in _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            ):
+                self.assertEqual(prefill_span["version"], version)
 
     def test_09_three_spans_across_two_updates(self):
         """Two updates during one request produce three ordered, non-empty spans."""
@@ -365,7 +415,7 @@ class TestWeightVersionSpans(CustomTestCase):
             futures = [
                 executor.submit(
                     self._generate,
-                    max_new_tokens=2048,
+                    max_new_tokens=4096,
                     prompt=f"Write a long story about the number {i}.",
                 )
                 for i in range(4)
@@ -391,6 +441,10 @@ class TestWeightVersionSpans(CustomTestCase):
             for span in spans:
                 self.assertGreater(span["end"], span["start"])
             self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
+            for prefill_span in _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            ):
+                self.assertNotIn(prefill_span["version"], ("multi-a", "multi-b"))
             if len(spans) == 3:
                 three_span_count += 1
 
@@ -404,16 +458,10 @@ class TestWeightVersionSpans(CustomTestCase):
         """A request aborted before producing a token still reports a well-formed span."""
         version = self._current_version()
 
-        def abort_all():
-            requests.post(
-                f"{self.base_url}/abort_request",
-                json={"abort_all": True},
-                timeout=30,
-            ).raise_for_status()
 
         results = self._run_while_paused(
             num_requests=16,
-            while_paused=abort_all,
+            while_paused=self._abort_all,
         )
 
         empty_aborts = [
@@ -429,6 +477,7 @@ class TestWeightVersionSpans(CustomTestCase):
                 [{"version": version, "start": 0, "end": 0}],
             )
             self.assertEqual(meta_info["weight_version"], version)
+            self.assertNotIn("prefill_weight_versions", meta_info)
 
     def test_11_streaming_reports_spans_only_on_the_final_chunk(self):
         """Intermediate stream chunks carry no spans; the finishing chunk carries them all."""
@@ -462,12 +511,16 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertGreater(len(chunks), 1)
         for chunk in chunks[:-1]:
             self.assertNotIn("weight_versions", chunk["meta_info"])
+            self.assertNotIn("prefill_weight_versions", chunk["meta_info"])
             self.assertEqual(chunk["meta_info"]["weight_version"], version)
 
         meta_info = chunks[-1]["meta_info"]
         spans = _assert_spans_contiguous(self, meta_info)
         self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
         self.assertEqual(spans[-1]["end"], max_new_tokens)
+        _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
 
     def test_12_completions_endpoint_reports_metadata(self):
         """/v1/completions surfaces the spans the same way /v1/chat/completions does."""
@@ -491,6 +544,69 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(spans[0]["version"], metadata["weight_version"])
         self.assertEqual(spans[0]["start"], 0)
         self.assertEqual(spans[0]["end"], data["usage"]["completion_tokens"])
+        _assert_prefill_spans_contiguous(
+            self, metadata, prompt_tokens=data["usage"]["prompt_tokens"]
+        )
+
+    def test_17_reused_prefix_keeps_the_version_that_computed_it(self):
+        """A radix hit on KV computed before a relabel shows up as a stale leading prefill span."""
+        self._flush_cache()
+        self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Name three colors.")
+        version_before = self._current_version()
+
+        self._set_weight_version("reuse-v4")
+        data = self._generate(
+            max_new_tokens=8,
+            prompt=_SHARED_PREFIX + "Name three colors. Then name three shapes.",
+        )
+
+        meta_info = data["meta_info"]
+        self.assertGreater(meta_info["cached_tokens"], 0)
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(
+            [span["version"] for span in prefill_spans], [version_before, "reuse-v4"]
+        )
+        self.assertEqual(prefill_spans[0]["end"], meta_info["cached_tokens"])
+        spans = _assert_spans_contiguous(self, meta_info)
+        self.assertEqual([span["version"] for span in spans], ["reuse-v4"])
+
+    def test_18_flushed_cache_recomputes_the_prefix(self):
+        """After a flush the whole prompt is recomputed under the current version."""
+        self._flush_cache()
+        data = self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Say hello.")
+
+        meta_info = data["meta_info"]
+        self.assertEqual(meta_info["cached_tokens"], 0)
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(len(prefill_spans), 1)
+        self.assertEqual(prefill_spans[0]["version"], self._current_version())
+
+    def test_19_aborted_after_prefill_reports_both_spans(self):
+        """A request aborted mid-decode keeps its prompt spans and reports output spans."""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                self._generate,
+                max_new_tokens=8192,
+                prompt=_SHARED_PREFIX + "Write an even longer story.",
+            )
+            time.sleep(1)
+            self._pause("in_place")
+            try:
+                self._abort_all()
+            finally:
+                self._continue()
+            data = future.result()
+
+        meta_info = data["meta_info"]
+        self.assertEqual(meta_info["finish_reason"]["type"], "abort")
+        self.assertGreater(meta_info["completion_tokens"], 0)
+        spans = _assert_spans_contiguous(self, meta_info)
+        self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
+        _assert_prefill_spans_contiguous(self, meta_info)
 
     def test_13_new_requests_after_the_endpoint_returns_see_the_new_version(self):
         """Once the endpoint returns, every concurrently admitted request stamps the new version."""

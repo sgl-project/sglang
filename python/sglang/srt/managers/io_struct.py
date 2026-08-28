@@ -1464,6 +1464,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     retraction_counts: Optional[List[int]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -1561,6 +1562,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     retraction_counts: Optional[List[int]] = None
 
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+    prefill_weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
@@ -2084,6 +2086,7 @@ class AbortReq(BaseReq, kw_only=True):
     # abort for the parent rid must cover them.
     prefix: bool = False
     weight_versions: Optional[WeightVersionSpans] = None
+    prefill_weight_versions: Optional[WeightVersionSpans] = None
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code

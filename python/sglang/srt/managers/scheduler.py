@@ -283,6 +283,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_discard,
 )
+from sglang.srt.mem_cache.kv_slot_weight_versions import KvSlotWeightVersions
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -663,6 +664,8 @@ class Scheduler(
         self.init_kv_events_publisher()
 
         self.init_load_inquirer()
+
+        self.init_kv_slot_weight_versions()
 
         self.init_output_streamer()
 
@@ -2172,6 +2175,18 @@ class Scheduler(
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
 
+    def init_kv_slot_weight_versions(self) -> None:
+        if not self.server_args.enable_prefill_weight_versions:
+            self.kv_slot_weight_versions = None
+            return
+
+        allocator = self.token_to_kv_pool_allocator
+        self.kv_slot_weight_versions = KvSlotWeightVersions(
+            num_slots=allocator.size_full + allocator.page_size,
+            device=allocator.device,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def init_output_streamer(self) -> None:
         self.output_streamer = SchedulerOutputStreamer(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
@@ -2198,6 +2213,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
+            kv_slot_weight_versions=self.kv_slot_weight_versions,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
             metrics_reporter=self.metrics_reporter,
@@ -3963,6 +3979,12 @@ class Scheduler(
         flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
+        if self.kv_slot_weight_versions is not None and batch.out_cache_loc is not None:
+            self.kv_slot_weight_versions.record(
+                slot_indices=batch.out_cache_loc,
+                version=get_server_args().weight_version,
+            )
+
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -5187,4 +5209,5 @@ def _make_abort_req(
             current_version=get_serving().weight_version,
             num_output_tokens=len(req.output_ids),
         ),
+        prefill_weight_versions=req.prefill_weight_versions,
     )

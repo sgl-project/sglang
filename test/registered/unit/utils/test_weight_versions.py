@@ -24,6 +24,7 @@ class _ReqStub:
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def record_weight_version_change(self, old_version):
         record_weight_version_events([self], old_version=old_version)
