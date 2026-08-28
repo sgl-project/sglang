@@ -1191,14 +1191,21 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         )
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.moe_runner_backend, "flashinfer_trtllm_routed")
-        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "mxfp8")
+        self.assertEqual(
+            resolution_result(server_args, "moe_runner_backend"),
+            "flashinfer_trtllm_routed",
+        )
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "mxfp8"
+        )
 
     def test_auto_resolves_modelopt_fp4_to_nvfp4(self):
         server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="auto")
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "nvfp4")
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
+        )
 
     def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="auto")
@@ -1207,7 +1214,9 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         )
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "nvfp4")
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
+        )
 
     def test_unspecified_preserves_legacy_nvfp4_auto_enable(self):
         server_args = self._make_args(quantization="modelopt_fp4")
@@ -1240,13 +1249,17 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         )
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "nvfp4")
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
+        )
 
     def test_explicit_bf16_overrides_auto(self):
         server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="bf16")
         server_args._handle_a2a_moe()
 
-        self.assertEqual(server_args.flashinfer_a2a_dispatch_type, "bf16")
+        self.assertEqual(
+            resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "bf16"
+        )
 
     def test_legacy_env_maps_to_dispatch_type(self):
         with envs.SGLANG_MOE_NVFP4_DISPATCH.override("1"):

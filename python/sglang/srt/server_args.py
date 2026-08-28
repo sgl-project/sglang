@@ -7551,8 +7551,8 @@ class ServerArgs:
             )
 
     def _handle_flashinfer_a2a_dispatch_type(self):
-        view = resolved_view(self)
-        cli_dispatch_type = self.flashinfer_a2a_dispatch_type
+        cfg = resolving_view(self)
+        cli_dispatch_type = cfg.flashinfer_a2a_dispatch_type
         nvfp4_dispatch_env_is_set = envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
 
         if nvfp4_dispatch_env_is_set:
@@ -7564,11 +7564,11 @@ class ServerArgs:
         dispatch_type = cli_dispatch_type or "auto"
 
         supports_nvfp4_dispatch = (
-            view.quantization == "modelopt_fp4"
+            cfg.quantization == "modelopt_fp4"
             or self.get_model_config().nvfp4_moe_meta is not None
         )
         if dispatch_type == "auto":
-            if view.quantization == "mxfp8":
+            if cfg.quantization == "mxfp8":
                 dispatch_type = "mxfp8"
             elif supports_nvfp4_dispatch:
                 dispatch_type = "nvfp4"
@@ -7576,12 +7576,12 @@ class ServerArgs:
                 dispatch_type = "bf16"
 
         if dispatch_type == "mxfp8":
-            if view.quantization != "mxfp8":
+            if cfg.quantization != "mxfp8":
                 raise ValueError(
                     "--flashinfer-a2a-dispatch-type mxfp8 requires "
                     "--quantization mxfp8."
                 )
-            if view.moe_runner_backend != "flashinfer_trtllm_routed":
+            if cfg.moe_runner_backend != "flashinfer_trtllm_routed":
                 raise ValueError(
                     "--flashinfer-a2a-dispatch-type mxfp8 requires "
                     "--moe-runner-backend flashinfer_trtllm_routed."
@@ -7778,7 +7778,7 @@ class ServerArgs:
             self._declare("_handle_a2a_moe", enforce_shared_experts_fusion=True)
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
-        if a2a_backend != "flashinfer" and self.flashinfer_a2a_dispatch_type not in (
+        if a2a_backend != "flashinfer" and cfg.flashinfer_a2a_dispatch_type not in (
             None,
             "auto",
         ):
@@ -7791,7 +7791,7 @@ class ServerArgs:
             self._validate_flashinfer_megamoe_model()
             self._validate_flashinfer_megamoe_envs()
             assert (
-                self.enable_dp_attention and self.dp_size == self.tp_size
+                cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size
             ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
             if resolved_view(self).moe_runner_backend == "auto":
                 self._declare(
@@ -7807,7 +7807,7 @@ class ServerArgs:
                 )
             logger.info(
                 f"FlashInfer MegaMOE is enabled. The expert parallel size is "
-                f"adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                f"adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
             )
 
         if a2a_backend == "deepep":
@@ -7920,7 +7920,7 @@ class ServerArgs:
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             if cfg.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if self.flashinfer_a2a_dispatch_type is None:
+            if cfg.flashinfer_a2a_dispatch_type is None:
                 if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
                     resolved_view(self).quantization == "modelopt_fp4"
                     or self.get_model_config().nvfp4_moe_meta is not None
