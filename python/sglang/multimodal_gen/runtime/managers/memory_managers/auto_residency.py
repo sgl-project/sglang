@@ -190,8 +190,8 @@ class ResidencyTarget(msgspec.Struct, frozen=True):
     # but is not the semantic owner of this phase.
     present_device_delta_bytes: int = 0
     # Delta for a prefetched component while another component owns the phase.
-    # Component offload suppresses that overlap; resident and layerwise targets
-    # use the same footprint as an ordinary active use.
+    # The ordinary strategies use their active footprint during prefetch, so
+    # None reuses active_device_delta_bytes.
     concurrent_prefetch_device_delta_bytes: int | None = None
     inactive_device_delta_bytes: int = 0
     # None preserves the historical derived target for hand-built callers:
@@ -1865,11 +1865,6 @@ def _unconfigured_layerwise_targets(
                             + active_managed_bytes
                             - full_weight_bytes
                         ),
-                        concurrent_prefetch_device_delta_bytes=(
-                            unmanaged_weight_bytes
-                            + active_managed_bytes
-                            - (full_weight_bytes if current_resident else 0)
-                        ),
                         present_device_delta_bytes=(
                             unmanaged_weight_bytes
                             + active_managed_bytes
@@ -2093,9 +2088,6 @@ def collect_residency_targets(
                         present_device_delta_bytes=(
                             -weight_bytes if current_resident else 0
                         ),
-                        concurrent_prefetch_device_delta_bytes=(
-                            -weight_bytes if current_resident else 0
-                        ),
                         current_placement=not current_resident,
                     ),
                     ResidencyTarget(
@@ -2113,9 +2105,6 @@ def collect_residency_targets(
                             0 if current_resident else weight_bytes
                         ),
                         present_device_delta_bytes=0,
-                        concurrent_prefetch_device_delta_bytes=(
-                            0 if current_resident else weight_bytes
-                        ),
                         current_placement=current_resident,
                         target_device_weight_bytes=weight_bytes,
                     ),
@@ -2218,16 +2207,13 @@ def collect_residency_targets(
                     pinned_host_delta_bytes=-current_pinned_bytes,
                     host_unpin_scratch_bytes=unpin_scratch,
                     device_transition_delta_bytes=(
-                        0 if current_permanent else managed_weight_bytes
+                        -full_weight_bytes if current_permanent else 0
                     ),
                     active_device_delta_bytes=(
                         managed_weight_bytes - current_peak_device_bytes
                     ),
                     present_device_delta_bytes=(
                         managed_weight_bytes - current_peak_device_bytes
-                    ),
-                    concurrent_prefetch_device_delta_bytes=(
-                        -unmanaged_weight_bytes - current_peak_device_bytes
                     ),
                     inactive_device_delta_bytes=-current_inactive_device_bytes,
                     target_device_weight_bytes=0,
@@ -2321,9 +2307,6 @@ def collect_residency_targets(
                             active_device_delta_bytes=(
                                 target_peak_device_bytes - current_peak_device_bytes
                             ),
-                            concurrent_prefetch_device_delta_bytes=(
-                                target_peak_device_bytes - current_peak_device_bytes
-                            ),
                             inactive_device_delta_bytes=(
                                 -current_inactive_device_bytes
                             ),
@@ -2383,7 +2366,7 @@ def collect_residency_targets(
                     host_unpin_scratch_bytes=unpin_scratch,
                     host_pin_scratch_bytes=pin_scratch,
                     device_transition_delta_bytes=(
-                        0 if current_permanent else managed_weight_bytes
+                        0 if current_permanent else full_weight_bytes
                     ),
                     permanent_residency=True,
                     active_device_delta_bytes=(
@@ -2396,9 +2379,6 @@ def collect_residency_targets(
                     ),
                     present_device_delta_bytes=(
                         managed_weight_bytes - current_inactive_device_bytes
-                    ),
-                    concurrent_prefetch_device_delta_bytes=(
-                        managed_weight_bytes - current_peak_device_bytes
                     ),
                     current_placement=(
                         current_permanent and permanent_pins == current_pinned_layers

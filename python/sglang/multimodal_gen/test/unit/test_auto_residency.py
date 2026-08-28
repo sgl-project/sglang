@@ -3056,6 +3056,7 @@ class TestSizeAccounting:
             }
         )
         module = _FakeLayerwiseDit([manager])
+        module.register_parameter("unmanaged", nn.Parameter(torch.zeros(8)))
 
         runtime = component_runtime_weight_bytes({"transformer": module})
 
@@ -3654,6 +3655,9 @@ class TestCollectResidencyTargets:
             resident.device_transition_delta_bytes
             == resident.target_device_weight_bytes
         )
+        assert (
+            resident.concurrent_prefetch_delta() == resident.active_device_delta_bytes
+        )
 
     def test_virtual_layerwise_prefetch_is_runtime_not_transition_memory(self):
         module = _FakeLazyLayerwiseDit(num_layers=3)
@@ -3674,6 +3678,9 @@ class TestCollectResidencyTargets:
         )
         assert streamed.device_transition_delta_bytes == 0
         assert streamed.active_device_delta_bytes < 0
+        assert (
+            streamed.concurrent_prefetch_delta() == streamed.active_device_delta_bytes
+        )
 
     def test_lazy_layerwise_frontier_keeps_buffers_out_of_managed_weights(self):
         module = _FakeLazyLayerwiseDit(num_layers=2)
@@ -3878,8 +3885,17 @@ class TestCollectResidencyTargets:
         resident = next(
             candidate for candidate in candidates if candidate.permanent_residency
         )
+        component = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
         assert (
-            resident.device_transition_delta_bytes == manager.offloaded_weight_bytes()
+            component.concurrent_prefetch_delta() == component.active_device_delta_bytes
+        )
+        assert (
+            resident.device_transition_delta_bytes
+            == resident.target_device_weight_bytes
         )
         module.disable_offload()
         candidates = collect_residency_targets(
@@ -3897,6 +3913,15 @@ class TestCollectResidencyTargets:
         )
         assert (
             streamed.device_transition_delta_bytes == -manager.offloaded_weight_bytes()
+        )
+        component = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
+        assert (
+            component.device_transition_delta_bytes
+            == -resident.target_device_weight_bytes
         )
 
 
