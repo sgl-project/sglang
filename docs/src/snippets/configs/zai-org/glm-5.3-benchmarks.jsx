@@ -144,8 +144,17 @@ export const benchmarks = [
         ttft_ms: 2132, tpot_ms: 6.18, tokens_per_sec_per_gpu: 3979 },
     ],
   },
-  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
-  { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
+  {
+    match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "main @ 26fd7fdaa273",
+    accuracy: { gsm8k_pct: 97.42 },
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
+        ttft_ms: 5828, tpot_ms: 16.69, tokens_per_sec_per_gpu: 6108 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 256 },
+        ttft_ms: 22330, tpot_ms: 39.63, tokens_per_sec_per_gpu: 8537 },
+    ],
+  },
 
   // NVIDIA BF16.
   {
