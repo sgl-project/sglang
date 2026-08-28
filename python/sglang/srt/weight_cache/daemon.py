@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, publish
@@ -148,27 +149,28 @@ class WeightCacheDaemon:
         dist_init_method: Optional[str] = None,
     ):
         self.server_args = server_args
-        self.model_path = server_args.model_path
+        cfg = resolving_view(server_args)
+        self.model_path = cfg.model_path
         self.gpu_id = gpu_id
-        self.tp_size = server_args.tp_size
+        self.tp_size = cfg.tp_size
         self.tp_rank = tp_rank
-        self.pp_size = server_args.pp_size
+        self.pp_size = cfg.pp_size
         self.pp_rank = pp_rank
-        self.dp_size = server_args.dp_size
-        self.ep_size = server_args.ep_size
-        self.moe_dp_size = server_args.moe_dp_size
-        self.enable_dp_attention = server_args.enable_dp_attention
-        self.enable_dp_lm_head = server_args.enable_dp_lm_head
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dense_tp_size = server_args.moe_dense_tp_size
-        self.moe_a2a_backend = server_args.moe_a2a_backend
-        self.deepep_mode = server_args.deepep_mode
-        self.load_format = server_args.load_format
-        self.dtype = server_args.dtype
-        self.quantization = server_args.quantization
-        self.model_loader_extra_config = server_args.model_loader_extra_config
-        self.trust_remote_code = server_args.trust_remote_code
-        self.revision = server_args.revision
+        self.dp_size = cfg.dp_size
+        self.ep_size = cfg.ep_size
+        self.moe_dp_size = cfg.moe_dp_size
+        self.enable_dp_attention = cfg.enable_dp_attention
+        self.enable_dp_lm_head = cfg.enable_dp_lm_head
+        self.attn_cp_size = cfg.attn_cp_size
+        self.moe_dense_tp_size = cfg.moe_dense_tp_size
+        self.moe_a2a_backend = cfg.moe_a2a_backend
+        self.deepep_mode = cfg.deepep_mode
+        self.load_format = cfg.load_format
+        self.dtype = cfg.dtype
+        self.quantization = cfg.quantization
+        self.model_loader_extra_config = cfg.model_loader_extra_config
+        self.trust_remote_code = cfg.trust_remote_code
+        self.revision = cfg.revision
         self.dist_init_method = dist_init_method
 
         self.socket_path = get_socket_path(
@@ -182,6 +184,7 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> transport-specific tensor entry metadata (shape/dtype/is_param + payload metadata)
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        self.preloaded_weights_bytes = 0
         self.transport_backend = None
 
     def _init_distributed(self, server_args, model_config):
@@ -223,7 +226,7 @@ class WeightCacheDaemon:
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend=current_platform.get_torch_distributed_backend_str(),
-                moe_a2a_backend=server_args.moe_a2a_backend,
+                moe_a2a_backend=self.moe_a2a_backend,
             )
 
         initialize_model_parallel(
@@ -281,7 +284,7 @@ class WeightCacheDaemon:
 
         from sglang.srt.layers.moe import initialize_moe_config
 
-        initialize_moe_config(server_args)
+        initialize_moe_config()
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -314,6 +317,7 @@ class WeightCacheDaemon:
         # The initialized groups are the authority for rank identity. This
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
+        self._initialize_eplb_expert_location_metadata(model_config)
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -343,6 +347,9 @@ class WeightCacheDaemon:
             revision=self.revision or "",
             **compute_env_stamp(),
         )
+
+        current_platform.empty_cache()
+        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -374,6 +381,10 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+        current_platform.empty_cache()
+        self.preloaded_weights_bytes = max(
+            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+        )
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -453,6 +464,23 @@ class WeightCacheDaemon:
             f"({non_persistent_count} non-persistent buffers), "
             f"transport={self.transport_backend.name}, "
             f"metadata size ~{total_bytes / 1024 / 1024:.1f} MB"
+        )
+
+    def _initialize_eplb_expert_location_metadata(self, model_config) -> None:
+        """Build the same initial physical expert layout as the engine."""
+        if not self.server_args.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import (
+            compute_initial_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        set_global_expert_location_metadata(
+            compute_initial_expert_location_metadata(
+                model_config=model_config,
+                moe_ep_rank=get_parallel().moe_ep_rank,
+            )
         )
 
     def serve(self):
@@ -562,6 +590,7 @@ class WeightCacheDaemon:
                 # process dies while clients hold IPC mappings, their
                 # param.data (and any CUDA-graph-captured addresses) dangle.
                 pid=os.getpid(),
+                preloaded_weights_bytes=self.preloaded_weights_bytes,
             )
 
         elif req.get("type") == "ping":
@@ -672,23 +701,24 @@ def launch_weight_cache_daemons(
             --nnodes 2 --node-rank 1 \\
             --dist-init-method tcp://node0-ip:29500
     """
+    cfg = resolving_view(server_args)
     import socket as sock_mod
 
     # Replicate _calculate_rank_ranges logic from engine.py
-    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+    pp_size_per_node = max(cfg.pp_size // cfg.nnodes, 1)
+    nnodes_per_pp_rank = max(cfg.nnodes // cfg.pp_size, 1)
     pp_rank_range = range(
-        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+        pp_size_per_node * (cfg.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (cfg.node_rank // nnodes_per_pp_rank + 1),
     )
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_size_per_node = cfg.tp_size // nnodes_per_tp_group
     tp_rank_range = range(
-        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group + 1),
     )
 
-    if server_args.nnodes > 1 and dist_init_method is None:
+    if cfg.nnodes > 1 and dist_init_method is None:
         raise ValueError(
             "dist_init_method is required for multi-node weight cache daemons. "
             "Use --dist-init-method tcp://<node0-ip>:<port> to specify the "
@@ -705,7 +735,7 @@ def launch_weight_cache_daemons(
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
+            global_rank = compute_global_rank(cfg.tp_size, pp_rank, tp_rank)
             cleanup_stale_daemon_files(global_rank, force=force)
 
     procs = []
@@ -716,8 +746,8 @@ def launch_weight_cache_daemons(
                 tp_rank,
                 pp_size_per_node,
                 tp_size_per_node,
-                base_gpu_id=server_args.base_gpu_id,
-                gpu_id_step=server_args.gpu_id_step,
+                base_gpu_id=cfg.base_gpu_id,
+                gpu_id_step=cfg.gpu_id_step,
             )
             proc = spawn_weight_cache_daemon(
                 server_args,
@@ -738,7 +768,7 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
+            global_rank = compute_global_rank(cfg.tp_size, pp_rank, tp_rank)
             ready_path = get_ready_path(global_rank)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
@@ -772,7 +802,7 @@ def launch_weight_cache_daemons(
             )
 
     logger.info(
-        f"All {num_daemons} weight cache daemons on node {server_args.node_rank} are ready "
+        f"All {num_daemons} weight cache daemons on node {cfg.node_rank} are ready "
         f"(pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
         f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
         f"dist_init_method={dist_init_method})"
