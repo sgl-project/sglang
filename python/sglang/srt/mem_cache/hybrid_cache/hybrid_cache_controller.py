@@ -148,8 +148,10 @@ class HybridCacheController(BaseHiCacheController):
             )
 
     def _start_storage_threads(self):
-        super()._start_storage_threads()
+        # Rebuild the release queues before the base class starts the threads, so a
+        # worker can never observe the dict mid-rebuild.
         self._init_extra_host_mem_release_queues()
+        super()._start_storage_threads()
 
     def attach_storage_backend(
         self,
@@ -298,14 +300,6 @@ class HybridCacheController(BaseHiCacheController):
             self._append_host_mem_release_pages(
                 release_queue, transfer.host_indices, entry.host_pool.page_size
             )
-
-    def reset(self):
-        super().reset()
-        if self.enable_storage:
-            self.host_mem_release_queue.queue.clear()
-            for release_queue in self.extra_host_mem_release_queues.values():
-                release_queue.queue.clear()
-            self.prefetch_tokens_occupied = 0
 
     def write(
         self,

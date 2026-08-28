@@ -300,6 +300,15 @@ class HiCacheController:
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
 
+        # Storage threads and the queues wiring them together are created as one
+        # unit in _start_storage_threads(); None means storage was never attached.
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_io_aux_thread: Optional[threading.Thread] = None
+        self.backup_thread: Optional[threading.Thread] = None
+        self.prefetch_queue: Optional[Queue] = None
+        self.prefetch_buffer: Optional[Queue] = None
+        self.backup_queue: Optional[Queue] = None
+
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
@@ -387,21 +396,40 @@ class HiCacheController:
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
 
-        self.prefetch_thread = threading.Thread(
-            target=self.prefetch_thread_func, daemon=True
-        )
-        self.backup_thread = threading.Thread(
-            target=self.backup_thread_func, daemon=True
-        )
         self.prefetch_queue = Queue()
+        self.prefetch_buffer = Queue()
         self.backup_queue = Queue()
 
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
-        self.prefetch_thread.start()
-        self.backup_thread.start()
+        # prefetch_thread and prefetch_io_aux_thread are siblings wired together by
+        # prefetch_buffer: the former resolves how many pages are available, the
+        # latter transfers them into the host pool. Both are created here so that a
+        # single place owns every start, join and rebind of storage threads.
+        self.prefetch_thread = threading.Thread(
+            target=self.prefetch_thread_func, daemon=True, name="hicache-prefetch"
+        )
+        self.prefetch_io_aux_thread = threading.Thread(
+            target=self.prefetch_io_aux_func, daemon=True, name="hicache-prefetch-io"
+        )
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True, name="hicache-backup"
+        )
+        for thread in self._storage_threads():
+            thread.start()
+
+    def _storage_threads(self) -> List[threading.Thread]:
+        return [
+            thread
+            for thread in (
+                self.prefetch_thread,
+                self.prefetch_io_aux_thread,
+                self.backup_thread,
+            )
+            if thread is not None
+        ]
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -416,36 +444,26 @@ class HiCacheController:
         self.storage_stop_event.set()
 
         # Best-effort wakeups so threads exit promptly even if blocked on queues.
-        try:
-            if hasattr(self, "prefetch_queue"):
-                self.prefetch_queue.put_nowait(None)
-            if hasattr(self, "backup_queue"):
-                self.backup_queue.put_nowait(None)
-            if hasattr(self, "prefetch_buffer"):
-                self.prefetch_buffer.put_nowait(None)
-        except Exception:
-            pass
+        for queue in (self.prefetch_queue, self.prefetch_buffer, self.backup_queue):
+            if queue is not None:
+                try:
+                    queue.put_nowait(None)
+                except Exception:
+                    pass
 
         # Best-effort joins (threads are daemon, but join keeps state clean).
-        threads = []
-        if hasattr(self, "prefetch_thread"):
-            threads.append(self.prefetch_thread)
-        if hasattr(self, "backup_thread"):
-            threads.append(self.backup_thread)
-        if hasattr(self, "prefetch_io_aux_thread"):
-            threads.append(self.prefetch_io_aux_thread)
-
+        threads = self._storage_threads()
         for t in threads:
             try:
                 t.join(timeout=10)
             except Exception:
                 pass
 
-        alive = [t for t in threads if getattr(t, "is_alive", lambda: False)()]
+        alive = [t for t in threads if t.is_alive()]
         if alive:
             logger.error(
                 "Failed to stop HiCache storage threads cleanly: %s",
-                [getattr(t, "name", repr(t)) for t in alive],
+                [t.name for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
@@ -662,33 +680,22 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.storage_stop_event.set()
-
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
-        if self.enable_storage:
-            self.prefetch_thread.join()
-            self.backup_thread.join()
-            self.prefetch_queue.queue.clear()
-            self.backup_queue.queue.clear()
-            self.prefetch_hit_queue.queue.clear()
-            self.ack_backup_queue.queue.clear()
-            self.host_mem_release_queue.queue.clear()
-            self.prefetch_tokens_occupied = 0
 
+        if not self.enable_storage:
+            return
+
+        # Delegate to the same start/stop pair attach and detach use, so storage
+        # threads and queues are always created by one owner. Restarting through
+        # _start_storage_threads() also rebuilds the queues, which drops operations
+        # left over from before the reset.
+        self._stop_storage_threads()
+        self.prefetch_tokens_occupied = 0
         self.storage_stop_event.clear()
-
-        if self.enable_storage:
-            self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
-            )
-            self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
-            )
-            self.prefetch_thread.start()
-            self.backup_thread.start()
+        self._start_storage_threads()
 
     def write(
         self,
@@ -1036,15 +1043,23 @@ class HiCacheController:
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
-                )
             except Empty:
                 continue
+            if operation is None:
+                continue
+            try:
+                self._page_transfer(operation)
+            except Exception:
+                # A failed transfer must not take this thread down, otherwise every
+                # later prefetch operation can only end in a timeout.
+                logger.exception(
+                    f"Prefetch operation {operation.request_id} failed during IO transfer."
+                )
+                operation.mark_terminate()
+            # Release whatever the transfer did not fill, success or not.
+            self.append_host_mem_release(
+                operation.host_indices[operation.completed_tokens :]
+            )
 
     def prefetch_rate_limited(self) -> bool:
         """
@@ -1083,12 +1098,11 @@ class HiCacheController:
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
+
+        Hit-length resolution and the cross-rank all-reduce stay on this thread so
+        that collective ordering is identical across ranks; the storage->host
+        transfer runs on prefetch_io_aux_thread, reached through prefetch_buffer.
         """
-        self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
