@@ -14,29 +14,6 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 
 <Tabs>
 
-<Tab title="Python (pip / uv)">
-
-```bash Command
-pip install -U uv
-uv venv --python 3.12 && source .venv/bin/activate
-
-# Install from source — Hy4-Preview support (the HYV4 model code + the
-# suffix-aware `hunyuan` parsers) lives on the `hy4-dev` branch. Once a
-# tagged release picks it up, `uv pip install --prerelease=allow sglang`
-# is enough.
-git clone -b hy4-dev https://github.com/JustinTong0323/sglang-hy4-dev.git
-cd sglang-hy4-dev
-uv pip install --prerelease=allow -e python
-```
-
-<Note>
-On a fresh box, the dependency set can resolve CUDA 13.3 components that break the DeepGEMM JIT (`ptxas: Unsupported .version 9.3`). Pin exactly: `nvidia-cuda-nvcc==13.0.88 nvidia-cuda-crt==13.0.88 nvidia-nvvm==13.0.88 nvidia-cuda-cccl==13.0.85 sgl-deep-gemm==0.1.5.post3` (note `cicc` ships in `nvidia-nvvm`, not `nvidia-cuda-nvcc`), and symlink `libcublasLt.so` / `libcudart.so` / `libcublas.so` to their `.so.13` files under `$CUDA_HOME/lib` or the FlashInfer JIT link fails.
-</Note>
-
-Then run the **Python** output of the command panel below in that environment.
-
-</Tab>
-
 <Tab title="Docker">
 
 ```bash Command
