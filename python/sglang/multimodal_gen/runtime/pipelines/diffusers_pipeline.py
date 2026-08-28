@@ -371,6 +371,12 @@ class DiffusersPipeline(ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
         executor: PipelineExecutor | None = None,
     ):
+        if server_args.component_precisions:
+            raise ValueError(
+                "--component-precisions requires the native SGLang backend; "
+                "a whole Diffusers pipeline cannot guarantee per-component "
+                "load and autocast precision"
+            )
         self.server_args = server_args
         self.model_path = model_path
         self._stages: list[PipelineStage] = []

@@ -186,6 +186,22 @@ def test_single_component_stage_is_prepared_at_stage_entry():
     strategy.wait_for_use.assert_called_once_with(module, use, manager.state)
 
 
+def test_exact_precision_fills_missing_target_but_preserves_stage_override():
+    module = torch.nn.Linear(2, 2)
+    stage = _Stage(ComponentUse("stage", "text_encoder"))
+    manager, server_args = _manager_for_stage(stage, {"text_encoder": module})
+    server_args.component_precisions = {"text_encoder": "bf16"}
+    manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
+
+    assert manager._ordered_uses[0].target_dtype == torch.bfloat16
+
+    decode_stage = _Stage(
+        ComponentUse("decode", "text_encoder", target_dtype=torch.float32)
+    )
+    manager.begin_request([decode_stage], SimpleNamespace(is_warmup=False), server_args)
+    assert manager._ordered_uses[0].target_dtype == torch.float32
+
+
 def test_explicit_component_use_is_prepared_only_at_call_site():
     module = torch.nn.Linear(2, 2)
     use = ComponentUse("stage", "text_encoder", start_at_stage_entry=False)
@@ -252,15 +268,18 @@ def test_qwen_layered_uses_loaded_text_encoder(monkeypatch):
         qwen_image, "QwenImageLayeredBeforeDenoisingStage", create_stage
     )
     server_args = SimpleNamespace(
+        component_precisions={"text_encoder": "fp32", "vae": "fp16"},
         pipeline_config=SimpleNamespace(
             vae_precision="bf16",
             text_encoder_precisions=("bf16",),
-        )
+        ),
     )
 
     pipeline.create_pipeline_stages(server_args)
 
     assert stage_kwargs["text_encoder"] is text_encoder
+    assert stage_kwargs["text_encoder_dtype"] == torch.float32
+    assert stage_kwargs["vae_dtype"] == torch.float16
 
 
 def test_single_component_stage_is_finished_at_stage_exit():

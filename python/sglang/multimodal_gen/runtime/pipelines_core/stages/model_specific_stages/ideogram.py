@@ -39,7 +39,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_decode_precision
 
 SEQUENCE_PADDING_INDICATOR = -1
 OUTPUT_IMAGE_INDICATOR = 2
@@ -508,9 +508,7 @@ class Ideogram4DecodingStage(PipelineStage):
             ComponentUse(
                 self._component_stage_name(stage_name),
                 "vae",
-                target_dtype=PRECISION_TO_TYPE[
-                    server_args.pipeline_config.vae_precision
-                ],
+                target_dtype=resolve_decode_precision(server_args),
                 keep_ready_after_warmup=True,
             )
         ]
@@ -531,7 +529,7 @@ class Ideogram4DecodingStage(PipelineStage):
         z = z.view(batch_size, grid_h, grid_w, patch, patch, ae_channels)
         z = z.permute(0, 5, 1, 3, 2, 4).contiguous()
         z = z.view(batch_size, ae_channels, grid_h * patch, grid_w * patch)
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_decode_precision(server_args)
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             z = z.to(vae_dtype)
             decoded = vae.decode(z)

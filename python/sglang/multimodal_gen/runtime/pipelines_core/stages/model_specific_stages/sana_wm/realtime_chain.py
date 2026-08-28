@@ -36,7 +36,9 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_decode_precision,
+)
 
 from . import parity_probe
 from .base import (
@@ -44,6 +46,7 @@ from .base import (
     _SANA_WM_DEFAULT_TRANSLATION_SPEED,
     SanaWMBeforeDenoisingStage,
     configure_sana_wm_ltx2_vae_for_long_video,
+    resolve_sana_wm_dit_dtype,
     snap_sana_wm_num_frames,
 )
 from .realtime_stage import (
@@ -138,11 +141,8 @@ class SanaWMCondFrameEncodeStage(SanaWMRealtimeStage):
         session = self.require_session(batch, context="SANA-WM realtime chain")
         self._pipeline_config = server_args.pipeline_config
         device = get_local_torch_device()
-        weight_dtype = PRECISION_TO_TYPE.get(
-            getattr(server_args.pipeline_config, "dit_precision", "bf16"),
-            torch.bfloat16,
-        )
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        weight_dtype = resolve_sana_wm_dit_dtype(server_args)
+        vae_dtype = resolve_decode_precision(server_args)
 
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)
@@ -213,10 +213,7 @@ class SanaWMRealtimeLatentPrepStage(SanaWMRealtimeStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        weight_dtype = PRECISION_TO_TYPE.get(
-            getattr(server_args.pipeline_config, "dit_precision", "bf16"),
-            torch.bfloat16,
-        )
+        weight_dtype = resolve_sana_wm_dit_dtype(server_args)
         session = self.require_session(batch, context="SANA-WM realtime chain")
         inputs = session.get_or_create_state(SanaWMSessionInputsState)
         noise = session.get_or_create_state(SanaWMNoiseState)
@@ -331,10 +328,7 @@ class SanaWMCameraCondStage(SanaWMRealtimeStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        weight_dtype = PRECISION_TO_TYPE.get(
-            getattr(server_args.pipeline_config, "dit_precision", "bf16"),
-            torch.bfloat16,
-        )
+        weight_dtype = resolve_sana_wm_dit_dtype(server_args)
         session = self.require_session(batch, context="SANA-WM realtime chain")
         inputs = session.get_or_create_state(SanaWMSessionInputsState)
         cache = get_realtime_causal_dit_state(session)
@@ -538,7 +532,7 @@ class SanaWMCausalDecodeChainStage(SanaWMRealtimeStage):
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         device = get_local_torch_device()
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_decode_precision(server_args)
 
         self.vae = self.vae.to(device=device, dtype=vae_dtype).eval()
         configure_sana_wm_ltx2_vae_for_long_video(self.vae, server_args.pipeline_config)

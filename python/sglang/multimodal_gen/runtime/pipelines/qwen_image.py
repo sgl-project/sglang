@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):
@@ -112,10 +112,10 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                vae_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
-                text_encoder_dtype=PRECISION_TO_TYPE[
-                    server_args.pipeline_config.text_encoder_precisions[0]
-                ],
+                vae_dtype=resolve_component_precision(server_args, "vae"),
+                text_encoder_dtype=resolve_component_precision(
+                    server_args, "text_encoder"
+                ),
             )
             return stage
 

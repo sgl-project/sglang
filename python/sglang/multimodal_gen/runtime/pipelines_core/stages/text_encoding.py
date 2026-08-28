@@ -41,6 +41,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    explicit_component_autocast_context,
+    resolve_component_precision,
+)
 
 logger = init_logger(__name__)
 
@@ -707,16 +711,22 @@ class TextEncodingStage(ConditionEncodingStage):
             dp_group = self._text_encode_dp_group(
                 server_args, encoder_config, input_ids.shape[0], text_encoder
             )
-            if dp_group is not None:
-                outputs = _data_parallel_text_encode(
-                    lambda kw: self._forward_text_encoder(text_encoder, kw),
-                    encoder_forward_kwargs,
-                    dp_group,
-                )
-            else:
-                outputs = self._forward_text_encoder(
-                    text_encoder, encoder_forward_kwargs
-                )
+            component_name = "text_encoder" if i == 0 else f"text_encoder_{i + 1}"
+            encoder_dtype = resolve_component_precision(server_args, component_name)
+            assert encoder_dtype is not None
+            with explicit_component_autocast_context(
+                server_args, component_name, encoder_dtype
+            ):
+                if dp_group is not None:
+                    outputs = _data_parallel_text_encode(
+                        lambda kw: self._forward_text_encoder(text_encoder, kw),
+                        encoder_forward_kwargs,
+                        dp_group,
+                    )
+                else:
+                    outputs = self._forward_text_encoder(
+                        text_encoder, encoder_forward_kwargs
+                    )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}

@@ -96,6 +96,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
@@ -764,9 +765,8 @@ class TextEncoderLoader(ComponentLoader):
             server_args.encoder_parallel,
             prefer_dp=prefer_dp,
         )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
-            encoder_index
-        ]
+        encoder_dtype = resolve_component_precision(server_args, component_name)
+        assert encoder_dtype is not None
         # TODO(will): add support for other dtypes
         try:
             return self.load_model(
@@ -813,13 +813,15 @@ class TextEncoderLoader(ComponentLoader):
         model_path: str,
         model_config: EncoderConfig,
         server_args: ServerArgs,
-        dtype: str = "fp16",
+        dtype: str | torch.dtype = "fp16",
         component_starts_on_cpu: bool | None = None,
         component_name: str = "text_encoder",
     ):
         local_torch_device = get_local_torch_device()
         quant_config = model_config.quant_config
-        param_dtype = PRECISION_TO_TYPE[dtype]
+        param_dtype = (
+            dtype if isinstance(dtype, torch.dtype) else PRECISION_TO_TYPE[dtype]
+        )
         if quant_config is not None:
             if param_dtype not in quant_config.get_supported_act_dtypes():
                 raise ValueError(
@@ -877,7 +879,7 @@ class TextEncoderLoader(ComponentLoader):
 
         encoder_tp_group = get_folding_tp_group(model_config)
         with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
-            PRECISION_TO_TYPE[dtype]
+            param_dtype
         ):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])

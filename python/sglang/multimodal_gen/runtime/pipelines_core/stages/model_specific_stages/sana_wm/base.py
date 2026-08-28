@@ -47,9 +47,21 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_precision,
+)
 
 logger = init_logger(__name__)
+
+
+def resolve_sana_wm_dit_dtype(
+    server_args: ServerArgs, component_name: str = "transformer"
+) -> torch.dtype:
+    return resolve_precision(
+        server_args, component_name, precision_attr="dit_precision"
+    )
+
 
 SANA_WM_TARGET_HEIGHT = 704
 SANA_WM_TARGET_WIDTH = 1280
@@ -831,10 +843,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             )
 
         device = get_local_torch_device()
-        target_dtype = PRECISION_TO_TYPE.get(
-            getattr(server_args.pipeline_config, "dit_precision", "bf16"),
-            torch.bfloat16,
-        )
+        target_dtype = resolve_sana_wm_dit_dtype(server_args)
         scheduler = getattr(
             batch, "scheduler", None
         ) or get_or_create_request_scheduler(batch, self.scheduler)
@@ -1080,8 +1089,9 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         if self.vae is None:
             return []
         stage_name = self._component_stage_name(stage_name)
-        pipeline_config = getattr(server_args, "pipeline_config", self.pipeline_config)
-        vae_dtype = PRECISION_TO_TYPE[pipeline_config.vae_precision]
+        vae_dtype = resolve_precision(
+            server_args, "vae", precision_attr="vae_precision"
+        )
         return [
             ComponentUse(
                 stage_name=stage_name,
@@ -1100,9 +1110,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         """Encode a single image frame through the VAE encoder."""
         vae = self.vae
         configure_sana_wm_ltx2_vae_for_long_video(vae, self.pipeline_config)
-        vae_dtype = PRECISION_TO_TYPE.get(
-            self.pipeline_config.vae_precision, torch.bfloat16
-        )
+        vae_dtype = dtype
 
         # Normalize image to [-1, 1] range expected by the VAE
         if image.max() > 1.01:
@@ -2200,10 +2208,8 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         Expects batch to already have prompt_embeds set by SanaWMTextEncodingStage.
         """
         device = get_local_torch_device()
-        dtype = PRECISION_TO_TYPE.get(
-            getattr(self.pipeline_config, "dit_precision", "bf16"),
-            torch.bfloat16,
-        )
+        dtype = resolve_sana_wm_dit_dtype(server_args)
+        vae_dtype = resolve_component_precision(server_args, "vae") or dtype
         if not hasattr(batch, "extra") or batch.extra is None:
             batch.extra = {}
 
@@ -2255,7 +2261,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         if condition_image is not None:
             try:
                 latents = self._splice_first_frame(
-                    latents, condition_image, dtype, device, batch=batch
+                    latents, condition_image, vae_dtype, device, batch=batch
                 )
                 self.log_info("First-frame spliced into noise latents.")
             except Exception as e:

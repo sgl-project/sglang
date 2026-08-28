@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_exact_component_precision,
+)
 
 logger = init_logger(__name__)
 
@@ -168,9 +171,12 @@ class PELoader(ComponentLoader):
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+        model_dtype = resolve_exact_component_precision(server_args, component_name)
+        if model_dtype is None:
+            model_dtype = torch.bfloat16
         model = Ministral3ForCausalLM.from_pretrained(
             component_model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             trust_remote_code=server_args.trust_remote_code,
         )
 

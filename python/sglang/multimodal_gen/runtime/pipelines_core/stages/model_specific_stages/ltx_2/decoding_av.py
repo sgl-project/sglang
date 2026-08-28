@@ -45,13 +45,16 @@ class LTX2AVDecodingStage(DecodingStage):
         audio_vae_dtype = resolve_precision(
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
+        diffusion_decoder_dtype = resolve_decode_precision(
+            server_args, "diffusion_decoder"
+        )
         uses = [ComponentUse(stage_name, "vae", target_dtype=vae_dtype)]
         if self.diffusion_decoder is not None:
             uses.append(
                 ComponentUse(
                     stage_name,
                     "diffusion_decoder",
-                    target_dtype=vae_dtype,
+                    target_dtype=diffusion_decoder_dtype,
                     allow_prefetch=False,
                 )
             )
@@ -110,13 +113,19 @@ class LTX2AVDecodingStage(DecodingStage):
                 assert decoder is not None
                 decoder.eval()
                 latents = self._prepare_video_latents(batch, decoder, server_args)
+                diffusion_decoder_dtype = resolve_decode_precision(
+                    server_args, "diffusion_decoder"
+                )
+                diffusion_decoder_autocast_enabled = autocast_enabled(
+                    diffusion_decoder_dtype, server_args.disable_autocast
+                )
                 with autocast_context(
-                    dtype=vae_dtype,
+                    dtype=diffusion_decoder_dtype,
                     disable_autocast=server_args.disable_autocast,
-                    enabled=vae_autocast_enabled,
+                    enabled=diffusion_decoder_autocast_enabled,
                 ):
-                    if not vae_autocast_enabled:
-                        latents = latents.to(vae_dtype)
+                    if not diffusion_decoder_autocast_enabled:
+                        latents = latents.to(diffusion_decoder_dtype)
                     decode_output = self._decode_with_diffusion_decoder(
                         decoder, latents, batch, server_args
                     )

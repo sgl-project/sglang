@@ -29,8 +29,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -488,8 +488,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             if hasattr(batch, "latents") and batch.latents is not None
             else torch.device("cuda")
         )
-        target_dtype = PRECISION_TO_TYPE.get(
-            server_args.pipeline_config.precision, torch.bfloat16
+        target_dtype = resolve_precision(
+            server_args, "transformer", precision_attr="precision"
         )
 
         # Get config params

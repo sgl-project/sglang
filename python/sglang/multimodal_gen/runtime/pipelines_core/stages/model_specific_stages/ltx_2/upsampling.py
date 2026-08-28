@@ -8,6 +8,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_exact_component_precision,
+)
 
 logger = init_logger(__name__)
 
@@ -75,24 +78,40 @@ class LTX2UpsampleStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        return [ComponentUse(stage_name, "spatial_upsampler")]
+        upsampler_dtype = (
+            resolve_exact_component_precision(server_args, "spatial_upsampler")
+            or torch.bfloat16
+        )
+        return [
+            ComponentUse(
+                stage_name,
+                "spatial_upsampler",
+                target_dtype=upsampler_dtype,
+            )
+        ]
 
     def _upsample_video_latents(
         self, latents: torch.Tensor, server_args: ServerArgs, device: torch.device
     ) -> torch.Tensor:
+        output_dtype = latents.dtype
+        upsampler_dtype = (
+            resolve_exact_component_precision(server_args, "spatial_upsampler")
+            or torch.bfloat16
+        )
         vae_mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(
-            device=device, dtype=latents.dtype
+            device=device, dtype=output_dtype
         )
         vae_std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(
-            device=device, dtype=latents.dtype
+            device=device, dtype=output_dtype
         )
         latents = latents * vae_std + vae_mean
         with self.use_declared_component(
             component_name="spatial_upsampler",
             module=self.spatial_upsampler,
-            target_dtype=latents.dtype,
         ) as spatial_upsampler:
-            latents = spatial_upsampler(latents)
+            latents = spatial_upsampler(latents.to(dtype=upsampler_dtype)).to(
+                dtype=output_dtype
+            )
         latents = (latents - vae_mean) / vae_std
         return latents
 

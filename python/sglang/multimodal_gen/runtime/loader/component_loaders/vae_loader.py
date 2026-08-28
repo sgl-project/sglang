@@ -339,16 +339,18 @@ class VAELoader(ComponentLoader):
 
         if component_name in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
-            pipeline_vae_precision = "vae_precision"
+            legacy_vae_precision = server_args.pipeline_config.vae_precision
         elif component_name in ("audio_vae",):
             pipeline_vae_config_attr = "audio_vae_config"
-            pipeline_vae_precision = "audio_vae_precision"
+            legacy_vae_precision = server_args.pipeline_config.audio_vae_precision
         else:
             raise ValueError(
                 f"Unsupported module name for VAE loader: {component_name}"
             )
         vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
-        vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
+        vae_precision = server_args.component_precisions.get(
+            component_name, legacy_vae_precision
+        )
         resolved_vae_dtype = resolve_component_precision(server_args, component_name)
         vae_dtype = (
             resolved_vae_dtype

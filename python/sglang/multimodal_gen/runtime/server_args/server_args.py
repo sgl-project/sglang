@@ -306,6 +306,8 @@ class ServerArgs(DisaggServerArgsMixin):
     component_paths: dict[str, str] = field(default_factory=dict)
     # Exact weight-file overrides retain the base component configuration.
     component_weights_paths: dict[str, str] = field(default_factory=dict)
+    # Exact component precision overrides. Family precision flags remain the fallback.
+    component_precisions: dict[str, str] = field(default_factory=dict)
     # Explicit quantization override for one component. Self-describing
     # checkpoints remain auto-detected and do not need this override.
     component_quantizations: dict[str, str] = field(default_factory=dict)
@@ -1751,6 +1753,28 @@ class ServerArgs(DisaggServerArgsMixin):
             component_weights_paths[component] = path
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
+        normalized_precisions: dict[str, str] = {}
+        for component, precision in self.component_precisions.items():
+            component = str(component).strip().replace("-", "_").lower()
+            precision = str(precision).strip().lower()
+            if not component or precision not in {"fp16", "bf16", "fp32"}:
+                raise ValueError(
+                    "Component precision entries require an exact component key "
+                    "and one of fp16, bf16, or fp32"
+                )
+            previous = normalized_precisions.get(component)
+            if previous is not None and previous != precision:
+                raise ValueError(
+                    f"Conflicting precision overrides for {component!r}: "
+                    f"{previous!r} and {precision!r}"
+                )
+            normalized_precisions[component] = precision
+        self.component_precisions = normalized_precisions
+        if self.backend == Backend.DIFFUSERS and self.component_precisions:
+            raise ValueError(
+                "The whole-pipeline Diffusers backend does not support component "
+                "precision overrides."
+            )
         normalized_quantizations: dict[str, str] = {}
         for component, quantization in self.component_quantizations.items():
             component = str(component).strip().replace("-", "_")
@@ -2845,7 +2869,7 @@ class ServerArgs(DisaggServerArgsMixin):
         unknown_args: list[str],
         *,
         option_prefixes: tuple[str, ...],
-        alias_suffix: str,
+        alias_suffix: str | None = None,
     ) -> tuple[dict[str, str], list[str]]:
         component_values: dict[str, str] = {}
         remaining: list[str] = []
@@ -2860,6 +2884,7 @@ class ServerArgs(DisaggServerArgsMixin):
                     break
             if (
                 component is None
+                and alias_suffix is not None
                 and key_part.startswith("--")
                 and key_part.endswith(alias_suffix)
             ):
@@ -2926,6 +2951,20 @@ class ServerArgs(DisaggServerArgsMixin):
                 "--component_quantizations.",
             ),
             alias_suffix="-quantization",
+        )
+
+    @classmethod
+    def _extract_component_precisions(
+        cls,
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        """Extract exact per-component precision overrides."""
+        return cls._extract_dynamic_component_map(
+            unknown_args,
+            option_prefixes=(
+                "--component-precisions.",
+                "--component_precisions.",
+            ),
         )
 
     @staticmethod
@@ -3018,6 +3057,7 @@ class ServerArgs(DisaggServerArgsMixin):
         dynamic_quantizations, remaining = cls._extract_component_quantizations(
             unknown_args
         )
+        dynamic_precisions, remaining = cls._extract_component_precisions(remaining)
         dynamic_ignored_layers, remaining = (
             cls._extract_component_quantization_ignored_layers(remaining)
         )
@@ -3061,6 +3101,16 @@ class ServerArgs(DisaggServerArgsMixin):
             existing.update(dynamic_quantizations)
             provided_args["component_quantizations"] = existing
             explicit_arg_names.add("component_quantizations")
+        if dynamic_precisions:
+            existing = {
+                str(component).strip().replace("-", "_").lower(): precision
+                for component, precision in dict(
+                    provided_args.get("component_precisions") or {}
+                ).items()
+            }
+            existing.update(dynamic_precisions)
+            provided_args["component_precisions"] = existing
+            explicit_arg_names.add("component_precisions")
         if dynamic_ignored_layers:
             existing = dict(
                 provided_args.get("component_quantization_ignored_layers") or {}

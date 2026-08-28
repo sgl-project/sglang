@@ -62,7 +62,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_exact_component_precision,
+    resolve_precision,
+)
 
 logger = init_logger(__name__)
 
@@ -408,7 +412,6 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         server_args: ServerArgs,
         config: Hunyuan3D2PipelineConfig,
     ) -> dict[str, Any]:
-        dtype = PRECISION_TO_TYPE[config.dit_precision]
         components: dict[str, Any] = {}
 
         paint_dir = cls._resolve_model_subfolder(
@@ -422,12 +425,12 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         )
         components["paint_vae"] = cls._load_stable_diffusion_vae(
             os.path.join(paint_dir, "vae"),
-            dtype,
+            resolve_precision(server_args, "paint_vae", precision_attr="dit_precision"),
             cls._component_device(server_args, "paint_vae"),
         )
         components["paint_transformer"] = cls._load_stable_diffusion_unet(
             os.path.join(paint_dir, "unet"),
-            dtype,
+            resolve_component_precision(server_args, "paint_transformer"),
             cls._component_device(server_args, "paint_transformer"),
             paint=True,
             is_turbo=config.paint_turbo_mode,
@@ -460,12 +463,14 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             )
             components["delight_vae"] = cls._load_stable_diffusion_vae(
                 os.path.join(delight_dir, "vae"),
-                dtype,
+                resolve_precision(
+                    server_args, "delight_vae", precision_attr="dit_precision"
+                ),
                 cls._component_device(server_args, "delight_vae"),
             )
             components["delight_transformer"] = cls._load_stable_diffusion_unet(
                 os.path.join(delight_dir, "unet"),
-                dtype,
+                resolve_component_precision(server_args, "delight_transformer"),
                 cls._component_device(server_args, "delight_transformer"),
                 paint=False,
             )
@@ -535,7 +540,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 if server_args.should_start_component_on_cpu("hy3dshape_model")
                 else device
             ),
-            dtype,
+            resolve_exact_component_precision(server_args, "hy3dshape_model") or dtype,
         )
 
         components["hy3dshape_vae"] = self._load_simple_component(
@@ -546,7 +551,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 if server_args.should_start_component_on_cpu("hy3dshape_vae")
                 else device
             ),
-            dtype,
+            resolve_exact_component_precision(server_args, "hy3dshape_vae") or dtype,
         )
 
         components["hy3dshape_conditioner"] = self._load_simple_component(
@@ -557,7 +562,8 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 if server_args.should_start_component_on_cpu("hy3dshape_conditioner")
                 else device
             ),
-            dtype,
+            resolve_exact_component_precision(server_args, "hy3dshape_conditioner")
+            or dtype,
         )
 
         components["hy3dshape_scheduler"] = self._instantiate_component(

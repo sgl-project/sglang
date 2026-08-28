@@ -37,11 +37,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 from .base import (
     SanaWMDecodingStage,
     log_sana_wm_tensor_stats,
+    resolve_sana_wm_dit_dtype,
     sana_wm_diagnostics_enabled,
 )
 
@@ -129,8 +129,7 @@ def sana_wm_skip_refiner_enabled(batch: Req | None = None) -> bool:
 
 
 def default_sana_wm_refiner_dtype(server_args: ServerArgs) -> torch.dtype:
-    precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
-    return PRECISION_TO_TYPE.get(precision, torch.bfloat16)
+    return resolve_sana_wm_dit_dtype(server_args, "transformer_2")
 
 
 def _is_current_cfg_main_rank() -> bool:

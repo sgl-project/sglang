@@ -42,6 +42,8 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     autocast_context,
     autocast_enabled,
+    explicit_component_autocast_context,
+    resolve_component_precision,
     resolve_precision,
     temporary_module_dtype,
 )
@@ -150,16 +152,27 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
+    def _component_name(self, module, default_name: str) -> str:
+        manager = self._component_residency_manager
+        if manager is None or module is None:
+            return default_name
+        for name, candidate in manager.pipeline.modules.items():
+            if candidate is module:
+                return name
+        return default_name
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        uses = []
-        if self.image_encoder is not None:
-            uses.append(ComponentUse(stage_name, "image_encoder"))
-        if self.text_encoder is not None:
-            uses.append(ComponentUse(stage_name, "text_encoder"))
-        return uses
+        return [
+            ComponentUse(stage_name, self._component_name(module, name))
+            for module, name in (
+                (self.image_encoder, "image_encoder"),
+                (self.text_encoder, "text_encoder"),
+            )
+            if module is not None
+        ]
 
     def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
         """Encode image-edit text features via pipeline-configured postprocess hook."""
@@ -249,8 +262,11 @@ class ImageEncodingStage(PipelineStage):
 
             if self.image_encoder:
                 # if an image encoder is provided
+                image_encoder_component = self._component_name(
+                    self.image_encoder, "image_encoder"
+                )
                 with self.use_declared_component(
-                    component_name="image_encoder",
+                    component_name=image_encoder_component,
                     module=self.image_encoder,
                 ) as image_encoder:
                     assert image_encoder is not None
@@ -263,7 +279,15 @@ class ImageEncodingStage(PipelineStage):
                             self.image_encoder,
                             device=cuda_device,
                         )
-                    with set_forward_context(current_timestep=0, attn_metadata=None):
+                    image_encoder_dtype = resolve_component_precision(
+                        server_args, image_encoder_component
+                    )
+                    assert image_encoder_dtype is not None
+                    with explicit_component_autocast_context(
+                        server_args,
+                        image_encoder_component,
+                        image_encoder_dtype,
+                    ), set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.image_encoder(
                             **image_inputs,
                             **server_args.pipeline_config.image_encoder_extra_args,
@@ -291,8 +315,11 @@ class ImageEncodingStage(PipelineStage):
                         **neg_image_processor_kwargs,
                     ).to(cuda_device)
 
+                text_encoder_component = self._component_name(
+                    self.text_encoder, "text_encoder"
+                )
                 with self.use_declared_component(
-                    component_name="text_encoder",
+                    component_name=text_encoder_component,
                     module=self.text_encoder,
                 ) as text_encoder:
                     assert text_encoder is not None
@@ -315,7 +342,15 @@ class ImageEncodingStage(PipelineStage):
                             self.text_encoder,
                             device=cuda_device,
                         )
-                    with set_forward_context(current_timestep=0, attn_metadata=None):
+                    text_encoder_dtype = resolve_component_precision(
+                        server_args, text_encoder_component
+                    )
+                    assert text_encoder_dtype is not None
+                    with explicit_component_autocast_context(
+                        server_args,
+                        text_encoder_component,
+                        text_encoder_dtype,
+                    ), set_forward_context(current_timestep=0, attn_metadata=None):
                         outputs = self.text_encoder(
                             input_ids=image_inputs.input_ids,
                             attention_mask=image_inputs.attention_mask,
@@ -664,11 +699,13 @@ class LTX2ImageEncodingStage(PipelineStage):
         self, video_condition: torch.Tensor, server_args: ServerArgs
     ) -> torch.Tensor:
         """LTX-2.3 condition-image encoder path (bypasses VAE)."""
-        vae_dtype = resolve_precision(
-            server_args, "vae", precision_attr="vae_precision"
+        encoder_dtype = resolve_precision(
+            server_args,
+            "condition_image_encoder",
+            precision_attr="vae_precision",
         )
 
-        with autocast_context(vae_dtype, server_args.disable_autocast):
+        with autocast_context(encoder_dtype, server_args.disable_autocast):
             return self._condition_image_encoder(video_condition)
 
     @staticmethod
@@ -747,7 +784,7 @@ class LTX2ImageEncodingStage(PipelineStage):
         use_condition_encoder = self._ensure_condition_image_encoder(server_args)
 
         device = get_local_torch_device()
-        encode_dtype = batch.latents.dtype
+        output_dtype = batch.latents.dtype
 
         if use_condition_encoder:
             component_name = "condition_image_encoder"
@@ -755,12 +792,15 @@ class LTX2ImageEncodingStage(PipelineStage):
         else:
             component_name = "vae"
             encoder = self.vae
+        component_dtype = resolve_precision(
+            server_args, component_name, precision_attr="vae_precision"
+        )
 
         packed_latents = []
         with self.use_declared_component(
             component_name=component_name,
             module=encoder,
-            target_dtype=encode_dtype,
+            target_dtype=component_dtype,
         ) as active_encoder:
             assert active_encoder is not None
             if use_condition_encoder:
@@ -774,18 +814,17 @@ class LTX2ImageEncodingStage(PipelineStage):
                     width=int(batch.width),
                     height=int(batch.height),
                     device=device,
-                    dtype=encode_dtype,
+                    dtype=component_dtype,
                 )
 
                 # 3. Encode
                 if use_condition_encoder:
-                    latent = self._condition_encode(video_condition, server_args).to(
-                        dtype=encode_dtype
-                    )
+                    latent = self._condition_encode(video_condition, server_args)
                 else:
                     latent = self._vae_encode(
                         video_condition, server_args, batch.generator
                     )
+                latent = latent.to(dtype=output_dtype)
 
                 packed = server_args.pipeline_config.maybe_pack_latents(
                     latent, latent.shape[0], batch
@@ -1043,7 +1082,9 @@ class ImageVAEEncodingStage(PipelineStage):
             width=batch.width,
             num_frames=batch.num_frames,
             encode_sample_mode=sample_mode,
-            vae_precision=server_args.pipeline_config.vae_precision,
+            vae_precision=server_args.component_precisions.get(
+                "vae", server_args.pipeline_config.vae_precision
+            ),
             vae_tiling=bool(server_args.pipeline_config.vae_tiling),
         )
 

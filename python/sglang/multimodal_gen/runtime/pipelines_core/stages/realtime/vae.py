@@ -21,7 +21,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_decode_precision,
+)
 
 
 class RealtimeVAEState(BaseRealtimeState):
@@ -130,7 +132,7 @@ class CausalVaeDecodingStage(DecodingStage):
         *,
         first_chunk: bool,
     ) -> torch.Tensor:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_decode_precision(server_args, self.component_name)
         self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
         latents = latents.to(get_local_torch_device())
         vae_autocast_enabled = (

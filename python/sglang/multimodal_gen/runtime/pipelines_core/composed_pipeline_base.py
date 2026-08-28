@@ -107,6 +107,7 @@ class ComposedPipelineBase(ABC):
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
+        self._declared_component_names: set[str] = set()
         self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
         self.executor = executor or self.build_executor(server_args=server_args)
         self.component_residency_manager: ComponentResidencyManager | None = None
@@ -145,6 +146,26 @@ class ComposedPipelineBase(ABC):
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
+        valid_precision_components = self._declared_component_names.union(self.modules)
+        unknown = set(server_args.component_precisions).difference(
+            valid_precision_components
+        )
+        if unknown:
+            raise ValueError(
+                "Unknown component precision override(s): "
+                f"{', '.join(sorted(unknown))}."
+            )
+        unsupported = sorted(
+            component_name
+            for component_name in server_args.component_precisions
+            if component_name in self.modules
+            and not isinstance(self.modules[component_name], torch.nn.Module)
+        )
+        if unsupported:
+            raise ValueError(
+                "Component precision override(s) require torch modules: "
+                f"{', '.join(unsupported)}."
+            )
 
         self.__post_init__()
 
@@ -426,6 +447,13 @@ class ComposedPipelineBase(ABC):
         model_index.pop("boundary_ratio", None)
         # used by Wan2.2 ti2v
         model_index.pop("expand_timesteps", None)
+        self._declared_component_names = {
+            name
+            for name, spec in model_index.items()
+            if isinstance(spec, (list, tuple))
+            and len(spec) == 2
+            and spec[0] is not None
+        }
 
         # some sanity checks
         assert (

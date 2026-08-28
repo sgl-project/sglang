@@ -187,7 +187,7 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
         logger.info("Resolved transformer class: %s", cls_name)
 
         default_dtype = resolve_precision(
-            server_args, "dit", precision_attr="dit_precision"
+            server_args, "transformer", precision_attr="dit_precision"
         )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         assert server_args.hsdp_shard_dim is not None, "hsdp_shard_dim must be set"

@@ -725,6 +725,25 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(spec.is_comfy_fp8)
         self.assertTrue(spec.needs_device_weight_postprocess)
 
+    def test_component_precision_validates_quantized_activation_dtype(self):
+        server_args = self._make_server_args(
+            component_precisions={"transformer_2": "fp32"}
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "does not support activation dtype torch.float32"
+        ):
+            resolve_transformer_quant_load_spec(
+                hf_config={},
+                server_args=server_args,
+                safetensors_list=["model.safetensors"],
+                component_model_path="/unused/component/path",
+                model_cls=_FakeFluxTransformer,
+                cls_name=_FakeFluxTransformer.__name__,
+                component_name="transformer_2",
+                checkpoint_quant_config=ComfyFp8Config({}),
+            )
+
     def test_checkpoint_quantization_rejects_explicit_quantization(self):
         server_args = self._make_server_args(quantization="fp8")
 

@@ -71,8 +71,12 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_decode_precision,
+    validate_shared_component_autocast,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils.common import get_compiler_backend
 
 _is_npu = current_platform.is_npu()
@@ -110,7 +114,11 @@ class MOVALatentPreparationStage(PipelineStage):
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        dit_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        validate_shared_component_autocast(
+            server_args, ["video_dit", "audio_dit", "dual_tower_bridge"]
+        )
+        dit_dtype = resolve_component_precision(server_args, "video_dit")
+        assert dit_dtype is not None
         batch.latents = randn_tensor(
             video_shape, generator=generator, device=device, dtype=dit_dtype
         )
@@ -941,7 +949,7 @@ class MOVADecodingStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_decode_precision(server_args, "video_vae")
         return [
             ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),
             ComponentUse(stage_name, "audio_vae"),
@@ -959,7 +967,7 @@ class MOVADecodingStage(PipelineStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_decode_precision(server_args, "video_vae")
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast

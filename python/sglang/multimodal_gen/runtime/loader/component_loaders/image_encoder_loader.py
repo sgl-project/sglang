@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
 
@@ -53,6 +54,8 @@ class ImageEncoderLoader(TextEncoderLoader):
             encoder_config,
             server_args.encoder_parallel,
         )
+        encoder_dtype = resolve_component_precision(server_args, component_name)
+        assert encoder_dtype is not None
 
         # Always start with local device; load_model will adjust for offload if needed
         # TODO(will): add support for other dtypes
@@ -60,6 +63,6 @@ class ImageEncoderLoader(TextEncoderLoader):
             component_weights_path,
             encoder_config,
             server_args,
-            server_args.pipeline_config.image_encoder_precision,
+            encoder_dtype,
             component_name=component_name,
         )

@@ -315,6 +315,13 @@ class ComponentLoader(ABC):
             logger.error("Load %s failed", component_name)
             consumed = 0.0
         else:
+            if component_name in server_args.component_precisions and not isinstance(
+                component, nn.Module
+            ):
+                raise ValueError(
+                    f"Component precision override for {component_name!r} is not "
+                    "supported because the loaded component is not a torch module."
+                )
             if isinstance(component, nn.Module):
                 component = component.eval()
                 if not is_fsdp_managed_module(component):

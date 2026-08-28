@@ -147,6 +147,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 )
 from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
+    validate_shared_component_autocast,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
@@ -1140,8 +1141,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # Setup precision and autocast settings
+        transformer_component = self._component_name_for_stage_module(
+            self.transformer, "transformer"
+        )
+        transformer_components = [transformer_component]
+        if self.transformer_2 is not None:
+            transformer_components.append(
+                self._component_name_for_stage_module(
+                    self.transformer_2, "transformer_2"
+                )
+            )
+        validate_shared_component_autocast(server_args, transformer_components)
         target_dtype = resolve_precision(
-            server_args, "dit", precision_attr="dit_precision"
+            server_args, transformer_component, precision_attr="dit_precision"
         )
         autocast_enabled = precision_autocast_enabled(
             target_dtype, server_args.disable_autocast

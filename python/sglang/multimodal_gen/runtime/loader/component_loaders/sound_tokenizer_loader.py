@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 logger = init_logger(__name__)
 
@@ -34,11 +34,9 @@ class SoundTokenizerLoader(PlainStateDictComponentLoader):
 
         server_args.model_paths[component_name] = component_model_path
 
-        try:
-            precision = server_args.pipeline_config.vae_precision
-        except AttributeError:
-            precision = "bf16"
-        dtype = PRECISION_TO_TYPE[precision]
+        dtype = resolve_precision(
+            server_args, component_name, precision_attr="vae_precision"
+        )
         target_device = self.target_device(
             server_args.should_start_component_on_cpu(component_name)
         )

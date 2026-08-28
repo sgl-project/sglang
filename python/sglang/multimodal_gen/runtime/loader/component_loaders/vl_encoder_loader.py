@@ -8,6 +8,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_exact_component_precision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +64,15 @@ class VisionLanguageEncoderLoader(ComponentLoader):
             target_device = self.target_device(
                 server_args.should_start_component_on_cpu("vision_language_encoder")
             )
+            model_dtype = resolve_exact_component_precision(
+                server_args, "vision_language_encoder"
+            )
             model = GlmImageForConditionalGeneration.from_pretrained(
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                **({"torch_dtype": model_dtype} if model_dtype is not None else {}),
             ).to(target_device)
             return model
         else:

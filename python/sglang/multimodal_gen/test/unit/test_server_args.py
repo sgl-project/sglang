@@ -155,6 +155,43 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
         self.assertEqual(args.model_path, "/data/my-model")
 
+    def test_component_precisions_are_exact_and_validated(self):
+        values, remaining = ServerArgs._extract_component_precisions(
+            [
+                "--component-precisions.text-encoder-2=fp32",
+                "--component-precisions.transformer",
+                "bf16",
+                "--other",
+            ]
+        )
+        self.assertEqual(values, {"text_encoder_2": "fp32", "transformer": "bf16"})
+        self.assertEqual(remaining, ["--other"])
+
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_precisions": {"Text-Encoder-2": "FP16"},
+            }
+        )
+        self.assertEqual(args.component_precisions, {"text_encoder_2": "fp16"})
+
+        with self.assertRaisesRegex(ValueError, "one of fp16, bf16, or fp32"):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_precisions": {"text_encoder": "fp8"},
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "Diffusers backend"):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "backend": "diffusers",
+                    "component_precisions": {"vae": "bf16"},
+                }
+            )
+
     def test_component_paths_are_expanded_before_pipeline_resolution(self):
         args = self._from_dict_without_model_resolution(
             {

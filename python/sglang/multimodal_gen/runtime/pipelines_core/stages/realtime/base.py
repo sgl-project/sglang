@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     scale_and_shift_latents,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 
 
 @dataclass(frozen=True)
@@ -81,8 +81,11 @@ class RealtimeDiffusionStage(PipelineStage):
         for spec in self.component_specs:
             target_dtype = None
             if spec.precision_attr is not None:
-                precision = getattr(server_args.pipeline_config, spec.precision_attr)
-                target_dtype = PRECISION_TO_TYPE[precision]
+                target_dtype = resolve_precision(
+                    server_args,
+                    spec.component_name,
+                    precision_attr=spec.precision_attr,
+                )
             uses.append(
                 ComponentUse(
                     stage_name,

@@ -269,7 +269,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         logger.info("Loading weights from: %s", safetensors_list)
 
         default_dtype = resolve_precision(
-            server_args, "dit", precision_attr="dit_precision"
+            server_args, "transformer", precision_attr="dit_precision"
         )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         hf_config = {}

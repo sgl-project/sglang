@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_exact_component_precision,
+)
 
 logger = init_logger(__name__)
 
@@ -49,11 +52,15 @@ class Krea2BeforeDenoisingStage(PipelineStage):
     def component_uses(self, server_args: ServerArgs, stage_name: str | None = None):
         # Declare the text encoder so the residency manager can CPU-offload it
         # (with --text-encoder-cpu-offload) for the denoise loop, where it is idle.
+        text_encoder_dtype = (
+            resolve_exact_component_precision(server_args, "text_encoder")
+            or torch.bfloat16
+        )
         return [
             ComponentUse(
                 self._component_stage_name(stage_name),
                 "text_encoder",
-                target_dtype=torch.bfloat16,
+                target_dtype=text_encoder_dtype,
             )
         ]
 

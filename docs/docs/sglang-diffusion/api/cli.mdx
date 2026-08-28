@@ -131,6 +131,7 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
+| Set load and compute precision | `--component-precisions.<component> {fp32|fp16|bf16}` | None | Override the family precision for one exact component key |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
@@ -149,6 +150,14 @@ actual component name, which is pipeline-specific. Use `--quantization` only
 to override the method inferred by the transformer loader, and
 `--quantization-ignored-layers` to keep matching transformer layers
 unquantized during online quantization.
+
+Component precision controls weight materialization and the component's default
+native forward/autocast path; it does not change quantized storage formats.
+Existing family options such as `--dit-precision`, `--vae-precision`, and
+`--text-encoder-precisions` remain fallbacks. VAE decode-specific precision can
+temporarily take precedence during decode. Paired DiTs currently require one
+shared precision, and the whole-pipeline Diffusers backend rejects component
+precision overrides.
 
 For a native text encoder:
 
@@ -210,7 +219,7 @@ width: 1280
 num_inference_steps: 6
 seed: 1024
 fps: 24
-precision: bf16
+dit_precision: bf16
 vae_precision: fp16
 vae_tiling: true
 vae_sp: true

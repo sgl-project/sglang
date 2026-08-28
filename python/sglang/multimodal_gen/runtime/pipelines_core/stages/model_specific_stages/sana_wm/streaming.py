@@ -47,7 +47,6 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 from . import parity_probe
 from .base import (
@@ -56,6 +55,7 @@ from .base import (
     _first_tensor,
     _to_device_dtype,
     log_sana_wm_tensor_stats,
+    resolve_sana_wm_dit_dtype,
 )
 
 _SANAWM_INJECT_DIR = _os.environ.get(parity_probe.ENV_INJECT)
@@ -193,9 +193,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
             ComponentUse(
                 stage_name,
                 "transformer",
-                target_dtype=PRECISION_TO_TYPE[
-                    server_args.pipeline_config.dit_precision
-                ],
+                target_dtype=resolve_sana_wm_dit_dtype(server_args),
                 memory_intensive=True,
                 keep_ready_after_warmup=True,
             ),
@@ -248,11 +246,8 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
                 "SANA-WM realtime denoising expects this tick's pre-noised chunk "
                 "latents (B, C, n, H, W) from the latent-preparation stage."
             )
-        pcfg = server_args.pipeline_config
         device = get_local_torch_device()
-        target_dtype = PRECISION_TO_TYPE.get(
-            getattr(pcfg, "dit_precision", "bf16"), torch.bfloat16
-        )
+        target_dtype = resolve_sana_wm_dit_dtype(server_args)
         if batch.session is None:
             raise ValueError("SANA-WM realtime denoising requires a realtime session")
         state = get_realtime_causal_dit_state(batch.session)
@@ -544,9 +539,7 @@ class SanaWMStreamingDenoisingStage(CausalDMDDenoisingStage):
 
         pcfg = server_args.pipeline_config
         device = get_local_torch_device()
-        target_dtype = PRECISION_TO_TYPE.get(
-            getattr(pcfg, "dit_precision", "bf16"), torch.bfloat16
-        )
+        target_dtype = resolve_sana_wm_dit_dtype(server_args)
 
         # .clone() detaches from the loader's InferenceMode tensor so the
         # per-chunk in-place latent updates below are allowed.

@@ -14,7 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision import resolve_decode_precision
 
 logger = init_logger(__name__)
 
@@ -48,7 +48,7 @@ class HeliosDecodingStage(DecodingStage):
         # Load VAE if needed
         self.load_model()
 
-        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_dtype = resolve_decode_precision(server_args, self.component_name)
         # Decode each chunk separately and concatenate in pixel space
         video_chunks = []
         with self.use_declared_component(

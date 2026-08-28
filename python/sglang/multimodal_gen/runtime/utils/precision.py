@@ -3,6 +3,13 @@ from typing import Iterator, Optional, Union
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    component_base_name,
+    is_legacy_dit_offload_component_name,
+    is_legacy_image_encoder_offload_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
@@ -24,6 +31,13 @@ def resolve_precision(
     precision_attr: Optional[str] = None,
     field_name: Optional[str] = None,
 ) -> torch.dtype:
+    component_precisions = vars(server_args).get("component_precisions", {})
+    component_precision = component_precisions.get(component_or_precision_attr)
+    if component_precision is not None:
+        return precision_to_dtype(
+            component_precision,
+            f"component_precisions.{component_or_precision_attr}",
+        )
     precision_attr = precision_attr or component_or_precision_attr
     precision = getattr(server_args.pipeline_config, precision_attr)
     return precision_to_dtype(precision, field_name or precision_attr)
@@ -59,31 +73,30 @@ def resolve_decode_precision(
 
 
 def resolve_component_precision(server_args, module_name: str) -> Optional[torch.dtype]:
+    exact_precision = resolve_exact_component_precision(server_args, module_name)
+    if exact_precision is not None:
+        return exact_precision
+
     pipeline_config = getattr(server_args, "pipeline_config", None)
     if pipeline_config is None:
         return None
 
-    if module_name in ("audio_vae", "vocoder"):
+    base_name = component_base_name(module_name)
+    if base_name in ("audio_vae", "vocoder"):
         precision_attr = "audio_vae_precision"
-    elif module_name in ("vae", "video_vae", "diffusion_decoder"):
+    elif is_vae_component_name(module_name):
         precision_attr = "vae_precision"
-    elif module_name in (
-        "transformer",
-        "transformer_2",
-        "audio_dit",
-        "video_dit",
-        "connectors",
-        "dual_tower_bridge",
-    ):
+    elif is_legacy_dit_offload_component_name(module_name):
         precision_attr = "dit_precision"
-    elif module_name == "image_encoder":
+    elif is_legacy_image_encoder_offload_component_name(module_name):
         precision_attr = "image_encoder_precision"
-    elif module_name == "text_encoder" or module_name.startswith("text_encoder_"):
-        precisions = getattr(pipeline_config, "text_encoder_precisions", None)
+    elif is_text_encoder_component_name(module_name):
+        precisions = vars(pipeline_config).get("text_encoder_precisions")
         if not precisions:
             return None
         suffix = module_name.removeprefix("text_encoder")
-        index = 0 if suffix == "" else int(suffix.removeprefix("_")) - 1
+        numbered_suffix = suffix.removeprefix("_")
+        index = max(int(numbered_suffix) - 1, 0) if numbered_suffix.isdigit() else 0
         if index < 0 or index >= len(precisions):
             raise ValueError(
                 f"No configured precision for {module_name!r}; "
@@ -94,9 +107,46 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
     else:
         return None
 
-    if not hasattr(pipeline_config, precision_attr):
+    if precision_attr not in vars(pipeline_config):
         return None
-    return resolve_precision(server_args, precision_attr)
+    return resolve_precision(server_args, module_name, precision_attr=precision_attr)
+
+
+def resolve_exact_component_precision(
+    server_args, component_name: str
+) -> Optional[torch.dtype]:
+    precision = vars(server_args).get("component_precisions", {}).get(component_name)
+    if precision is None:
+        return None
+    return precision_to_dtype(precision, f"component_precisions.{component_name}")
+
+
+def validate_shared_component_autocast(server_args, component_names: list[str]) -> None:
+    if len(component_names) < 2 or not any(
+        name in server_args.component_precisions for name in component_names
+    ):
+        return
+    precisions = {
+        resolve_component_precision(server_args, name) for name in component_names
+    }
+    if len(precisions) > 1:
+        raise ValueError(
+            "Components sharing one execution path must use one precision because "
+            "they share a single autocast context"
+        )
+
+
+def explicit_component_autocast_context(
+    server_args, component_name: str, dtype: torch.dtype
+):
+    return autocast_context(
+        dtype,
+        server_args.disable_autocast,
+        enabled=(
+            component_name in server_args.component_precisions
+            and autocast_enabled(dtype, server_args.disable_autocast)
+        ),
+    )
 
 
 def autocast_enabled(dtype: torch.dtype, disable_autocast: bool) -> bool:

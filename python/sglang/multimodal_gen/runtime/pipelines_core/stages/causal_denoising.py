@@ -174,7 +174,13 @@ class CausalDMDDenoisingStage(DenoisingStage):
         self._causal_attn_metadata_builder_cls = None
         self._causal_attn_metadata_builder = None
 
-    def _target_dtype(self) -> torch.dtype:
+    def _target_dtype(self, server_args: ServerArgs) -> torch.dtype:
+        component_name = self._component_name_for_stage_module(
+            self.transformer, "transformer"
+        )
+        precision = server_args.component_precisions.get(component_name)
+        if precision is not None and precision != "bf16":
+            raise ValueError("Causal denoising supports only bf16 component precision")
         return torch.bfloat16
 
     def _autocast_enabled(
@@ -338,7 +344,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> CausalDMDForwardContext:
-        target_dtype = self._target_dtype()
+        target_dtype = self._target_dtype(server_args)
         autocast_enabled = self._autocast_enabled(target_dtype, server_args)
         device = get_local_torch_device()
         scheduler = self._get_causal_dmd_scheduler(batch, server_args)

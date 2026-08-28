@@ -820,7 +820,23 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         server_args=server_args,
+        component_name=component_name or "transformer",
     )
+    activation_dtype = resolve_precision(
+        server_args,
+        component_name or "transformer",
+        precision_attr="dit_precision",
+    )
+    runtime_quant_config = quant_config or nunchaku_config
+    if (
+        runtime_quant_config is not None
+        and activation_dtype not in runtime_quant_config.get_supported_act_dtypes()
+    ):
+        raise ValueError(
+            f"{component_name or 'transformer'!r} quantization method "
+            f"{runtime_quant_config.get_name()!r} does not support activation "
+            f"dtype {activation_dtype}"
+        )
 
     adapters = _build_transformer_quant_adapters(
         cls_name=cls_name,
@@ -1078,7 +1094,10 @@ def _resolve_target_param_dtype(
     quant_config: Optional[QuantizationConfig],
     nunchaku_config: Optional[NunchakuConfig],
     server_args: ServerArgs,
+    component_name: str,
 ) -> Optional[torch.dtype]:
     if quant_config is not None or nunchaku_config is not None:
         return None
-    return resolve_precision(server_args, "dit", precision_attr="dit_precision")
+    return resolve_precision(
+        server_args, component_name, precision_attr="dit_precision"
+    )
