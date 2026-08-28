@@ -54,6 +54,12 @@ _State = tuple[
     tuple[PlacementOption, ...],
 ]
 
+_UnconstrainedState = tuple[
+    int,
+    tuple[int, ...],
+    tuple[PlacementOption, ...],
+]
+
 
 def _selection_key(state: _State) -> tuple[str, ...]:
     return tuple(option.option_key for option in state[3])
@@ -160,6 +166,93 @@ def _drop_locally_latency_ineligible_options(
     ]
 
 
+def _prune_unconstrained_states(
+    states: Iterable[_UnconstrainedState],
+) -> list[_UnconstrainedState]:
+    """Keep the exact latency-deficit versus lexicographic-cost frontier."""
+    best_by_deficit: dict[int, _UnconstrainedState] = {}
+    for state in states:
+        incumbent = best_by_deficit.get(state[0])
+        if incumbent is None or (
+            state[1],
+            tuple(option.option_key for option in state[2]),
+        ) < (incumbent[1], tuple(option.option_key for option in incumbent[2])):
+            best_by_deficit[state[0]] = state
+
+    frontier = []
+    best_cost: tuple[int, ...] | None = None
+    for state in sorted(
+        best_by_deficit.values(),
+        key=lambda item: (
+            item[0],
+            item[1],
+            tuple(option.option_key for option in item[2]),
+        ),
+    ):
+        if best_cost is not None and best_cost <= state[1]:
+            continue
+        frontier.append(state)
+        best_cost = state[1]
+    return frontier
+
+
+def _optimize_unconstrained(
+    grouped: Mapping[str, list[PlacementOption]],
+    *,
+    placement_cost_dimensions: int,
+    estimated_latency_tolerance: int,
+    require_selection_from_every_group: bool,
+) -> _State:
+    """Solve the exact global latency window after every budget is non-binding."""
+    zero_cost = (0,) * placement_cost_dimensions
+    frontier: list[_UnconstrainedState] = [(0, zero_cost, ())]
+    maximum_utility = 0
+
+    for group_key in sorted(grouped):
+        alternatives = list(grouped[group_key])
+        group_maximum = max(
+            [option.estimated_latency_savings for option in alternatives]
+            + ([] if require_selection_from_every_group else [0])
+        )
+        maximum_utility += group_maximum
+        group_states = [
+            (
+                group_maximum - option.estimated_latency_savings,
+                option.placement_cost_bytes or zero_cost,
+                (option,),
+            )
+            for option in alternatives
+            if group_maximum - option.estimated_latency_savings
+            <= estimated_latency_tolerance
+        ]
+        if (
+            not require_selection_from_every_group
+            and group_maximum <= estimated_latency_tolerance
+        ):
+            group_states.append((group_maximum, zero_cost, ()))
+        group_frontier = _prune_unconstrained_states(group_states)
+        frontier = _prune_unconstrained_states(
+            (
+                accumulated[0] + choice[0],
+                tuple(left + right for left, right in zip(accumulated[1], choice[1])),
+                accumulated[2] + choice[2],
+            )
+            for accumulated in frontier
+            for choice in group_frontier
+            if accumulated[0] + choice[0] <= estimated_latency_tolerance
+        )
+
+    best = min(
+        frontier,
+        key=lambda state: (
+            state[1],
+            state[0],
+            tuple(option.option_key for option in state[2]),
+        ),
+    )
+    return (), maximum_utility - best[0], best[1], best[2]
+
+
 def optimize_placement(
     options: Iterable[PlacementOption],
     *,
@@ -253,6 +346,26 @@ def optimize_placement(
     resource_budgets = tuple(
         int(resource_budget_bytes[name]) for name in resource_names
     )
+
+    if not resource_names:
+        best = _optimize_unconstrained(
+            grouped,
+            placement_cost_dimensions=placement_cost_dimensions,
+            estimated_latency_tolerance=estimated_latency_tolerance,
+            require_selection_from_every_group=require_selection_from_every_group,
+        )
+        full_resource_deltas = {
+            resource_name: sum(
+                option.resource_delta_bytes.get(resource_name, 0) for option in best[3]
+            )
+            for resource_name in all_resource_names
+        }
+        return PlacementPlan(
+            resource_delta_bytes=full_resource_deltas,
+            estimated_latency_savings=best[1],
+            placement_cost_bytes=best[2],
+            selections=list(best[3]),
+        )
 
     # Each local frontier includes the implicit "keep current placement" choice
     # when selection is optional. Keep the branch representation compact so the

@@ -556,7 +556,9 @@ def _repeated_stages(
     stages.update(record.stage_iterations)
     stages.update(
         stage_name
-        for stage_name in record.stage_duration_ms
+        for stage_name in set(record.stage_duration_ms).union(
+            *(stage_names for stage_names in component_stages.values())
+        )
         if stage_name.endswith("DenoisingStage")
         and not stage_name.endswith("BeforeDenoisingStage")
     )

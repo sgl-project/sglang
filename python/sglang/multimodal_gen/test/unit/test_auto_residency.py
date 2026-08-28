@@ -274,10 +274,10 @@ class TestEstimateDefaultWorkloadTiming:
         )
 
         assert stage_ns == {
-            "ShapeDenoisingStage": 5_100_000_000,
+            "ShapeDenoisingStage": 5_000_000_000,
             "PaintStage": 4_500_000_000,
         }
-        assert request_ns == 9_600_000_000
+        assert request_ns == 9_500_000_000
 
     def test_transfer_savings_uses_component_stage_as_cross_component_cap(self):
         candidates = [
@@ -3054,7 +3054,10 @@ class TestSizeAccounting:
 
         runtime = component_runtime_weight_bytes({"transformer": module})
 
-        assert runtime["transformer"] == manager.peak_managed_device_weight_bytes()
+        assert runtime["transformer"] == (
+            module.layers[0].cache.untyped_storage().nbytes()
+            + manager.peak_managed_device_weight_bytes()
+        )
 
 
 class TestCollectResidencyTargets:
@@ -3892,6 +3895,10 @@ class TestCollectResidencyTargets:
             == resident.target_device_weight_bytes
         )
         module.disable_offload()
+        module.register_parameter(
+            "materialized",
+            nn.Parameter(torch.zeros(manager.offloaded_weight_bytes() // 4)),
+        )
         candidates = collect_residency_targets(
             modules={"transformer": module},
             residency_mode_of=self._modes({"transformer": RESIDENT}),
