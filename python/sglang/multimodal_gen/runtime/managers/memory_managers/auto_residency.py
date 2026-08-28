@@ -2105,7 +2105,9 @@ def collect_residency_targets(
                         target_resident_weight_bytes=weight_bytes,
                         h2d_bytes_per_request=(maximum_transfer_work or weight_bytes),
                         permanent_residency=True,
-                        device_transition_delta_bytes=0,
+                        device_transition_delta_bytes=(
+                            0 if current_resident else weight_bytes
+                        ),
                         active_device_delta_bytes=0,
                         inactive_device_delta_bytes=(
                             0 if current_resident else weight_bytes

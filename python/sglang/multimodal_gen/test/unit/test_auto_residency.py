@@ -3647,7 +3647,13 @@ class TestCollectResidencyTargets:
             candidate.target_layerwise_resident_layers == (2,)
             for candidate in candidates
         )
-        assert any(candidate.target_mode() == RESIDENT for candidate in candidates)
+        resident = next(
+            candidate for candidate in candidates if candidate.target_mode() == RESIDENT
+        )
+        assert (
+            resident.device_transition_delta_bytes
+            == resident.target_device_weight_bytes
+        )
 
     def test_virtual_layerwise_prefetch_is_runtime_not_transition_memory(self):
         module = _FakeLazyLayerwiseDit(num_layers=3)
