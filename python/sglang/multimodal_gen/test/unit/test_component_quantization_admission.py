@@ -170,7 +170,9 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
             UpsamplerLoader().load_customized(
-                "/model/spatial_upsampler", None, "spatial_upsampler"
+                "/model/spatial_upsampler",
+                SimpleNamespace(revision="pinned-revision"),
+                "spatial_upsampler",
             )
 
         load_weights.assert_not_called()
@@ -186,6 +188,11 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.loader.component_loaders."
                 "upsampler_loader.glob.glob",
                 return_value=["/cache/component/model.safetensors"],
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "upsampler_loader.os.path.isdir",
+                side_effect=lambda path: path == "/cache/component",
             ),
         ):
             resolved = _find_safetensors_file(
