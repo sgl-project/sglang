@@ -136,6 +136,16 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
+    def finalize_local(self):
+        """Populate gather-derived metadata from the sole attention-DP rank."""
+        self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
+        self.global_num_tokens = [self.num_tokens]
+        self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        if _ENABLE_METRICS_DP_ATTENTION:
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                self.tp0_info_cpu[:, 5].tolist()
+            )
+
     def all_gather(
         self,
         device,
@@ -212,7 +222,7 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
-    skip_all_gather=False,
+    skip_global_metadata=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
@@ -223,7 +233,7 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
-    if not skip_all_gather:
+    if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
@@ -231,6 +241,20 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+
+
+def should_skip_scheduler_all_gather(dp_size: int) -> bool:
+    """Return whether scheduler metadata is already local and rank-invariant.
+
+    With one attention-DP rank there is no cross-DP state to reconcile.  The
+    TP schedulers consume the same broadcast request stream, so gathering the
+    identical batch mode, graph eligibility, and token counts only adds a
+    device collective plus host synchronization.  Preserve the environment
+    override for deployments that explicitly guarantee this invariant beyond
+    DP1.
+    """
+
+    return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
 
 
 def _local_decode_cuda_graph_vote(
@@ -358,7 +382,6 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
     )
@@ -408,6 +431,7 @@ def prepare_mlp_sync_batch_raw(
             local_num_tokens=num_tokens,
             local_forward_mode=local_forward_mode,
         )
+    skip_all_gather = should_skip_scheduler_all_gather(dp_size)
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -422,13 +446,17 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
     )
 
-    if not skip_all_gather:
+    if dp_size == 1:
+        mlp_sync_info.finalize_local()
+    elif not skip_all_gather:
         mlp_sync_info.all_gather(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
         )
 
+    metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
@@ -452,12 +480,15 @@ def prepare_mlp_sync_batch_raw(
 
     if batch_to_gather is not None:
         _update_gather_batch(
-            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+            batch_to_gather,
+            mlp_sync_info,
+            require_mlp_tp_gather,
+            skip_global_metadata=not metadata_ready,
         )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
-    if local_batch is not None and not skip_all_gather:
+    if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
                 mlp_sync_info.tp0_info_cpu[:, 5].tolist()
