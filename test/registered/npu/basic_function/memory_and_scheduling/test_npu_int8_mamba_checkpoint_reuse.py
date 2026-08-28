@@ -175,7 +175,9 @@ def _measure_config(int8_enabled, plan):
             sum_cached = sum(m["cached_tokens"] for m in metas)
             reuse = sum_cached / max(1, sum_prompt)
             results[K] = reuse
-            print(f"[int8={'on' if int8_enabled else 'off'}] K={K}: reuse_frac={reuse:.3f}")
+            print(
+                f"[int8={'on' if int8_enabled else 'off'}] K={K}: reuse_frac={reuse:.3f}"
+            )
         return results
     finally:
         terminate_and_kill_process_tree(proc, terminate_timeout=60)
