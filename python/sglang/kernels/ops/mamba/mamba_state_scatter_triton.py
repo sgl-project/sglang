@@ -248,9 +248,11 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
-    if not dst.is_cuda or not src.is_cuda:
+    dst_ok = dst.is_cuda or dst.is_xpu
+    src_ok = src.is_cuda or src.is_xpu
+    if not dst_ok or not src_ok:
         raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
+            "fused_mamba_state_scatter_with_mask only supports CUDA/XPU tensors."
         )
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
@@ -408,10 +410,14 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
+    if not (
+        (dst.is_cuda or dst.is_xpu)
+        and (src.is_cuda or src.is_xpu)
+        and dst.device == src.device
+    ):
         raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
-            f"tensors on the same device ({dst.device=}, {src.device=})."
+            "fused_conv_window_scatter_with_mask requires dst and src to be "
+            f"CUDA/XPU tensors on the same device ({dst.device=}, {src.device=})."
         )
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
@@ -556,6 +562,19 @@ def _fused_conv_window_scatter_multi_kernel(
             tl.store(dst_ptr + dst_off, data, mask=mask)
 
 
+def _signed_i64(ptr: int) -> int:
+    """Reinterpret a raw (possibly >= 2**63) device pointer as a signed int64.
+
+    XPU USM device pointers can have their top address bit set (unlike typical
+    CUDA pointers), so ``data_ptr()`` may return a value >= 2**63 that overflows
+    when packed into a signed ``torch.int64`` tensor. The bit pattern is
+    preserved via two's-complement wraparound, and the Triton kernel bit-casts
+    the loaded int64 back to a pointer (``.to(tl.pointer_type(...))``), so this
+    is a lossless, safe transformation.
+    """
+    return ptr - (1 << 64) if ptr >= (1 << 63) else ptr
+
+
 def _conv_multi_build_meta(pairs, block_size: int):
     rows = []
     block_start = 0
@@ -563,8 +582,8 @@ def _conv_multi_build_meta(pairs, block_size: int):
         elem = dst.shape[2] * dst.shape[3]
         rows.append(
             [
-                src.data_ptr(),
-                dst.data_ptr(),
+                _signed_i64(src.data_ptr()),
+                _signed_i64(dst.data_ptr()),
                 elem,
                 src.stride(0),
                 src.stride(1),
