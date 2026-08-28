@@ -1346,14 +1346,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 latest_round_only=True,
             )
         if validate_only:
+            latest_round = self._latest_auto_residency_round()
             short_validation = (
                 self._latest_auto_residency_round_supports_short_validation()
+            )
+            commit_modules = (
+                self.pipeline.modules
+                if any(
+                    change.previous_layerwise_resident_layers is not None
+                    for change in latest_round
+                )
+                else {}
             )
             commit_error = None
             try:
                 commit_residency_changes(
-                    applied=self._latest_auto_residency_round(),
-                    modules=self.pipeline.modules,
+                    applied=latest_round,
+                    modules=commit_modules,
                     server_args=self.server_args,
                 )
             except Exception as e:

@@ -2358,7 +2358,7 @@ def commit_residency_changes(
     """Release rollback-only stores after post-adjustment validation succeeds."""
     for adjustment in applied:
         if (
-            not adjustment.previous_layerwise_configured
+            adjustment.previous_layerwise_resident_layers is None
             or server_args.residency_mode(adjustment.component_name) != RESIDENT
         ):
             continue
