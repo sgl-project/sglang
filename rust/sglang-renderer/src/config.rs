@@ -27,6 +27,8 @@ pub struct RendererConfig {
     pub chat_template: Option<String>,
     pub tool_call_parser: Option<String>,
     pub reasoning_parser: Option<String>,
+    #[serde(default)]
+    pub default_chat_template_kwargs: std::collections::HashMap<String, serde_json::Value>,
     pub stream_response_default_include_usage: bool,
     pub skip_tokenizer_init: bool,
     pub vocab_size: u64,

@@ -213,6 +213,7 @@ mod tests {
             chat_template: Some("chatml".into()),
             tool_call_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,
             vocab_size: 100,

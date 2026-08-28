@@ -1,7 +1,12 @@
 import json
 import unittest
+from types import SimpleNamespace
 
-from sglang.cli.render import extract_engine_url, write_renderer_config
+from sglang.cli.render import (
+    _build_renderer_config,
+    extract_engine_url,
+    write_renderer_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -32,6 +37,33 @@ class TestStandaloneRendererCli(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()), payload)
         finally:
             path.unlink(missing_ok=True)
+
+    def test_renderer_config_forwards_default_chat_template_kwargs(self):
+        server_args = SimpleNamespace(
+            served_model_name="model",
+            tokenizer_path="tokenizer",
+            revision=None,
+            model_path="model-path",
+            chat_template=None,
+            tool_call_parser=None,
+            reasoning_parser=None,
+            default_chat_template_kwargs={"enable_thinking": False},
+            stream_response_default_include_usage=False,
+            allow_auto_truncate=False,
+            enable_return_hidden_states=False,
+        )
+        model_config = SimpleNamespace(vocab_size=128, context_len=4096)
+
+        config = _build_renderer_config(
+            server_args,
+            model_config,
+            {"temperature": 0.7, "top_p": 0.9},
+            32,
+        )
+
+        self.assertEqual(
+            config["default_chat_template_kwargs"], {"enable_thinking": False}
+        )
 
 
 if __name__ == "__main__":

@@ -83,10 +83,7 @@ async fn completions(
         Ok(parts) => parts,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
     };
-    let response_id = extensions
-        .rid
-        .clone()
-        .unwrap_or_else(|| format!("cmpl-{}", uuid::Uuid::new_v4().simple()));
+    let response_id = extensions.response_id("cmpl");
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -104,7 +101,6 @@ async fn completions(
         .as_ref()
         .is_some_and(|options| options.continuous_usage_stats);
     let want_logprobs = request.logprobs.is_some();
-    let request_metadata = extensions.metadata(model.clone());
     let created = unix_seconds_u32();
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let submitted = if text_prompt {
@@ -116,11 +112,17 @@ async fn completions(
                     return openai_error(status, error.to_string(), false);
                 }
             };
-        for completion in &mut completion_requests {
+        let prompt_count = completion_requests.len() / n;
+        let contexts = match extensions.expand(model.clone(), prompt_count, n, &response_id) {
+            Ok(contexts) => contexts,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        };
+        for (completion, context) in completion_requests.iter_mut().zip(contexts) {
             sampling_overrides
                 .clone()
                 .apply(&mut completion.options.sampling_params);
-            completion.metadata = request_metadata.clone();
+            completion.rid = context.request_id;
+            completion.metadata = context.metadata;
         }
         let metadata = completion_requests
             .iter()
@@ -152,11 +154,17 @@ async fn completions(
                 return openai_error(status, error.to_string(), false);
             }
         };
-        for token_request in &mut token_requests {
+        let prompt_count = token_requests.len() / n;
+        let contexts = match extensions.expand(model.clone(), prompt_count, n, &response_id) {
+            Ok(contexts) => contexts,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        };
+        for (token_request, context) in token_requests.iter_mut().zip(contexts) {
             sampling_overrides
                 .clone()
                 .apply(&mut token_request.options.sampling_params);
-            token_request.metadata = request_metadata.clone();
+            token_request.rid = context.request_id;
+            token_request.metadata = context.metadata;
         }
         let mut metadata = Vec::with_capacity(token_requests.len());
         let mut prompt_echo = String::new();

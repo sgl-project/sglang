@@ -13,7 +13,7 @@ use dynamo_protocols::types::{
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{GenerateRequestMetadata, SamplingParamsOverrides};
+use crate::{GenerateRequestMetadata, OneOrMany, OneOrManyItem, SamplingParamsOverrides};
 
 mod error;
 mod generate_client;
@@ -264,19 +264,19 @@ fn reject_unsupported_fields(fields: &HashMap<String, Value>) -> Result<(), Stri
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct RequestExtensions {
     #[serde(default)]
-    pub rid: Option<String>,
+    pub rid: Option<OneOrMany<String>>,
     #[serde(default)]
-    pub cache_salt: Option<String>,
+    pub cache_salt: Option<OneOrMany<String>>,
     #[serde(default)]
-    pub extra_key: Option<String>,
+    pub extra_key: Option<OneOrMany<String>>,
     #[serde(default)]
     pub priority: Option<i64>,
     #[serde(default)]
-    pub bootstrap_host: Option<String>,
+    pub bootstrap_host: Option<OneOrMany<String>>,
     #[serde(default)]
-    pub bootstrap_port: Option<i64>,
+    pub bootstrap_port: Option<OneOrMany<Option<i64>>>,
     #[serde(default)]
-    pub bootstrap_room: Option<i64>,
+    pub bootstrap_room: Option<OneOrMany<i64>>,
     #[serde(default)]
     pub routed_dp_rank: Option<i64>,
     #[serde(default)]
@@ -301,6 +301,12 @@ pub(crate) struct RequestExtensions {
     pub mm_hashes: Option<serde_json::Value>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ExpandedRequestContext {
+    pub request_id: String,
+    pub metadata: GenerateRequestMetadata,
+}
+
 impl RequestExtensions {
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
@@ -322,19 +328,109 @@ impl RequestExtensions {
         Ok(())
     }
 
-    pub fn metadata(self, model: String) -> GenerateRequestMetadata {
-        GenerateRequestMetadata {
-            model: Some(model),
-            cache_salt: self.cache_salt,
-            extra_key: self.extra_key,
-            priority: self.priority,
-            bootstrap_host: self.bootstrap_host,
-            bootstrap_port: self.bootstrap_port,
-            bootstrap_room: self.bootstrap_room,
-            routed_dp_rank: self.routed_dp_rank.or(self.data_parallel_rank),
-            disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
+    pub fn response_id(&self, prefix: &str) -> String {
+        match self.rid.as_ref() {
+            Some(OneOrMany::One(rid)) => rid.clone(),
+            Some(OneOrMany::Many(rids)) => rids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| generated_response_id(prefix)),
+            None => generated_response_id(prefix),
         }
     }
+
+    pub fn expand(
+        self,
+        model: String,
+        prompt_count: usize,
+        choice_count: usize,
+        response_id: &str,
+    ) -> Result<Vec<ExpandedRequestContext>, String> {
+        let list_rids = matches!(&self.rid, Some(OneOrMany::Many(_)));
+        let rids = expand_per_prompt("rid", self.rid, prompt_count)?;
+        if list_rids {
+            let mut seen = std::collections::HashSet::new();
+            for rid in rids.iter().flatten() {
+                if !seen.insert(rid) {
+                    return Err(format!("duplicate request ID in rid: {rid}"));
+                }
+            }
+        }
+        let cache_salts = expand_per_prompt("cache_salt", self.cache_salt, prompt_count)?;
+        let extra_keys = expand_per_prompt("extra_key", self.extra_key, prompt_count)?;
+        let bootstrap_hosts =
+            expand_per_prompt("bootstrap_host", self.bootstrap_host, prompt_count)?;
+        let bootstrap_ports =
+            expand_per_prompt("bootstrap_port", self.bootstrap_port, prompt_count)?;
+        let bootstrap_rooms = match self.bootstrap_room {
+            Some(OneOrMany::One(base)) => (0..prompt_count)
+                .map(|prompt_index| {
+                    let offset = i64::try_from(prompt_index)
+                        .map_err(|_| "bootstrap_room prompt index exceeds i64".to_owned())?;
+                    base.checked_add(offset)
+                        .map(Some)
+                        .ok_or_else(|| "bootstrap_room overflows i64".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            value => expand_per_prompt("bootstrap_room", value, prompt_count)?,
+        };
+        let routed_dp_rank = self.routed_dp_rank.or(self.data_parallel_rank);
+        let total = prompt_count
+            .checked_mul(choice_count)
+            .ok_or_else(|| "prompt count times n overflows usize".to_owned())?;
+        let mut contexts = Vec::with_capacity(total);
+        for prompt_index in 0..prompt_count {
+            for sample_index in 0..choice_count {
+                let index = prompt_index * choice_count + sample_index;
+                let request_id = match (&rids[prompt_index], list_rids) {
+                    (Some(rid), true) if choice_count == 1 => rid.clone(),
+                    (Some(rid), true) => format!("{rid}-{sample_index}"),
+                    _ => format!("{response_id}-{index}"),
+                };
+                contexts.push(ExpandedRequestContext {
+                    request_id,
+                    metadata: GenerateRequestMetadata {
+                        model: Some(model.clone()),
+                        cache_salt: cache_salts[prompt_index]
+                            .clone()
+                            .filter(|value| !value.is_empty()),
+                        extra_key: extra_keys[prompt_index]
+                            .clone()
+                            .filter(|value| !value.is_empty()),
+                        priority: self.priority,
+                        bootstrap_host: bootstrap_hosts[prompt_index].clone(),
+                        bootstrap_port: bootstrap_ports[prompt_index].flatten(),
+                        bootstrap_room: bootstrap_rooms[prompt_index],
+                        routed_dp_rank,
+                        disagg_prefill_dp_rank: self.disagg_prefill_dp_rank,
+                    },
+                });
+            }
+        }
+        Ok(contexts)
+    }
+}
+
+fn expand_per_prompt<T: Clone + OneOrManyItem>(
+    name: &str,
+    value: Option<OneOrMany<T>>,
+    prompt_count: usize,
+) -> Result<Vec<Option<T>>, String> {
+    match value {
+        None => Ok(vec![None; prompt_count]),
+        Some(OneOrMany::One(value)) => Ok(vec![Some(value); prompt_count]),
+        Some(OneOrMany::Many(values)) if values.len() == prompt_count => {
+            Ok(values.into_iter().map(Some).collect())
+        }
+        Some(OneOrMany::Many(values)) => Err(format!(
+            "the length of {name} must equal the prompt batch size ({prompt_count}), got {}",
+            values.len()
+        )),
+    }
+}
+
+fn generated_response_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
 pub(crate) use generate_client::HttpGenerateClient;
@@ -388,7 +484,10 @@ mod tests {
     use futures::future::BoxFuture;
     use tower::ServiceExt;
 
-    use super::{ChatCompletionRequest, HttpGenerateClient, OpenAIHttpFrontend, standalone_routes};
+    use super::{
+        ChatCompletionRequest, CompletionRequest, HttpGenerateClient, OpenAIHttpFrontend,
+        RequestExtensions, standalone_routes,
+    };
     use crate::{
         RendererConfig, RendererError, RendererLimits, RendererService, SamplingDefaults,
         TextRequest, TokenIdsRequest, TokenizationBackend,
@@ -444,6 +543,84 @@ mod tests {
         };
 
         assert_eq!(error, "unsupported request fields: input_ids, task");
+    }
+
+    #[test]
+    fn batched_request_metadata_expands_in_prompt_major_order() {
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "prompt": ["one", "two"],
+            "n": 2,
+            "rid": ["prompt-a", "prompt-b"],
+            "cache_salt": ["tenant-a", "tenant-b"],
+            "extra_key": ["", "batch"],
+            "bootstrap_host": ["prefill-a", "prefill-b"],
+            "bootstrap_port": [8998, null],
+            "bootstrap_room": [41, 52],
+            "priority": 7,
+            "routed_dp_rank": 2
+        }))
+        .unwrap();
+        let (_, _, extensions) = request.into_parts().unwrap();
+        let response_id = extensions.response_id("cmpl");
+
+        let contexts = extensions
+            .expand("model".into(), 2, 2, &response_id)
+            .unwrap();
+
+        assert_eq!(response_id, "prompt-a");
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|context| context.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["prompt-a-0", "prompt-a-1", "prompt-b-0", "prompt-b-1"]
+        );
+        assert_eq!(contexts[0].metadata.cache_salt.as_deref(), Some("tenant-a"));
+        assert_eq!(contexts[1].metadata.extra_key, None);
+        assert_eq!(contexts[2].metadata.extra_key.as_deref(), Some("batch"));
+        assert_eq!(contexts[0].metadata.bootstrap_port, Some(8998));
+        assert_eq!(contexts[2].metadata.bootstrap_port, None);
+        assert_eq!(contexts[1].metadata.bootstrap_room, Some(41));
+        assert_eq!(contexts[3].metadata.bootstrap_room, Some(52));
+        assert_eq!(contexts[3].metadata.routed_dp_rank, Some(2));
+    }
+
+    #[test]
+    fn batch_metadata_validates_lengths_duplicates_and_scalar_rooms() {
+        let extensions: RequestExtensions = serde_json::from_value(serde_json::json!({
+            "rid": ["duplicate", "duplicate"],
+            "cache_salt": ["only-one"]
+        }))
+        .unwrap();
+        let error = extensions
+            .expand("model".into(), 2, 1, "cmpl-test")
+            .unwrap_err();
+        assert!(error.contains("duplicate request ID"));
+
+        let extensions: RequestExtensions = serde_json::from_value(serde_json::json!({
+            "cache_salt": ["only-one"]
+        }))
+        .unwrap();
+        let error = extensions
+            .expand("model".into(), 2, 1, "cmpl-test")
+            .unwrap_err();
+        assert!(error.contains("prompt batch size (2)"));
+
+        let extensions: RequestExtensions = serde_json::from_value(serde_json::json!({
+            "bootstrap_room": 90
+        }))
+        .unwrap();
+        let contexts = extensions
+            .expand("model".into(), 2, 2, "cmpl-test")
+            .unwrap();
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|context| context.metadata.bootstrap_room)
+                .collect::<Vec<_>>(),
+            [Some(90), Some(90), Some(91), Some(91)]
+        );
     }
 
     struct WordTokenizer;
@@ -503,6 +680,7 @@ mod tests {
             chat_template: Some("chatml".into()),
             tool_call_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,
             vocab_size: 128,
@@ -548,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_and_render_share_chat_preparation() {
+    async fn inference_and_render_share_request_preparation() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -602,10 +780,9 @@ mod tests {
         )
         .unwrap();
 
-        let inference_response = post_request(app, "/v1/chat/completions", &body).await;
+        let inference_response = post_request(app.clone(), "/v1/chat/completions", &body).await;
         assert_eq!(inference_response.status(), StatusCode::OK);
         let engine_request = captured.lock().unwrap().pop().unwrap();
-        engine.abort();
         assert!(engine_request.get("text").is_none());
 
         rendered["stream"] = serde_json::Value::Bool(true);
@@ -613,5 +790,49 @@ mod tests {
         rendered["sampling_params"]["stop"] = serde_json::json!([]);
         rendered["incremental_streaming_output"] = serde_json::Value::Bool(true);
         assert_eq!(engine_request, rendered);
+
+        let batch = serde_json::json!({
+            "model": "model",
+            "prompt": ["one", "two"],
+            "n": 2,
+            "rid": ["prompt-a", "prompt-b"],
+            "cache_salt": ["tenant-a", "tenant-b"],
+            "extra_key": ["interactive", "batch"],
+            "bootstrap_host": ["prefill-a", "prefill-b"],
+            "bootstrap_port": [8998, null],
+            "bootstrap_room": [41, 52]
+        });
+        let render_response = post_request(app.clone(), "/v1/completions/render", &batch).await;
+        assert_eq!(render_response.status(), StatusCode::OK);
+        let rendered: serde_json::Value = serde_json::from_slice(
+            &to_bytes(render_response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rendered[0]["rid"], "prompt-a-0");
+        assert_eq!(rendered[1]["rid"], "prompt-a-1");
+        assert_eq!(rendered[2]["rid"], "prompt-b-0");
+        assert_eq!(rendered[3]["rid"], "prompt-b-1");
+        assert_eq!(rendered[3]["cache_salt"], "tenant-b");
+        assert_eq!(rendered[3]["bootstrap_room"], 52);
+
+        let inference_response = post_request(app, "/v1/completions", &batch).await;
+        assert_eq!(inference_response.status(), StatusCode::OK);
+        let mut engine_requests = std::mem::take(&mut *captured.lock().unwrap());
+        engine.abort();
+        engine_requests.sort_by(|left, right| left["rid"].as_str().cmp(&right["rid"].as_str()));
+        assert_eq!(engine_requests.len(), 4);
+        assert_eq!(engine_requests[0]["rid"], "prompt-a-0");
+        assert_eq!(engine_requests[1]["rid"], "prompt-a-1");
+        assert_eq!(engine_requests[2]["rid"], "prompt-b-0");
+        assert_eq!(engine_requests[3]["rid"], "prompt-b-1");
+        assert_eq!(engine_requests[2]["cache_salt"], "tenant-b");
+        assert_eq!(engine_requests[2]["bootstrap_host"], "prefill-b");
+        assert_eq!(
+            engine_requests[2]["bootstrap_port"],
+            serde_json::Value::Null
+        );
+        assert_eq!(engine_requests[3]["bootstrap_room"], 52);
     }
 }

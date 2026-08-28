@@ -214,8 +214,9 @@ fn load_chat_support(config: &RendererConfig) -> (Option<ChatFormatter>, Option<
         .and_then(load_model_type)
         .map(|model_type| model_type.to_ascii_lowercase());
     let display_name_lower = model_source.to_ascii_lowercase();
-    if let Some(formatter) = kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true)
-        .or_else(|| native_formatter_for(&model_type_lower, &display_name_lower))
+    if config.chat_template.is_none()
+        && let Some(formatter) = kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true)
+            .or_else(|| native_formatter_for(&model_type_lower, &display_name_lower))
     {
         return (Some(ChatFormatter::HuggingFace(formatter)), None);
     }
@@ -278,6 +279,7 @@ mod tests {
             chat_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,
             vocab_size: 128,
@@ -314,6 +316,7 @@ mod tests {
             chat_template: Some("chatml".into()),
             tool_call_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,
             vocab_size: 128,
@@ -414,6 +417,143 @@ mod tests {
     }
 
     #[test]
+    fn explicit_chat_template_overrides_native_model_detection() {
+        for model_type in ["kimi_k3", "deepseek_v4", "inkling_mm_model"] {
+            let directory = std::env::temp_dir().join(format!(
+                "sglang-renderer-template-override-{model_type}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("config.json"),
+                serde_json::json!({"model_type": model_type}).to_string(),
+            )
+            .unwrap();
+            std::fs::write(directory.join("tokenizer_config.json"), "{}").unwrap();
+            let mut config = model_config(directory.to_string_lossy().into_owned());
+            let template = directory.join("override.jinja");
+            std::fs::write(&template, "OVERRIDE {{ messages[0].content }}").unwrap();
+            config.chat_template = Some(template.to_string_lossy().into_owned());
+            let (formatter, error) = load_chat_support(&config);
+            let formatter = formatter.unwrap_or_else(|| panic!("{model_type}: {error:?}"));
+            let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap();
+
+            let prompt = formatter.render_prompt(&request).unwrap();
+
+            assert_eq!(prompt.as_str(), "OVERRIDE hello", "{model_type}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn top_level_reasoning_effort_reaches_deepseek_v4_formatter() {
+        let directory = std::env::temp_dir().join(format!(
+            "sglang-renderer-deepseek-v4-effort-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("config.json"),
+            r#"{"model_type":"deepseek_v4"}"#,
+        )
+        .unwrap();
+        let config = model_config(directory.to_string_lossy().into_owned());
+        let messages = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "hello"}
+        ]))
+        .unwrap();
+        let request = ChatRequest {
+            rid: "chatcmpl-test".into(),
+            model: "model".into(),
+            messages,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            reasoning_effort: Some(serde_json::from_value(serde_json::json!("max")).unwrap()),
+            continue_final_message: false,
+            chat_template_args: None,
+            sampling_params: SamplingParams::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
+            parallel_tool_calls: true,
+            metadata: GenerateRequestMetadata::default(),
+        };
+        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
+
+        let chat = service.preprocess_chat(request).unwrap();
+
+        assert!(
+            chat.text_requests[0]
+                .prompt
+                .as_str()
+                .contains("Reasoning Effort: Absolute maximum")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn chat_template_argument_precedence_is_request_then_top_level_then_defaults() {
+        let directory = std::env::temp_dir().join(format!(
+            "sglang-renderer-template-defaults-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("tokenizer_config.json"), "{}").unwrap();
+        let mut config = model_config(directory.to_string_lossy().into_owned());
+        let template = directory.join("arguments.jinja");
+        std::fs::write(&template, "{{ marker }}|{{ reasoning_effort }}").unwrap();
+        config.chat_template = Some(template.to_string_lossy().into_owned());
+        config.default_chat_template_kwargs = std::collections::HashMap::from([
+            ("marker".into(), serde_json::json!("default")),
+            ("reasoning_effort".into(), serde_json::json!("low")),
+        ]);
+        let messages = serde_json::from_value(serde_json::json!([
+            {"role": "user", "content": "hello"}
+        ]))
+        .unwrap();
+        let mut request = ChatRequest {
+            rid: "chatcmpl-test".into(),
+            model: "model".into(),
+            messages,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            reasoning_effort: Some(serde_json::from_value(serde_json::json!("max")).unwrap()),
+            continue_final_message: false,
+            chat_template_args: Some(std::collections::HashMap::from([(
+                "marker".into(),
+                serde_json::json!("request"),
+            )])),
+            sampling_params: SamplingParams::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
+            parallel_tool_calls: true,
+            metadata: GenerateRequestMetadata::default(),
+        };
+        let service = RendererService::new(config, Arc::new(UnexpectedTokenizer));
+
+        let chat = service.preprocess_chat(request.clone()).unwrap();
+        assert_eq!(chat.text_requests[0].prompt.as_str(), "request|max");
+
+        request
+            .chat_template_args
+            .as_mut()
+            .unwrap()
+            .insert("reasoning_effort".into(), serde_json::json!("medium"));
+        let chat = service.preprocess_chat(request).unwrap();
+        assert_eq!(chat.text_requests[0].prompt.as_str(), "request|medium");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn token_id_completion_bypasses_tokenization_and_builds_generate_request() {
         let config = RendererConfig {
             served_model_name: "model".into(),
@@ -423,6 +563,7 @@ mod tests {
             chat_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,
             vocab_size: 128,

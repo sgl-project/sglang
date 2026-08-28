@@ -70,11 +70,16 @@ async fn render_chat(
         );
     }
     let model = request.model.clone();
-    let response_id = extensions
-        .rid
-        .clone()
-        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
-    let metadata = extensions.metadata(model);
+    let response_id = extensions.response_id("chatcmpl");
+    let metadata = match extensions.expand(model, 1, 1, &response_id) {
+        Ok(mut contexts) => {
+            contexts
+                .pop()
+                .expect("one chat prompt produces one metadata context")
+                .metadata
+        }
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+    };
     let mut chat_request = match lower_chat_request_with_template_args(
         state.renderer.config(),
         request,
@@ -118,11 +123,8 @@ async fn render_completions(
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
     };
     let model = request.model.clone();
-    let response_id = extensions
-        .rid
-        .clone()
-        .unwrap_or_else(|| format!("cmpl-{}", uuid::Uuid::new_v4().simple()));
-    let metadata = extensions.metadata(model);
+    let response_id = extensions.response_id("cmpl");
+    let n = request.n.unwrap_or(1) as usize;
     let text_prompt = matches!(&request.prompt, Prompt::String(_) | Prompt::StringArray(_));
     let requests = if text_prompt {
         let mut requests =
@@ -132,11 +134,17 @@ async fn render_completions(
                     return openai_error(renderer_status(&error), error.to_string(), false);
                 }
             };
-        for request in &mut requests {
+        let prompt_count = requests.len() / n;
+        let contexts = match extensions.expand(model.clone(), prompt_count, n, &response_id) {
+            Ok(contexts) => contexts,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        };
+        for (request, context) in requests.iter_mut().zip(contexts) {
             sampling_overrides
                 .clone()
                 .apply(&mut request.options.sampling_params);
-            request.metadata = metadata.clone();
+            request.rid = context.request_id;
+            request.metadata = context.metadata;
         }
         state.renderer.prepare_completions(requests).await
     } else {
@@ -150,11 +158,17 @@ async fn render_completions(
                 return openai_error(renderer_status(&error), error.to_string(), false);
             }
         };
-        for request in &mut requests {
+        let prompt_count = requests.len() / n;
+        let contexts = match extensions.expand(model, prompt_count, n, &response_id) {
+            Ok(contexts) => contexts,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        };
+        for (request, context) in requests.iter_mut().zip(contexts) {
             sampling_overrides
                 .clone()
                 .apply(&mut request.options.sampling_params);
-            request.metadata = metadata.clone();
+            request.rid = context.request_id;
+            request.metadata = context.metadata;
         }
         state.renderer.prepare_token_ids_requests(requests)
     };
@@ -211,6 +225,7 @@ mod tests {
             chat_template: Some("chatml".into()),
             tool_call_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,
             vocab_size: 100,

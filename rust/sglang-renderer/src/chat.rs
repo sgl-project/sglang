@@ -102,6 +102,7 @@ pub struct ChatPreprocessor {
     formatter_error: Option<String>,
     tool_call_parser: Option<String>,
     reasoning_parser: Option<String>,
+    default_chat_template_kwargs: HashMap<String, serde_json::Value>,
 }
 
 impl ChatPreprocessor {
@@ -111,6 +112,7 @@ impl ChatPreprocessor {
             formatter_error: None,
             tool_call_parser: config.tool_call_parser.clone(),
             reasoning_parser: config.reasoning_parser.clone(),
+            default_chat_template_kwargs: config.default_chat_template_kwargs.clone(),
         }
     }
 
@@ -121,6 +123,7 @@ impl ChatPreprocessor {
 
     pub fn preprocess(&self, mut request: ChatRequest) -> Result<LoweredChat, RendererError> {
         validate_chat(&request)?;
+        self.normalize_template_args(&mut request);
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
@@ -130,6 +133,9 @@ impl ChatPreprocessor {
             !tools.is_empty(),
             &tool_choice,
         )?;
+        if parser.is_some() {
+            request.sampling_params.skip_special_tokens = false;
+        }
         apply_tool_constraint(
             &mut request.sampling_params,
             parser.as_deref(),
@@ -179,6 +185,7 @@ impl ChatPreprocessor {
     /// Render chat for tokenization without creating generation/output state.
     pub fn lower_to_text(&self, mut request: ChatRequest) -> Result<TextRequest, RendererError> {
         validate_chat(&request)?;
+        self.normalize_template_args(&mut request);
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
         let prompt = self.render(&request)?;
         Ok(TextRequest::rendered(
@@ -191,6 +198,19 @@ impl ChatPreprocessor {
             },
         )
         .with_metadata(request.metadata))
+    }
+
+    fn normalize_template_args(&self, request: &mut ChatRequest) {
+        let request_args = request.chat_template_args.take().unwrap_or_default();
+        let mut args = self.default_chat_template_kwargs.clone();
+        if let Some(reasoning_effort) = request.reasoning_effort.as_ref() {
+            args.insert(
+                "reasoning_effort".into(),
+                serde_json::to_value(reasoning_effort).expect("reasoning effort must serialize"),
+            );
+        }
+        args.extend(request_args);
+        request.chat_template_args = (!args.is_empty()).then_some(args);
     }
 
     fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt, RendererError> {
@@ -479,6 +499,7 @@ fn apply_tool_constraint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RendererLimits, SamplingDefaults};
     use dynamo_protocols::types::{
         ChatCompletionNamedToolChoice, ChatCompletionToolType, FunctionName,
     };
@@ -493,6 +514,68 @@ mod tests {
             })),
             strict: Some(strict),
         }
+    }
+
+    fn chat_request(tool_choice: Option<ChatCompletionToolChoiceOption>) -> ChatRequest {
+        ChatRequest {
+            rid: "chatcmpl-test".into(),
+            model: "model".into(),
+            messages: serde_json::from_value(serde_json::json!([
+                {"role": "user", "content": "hello"}
+            ]))
+            .unwrap(),
+            tools: Some(
+                serde_json::from_value(serde_json::json!([{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"}
+                    }
+                }]))
+                .unwrap(),
+            ),
+            tool_choice,
+            response_format: None,
+            reasoning_effort: None,
+            continue_final_message: false,
+            chat_template_args: None,
+            sampling_params: SamplingParams::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
+            parallel_tool_calls: true,
+            metadata: GenerateRequestMetadata::default(),
+        }
+    }
+
+    fn chat_preprocessor() -> ChatPreprocessor {
+        let config = RendererConfig {
+            served_model_name: "model".into(),
+            tokenizer_path: ".".into(),
+            revision: None,
+            model_path: String::new(),
+            chat_template: Some("chatml".into()),
+            tool_call_parser: Some("llama3".into()),
+            reasoning_parser: None,
+            default_chat_template_kwargs: Default::default(),
+            stream_response_default_include_usage: false,
+            skip_tokenizer_init: false,
+            vocab_size: 128,
+            default_sampling_params: SamplingDefaults::default(),
+            limits: RendererLimits {
+                skip_tokenizer_init: false,
+                vocab_size: 128,
+                context_len: 128,
+                num_reserved_tokens: 0,
+                allow_auto_truncate: false,
+                enable_return_hidden_states: false,
+            },
+        };
+        ChatPreprocessor::new(
+            &config,
+            Some(crate::template::load_chat_formatter(None, None, Some("chatml")).unwrap()),
+        )
     }
 
     #[test]
@@ -553,6 +636,36 @@ mod tests {
             )
             .unwrap_err()
             .contains("missing")
+        );
+    }
+
+    #[test]
+    fn tool_parsing_preserves_special_tokens_for_output_processing() {
+        let mut request = chat_request(None);
+        request.sampling_params.skip_special_tokens = true;
+
+        let chat = chat_preprocessor().preprocess(request).unwrap();
+
+        assert!(
+            !chat.text_requests[0]
+                .options
+                .sampling_params
+                .skip_special_tokens
+        );
+    }
+
+    #[test]
+    fn tool_choice_none_keeps_the_requested_special_token_behavior() {
+        let mut request = chat_request(Some(ChatCompletionToolChoiceOption::None));
+        request.sampling_params.skip_special_tokens = true;
+
+        let chat = chat_preprocessor().preprocess(request).unwrap();
+
+        assert!(
+            chat.text_requests[0]
+                .options
+                .sampling_params
+                .skip_special_tokens
         );
     }
 }

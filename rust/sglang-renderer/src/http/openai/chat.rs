@@ -73,10 +73,7 @@ async fn chat_completions(
         sampling_overrides,
         extensions,
     } = parts;
-    let response_id = extensions
-        .rid
-        .clone()
-        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
+    let response_id = extensions.response_id("chatcmpl");
     let stream = request.stream.unwrap_or(false);
     let model = request.model.clone();
     let want_logprobs = request.logprobs.unwrap_or(false);
@@ -89,6 +86,15 @@ async fn chat_completions(
             .config()
             .stream_response_default_include_usage;
     let service_tier = request.service_tier.clone();
+    let request_metadata = match extensions.expand(model.clone(), 1, 1, &response_id) {
+        Ok(mut contexts) => {
+            contexts
+                .pop()
+                .expect("one chat prompt produces one metadata context")
+                .metadata
+        }
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+    };
     let mut chat_request = match lower_chat_request_with_template_args(
         state.renderer.config(),
         request,
@@ -103,7 +109,7 @@ async fn chat_completions(
         }
     };
     sampling_overrides.apply(&mut chat_request.sampling_params);
-    chat_request.metadata = extensions.metadata(model.clone());
+    chat_request.metadata = request_metadata;
     let chat = match state.renderer.prepare_chat(chat_request).await {
         Ok(chat) => chat,
         Err(error) => {
@@ -528,6 +534,7 @@ mod tests {
             chat_template: Some("chatml".into()),
             tool_call_parser: None,
             reasoning_parser: reasoning_parser.map(str::to_owned),
+            default_chat_template_kwargs: Default::default(),
             revision: None,
             stream_response_default_include_usage: false,
             skip_tokenizer_init: false,

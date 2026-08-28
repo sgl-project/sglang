@@ -51,34 +51,12 @@ def render(args, extra_argv):
         "tokenizer_workers": server_args.tokenizer_worker_num,
         "queue_capacity": 128,
         "engine_url": engine_url,
-        "renderer": {
-            "served_model_name": server_args.served_model_name,
-            "tokenizer_path": server_args.tokenizer_path,
-            "revision": server_args.revision,
-            "model_path": server_args.model_path,
-            "chat_template": server_args.chat_template,
-            "tool_call_parser": server_args.tool_call_parser,
-            "reasoning_parser": server_args.reasoning_parser,
-            "stream_response_default_include_usage": (
-                server_args.stream_response_default_include_usage
-            ),
-            "skip_tokenizer_init": False,
-            "vocab_size": model_config.vocab_size,
-            "default_sampling_params": {
-                "temperature": defaults.get("temperature"),
-                "top_p": defaults.get("top_p"),
-            },
-            "limits": {
-                "skip_tokenizer_init": False,
-                "vocab_size": model_config.vocab_size,
-                "context_len": model_config.context_len,
-                "num_reserved_tokens": compute_num_reserved_tokens(),
-                "allow_auto_truncate": server_args.allow_auto_truncate,
-                "enable_return_hidden_states": (
-                    server_args.enable_return_hidden_states
-                ),
-            },
-        },
+        "renderer": _build_renderer_config(
+            server_args,
+            model_config,
+            defaults,
+            compute_num_reserved_tokens(),
+        ),
     }
 
     binary = os.environ.get("SGLANG_RENDERER_BIN") or shutil.which("sglang-renderer")
@@ -100,6 +78,38 @@ def render(args, extra_argv):
         config_path.unlink(missing_ok=True)
     if return_code:
         raise SystemExit(return_code)
+
+
+def _build_renderer_config(server_args, model_config, defaults, num_reserved_tokens):
+    return {
+        "served_model_name": server_args.served_model_name,
+        "tokenizer_path": server_args.tokenizer_path,
+        "revision": server_args.revision,
+        "model_path": server_args.model_path,
+        "chat_template": server_args.chat_template,
+        "tool_call_parser": server_args.tool_call_parser,
+        "reasoning_parser": server_args.reasoning_parser,
+        "default_chat_template_kwargs": (
+            server_args.default_chat_template_kwargs or {}
+        ),
+        "stream_response_default_include_usage": (
+            server_args.stream_response_default_include_usage
+        ),
+        "skip_tokenizer_init": False,
+        "vocab_size": model_config.vocab_size,
+        "default_sampling_params": {
+            "temperature": defaults.get("temperature"),
+            "top_p": defaults.get("top_p"),
+        },
+        "limits": {
+            "skip_tokenizer_init": False,
+            "vocab_size": model_config.vocab_size,
+            "context_len": model_config.context_len,
+            "num_reserved_tokens": num_reserved_tokens,
+            "allow_auto_truncate": server_args.allow_auto_truncate,
+            "enable_return_hidden_states": server_args.enable_return_hidden_states,
+        },
+    }
 
 
 def extract_engine_url(argv):
