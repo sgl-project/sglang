@@ -295,8 +295,18 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     fi
     # The pip ROCm SDK vendors NUMA and libdrm under rocm_sysdeps, outside the
     # default compiler, CMake, and linker search paths used by MORI.
+    # gfx1250 additionally needs the SDK's own cmake trees on the prefix path:
+    # that is what lets hsakmt-config.cmake resolve find_dependency(NUMA)
+    # without patching MORI's CMakeLists. Same split as docker/rocm.Dockerfile.
     ROCM_SYSDEPS="\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"
-    if [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+    if [ '${IMAGE_GFX}' = 'gfx1250' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
+      export PATH="\${ROCM_HOME}/bin:\${PATH}"
+      export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}/lib/cmake:\${ROCM_SYSDEPS}:\${ROCM_HOME}/lib/cmake:\${ROCM_HOME}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
+      export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
+      export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
+      echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    elif [ '${IMAGE_STAGE_SUFFIX}' = '-rocm1000' ] && [ -d "\${ROCM_SYSDEPS}" ]; then
       export CMAKE_PREFIX_PATH="\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}"
       export CPATH="\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}"
       export LIBRARY_PATH="\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}"
