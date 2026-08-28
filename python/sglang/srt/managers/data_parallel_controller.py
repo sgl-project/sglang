@@ -142,6 +142,11 @@ class DPBudget:
                 if method == LoadBalanceMethod.TOTAL_TOKENS
                 else self.active_tokens
             )
+            request_counts = (
+                self.total_requests
+                if method == LoadBalanceMethod.TOTAL_TOKENS
+                else self.active_requests
+            )
             candidates = (
                 range(self.dp_size)
                 if max_requests is None
@@ -153,7 +158,7 @@ class DPBudget:
             )
             target_rank = min(
                 candidates,
-                key=lambda i: (tokens[i], self.active_requests[i]),
+                key=lambda i: (tokens[i], request_counts[i]),
             )
         else:
             return None
