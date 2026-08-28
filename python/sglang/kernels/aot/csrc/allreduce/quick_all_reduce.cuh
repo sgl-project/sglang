@@ -22,6 +22,9 @@ struct CodecFP : public CodecBase {
   static constexpr int kWorldSize = world_size;
   static constexpr int kRankAtoms = kAtoms / kWorldSize;
 
+  // No block scale to protect, so the bf16 -> fp16 cast scale is the only range guard.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Fp;
+
   // Codec tile size process by this workgroup.
   // Each thread processes atoms of f16x8_t (16B).
   static constexpr int kRankTransmittedTileSize = kBlockSize * kRankAtoms * sizeof(int32x4_t);
@@ -53,6 +56,10 @@ struct CodecFP : public CodecBase {
 template <typename T, int world_size>
 struct CodecQ4 : public CodecBase {
   static constexpr int kWorldSize = world_size;
+
+  // Block-scaled: a large cast scale only pushes blocks past the rcp cliff. See
+  // kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
   // Each threads processes a fragment of fp16x8_t (16B),
@@ -191,6 +198,10 @@ struct CodecQ4 : public CodecBase {
 template <typename T, int world_size>
 struct CodecQ6 : public CodecBase {
   static constexpr int kWorldSize = world_size;
+
+  // Block-scaled: a large cast scale only pushes blocks past the rcp cliff. See
+  // kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
 
   // Codec tile size process by this workgroup.
   // Each threads processes a fragment of fp16x8_t (16B),
@@ -350,6 +361,10 @@ template <typename T, int world_size>
 struct CodecQ8 : public CodecBase {
   static constexpr int kWorldSize = world_size;
 
+  // Block-scaled: a large cast scale only pushes blocks past the rcp cliff. See
+  // kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  static constexpr int kCastScaleLog2 = kQRFp16CastScaleLog2Quant;
+
   // Codec tile size process by this workgroup.
   // Each threads processes a fragment of f16x8_t (16B),
   // into a int8x8_t (8B) and a f16 scale shared among 32 values.
@@ -493,6 +508,11 @@ struct AllReduceTwoshot {
 
   static constexpr int kWorldSize = Codec::kWorldSize;
 
+  // bf16 -> fp16 cast scale; power of two, so both multiplies are exact. See
+  // kQRFp16CastScaleLog2Fp / kQRFp16CastScaleLog2Quant in quick_all_reduce_base.h.
+  static constexpr float kCastScale = static_cast<float>(1 << Codec::kCastScaleLog2);
+  static constexpr float kCastInvScale = 1.0f / kCastScale;
+
   __device__ static void
   run(T const* __restrict__ input,
       T* __restrict__ output,
@@ -525,9 +545,9 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __bfloat1622float2(bf_buf[j]);
-          // Scale into fp16 range; undone on store. See kQRFp16CastScaleLog2 in quick_all_reduce_base.h.
-          f.x *= kQRFp16CastInvScale;
-          f.y *= kQRFp16CastInvScale;
+          // Scale into fp16 range; undone on store.
+          f.x *= kCastInvScale;
+          f.y *= kCastInvScale;
           half_buf[j] = __float22half2_rn(f);
         }
         tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
@@ -623,9 +643,9 @@ struct AllReduceTwoshot {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __half22float2(half_buf[j]);
-          // Undo the load-side scale; exact, and the fp32 intermediate cannot overflow.
-          f.x *= kQRFp16CastScale;
-          f.y *= kQRFp16CastScale;
+          // Undo the load-side scale; the fp32 intermediate cannot overflow.
+          f.x *= kCastScale;
+          f.y *= kCastScale;
           bf16_buf[j] = __float22bfloat162_rn(f);
         }
         buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer.descriptor, dst_offset, 0, 0);

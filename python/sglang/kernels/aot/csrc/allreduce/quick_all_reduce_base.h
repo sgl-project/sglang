@@ -33,19 +33,24 @@ using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 static constexpr int kNegOne = 0xBC00BC00;  // {-1, -1}, fp16x2_t
 
 // Range guard for the bf16 -> fp16 fast path (AllReduceTwoshot<..., true>): fp16 saturates at
-// 65504, and a saturated element becomes inf, which poisons its whole 32-element codec block
-// through the block max -- one out-of-range element destroys 32. Divide by a power of two on
-// load and multiply it back on store; the shift is exact and composes through the reduction,
-// since sum(x_i / S) * S == sum(x_i).
+// 65504. Divide by a power of two on load and multiply it back on store; the shift is exact, so
+// sum(x_i / S) * S == sum(x_i). S is per codec (Codec::kCastScaleLog2), because the two codec
+// families fail differently.
 //
-// S = 16 is the log-space midpoint of the window measured on captured gpt-oss-120b activations:
-// S >= 8 because the largest reduced magnitude seen is 3.3e5 (so S must exceed 5.1), and S <= 32
-// because at S = 64 the codec's own per-block decoding scale goes denormal and relative L2 error
-// degrades. Re-derive if activation magnitudes grow. Costs exactness below 2^-13 (was 2^-17) and
-// flushes to zero below 9.5e-7 (was 6.0e-8).
-static constexpr int kQRFp16CastScaleLog2 = 4;
-static constexpr float kQRFp16CastScale = static_cast<float>(1 << kQRFp16CastScaleLog2);
-static constexpr float kQRFp16CastInvScale = 1.0f / kQRFp16CastScale;
+// CodecFP carries no block scale, so S is its only range guard and is free there; S = 16 clears
+// the largest reduced magnitude measured on real TP4 traffic, 8.1e4, with margin.
+//
+// The quantized codecs already normalize each 32-element block by its own scale, and MODE.FP16_OVFL
+// (armed in CodecBase) stops an over-ceiling element from becoming an inf that poisons its whole
+// block through the block max. So for them S only costs the low end: encoding_scale =
+// rcp(decoding_scale) itself saturates at 65504, past which encode and decode stop being
+// reciprocals and the block is systematically attenuated. With L = 8 / 32 / 128 for Q4 / Q6 / Q8
+// that rcp cliff sits at blockmax = S * L / 65504, which for Q8 at S = 16 is 0.031 -- measured
+// past by 97.5% of a quiet model's blocks, taking relative L2 from 0.0057 to 0.68. This is a much
+// higher threshold than the decoding scale merely going denormal (blockmax = S * L * 2^-14),
+// which measures harmless. Keep S small here; S = 2 leaves ~2 decades below the observed blocks.
+static constexpr int kQRFp16CastScaleLog2Fp = 4;     // S = 16, CodecFP
+static constexpr int kQRFp16CastScaleLog2Quant = 1;  // S = 2, CodecQ4 / CodecQ6 / CodecQ8
 
 // Number of atoms (4xf16x2_t) processed by a single thread
 static constexpr int kAtoms = 8;
@@ -110,15 +115,15 @@ __quickreduce_device_inline__ static void
 buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) {}
 #endif
 
-// MODE.FP16_OVFL clamps overflowing fp16 arithmetic to +/-MAX_FP16 instead of inf. It does NOT
-// cover f32 -> f16 conversion (verified on gfx950: cvt(333824) still yields inf), which is why
-// the load path needs kQRFp16CastInvScale as well.
+// MODE.FP16_OVFL clamps overflowing fp16 results to +/-MAX_FP16 instead of inf, the f32 -> f16
+// conversion (v_cvt_pk_f16_f32) included. The memory clobber is load-bearing: without it the
+// compiler may hoist a conversion above the s_setreg, and that conversion still produces inf.
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
 #if defined(__gfx942__) || defined(__gfx950__)
   if (value) {
-    asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::);
+    asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::: "memory");
   } else {
-    asm volatile("s_setreg_imm32_b32 0xdc1, 0;" ::);
+    asm volatile("s_setreg_imm32_b32 0xdc1, 0;" ::: "memory");
   }
 #endif
 }
