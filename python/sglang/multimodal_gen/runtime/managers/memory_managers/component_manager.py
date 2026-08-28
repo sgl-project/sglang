@@ -1,6 +1,6 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Mapping, MutableMapping, Protocol, Sequence
 
 import torch
@@ -26,7 +26,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import DiffusionNvtxHooks
-from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
 
 logger = init_logger(__name__)
 
@@ -173,10 +172,7 @@ class ComponentResidencyManager:
         self._uses_seen.clear()
         self._modules_seen.clear()
         self._stage_uses_by_index = [
-            tuple(
-                self._effective_use(use)
-                for use in stage.component_uses(server_args, self.stage_name(stage))
-            )
+            tuple(stage.component_uses(server_args, self.stage_name(stage)))
             for stage in stages
         ]
         self._ordered_uses = tuple(
@@ -223,7 +219,6 @@ class ComponentResidencyManager:
 
         Repeated calls for the same component/phase extend the active interval.
         """
-        use = self._effective_use(use)
         if self._active_use is not None and self._same_use(self._active_use, use):
             previous_use = self._active_use
             if self._use_key(self._active_use) != self._use_key(use):
@@ -277,7 +272,6 @@ class ComponentResidencyManager:
 
     def end_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """End one sequential component use interval."""
-        use = self._effective_use(use)
         if self._active_use is None or not self._same_use(self._active_use, use):
             return
         self._disable_active_nvtx()
@@ -307,19 +301,7 @@ class ComponentResidencyManager:
 
     def ensure_ready(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Prepare a shared component and wait without making it the active use."""
-        self._prepare_forward_use(self._effective_use(use), module=module)
-
-    def _effective_use(self, use: ComponentUse) -> ComponentUse:
-        precision = (
-            vars(self.server_args)
-            .get("component_precisions", {})
-            .get(use.component_name)
-        )
-        return (
-            use
-            if precision is None or use.target_dtype is not None
-            else replace(use, target_dtype=precision_to_dtype(precision))
-        )
+        self._prepare_forward_use(use, module=module)
 
     def remove_nvtx_hooks_for_module(self, module: nn.Module | None) -> None:
         """Detach NVTX hooks before a component object is deleted or replaced."""
@@ -456,7 +438,6 @@ class ComponentResidencyManager:
 
     def _prefetch_use(self, use: ComponentUse) -> None:
         """Prepare a future memory-intensive component without waiting."""
-        use = self._effective_use(use)
         if not use.allow_prefetch:
             return
         module = self.get_module(use.component_name)

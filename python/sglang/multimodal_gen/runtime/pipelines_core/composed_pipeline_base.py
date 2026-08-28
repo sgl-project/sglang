@@ -112,6 +112,15 @@ class ComposedPipelineBase(ABC):
         self.executor = executor or self.build_executor(server_args=server_args)
         self.component_residency_manager: ComponentResidencyManager | None = None
 
+        preloaded_precision_overrides = set(loaded_modules or ()).intersection(
+            server_args.component_precisions
+        )
+        if preloaded_precision_overrides:
+            raise ValueError(
+                "Component precision overrides cannot be applied to preloaded "
+                "modules: " + ", ".join(sorted(preloaded_precision_overrides))
+            )
+
         base_required_config_modules = (
             required_config_modules
             if required_config_modules is not None
