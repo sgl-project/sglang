@@ -20,7 +20,7 @@ import threading
 import time
 import unittest.mock
 
-from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.utils.watchdog import SubprocessWatchdog, WatchdogRaw
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -133,6 +133,35 @@ class TestSubprocessWatchdog(CustomTestCase):
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
+
+
+class TestWatchdogRaw(CustomTestCase):
+    def test_timeout_dumps_local_traceback_before_pyspy(self):
+        watchdog = WatchdogRaw.__new__(WatchdogRaw)
+        watchdog.debug_name = "test"
+        watchdog.get_counter = lambda: 0
+        watchdog.is_active = lambda: True
+        watchdog.watchdog_timeout = 1
+        watchdog.soft = True
+        watchdog.dump_info = None
+
+        calls = []
+        with (
+            unittest.mock.patch(
+                "sglang.srt.utils.watchdog.time.perf_counter", side_effect=[0, 2]
+            ),
+            unittest.mock.patch(
+                "sglang.srt.utils.watchdog.faulthandler.dump_traceback",
+                side_effect=lambda **_: calls.append("faulthandler"),
+            ),
+            unittest.mock.patch(
+                "sglang.srt.utils.watchdog.pyspy_dump_schedulers",
+                side_effect=lambda: calls.append("pyspy"),
+            ),
+        ):
+            watchdog._watchdog_once()
+
+        self.assertEqual(calls, ["faulthandler", "pyspy"])
 
 
 if __name__ == "__main__":
