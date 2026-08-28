@@ -3794,6 +3794,11 @@ class UnifiedRadixCacheSuite:
         tail carries the producer's bytes, and the ack frees the entire
         bounce including the trimmed head."""
         self._skip_unsupported_hicache_test()
+        # Buffer-mode plan/commit logic is layout-independent, and each
+        # hicache fixture retains its pools for the whole file run. Pin to
+        # one config so the matrix does not exhaust a small CI GPU.
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
@@ -3858,6 +3863,11 @@ class UnifiedRadixCacheSuite:
         pin, occupancy) — a kept hold would leak, since admission without a
         host hit never calls init_load_back."""
         self._skip_unsupported_hicache_test()
+        # Buffer-mode plan/commit logic is layout-independent, and each
+        # hicache fixture retains its pools for the whole file run. Pin to
+        # one config so the matrix does not exhaust a small CI GPU.
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
@@ -3896,6 +3906,11 @@ class UnifiedRadixCacheSuite:
         cancel it BEFORE the bounce alloc and the storage read (counted as
         declined_device_covered), leaving no staging or occupancy behind."""
         self._skip_unsupported_hicache_test()
+        # Buffer-mode plan/commit logic is layout-independent, and each
+        # hicache fixture retains its pools for the whole file run. Pin to
+        # one config so the matrix does not exhaust a small CI GPU.
+        if self.cfg.page_size != 1 or self.cfg.sliding_window_size != 4:
+            self.skipTest("requires page_size=1, sliding_window_size=4")
         storage_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
 
