@@ -1407,9 +1407,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         if validate_only:
             if self.is_output_rank:
+                reference_ns = local_report.estimated_request_duration_ns
+                measured_ns = local_report.measured_request_duration_ns
+                if self._latest_auto_residency_round_supports_short_validation():
+                    result = "full-shape one-step memory check passed"
+                elif reference_ns > 0 and measured_ns > 0:
+                    change = (measured_ns - reference_ns) / reference_ns
+                    result = (
+                        "calibrated request estimate "
+                        f"{reference_ns / 1e9:.2f}s -> {measured_ns / 1e9:.2f}s "
+                        f"({change:+.1%})"
+                    )
+                else:
+                    result = "memory and execution checks passed"
                 logger.info(
-                    "Auto residency: post-adjustment calibration passed; "
-                    "keeping the selected placement."
+                    "Auto residency: post-adjustment validation passed (%s); "
+                    "keeping the selected placement.",
+                    result,
                 )
             return OutputBatch(
                 output=plan_summary_payload(
