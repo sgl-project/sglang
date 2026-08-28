@@ -26,7 +26,7 @@ placement to serve two different lifecycle objectives.
 from __future__ import annotations
 
 import statistics
-from itertools import chain
+from itertools import chain, product
 from typing import TYPE_CHECKING, Callable, Collection, Iterable, Mapping, Sequence
 
 import msgspec
@@ -146,6 +146,7 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     phase_used_components: dict[str, tuple[str, ...]] = {}
     phase_prefetched_components: dict[str, tuple[str, ...]] = {}
     phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
+    layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] = {}
     num_inference_steps: int = 1
     total_duration_ms: float = 0.0
     stage_duration_ms: dict[str, float] = {}
@@ -421,6 +422,54 @@ def resolve_measured_default_workload(
         num_frames=workload.num_frames,
         num_inference_steps=workload.num_inference_steps,
     )
+
+
+def estimate_layerwise_layer_uses(
+    *,
+    records: Iterable[WarmupMemoryRecord],
+    target_units: int | None,
+    target_num_inference_steps: int,
+) -> dict[str, dict[str, tuple[int, ...]]]:
+    """Estimate per-request layer calls from the calibration forward.
+
+    A full-shape probe may use fewer denoise steps than the target request. A
+    layer observed more than once is step-scoped and scales with that request;
+    a one-shot encoder, refiner, or decoder layer remains one-shot.
+    """
+    successful = [record for record in records if record.succeeded]
+    if target_units is not None:
+        covering = [
+            record for record in successful if record.workload_units() >= target_units
+        ]
+        if covering:
+            successful = covering
+
+    estimated: dict[str, dict[str, list[int]]] = {}
+    for record in successful:
+        source_steps = max(1, record.num_inference_steps)
+        for component_name, groups in record.layerwise_layer_uses.items():
+            component = estimated.setdefault(component_name, {})
+            for layer_name, counts in groups.items():
+                target = component.setdefault(layer_name, [0] * len(counts))
+                if len(target) != len(counts):
+                    continue
+                for layer_index, count in enumerate(counts):
+                    scaled = count
+                    if (
+                        is_dit_component_name(component_name)
+                        and count > 1
+                        and target_num_inference_steps > source_steps
+                    ):
+                        scaled = (
+                            count * target_num_inference_steps + source_steps - 1
+                        ) // source_steps
+                    target[layer_index] = max(target[layer_index], scaled)
+    return {
+        component_name: {
+            layer_name: tuple(counts) for layer_name, counts in groups.items()
+        }
+        for component_name, groups in estimated.items()
+    }
 
 
 def estimate_default_workload_timing(
@@ -1110,6 +1159,7 @@ def _layerwise_transfer_work_bytes(
     residency_policies: tuple[str, ...] | None = None,
     pinned_layers: tuple[tuple[int, ...], ...],
     uses_per_streamed_layer: int,
+    layer_uses: tuple[tuple[int, ...], ...] | None = None,
 ) -> int:
     """Relative transfer work for one request under a layerwise placement.
 
@@ -1118,9 +1168,14 @@ def _layerwise_transfer_work_bytes(
     conservative ordering metric rather than a latency prediction.
     """
     policies = _resolve_layerwise_policies(managers, residency_policies)
+    resolved_uses = _resolve_layerwise_uses(
+        managers=managers,
+        layer_uses=layer_uses,
+        fallback_uses=uses_per_streamed_layer,
+    )
     total = 0
-    for manager, resident_count, policy, pinned_indices in zip(
-        managers, resident_layers, policies, pinned_layers
+    for manager, resident_count, policy, pinned_indices, manager_uses in zip(
+        managers, resident_layers, policies, pinned_layers, resolved_uses
     ):
         streamed = set(
             compute_streamed_layers(
@@ -1131,12 +1186,73 @@ def _layerwise_transfer_work_bytes(
         )
         pinned = set(pinned_indices)
         for layer_idx, weight_bytes in manager.layer_weight_bytes().items():
-            uses = uses_per_streamed_layer if layer_idx in streamed else 1
+            observed_uses = manager_uses[layer_idx]
+            uses = observed_uses if layer_idx in streamed else min(1, observed_uses)
             transfer_multiplier = (
                 1 if layer_idx in pinned else PAGEABLE_H2D_COST_MULTIPLIER
             )
             total += uses * transfer_multiplier * weight_bytes
     return total
+
+
+def _resolve_layerwise_uses(
+    *,
+    managers: Sequence,
+    layer_uses: tuple[tuple[int, ...], ...] | None,
+    fallback_uses: int,
+) -> tuple[tuple[int, ...], ...]:
+    if layer_uses is None:
+        return tuple(
+            tuple(max(0, fallback_uses) for _ in range(manager.num_layers))
+            for manager in managers
+        )
+    if len(layer_uses) != len(managers):
+        raise ValueError("layerwise usage group count changed")
+    resolved = []
+    for manager, counts in zip(managers, layer_uses):
+        if len(counts) != manager.num_layers:
+            raise ValueError("layerwise usage layer count changed")
+        resolved.append(tuple(max(0, int(count)) for count in counts))
+    return tuple(resolved)
+
+
+def _layer_uses_for_managers(
+    *,
+    managers: Sequence,
+    uses_by_layer_name: Mapping[str, tuple[int, ...]] | None,
+    fallback_uses: int,
+) -> tuple[tuple[int, ...], ...] | None:
+    if uses_by_layer_name is None:
+        return None
+    return tuple(
+        uses_by_layer_name.get(
+            manager.layers_attr_str,
+            tuple(max(0, fallback_uses) for _ in range(manager.num_layers)),
+        )
+        for manager in managers
+    )
+
+
+def _layerwise_active_peak_device_bytes(
+    *,
+    managers: Sequence,
+    resident_layers: tuple[int, ...],
+    residency_policies: tuple[str, ...] | None = None,
+    layer_uses: tuple[tuple[int, ...], ...] | None,
+) -> int:
+    policies = _resolve_layerwise_policies(managers, residency_policies)
+    if layer_uses is None:
+        return sum(
+            manager.peak_managed_device_weight_bytes(count, policy)
+            for manager, count, policy in zip(managers, resident_layers, policies)
+        )
+    return sum(
+        manager.peak_managed_device_weight_bytes(count, policy)
+        for manager, count, policy, uses in zip(
+            managers, resident_layers, policies, layer_uses
+        )
+        if any(uses)
+    )
 
 
 def _layerwise_pin_targets(
@@ -1146,6 +1262,7 @@ def _layerwise_pin_targets(
     residency_policies: tuple[str, ...] | None = None,
     current_pinned_layers: tuple[tuple[int, ...], ...],
     uses_per_streamed_layer: int,
+    layer_uses: tuple[tuple[int, ...], ...] | None = None,
 ) -> list[tuple[tuple[int, ...], ...]]:
     """Pareto-optimal HostPin targets for one resident-layer placement.
 
@@ -1155,11 +1272,16 @@ def _layerwise_pin_targets(
     packings needed when layer sizes differ.
     """
     policies = _resolve_layerwise_policies(managers, residency_policies)
+    resolved_uses = _resolve_layerwise_uses(
+        managers=managers,
+        layer_uses=layer_uses,
+        fallback_uses=uses_per_streamed_layer,
+    )
     current = [set(indices) for indices in current_pinned_layers]
     current_bytes = 0
     grouped: dict[tuple[int, int, int, bool], list[tuple[int, int]]] = {}
-    for manager_index, (manager, resident_count, policy) in enumerate(
-        zip(managers, resident_layers, policies)
+    for manager_index, (manager, resident_count, policy, manager_uses) in enumerate(
+        zip(managers, resident_layers, policies, resolved_uses)
     ):
         streamed = set(
             compute_streamed_layers(
@@ -1173,7 +1295,8 @@ def _layerwise_pin_targets(
         transfer_bytes = manager.layer_weight_bytes()
         host_bytes = manager.layer_host_store_bytes()
         for layer_idx in manager.pinnable_layer_indices():
-            uses = uses_per_streamed_layer if layer_idx in streamed else 1
+            observed_uses = manager_uses[layer_idx]
+            uses = observed_uses if layer_idx in streamed else min(1, observed_uses)
             layer_host_bytes = host_bytes.get(layer_idx, 0)
             is_current = layer_idx in current[manager_index]
             if is_current:
@@ -1267,8 +1390,17 @@ def _layerwise_pin_targets(
     ]
 
 
-def _layerwise_resident_targets(managers: Sequence) -> list[tuple[int, ...]]:
-    """All resident-count tuples expressible by the component-level CLI knob.
+def _layerwise_resident_targets(
+    managers: Sequence,
+    *,
+    layer_uses: tuple[tuple[int, ...], ...] | None = None,
+) -> list[tuple[int, ...]]:
+    """Useful resident-count tuples for the measured request.
+
+    Measured repeatedly executed groups are independent. Groups used at most
+    once remain streamed because stage residency cannot avoid their only load;
+    HostPin or whole-component residency represents their useful alternatives.
+    Without measurements, retain every state expressible by the public knob.
 
     ``--layerwise-resident-layers`` accepts either one absolute count or one
     ratio for a component. Those are different paths when a component owns
@@ -1279,6 +1411,18 @@ def _layerwise_resident_targets(managers: Sequence) -> list[tuple[int, ...]]:
     explicit interface can represent.
     """
     layer_counts = tuple(manager.num_layers for manager in managers)
+    if layer_uses is not None:
+        resolved_uses = _resolve_layerwise_uses(
+            managers=managers,
+            layer_uses=layer_uses,
+            fallback_uses=0,
+        )
+        choices = [
+            range(num_layers + 1) if any(count > 1 for count in uses) else (0,)
+            for num_layers, uses in zip(layer_counts, resolved_uses)
+        ]
+        return list(product(*choices))
+
     targets = {tuple(0 for _ in managers)}
 
     for count in range(1, max(layer_counts) + 1):
@@ -1338,11 +1482,13 @@ class _EstimatedLayerwiseManager:
     def __init__(
         self,
         *,
+        layers_attr_str: str,
         layer_bytes: dict[int, int],
         prefetch_size: int,
         residency_policy: str,
         pin_cpu_memory: bool,
     ) -> None:
+        self.layers_attr_str = layers_attr_str
         self._layer_bytes = layer_bytes
         self.num_layers = len(layer_bytes)
         self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
@@ -1431,6 +1577,7 @@ def _estimate_unconfigured_layerwise_managers(
             prefetch_size = int(prefetch_value)
         estimates.append(
             _EstimatedLayerwiseManager(
+                layers_attr_str=layer_name,
                 layer_bytes=estimate_layer_weight_bytes(layers),
                 prefetch_size=prefetch_size,
                 residency_policy=residency_policy,
@@ -1452,6 +1599,8 @@ def _unconfigured_layerwise_targets(
     pin_cpu_memory: bool,
     allow_host_pin_reallocation: bool,
     tune_residency_policy: bool,
+    component_used: bool,
+    layer_uses_by_name: Mapping[str, tuple[int, ...]] | None,
 ) -> tuple[list[ResidencyTarget], int]:
     """Virtual layerwise frontier for a component still using coarse offload.
 
@@ -1474,7 +1623,14 @@ def _unconfigured_layerwise_targets(
         return [], 0
     unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
     uses_per_request = (
-        max(1, num_inference_steps) if is_dit_component_name(component_name) else 1
+        max(1, num_inference_steps)
+        if component_used and is_dit_component_name(component_name)
+        else int(component_used)
+    )
+    layer_uses = _layer_uses_for_managers(
+        managers=managers,
+        uses_by_layer_name=layer_uses_by_name,
+        fallback_uses=uses_per_request,
     )
     empty_pins = tuple(() for _ in managers)
     maximum_transfer_work = _layerwise_transfer_work_bytes(
@@ -1482,11 +1638,19 @@ def _unconfigured_layerwise_targets(
         resident_layers=tuple(0 for _ in managers),
         pinned_layers=empty_pins,
         uses_per_streamed_layer=uses_per_request,
+        layer_uses=layer_uses,
     )
-    coarse_transfer_work = maximum_transfer_work // uses_per_request
+    coarse_transfer_work = (
+        PAGEABLE_H2D_COST_MULTIPLIER * full_weight_bytes if component_used else 0
+    )
     coarse_savings = max(0, maximum_transfer_work - coarse_transfer_work)
     current_resident = current_mode == RESIDENT
     current_inactive_bytes = full_weight_bytes if current_resident else 0
+    initial_managed_bytes = _layerwise_active_peak_device_bytes(
+        managers=managers,
+        resident_layers=tuple(0 for _ in managers),
+        layer_uses=layer_uses,
+    )
     host_materialize_scratch = max(
         (
             weight_bytes
@@ -1496,7 +1660,7 @@ def _unconfigured_layerwise_targets(
         default=0,
     )
     targets = []
-    for resident_layers in _layerwise_resident_targets(managers):
+    for resident_layers in _layerwise_resident_targets(managers, layer_uses=layer_uses):
         for policies in _layerwise_policy_targets(
             managers=managers,
             resident_layers=resident_layers,
@@ -1506,9 +1670,11 @@ def _unconfigured_layerwise_targets(
                 manager.resident_weight_bytes(count, policy)
                 for manager, count, policy in zip(managers, resident_layers, policies)
             )
-            active_managed_bytes = sum(
-                manager.peak_managed_device_weight_bytes(count, policy)
-                for manager, count, policy in zip(managers, resident_layers, policies)
+            active_managed_bytes = _layerwise_active_peak_device_bytes(
+                managers=managers,
+                resident_layers=resident_layers,
+                residency_policies=policies,
+                layer_uses=layer_uses,
             )
             pin_targets = (
                 _layerwise_pin_targets(
@@ -1517,6 +1683,7 @@ def _unconfigured_layerwise_targets(
                     residency_policies=policies,
                     current_pinned_layers=empty_pins,
                     uses_per_streamed_layer=uses_per_request,
+                    layer_uses=layer_uses,
                 )
                 if allow_host_pin_reallocation
                 else [empty_pins]
@@ -1535,6 +1702,7 @@ def _unconfigured_layerwise_targets(
                     residency_policies=policies,
                     pinned_layers=pinned_layers,
                     uses_per_streamed_layer=uses_per_request,
+                    layer_uses=layer_uses,
                 )
                 targets.append(
                     ResidencyTarget(
@@ -1564,7 +1732,9 @@ def _unconfigured_layerwise_targets(
                         host_pin_scratch_bytes=pinned_bytes,
                         host_materialize_scratch_bytes=host_materialize_scratch,
                         device_transition_delta_bytes=(
-                            unmanaged_weight_bytes - current_inactive_bytes
+                            unmanaged_weight_bytes
+                            + initial_managed_bytes
+                            - current_inactive_bytes
                         ),
                         active_device_delta_bytes=(
                             unmanaged_weight_bytes
@@ -1627,6 +1797,8 @@ def collect_residency_targets(
     layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str]] | None = None,
     layerwise_policy_is_explicit: Callable[[str, bool], bool] | None = None,
     pin_cpu_memory: bool = True,
+    used_components: Iterable[str] | None = None,
+    layerwise_layer_uses: Mapping[str, Mapping[str, tuple[int, ...]]] | None = None,
 ) -> list[ResidencyTarget]:
     """Build complete target-state frontiers for auto-managed components.
 
@@ -1638,6 +1810,7 @@ def collect_residency_targets(
     custom_names = set(custom_strategy_names)
     mixed_dtype_names = set(mixed_dtype_components)
     required_resident_names = set(required_resident_components)
+    measured_used_names = set(used_components) if used_components is not None else None
     if baseline_residency_mode_of is None:
         baseline_residency_mode_of = residency_mode_of
     candidates = []
@@ -1654,7 +1827,21 @@ def collect_residency_targets(
             continue
         if is_fsdp_managed_module(module):
             continue
+        component_layer_uses = (
+            layerwise_layer_uses.get(name) if layerwise_layer_uses is not None else None
+        )
+        measured_layer_use = bool(
+            component_layer_uses
+            and any(
+                count for counts in component_layer_uses.values() for count in counts
+            )
+        )
         current_mode = residency_mode_of(name)
+        component_used = (
+            measured_used_names is None
+            or name in measured_used_names
+            or measured_layer_use
+        )
         if current_mode == RESIDENT and name in required_resident_names:
             # A runtime feature owns this hard requirement. Unset startup
             # residency is only an initial placement and remains tunable.
@@ -1721,15 +1908,17 @@ def collect_residency_targets(
                         pin_cpu_memory=pin_cpu_memory,
                         allow_host_pin_reallocation=allow_host_pin_reallocation,
                         tune_residency_policy=tune_residency_policy,
+                        component_used=component_used,
+                        layer_uses_by_name=component_layer_uses,
                     )
                 )
             uses_per_request = (
-                max(1, num_inference_steps) if is_dit_component_name(name) else 1
+                max(1, num_inference_steps)
+                if component_used and is_dit_component_name(name)
+                else int(component_used)
             )
             component_transfer_work = (
-                maximum_transfer_work // uses_per_request
-                if maximum_transfer_work
-                else 0
+                PAGEABLE_H2D_COST_MULTIPLIER * weight_bytes if component_used else 0
             )
             candidates.extend(
                 [
@@ -1809,7 +1998,14 @@ def collect_residency_targets(
         # A layerwise DiT re-streams its layers once per denoise forward;
         # every other offloaded component transfers once per request.
         uses_per_request = (
-            max(1, num_inference_steps) if is_dit_component_name(name) else 1
+            max(1, num_inference_steps)
+            if component_used and is_dit_component_name(name)
+            else int(component_used)
+        )
+        layer_uses = _layer_uses_for_managers(
+            managers=managers,
+            uses_by_layer_name=component_layer_uses,
+            fallback_uses=uses_per_request,
         )
         current_resident_layers = tuple(manager.resident_layers for manager in managers)
         current_residency_policies = tuple(
@@ -1821,7 +2017,12 @@ def collect_residency_targets(
         current_peak_device_bytes = (
             managed_weight_bytes
             if current_permanent
-            else sum(manager.peak_managed_device_weight_bytes() for manager in managers)
+            else _layerwise_active_peak_device_bytes(
+                managers=managers,
+                resident_layers=current_resident_layers,
+                residency_policies=current_residency_policies,
+                layer_uses=layer_uses,
+            )
         )
         current_inactive_device_bytes = managed_weight_bytes if current_permanent else 0
         current_pinned_bytes = sum(
@@ -1832,10 +2033,13 @@ def collect_residency_targets(
             resident_layers=tuple(0 for _ in managers),
             pinned_layers=tuple(() for _ in managers),
             uses_per_streamed_layer=uses_per_request,
+            layer_uses=layer_uses,
         )
         full_weight_bytes = _module_weight_bytes(module)
         unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
-        component_transfer_work = 2 * full_weight_bytes
+        component_transfer_work = (
+            PAGEABLE_H2D_COST_MULTIPLIER * full_weight_bytes if component_used else 0
+        )
         maximum_transfer_work = max(
             layerwise_maximum_transfer_work, component_transfer_work
         )
@@ -1879,7 +2083,9 @@ def collect_residency_targets(
                 )
             )
 
-        for target_resident_layers in _layerwise_resident_targets(managers):
+        for target_resident_layers in _layerwise_resident_targets(
+            managers, layer_uses=layer_uses
+        ):
             for target_policies in _layerwise_policy_targets(
                 managers=managers,
                 resident_layers=target_resident_layers,
@@ -1891,11 +2097,11 @@ def collect_residency_targets(
                         managers, target_resident_layers, target_policies
                     )
                 )
-                target_peak_device_bytes = sum(
-                    manager.peak_managed_device_weight_bytes(count, policy)
-                    for manager, count, policy in zip(
-                        managers, target_resident_layers, target_policies
-                    )
+                target_peak_device_bytes = _layerwise_active_peak_device_bytes(
+                    managers=managers,
+                    resident_layers=target_resident_layers,
+                    residency_policies=target_policies,
+                    layer_uses=layer_uses,
                 )
                 pin_targets = (
                     _layerwise_pin_targets(
@@ -1904,6 +2110,7 @@ def collect_residency_targets(
                         residency_policies=target_policies,
                         current_pinned_layers=current_pinned_layers,
                         uses_per_streamed_layer=uses_per_request,
+                        layer_uses=layer_uses,
                     )
                     if allow_host_pin_reallocation
                     else [current_pinned_layers]
@@ -1924,6 +2131,7 @@ def collect_residency_targets(
                         residency_policies=target_policies,
                         pinned_layers=target_pinned_layers,
                         uses_per_streamed_layer=uses_per_request,
+                        layer_uses=layer_uses,
                     )
                     unpin_scratch, pin_scratch = _layerwise_host_transition_bytes(
                         managers=managers,

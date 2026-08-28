@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
+    LayerwiseUsageTracker,
     compute_streamed_layers,
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
@@ -51,6 +52,36 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     RESIDENCY_POLICY_STRIDED,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class _UsageTrackedVAE(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["encoder", "decoder"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = torch.nn.ModuleList(torch.nn.Identity() for _ in range(2))
+        self.decoder = torch.nn.ModuleList(torch.nn.Identity() for _ in range(3))
+
+    def forward(self, value):
+        for layer in self.decoder:
+            value = layer(value)
+        return value
+
+
+def test_layerwise_usage_tracker_observes_only_executed_groups():
+    module = _UsageTrackedVAE()
+    tracker = LayerwiseUsageTracker({"vae": module})
+
+    module(torch.zeros(1))
+    uses = tracker.finish()
+
+    assert uses == {
+        "vae": {
+            "encoder": (0, 0),
+            "decoder": (1, 1, 1),
+        }
+    }
+    assert all(not layer._forward_pre_hooks for layer in module.decoder)
 
 
 class _FakeStream:
