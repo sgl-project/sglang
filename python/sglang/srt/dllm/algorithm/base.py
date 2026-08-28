@@ -92,9 +92,7 @@ class DllmAlgorithm:
                     states[i] = dict(carried)
                 elif isinstance(states[i], dict):
                     states[i].update(carried)
-        if all(
-            isinstance(state, dict) and "prompt_len" in state for state in states
-        ):
+        if all(isinstance(state, dict) and "prompt_len" in state for state in states):
             start_list = [state["prompt_len"] for state in states]
         else:
             start_list = self._block_start_list(forward_batch)

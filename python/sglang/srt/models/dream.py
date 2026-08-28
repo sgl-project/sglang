@@ -47,9 +47,7 @@ class DreamModel(Qwen2ForCausalLM):
                 seq_lens = forward_batch.extend_seq_lens_cpu
 
                 if seq_lens is None:
-                    raise RuntimeError(
-                        "Dream requires per-request sequence lengths"
-                    )
+                    raise RuntimeError("Dream requires per-request sequence lengths")
 
                 parts = hidden_states.split(seq_lens)
 
