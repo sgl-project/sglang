@@ -75,8 +75,8 @@ def _align_pipeline_layers(layers: list, layer_model) -> list:
     assert (
         len(layers) <= end_layer - start_layer
     ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
-    return [None] * start_layer + layers + [None] * (
-        len(layer_model.layers) - end_layer
+    return (
+        [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
     )
 
 
