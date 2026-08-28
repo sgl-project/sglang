@@ -580,7 +580,10 @@ class KimiK3MoE(nn.Module):
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
-        elif self._shared_experts_attn_tp_comm:
+        elif (
+            get_parallel().enable_shared_experts_attn_tp
+            and get_parallel().attn_tp_size > 1
+        ):
             shared_experts_tp_kwargs = dict(
                 tp_rank=get_parallel().attn_tp_rank,
                 tp_size=get_parallel().attn_tp_size,
