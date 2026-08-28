@@ -46,11 +46,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_never_written_slots_fail_the_lookup(self):
         """Looking up a slot no forward ever stamped is a bug, not a version."""
         with self.assertRaisesRegex(ValueError, r"\[0, 1, 2\]"):
-<<<<<<< ours
             _table()._lookup_spans(_slots(0, 1, 2))
-=======
-            _table()._lookup_spans(_slots(0, 1, 2))
->>>>>>> theirs
 
     def test_single_version_collapses_into_one_span(self):
         """Slots written by one version compress into a single span."""
@@ -82,11 +78,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
         table.record(slot_indices=_slots(1, 3), version="v0")
 
         with self.assertRaisesRegex(ValueError, r"\[2\]"):
-<<<<<<< ours
             table._lookup_spans(_slots(1, 2, 3))
-=======
-            table._lookup_spans(_slots(1, 2, 3))
->>>>>>> theirs
 
     def test_non_adjacent_slots_with_the_same_version_merge(self):
         """Compression follows lookup order, not slot order, so the same version merges."""
@@ -118,11 +110,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
         """Looking up an empty prompt yields an empty span list."""
         self.assertEqual(_table()._lookup_spans(_slots()), [])
 
-<<<<<<< ours
     def test_fill_req_prefill_weight_versions_resolves_the_prompt_slots_onto_the_request(
-=======
-    def test_fill_req_prefill_weight_versions_resolves_the_prompt_slots_onto_the_request(
->>>>>>> theirs
         self,
     ):
         """The prompt's KV slots resolve to the versions that computed them."""
@@ -141,11 +129,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
             ],
         )
 
-<<<<<<< ours
     def test_fill_req_prefill_weight_versions_is_clamped_to_the_committed_kv_length(
-=======
-    def test_fill_req_prefill_weight_versions_is_clamped_to_the_committed_kv_length(
->>>>>>> theirs
         self,
     ):
         """A prompt whose KV is only partially committed reports only the committed tokens."""
