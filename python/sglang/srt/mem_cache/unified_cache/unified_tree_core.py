@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -939,7 +940,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
@@ -1923,6 +1927,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             if t:
                 comp_xfers[comp.component_type] = t
+        # Reject transfers that would claim a node pinned by another load-back
+        # anchor; the empty spec makes the caller back off and recompute.
+        if any(
+            self.node_by_id(nid).load_back_pending_id not in (None, node_id)
+            for xfers in ([kv_xfer], *comp_xfers.values())
+            for xfer in xfers
+            for nid in xfer.nodes_to_load or ()
+        ):
+            empty_kv = PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.empty((0,), dtype=torch.int64, device="cpu"),
+                nodes_to_load=[],
+            )
+            return empty_kv, {}
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
