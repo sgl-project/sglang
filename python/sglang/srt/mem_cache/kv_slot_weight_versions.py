@@ -37,30 +37,30 @@ class KvSlotWeightVersions:
         )
 
     def _lookup_spans(self, slot_indices: torch.Tensor) -> WeightVersionSpans:
-        version_ids = self._slot_version_ids[slot_indices]
-        if len(version_ids) == 0:
-            return []
-
-        is_run_start = torch.ones_like(version_ids, dtype=torch.bool)
-        is_run_start[1:] = version_ids[1:] != version_ids[:-1]
-        run_starts = is_run_start.nonzero().flatten()
-        run_bounds = torch.cat([run_starts, run_starts.new_tensor([len(version_ids)])])
-        run_version_ids = version_ids[run_starts].tolist()
-        run_bounds_list = run_bounds.tolist()
-        if _UNWRITTEN_VERSION_ID in run_version_ids:
+        version_ids: List[int] = self._slot_version_ids[slot_indices].tolist()
+        if _UNWRITTEN_VERSION_ID in version_ids:
+            unwritten_slots = [
+                slot
+                for slot, version_id in zip(
+                    slot_indices.tolist(), version_ids, strict=True
+                )
+                if version_id == _UNWRITTEN_VERSION_ID
+            ]
             raise ValueError(
                 "KV slots without a recorded weight version were looked up: "
-                f"{slot_indices[version_ids == _UNWRITTEN_VERSION_ID].tolist()}"
+                f"{unwritten_slots}"
             )
 
-        return [
-            WeightVersionSpan(
-                version=self._version_str_by_id[version_id], start=start, end=end
-            )
-            for version_id, start, end in zip(
-                run_version_ids, run_bounds_list[:-1], run_bounds_list[1:], strict=True
-            )
-        ]
+        spans: WeightVersionSpans = []
+        for position, version_id in enumerate(version_ids):
+            version = self._version_str_by_id[version_id]
+            if spans and spans[-1].version == version:
+                spans[-1].end = position + 1
+            else:
+                spans.append(
+                    WeightVersionSpan(version=version, start=position, end=position + 1)
+                )
+        return spans
 
     def _intern(self, version: str) -> int:
         if (version_id := self._version_id_by_str.get(version)) is not None:
