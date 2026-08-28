@@ -822,14 +822,16 @@ def _layerwise_pin_targets(
     current_pinned_layers: tuple[tuple[int, ...], ...],
     uses_per_streamed_layer: int,
 ) -> list[tuple[tuple[int, ...], ...]]:
-    """Bounded useful HostPin frontier for one resident-layer placement.
+    """Pareto-optimal HostPin targets for one resident-layer placement.
 
-    Streamed layers have the highest value per byte because they transfer every
-    denoise step. Deterministic prefixes keep candidate generation linear in
-    the layer count; the joint planner still evaluates those targets against
-    rank VRAM, HostPin, and transition headroom together.
+    Layers with identical transfer value, host cost and current pin state are
+    interchangeable, so they are grouped before subset construction. This
+    keeps repeated transformer blocks linear while retaining non-prefix
+    packings needed when layer sizes differ.
     """
-    ordered: list[tuple[int, int, int]] = []
+    current = [set(indices) for indices in current_pinned_layers]
+    current_bytes = 0
+    grouped: dict[tuple[int, int, int, bool], list[tuple[int, int]]] = {}
     for manager_index, (manager, resident_count) in enumerate(
         zip(managers, resident_layers)
     ):
@@ -842,18 +844,101 @@ def _layerwise_pin_targets(
         )
         if not manager.pin_cpu_memory:
             continue
+        transfer_bytes = manager.layer_weight_bytes()
+        host_bytes = manager.layer_host_store_bytes()
         for layer_idx in manager.pinnable_layer_indices():
             uses = uses_per_streamed_layer if layer_idx in streamed else 1
-            ordered.append((-uses, manager_index, layer_idx))
-    ordered.sort()
+            layer_host_bytes = host_bytes.get(layer_idx, 0)
+            is_current = layer_idx in current[manager_index]
+            if is_current:
+                current_bytes += layer_host_bytes
+            grouped.setdefault(
+                (
+                    uses,
+                    transfer_bytes.get(layer_idx, 0),
+                    layer_host_bytes,
+                    is_current,
+                ),
+                [],
+            ).append((manager_index, layer_idx))
 
-    targets: list[tuple[tuple[int, ...], ...]] = [current_pinned_layers]
-    selected = [set() for _ in managers]
-    targets.append(tuple(() for _ in managers))
-    for _, manager_index, layer_idx in ordered:
-        selected[manager_index].add(layer_idx)
-        targets.append(tuple(tuple(sorted(indices)) for indices in selected))
-    return list(dict.fromkeys(targets))
+    # target HostPin bytes, avoided pageable-transfer work, unpin scratch,
+    # pin scratch, selected layer indices.
+    states = [(0, 0, current_bytes, 0, tuple(() for _ in managers))]
+
+    def dominates(left, right) -> bool:
+        return (
+            left[0] <= right[0]
+            and left[1] >= right[1]
+            and left[2] <= right[2]
+            and left[3] <= right[3]
+        )
+
+    def prune(candidates):
+        best_by_cost = {}
+        for state in candidates:
+            key = state[:4]
+            incumbent = best_by_cost.get(key)
+            if incumbent is None or state[4] < incumbent[4]:
+                best_by_cost[key] = state
+        frontier = []
+        for state in sorted(
+            best_by_cost.values(),
+            key=lambda item: (item[0], item[2], item[3], -item[1], item[4]),
+        ):
+            if any(dominates(existing, state) for existing in frontier):
+                continue
+            frontier = [
+                existing for existing in frontier if not dominates(state, existing)
+            ]
+            frontier.append(state)
+        return frontier
+
+    for (uses, transfer_bytes, host_bytes, is_current), layers in sorted(
+        grouped.items(),
+        key=lambda item: (-item[0][0], -item[0][1], item[0][2], item[0][3]),
+    ):
+        layers.sort()
+        choices = []
+        selected = [set() for _ in managers]
+        for count in range(len(layers) + 1):
+            if count:
+                manager_index, layer_idx = layers[count - 1]
+                selected[manager_index].add(layer_idx)
+            choices.append(
+                (
+                    count * host_bytes,
+                    count * uses * transfer_bytes,
+                    -count * host_bytes if is_current else 0,
+                    0 if is_current else count * host_bytes,
+                    tuple(tuple(sorted(indices)) for indices in selected),
+                )
+            )
+
+        expanded = []
+        for state in states:
+            for choice in choices:
+                expanded.append(
+                    (
+                        state[0] + choice[0],
+                        state[1] + choice[1],
+                        state[2] + choice[2],
+                        state[3] + choice[3],
+                        tuple(
+                            tuple(sorted(set(left) | set(right)))
+                            for left, right in zip(state[4], choice[4])
+                        ),
+                    )
+                )
+        states = prune(expanded)
+
+    return [
+        state[4]
+        for state in sorted(
+            states,
+            key=lambda item: (item[0], item[2], item[3], -item[1], item[4]),
+        )
+    ]
 
 
 def _layerwise_resident_targets(managers: Sequence) -> list[tuple[int, ...]]:
