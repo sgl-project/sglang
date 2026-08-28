@@ -873,7 +873,10 @@ class DataParallelController:
     def event_loop(self):
         while True:
             ready_requests = []
-            while len(ready_requests) < self._active_count_cache:
+            ready_request_limit = (
+                self.server_args.max_running_requests or self._active_count_cache
+            )
+            while len(ready_requests) < ready_request_limit:
                 self.soft_watchdog.feed()
                 try:
                     ready_requests.append(
