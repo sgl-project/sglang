@@ -283,11 +283,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        capturing = (
-            torch.xpu.is_current_stream_capturing()
-            if _is_xpu
-            else torch.cuda.is_current_stream_capturing()
-        )
+        capturing = torch.get_device_module().is_current_stream_capturing()
 
         if visual_token_mask is not None and not capturing:
             all_visual = visual_token_mask.all()
