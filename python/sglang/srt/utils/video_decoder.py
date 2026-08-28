@@ -74,11 +74,24 @@ class VideoDecoderWrapper:
                 import tempfile
 
                 fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
-                try:
-                    os.write(fd, source)
-                finally:
-                    os.close(fd)
+                # Record the path before writing. The write can fail part way
+                # through (ENOSPC on a large video, for instance) and the file
+                # still exists on disk, but close() only removes what
+                # _tmp_path names, so assigning afterwards orphans the file.
                 self._tmp_path = tmp_path
+                try:
+                    # Write through a buffered writer rather than a bare
+                    # os.write(). os.write() is a single write(2), which the
+                    # kernel caps (0x7ffff000 bytes on Linux) and which reports
+                    # a short count rather than raising, so it silently
+                    # truncated videos above ~2 GiB.
+                    with os.fdopen(fd, "wb") as tmp_file:
+                        tmp_file.write(source)
+                except BaseException:
+                    # __del__ is not a reliable cleanup path for an object
+                    # whose __init__ raised, so remove the file here.
+                    self.close()
+                    raise
                 self._decoder = VideoReader(tmp_path, ctx=cpu(0))
             else:
                 self._decoder = VideoReader(source, ctx=cpu(0))
