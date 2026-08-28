@@ -2411,9 +2411,7 @@ class LayerwiseOffloadableModuleMixin:
                     parameter = parameters.get(name)
                     if parameter is not None:
                         parameter.data = host_tensor
-            if current_platform.is_mps() and hasattr(
-                self, "_mps_cpu_non_layer_parameters"
-            ):
+            if current_platform.is_mps():
                 self.restore_mps_cpu_non_layer_weights()
             self.to("cpu")
         else:
