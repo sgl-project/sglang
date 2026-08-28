@@ -149,12 +149,14 @@ class TestTransportBackend(CustomTestCase):
                 config={"k": "v"},
                 entries=entries,
                 pid=123,
+                preloaded_weights_bytes=65536,
             )
             resp = recv_msg(b)
             resp = backend.recv_fetch_state_response(b, resp)
             imported = backend.import_tensor(resp["entries"]["x"])
             self.assertTrue(torch.equal(imported.cpu(), state_tensors["x"][0]))
             self.assertEqual(resp["transport_backend"], TORCH_IPC_BACKEND)
+            self.assertEqual(resp["preloaded_weights_bytes"], 65536)
         finally:
             a.close()
             b.close()

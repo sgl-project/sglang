@@ -5,6 +5,7 @@ Usage:
 python3 -m unittest test_xpu_embedding.TestXPUEmbedding
 """
 
+import gc
 import multiprocessing as mp
 import unittest
 from typing import Optional
@@ -14,7 +15,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, get_similarities
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache, get_similarities
 
 register_xpu_ci(est_time=180, suite="stage-b-test-1-gpu-xpu")
 
@@ -65,12 +66,16 @@ class TestXPUEmbedding(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
 
+        gc.collect()
+        empty_gpu_cache()
+
         with SRTRunner(
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
             attention_backend="intel_xpu",
+            mem_fraction_static=0.55,
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]}
                 if matryoshka_dim is not None
