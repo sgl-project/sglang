@@ -2434,6 +2434,11 @@ class ServerArgs:
         "Select DeepEP dispatcher output dtype",
         NS("exec.moe"),
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+        NS("exec.moe"),
+    ] = None
     ep_num_redundant_experts: A[
         int,
         "Allocate this number of redundant experts in expert parallel.",
