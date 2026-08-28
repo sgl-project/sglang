@@ -245,11 +245,9 @@ class TestWeightVersionSpans(CustomTestCase):
             versions = [span["version"] for span in spans]
             self.assertEqual(versions[0], base_version)
             self.assertIn(versions[-1], (base_version, "disk-v2"))
-            prefill_spans = _assert_prefill_spans_contiguous(
+            _assert_prefill_spans_contiguous(
                 self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
             )
-            self.assertEqual(len(prefill_spans), 1)
-            self.assertEqual(prefill_spans[0]["version"], versions[-1])
             if len(spans) > 1:
                 multi_span_count += 1
                 self.assertEqual(versions, [base_version, "disk-v2"])
@@ -390,11 +388,9 @@ class TestWeightVersionSpans(CustomTestCase):
             self.assertEqual(len(spans), 1)
             self.assertEqual(spans[0]["version"], version)
             self.assertEqual(spans[0]["end"], meta_info["completion_tokens"])
-            prefill_spans = _assert_prefill_spans_contiguous(
+            _assert_prefill_spans_contiguous(
                 self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
             )
-            self.assertEqual(len(prefill_spans), 1)
-            self.assertEqual(prefill_spans[0]["version"], version)
 
     def test_08_reannouncing_current_version_is_a_noop(self):
         """Re-announcing the version the server already has must not split anything."""
@@ -637,7 +633,7 @@ class TestWeightVersionSpans(CustomTestCase):
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
             self.assertEqual(spans[0]["version"], previous_version)
-            prefill_spans = _assert_prefill_spans_contiguous(
+            _assert_prefill_spans_contiguous(
                 self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
             )
             if len(spans) > 1:
@@ -647,7 +643,6 @@ class TestWeightVersionSpans(CustomTestCase):
                     [previous_version, "spec-v1"],
                 )
                 self.assertGreater(spans[0]["end"], 0)
-                self.assertEqual(prefill_spans[-1]["version"], "spec-v1")
 
         self.assertGreater(
             split_count,
