@@ -2822,6 +2822,23 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    hicache_storage_prefetch_retry_poll_interval: A[
+        int,
+        Arg(
+            help=(
+                "Scheduling passes a queued request waits after a storage "
+                "prefetch miss before the availability check is retried "
+                "(under load the first check can run before the needed "
+                "backup commits). 0 disables retries."
+            ),
+        ),
+        NS("memory"),
+    ] = 0
+    hicache_storage_prefetch_retry_max_attempts: A[
+        int,
+        "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
+        NS("memory"),
+    ] = 4
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -6091,7 +6108,7 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
