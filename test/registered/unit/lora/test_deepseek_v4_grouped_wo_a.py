@@ -29,16 +29,11 @@ def _batch_info(*, permutation=None):
 
 class _TorchSegmentedBackend(BaseLoRABackend):
     name = "test"
-    supports_repeated_sgemm_batch_info = True
 
-    def __init__(self, batch_info, *, supports_repeated=True):
+    def __init__(self, batch_info):
         self.batch_info = batch_info
-        self.supports_repeated_sgemm_batch_info = supports_repeated
-        self.repeated_batch_info = None
-
-    def get_repeated_sgemm_batch_info(self, repeats):
-        self.repeated_batch_info = super().get_repeated_sgemm_batch_info(repeats)
-        return self.repeated_batch_info
+        self.a_input_shapes = []
+        self.b_weight_shapes = []
 
     def _adapter_per_row(self, batch_info, num_rows):
         adapters = torch.empty(num_rows, dtype=torch.long)
@@ -54,16 +49,16 @@ class _TorchSegmentedBackend(BaseLoRABackend):
             adapters[physical_rows] = batch_info.weight_indices[segment].long()
         return adapters
 
-    def run_lora_a_sgemm(self, x, weights, pruned_batch_info):
-        assert pruned_batch_info is self.repeated_batch_info
-        adapters = self._adapter_per_row(pruned_batch_info, x.shape[0])
+    def run_lora_a_sgemm(self, x, weights, **_kwargs):
+        self.a_input_shapes.append(tuple(x.shape))
+        adapters = self._adapter_per_row(self.batch_info, x.shape[0])
         return torch.bmm(x.unsqueeze(1), weights[adapters].transpose(1, 2)).squeeze(1)
 
-    def run_lora_b_sgemm(self, x, weights, pruned_batch_info, **_kwargs):
-        assert pruned_batch_info is self.repeated_batch_info
-        adapters = self._adapter_per_row(pruned_batch_info, x.shape[0])
+    def run_lora_b_sgemm(self, x, weights, **_kwargs):
+        self.b_weight_shapes.append(tuple(weights.shape))
+        adapters = self._adapter_per_row(self.batch_info, x.shape[0])
         output = torch.bmm(x.unsqueeze(1), weights[adapters].transpose(1, 2)).squeeze(1)
-        return output * pruned_batch_info.scalings[adapters].unsqueeze(1)
+        return output * self.batch_info.scalings[adapters].unsqueeze(1)
 
 
 def _layer(backend, lora_a, lora_b):
@@ -99,10 +94,10 @@ def test_grouped_wo_a_lora_selects_matching_group_diagonal():
     torch.testing.assert_close(output, expected)
 
 
-def test_grouped_batch_metadata_repeats_segments_and_permutation():
+def test_grouped_wo_a_preserves_backend_segments_and_chunk_size():
     info = _batch_info(permutation=torch.tensor([2, 0, 1], dtype=torch.int32))
     backend = _TorchSegmentedBackend(info)
-    groups = 2
+    groups = 4
     layer = _layer(
         backend,
         torch.randn(2, 3, 4),
@@ -114,30 +109,23 @@ def test_grouped_batch_metadata_repeats_segments_and_permutation():
         torch.randn(3, groups, 4),
     )
 
-    repeated = backend.repeated_batch_info
-    torch.testing.assert_close(
-        repeated.seg_indptr, torch.tensor([0, 2, 6], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        repeated.seg_lens, torch.tensor([2, 4], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        repeated.permutation,
-        torch.tensor([4, 5, 0, 1, 2, 3], dtype=torch.int32),
-    )
-    assert repeated.expected_tokens == 6
+    assert backend.batch_info is info
+    assert info.max_len == 2
+    torch.testing.assert_close(info.seg_indptr, torch.tensor([0, 1, 3]))
+    assert backend.a_input_shapes == [(3, 4)] * groups
+    assert backend.b_weight_shapes == [(2, 5, 3)] * groups
 
 
-def test_grouped_wo_a_rejects_backend_without_repeated_metadata():
+def test_grouped_wo_a_rejects_incompatible_b_layout():
     groups = 2
-    backend = _TorchSegmentedBackend(_batch_info(), supports_repeated=False)
+    backend = _TorchSegmentedBackend(_batch_info())
     layer = _layer(
         backend,
         torch.randn(1, 3, 4),
-        torch.randn(1, groups * 5, 3),
+        torch.randn(1, groups * 5 + 1, 3),
     )
 
-    with pytest.raises(RuntimeError, match="does not support repeated"):
+    with pytest.raises(RuntimeError, match="B/output mismatch"):
         layer.apply_grouped_lora(
             torch.randn(3, groups, 5),
             torch.randn(3, groups, 4),
