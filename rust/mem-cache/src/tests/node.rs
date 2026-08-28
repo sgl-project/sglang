@@ -1,10 +1,52 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tch::Tensor;
 
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
 use crate::node::TreeCoreRuntimeError;
+
+static COUNTED_KEY_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+struct CountedKey(Vec<i64>);
+
+impl AsRef<[i64]> for CountedKey {
+    fn as_ref(&self) -> &[i64] {
+        &self.0
+    }
+}
+
+impl Borrow<[i64]> for CountedKey {
+    fn borrow(&self) -> &[i64] {
+        &self.0
+    }
+}
+
+impl From<Vec<i64>> for CountedKey {
+    fn from(value: Vec<i64>) -> Self {
+        COUNTED_KEY_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+        Self(value)
+    }
+}
+
+impl ChildKeyType for CountedKey {
+    type Atom = i64;
+    const IS_BIGRAM: bool = false;
+
+    fn key_from(token_ids: Cow<'_, Vec<i64>>) -> Cow<'_, Self> {
+        Cow::Owned(Self::from(token_ids.into_owned()))
+    }
+
+    fn hash_words(atom: &Self::Atom) -> impl Iterator<Item = u32> {
+        std::iter::once(*atom as u32)
+    }
+
+    fn raw_token_ids(atoms: &[Self::Atom]) -> Cow<'_, [i64]> {
+        Cow::Borrowed(atoms)
+    }
+}
 
 #[test]
 fn evicted_only_for_attached_nodes_without_full_device_value() {
@@ -1013,6 +1055,37 @@ fn salted_children_file_under_their_namespace() -> Result<(), TreeCoreRuntimeErr
     assert_eq!(arena.root_child(Some("lora-2"), &[7]), Some(b));
     assert_eq!(arena.root_child(None, &[7]), Some(c));
     assert_eq!(arena.root_child(Some("ghost"), &[7]), None);
+    Ok(())
+}
+
+#[test]
+fn child_page_lookup_borrows_namespace_and_page_key() -> Result<(), TreeCoreRuntimeError> {
+    let mut arena: NodeArena<CountedKey> = NodeArena::new(vec![FULL], /* page_size = */ 2);
+    let root = arena.root();
+    let default_child = arena.alloc_child(
+        root,
+        CountedKey(vec![1, 2, 3]),
+        /* priority = */ 0,
+        /* extra_key = */ None,
+    )?;
+    let namespaced_child = arena.alloc_child(
+        root,
+        CountedKey(vec![1, 2, 4]),
+        /* priority = */ 0,
+        Some("adapter-a"),
+    )?;
+
+    COUNTED_KEY_CONSTRUCTIONS.store(0, Ordering::Relaxed);
+    for _ in 0..100 {
+        assert_eq!(arena.root_child(None, &[1, 2]), Some(default_child));
+        assert_eq!(
+            arena.root_child(Some("adapter-a"), &[1, 2]),
+            Some(namespaced_child)
+        );
+        assert_eq!(arena.root_child(Some("adapter-b"), &[1, 2]), None);
+        assert_eq!(arena.root_child(None, &[2, 3]), None);
+    }
+    assert_eq!(COUNTED_KEY_CONSTRUCTIONS.load(Ordering::Relaxed), 0);
     Ok(())
 }
 

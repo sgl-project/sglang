@@ -2,15 +2,38 @@
 
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use hashbrown::hash_map::Entry;
+use hashbrown::{Equivalent, HashMap as HashBrownMap};
 use sha2::{Digest, Sha256};
 use tch::Tensor;
 
 use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
+
+type ChildMap<K> = HashBrownMap<(Option<Arc<str>>, K), NodeIdx_, RandomState>;
+
+/// Borrowed view of a namespaced child edge used for allocation-free lookup.
+struct ChildEdgeRef<'a, K: ChildKeyType> {
+    extra_key: Option<&'a str>,
+    page: &'a [K::Atom],
+}
+
+impl<K: ChildKeyType> Hash for ChildEdgeRef<'_, K> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.extra_key.hash(state);
+        self.page.hash(state);
+    }
+}
+
+impl<K: ChildKeyType> Equivalent<(Option<Arc<str>>, K)> for ChildEdgeRef<'_, K> {
+    fn equivalent(&self, edge: &(Option<Arc<str>>, K)) -> bool {
+        self.extra_key == edge.0.as_deref() && self.page == edge.1.as_ref()
+    }
+}
 
 /// A radix-tree node, generic over the child-key type `K` (single-token or bigram).
 pub struct Node<K: ChildKeyType> {
@@ -23,7 +46,7 @@ pub struct Node<K: ChildKeyType> {
     pub extra_key: Option<Arc<str>>,
     /// Child edges keyed by (namespace, the child's page key); the namespace
     /// component mirrors the child's `extra_key` at every level.
-    pub children: HashMap<(Option<Arc<str>>, K), NodeIdx_>,
+    pub children: ChildMap<K>,
     /// The page key labelling the edge from the parent (also this node's key in the
     /// parent's `children`); empty for the root.
     pub key: K,
@@ -247,7 +270,7 @@ impl<K: ChildKeyType> Node<K> {
         Node {
             parent: None,
             extra_key: None,
-            children: HashMap::new(),
+            children: ChildMap::with_hasher(RandomState::new()),
             key: K::default(),
             values: Default::default(),
             swa_uuid: None,
@@ -269,7 +292,7 @@ impl<K: ChildKeyType> Node<K> {
         Node {
             parent: None,
             extra_key: None,
-            children: HashMap::new(),
+            children: ChildMap::with_hasher(RandomState::new()),
             key,
             values: Default::default(),
             swa_uuid: None,
@@ -989,9 +1012,10 @@ impl<K: ChildKeyType> NodeArena<K> {
         extra_key: Option<&str>,
         page: &[K::Atom],
     ) -> Option<NodeIdx_> {
-        // Tuple keys cannot borrow-match a (str, slice) pair, so build an owned key.
-        let key = (extra_key.map(Arc::from), K::from(page.to_vec()));
-        self.node(id).children.get(&key).copied()
+        self.node(id)
+            .children
+            .get(&ChildEdgeRef::<K> { extra_key, page })
+            .copied()
     }
 
     /// The root's child on the key's first page within the namespace, if any.
