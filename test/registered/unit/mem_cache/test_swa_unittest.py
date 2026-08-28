@@ -851,5 +851,103 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         tree.sanity_check()
 
 
+class TestFreeFullPartition(CustomTestCase):
+    """`free_full` releases only the full side of a hybrid SWA allocator."""
+
+    def setUp(self):
+        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.full_baseline = self.allocator.full_available_size()
+        self.swa_baseline = self.allocator.swa_available_size()
+
+    def _sizes(self):
+        return (
+            self.allocator.full_available_size(),
+            self.allocator.swa_available_size(),
+        )
+
+    def test_free_full_keeps_the_swa_peers_allocated(self):
+        indices = _swa_alloc(self.allocator, 4)
+        self.allocator.free_full(indices)
+
+        full_avail, swa_avail = self._sizes()
+        self.assertEqual(full_avail, self.full_baseline)
+        self.assertEqual(swa_avail, self.swa_baseline - 4)
+
+    def test_free_full_leaves_the_mapping_intact(self):
+        indices = _swa_alloc(self.allocator, 4)
+        before = self.allocator.full_to_swa_index_mapping[indices].clone()
+        self.allocator.free_full(indices)
+
+        self.assertTrue(bool((before > 0).all()))
+        self.assertTrue(
+            torch.equal(self.allocator.full_to_swa_index_mapping[indices], before)
+        )
+
+    def test_free_full_is_deferred_inside_a_free_group(self):
+        indices = _swa_alloc(self.allocator, 4)
+
+        self.allocator.free_group_begin()
+        self.allocator.free_full(indices)
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline - 4)
+        self.allocator.free_group_end()
+
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline)
+
+
+class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
+    """An unfinished request whose SWA prefix is already gone must insert that
+    prefix as a tombstone, not as live SWA KV."""
+
+    def test_evicted_prefix_inserts_as_tombstone(self):
+        page_size, window, num_tokens, evicted = 4, 4, 16, 8
+        tree, allocator, req_to_token_pool = _build_swa_tree(
+            is_eagle=False, page_size=page_size, sliding_window_size=window
+        )
+        kv_indices = _swa_alloc(allocator, num_tokens)
+        req_to_token_pool.write((0, slice(0, num_tokens)), kv_indices)
+        # Drop the prefix's SWA peers, as window eviction would.
+        allocator.free_swa(kv_indices[:evicted])
+        swa_before = allocator.swa_available_size()
+
+        token_ids = array("q", range(1, num_tokens + 1))
+        req = _DummyReq()
+        req.req_pool_idx = 0
+        req.origin_input_ids = token_ids
+        req.output_ids = array("q")
+        req.get_fill_ids = lambda: token_ids
+        req.extra_key = None
+        req.cache_salt = None
+        req.cache_protected_len = 0
+        req.last_node = tree.root_node
+        req.swa_uuid_for_lock = None
+        req.prefix_indices = torch.empty(0, dtype=torch.int64, device=tree.device)
+        req.kv.swa_evicted_seqlen = evicted
+
+        tree.cache_unfinished_req(req)
+
+        # The insert itself frees nothing.
+        self.assertEqual(allocator.swa_available_size(), swa_before)
+        # The live leaf holds a full window, so the whole key stays matchable.
+        self.assertEqual(req.cache_protected_len, num_tokens)
+        # [0, evicted) is a tombstone; only [evicted, num_tokens) counts as SWA.
+        (first,) = tree.root_node.children.values()
+        self.assertTrue(first.swa_tombstone)
+        self.assertEqual(len(first.value), evicted)
+        self.assertEqual(
+            tree.swa_evictable_size_ + tree.swa_protected_size_,
+            num_tokens - evicted,
+        )
+
+        # Finishing drops the locks, which sanity_check needs; the accounting
+        # must survive the re-walk.
+        tree.cache_finished_req(req, kv_len_to_handle=num_tokens)
+        self.assertEqual(allocator.swa_available_size(), swa_before)
+        self.assertEqual(
+            tree.swa_evictable_size_ + tree.swa_protected_size_,
+            num_tokens - evicted,
+        )
+        tree.sanity_check()
+
+
 if __name__ == "__main__":
     unittest.main()
