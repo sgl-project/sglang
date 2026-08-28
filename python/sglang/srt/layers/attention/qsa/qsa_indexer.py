@@ -330,6 +330,20 @@ class QSAIndexer(MultiPlatformOp):
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
+            # `_qsa_write_plan`'s capacity is a shape-derived worst-case bound
+            # (avoids a device-to-host sync), so it can reserve more compacted
+            # entries than this forward actually has complete groups for. The
+            # padding entries are inert: `_qsa_write_plan` gives them
+            # member_rows == 0 and routes their compressed output to the
+            # shared reserved write slot 0, which is never read back. But for
+            # very short extend chunks (fewer than `compress_ratio` packed
+            # tokens), member_rows == 0 plus the full compress_ratio stride
+            # still walks past the end of `token_k`, which holds only this
+            # forward's real tokens (no padding rows) — an out-of-bounds
+            # gather. Clamp to the last valid row: the gathered values for
+            # these inert entries are discarded downstream regardless, so
+            # only staying in bounds matters, not what value is read.
+            group_locs = group_locs.clamp(max=max(token_k.shape[0] - 1, 0))
             source_keys = token_k
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
@@ -645,6 +659,22 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions,
             row_sequence_lengths,
         )
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        # forward_cuda's fast/fused sub-paths (fused qk-prep, fused compress
+        # store, sgl_kernel/JIT fast-topk) are all internally gated on
+        # `tensor.is_cuda`, with portable torch (and, for block-index
+        # expansion, Triton) fallbacks used otherwise. XPU tensors report
+        # `is_cuda == False`, so those guards already route us to the
+        # device-agnostic reference implementations. Reuse the same
+        # orchestration instead of duplicating it.
+        return self.forward_cuda(hidden_states, positions, forward_batch, indexer_metadata)
 
 
 __all__ = [
