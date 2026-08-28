@@ -271,7 +271,7 @@ class PcieIpcCommunicator:
             )
             return
         try:
-            self._workspace.tune(
+            tuned = self._workspace.tune(
                 [hidden], dtype=torch.bfloat16, tune_group=self._cpu_group
             )
         except Exception as e:
@@ -280,8 +280,20 @@ class PcieIpcCommunicator:
                 e,
             )
             return
+        # Report what tune() covered, not that it returned: it declines shapes
+        # silently, and a log line that only proves no exception was raised is
+        # how an autotune that measured nothing reads as a success.
+        if not tuned:
+            logger.warning(
+                "FlashInfer PCIe-IPC autotune covered no shapes for hidden=%d "
+                "(requested rows %s); the kernels keep the seed policy.",
+                hidden,
+                _tune_batches(self.max_numel // hidden),
+            )
+            return
         logger.info(
-            "FlashInfer PCIe-IPC all-reduce autotuned (hidden=%d, rows=%s)",
+            "FlashInfer PCIe-IPC all-reduce autotuned %d shape(s) (hidden=%d, rows=%s)",
+            len(tuned),
             hidden,
             _tune_batches(self.max_numel // hidden),
         )
