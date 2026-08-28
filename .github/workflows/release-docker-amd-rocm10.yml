@@ -1,5 +1,10 @@
 name: Release Docker Images Nightly ROCm 10 (AMD)
 on:
+  # One-time branch trigger because workflow_dispatch is unavailable until this
+  # new workflow lands on the default branch.
+  push:
+    branches:
+      - codex/rocm10-release-once-cc5f490b
   workflow_dispatch:
     inputs:
       job_select:
