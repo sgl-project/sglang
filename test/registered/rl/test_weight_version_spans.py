@@ -96,6 +96,7 @@ class TestWeightVersionSpans(CustomTestCase):
         max_new_tokens: int,
         prompt: str = "The capital of France is",
         dp_rank: Optional[int] = None,
+        extra_key: Optional[str] = None,
     ):
         response = requests.post(
             f"{self.base_url}/generate",
@@ -107,6 +108,7 @@ class TestWeightVersionSpans(CustomTestCase):
                     "ignore_eos": True,
                 },
                 "routed_dp_rank": dp_rank,
+                "extra_key": extra_key,
             },
             timeout=_REQUEST_TIMEOUT,
         )
@@ -810,6 +812,33 @@ class TestWeightVersionSpans(CustomTestCase):
             [span["version"] for span in fresh["meta_info"]["prefill_weight_versions"]],
             ["rank-v2"],
         )
+
+    def test_23_extra_key_partitions_stay_apart(self):
+        """A prefix cached under one extra_key is invisible to another, so only the same key sees the stale span."""
+        self._flush_cache()
+        self._set_weight_version("key-v1")
+        prompt = _SHARED_PREFIX + "Which partition served me?"
+        self._generate(max_new_tokens=8, prompt=prompt, dp_rank=0, extra_key="alpha")
+        self._set_weight_version("key-v2")
+
+        same_key = self._generate(
+            max_new_tokens=8, prompt=prompt, dp_rank=0, extra_key="alpha"
+        )
+        other_key = self._generate(
+            max_new_tokens=8, prompt=prompt, dp_rank=0, extra_key="beta"
+        )
+        no_key = self._generate(max_new_tokens=8, prompt=prompt, dp_rank=0)
+
+        self.assertEqual(
+            [s["version"] for s in same_key["meta_info"]["prefill_weight_versions"]],
+            ["key-v1", "key-v2"],
+        )
+        for data in (other_key, no_key):
+            self.assertEqual(data["meta_info"]["cached_tokens"], 0)
+            self.assertEqual(
+                [s["version"] for s in data["meta_info"]["prefill_weight_versions"]],
+                ["key-v2"],
+            )
 
 
 if __name__ == "__main__":
