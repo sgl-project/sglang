@@ -1401,7 +1401,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         )
         return server_args
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_accepts_audited_model_architectures(self, _):
         supported = (
             "DeepseekV2ForCausalLM",
@@ -1425,7 +1425,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         ):
             handle_a2a_moe(self._make_args("UnsupportedMoeForCausalLM"))
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_accepts_supported_quantization_formats(self, _):
         supported = (
             {"quantization": "modelopt_fp4"},
@@ -1441,14 +1441,12 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Standard FP8 MoE checkpoints"):
             handle_a2a_moe(self._make_args(quantization="fp8"))
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=False)
     def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
         with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
-            handle_a2a_moe(
-                self._make_args(quantization="fp8", is_fp4_experts=True)
-            )
+            handle_a2a_moe(self._make_args(quantization="fp8", is_fp4_experts=True))
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
             handle_a2a_moe(self._make_args())
@@ -1456,7 +1454,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("mxfp8"):
             handle_a2a_moe(self._make_args())
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_rejects_invalid_value(self, _):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("fp8"):
             with self.assertRaisesRegex(
@@ -1464,7 +1462,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             ):
                 handle_a2a_moe(self._make_args())
 
-    @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_conflicts_with_ikr(self, _):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
             with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
