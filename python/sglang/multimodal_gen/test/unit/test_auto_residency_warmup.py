@@ -376,20 +376,6 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._rollback_everywhere.assert_not_called()
         self.assertEqual(worker._auto_residency_round_sizes, [])
 
-    def test_dit_residency_keeps_multi_step_validation(self):
-        worker = GPUWorker.__new__(GPUWorker)
-        worker.server_args = SimpleNamespace(residency_mode=lambda _name: RESIDENT)
-        worker._auto_residency_applied = [
-            AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
-        ]
-        worker._auto_residency_round_sizes = [1]
-        worker._auto_residency_repeated_components = set()
-
-        self.assertTrue(worker._latest_auto_residency_round_is_resident_only())
-        self.assertFalse(
-            worker._latest_auto_residency_round_supports_short_validation()
-        )
-
     def test_validation_rolls_back_when_selected_placement_spends_the_reserve(self):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0

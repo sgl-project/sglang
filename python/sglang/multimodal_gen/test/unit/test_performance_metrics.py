@@ -230,6 +230,8 @@ def test_server_warmup_normalizes_profile_stage_names_for_residency_timing():
             total_duration_ms=12.0,
             stages={"RefinerStage": 10.0},
             steps=[],
+            steps_by_stage={},
+            stage_iterations={},
         )
     )
 
@@ -332,7 +334,6 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     worker = GPUWorker.__new__(GPUWorker)
     worker.rank = 0
     worker.is_output_rank = True
-    worker._auto_residency_budget_correction_bytes = 2 * GIB_BYTES
     worker._auto_residency_reference_request_duration_ns = None
     worker._auto_residency_reference_stage_duration_ns = {}
     worker._auto_residency_reference_component_stages = {}
@@ -385,7 +386,8 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
                     height=64,
                     num_frames=1,
                     baseline_allocated_bytes=1,
-                    peak_allocated_bytes=2,
+                    peak_allocated_bytes=60 * GIB_BYTES,
+                    peak_reserved_bytes=62 * GIB_BYTES,
                     succeeded=True,
                 )
             ],
