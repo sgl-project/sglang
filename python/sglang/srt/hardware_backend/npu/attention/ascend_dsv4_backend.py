@@ -456,7 +456,13 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        cmp_kv = torch.ops.custom.compressor(
+        # TODO: Use a unified compressor op once the A5 implementation is available in torch_npu.
+        compressor_op = (
+            torch.ops.custom.compressor
+            if _is_npu_arch35()
+            else torch.ops.npu.compressor
+        )
+        cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
