@@ -26,10 +26,28 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
 class TestAutoResidencyWarmup(unittest.TestCase):
+    def test_worker_skips_only_fixed_custom_residency_strategies(self):
+        class AutoCompatibleStrategy(ComponentResidencyStrategy):
+            def supports_auto_residency(self) -> bool:
+                return True
+
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.pipeline = SimpleNamespace(
+            component_residency_strategies={
+                "fixed": ComponentResidencyStrategy(),
+                "dynamic": AutoCompatibleStrategy(),
+            }
+        )
+
+        self.assertEqual(worker._fixed_custom_residency_strategy_names(), {"fixed"})
+
     def test_rewarm_step_limit_keeps_full_shape_but_shortens_denoising(self):
         req = SimpleNamespace(
             is_warmup=True,

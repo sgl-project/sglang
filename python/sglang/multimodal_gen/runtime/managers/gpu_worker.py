@@ -1238,9 +1238,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         Reuses the auto-residency candidate frontier and benefit ranking, but
         remains a raw-capacity hint rather than the phase-constrained joint
-        plan. It omits components driven by a pipeline-custom residency
-        strategy because user residency flags cannot control them, and it
-        applies no reserve or activation margin.
+        plan. It omits components driven by fixed pipeline-custom residency
+        strategies and applies no reserve or activation margin.
         """
         if not self.pipeline:
             return []
@@ -1256,7 +1255,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # chose offload and should learn when the headroom no longer
             # requires it (automatic adjustment never touches explicit ones).
             explicit_residency_mode_of=lambda _name: None,
-            custom_strategy_names=self.pipeline.component_residency_strategies,
+            custom_strategy_names=self._fixed_custom_residency_strategy_names(),
             num_inference_steps=(
                 workload.num_inference_steps if workload is not None else 1
             ),
@@ -1630,7 +1629,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             residency_mode_of=self.server_args.residency_mode,
             baseline_residency_mode_of=(self.server_args.configured_residency_mode),
             explicit_residency_mode_of=self.server_args.explicit_residency_mode,
-            custom_strategy_names=self.pipeline.component_residency_strategies,
+            custom_strategy_names=self._fixed_custom_residency_strategy_names(),
             num_inference_steps=workload.num_inference_steps,
             allow_host_pin_reallocation=True,
             mixed_dtype_components=self._mixed_dtype_residency_components(),
@@ -1979,6 +1978,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if manager is None:
             return dict(self.pipeline.modules)
         return manager.placement_modules()
+
+    def _fixed_custom_residency_strategy_names(self) -> set[str]:
+        if self.pipeline is None:
+            return set()
+        return {
+            name
+            for name, strategy in self.pipeline.component_residency_strategies.items()
+            if not strategy.supports_auto_residency()
+        }
 
     def _latest_auto_residency_round(self) -> list[AppliedResidencyChange]:
         if not self._auto_residency_round_sizes:

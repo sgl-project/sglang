@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
+    build_component_residency_strategy,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
     ComponentWeightSource,
@@ -444,6 +445,12 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
 
     def __init__(self, manager: "LTX2TwoStageResidencyController") -> None:
         self.manager = manager
+        self._placement_strategies: dict[
+            tuple[str, int, str], ComponentResidencyStrategy
+        ] = {}
+
+    def supports_auto_residency(self) -> bool:
+        return True
 
     @property
     def pipeline(self) -> "LTX2TwoStagePipeline":
@@ -461,6 +468,19 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
     def initialize(self) -> None:
         pass
 
+    def _placement_strategy(
+        self, module: torch.nn.Module, use: ComponentUse
+    ) -> ComponentResidencyStrategy:
+        mode = self.server_args.residency_mode(use.component_name)
+        key = (use.component_name, id(module), mode)
+        strategy = self._placement_strategies.get(key)
+        if strategy is None:
+            strategy = build_component_residency_strategy(
+                use.component_name, module, self.server_args
+            )
+            self._placement_strategies[key] = strategy
+        return strategy
+
     def prepare_for_use(
         self,
         module: torch.nn.Module,
@@ -470,6 +490,20 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         phase = self._phase(use)
         if phase != self.manager._active_phase:
             self.enter_phase(phase)
+        self._placement_strategy(module, use).prepare_for_use(module, use, state)
+
+    def prefetch_for_use(
+        self,
+        module: torch.nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> bool:
+        phase = self._phase(use)
+        if phase != self.manager._active_phase:
+            self.enter_phase(phase)
+        return self._placement_strategy(module, use).prefetch_for_use(
+            module, use, state
+        )
 
     def wait_for_use(
         self,
@@ -477,6 +511,7 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
+        self._placement_strategy(module, use).wait_for_use(module, use, state)
         self.ensure_phase_ready(self._phase(use))
 
     def finish_use(
@@ -485,6 +520,7 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
+        self._placement_strategy(module, use).finish_use(module, use, state)
         self.exit_phase(self._phase(use))
 
     def finish_request(
@@ -495,8 +531,11 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         *,
         preferred: bool,
     ) -> None:
+        self._placement_strategy(module, use).finish_request(
+            module, use, state, preferred=preferred
+        )
         if not preferred:
-            self.finish_use(module, use, state)
+            self.exit_phase(self._phase(use))
             return
         phase = self._phase(use)
         if phase != self.manager._active_phase:
