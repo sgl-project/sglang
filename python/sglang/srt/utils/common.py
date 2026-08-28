@@ -523,8 +523,13 @@ def get_available_gpu_memory(
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
         if empty_cache:
-            current_platform.empty_cache()
-        free_gpu_memory, _ = current_platform.get_available_memory(gpu_id)
+            empty_device_cache(torch.mps)
+        # Unified memory has two independent ceilings: host memory available to
+        # the process, and the remaining Metal working set (which Apple caps
+        # below physical RAM). Respect whichever is tighter.
+        total_gpu_memory = torch.mps.recommended_max_memory()
+        metal_headroom = max(0, total_gpu_memory - torch.mps.driver_allocated_memory())
+        free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -773,6 +778,15 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    # Apple's unified memory caps the GPU working set below physical RAM, so
+    # size against the budget Metal will actually honor.
+    try:
+        return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -821,15 +835,12 @@ def get_device_memory_capacity(device: str = None):
         if mem_bytes:
             return mem_bytes / (1 << 20)  # bytes -> MiB
         return None
-    if current_platform.is_mps() and (
-        device is None or str(device).split(":", 1)[0] == "mps"
-    ):
-        mem_bytes = current_platform.get_device_total_memory()
-        return mem_bytes / (1 << 20) if mem_bytes else None
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif is_mps():
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -848,8 +859,8 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if current_platform.is_mps():
-        return current_platform.get_device_name(device_id)
+    if is_mps():
+        return f"Apple MPS ({platform.machine()})"
 
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
@@ -926,7 +937,9 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "musa:{}".format(device_id)
 
     if is_mps():
-        return str(current_platform.get_device(0 if device_id is None else device_id))
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
 
     try:
         return current_platform.get_device(device_id)
@@ -938,8 +951,8 @@ def get_device(device_id: Optional[int] = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
-    if current_platform.is_mps():
-        return current_platform.get_device_count()
+    if is_mps():
+        return 1
 
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
@@ -966,9 +979,6 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
-    if current_platform.is_mps():
-        return current_platform.get_device_core_count(device_id)
-
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -979,12 +989,6 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
-    if current_platform.is_mps():
-        capability = current_platform.get_device_capability(device_id)
-        if capability is not None:
-            major, minor = capability
-        return major, minor
-
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         major, minor = torch.cuda.get_device_capability(device_id)
 
@@ -1011,8 +1015,12 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
-    if current_platform.is_out_of_tree() or current_platform.is_mps():
+    if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
+
+    if is_mps():
+        # Torch MPS has no SGLang graph runner yet.
+        return "eager"
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"

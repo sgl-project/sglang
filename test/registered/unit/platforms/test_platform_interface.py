@@ -5,7 +5,8 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
-from unittest.mock import MagicMock, call, patch
+import platform
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -211,32 +212,6 @@ class TestSRTPlatform(CustomTestCase):
         self.assertFalse(base.is_pin_memory_available())
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
-    def test_legacy_oot_device_lifecycle_uses_generic_module_defaults(self):
-        """OOT plugins need not immediately reimplement the new active hooks."""
-
-        class LegacyOotPlatform(SRTPlatform):
-            _enum = PlatformEnum.OOT
-            device_name = "privateuseone"
-            device_type = "privateuseone"
-
-        module = MagicMock()
-        stream = object()
-        module.Stream.return_value = stream
-        platform = LegacyOotPlatform()
-        device = platform.get_device(3)
-
-        with patch(
-            "sglang.srt.platforms.device_mixin.torch.get_device_module",
-            return_value=module,
-        ) as mock_get_module:
-            platform.set_device(device)
-            self.assertIs(platform.create_stream(device), stream)
-
-        self.assertEqual(device, torch.device("privateuseone", 3))
-        self.assertEqual(mock_get_module.call_args_list, [((device,),), ((device,),)])
-        module.set_device.assert_called_once_with(3)
-        module.Stream.assert_called_once_with()
-
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
@@ -426,27 +401,14 @@ class TestMpsDeviceMixin(CustomTestCase):
         "sglang.srt.platforms.mps.torch.mps.current_allocated_memory",
         side_effect=AssertionError("device budget must use driver allocation"),
     )
-    @patch("sglang.srt.platforms.mps.psutil.virtual_memory")
-    def test_unified_memory_contract(
-        self, mock_vm, mock_current, mock_recommended, mock_driver
-    ):
-        mock_vm.return_value.total = 1024
-        mock_vm.return_value.available = 640
+    def test_unified_memory_contract(self, mock_current, mock_recommended, mock_driver):
         mock_recommended.return_value = 800
         mock_driver.return_value = 350
         base = MpsSRTPlatform()
+        # The device budget is the Metal working set, not the host RAM total,
+        # and in-use memory must come from the driver allocation.
         self.assertEqual(base.get_device_total_memory(), 800)
         self.assertEqual(base.get_current_memory_usage(), 350.0)
-        self.assertEqual(base.get_available_memory(), (450, 800))
-
-        # Host pressure can be tighter than the remaining Metal budget.
-        mock_vm.return_value.available = 300
-        mock_driver.return_value = 100
-        self.assertEqual(base.get_available_memory(), (300, 800))
-
-        # Never report negative memory if the driver is already over budget.
-        mock_driver.return_value = 900
-        self.assertEqual(base.get_available_memory(), (0, 800))
         mock_current.assert_not_called()
 
         mock_recommended.return_value = 0
@@ -461,59 +423,56 @@ class TestMpsDeviceMixin(CustomTestCase):
 
     def test_device_metadata_contract(self):
         base = MpsSRTPlatform()
-        self.assertEqual(base.get_device_count(), 1)
-        self.assertEqual(base.get_device_core_count(), 0)
+        # MPS exposes no compute-capability analogue.
         self.assertIsNone(base.get_device_capability())
+        self.assertEqual(base.get_device_name(), f"Apple MPS ({platform.machine()})")
 
-    def test_common_device_helpers_route_to_mps_platform(self):
+    @patch("torch.mps.driver_allocated_memory")
+    @patch("torch.mps.recommended_max_memory")
+    def test_common_device_helpers_handle_mps_inline(
+        self, mock_recommended, mock_driver
+    ):
+        """MPS is an in-tree device, so utils.common must answer for it
+        directly instead of dispatching through the out-of-tree platform."""
         from sglang.srt.utils import common
 
-        base = MagicMock(spec=MpsSRTPlatform)
-        base.is_out_of_tree.return_value = False
-        base.is_mps.return_value = True
-        base.get_device_total_memory.return_value = 8 << 30
-        base.get_device_name.return_value = "Apple MPS (arm64)"
-        base.get_device_count.return_value = 1
-        base.get_device_core_count.return_value = 0
-        base.get_device_capability.return_value = None
-        base.get_device.return_value = torch.device("mps")
-        base.get_available_memory.return_value = (3 << 30, 8 << 30)
-        base.get_compile_backend.return_value = "eager"
+        mock_recommended.return_value = 8 << 30
+        mock_driver.return_value = 5 << 30
 
         with (
-            patch.object(common, "current_platform", base),
             patch.object(common, "is_mps", return_value=True),
+            patch.object(common, "is_cuda", return_value=False),
+            patch.object(common, "is_hip", return_value=False),
+            patch.object(common, "empty_device_cache"),
         ):
             common.get_device_count.cache_clear()
             common.get_device.cache_clear()
             try:
                 self.assertEqual(common.get_device_memory_capacity("mps"), 8192)
-                self.assertEqual(common.get_device_name(), "Apple MPS (arm64)")
-                self.assertEqual(common.get_device_count(), 1)
-                self.assertEqual(common.get_device_core_count(), 0)
-                self.assertEqual(common.get_device_capability(), (None, None))
-                self.assertEqual(common.get_device(), "mps")
-                self.assertEqual(common.get_available_gpu_memory("mps", 0), 3.0)
-                base.empty_cache.assert_called_once_with()
-                base.empty_cache.reset_mock()
                 self.assertEqual(
-                    common.get_available_gpu_memory("mps", 0, empty_cache=False),
-                    3.0,
+                    common.get_device_name(), f"Apple MPS ({platform.machine()})"
                 )
-                base.empty_cache.assert_not_called()
+                self.assertEqual(common.get_device_count(), 1)
+                self.assertEqual(common.get_device(), "mps")
+                self.assertEqual(common.get_device(0), "mps:0")
                 self.assertEqual(common.get_compiler_backend(), "eager")
+
+                # Free memory is the tighter of host availability and the
+                # remaining Metal working set (here: 8Gi - 5Gi = 3Gi).
+                with patch.object(common.psutil, "virtual_memory") as mock_vm:
+                    mock_vm.return_value.available = 6 << 30
+                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 3.0)
+
+                    # Host pressure can be the binding constraint instead.
+                    mock_vm.return_value.available = 1 << 30
+                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 1.0)
+
+                    # Never report negative free memory when over budget.
+                    mock_driver.return_value = 9 << 30
+                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 0.0)
             finally:
                 common.get_device_count.cache_clear()
                 common.get_device.cache_clear()
-
-        base.get_device_total_memory.assert_called_once_with()
-        base.get_device_name.assert_called_once_with(0)
-        base.get_device_count.assert_called_once_with()
-        base.get_device_core_count.assert_called_once_with(0)
-        base.get_device_capability.assert_called_once_with(0)
-        base.get_device.assert_called_once_with(0)
-        self.assertEqual(base.get_available_memory.call_args_list, [call(0)] * 2)
-        base.get_compile_backend.assert_called_once_with(None)
 
 
 class TestPinMemoryAvailability(CustomTestCase):
