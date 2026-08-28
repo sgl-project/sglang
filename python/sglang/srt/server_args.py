@@ -80,6 +80,7 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
+    ALLOWED_KEYS_PER_PHASE,
     Backend,
     CudaGraphConfig,
     Phase,
@@ -4943,9 +4944,22 @@ class ServerArgs:
 
         # ---- Explicit JSON config (highest precedence) ----
         for phase, phase_config in explicit_input.items():
+            if phase not in Phase.ALL:
+                raise ValueError(
+                    f"--cuda-graph-config: unknown phase {phase!r}, "
+                    f"expected one of {Phase.ALL}"
+                )
             if not isinstance(phase_config, dict):
-                continue
+                raise ValueError(
+                    f"--cuda-graph-config[{phase!r}] must be a dict, got "
+                    f"{type(phase_config).__name__}"
+                )
             for key, value in phase_config.items():
+                if key not in ALLOWED_KEYS_PER_PHASE[phase]:
+                    raise ValueError(
+                        f"--cuda-graph-config[{phase!r}]: unknown key {key!r}, "
+                        f"expected one of {ALLOWED_KEYS_PER_PHASE[phase]}"
+                    )
                 _set(phase, key, value)
 
         self._declare(
@@ -5220,6 +5234,50 @@ class ServerArgs:
                 raise ValueError(
                     f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                     f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
+                )
+            phase_config = getattr(cfg.cuda_graph_config, phase)
+            if phase_config.max_bs is not None and (
+                isinstance(phase_config.max_bs, bool)
+                or not isinstance(phase_config.max_bs, int)
+                or phase_config.max_bs <= 0
+            ):
+                raise ValueError(
+                    f"--cuda-graph-config[{phase}].max_bs must be a positive "
+                    f"integer or None, got {phase_config.max_bs!r}"
+                )
+            if phase == Phase.DECODE and phase_config.bs == []:
+                raise ValueError(
+                    "--cuda-graph-config[decode].bs must be a non-empty list "
+                    "of positive integers or None, got []"
+                )
+            if phase_config.bs is not None and (
+                not isinstance(phase_config.bs, list)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                    for value in phase_config.bs
+                )
+            ):
+                raise ValueError(
+                    f"--cuda-graph-config[{phase}].bs must be a list of "
+                    f"positive integers or None, got {phase_config.bs!r}"
+                )
+            if phase_config.tc_compiler not in ("eager", "inductor"):
+                raise ValueError(
+                    f"--cuda-graph-config[{phase}].tc_compiler must be 'eager' "
+                    f"or 'inductor', got {phase_config.tc_compiler!r}"
+                )
+        prefill_config = cfg.cuda_graph_config.prefill
+        for key in (
+            "full_prefill_max_req",
+            "full_prefill_prefix_chunk_tokens",
+        ):
+            value = getattr(prefill_config, key)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(
+                    f"--cuda-graph-config[prefill].{key} must be a positive "
+                    f"integer or None, got {value!r}"
                 )
 
     def _handle_multi_item_scoring(self):
