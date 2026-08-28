@@ -267,6 +267,72 @@ sgl-eval run gsm8k \\
       ],
     },
 
+    // ----- Card: "Speculative" -----
+    // The Deploy panel only picks speculation through the Strategy dim (Low
+    // Latency = the checkpoint's adaptive MTP head, High Throughput = off).
+    // This card is the finer control, and it adds the one algorithm no cell
+    // ships: DFlash2, whose draft is a separate checkpoint.
+    //
+    // The EAGLE preset is byte-identical to what the Low Latency cells carry,
+    // so a Low Latency base derives onto that chip instead of showing
+    // "Inherited from base", and re-picking it is a no-op.
+    speculative: {
+      options: [
+        { id: "current", label: "Inherited from base" },
+        { id: "off", label: "Off (greedy)" },
+        {
+          id: "eagle",
+          label: "EAGLE / Adaptive MTP 5-1-6",
+          flags: [
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 5",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 6",
+            "--speculative-adaptive",
+          ],
+          disable: [
+            {
+              when: { dpAttnOn: [true] },
+              reason: "Adaptive MTP does not support DP-Attention — the server falls back to a static draft depth and warns. Turn DP-Attention off in the Attention card above.",
+            },
+            {
+              when: { hw: ["mi300x", "mi325x", "mi355x"] },
+              reason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; the Strategy row disables Low Latency there for the same reason.",
+            },
+          ],
+        },
+        {
+          id: "dflash",
+          label: "DFlash2",
+          // Block-wise draft: the block size comes from the draft checkpoint,
+          // so no --speculative-num-draft-tokens here. The draft is a dense
+          // model and does not run on the target's DSA backends, hence the
+          // explicit draft attention backend.
+          flags: [
+            "--speculative-algorithm DFLASH",
+            "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
+            "--speculative-draft-attention-backend fa4",
+          ],
+          // DFLASH needs this model's hidden-state capture, which landed on the
+          // GLM-5.3-Flash support branch (PR #36708 into #36507's
+          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
+          // image the Install accordion pins. Drop this note once #36507 merges
+          // and a published image carries it.
+          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
+          disable: [
+            {
+              when: { dpAttnOn: [true] },
+              reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
+            },
+            {
+              when: { hw: ["mi300x", "mi325x", "mi355x"] },
+              reason: "DFLASH speculative decoding only supports CUDA and NPU devices; the server rejects it on ROCm at startup.",
+            },
+          ],
+        },
+      ],
+    },
+
   },
 
   cells: [

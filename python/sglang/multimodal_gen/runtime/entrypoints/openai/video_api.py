@@ -117,19 +117,6 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "guardrails",
     "video_path",
     "video_url",
-    "generate_sound",
-    "sound_duration",
-    "condition_frame_indexes",
-    "action_mode",
-    "domain_id",
-    "domain_name",
-    "raw_action_dim",
-    "action_fps",
-    "action",
-    "action_view_point",
-    "action_normalization",
-    "condition_frame_indexes_vision",
-    "condition_video_keep",
     "quality",
 )
 
@@ -265,6 +252,49 @@ def _coerce_optional_int_list(value: Any) -> list[int] | None:
     return [int(value)]
 
 
+def _coerce_optional_float_list(value: Any) -> list[float] | None:
+    value = _parse_form_extra_value(value)
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return [float(value)]
+
+
+def _coerce_optional_bool(value: Any) -> bool | None:
+    value = _parse_form_extra_value(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(value)
+
+
+def _coerce_optional_str_list(value: Any) -> str | list[str] | None:
+    """Coerce a control_path/control_hint value to str or list[str].
+
+    Accepts a JSON list (``["edge.mp4", "depth.mp4"]``), a plain string, or a
+    native list. Empty values resolve to ``None`` so unset fields don't override
+    sampling-param defaults.
+    """
+    value = _parse_form_extra_value(value)
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        items = [str(item) for item in value if str(item).strip()]
+        return items or None
+    if isinstance(value, str):
+        return value if value.strip() else None
+    return str(value)
+
+
 def _resolve_video_path(req: VideoGenerationsRequest) -> str | None:
     video_path = _request_value(req, "video_path") or _request_value(req, "video_url")
     if video_path:
@@ -323,6 +353,41 @@ def _cosmos3_sampling_param_kwargs(
     condition_frame_indexes = _coerce_optional_int_list(condition_frame_indexes)
     if condition_frame_indexes is not None:
         kwargs["condition_frame_indexes"] = condition_frame_indexes
+
+    # Transfer (control-video) conditioning.
+    control_path = _coerce_optional_str_list(_request_value(req, "control_path"))
+    if control_path is not None:
+        kwargs["control_path"] = control_path
+    control_hint = _coerce_optional_str_list(_request_value(req, "control_hint"))
+    if control_hint is not None:
+        kwargs["control_hint"] = control_hint
+    control_guidance = _request_value(req, "control_guidance")
+    if control_guidance is not None:
+        kwargs["control_guidance"] = float(control_guidance)
+    control_guidance_interval = _coerce_optional_float_list(
+        _request_value(req, "control_guidance_interval")
+    )
+    if control_guidance_interval is not None:
+        kwargs["control_guidance_interval"] = tuple(control_guidance_interval)
+
+    for name in (
+        "num_video_frames_per_chunk",
+        "num_conditional_frames",
+        "num_first_chunk_conditional_frames",
+        "max_frames",
+    ):
+        value = _parse_form_extra_value(_request_value(req, name))
+        if value is not None and value != "":
+            kwargs[name] = int(value)
+
+    for name in (
+        "show_control_condition",
+        "show_input",
+        "share_vision_temporal_positions",
+    ):
+        value = _coerce_optional_bool(_request_value(req, name))
+        if value is not None:
+            kwargs[name] = value
 
     for name in (
         "condition_video_keep",

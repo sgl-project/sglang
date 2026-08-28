@@ -149,6 +149,13 @@ def _uses_modelopt_fp8_pb_wo(
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
 
 
+def _uses_split_gguf_kv_b(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether a K3 checkpoint stores MLA K/V as separate GGUF tensors."""
+    return bool(getattr(quant_config, "supports_kimi_k3_split_gguf_kv_b", False))
+
+
 def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
     """Map ModelOpt FP8_PB_WO scale keys to SGLang block-FP8 params."""
     if name.endswith(".weight_scale"):
@@ -1898,9 +1905,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        split_gguf_kv_b = getattr(
-            quant_config, "supports_kimi_k3_quantized_latent_projections", False
-        )
+        # ModelSlim can quantize K3 latent projections while still storing
+        # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
+        split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
@@ -3228,6 +3235,24 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+
+    # Fused runtime module -> checkpoint shard names, so quant configs can
+    # match fused prefixes against per-shard exclude_modules
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+    }
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,

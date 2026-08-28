@@ -21,20 +21,13 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 
 def _xpu_total_gib() -> float:
     if not torch.xpu.is_available():
         return 0.0
     return torch.xpu.get_device_properties(0).total_memory / (1024**3)
-
-
-def _xpu_free_cache() -> None:
-    gc.collect()
-    if torch.xpu.is_available():
-        torch.xpu.empty_cache()
-        torch.xpu.synchronize()
 
 
 # fp32+Triton fits on B60 (22GiB) but hangs on B580 (~12GiB).
@@ -214,8 +207,8 @@ class TestXPUCrossEncoderRerank(CustomTestCase):
         ) as hf_runner:
             hf_scores = hf_runner.forward(prompts).scores
 
-        # HFRunner leaks a ZMQ context on shutdown; free VRAM before SRT starts.
-        _xpu_free_cache()
+        gc.collect()
+        empty_gpu_cache()
 
         with SRTRunner(
             model_path,
