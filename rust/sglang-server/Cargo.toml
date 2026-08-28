@@ -49,17 +49,16 @@ dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }
+# The HTTP router/server; the handlers keep their own body plumbing
+# (`response.rs`) instead of axum's extractors.
+axum = "0.8"
 # Transport-shared HTTP primitives (StatusCode in `api_core`): the same crate
 # axum re-exports, and the one tonic serves over, so the core stays off axum.
 http = "1"
 # The hand-built HTTP edge (api_server/http.rs) + layer rejection bodies.
 http-body = "1"
 http-body-util = "0.1"
-# The HTTP server: hand-built route table served by hyper directly (no axum).
-hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
-# axum-parity extraction: `Path<String>` percent-decoding, `Query<HashMap>`.
-percent-encoding = "2"
+# PD bootstrap `Query<HashMap>`-parity query parsing.
 serde_urlencoded = "0.7"
 itertools = "0.14"
 # POSIX shm for the MM feature fan-out (`mm::ShmSegment`).

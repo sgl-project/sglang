@@ -1,4 +1,4 @@
-//! The HTTP transport (tower + hyper / tokio). I/O-bound; own pinned multi-thread
+//! The HTTP transport (axum + tower / tokio). I/O-bound; own pinned multi-thread
 //! runtime. Only this module knows HTTP: endpoint logic lives in
 //! `api_server::core`, whose shared `CoreState` another transport can mount
 //! unchanged. `/generate` submits a `Request` then awaits one `Done` (unary) or

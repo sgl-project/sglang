@@ -1,8 +1,8 @@
-//! The hand-built HTTP plumbing the transport runs on: the body type, the
-//! response builders, JSON extraction, and SSE framing — over `http` +
-//! `http-body` + tower directly. The client-visible bytes (extractor
-//! rejection texts, SSE headers, error statuses) reproduce the previous
-//! axum edge exactly; `http_edge_wire_contract` pins them.
+//! The HTTP plumbing the handlers run on: the body type, the response
+//! builders, JSON extraction, and SSE framing — over `http` + `http-body`
+//! directly, so the handlers stay generic over the request body instead of
+//! using axum's extractors. The client-visible bytes (extractor rejection
+//! texts, SSE headers, error statuses) match axum's own edge exactly.
 
 use bytes::Bytes;
 use futures::StreamExt;

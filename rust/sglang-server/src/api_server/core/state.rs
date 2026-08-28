@@ -9,17 +9,10 @@ use crate::tokenizer_manager::wiring::Senders;
 
 /// Shared handler state: submission handles, immutable server configuration,
 /// and the API-owned chat formatter.
-///
-/// Transports clone their state into **every** request, so it is mounted as
-/// `Arc<CoreState>` — one refcount bump per request instead of cloning each
-/// `flume::Sender` and the chat formatter. Deliberately not `Clone`, so it
-/// can only be shared through that `Arc`.
 pub(crate) struct CoreState {
     pub(crate) senders: Senders,
     pub(crate) response_buf: usize,
-    /// The API key both transports gate on (None = open). Deliberately NOT a
-    /// `ServerArgs` field: the pyclass schema structurally cannot leak it
-    /// through `/server_info` (see api_server/core/control.rs's secrets test).
+    /// The API key both transports gate on (None = open).
     pub(crate) api_key: Option<String>,
     pub(crate) server_args: Arc<ServerArgs>,
     pub(crate) chat_formatter: Option<ChatFormatter>,
