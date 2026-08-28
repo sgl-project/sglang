@@ -718,6 +718,26 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_max += self.speculative_step_id + 1
         else:
             seq_lens_max = forward_batch.seq_lens_cpu.max()
+            # Context-parallel in-seq-split mode inflates the last sequence's
+            # extend length by the batch-level CP alignment padding:
+            # prepare_context_parallel_metadata adds the gap between the padded
+            # input_ids length and sum(extend_seq_lens) to the last seq's
+            # extend_seqs_len.  The block_table must cover those padding tokens
+            # so the NPU indexer / sparse-attention kernels don't read past the
+            # last page when actual_seq_lengths_kv includes them.
+            if (
+                forward_batch.extend_seq_lens_cpu is not None
+                and forward_batch.input_ids is not None
+            ):
+                batch_pad = (
+                    forward_batch.input_ids.shape[0]
+                    - sum(forward_batch.extend_seq_lens_cpu)
+                )
+                if batch_pad > 0:
+                    seq_lens_max = max(
+                        seq_lens_max,
+                        forward_batch.seq_lens_cpu[-1] + batch_pad,
+                    )
 
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
