@@ -448,10 +448,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """C4 compress state ring (attention + indexer).
 
-        On A5 (CYCLE cache_mode) the compressor derives the ring bank from
-        ``req_pool_idx``; PD transfer must therefore index this buffer by
-        ``req_pool_idx`` (one ``ring_size``-row bank per request), not by SWA
-        page.
+        Register one physical state row as an item.  PD peers can have
+        different request-local ring sizes (for example prefill without MTP
+        and decode with MTP), so payload indices map the same logical token
+        positions into each peer's local ring independently.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -464,7 +464,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 state = pool.kv_score_buffer.kv_score
                 data_ptrs.append(state.data_ptr())
                 data_lens.append(state.nbytes)
-                item_lens.append(state[0].nbytes * pool.ring_size)
+                item_lens.append(state[0].nbytes)
 
         return data_ptrs, data_lens, item_lens
 
