@@ -288,18 +288,6 @@ def benchmark(message_KB: int, provider: str):
 
 
 if __name__ == "__main__":
-    # `python bench_custom_all_reduce.py [--num-gpu N,...]` relaunches itself
-    # under a single-node torchrun, once per world size. For more GPUs than one
-    # node has, drive it with your own torchrun instead -- `multigpu_launch`
-    # detects that and runs the sweep in place:
-    #
-    #   torchrun --nnodes=2 --nproc_per_node=4 --node_rank=$R \
-    #     --master_addr=$MASTER --master_port=$PORT --rdzv_backend=static \
-    #     bench_custom_all_reduce.py
-    #
-    # A multi-node group needs a VMM-backed allocator for the v2 planes to
-    # rendezvous (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`), and
-    # reports `aot` / `jit-graph` as skipped for the reasons above.
     multigpu_bench_main(
         name=__name__,
         file=__file__,
