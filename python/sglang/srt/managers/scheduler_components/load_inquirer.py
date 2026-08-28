@@ -97,7 +97,11 @@ class SchedulerLoadInquirer:
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        running_reqs = self.get_running_batch().reqs
+        num_running_reqs = len(running_reqs)
+        num_running_input_tokens = sum(
+            len(req.origin_input_ids) for req in running_reqs
+        )
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
@@ -220,6 +224,7 @@ class SchedulerLoadInquirer:
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
+            num_running_input_tokens=num_running_input_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

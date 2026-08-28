@@ -204,6 +204,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
     # outside disaggregated decode).
     num_active_tokens: int = 0
+    # Original input tokens belonging only to the current running batch. This
+    # matches the load used by attention-DP routers that place ready requests.
+    num_running_input_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
@@ -278,7 +281,7 @@ snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 # ---------------------------------------------------------------------------
 
 MAGIC = b"SLNS"
-VERSION = 2
+VERSION = 3
 HEADER_STRUCT = struct.Struct("<4sHHI")
 SLOT_LEN_STRUCT = struct.Struct("<I")
 SLOT_SIZE = 16 * 1024

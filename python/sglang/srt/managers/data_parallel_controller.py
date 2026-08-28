@@ -107,6 +107,7 @@ class DPBudget:
     def __init__(self, dp_size: int):
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
+        self.active_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
@@ -120,8 +121,9 @@ class DPBudget:
             self.total_requests[load.dp_rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
+            self.active_requests[load.dp_rank] = load.num_running_reqs
             self.total_tokens[load.dp_rank] = load.num_total_tokens
-            self.active_tokens[load.dp_rank] = load.num_active_tokens
+            self.active_tokens[load.dp_rank] = load.num_running_input_tokens
 
     def dispatch(
         self,
@@ -146,18 +148,19 @@ class DPBudget:
                 else (
                     rank
                     for rank in range(self.dp_size)
-                    if self.total_requests[rank] < max_requests
+                    if self.active_requests[rank] < max_requests
                 )
             )
             target_rank = min(
                 candidates,
-                key=lambda i: (tokens[i], self.total_requests[i]),
+                key=lambda i: (tokens[i], self.active_requests[i]),
             )
         else:
             return None
 
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
+        self.active_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
         self.active_tokens[target_rank] += estimated_tokens
         return target_rank
@@ -848,7 +851,7 @@ class DataParallelController:
         """Balance an already-ready request burst with longest inputs first."""
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
-        request_counts = self.dp_budget.total_requests
+        request_counts = self.dp_budget.active_requests
         self._active_token_request_cap = max(
             (sum(request_counts) + len(requests) + self.dp_budget.dp_size - 1)
             // self.dp_budget.dp_size,

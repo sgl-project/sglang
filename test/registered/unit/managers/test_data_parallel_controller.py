@@ -88,14 +88,25 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_tokens, [150, 80])
 
-    def test_maps_num_active_tokens(self):
+    def test_maps_active_running_state(self):
         budget = DPBudget(dp_size=2)
         budget.update_budget(
             [
-                _load(dp_rank=0, timestamp=1.0, num_active_tokens=120),
-                _load(dp_rank=1, timestamp=1.0, num_active_tokens=80),
+                _load(
+                    dp_rank=0,
+                    timestamp=1.0,
+                    num_running_reqs=3,
+                    num_running_input_tokens=120,
+                ),
+                _load(
+                    dp_rank=1,
+                    timestamp=1.0,
+                    num_running_reqs=5,
+                    num_running_input_tokens=80,
+                ),
             ]
         )
+        self.assertEqual(budget.active_requests, [3, 5])
         self.assertEqual(budget.active_tokens, [120, 80])
 
     def test_partial_update_only_affects_reported_rank(self):
@@ -178,7 +189,7 @@ class TestDPBudgetDispatch(CustomTestCase):
     def test_active_tokens_respects_request_soft_cap(self):
         budget = DPBudget(dp_size=3)
         budget.active_tokens = [0, 50, 100]
-        budget.total_requests = [2, 1, 1]
+        budget.active_requests = [2, 1, 1]
         rank = budget.dispatch(LoadBalanceMethod.ACTIVE_TOKENS, max_requests=2)
         self.assertEqual(rank, 1)
 
