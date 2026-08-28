@@ -1595,7 +1595,7 @@ class TestOffloadDefaults(unittest.TestCase):
                 "text_encoder", constrained_args.layerwise_offload_components or []
             )
 
-    def test_auto_multi_gpu_sana_wm_defers_fsdp_and_enables_cfg_parallel(self):
+    def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
             SanaWMPipelineConfig(),
             kwargs={
@@ -1605,22 +1605,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
-
-    def test_server_warmup_keeps_sana_wm_dit_available_to_residency_planner(self):
-        args = self._from_dict_with_pipeline_config(
-            SanaWMPipelineConfig(),
-            kwargs={
-                "model_path": "Efficient-Large-Model/SANA-WM_bidirectional",
-                "num_gpus": 2,
-                "performance_mode": "auto",
-                "warmup_mode": "server",
-            },
-        )
-
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
     def test_cache_dit_rejects_explicit_fsdp(self):

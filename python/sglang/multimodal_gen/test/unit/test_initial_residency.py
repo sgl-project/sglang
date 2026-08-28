@@ -40,6 +40,7 @@ class _Args:
         self.component_quantizations = {}
         self.nunchaku_config = None
         self.direct_gpu_weight_loading = False
+        self.ltx2_two_stage_device_mode = None
 
     def residency_mode(self, component_name):
         return self.selected.get(

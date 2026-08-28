@@ -302,6 +302,7 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
         quantization=None,
         direct_gpu_weight_loading=False,
         nunchaku_config=None,
+        ltx2_two_stage_device_mode=None,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100, 100)
@@ -362,6 +363,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
         quantization=None,
         direct_gpu_weight_loading=False,
         nunchaku_config=None,
+        ltx2_two_stage_device_mode=None,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)
