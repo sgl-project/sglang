@@ -139,7 +139,14 @@ def plan_dcp_decode_metadata(
     init_metadata_replay: bool,
     fast_decode_kwargs: dict,
     bs: int,
-):
+) -> int:
+    """Shard `kv_indices` to this DCP rank in place; return the shard's length.
+
+    `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
+    rank's ids (`loc % dcp_size == dcp_rank`, collapsed by `// dcp_size`) are
+    compacted into `kv_indices[:total_local_len]`. The returned length bounds
+    the prefix a caller may post-process (e.g. the unified pool's dense translate).
+    """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()
     update_local_kv_lens_for_dcp(local_kv_lens)
@@ -185,3 +192,4 @@ def plan_dcp_decode_metadata(
     kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
     kv_lens.copy_(local_kv_lens)
     kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
+    return total_local_len

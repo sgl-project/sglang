@@ -263,6 +263,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         is_id_owner: bool,
         page_size: int = 1,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
@@ -270,9 +272,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     ):
         spec = unified_buffer.spec(sub_pool_name)
         max_slots = unified_buffer.max_slots(sub_pool_name)
+        assert dcp_size >= 1, f"dcp_size must be >= 1; got {dcp_size}"
+        assert (
+            0 <= dcp_rank < dcp_size
+        ), f"dcp_rank must be in [0, {dcp_size}); got {dcp_rank}"
         super().__init__(
-            size=max_slots,
-            page_size=page_size,
+            size=max_slots * dcp_size,
+            page_size=page_size * dcp_size,
             dtype=spec.get_dtype(),
             device=device,
             kvcache=kvcache,
@@ -301,12 +307,27 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.forward_stream = forward_stream
 
         # --- Page-aware bookkeeping ---
-        # `min_page_index` = ceil(min_slot_index / page_size), keeping the
+        # Two page sizes, equal unless decode context parallelism is on:
+        # `page_size` is VIRTUAL (what the scheduler, the tree cache and the
+        # alloc/free surface speak, matching PagedTokenToKVPoolAllocator's
+        # widened DCP contract), `pool_page_size` is the PHYSICAL rows one page
+        # occupies here. Under DCP a virtual page holds dcp_size logical ids per
+        # stored row, of which this rank owns `loc % dcp_size == dcp_rank`; the
+        # backends' DCP index kernels collapse `loc // dcp_size` before calling
+        # `translate_kv_loc*`, so everything at or below the v2p table -- byte
+        # budget, compaction moves, translate -- stays on `pool_page_size`.
+        # Page ids are invariant under the widening, so v2p/p2v are unchanged.
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.pool_page_size = page_size
+        self.page_size = page_size * dcp_size
+        self.num_pages = max_slots // self.pool_page_size
+        # `min_page_index` = ceil(min_slot_index / pool_page_size), keeping the
         # reserved-sink invariant (min_page_index * entry_bytes_per_page >= entry_max).
-        self.page_size = page_size
-        self.num_pages = max_slots // page_size
-        self.min_page_index = (self.min_slot_index + page_size - 1) // page_size
-        self.entry_bytes_per_page = self.entry_bytes * page_size
+        self.min_page_index = (
+            self.min_slot_index + self.pool_page_size - 1
+        ) // self.pool_page_size
+        self.entry_bytes_per_page = self.entry_bytes * self.pool_page_size
 
         # v2p / p2v sized by PAGES. Page 0 is the padding anchor; trailing row is
         # the -1 sentinel.
@@ -982,6 +1003,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     ) -> torch.Tensor:
         """Translate token-granular virtual ids to physical ids.
 
+        Under DCP the input is the DCP-collapsed id (`widened // dcp_size`, what
+        every DCP index kernel emits), so this works on `pool_page_size`.
+
         ``out=`` writes in-place into a caller-owned buffer — required under
         cuda-graph capture for buffer-stability (the captured graph records the
         gather against a fixed ``data_ptr``).
@@ -1008,7 +1032,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # routes any tombstoned read/write to physical slot 0 — reserved
         # padding-sink space by the `min_slot_index` invariant (bytes [0, entry_max)
         # across all sub-pools hold no real data).
-        if self.page_size == 1:
+        ps = self.pool_page_size
+        if ps == 1:
             if out is not None:
                 # `index_select(out=out)` forbids index/out aliasing, but the
                 # canonical caller does in-place `translate(kv_indices, out=kv_indices)`.
@@ -1019,18 +1044,18 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return out
             result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
             return torch.clamp_min(result, 0)
-        # page_size > 1: page math. `virt_pages`/`offsets` are fresh, so they
+        # ps > 1: page math. `virt_pages`/`offsets` are fresh, so they
         # cannot alias `out` — `index_select(out=out)` is safe.
-        virt_pages = virt_tokens // self.page_size
-        offsets = virt_tokens % self.page_size
+        virt_pages = virt_tokens // ps
+        offsets = virt_tokens % ps
         if out is not None:
             torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
-            out.mul_(self.page_size)
+            out.mul_(ps)
             out.add_(offsets)
             out.clamp_(min=0)  # tombstoned page: -1*ps + offset in [-ps, -1]
             return out
         phys_pages = self.virtual_to_physical[virt_pages]
-        result = phys_pages * self.page_size + offsets
+        result = phys_pages * ps + offsets
         return torch.clamp_min(result, 0)
 
     def translate_kv_loc_for_kernel(
@@ -1048,7 +1073,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
         kernel ABI wants int32 narrows where it fills that buffer.
         """
-        ps = self.page_size
+        ps = self.pool_page_size
         stride = ps * self.kernel_page_multiplier
         with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
             pages = virt_tokens if ps == 1 else virt_tokens // ps
@@ -1075,6 +1100,31 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if offsets is not None:
                 out.add_(offsets)
             return out.clamp_(min=0)
+
+    def translate_write_loc_for_kernel(
+        self,
+        widened_loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Widened virtual WRITE loc (`out_cache_loc`) -> kernel-facing id.
+
+        Reads arrive already DCP-collapsed (every DCP index kernel divides), but
+        `out_cache_loc` does not: it still carries the owner rule in
+        `loc % dcp_size`. Resolve ownership, collapse, translate; ids this rank
+        does not own go to kernel id 0, the padding sink every write kernel
+        skips. Identity with `translate_kv_loc_for_kernel` at dcp_size == 1.
+        """
+        if self.dcp_size == 1:
+            return self.translate_kv_loc_for_kernel(widened_loc, out=out)
+        with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
+            owned = (widened_loc % self.dcp_size) == self.dcp_rank
+            dense = self.translate_kv_loc_for_kernel(widened_loc // self.dcp_size)
+            dense = torch.where(owned, dense, torch.zeros_like(dense))
+            if out is not None:
+                out.copy_(dense)
+                return out
+            return dense
 
     # -- alloc --
 
@@ -1571,9 +1621,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return None
         # `oclv` is non-None here (set_inflight_forward clears the slot otherwise).
         with record_function("MultiEndedAlloc._materialize_inflight_write_set"):
+            # `oclv` is a WIDENED virtual id under DCP; collapse to the id space
+            # translate speaks. The write set is a page set, and a widened page
+            # covers exactly the same page, so the non-owned ids fold in harmlessly.
+            if self.dcp_size > 1:
+                oclv = oclv // self.dcp_size
             phys_tokens = self.translate_kv_loc(oclv)
-            if self.page_size > 1:
-                phys_pages = (phys_tokens // self.page_size).unique()
+            if self.pool_page_size > 1:
+                phys_pages = (phys_tokens // self.pool_page_size).unique()
             else:
                 phys_pages = phys_tokens
             return set(phys_pages.tolist())  # .tolist() syncs schedule_stream
@@ -1999,17 +2054,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 (v_moveds_t >= 0).all(),
                 "invalid p2v mapping in MultiEndedAllocator._flush",
             )
-            # Expand to token granularity (the move kernel is token-granular).
-            if self.page_size == 1:
+            # Expand to PHYSICAL token granularity (the move kernel is
+            # token-granular over pool rows).
+            if self.pool_page_size == 1:
                 src_t, dst_t = src_pages_t, dst_pages_t
             else:
-                offsets = torch.arange(
-                    self.page_size,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-                src_t = (src_pages_t[:, None] * self.page_size + offsets).reshape(-1)
-                dst_t = (dst_pages_t[:, None] * self.page_size + offsets).reshape(-1)
+                ps = self.pool_page_size
+                offsets = torch.arange(ps, dtype=torch.int64, device=self.device)
+                src_t = (src_pages_t[:, None] * ps + offsets).reshape(-1)
+                dst_t = (dst_pages_t[:, None] * ps + offsets).reshape(-1)
             self._kvcache.move_kv_cache(dst_t, src_t)
             # ONE bulk remap (single-writer on schedule_stream).
             self.virtual_to_physical[v_moveds_t] = dst_pages_t
@@ -2706,14 +2759,16 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache,  # HybridLinearKVPool
         device: str,
         page_size: int = 1,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
     ):
         full_max = unified_buffer.max_slots("full")
         super().__init__(
-            size=full_max - 1,
-            page_size=page_size,
+            size=(full_max - 1) * dcp_size,
+            page_size=page_size * dcp_size,
             dtype=unified_buffer.spec("full").get_dtype(),
             device=device,
             kvcache=kvcache,
@@ -2721,11 +2776,14 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.unified_buffer = unified_buffer
         self._kvcache = kvcache
-        self.page_size = page_size
+        # Widened under DCP, matching the full sub-allocator; see its __init__.
+        self.dcp_size = dcp_size
+        self.page_size = page_size * dcp_size
         self.lazy_compaction = lazy_compaction
 
         # FULL is page-aware; MAMBA stays page_size=1 (state is per-request,
-        # orthogonal to the full side's per-token paging).
+        # orthogonal to the full side's per-token paging). DCP shards KV tokens
+        # only, so the mamba side keeps dcp_size=1: its state is replicated.
         self.full_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
@@ -2733,6 +2791,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             device=device,
             is_id_owner=True,
             page_size=page_size,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
@@ -2821,7 +2881,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def size_full(self) -> int:
-        return self.full_attn_allocator.max_slots - 1
+        # Widened like `size`: a logical token capacity, not a row count.
+        return (self.full_attn_allocator.max_slots - 1) * self.dcp_size
 
     @property
     def size_mamba(self) -> int:
@@ -2915,6 +2976,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Full-pool virtual TOKEN ids -> kernel-facing ids."""
         return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
 
+    def translate_write_loc_for_kernel(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Widened virtual WRITE loc -> DENSE id; see the sub-allocator's copy."""
+        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
+
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
@@ -2923,6 +2993,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
         `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`).
         """
+        assert self.dcp_size == 1, (
+            "PD-disaggregation transfer with the unified memory pool does not "
+            "support decode context parallelism: the transfer ships whole page "
+            "envelopes, which hold only this rank's shard of each widened page."
+        )
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
     def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
@@ -3360,6 +3435,17 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ) -> torch.Tensor:
         """Full-pool virtual TOKEN ids -> kernel-facing ids."""
         return self.full_attn_allocator.translate_kv_loc_for_kernel(loc, out=out)
+
+    def translate_write_loc_for_kernel(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Widened virtual WRITE loc -> kernel-facing id; see the sub-allocator's
+        copy. DCP is rejected for this composite at argument validation, so this
+        is the dcp_size == 1 identity with the read translate."""
+        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
 
     @property
     def swa_kernel_page_multiplier(self) -> int:

@@ -122,6 +122,11 @@ class KVIndexTranslator:
             self._full_p2v_table = alloc.full_p2v_page_table
             self._full_page_multiplier = alloc.kernel_page_multiplier
             self._translate_full = alloc.translate_kv_loc_for_kernel
+            # The WRITE loc is the one id that arrives DCP-WIDENED: read indices
+            # are collapsed by the DCP index kernels, `out_cache_loc` still
+            # carries the owner rule in `loc % dcp_size`. Identity with the read
+            # translate when dcp_size == 1.
+            self._translate_write_full = alloc.translate_write_loc_for_kernel
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
@@ -135,6 +140,7 @@ class KVIndexTranslator:
             self._full_p2v_table = None
             self._full_page_multiplier = 1
             self._translate_full = None
+            self._translate_write_full = None
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
             self._swa_write_loc_from_full = (
@@ -338,7 +344,9 @@ class KVIndexTranslator:
         self._index_table_memo = None
         if not self.is_translating or forward_batch.out_cache_loc is None:
             return
-        forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
+        forward_batch.out_cache_loc = self._translate_write_full(
+            forward_batch.out_cache_loc
+        )
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]

@@ -919,25 +919,49 @@ class FlashInferMLAIndicesUpdaterDecode:
                 if not init_metadata_replay
                 else fast_decode_kwargs["kv_indices"]
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                kv_view.ids,
-                kv_view.row_ids,
-                paged_kernel_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                kv_view.row_stride,
-                ENTRY_PAGE_SIZE=kv_view.entry_page_size,
-            )
-
+            translator = self.kv_index_translator
             if get_parallel().dcp_enabled:
-                plan_dcp_decode_metadata(
+                # SHARD BEFORE TRANSLATE. `plan_dcp_decode_metadata` applies the
+                # owner rule and collapses `loc // dcp_size`, so it must see
+                # VIRTUAL ids -- build straight from `req_to_token` rather than
+                # from the (already kernel-facing) read table, shard, then
+                # translate only the compacted prefix it reports.
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    translator.req_to_token,
+                    req_pool_indices[:bs],
+                    paged_kernel_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    translator.req_to_token.stride(0),
+                    ENTRY_PAGE_SIZE=1,
+                )
+                n_kernel_ids = plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,
                     kv_indices,
                     init_metadata_replay,
                     fast_decode_kwargs,
                     bs,
+                )
+                # Written back IN PLACE: on cuda-graph replay `kv_indices` IS the
+                # capture-stable buffer the captured wrapper reads, so rebinding
+                # the local name would leave the graph on virtual ids. Only the
+                # compacted prefix is translated; the stale tail never indexes
+                # the v2p table.
+                if translator.is_translating and n_kernel_ids > 0:
+                    valid = kv_indices[:n_kernel_ids]
+                    valid.copy_(translator.translate_full_attn_ids(valid))
+            else:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    kv_view.ids,
+                    kv_view.row_ids,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    kv_view.row_stride,
+                    ENTRY_PAGE_SIZE=kv_view.entry_page_size,
                 )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices

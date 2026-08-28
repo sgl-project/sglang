@@ -4117,7 +4117,13 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        *,
+        dcp_resolved: bool = False,
     ) -> None:
+        # `dcp_resolved`: `loc` already addresses this rank's rows (the unified
+        # pool's dense-id contract), so the write kernel must not re-apply the
+        # DCP owner rule. The DSA branches below have no such kernel argument.
+        assert not (dcp_resolved and (self.use_dsa or self.dsa_kv_cache_store_fp8))
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4158,6 +4164,7 @@ class MLATokenToKVPool(KVCache):
                 loc,
                 cache_k_nope,
                 cache_k_rope,
+                dcp_resolved=dcp_resolved,
             )
 
     def set_mla_kv_buffer(

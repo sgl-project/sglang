@@ -95,6 +95,7 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: torch.Tensor,
     *,
     reserved_skip_index: int = 0,
+    dcp_resolved: bool = False,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -121,6 +122,11 @@ def set_mla_kv_buffer_triton(
 
     Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
     for CUDA-graph padding by default; pass -1 to disable skipping.
+
+    ``dcp_resolved``: ``loc`` already addresses this rank's rows and the ids it
+    does not own are already tombstoned onto ``reserved_skip_index`` (the
+    unified pool's dense-id contract), so the DCP owner rule must NOT be applied
+    a second time here.
     """
     from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
@@ -132,11 +138,13 @@ def set_mla_kv_buffer_triton(
     n_loc = loc.numel()
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
+    dcp_rank = 0 if dcp_resolved else get_parallel().attn_dcp_rank
+    dcp_world_size = 1 if dcp_resolved else get_parallel().attn_dcp_size
     if (
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not get_parallel().dcp_enabled
+        and dcp_world_size == 1
     ):
         jit_set_mla_kv_buffer(
             kv_buffer,
@@ -170,8 +178,8 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_parallel().attn_dcp_rank,
-        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
     )
 

@@ -176,7 +176,10 @@ class TestUnifiedSWATombstoneClamp(unittest.TestCase):
         # A real sub-allocator (not a stand-in): the translation reads its v2p
         # table, and the pool reaches it through the allocator's own method.
         swa_allocator = object.__new__(MultiEndedAllocator)
+        # `page_size` is the WIDENED (DCP) surface, `pool_page_size` the physical
+        # rows per page; equal at dcp_size == 1, which is what this fixture is.
         swa_allocator.page_size = page_size
+        swa_allocator.pool_page_size = page_size
         swa_allocator.virtual_to_physical = v2p
         swa_allocator.kernel_page_multiplier = multiplier
         pool = object.__new__(UnifiedSWAKVPool)

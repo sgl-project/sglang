@@ -3299,5 +3299,120 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
             fla.bind_peer(sa)
 
 
+class TestDcpWidening(unittest.TestCase):
+    """`dcp_size > 1`: the alloc surface speaks a widened virtual id space while
+    the pool keeps storing one row per `dcp_size` logical ids."""
+
+    def _build(self, *, page_size, dcp_size, dcp_rank, n_full_slots=64):
+        full = _make_mha_spec("full", "up", layer_num=2)
+        mamba = _make_mamba_spec("mamba", "down", layer_num=2)
+        pool = UnifiedKVPool(
+            total_bytes=full.entry_bytes() * n_full_slots + mamba.entry_bytes() * 16,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+        )
+        alloc = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("full")),
+            unified_buffer=pool,
+            sub_pool_name="full",
+            device=_DEV,
+            is_id_owner=True,
+            page_size=page_size,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        alloc.bind_peer(
+            MultiEndedAllocator(
+                kvcache=_FakeKVCache(pool.max_slots("mamba")),
+                unified_buffer=pool,
+                sub_pool_name="mamba",
+                device=_DEV,
+                is_id_owner=True,
+            )
+        )
+        return alloc
+
+    def test_capacity_scales_but_physical_pages_do_not(self):
+        for page_size in (1, 8):
+            base = self._build(page_size=page_size, dcp_size=1, dcp_rank=0)
+            for dcp_size in (2, 4):
+                a = self._build(page_size=page_size, dcp_size=dcp_size, dcp_rank=0)
+                self.assertEqual(a.page_size, page_size * dcp_size)
+                self.assertEqual(a.pool_page_size, page_size)
+                # Same rows, same byte budget per page — only the id space grows.
+                self.assertEqual(a.num_pages, base.num_pages)
+                self.assertEqual(a.entry_bytes_per_page, base.entry_bytes_per_page)
+                self.assertEqual(a.available_size(), base.available_size() * dcp_size)
+
+    def test_alloc_returns_whole_widened_pages(self):
+        a = self._build(page_size=4, dcp_size=2, dcp_rank=1)
+        ids = a.alloc(3 * 8)  # 3 widened pages of 4*2 ids
+        self.assertIsNotNone(ids)
+        pages = ids.view(3, 8)
+        self.assertTrue(
+            torch.equal(pages[:, 1:] - pages[:, :-1], torch.ones(3, 7).long())
+        )
+        self.assertTrue(bool((pages[:, 0] % 8 == 0).all()))
+        # Freeing the widened ids releases exactly the pages they came from.
+        before = a.available_size()
+        a.free(ids)
+        self.assertEqual(a.available_size(), before + 3 * 8)
+
+    def test_every_rank_maps_a_widened_page_to_one_physical_page(self):
+        """The DCP ranks must agree on the physical page a widened page uses;
+        only the row WITHIN it differs, by `(loc % dcp) -> loc // dcp`."""
+        dcp_size = 4
+        allocs = [
+            self._build(page_size=2, dcp_size=dcp_size, dcp_rank=r)
+            for r in range(dcp_size)
+        ]
+        ids = [a.alloc(2 * dcp_size * 2) for a in allocs]
+        for a, i in zip(allocs, ids):
+            self.assertIsNotNone(i)
+        # Same allocation order -> same widened ids on every rank.
+        for i in ids[1:]:
+            self.assertTrue(torch.equal(i, ids[0]))
+        for rank, (a, i) in enumerate(zip(allocs, ids)):
+            owned = (i % dcp_size) == rank
+            self.assertEqual(int(owned.sum()), i.numel() // dcp_size)
+            phys = a.translate_kv_loc(i[owned] // dcp_size)
+            # Collapsed ids land inside this rank's physical rows, contiguously
+            # within each page, and never on the reserved sink.
+            self.assertTrue(bool((phys > 0).all()))
+            self.assertTrue(bool((phys < a.max_slots).all()))
+            self.assertEqual(len(set(phys.tolist())), phys.numel())
+
+    def test_write_translate_tombstones_unowned_ids(self):
+        dcp_size = 2
+        for rank in range(dcp_size):
+            a = self._build(page_size=2, dcp_size=dcp_size, dcp_rank=rank)
+            ids = a.alloc(2 * dcp_size * 3)
+            written = a.translate_write_loc_for_kernel(ids)
+            owned = (ids % dcp_size) == rank
+            # Owned ids agree with the read translate of the collapsed id...
+            self.assertTrue(
+                torch.equal(
+                    written[owned],
+                    a.translate_kv_loc_for_kernel(ids[owned] // dcp_size),
+                )
+            )
+            # ...and the rest go to the padding sink the write kernels skip.
+            self.assertTrue(bool((written[~owned] == 0).all()))
+            self.assertTrue(bool((written[owned] > 0).all()))
+
+    def test_dcp_size_one_is_unchanged(self):
+        a = self._build(page_size=4, dcp_size=1, dcp_rank=0)
+        ids = a.alloc(8)
+        self.assertEqual(a.page_size, a.pool_page_size)
+        self.assertTrue(
+            torch.equal(
+                a.translate_write_loc_for_kernel(ids),
+                a.translate_kv_loc_for_kernel(ids),
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

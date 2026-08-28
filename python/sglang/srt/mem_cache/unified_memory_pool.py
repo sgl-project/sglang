@@ -36,6 +36,7 @@ from torch.profiler import record_function
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.layout.page_major import (
     build_mha_views,
     build_mla_views,
@@ -50,6 +51,7 @@ from sglang.srt.mem_cache.memory_pool import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -708,6 +710,57 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Write at DENSE locs. DCP is already resolved by the loc-space contract.
+
+        `translate_write_loc_dense` collapsed the widened id and tombstoned the
+        rows this rank does not own onto dense id 0, so the kernel must not
+        re-apply the owner rule (the parent bounds by `size * dcp_size` and
+        divides in-kernel; both are wrong for a dense id).
+        """
+        maybe_detect_oob(loc, 0, self._view_rows, "set_mla_kv_buffer (unified MLA)")
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        self._write_mla_kv_buffer(
+            self.kv_buffer[layer_id - self.start_layer],
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            dcp_resolved=True,
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Write the combined latent+rope row at DENSE locs.
+
+        Same contract as `set_mla_kv_buffer`: the loc is dense, so the parent's
+        DCP owner-rule branch must not run.
+        """
+        loc, _, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(loc, 0, self._view_rows, "set_kv_buffer (unified MLA)")
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+        self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+
     def get_kv_size_bytes(self):
         return 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
@@ -1187,6 +1240,8 @@ def init_unified_mamba_pools(
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
     unified_total_bytes: Optional[int] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1321,6 +1376,8 @@ def init_unified_mamba_pools(
         kvcache=token_to_kv_pool,
         device=device,
         page_size=page_size,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
