@@ -36,6 +36,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             component_quantizations={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
+            requested_component_attention_backend=lambda _name: None,
         )
 
     def _component_config(self, architecture, *, quantized):

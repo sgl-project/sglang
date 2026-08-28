@@ -233,6 +233,9 @@ class ServerArgs(DisaggServerArgsMixin):
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
     )
+    _requested_component_attention_backends: dict[str, str] | None = field(
+        default=None, repr=False, compare=False
+    )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -930,6 +933,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends
             )
         )
+        if self._requested_component_attention_backends is None:
+            self._requested_component_attention_backends = dict(
+                self.component_attention_backends
+            )
+        else:
+            self._requested_component_attention_backends = (
+                self._normalize_component_attention_backends(
+                    self._requested_component_attention_backends
+                )
+            )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -1156,6 +1169,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 if backend is not None:
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
+
+    def requested_component_attention_backend(self, component_name: str) -> str | None:
+        assert self._requested_component_attention_backends is not None
+        return self._requested_component_attention_backends.get(component_name)
+
+    def has_requested_component_attention_backends(self) -> bool:
+        return bool(self._requested_component_attention_backends)
 
     def _adjust_warmup(self):
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:
