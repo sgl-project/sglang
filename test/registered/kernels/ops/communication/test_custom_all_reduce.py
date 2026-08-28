@@ -35,7 +35,7 @@ from sglang.kernels.ops.communication.all_reduce import (
 )
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
-    _MULTINODE_LAMPORT,
+    _MULTINODE_TWO_SHOT_PUSH,
     get_all_reduce_config,
     get_supported_world_sizes,
 )
@@ -75,7 +75,7 @@ TEST_ALGOS = [
     AllReduceAlgo.ONE_SHOT_PULL,
     AllReduceAlgo.ONE_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
-    AllReduceAlgo.TWO_SHOT_LAMPORT,
+    AllReduceAlgo.TWO_SHOT_PUSH,
 ]
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
@@ -172,7 +172,7 @@ def _init_comm_once() -> CustomAllReduceV2:
         device,
         max_pull_size=max_size,
         max_push_size=max_size,
-        max_lamport_size=max_size,
+        max_two_shot_push_size=max_size,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -254,11 +254,11 @@ def test_empty_input_dispatches_like_the_smallest_one() -> None:
         )
 
 
-def test_multinode_only_retunes_the_eager_lamport_band() -> None:
+def test_multinode_only_retunes_the_eager_2shot_push_band() -> None:
     cuda_major, _ = torch.cuda.get_device_capability()
     tuned = {
         world_size: band
-        for (major, world_size), band in _MULTINODE_LAMPORT.items()
+        for (major, world_size), band in _MULTINODE_TWO_SHOT_PUSH.items()
         if major == cuda_major
     }
     for world_size in get_supported_world_sizes():
@@ -268,41 +268,41 @@ def test_multinode_only_retunes_the_eager_lamport_band() -> None:
         if band is None:
             assert multi == single, f"{world_size=} has no multi-node entry"
             continue
-        assert multi.eager.lamport == band
+        assert multi.eager.two_shot_push == band
         assert multi == single._replace(
-            eager=single.eager._replace(lamport=band)
-        ), f"{world_size=} multi-node override reached past eager.lamport"
+            eager=single.eager._replace(two_shot_push=band)
+        ), f"{world_size=} multi-node override reached past eager.two_shot_push"
         # the band has to stay inside the pull workspace it stages through
         assert band.max_bytes <= multi.eager.max_pull_bytes
 
 
 @torch.inference_mode()
-def test_2shot_lamport_shared_push_plane() -> None:
+def test_2shot_push_shares_the_1shot_plane() -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     dtype = torch.bfloat16
     push_size = _ALIGN_BYTES // dtype.itemsize  # exactly fills a push slot
-    lamport_size = 16 * push_size  # far more than the push slots hold
-    lamport_bytes = lamport_size * dtype.itemsize
+    two_shot_size = 16 * push_size  # far more than the push slots hold
+    two_shot_bytes = two_shot_size * dtype.itemsize
     comm = CustomAllReduceV2(
         _init_cpu_group_once(),
         device,
-        max_pull_size=lamport_bytes,
+        max_pull_size=two_shot_bytes,
         max_push_size=_ALIGN_BYTES,
-        max_lamport_size=lamport_bytes,
+        max_two_shot_push_size=two_shot_bytes,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)
-    # A whole Lamport message spans one enlarged shared slot per peer. Keep
+    # A whole 2shot_push message spans one enlarged shared slot per peer. Keep
     # the tuned 1shot limit smaller: physical capacity must not silently widen
     # its dispatch range.
-    assert comm.gather_slot_size * comm.world_size >= lamport_bytes
-    assert comm.max_push_size * comm.world_size < lamport_bytes
+    assert comm.gather_slot_size * comm.world_size >= two_shot_bytes
+    assert comm.max_push_size * comm.world_size < two_shot_bytes
     assert comm.shared_slot_size == comm.gather_slot_size
     assert comm.shared_slot_size > comm.max_push_size
 
-    plan = [(AllReduceAlgo.TWO_SHOT_LAMPORT, lamport_size)] * TEST_LAYERS
+    plan = [(AllReduceAlgo.TWO_SHOT_PUSH, two_shot_size)] * TEST_LAYERS
     plan += [(AllReduceAlgo.ONE_SHOT_PUSH, push_size)] * TEST_LAYERS
     plan[::2], plan[1::2] = plan[:TEST_LAYERS], plan[TEST_LAYERS:]
 

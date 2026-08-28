@@ -22,10 +22,17 @@ class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
-    TWO_SHOT_LAMPORT = enum.auto()
+    TWO_SHOT_PUSH = enum.auto()
 
-    def is_push(self) -> bool:
-        return self == AllReduceAlgo.ONE_SHOT_PUSH
+    def supports_zero_copy(self) -> bool:
+        """Whether peers can reduce straight out of the caller's own buffer.
+
+        Only ``1shot_push`` cannot: it publishes its input to every peer up
+        front, so there is nothing for the graph pointer table to register.
+        The two-shot push does read peers' inputs in place — it pushes only
+        the *reduced shard*, in its all-gather half.
+        """
+        return self != AllReduceAlgo.ONE_SHOT_PUSH
 
     @property
     def algo_name(self) -> str:
@@ -36,7 +43,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
-    AllReduceAlgo.TWO_SHOT_LAMPORT: "2shot_lamport",
+    AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
 }
 
 if TYPE_CHECKING:
@@ -184,7 +191,7 @@ class Communicator(tvm_ffi.Object):
 
     @property
     def gather(self) -> PushPlane | None:
-        """The shared push-plane handle used by 2shot_lamport, or None."""
+        """The shared push-plane handle used by 2shot_push, or None."""
         return self.get_gather()
 
 

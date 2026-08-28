@@ -3,7 +3,7 @@
 The CUDA side is split into independent pieces:
 
 - ``PushPlane``: the zero-filled symmetric push buffers plus a rank-local
-  phase counter. ``1shot_push`` and ``2shot_lamport`` share this plane: the
+  phase counter. ``1shot_push`` and ``2shot_push`` share this plane: the
   former treats it as one full-input slot per source, while the latter lays
   the reduced shards contiguously across those same slots.
 - ``PullPlane``: the symmetric pull buffers plus the per-block semaphores
@@ -11,14 +11,14 @@ The CUDA side is split into independent pieces:
   all-reduce tensors that are not symmetric memory, so it stages them
   through; the K3 fused collectives bring their own symmetric input and
   borrow the semaphores alone.
-- the gather handle: an alias of ``PushPlane``, used by ``2shot_lamport`` for
+- the gather handle: an alias of ``PushPlane``, used by ``2shot_push`` for
   the all-gather half of its reduce-scatter. Sharing the handle also shares
   the epoch counter, so both algorithms advance the double buffer together.
 - ``Communicator``: the planes above (any may be absent), the handle every
   kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
   graph_params, use_multicast)`` with four algorithms (1shot_push /
-  1shot_pull / 2shot_pull / 2shot_lamport) and three pull data sources (eager
+  1shot_pull / 2shot_pull / 2shot_push) and three pull data sources (eager
   pull buffer / CUDA-graph pointer table / multicast address).
 
 All storage is allocated and owned here, in Python.
@@ -122,7 +122,7 @@ class CustomAllReduceV2:
         *,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
-        max_lamport_size: Optional[int] = None,
+        max_two_shot_push_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
@@ -136,7 +136,7 @@ class CustomAllReduceV2:
                               push-only instance.
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
-        :param max_lamport_size: explicit ``2shot_lamport`` message ceiling,
+        :param max_two_shot_push_size: explicit ``2shot_push`` message ceiling,
                                  which may enlarge the shared push slots;
                                  overrides both the tuned size and
                                  ``max_size``. ``0`` disables the algo and its
@@ -167,8 +167,8 @@ class CustomAllReduceV2:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
             max_push_size = min(base_config.max_push_bytes, max_size)
-        if max_lamport_size is None:
-            max_lamport_size = min(base_config.max_lamport_bytes, max_size)
+        if max_two_shot_push_size is None:
+            max_two_shot_push_size = min(base_config.max_two_shot_push_bytes, max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -206,24 +206,24 @@ class CustomAllReduceV2:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
-        self.lamport_enabled = self.pull_enabled and max_lamport_size > 0
+        self.two_shot_push_enabled = self.pull_enabled and max_two_shot_push_size > 0
         self.gather_slot_size = (
             _ceil_align(
-                _div_ceil(max_lamport_size, self.world_size),
+                _div_ceil(max_two_shot_push_size, self.world_size),
                 _ALIGN_BYTES,
             )
-            if self.lamport_enabled
+            if self.two_shot_push_enabled
             else 0
         )
         self.shared_slot_size = max(self.max_push_size, self.gather_slot_size)
-        self.max_lamport_size = min(
+        self.max_two_shot_push_size = min(
             self.gather_slot_size * self.world_size, self.max_pull_size
         )
         self.max_size = max(self.max_pull_size, self.max_push_size)
         self.config = base_config.clip(
             max_push_bytes=self.max_push_size,
             max_pull_bytes=self.max_pull_size,
-            max_lamport_bytes=self.max_lamport_size,
+            max_two_shot_push_bytes=self.max_two_shot_push_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
@@ -253,18 +253,18 @@ class CustomAllReduceV2:
 
         Layout per rank: ``[2 * world_size shared push slots | pull buffer |
         pull semaphores]``. The shared slots serve both ``1shot_push`` and
-        ``2shot_lamport``; their common counter is rank-local and therefore
+        ``2shot_push``; their common counter is rank-local and therefore
         lives in a plain CUDA tensor.
         """
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
         push_bytes = push_num_slots * self.shared_slot_size
         pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
-        # Lamport now launches with the push grid (`num_sms`) but enters
+        # 2shot_push now launches with the push grid (`num_sms`) but enters
         # through the pull barrier. Allocate enough semaphore rows for that
         # grid while keeping the tuned pull launch width in Communicator.
         num_sem_blocks = cfg.num_pull_blocks if self.pull_enabled else 0
-        if self.lamport_enabled:
+        if self.two_shot_push_enabled:
             num_sem_blocks = max(num_sem_blocks, cfg.num_push_blocks)
         sem_bytes = _SEMAPHORE_BYTES * num_sem_blocks
         total_bytes = push_bytes + pull_bytes + sem_bytes
@@ -309,7 +309,7 @@ class CustomAllReduceV2:
             counter=self._push_counter.view(-1, 1).view(torch.uint8),
             mc_workspace=mc_at(0),
         )
-        gather_plane = push_plane if self.lamport_enabled else None
+        gather_plane = push_plane if self.two_shot_push_enabled else None
         pull_plane = None
         if self.pull_enabled:
             pull_plane = PullPlane(
@@ -331,12 +331,12 @@ class CustomAllReduceV2:
         if self.rank == 0:
             logger.info(
                 "All Reduce config: symmetric_memory = %.2f MB, "
-                "local_buffer = %.2f MB, multicast = %s, pull = %s, lamport = %s",
+                "local_buffer = %.2f MB, multicast = %s, pull = %s, 2shot_push = %s",
                 total_bytes / MB,
                 (self.graph_params.nbytes + self._push_counter.nbytes) / MB,
                 self.config.num_mc_blocks is not None,
                 self.pull_enabled,
-                self.lamport_enabled,
+                self.two_shot_push_enabled,
             )
         dist.barrier(group=self.group)
 
@@ -379,10 +379,8 @@ class CustomAllReduceV2:
         heuristic = self.config.graph if can_use_graph else self.config.eager
         can_use_multicast = self.config.num_mc_blocks is not None
         # tried first so its band may start below one_shot_push_threshold
-        if heuristic.lamport.contains(nbytes):
-            return AllReduceConfig(
-                AllReduceAlgo.TWO_SHOT_LAMPORT, use_graph=can_use_graph
-            )
+        if heuristic.two_shot_push.contains(nbytes):
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH, use_graph=can_use_graph)
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
@@ -416,7 +414,7 @@ class CustomAllReduceV2:
         if self.override_algo is not None:
             # TODO: enhance this override pattern
             algo = self.override_algo
-            use_graph = self._can_use_graph() and not algo.is_push()
+            use_graph = self._can_use_graph() and algo.supports_zero_copy()
             use_multicast = False
         else:
             config = self._pick_config(nbytes, self._can_use_graph())

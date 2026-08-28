@@ -34,7 +34,7 @@ class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
     Five algos are tried in order of preference (fastest first):
-      1. ``2shot_lamport``: nbytes in ``lamport.min_bytes..lamport.max_bytes``
+      1. ``2shot_push``: nbytes in ``two_shot_push.min_bytes..two_shot_push.max_bytes``
       2. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
       3. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
       4. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
@@ -42,18 +42,18 @@ class Heuristic(NamedTuple):
       5. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
     Above all of these, the caller falls back to NCCL.
 
-    ``lamport`` is tried first so its band may start below
+    ``two_shot_push`` is tried first so its band may start below
     ``one_shot_push_threshold``
 
     Setting two adjacent thresholds equal effectively disables the middle
-    algo; leaving ``mc`` / ``lamport`` at the default disables that algo.
+    algo; leaving ``mc`` / ``two_shot_push`` at the default disables that algo.
     """
 
     one_shot_push_threshold: int
     one_shot_pull_threshold: int
     two_shot_pull_threshold: int
     mc: Range = Range(0, 0)  # default: multicast disabled in this context
-    lamport: Range = Range(0, 0)  # default: 2shot_lamport disabled here
+    two_shot_push: Range = Range(0, 0)  # default: 2shot_push disabled here
 
     @property
     def max_push_bytes(self) -> int:
@@ -62,28 +62,28 @@ class Heuristic(NamedTuple):
     @property
     def max_pull_bytes(self) -> int:
         # The pull workspace hosts every pull-variant kernel, so it has to
-        # fit whichever variant runs at the largest size. 2shot_lamport
+        # fit whichever variant runs at the largest size. 2shot_push
         # stages its input through it too, and only gathers elsewhere.
         return max(
             self.one_shot_pull_threshold,
             self.two_shot_pull_threshold,
             self.mc.max_bytes,
-            self.lamport.max_bytes,
+            self.two_shot_push.max_bytes,
         )
 
     @property
-    def max_lamport_bytes(self) -> int:
-        return self.lamport.max_bytes
+    def max_two_shot_push_bytes(self) -> int:
+        return self.two_shot_push.max_bytes
 
     def clip(
-        self, *, max_push_bytes: int, max_pull_bytes: int, max_lamport_bytes: int
+        self, *, max_push_bytes: int, max_pull_bytes: int, max_two_shot_push_bytes: int
     ) -> "Heuristic":
         return Heuristic(
             min(self.one_shot_push_threshold, max_push_bytes),
             min(self.one_shot_pull_threshold, max_pull_bytes),
             min(self.two_shot_pull_threshold, max_pull_bytes),
             self.mc.clip(max_pull_bytes),
-            self.lamport.clip(max_lamport_bytes),
+            self.two_shot_push.clip(max_two_shot_push_bytes),
         )
 
 
@@ -93,7 +93,7 @@ class AllReduceConfig(NamedTuple):
     The two ``Heuristic`` entries describe the size crossover for each
     dispatch context (CUDA-graph capture vs eager). Block-count knobs apply
     to the kernel grid:
-      - ``num_push_blocks``: shared 1shot_push / 2shot_lamport grid (bound to
+      - ``num_push_blocks``: shared 1shot_push / 2shot_push grid (bound to
         the counter array)
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
@@ -114,16 +114,18 @@ class AllReduceConfig(NamedTuple):
         return max(self.graph.max_pull_bytes, self.eager.max_pull_bytes)
 
     @property
-    def max_lamport_bytes(self) -> int:
-        return max(self.graph.max_lamport_bytes, self.eager.max_lamport_bytes)
+    def max_two_shot_push_bytes(self) -> int:
+        return max(
+            self.graph.max_two_shot_push_bytes, self.eager.max_two_shot_push_bytes
+        )
 
     def clip(
-        self, *, max_push_bytes: int, max_pull_bytes: int, max_lamport_bytes: int
+        self, *, max_push_bytes: int, max_pull_bytes: int, max_two_shot_push_bytes: int
     ) -> "AllReduceConfig":
         bounds = dict(
             max_push_bytes=max_push_bytes,
             max_pull_bytes=max_pull_bytes,
-            max_lamport_bytes=max_lamport_bytes,
+            max_two_shot_push_bytes=max_two_shot_push_bytes,
         )
         return self._replace(
             graph=self.graph.clip(**bounds),
@@ -341,9 +343,9 @@ def get_supported_world_sizes() -> tuple[int, ...]:
     return tuple(_get_all_reduce_configs())
 
 
-_MULTINODE_LAMPORT: dict[tuple[int, int], Range] = {
-    # 2 x GB200 (4 GPUs each). lamport beats mc 2shot_pull by 3-30% here and
-    # loses to it from 4 MB up; below 512 KB 1shot_push is still ahead.
+_MULTINODE_TWO_SHOT_PUSH: dict[tuple[int, int], Range] = {
+    # 2 x GB200 (4 GPUs each). 2shot_push beats mc 2shot_pull by 3-30% here
+    # and loses to it from 4 MB up; below 512 KB 1shot_push is still ahead.
     (10, 8): Range(512 * KB, int(3.5 * MB)),
 }
 
@@ -355,7 +357,7 @@ def get_all_reduce_config(world_size: int, multinode: bool = False) -> AllReduce
     Only SM90, SM100 and SM107 are benchmarked so far; other archs get a
     conservative default (1 MB one-shot crossovers, no multicast).
 
-    ``multinode`` swaps in a separately tuned ``2shot_lamport`` band where one
+    ``multinode`` swaps in a separately tuned ``2shot_push`` band where one
     exists. Only the eager row can differ: a multi-node group forces eager
     anyway, because graph zero-copy input registration is node-local.
     """
@@ -363,7 +365,7 @@ def get_all_reduce_config(world_size: int, multinode: bool = False) -> AllReduce
     if not multinode:
         return config
     cuda_major, _ = torch.cuda.get_device_capability()
-    band = _MULTINODE_LAMPORT.get((cuda_major, world_size))
+    band = _MULTINODE_TWO_SHOT_PUSH.get((cuda_major, world_size))
     if band is None:
         return config
-    return config._replace(eager=config.eager._replace(lamport=band))
+    return config._replace(eager=config.eager._replace(two_shot_push=band))
