@@ -1301,6 +1301,7 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        combined_q_topk_workspace=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         # kv_score depends only on x, so its CP all-gather can start before the
@@ -1517,12 +1518,15 @@ class MQALayer(MqaAttentionBase):
         del qkv_a
 
         if self.indexer is not None:
-            self.indexer(
+            gathered_q = self.indexer(
                 x=x,
                 q_lora=q_lora,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
+                combined_q_topk_workspace=combined_q_topk_workspace,
             )
+            if gathered_q is not None:
+                q = gathered_q
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -1571,23 +1575,47 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        combined_q_topk_workspace = None
+        get_combined_workspace = getattr(
+            attn_backend, "get_dcp_combined_q_topk_workspace", None
+        )
+        if self.indexer is not None and get_combined_workspace is not None:
+            combined_q_topk_workspace = get_combined_workspace(
+                forward_batch=forward_batch,
+                batch_size=x.shape[0],
+                local_heads=self.n_local_heads,
+                head_dim=self.head_dim,
+                topk=self.indexer.index_topk,
+                dtype=x.dtype,
+                device=x.device,
+                enable_multi_stream=enable_multi_stream,
+            )
+
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+            if combined_q_topk_workspace is not None:
+                # The Q producer writes directly into the first Hlocal heads.
+                # Candidate words occupy the remaining heads and are filled by
+                # the indexer before the one combined all-gather.
+                q_out = combined_q_topk_workspace.local_combined[
+                    :, : self.n_local_heads, :
+                ]
             else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
-            tp_slice = slice(0, self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
+                # FlashMLA's fp8 sparse decode kernel only specializes h_q for
+                # {64, 128}. Pad the per-rank heads to 64 (not the full n_heads)
+                # when they fit, to dispatch the cheaper decode::head64 variant;
+                # attn_sink is sliced to this rank and padded to match.
+                padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+                # Only [0:n_local_heads] is written below. Uninitialized padded
+                # TP heads inject NaN into attention on gfx942 (fnuz), so
+                # zero-init there; other archs tolerate new_empty and skip the
+                # per-forward memset.
+                if _is_gfx942_supported:
+                    q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                else:
+                    q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+                tp_slice = slice(0, self.n_local_heads)
+                q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
@@ -1629,6 +1657,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                combined_q_topk_workspace=combined_q_topk_workspace,
             )
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
@@ -1644,7 +1673,10 @@ class MQALayer(MqaAttentionBase):
         )
 
         if is_unified_kv_triton():
-            attn_q = q_out if q_out is not None else q
+            # A 4D Q is the zero-copy [B,DCP,Hlocal,D] view returned by the
+            # combined candidate+Q all-gather. Do not replace it with the local
+            # producer view in q_out.
+            attn_q = q if q.ndim == 4 else (q_out if q_out is not None else q)
             o = attn_backend.forward(
                 q=attn_q,
                 k=attn_k,

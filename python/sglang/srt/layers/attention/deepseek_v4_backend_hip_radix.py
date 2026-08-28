@@ -1304,8 +1304,24 @@ class DeepseekV4HipRadixBackend(
         ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
 
-        if q.ndim == 4:
+        if q.ndim == 4 and q.shape[1] == 1:
             q = q.squeeze(1)
+        if q.ndim not in (3, 4):
+            raise ValueError(f"unified_kv expects 3D or 4D Q, got {q.shape}")
+        rank_major_q = q.ndim == 4
+        if rank_major_q and (
+            not envs.SGLANG_DSV4_DCP_COMBINED_Q_TOPK.get()
+            or not envs.SGLANG_DSV4_DCP_PACKED_TOPK.get()
+            or self.dsv4_dcp_size <= 1
+            or compress_ratio != 4
+            or not forward_batch.forward_mode.is_decode()
+            or q.shape[1] != self.dsv4_dcp_size
+        ):
+            raise ValueError(
+                "rank-major Q is reserved for combined DCP C4 plain decode; "
+                f"got shape={tuple(q.shape)}, mode={forward_batch.forward_mode}, "
+                f"compress_ratio={compress_ratio}, dcp={self.dsv4_dcp_size}"
+            )
         device = q.device
         positions = forward_batch.positions.to(torch.int64)
         T = q.shape[0]
@@ -1369,8 +1385,11 @@ class DeepseekV4HipRadixBackend(
                 )
 
             group = get_parallel().dcp_group
-            local_num_heads = q.shape[1]
-            q = group.all_gather(q.contiguous(), dim=1).contiguous()
+            if rank_major_q:
+                local_num_heads = q.shape[2]
+            else:
+                local_num_heads = q.shape[1]
+                q = group.all_gather(q.contiguous(), dim=1).contiguous()
             shifted_sink = select_dcp_attn_sink(
                 attn_sink,
                 local_num_heads,
@@ -1511,26 +1530,21 @@ class DeepseekV4HipRadixBackend(
                 return_lse=True,
                 replicated_logit_shift=-math.log(float(self.dsv4_dcp_size)),
             )
-            comm_backend = get_parallel().dcp_comm_backend
-            if comm_backend in ("a2a", "fi_a2a"):
-                o = dcp_a2a_lse_reduce(
-                    partial_out.contiguous(),
-                    partial_lse.contiguous(),
+            # Keep A2A decode-only. During chunked prefill B is the token count
+            # (typically 8192), so packed A2A allocates and exchanges GB-scale
+            # send/recv buffers per layer. Repeated 512K requests exposed an
+            # asynchronous memory fault in that path; AG/RS is stable and does
+            # not affect the decode TPOT benefit of the configured A2A backend.
+            o = (
+                cp_lse_ag_out_rs_mla(
+                    partial_out,
+                    partial_lse,
                     group,
                     is_lse_base_on_e=True,
-                    comm_backend=comm_backend,
                 )
-            else:
-                o = (
-                    cp_lse_ag_out_rs_mla(
-                        partial_out,
-                        partial_lse,
-                        group,
-                        is_lse_base_on_e=True,
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request

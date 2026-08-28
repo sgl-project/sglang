@@ -170,6 +170,64 @@ def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
     return F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
 
 
+@triton.jit
+def _update_dcp_csa_stream_kernel(
+    indices_ptr,
+    indptr_ptr,
+    state_slot_ptr,
+    positions_ptr,
+    swa_len_ptr,
+    c4_page_indices_ptr,
+    c4_len_ptr,
+    ring_stride,
+    swa_pages,
+    N: tl.constexpr,
+    Wc: tl.constexpr,
+    WIN: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    rows = tl.arange(0, BLOCK_B)
+    row_mask = rows < N
+    row_lengths = tl.load(swa_len_ptr + rows, mask=row_mask, other=0).to(
+        tl.int32
+    ) + tl.load(c4_len_ptr + rows, mask=row_mask, other=0).to(tl.int32)
+    base = tl.sum(tl.where(rows < row, row_lengths, 0), axis=0)
+
+    ns = tl.load(swa_len_ptr + row).to(tl.int32)
+    nc = tl.load(c4_len_ptr + row).to(tl.int32)
+    tl.store(indptr_ptr + row, base)
+    tl.store(indptr_ptr + N, base + ns + nc, mask=row == N - 1)
+
+    slot = tl.load(state_slot_ptr + row).to(tl.int64)
+    pos = tl.load(positions_ptr + row).to(tl.int64)
+    start = tl.maximum(pos - WIN + 1, 0)
+    first_owned = start + (DCP_RANK + DCP_SIZE - (start % DCP_SIZE)) % DCP_SIZE
+    max_swa = (WIN + DCP_SIZE - 1) // DCP_SIZE
+    for offset in tl.range(0, max_swa, BLOCK):
+        j = offset + tl.arange(0, BLOCK)
+        mask = j < ns
+        absolute_position = first_owned + j * DCP_SIZE
+        ring_index = absolute_position % ring_stride
+        tl.store(
+            indices_ptr + base + j,
+            slot * ring_stride + ring_index,
+            mask=mask,
+        )
+
+    for offset in tl.range(0, Wc, BLOCK):
+        j = offset + tl.arange(0, BLOCK)
+        mask = j < nc
+        page_index = tl.load(
+            c4_page_indices_ptr + row * Wc + j, mask=mask, other=-1
+        ).to(tl.int32)
+        c4_index = tl.where(page_index >= 0, page_index + swa_pages, -1)
+        tl.store(indices_ptr + base + ns + j, c4_index, mask=mask)
+
+
 def build_dcp_decode_streams_reference(
     *,
     state_slot: torch.Tensor,
@@ -437,6 +495,31 @@ def update_dcp_csa_stream(
     dcp_size: int,
     dcp_rank: int,
 ) -> None:
+    num_rows, c4_width = c4_page_indices.shape
+    if num_rows == 0:
+        return
+    if num_rows <= 32:
+        _update_dcp_csa_stream_kernel[(num_rows,)](
+            indices,
+            indptr,
+            state_slot,
+            positions,
+            swa_len,
+            c4_page_indices,
+            c4_len,
+            ring_stride,
+            swa_pages,
+            N=num_rows,
+            Wc=c4_width,
+            WIN=win,
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+            BLOCK_B=triton.next_power_of_2(num_rows),
+            BLOCK=256,
+            num_warps=4,
+        )
+        return
+
     indptr.copy_(_lengths_to_indptr(swa_len + c4_len))
     write_v4_paged_single_stream_indices(
         state_slot=state_slot,

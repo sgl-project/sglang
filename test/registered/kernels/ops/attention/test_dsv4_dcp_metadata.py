@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
 from sglang.srt.layers.attention.dsv4.dcp import (
+    combined_q_topk_rank_major_q_view,
     local_compressed_lens,
     local_swa_lens,
     localize_compressed_indices,
@@ -364,6 +365,83 @@ def test_partitioned_decode_lse_merge_matches_unsharded(kv_splits: int) -> None:
         combined_out.float(), reference_out.float(), atol=3e-2, rtol=3e-2
     )
     torch.testing.assert_close(combined_lse, reference_lse, atol=3e-3, rtol=3e-3)
+
+
+@pytest.mark.parametrize("kv_splits", [1, 8])
+def test_paged_decode_rank_major_q_matches_contiguous(kv_splits: int) -> None:
+    torch.manual_seed(20260828 + kv_splits)
+    batch_size, dcp_size, local_heads, head_dim, topk = 2, 8, 16, 512, 1024
+    combined_heads = local_heads + topk * 4 // head_dim
+    logical_q = torch.randn(
+        batch_size,
+        dcp_size,
+        local_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    gathered_combined = torch.empty(
+        dcp_size * batch_size,
+        combined_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=DEVICE,
+    )
+    for rank in range(dcp_size):
+        gathered_combined[
+            rank * batch_size : (rank + 1) * batch_size, :local_heads, :
+        ].copy_(logical_q[:, rank])
+    rank_major_q = combined_q_topk_rank_major_q_view(
+        gathered_combined,
+        batch_size=batch_size,
+        local_heads=local_heads,
+        topk=topk,
+        dcp_size=dcp_size,
+    )
+    contiguous_q = logical_q.reshape(
+        batch_size, dcp_size * local_heads, head_dim
+    ).contiguous()
+
+    kv_lens = [41, 29]
+    total_kv = sum(kv_lens)
+    kv = torch.randn(total_kv, head_dim, dtype=torch.bfloat16, device=DEVICE)
+    kv_indices = torch.arange(total_kv, dtype=torch.int32, device=DEVICE)
+    kv_indptr = torch.tensor(
+        [0, kv_lens[0], total_kv], dtype=torch.int32, device=DEVICE
+    )
+    sink = torch.randn(dcp_size * local_heads, dtype=torch.float32, device=DEVICE)
+    scale = head_dim**-0.5
+
+    rank_major_out, rank_major_lse = _sparse_attn_v4_paged_decode_triton(
+        rank_major_q,
+        kv,
+        kv_indices,
+        kv_indptr,
+        sink,
+        scale,
+        kv_splits=kv_splits,
+        return_lse=True,
+    )
+    contiguous_out, contiguous_lse = _sparse_attn_v4_paged_decode_triton(
+        contiguous_q,
+        kv,
+        kv_indices,
+        kv_indptr,
+        sink,
+        scale,
+        kv_splits=kv_splits,
+        return_lse=True,
+    )
+
+    assert rank_major_out.shape == (
+        batch_size,
+        dcp_size * local_heads,
+        head_dim,
+    )
+    torch.testing.assert_close(
+        rank_major_out.float(), contiguous_out.float(), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(rank_major_lse, contiguous_lse, atol=2e-3, rtol=2e-3)
 
 
 def test_partitioned_prefill_lse_merge_counts_replicated_terms_once() -> None:

@@ -21,9 +21,13 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
     _sparse_attn_v4_paged_decode_triton,
 )
 from sglang.srt.layers.attention.dsv4.dcp import (
+    DSV4DCPCombinedQTopKWorkspace,
+    combined_q_topk_candidate_view,
     local_c4_topk_candidates,
     local_compressed_lens,
     merge_c4_topk_candidates,
+    run_combined_q_c4_topk,
+    run_packed_c4_topk,
 )
 from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mla, dcp_a2a_lse_reduce
 from sglang.test.ci.ci_register import register_amd_ci
@@ -148,9 +152,99 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         page_table,
         c4_page_size,
     )
-    local_indices, local_indptr = _flat_indices(
-        topk_result.page_indices, topk_result.local_lens
+
+    packed_page_indices = torch.empty_like(topk_result.page_indices)
+    packed_local_raw = torch.empty_like(topk_result.local_raw_indices)
+    packed_local_lens = torch.empty_like(topk_result.local_lens)
+    local_candidates = torch.empty((batch, topk), dtype=torch.int64, device=device)
+    gathered_candidates = torch.empty(
+        (world_size * batch, topk), dtype=torch.int64, device=device
     )
+    run_packed_c4_topk(
+        logits=local_scores,
+        local_lens=local_lens.to(torch.int32),
+        local_page_table=page_table,
+        local_candidates=local_candidates,
+        gathered_candidates=gathered_candidates,
+        out_page_indices=packed_page_indices,
+        out_local_lens=packed_local_lens,
+        c4_page_size=c4_page_size,
+        dcp_size=world_size,
+        dcp_rank=rank,
+        dcp_group=coordinator,
+        out_local_raw_indices=packed_local_raw,
+    )
+    for row in range(batch):
+        expected_count = int(topk_result.local_lens[row])
+        actual_count = int(packed_local_lens[row])
+        assert actual_count == expected_count
+        torch.testing.assert_close(
+            torch.sort(packed_local_raw[row, :actual_count]).values,
+            torch.sort(topk_result.local_raw_indices[row, :expected_count]).values,
+        )
+        torch.testing.assert_close(
+            torch.sort(packed_page_indices[row, :actual_count]).values,
+            torch.sort(topk_result.page_indices[row, :expected_count]).values,
+        )
+
+    combined_heads = local_heads + topk * 4 // head_dim
+    local_combined = torch.empty(
+        (batch, combined_heads, head_dim), dtype=torch.bfloat16, device=device
+    )
+    local_combined[:, :local_heads, :].copy_(local_q)
+    gathered_combined = torch.empty(
+        (world_size * batch, combined_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    combined_workspace = DSV4DCPCombinedQTopKWorkspace(
+        local_combined=local_combined,
+        gathered_combined=gathered_combined,
+    )
+    combined_page_indices = torch.empty_like(packed_page_indices)
+    combined_local_raw = torch.empty_like(packed_local_raw)
+    combined_local_lens = torch.empty_like(packed_local_lens)
+    rank_major_q = run_combined_q_c4_topk(
+        logits=local_scores,
+        local_lens=local_lens.to(torch.int32),
+        local_page_table=page_table,
+        workspace=combined_workspace,
+        local_heads=local_heads,
+        out_page_indices=combined_page_indices,
+        out_local_lens=combined_local_lens,
+        c4_page_size=c4_page_size,
+        dcp_size=world_size,
+        dcp_rank=rank,
+        dcp_group=coordinator,
+        out_local_raw_indices=combined_local_raw,
+    )
+    torch.testing.assert_close(
+        rank_major_q.reshape(batch, global_heads, head_dim), q_global, rtol=0, atol=0
+    )
+    combined_candidate_rows = combined_q_topk_candidate_view(
+        gathered_combined,
+        local_heads=local_heads,
+        topk=topk,
+    )
+    torch.testing.assert_close(
+        torch.sort(combined_candidate_rows, dim=1).values,
+        torch.sort(gathered_candidates, dim=1).values,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(combined_local_lens, packed_local_lens)
+    for row in range(batch):
+        count = int(combined_local_lens[row])
+        torch.testing.assert_close(
+            torch.sort(combined_local_raw[row, :count]).values,
+            torch.sort(packed_local_raw[row, :count]).values,
+        )
+        torch.testing.assert_close(
+            torch.sort(combined_page_indices[row, :count]).values,
+            torch.sort(packed_page_indices[row, :count]).values,
+        )
+
+    local_indices, local_indptr = _flat_indices(packed_page_indices, packed_local_lens)
 
     reference_indices, reference_indptr = _flat_indices(
         topk_result.global_indices,
@@ -171,7 +265,7 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         torch.tensor(float(world_size), dtype=torch.float32, device=device)
     )
     partial_out, partial_lse = _sparse_attn_v4_paged_decode_triton(
-        gathered_q,
+        rank_major_q,
         local_kv,
         local_indices,
         local_indptr,
@@ -206,6 +300,53 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
     torch.testing.assert_close(a2a.float(), ag_rs.float(), atol=3e-2, rtol=3e-2)
     assert ag_rs.is_contiguous()
     ag_rs.view(batch, -1)
+
+    graph_scores = local_scores.clone()
+    graph_local_combined = torch.empty_like(local_combined)
+    graph_local_combined[:, :local_heads, :].copy_(local_q)
+    graph_gathered_combined = torch.empty_like(gathered_combined)
+    graph_combined_workspace = DSV4DCPCombinedQTopKWorkspace(
+        local_combined=graph_local_combined,
+        gathered_combined=graph_gathered_combined,
+    )
+    graph_page_indices = torch.empty_like(packed_page_indices)
+    graph_local_raw = torch.empty_like(packed_local_raw)
+    graph_local_lens = torch.empty_like(packed_local_lens)
+    topk_graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with coordinator.graph_capture() as graph_context:
+        with torch.cuda.graph(topk_graph, stream=graph_context.stream):
+            graph_rank_major_q = run_combined_q_c4_topk(
+                logits=graph_scores,
+                local_lens=local_lens.to(torch.int32),
+                local_page_table=page_table,
+                workspace=graph_combined_workspace,
+                local_heads=local_heads,
+                out_page_indices=graph_page_indices,
+                out_local_lens=graph_local_lens,
+                c4_page_size=c4_page_size,
+                dcp_size=world_size,
+                dcp_rank=rank,
+                dcp_group=coordinator,
+                out_local_raw_indices=graph_local_raw,
+            )
+    torch.cuda.synchronize()
+    for _ in range(3):
+        topk_graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_local_lens, packed_local_lens)
+        torch.testing.assert_close(
+            graph_rank_major_q.reshape(batch, global_heads, head_dim),
+            q_global,
+            rtol=0,
+            atol=0,
+        )
+        for row in range(batch):
+            count = int(graph_local_lens[row])
+            torch.testing.assert_close(
+                torch.sort(graph_local_raw[row, :count]).values,
+                torch.sort(packed_local_raw[row, :count]).values,
+            )
 
     graph_partial_out = torch.empty_like(partial_out)
     graph_partial_lse = torch.empty_like(partial_lse)

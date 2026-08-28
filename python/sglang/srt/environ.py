@@ -1124,6 +1124,10 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_DSV4_DCP_PACKED_TOPK = EnvBool(False)
+    # Experimental gfx950 decode-only PoC: transport the C4 packed candidates
+    # and attention Q in one bf16 DCP all-gather.
+    SGLANG_DSV4_DCP_COMBINED_Q_TOPK = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

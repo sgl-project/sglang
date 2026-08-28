@@ -29,8 +29,11 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dcp import (
+    DSV4DCPCombinedQTopKWorkspace,
     local_c4_topk_candidates,
     merge_c4_topk_candidates,
+    run_combined_q_c4_topk,
+    run_packed_c4_topk,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -50,7 +53,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -413,6 +416,106 @@ class C4IndexerBackendMixin:
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self._dcp_packed_c4_workspace_cache: dict[
+            tuple, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._dcp_combined_q_topk_workspace_cache: dict[
+            tuple, DSV4DCPCombinedQTopKWorkspace
+        ] = {}
+
+    def get_dcp_combined_q_topk_workspace(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        batch_size: int,
+        local_heads: int,
+        head_dim: int,
+        topk: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        enable_multi_stream: bool,
+    ) -> Optional[DSV4DCPCombinedQTopKWorkspace]:
+        """Get stable exact-B storage for the experimental combined DCP AG."""
+        if (
+            not envs.SGLANG_DSV4_DCP_COMBINED_Q_TOPK.get()
+            or not envs.SGLANG_DSV4_DCP_PACKED_TOPK.get()
+            or enable_multi_stream
+            or not is_hip()
+            or not is_gfx95_supported()
+            or not self.dsa_topk_backend.is_sgl_kernel()
+            or self.debug_use_external_c4_sparse_indices
+        ):
+            return None
+
+        parallel = get_parallel()
+        dcp_size = parallel.attn_dcp_size
+        actual_mode = getattr(forward_batch, "actual_forward_mode", None)
+        if (
+            not parallel.dcp_enabled
+            or dcp_size <= 1
+            or dcp_size not in (2, 4, 8)
+            or getattr(self, "dsv4_dcp_size", dcp_size) != dcp_size
+            or not forward_batch.forward_mode.is_decode()
+            or (
+                actual_mode is not None
+                and hasattr(actual_mode, "is_decode")
+                and not actual_mode.is_decode()
+            )
+            or getattr(forward_batch, "_original_forward_mode", None) is not None
+            or getattr(forward_batch, "tbo_split_seq_index", None) is not None
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            or batch_size <= 0
+            or batch_size != forward_batch.batch_size
+        ):
+            return None
+
+        # This PoC intentionally targets the V4-Pro TP8/DCP8 wire layout:
+        # Q=[B,Hlocal,512] bf16 plus 1024 packed int64 candidates (8 bf16 heads).
+        if (
+            dtype != torch.bfloat16
+            or device.type != "cuda"
+            or local_heads <= 0
+            or head_dim != 512
+            or topk != 1024
+        ):
+            return None
+
+        candidate_bf16_elements = topk * 4
+        if candidate_bf16_elements % head_dim != 0:
+            return None
+        combined_heads = local_heads + candidate_bf16_elements // head_dim
+        stream_id = torch.cuda.current_stream(device).cuda_stream
+        workspace_key = (
+            device,
+            stream_id,
+            batch_size,
+            local_heads,
+            head_dim,
+            topk,
+            dcp_size,
+            dtype,
+        )
+        workspace = self._dcp_combined_q_topk_workspace_cache.get(workspace_key)
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Combined DCP Q/top-k workspace was not warmed before graph "
+                    f"capture for key={workspace_key!r}"
+                )
+            workspace = DSV4DCPCombinedQTopKWorkspace(
+                local_combined=torch.empty(
+                    (batch_size, combined_heads, head_dim),
+                    dtype=dtype,
+                    device=device,
+                ),
+                gathered_combined=torch.empty(
+                    (dcp_size * batch_size, combined_heads, head_dim),
+                    dtype=dtype,
+                    device=device,
+                ),
+            )
+            self._dcp_combined_q_topk_workspace_cache[workspace_key] = workspace
+        return workspace
 
     def _forward_prepare_multi_stream(
         self,
@@ -651,9 +754,11 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
-    ) -> None:
+        combined_q_topk_workspace: Optional[DSV4DCPCombinedQTopKWorkspace] = None,
+    ) -> Optional[torch.Tensor]:
         if forward_batch.forward_mode.is_idle():
-            return
+            return None
+        gathered_q = None
         token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
@@ -803,7 +908,7 @@ class C4IndexerBackendMixin:
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
-            return
+            return None
 
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
@@ -848,30 +953,112 @@ class C4IndexerBackendMixin:
         elif get_parallel().dcp_enabled:
             dcp_size = get_parallel().attn_dcp_size
             dcp_rank = get_parallel().attn_dcp_rank
-            local_scores, global_ids = local_c4_topk_candidates(
-                logits,
-                c4_seq_lens,
-                c4_sparse_page_indices.shape[1],
-                dcp_size,
-                dcp_rank,
-            )
             group = get_parallel().dcp_group
-            gathered_scores = group.all_gather(local_scores.contiguous(), dim=1)
-            gathered_ids = group.all_gather(global_ids.contiguous(), dim=1)
-            result = merge_c4_topk_candidates(
-                gathered_scores,
-                gathered_ids,
-                c4_sparse_page_indices.shape[1],
-                dcp_size,
-                dcp_rank,
-                page_table,
-                indexer_metadata.c4_page_size,
-            )
-            core_metadata.c4_sparse_page_indices.copy_(result.page_indices)
-            core_metadata.c4_sparse_topk_lengths_raw.copy_(result.local_lens)
-            core_metadata.c4_sparse_topk_lengths.copy_(result.local_lens)
-            if raw_indices is not None:
-                raw_indices.copy_(result.local_raw_indices)
+            if envs.SGLANG_DSV4_DCP_PACKED_TOPK.get():
+                if not is_hip() or not is_gfx95_supported():
+                    raise RuntimeError(
+                        "SGLANG_DSV4_DCP_PACKED_TOPK currently requires ROCm gfx950"
+                    )
+                if dcp_size not in (2, 4, 8):
+                    raise RuntimeError(
+                        "SGLANG_DSV4_DCP_PACKED_TOPK requires dcp_size in {2, 4, 8}"
+                    )
+                local_lens = core_metadata.c4_sparse_topk_lengths_raw[:query_rows]
+                page_indices = core_metadata.c4_sparse_page_indices[:query_rows]
+                combined_workspace_matches = (
+                    combined_q_topk_workspace is not None
+                    and combined_q_topk_workspace.local_combined.shape[0] == query_rows
+                    and combined_q_topk_workspace.gathered_combined.shape[0]
+                    == dcp_size * query_rows
+                )
+                if combined_workspace_matches:
+                    combined = combined_q_topk_workspace.local_combined
+                    candidate_bf16_elements = page_indices.shape[1] * 4
+                    if candidate_bf16_elements % combined.shape[2] != 0:
+                        raise RuntimeError(
+                            "Combined DCP candidate payload does not span whole Q heads"
+                        )
+                    local_heads = (
+                        combined.shape[1] - candidate_bf16_elements // combined.shape[2]
+                    )
+                    gathered_q = run_combined_q_c4_topk(
+                        logits=logits,
+                        local_lens=c4_seq_lens,
+                        local_page_table=page_table,
+                        workspace=combined_q_topk_workspace,
+                        local_heads=local_heads,
+                        out_page_indices=page_indices,
+                        out_local_lens=local_lens,
+                        c4_page_size=indexer_metadata.c4_page_size,
+                        dcp_size=dcp_size,
+                        dcp_rank=dcp_rank,
+                        dcp_group=group,
+                        out_local_raw_indices=raw_indices,
+                    )
+                else:
+                    workspace_key = (
+                        logits.device,
+                        torch.cuda.current_stream(logits.device).cuda_stream,
+                        query_rows,
+                        page_indices.shape[1],
+                        dcp_size,
+                    )
+                    workspace = self._dcp_packed_c4_workspace_cache.get(workspace_key)
+                    if workspace is None:
+                        workspace = (
+                            torch.empty(
+                                (query_rows, page_indices.shape[1]),
+                                dtype=torch.int64,
+                                device=logits.device,
+                            ),
+                            torch.empty(
+                                (dcp_size * query_rows, page_indices.shape[1]),
+                                dtype=torch.int64,
+                                device=logits.device,
+                            ),
+                        )
+                        self._dcp_packed_c4_workspace_cache[workspace_key] = workspace
+                    run_packed_c4_topk(
+                        logits=logits,
+                        local_lens=c4_seq_lens,
+                        local_page_table=page_table,
+                        local_candidates=workspace[0],
+                        gathered_candidates=workspace[1],
+                        out_page_indices=page_indices,
+                        out_local_lens=local_lens,
+                        c4_page_size=indexer_metadata.c4_page_size,
+                        dcp_size=dcp_size,
+                        dcp_rank=dcp_rank,
+                        dcp_group=group,
+                        out_local_raw_indices=raw_indices,
+                    )
+                core_metadata.c4_sparse_topk_lengths[:query_rows].copy_(local_lens)
+            else:
+                local_scores, global_ids = local_c4_topk_candidates(
+                    logits,
+                    c4_seq_lens,
+                    c4_sparse_page_indices.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+                gathered_scores = group.all_gather(local_scores.contiguous(), dim=1)
+                gathered_ids = group.all_gather(global_ids.contiguous(), dim=1)
+                result = merge_c4_topk_candidates(
+                    gathered_scores,
+                    gathered_ids,
+                    c4_sparse_page_indices.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                    page_table,
+                    indexer_metadata.c4_page_size,
+                )
+                core_metadata.c4_sparse_page_indices.copy_(result.page_indices)
+                core_metadata.c4_sparse_topk_lengths_raw.copy_(result.local_lens)
+                core_metadata.c4_sparse_topk_lengths.copy_(result.local_lens)
+                if raw_indices is not None:
+                    raw_indices.copy_(result.local_raw_indices)
+                page_indices = result.page_indices
+                local_lens = result.local_lens
 
             if forward_batch.forward_mode.is_decode_or_idle() or (
                 forward_batch.forward_mode.is_target_verify()
@@ -889,8 +1076,8 @@ class C4IndexerBackendMixin:
                     state_slot=state_slot,
                     positions=core_metadata.positions_casual[:query_rows],
                     swa_len=core_metadata.swa_topk_lengths[:query_rows],
-                    c4_page_indices=result.page_indices,
-                    c4_len=result.local_lens,
+                    c4_page_indices=page_indices,
+                    c4_len=local_lens,
                     win=token_to_kv_pool.unified_swa_window,
                     ring_stride=token_to_kv_pool.unified_swa_ring_size,
                     swa_pages=token_to_kv_pool.unified_swa_pages,
@@ -943,6 +1130,7 @@ class C4IndexerBackendMixin:
                 c4_indexer.layer_id
             ].compress_layer_id
             indexer_capturer.capture(compress_layer_id, raw_indices)
+        return gathered_q
 
 
 class C4Indexer(nn.Module):
@@ -1037,7 +1225,13 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
-    ) -> None:
+        combined_q_topk_workspace: Optional[DSV4DCPCombinedQTopKWorkspace] = None,
+    ) -> Optional[torch.Tensor]:
+        combined_kwargs = (
+            {"combined_q_topk_workspace": combined_q_topk_workspace}
+            if combined_q_topk_workspace is not None
+            else {}
+        )
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -1047,4 +1241,5 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+            **combined_kwargs,
         )

@@ -215,7 +215,7 @@ def _kv_splits_heuristic(
 
 @triton.jit
 def _paged_decode_fused_kernel(
-    q_ptr,  # [N, H, D]
+    q_ptr,  # [N, H, D] or rank-major [N, DCP, Hlocal, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
@@ -224,6 +224,7 @@ def _paged_decode_fused_kernel(
     out_ptr,  # [N, H, D]
     lse_out_ptr,  # [N, H] fp32 when STORE_LSE
     q_stride_t,
+    q_stride_rank,
     q_stride_h,
     q_stride_d,
     kv_stride_n,
@@ -235,7 +236,9 @@ def _paged_decode_fused_kernel(
     qk_scale,  # = softmax_scale * LOG2E
     log2e,  # = LOG2E, to lift natural-log sink into log2 domain
     H: tl.constexpr,
+    H_LOCAL: tl.constexpr,
     D: tl.constexpr,
+    RANK_MAJOR_Q: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -259,11 +262,14 @@ def _paged_decode_fused_kernel(
     h_mask = h_offs < H
     d_mask = d_offs < D
 
+    if RANK_MAJOR_Q:
+        q_head_offsets = (h_offs // H_LOCAL) * q_stride_rank + (
+            h_offs % H_LOCAL
+        ) * q_stride_h
+    else:
+        q_head_offsets = h_offs * q_stride_h
     q = tl.load(
-        q_ptr
-        + t * q_stride_t
-        + h_offs[:, None] * q_stride_h
-        + d_offs[None, :] * q_stride_d,
+        q_ptr + t * q_stride_t + q_head_offsets[:, None] + d_offs[None, :] * q_stride_d,
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
@@ -376,7 +382,7 @@ def _paged_decode_fused_kernel(
 
 @triton.jit
 def _paged_decode_split_kernel(
-    q_ptr,  # [N, H, D]
+    q_ptr,  # [N, H, D] or rank-major [N, DCP, Hlocal, D]
     unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
     kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
     kv_indices_ptr,  # [total_indices] int32
@@ -385,6 +391,7 @@ def _paged_decode_split_kernel(
     l_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32
     acc_partial_ptr,  # [N, KV_SPLITS, H_padded, D] fp32
     q_stride_t,
+    q_stride_rank,
     q_stride_h,
     q_stride_d,
     kv_stride_n,
@@ -401,9 +408,11 @@ def _paged_decode_split_kernel(
     ap_stride_h,
     ap_stride_d,
     H: tl.constexpr,
+    H_LOCAL: tl.constexpr,
     D: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     qk_scale,  # = softmax_scale * LOG2E
+    RANK_MAJOR_Q: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -425,11 +434,14 @@ def _paged_decode_split_kernel(
     h_mask = h_offs < H
     d_mask = d_offs < D
 
+    if RANK_MAJOR_Q:
+        q_head_offsets = (h_offs // H_LOCAL) * q_stride_rank + (
+            h_offs % H_LOCAL
+        ) * q_stride_h
+    else:
+        q_head_offsets = h_offs * q_stride_h
     q = tl.load(
-        q_ptr
-        + t * q_stride_t
-        + h_offs[:, None] * q_stride_h
-        + d_offs[None, :] * q_stride_d,
+        q_ptr + t * q_stride_t + q_head_offsets[:, None] + d_offs[None, :] * q_stride_d,
         mask=h_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
@@ -689,8 +701,9 @@ def _sparse_attn_v4_paged_decode_triton(
     return_lse: bool = False,
 ):
     """V4 sparse decode Triton implementation: split-K with FUSED fast path,
-    exp2 softmax, CG-safe heuristic. ``block_h`` and ``kv_splits`` are
-    escape hatches for benchmarks; production callers pass neither.
+    exp2 softmax, CG-safe heuristic. Q may be contiguous ``[T,H,D]`` or the
+    zero-copy combined-AG view ``[T,DCP,Hlocal,D]``. ``block_h`` and
+    ``kv_splits`` are escape hatches for benchmarks; production callers pass neither.
 
     When ``kv_scales`` is provided, ``unified_kv`` must be e4m3fnuz and
     ``kv_scales`` must be ``[total_pages, D // GROUP_SIZE]`` fp32 — 1xGROUP_SIZE
@@ -734,8 +747,37 @@ def _sparse_attn_v4_paged_decode_triton(
                 f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
             )
 
-    T, H, D = q.shape
-    out = torch.empty_like(q)
+    if q.ndim == 3:
+        T, H, D = q.shape
+        h_local = H
+        q_stride_rank = 0
+        q_stride_h = q.stride(1)
+        q_stride_d = q.stride(2)
+        rank_major_q = False
+    elif q.ndim == 4:
+        T, dcp_size, h_local, D = q.shape
+        if dcp_size <= 0 or h_local <= 0:
+            raise RuntimeError(f"invalid rank-major Q shape: {tuple(q.shape)}")
+        H = dcp_size * h_local
+        q_stride_rank = q.stride(1)
+        q_stride_h = q.stride(2)
+        q_stride_d = q.stride(3)
+        rank_major_q = True
+    else:
+        raise RuntimeError(
+            "sparse_attn_v4_paged_decode expects Q shaped [T,H,D] or "
+            f"[T,DCP,Hlocal,D], got {tuple(q.shape)}"
+        )
+    if attn_sink.numel() < H:
+        raise RuntimeError(
+            f"attn_sink has {attn_sink.numel()} heads but Q needs at least {H}"
+        )
+
+    out = (
+        torch.empty((T, H, D), dtype=q.dtype, device=q.device)
+        if rank_major_q
+        else torch.empty_like(q)
+    )
     lse_out = torch.empty((T, H), dtype=torch.float32, device=q.device)
     lse_arg = lse_out if return_lse else q.new_empty(1, dtype=torch.float32)
 
@@ -790,8 +832,9 @@ def _sparse_attn_v4_paged_decode_triton(
             out,
             lse_arg,
             q.stride(0),
-            q.stride(1),
-            q.stride(2),
+            q_stride_rank,
+            q_stride_h,
+            q_stride_d,
             unified_kv.stride(0),
             unified_kv.stride(1),
             ks_stride_n_arg,
@@ -801,10 +844,12 @@ def _sparse_attn_v4_paged_decode_triton(
             qk_scale,
             LOG2E,
             H,
+            h_local,
             D,
             BLOCK_H=block_h,
             BLOCK_D=block_d,
             BLOCK_K=block_k,
+            RANK_MAJOR_Q=rank_major_q,
             QUANT_KV=quant_kv,
             GROUP_SIZE=_FP8_GROUP_SIZE,
             NUM_GROUPS=num_groups_arg,
@@ -837,8 +882,9 @@ def _sparse_attn_v4_paged_decode_triton(
         l_partial,
         acc_partial,
         q.stride(0),
-        q.stride(1),
-        q.stride(2),
+        q_stride_rank,
+        q_stride_h,
+        q_stride_d,
         unified_kv.stride(0),
         unified_kv.stride(1),
         ks_stride_n_arg,
@@ -853,12 +899,14 @@ def _sparse_attn_v4_paged_decode_triton(
         acc_partial.stride(2),
         acc_partial.stride(3),
         H,
+        h_local,
         D,
         kv_splits,
         qk_scale,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        RANK_MAJOR_Q=rank_major_q,
         QUANT_KV=quant_kv,
         GROUP_SIZE=_FP8_GROUP_SIZE,
         NUM_GROUPS=num_groups_arg,
