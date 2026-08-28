@@ -306,6 +306,10 @@ class Envs:
     # has to match the HCA the rest of the cluster handshakes on, while this
     # one wants a per-rank split to avoid contending on transfer.
     SGLANG_REMOTE_INSTANCE_IB_DEVICE = EnvStr(None)
+    # load_format the remote-instance loader falls back to when the seed is
+    # unreachable. "auto" unless set; --load-format is already spoken for by
+    # remote_instance, so there is nowhere else to say it.
+    SGLANG_REMOTE_INSTANCE_FALLBACK_LOAD_FORMAT = EnvStr(None)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)

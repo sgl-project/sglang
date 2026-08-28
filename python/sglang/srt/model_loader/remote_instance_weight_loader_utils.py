@@ -133,9 +133,7 @@ def deregister_memory_region(transfer_engine, registered_blocks) -> bool:
     except Exception as e:
         # EAGAIN when the batch call fans out over too many blocks at once, and
         # AttributeError on mooncake builds without the batch entry point.
-        logger.warning(
-            "Batch deregistration raised (%s); retrying block by block.", e
-        )
+        logger.warning("Batch deregistration raised (%s); retrying block by block.", e)
 
     # The pinned pages stay resident until this succeeds -- a caller falling
     # back to disk has no room to load into while they do. EAGAIN here is the
