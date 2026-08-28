@@ -340,9 +340,7 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
-        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
-            model_runner.server_args.dsa_topk_backend
-        )
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -426,7 +424,7 @@ class DeepseekSparseAttnBackend(
 
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
         # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
-        # via the shared DSA_CHOICES list.
+        # via the shared CLI choices.
         if self.dsa_decode_impl == "flashmla_sparse_q8":
             raise ValueError(
                 "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
