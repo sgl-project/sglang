@@ -278,6 +278,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker.is_output_rank = False
         worker.server_args = SimpleNamespace()
         worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_applied = []
         worker._auto_residency_round_sizes = [1]
         report = RankResidencyReport(
             rank=0,
@@ -324,6 +325,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker.pipeline = SimpleNamespace(modules={})
         worker.server_args = SimpleNamespace()
         worker._auto_residency_warmup_records = []
+        worker._auto_residency_applied = []
         worker._auto_residency_round_sizes = [1]
         worker._auto_residency_budget_correction_bytes = 0
         worker._auto_residency_last_applied_plan = AutoResidencyPlan(
