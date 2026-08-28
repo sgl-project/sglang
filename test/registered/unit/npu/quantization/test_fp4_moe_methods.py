@@ -19,20 +19,13 @@ import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluLimit
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4FusedMoEMethod,
-    NPUW4A8MXFP4MoEMethod,
     prepare_w4a8_mxfp_weight,
     reshape_mxfp_activation_scale_for_npu,
     reshape_w4a8_mxfp_weight_scale_for_npu,
+    w4a8_mxfp_gmm,
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-
-
-class TestW4A8MxfpComputeOwnership(unittest.TestCase):
-    def test_no_standalone_w4a8_mxfp_gmm_exists(self):
-        from sglang.srt.hardware_backend.npu.quantization import moe_methods
-
-        self.assertFalse(hasattr(moe_methods, "w4a8_mxfp_gmm"))
 
 
 class TestFP4MethodGate(unittest.TestCase):
@@ -166,28 +159,23 @@ class TestReshapeMxfpActivationScaleForNpu(unittest.TestCase):
         self.assertIs(reshape_mxfp_activation_scale_for_npu(packed), packed)
 
 
-class TestNPUW4A8MXFP4MoEMethod(unittest.TestCase):
+class TestW4A8MxfpGmmInputScale(unittest.TestCase):
     def setUp(self):
         self.input = torch.randn(2, 64)
         self.input_scale = torch.ones(2, 1, 2)
         self.weight = torch.empty(2, 64, 32, dtype=torch.uint8)
         self.weight_scale = torch.ones(2, 1, 32, 2, dtype=torch.uint8)
         self.group_list = torch.tensor([1, 1], dtype=torch.int32)
-        self.quant_info = SimpleNamespace(
-            w2_weight=self.weight,
-            w2_weight_scale=self.weight_scale,
-        )
-        self.method = NPUW4A8MXFP4MoEMethod()
 
-    def _apply(self, input_scale):
-        return self.method.apply(
-            self.quant_info,
-            self.input,
-            self.group_list,
-            input_scale,
-            torch.bfloat16,
-            "w2",
+    def _call_gmm(self, input_scale):
+        return w4a8_mxfp_gmm(
+            input=self.input,
+            input_scale=input_scale,
+            weight=self.weight,
+            weight_scale=self.weight_scale,
             group_list_type=1,
+            group_list=self.group_list,
+            output_dtype=torch.bfloat16,
         )
 
     def test_supplied_scale_skips_dynamic_quant(self):
@@ -203,7 +191,7 @@ class TestNPUW4A8MXFP4MoEMethod(unittest.TestCase):
                 create=True,
             ) as grouped_matmul,
         ):
-            output = self._apply(self.input_scale)
+            output = self._call_gmm(self.input_scale)
 
         dynamic_quant.assert_not_called()
         self.assertIs(output, expected)
@@ -230,50 +218,12 @@ class TestNPUW4A8MXFP4MoEMethod(unittest.TestCase):
                 create=True,
             ) as grouped_matmul,
         ):
-            output = self._apply(None)
+            output = self._call_gmm(None)
 
         dynamic_quant.assert_called_once()
         self.assertIs(output, expected)
         self.assertIs(
             grouped_matmul.call_args.kwargs["per_token_scale"][0], quantized_scale
-        )
-
-    def test_none_dynamic_quant_config_uses_mxfp8_defaults(self):
-        method = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
-        quantized = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
-        quantized_scale = torch.ones(2, 1, 2)
-
-        with (
-            patch.object(
-                torch.ops.npu,
-                "npu_dynamic_mx_quant",
-                return_value=(quantized, quantized_scale),
-                create=True,
-            ) as dynamic_quant,
-            patch.object(
-                torch.ops.npu,
-                "npu_grouped_matmul",
-                return_value=[torch.randn(2, 32)],
-                create=True,
-            ),
-        ):
-            method.apply(
-                self.quant_info,
-                self.input,
-                self.group_list,
-                None,
-                torch.bfloat16,
-                "w2",
-                group_list_type=1,
-            )
-
-        dynamic_quant.assert_called_once_with(
-            self.input,
-            axis=1,
-            round_mode="rint",
-            dst_type=torch.float8_e4m3fn,
-            block_size=32,
-            scale_alg=None,
         )
 
 
