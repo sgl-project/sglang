@@ -12,10 +12,11 @@ import traceback
 
 def _preload_common_modules() -> None:
     """Load the expensive common stack without creating a CUDA context."""
+    import numpy  # noqa: F401
     import pytest  # noqa: F401
+    import scipy  # noqa: F401
     import torch
-
-    import sglang  # noqa: F401
+    import triton  # noqa: F401
 
     if torch.cuda.is_initialized():
         raise RuntimeError("fork test worker initialized CUDA before forking")
