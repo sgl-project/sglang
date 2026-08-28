@@ -193,9 +193,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             and prefill_cuda_graph_config.max_bs
             > _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
         ):
-            prefill_cuda_graph_config.max_bs = (
-                _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
-            )
+            prefill_cuda_graph_config.max_bs = _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
 
         # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
         if cfg.max_total_tokens is not None:

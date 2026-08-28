@@ -118,10 +118,7 @@ def apply_cuda_graph_compatibility(server_args: Any):
     # aggregate forwards, while enabling it implicitly would also capture
     # large buckets that can be slower than eager. An explicit backend
     # selection bypasses this default policy.
-    if (
-        cfg.pp_size > 1
-        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-    ):
+    if cfg.pp_size > 1 and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
         logger.info(
             "Disabling breakable prefill CUDA graph by default for pipeline "
             "parallelism. Set --cuda-graph-backend-prefill=breakable to opt in."
