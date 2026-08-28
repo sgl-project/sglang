@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -361,8 +362,8 @@ def handle_elastic_ep(server_args: Any):
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep",
-                mooncake_ib_device=server_args._validate_ib_devices(
-                    cfg.mooncake_ib_device
+                mooncake_ib_device=validate_ib_devices(
+                    server_args, cfg.mooncake_ib_device
                 ),
             )
     if cfg.ep_join_mode is not None:

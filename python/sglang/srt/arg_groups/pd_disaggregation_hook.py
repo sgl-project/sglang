@@ -5,10 +5,12 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from sglang.srt.arg_groups.model_hook import handle_language_model_only
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
+from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -188,7 +190,7 @@ def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.server_args import resolve_encoder_transfer_backend
 
     cfg = resolving_view(server_args)
-    server_args._handle_language_model_only()
+    handle_language_model_only(server_args)
     if cfg.enable_prefix_mm_cache and not cfg.encoder_only:
         raise ValueError(
             "--enable-prefix-mm-cache requires --encoder-only to be enabled"
@@ -215,8 +217,8 @@ def handle_encoder_disaggregation(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_encoder_disaggregation",
-            disaggregation_ib_device=server_args._validate_ib_devices(
-                cfg.disaggregation_ib_device
+            disaggregation_ib_device=validate_ib_devices(
+                server_args, cfg.disaggregation_ib_device
             ),
         )
 
