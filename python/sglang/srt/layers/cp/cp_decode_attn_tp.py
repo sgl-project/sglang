@@ -51,7 +51,7 @@ class CpDecodeAttnTpContext:
     """Slices replicated attention weights across CP ranks during decode."""
 
     def __init__(self):
-        enable_attn_tp = get_parallel().config.enable_cp_decode_attn_tp
+        enable_attn_tp = get_parallel().enable_cp_decode_attn_tp
 
         if enable_attn_tp and get_parallel().attn_cp_size > 1:
             self.decode_tp_rank = get_parallel().attn_cp_rank

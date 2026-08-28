@@ -110,7 +110,7 @@ class TestTheModelConfigCache(CustomTestCase):
         server_args = self._resolved(
             model_path=_OBJECT_STORE_URI, load_format="runai_streamer"
         )
-        cached = server_args.__dict__["model_config"]
+        cached = server_args.__dict__["_model_config"]
         self.assertIsInstance(cached, ModelConfig)
         # The record still carries the URI the operator typed, and the
         # configuration carries the directory it read the metadata from.
@@ -162,7 +162,7 @@ class TestTheModelConfigCache(CustomTestCase):
         invalidates it."""
         server_args = ServerArgs(model_path=self._checkpoint(), device="cuda")
         stand_in = SimpleNamespace(model_path="somewhere/else")
-        server_args.model_config = stand_in
+        server_args._model_config = stand_in
 
         self.assertIs(server_args.get_model_config(), stand_in)
 
