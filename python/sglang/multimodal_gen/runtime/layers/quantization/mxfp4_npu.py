@@ -1,4 +1,4 @@
-"""Online MXFP4 quantization for Diffusion models on Ascend NPU.
+"""Online MXFP4 quantization for Diffusion models on NPU.
 
 Provides ``NPUMXFP4Config`` (registered as ``"mxfp4_npu"``) and
 ``NPUMXFP4DiffusionLinearMethod`` which quantises FP16/BF16 weights to MXFP4
@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 
 
 class NPUMXFP4Config(QuantizationConfig):
-    """Config for online MXFP4 quantization on Ascend NPU (Diffusion)."""
+    """Config for online MXFP4 quantization on NPU (Diffusion)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -79,7 +79,7 @@ class NPUMXFP4Config(QuantizationConfig):
 
 
 class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
-    """Ascend NPU MXFP4 linear method for Diffusion models (dual-level).
+    """NPU MXFP4 linear method for Diffusion models (dual-level).
 
     Online mode: loads FP16/BF16 weights → quantises to MXFP4 at load time
     via ``npu_dynamic_dual_level_mx_quant``.

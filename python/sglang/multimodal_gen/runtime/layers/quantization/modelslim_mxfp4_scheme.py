@@ -1,4 +1,4 @@
-"""ModelSlim MXFP4 scheme for pre-quantized weight inference on Ascend NPU.
+"""ModelSlim MXFP4 scheme for pre-quantized weight inference on NPU.
 
 Loads weights pre-quantized by msmodelslim and runs MXFP4 dual-level
 matmul at inference via npu_dual_level_quant_matmul.
