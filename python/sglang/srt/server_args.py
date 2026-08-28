@@ -3032,6 +3032,20 @@ class ServerArgs:
         ),
         NS("lora"),
     ] = "csgmv"
+    lora_page_rank_size: A[
+        int,
+        Arg(
+            help="Page size (in rank dimension) for paged LoRA memory pool. 0 = disabled (use the existing contiguous LoRAMemoryPool). When enabled (e.g. 8), the pool is organised as fixed-size pages that are allocated and evicted individually.",
+        ),
+        NS("lora"),
+    ] = 0
+    lora_pages: A[
+        int,
+        Arg(
+            help="Total physical pages in the paged LoRA pool. 0 = auto-compute from max_loras_per_batch * ceil(max_lora_rank / lora_page_rank_size).",
+        ),
+        NS("lora"),
+    ] = 0
     max_lora_chunk_size: A[
         Optional[int],
         Arg(
@@ -3854,6 +3868,13 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args.
         self._handle_asr_validation()
+
+        if self.default_chat_template_kwargs is not None and not isinstance(
+            self.default_chat_template_kwargs, dict
+        ):
+            raise ValueError(
+                "--default-chat-template-kwargs must decode to a JSON object"
+            )
 
         # Handle deprecated arguments.
         self._handle_deprecated_args()
@@ -5158,6 +5179,8 @@ class ServerArgs:
                 lambda: self.get_model_config().is_multimodal
                 and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported,
             ),
+            # DP-attn × BCG capture/replay not yet validated.
+            ("DP attention", lambda: self._resolved().enable_dp_attention),
         ]
         for name, predicate in rules:
             if predicate():
@@ -10179,6 +10202,7 @@ class ServerArgs:
         view so declared fields resolve from the declaration stash."""
         from sglang.srt.arg_groups.overrides import (
             attention_backends_of,
+            resolved_view,
         )
 
         return attention_backends_of(resolved_view(self))

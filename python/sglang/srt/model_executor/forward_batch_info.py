@@ -944,7 +944,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                if not model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids)):
+                    raise RuntimeError(
+                        "fetch_new_loras failed: insufficient page budget for "
+                        f"lora_ids={set(ret.lora_ids)}"
+                    )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
