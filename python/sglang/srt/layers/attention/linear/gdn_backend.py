@@ -43,11 +43,6 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_xpu():
-    from sgl_kernel import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
-
-    causal_conv1d_fn = causal_conv1d_fn_xpu
-    causal_conv1d_update = causal_conv1d_update_xpu
 elif is_npu():
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -405,7 +400,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
                 self.req_to_token_pool.size,
-                model_runner.server_args,
                 model_runner.device,
             )
         )

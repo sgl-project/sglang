@@ -118,7 +118,7 @@ def start_sidecar(server_args) -> Sidecar:
     module_name = server_args.sidecar
     assert module_name is not None
     sidecar_args, shutdown_timeout = _parse_sidecar_args(server_args.sidecar_args)
-    endpoint = build_sidecar_endpoint(server_args.host, get_serving().grpc_port)
+    endpoint = build_sidecar_endpoint(get_serving().host, get_serving().grpc_port)
     proc = mp.get_context("spawn").Process(
         name=f"sglang_sidecar_{module_name}",
         target=_run_sidecar,

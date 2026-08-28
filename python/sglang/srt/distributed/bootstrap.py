@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
 from sglang.srt.distributed.parallel_state import (
     _tag_groups_for_flashinfer_allreduce_only,
 )
@@ -30,6 +31,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -132,6 +134,10 @@ def init_torch_distributed(
         ):
             _prewarm_tp_lm_head_all_to_all()
 
+    maybe_wait_for_gated_launch(
+        host=server_args.host, port=server_args.gated_launch_port
+    )
+
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
@@ -182,7 +188,7 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", dist_port
+            get_serving().host or "127.0.0.1", dist_port
         ).to_tcp()
     return dist_init_method
 
