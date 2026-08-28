@@ -3844,6 +3844,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._validate_tokenizer_event_loop_watchdog()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -9742,9 +9743,17 @@ class ServerArgs:
 
     def _handle_debug_utils(self):
         cfg = resolving_view(self)
+
         if is_in_ci() and cfg.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self._declare("_handle_debug_utils", soft_watchdog_timeout=300)
+
+    def _validate_tokenizer_event_loop_watchdog(self):
+        timeout = self.tokenizer_event_loop_watchdog_timeout
+        if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError(
+                "--tokenizer-event-loop-watchdog-timeout must be finite and positive"
+            )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
