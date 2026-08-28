@@ -184,9 +184,7 @@ class ServerArgumentTests(unittest.TestCase):
     def test_llama_reads_true_sp_flag_from_server_arguments(self):
         source = LLAMA_SOURCE.read_text()
         self.assertIn("get_server_args().enable_flashinfer_agmm_true_sp", source)
-        self.assertNotIn(
-            "get_parallel().config.enable_flashinfer_agmm_true_sp", source
-        )
+        self.assertNotIn("get_parallel().config.enable_flashinfer_agmm_true_sp", source)
         self.assertNotIn("get_parallel().enable_flashinfer_agmm_true_sp", source)
 
     def test_true_sp_flag_parses_from_cli_and_yaml(self):
