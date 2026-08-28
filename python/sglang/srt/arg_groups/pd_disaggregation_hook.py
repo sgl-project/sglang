@@ -218,9 +218,7 @@ def handle_encoder_disaggregation(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_encoder_disaggregation",
-            disaggregation_ib_device=validate_ib_devices(
-                server_args, cfg.disaggregation_ib_device
-            ),
+            disaggregation_ib_device=validate_ib_devices(cfg.disaggregation_ib_device),
         )
 
     # Validate model type for encoder disaggregation

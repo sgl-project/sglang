@@ -376,7 +376,7 @@ def apply_deepep_adjustments(server_args: Any):
         if bs is None:
             # 2048 = documented prefill default; max_bs unresolved here.
             max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
-            bs = generate_prefill_cuda_graph_batch_sizes(server_args, max_bs)
+            bs = generate_prefill_cuda_graph_batch_sizes(max_bs)
         aligned = sorted({((b + 7) // 8) * 8 for b in bs})
         if aligned != sorted(bs):
             logger.info(
@@ -473,7 +473,7 @@ def validate_cuda_graph_config(server_args: Any):
             )
 
 
-def generate_prefill_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
+def generate_prefill_cuda_graph_batch_sizes(max_bs: int):
     """
     Generate the list of batch sizes for prefill CUDA graph capture
     based on max_bs. For tc_piecewise prefill, bs carries the

@@ -206,7 +206,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
 
     if prefill_cuda_graph_config.bs is None:
         prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
-            server_args, prefill_cuda_graph_config.max_bs
+            prefill_cuda_graph_config.max_bs
         )
 
     if cuda_graph_config != cfg.cuda_graph_config:
