@@ -73,6 +73,32 @@ class TestMpsRuntime(unittest.TestCase):
             server_args.ServerArgs._handle_hardware_runtime_validation(args)
         validate.assert_not_called()
 
+    def test_runtime_gate_follows_autodetected_platform_when_device_is_unset(self):
+        """--device is normally omitted on macOS, so the gate must key off the
+        detected platform rather than the raw (still None) device field."""
+        from sglang.srt import server_args
+
+        args = types.SimpleNamespace(device=None)
+        with (
+            mock.patch.object(server_args, "use_mlx", return_value=False),
+            mock.patch.object(
+                server_args.current_platform, "is_mps", return_value=True
+            ),
+            mock.patch.object(server_args, "validate_mps_runtime") as validate,
+        ):
+            server_args.ServerArgs._handle_hardware_runtime_validation(args)
+        validate.assert_called_once_with()
+
+        with (
+            mock.patch.object(server_args, "use_mlx", return_value=False),
+            mock.patch.object(
+                server_args.current_platform, "is_mps", return_value=False
+            ),
+            mock.patch.object(server_args, "validate_mps_runtime") as validate,
+        ):
+            server_args.ServerArgs._handle_hardware_runtime_validation(args)
+        validate.assert_not_called()
+
     def test_checkpoint_derived_execution_modes_are_rejected(self):
         self.assertIsNone(
             runtime.validate_mps_model_config(
@@ -88,31 +114,37 @@ class TestMpsRuntime(unittest.TestCase):
                 types.SimpleNamespace(quantization=None, is_multimodal=True)
             )
 
-    def test_standard_path_rejects_non_torch_lora_backend(self):
+    def test_standard_path_rejects_unsupported_execution_modes(self):
         from sglang.srt.server_args import ServerArgs
 
-        args = types.SimpleNamespace(
-            attention_backend="torch_native",
-            prefill_attention_backend=None,
-            decode_attention_backend=None,
-            sampling_backend="pytorch",
-            kv_cache_dtype="auto",
-            enable_lora=True,
-            lora_paths=None,
-            lora_backend="csgmv",
-            enable_lora_overlap_loading=False,
-            tp_size=1,
-            pp_size=1,
-            dp_size=1,
-            dllm_algorithm=None,
-            enable_multimodal=None,
-            speculative_algorithm=None,
-            enable_torch_compile=False,
-            disaggregation_mode="null",
-            quantization=None,
-        )
-        with self.assertRaisesRegex(ValueError, "lora-backend torch_native"):
-            ServerArgs._validate_standard_mps_server_args(args)
+        def make(**overrides):
+            base = dict(
+                attention_backend="torch_native",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                sampling_backend="pytorch",
+                tp_size=1,
+                pp_size=1,
+                dp_size=1,
+                quantization=None,
+            )
+            base.update(overrides)
+            return types.SimpleNamespace(**base)
+
+        # The supported baseline must pass untouched.
+        self.assertIsNone(ServerArgs._validate_standard_mps_server_args(make()))
+
+        for overrides, expected in (
+            ({"attention_backend": "fa3"}, "torch_native attention backend"),
+            ({"sampling_backend": "flashinfer"}, "pytorch sampling backend"),
+            ({"quantization": "awq"}, "unquantized"),
+            ({"tp_size": 2}, "tp_size=1"),
+            ({"pp_size": 2}, "tp_size=1"),
+            ({"dp_size": 2}, "tp_size=1"),
+        ):
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(ValueError, expected):
+                    ServerArgs._validate_standard_mps_server_args(make(**overrides))
 
 
 if __name__ == "__main__":
