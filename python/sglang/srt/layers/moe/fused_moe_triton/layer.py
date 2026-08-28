@@ -1048,13 +1048,22 @@ class FusedMoE(torch.nn.Module):
             if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
+        kt_method = None
+        if isinstance(self.quant_method, KTEPWrapperMethod):
+            kt_method = self.quant_method
+        elif hasattr(self, "scheme") and isinstance(self.scheme, KTEPWrapperMethod):
+            kt_method = self.scheme
+
+        if kt_method is not None and kt_method.num_gpu_experts != -1:
+            if expert_id < 0 or expert_id >= len(kt_method.gpu_experts_mask):
+                return
+            if not kt_method.gpu_experts_mask[expert_id]:
+                return
+
+            mapped_expert_id = int(kt_method.logical_to_gpu_index[expert_id].item())
+            if mapped_expert_id < 0:
+                return
+            expert_id = mapped_expert_id
 
         self._weight_loader_impl(
             param=param,
