@@ -326,6 +326,8 @@ def handle_dwdp(server_args: Any):
 
 
 def handle_elastic_ep(server_args: Any):
+    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+
     cfg = resolving_view(server_args)
     if cfg.elastic_ep_rejoin:
         if cfg.ep_join_mode is None:
@@ -361,8 +363,8 @@ def handle_elastic_ep(server_args: Any):
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep",
-                mooncake_ib_device=server_args._validate_ib_devices(
-                    cfg.mooncake_ib_device
+                mooncake_ib_device=validate_ib_devices(
+                    server_args, cfg.mooncake_ib_device
                 ),
             )
     if cfg.ep_join_mode is not None:

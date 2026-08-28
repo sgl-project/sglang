@@ -178,7 +178,7 @@ def handle_a2a_moe(server_args: Any):
             )
 
     if a2a_backend == "deepep_v2":
-        server_args._validate_deepep_v2_model_architecture()
+        validate_deepep_v2_model_architecture(server_args)
         if resolved_view(server_args).enable_deterministic_inference:
             raise ValueError(
                 "DeepEP v2 does not forward deterministic=True to "

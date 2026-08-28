@@ -138,11 +138,11 @@ def apply_cuda_graph_compatibility(server_args: Any):
         )
 
     if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
-        server_args._disable_tc_piecewise_cudagraph_if_incompatible()
+        disable_tc_piecewise_cudagraph_if_incompatible(server_args)
     elif cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
-        server_args._disable_breakable_cudagraph_if_incompatible()
+        disable_breakable_cudagraph_if_incompatible(server_args)
     elif cfg.cuda_graph_config.prefill.backend == Backend.FULL:
-        server_args._disable_full_prefill_cudagraph_if_incompatible()
+        disable_full_prefill_cudagraph_if_incompatible(server_args)
 
 
 def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
@@ -427,11 +427,11 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
 def handle_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
 
-    server_args._parse_cuda_graph_config()
-    server_args._apply_cuda_graph_compatibility()
-    server_args._apply_deepep_adjustments()
+    parse_cuda_graph_config(server_args)
+    apply_cuda_graph_compatibility(server_args)
+    apply_deepep_adjustments(server_args)
     server_args._apply_cuda_graph_disaggregation_roles()
-    server_args._validate_cuda_graph_config()
+    validate_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
     # that path is skipped when the user explicitly sets the backend,
     # which is the only way to get 'full' for prefill today).

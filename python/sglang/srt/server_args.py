@@ -3802,10 +3802,38 @@ class ServerArgs:
         from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
         handle_mega_moe(self)
-        self._handle_return_hidden_states_mode()
-        self._handle_media_url_security()
-        self._handle_hicache_ratio_default()
-        self._validate_prefill_decode_interval()
+        from sglang.srt.arg_groups.serving_hook import (
+            handle_asr_validation,
+            handle_crash_dump_env,
+            handle_debug_utils,
+            handle_deprecated_args,
+            handle_environment_variables,
+            handle_grammar_backend,
+            handle_load_balance_method,
+            handle_media_url_security,
+            handle_missing_default_values,
+            handle_multimodal,
+            handle_other_validations,
+            handle_prefill_delayer_env_compat,
+            handle_return_hidden_states_mode,
+            handle_ssl_validation,
+            handle_tokenizer_batching,
+        )
+
+        handle_return_hidden_states_mode(self)
+        handle_media_url_security(self)
+        from sglang.srt.arg_groups.hicache_hook import (
+            handle_hicache,
+            handle_hicache_ratio_default,
+        )
+
+        handle_hicache_ratio_default(self)
+        from sglang.srt.arg_groups.validation_hook import (
+            validate_experimental_sgl_marlin,
+            validate_prefill_decode_interval,
+        )
+
+        validate_prefill_decode_interval(self)
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -3813,55 +3841,105 @@ class ServerArgs:
         if cfg.model_path.lower() in ["none", "dummy"]:
             return
 
-        self._handle_model_source_paths()
+        from sglang.srt.arg_groups.model_path_hook import (
+            handle_load_format,
+            handle_model_source_paths,
+        )
+
+        handle_model_source_paths(self)
 
         # Validate mm_process_config.
-        self._handle_multimodal()
+        handle_multimodal(self)
         # Validate SSL arguments early.
-        self._handle_ssl_validation()
+        handle_ssl_validation(self)
         # Validate transcription/ASR-specific server args.
-        self._handle_asr_validation()
+        handle_asr_validation(self)
 
         # Handle deprecated arguments.
-        self._handle_deprecated_args()
+        handle_deprecated_args(self)
 
         # Handle deprecated environment variables for prefill delayer.
-        self._handle_prefill_delayer_env_compat()
+        handle_prefill_delayer_env_compat(self)
 
         # Set missing default values.
-        self._handle_missing_default_values()
+        handle_missing_default_values(self)
 
         # expert_pack may replace a raw GGUF input with its generated local
         # model metadata before any model-specific handler calls get_model_config.
         # It also establishes eager-only invariants before CUDA graph parsing.
-        self._handle_expert_pack()
+        from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
+
+        handle_expert_pack(self)
 
         # Validate PD disaggregation flags before CUDA graph config.
-        self._handle_pd_disaggregation()
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_encoder_disaggregation,
+            handle_pd_disaggregation,
+        )
+
+        handle_pd_disaggregation(self)
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
-        self._handle_legacy_cp_arguments()
-        self._validate_prefill_only_disable_kv_cache_args()
-        self._handle_dcp_validation()
+        from sglang.srt.arg_groups.parallel_hook import (
+            handle_context_parallelism,
+            handle_data_parallelism,
+            handle_dcp_validation,
+            handle_dwdp,
+            handle_elastic_ep,
+            handle_eplb_and_dispatch,
+            handle_expert_distribution_metrics,
+            handle_legacy_cp_arguments,
+        )
+
+        handle_legacy_cp_arguments(self)
+        from sglang.srt.arg_groups.kv_cache_hook import (
+            handle_cache_compatibility,
+            handle_kv4_compatibility,
+            handle_mxfp8_kv_cache_compatibility,
+            handle_page_major_kv_layout,
+            handle_prefill_only_disable_kv_cache,
+            handle_unified_memory_pool,
+            validate_prefill_only_disable_kv_cache_args,
+        )
+
+        validate_prefill_only_disable_kv_cache_args(self)
+        handle_dcp_validation(self)
 
         # Model-arch prefill CUDA-graph default must land before cuda-graph
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
-        self._apply_inkling_prefill_cuda_graph_default()
-        self._apply_muse_glimmer_prefill_cuda_graph_max_bs_default()
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            apply_inkling_prefill_cuda_graph_default,
+            apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+            disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
+            handle_cuda_graph_config,
+        )
+
+        apply_inkling_prefill_cuda_graph_default(self)
+        apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self)
 
         # must run before _handle_cuda_graph_config and _handle_data_parallelism
-        self._handle_dwdp()
+        handle_dwdp(self)
 
-        self._handle_cuda_graph_config()
+        handle_cuda_graph_config(self)
 
         # Handle device-specific backends.
-        self._handle_hpu_backends()
-        self._handle_cpu_backends()
-        self._handle_npu_backends()
-        self._handle_mps_backends()
-        self._handle_xpu_backends()
+        from sglang.srt.arg_groups.platform_hook import (
+            handle_amd_specifics,
+            handle_cpu_backends,
+            handle_hpu_backends,
+            handle_mps_backends,
+            handle_nccl_pre_warm,
+            handle_npu_backends,
+            handle_xpu_backends,
+        )
+
+        handle_hpu_backends(self)
+        handle_cpu_backends(self)
+        handle_npu_backends(self)
+        handle_mps_backends(self)
+        handle_xpu_backends(self)
 
         # OOT platform plugins set fields directly (an interface this tree
         # does not own); the diff records what they applied.
@@ -3874,193 +3952,146 @@ class ServerArgs:
         gpu_mem = get_device_memory_capacity(cfg.device)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
-        self._handle_gpu_memory_settings(gpu_mem)
+        from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+
+        handle_gpu_memory_settings(self, gpu_mem)
 
         # Apply model-specific adjustments.
-        self._handle_model_specific_adjustments()
+        from sglang.srt.arg_groups.model_hook import (
+            handle_model_capability_adjustments,
+            handle_model_specific_adjustments,
+        )
+
+        handle_model_specific_adjustments(self)
 
         # Set kernel backends.
         self._handle_sampling_backend()
         # Must run before _handle_attention_backend_compatibility so the
         # deterministic backend is set before auto-detection fills it in.
-        self._handle_deterministic_inference()
-        self._handle_attention_backend_compatibility()
+        from sglang.srt.arg_groups.attention_hook import (
+            handle_attention_backend_compatibility,
+            handle_deterministic_inference,
+            handle_linear_attn_backend,
+            handle_multi_item_scoring,
+        )
+
+        handle_deterministic_inference(self)
+        handle_attention_backend_compatibility(self)
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
-        self._disable_prefill_cuda_graph_for_deepseek_trtllm_mla()
-        self._handle_mamba_backend()
-        self._handle_int8_mamba_checkpoint()
-        self._handle_linear_attn_backend()
-        self._handle_kv4_compatibility()
-        self._handle_mxfp8_kv_cache_compatibility()
+        disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self)
+        from sglang.srt.arg_groups.mamba_hook import (
+            handle_int8_mamba_checkpoint,
+            handle_mamba_backend,
+        )
+
+        handle_mamba_backend(self)
+        handle_int8_mamba_checkpoint(self)
+        handle_linear_attn_backend(self)
+        handle_kv4_compatibility(self)
+        handle_mxfp8_kv_cache_compatibility(self)
         self._handle_page_size()
-        self._handle_amd_specifics()
-        self._handle_nccl_pre_warm()
-        self._handle_grammar_backend()
+        handle_amd_specifics(self)
+        handle_nccl_pre_warm(self)
+        handle_grammar_backend(self)
 
         # Handle multi-item scoring constraints. Must run after the above so
         # the final attention backend and chunked_prefill_size are in effect.
-        self._handle_multi_item_scoring()
+        handle_multi_item_scoring(self)
 
         # Backend-dependent half of --prefill-only-disable-kv-cache validation.
         # Must stay after _handle_attention_backend_compatibility() (above) and
         # _handle_multi_item_scoring() so the resolved prefill backend is final;
         # the flag/precondition half runs earlier in
         # _validate_prefill_only_disable_kv_cache_args().
-        self._handle_prefill_only_disable_kv_cache()
+        handle_prefill_only_disable_kv_cache(self)
 
         # Handle Hicache settings.
-        self._handle_hicache()
+        handle_hicache(self)
 
         # Handle data parallelism.
-        self._handle_data_parallelism()
+        handle_data_parallelism(self)
 
         # Normalize load balancing defaults.
-        self._handle_load_balance_method()
+        handle_load_balance_method(self)
 
         # Re-apply after model-specific defaults resolve attention_backend so
         # canonical CP mirrors to the right legacy runtime aliases.
-        self._handle_legacy_cp_arguments()
+        handle_legacy_cp_arguments(self)
 
         # Handle context parallelism.
-        self._handle_context_parallelism()
+        handle_context_parallelism(self)
 
         # Handle MoE configurations.
-        self._handle_moe_kernel_config()
-        self._handle_a2a_moe()
-        self._handle_eplb_and_dispatch()
-        self._handle_expert_distribution_metrics()
-        self._handle_elastic_ep()
-        self._validate_experimental_sgl_marlin()
+        from sglang.srt.arg_groups.moe_hook import (
+            handle_a2a_moe,
+            handle_moe_kernel_config,
+            validate_cutedsl_a2a_token_budget,
+            validate_deepep_v2_dispatch_token_budget,
+            validate_deepep_v2_speculative_draft,
+        )
+
+        handle_moe_kernel_config(self)
+        handle_a2a_moe(self)
+        handle_eplb_and_dispatch(self)
+        handle_expert_distribution_metrics(self)
+        handle_elastic_ep(self)
+        validate_experimental_sgl_marlin(self)
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
 
         # Handle speculative decoding logic.
+
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
-        self._validate_cutedsl_a2a_token_budget()
+        validate_cutedsl_a2a_token_budget(self)
 
         # Handle model loading format.
-        self._handle_load_format()
+        handle_load_format(self)
 
         # Handle Encoder disaggregation.
-        self._handle_encoder_disaggregation()
+        handle_encoder_disaggregation(self)
 
         # Validate tokenizer settings.
-        self._handle_tokenizer_batching()
+        handle_tokenizer_batching(self)
 
         # Propagate environment variables.
-        self._handle_environment_variables()
+        handle_environment_variables(self)
 
         # Validate cache settings.
-        self._handle_cache_compatibility()
+        handle_cache_compatibility(self)
 
-        self._handle_page_major_kv_layout()
+        handle_page_major_kv_layout(self)
 
-        self._handle_unified_memory_pool()
+        handle_unified_memory_pool(self)
 
         # Handle diffusion LLM inference.
-        self._handle_dllm_inference()
+        from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
+
+        handle_dllm_inference(self)
 
         # Handle crash dump environment variables (must run before CUDA init).
-        self._handle_crash_dump_env()
+        handle_crash_dump_env(self)
 
         # Handle debug utilities.
-        self._handle_debug_utils()
+        handle_debug_utils(self)
 
         # Handle any other necessary validations.
-        self._handle_other_validations()
+        handle_other_validations(self)
 
         # Model-capability adjustments that legacy code applied at model-load
         # time; last declarations of the resolution, mirroring that order.
-        self._handle_model_capability_adjustments()
-
-        # Validate after all batch-size declarations are visible.
-        self._validate_deepep_v2_speculative_draft()
-        self._validate_deepep_v2_dispatch_token_budget()
-
-        self._resolution_finished = True
-
-    def _handle_return_hidden_states_mode(self):
-        from sglang.srt.arg_groups.serving_hook import handle_return_hidden_states_mode
-
-        handle_return_hidden_states_mode(self)
-
-    def _handle_model_capability_adjustments(self):
-        from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
-
         handle_model_capability_adjustments(self)
 
-    def _handle_model_source_paths(self):
-        from sglang.srt.arg_groups.model_path_hook import handle_model_source_paths
+        # Validate after all batch-size declarations are visible.
+        validate_deepep_v2_speculative_draft(self)
+        validate_deepep_v2_dispatch_token_budget(self)
 
-        handle_model_source_paths(self)
-
-    def _handle_pd_disaggregation(self):
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_pd_disaggregation,
-        )
-
-        handle_pd_disaggregation(self)
-
-    def _handle_dcp_validation(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_dcp_validation
-
-        handle_dcp_validation(self)
-
-    def _handle_load_balance_method(self):
-        from sglang.srt.arg_groups.serving_hook import handle_load_balance_method
-
-        handle_load_balance_method(self)
-
-    def _handle_ssl_validation(self):
-        from sglang.srt.arg_groups.serving_hook import handle_ssl_validation
-
-        handle_ssl_validation(self)
-
-    def _handle_multimodal(self):
-        from sglang.srt.arg_groups.serving_hook import handle_multimodal
-
-        handle_multimodal(self)
-
-    def _handle_media_url_security(self):
-        from sglang.srt.arg_groups.serving_hook import handle_media_url_security
-
-        handle_media_url_security(self)
-
-    def _handle_deprecated_args(self):
-        from sglang.srt.arg_groups.serving_hook import handle_deprecated_args
-
-        handle_deprecated_args(self)
-
-    def _handle_prefill_delayer_env_compat(self):
-        from sglang.srt.arg_groups.serving_hook import handle_prefill_delayer_env_compat
-
-        handle_prefill_delayer_env_compat(self)
-
-    def _handle_missing_default_values(self):
-        from sglang.srt.arg_groups.serving_hook import handle_missing_default_values
-
-        handle_missing_default_values(self)
-
-    def _handle_modelscope_paths(self):
-        from sglang.srt.arg_groups.model_path_hook import handle_modelscope_paths
-
-        handle_modelscope_paths(self)
-
-    def _handle_hpu_backends(self):
-        from sglang.srt.arg_groups.platform_hook import handle_hpu_backends
-
-        handle_hpu_backends(self)
-
-    def _handle_cpu_backends(self):
-        from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
-
-        handle_cpu_backends(self)
+        self._resolution_finished = True
 
     def _handle_hardware_runtime_validation(self):
         # This is intentionally independent of self.device: setting
@@ -4069,57 +4100,9 @@ class ServerArgs:
         # use_mlx() remains lazy and does not import MLX.
         use_mlx()
 
-    def _handle_npu_backends(self):
-        from sglang.srt.arg_groups.platform_hook import handle_npu_backends
-
-        handle_npu_backends(self)
-
-    def _handle_mps_backends(self):
-        from sglang.srt.arg_groups.platform_hook import handle_mps_backends
-
-        handle_mps_backends(self)
-
-    def _handle_xpu_backends(self):
-        from sglang.srt.arg_groups.platform_hook import handle_xpu_backends
-
-        handle_xpu_backends(self)
-
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
-    def _apply_inkling_prefill_cuda_graph_default(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            apply_inkling_prefill_cuda_graph_default,
-        )
-
-        apply_inkling_prefill_cuda_graph_default(self)
-
-    def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
-        )
-
-        apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self)
-
-    def _handle_cuda_graph_config(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import handle_cuda_graph_config
-
-        handle_cuda_graph_config(self)
-
-    def _apply_deepep_adjustments(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import apply_deepep_adjustments
-
-        apply_deepep_adjustments(self)
-
-    def _parse_cuda_graph_config(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
-
-        parse_cuda_graph_config(self)
-
-    def _apply_cuda_graph_compatibility(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
-
-        apply_cuda_graph_compatibility(self)
 
     def _apply_cuda_graph_disaggregation_roles(self):
         cfg = resolving_view(self)
@@ -4139,49 +4122,6 @@ class ServerArgs:
                         cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                     ),
                 )
-
-    def _disable_tc_piecewise_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            disable_tc_piecewise_cudagraph_if_incompatible,
-        )
-
-        disable_tc_piecewise_cudagraph_if_incompatible(self)
-
-    def _disable_breakable_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            disable_breakable_cudagraph_if_incompatible,
-        )
-
-        disable_breakable_cudagraph_if_incompatible(self)
-
-    def _disable_full_prefill_cudagraph_if_incompatible(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            disable_full_prefill_cudagraph_if_incompatible,
-        )
-
-        disable_full_prefill_cudagraph_if_incompatible(self)
-
-    def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
-        )
-
-        disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self)
-
-    def _validate_cuda_graph_config(self):
-        from sglang.srt.arg_groups.cuda_graph_hook import validate_cuda_graph_config
-
-        validate_cuda_graph_config(self)
-
-    def _handle_multi_item_scoring(self):
-        from sglang.srt.arg_groups.attention_hook import handle_multi_item_scoring
-
-        handle_multi_item_scoring(self)
-
-    def _handle_gpu_memory_settings(self, gpu_mem):
-        from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
-
-        handle_gpu_memory_settings(self, gpu_mem)
 
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
@@ -4408,47 +4348,10 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_split_backend_resolution)
 
-    def _validate_hisparse_dsa_backend(self, attr: str, label: str):
-        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_dsa_backend
-
-        validate_hisparse_dsa_backend(self, attr, label)
-
-    def _validate_hisparse_kv_cache_dtype(self):
-        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse_kv_cache_dtype
-
-        validate_hisparse_kv_cache_dtype(self)
-
-    def _handle_model_specific_adjustments(self):
-        from sglang.srt.arg_groups.model_hook import handle_model_specific_adjustments
-
-        handle_model_specific_adjustments(self)
-
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
         return supports_mamba_cache_extra_buffer(self, model_arch)
-
-    def _validate_mamba_no_buffer(self, view, model_arch: str):
-        from sglang.srt.arg_groups.mamba_hook import validate_mamba_no_buffer
-
-        validate_mamba_no_buffer(view, model_arch)
-
-    def _validate_mamba_extra_buffer(self, view, model_arch: str):
-        from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
-
-        validate_mamba_extra_buffer(
-            view,
-            model_arch,
-            mamba_cache_chunk_size_of=lambda: self.mamba_cache_chunk_size,
-        )
-
-    def _handle_mamba_radix_cache(self, model_arch: str):
-        # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
-        # _mamba_radix_cache_resolution), invoked here at each legacy call
-        # slot; this handler keeps the validation.
-        from sglang.srt.arg_groups.model_hook import handle_mamba_radix_cache
-
-        handle_mamba_radix_cache(self, model_arch)
 
     def _handle_sampling_backend(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -4535,25 +4438,6 @@ class ServerArgs:
             else:
                 return "triton"
 
-    def _handle_attention_backend_compatibility(self):
-        from sglang.srt.arg_groups.attention_hook import (
-            handle_attention_backend_compatibility,
-        )
-
-        handle_attention_backend_compatibility(self)
-
-    def _handle_mxfp8_kv_cache_compatibility(self):
-        from sglang.srt.arg_groups.kv_cache_hook import (
-            handle_mxfp8_kv_cache_compatibility,
-        )
-
-        handle_mxfp8_kv_cache_compatibility(self)
-
-    def _handle_kv4_compatibility(self):
-        from sglang.srt.arg_groups.kv_cache_hook import handle_kv4_compatibility
-
-        handle_kv4_compatibility(self)
-
     def _handle_page_size(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _page_size_default), invoked here at its legacy slot.
@@ -4563,61 +4447,6 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _page_size_default)
-
-    def _handle_amd_specifics(self):
-        from sglang.srt.arg_groups.platform_hook import handle_amd_specifics
-
-        handle_amd_specifics(self)
-
-    def _handle_nccl_pre_warm(self):
-        from sglang.srt.arg_groups.platform_hook import handle_nccl_pre_warm
-
-        handle_nccl_pre_warm(self)
-
-    def _handle_grammar_backend(self):
-        from sglang.srt.arg_groups.serving_hook import handle_grammar_backend
-
-        handle_grammar_backend(self)
-
-    def _handle_mamba_backend(self):
-        from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
-
-        handle_mamba_backend(self)
-
-    def _handle_int8_mamba_checkpoint(self):
-        from sglang.srt.arg_groups.mamba_hook import handle_int8_mamba_checkpoint
-
-        handle_int8_mamba_checkpoint(self)
-
-    def _handle_linear_attn_backend(self):
-        from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
-
-        handle_linear_attn_backend(self)
-
-    def _handle_legacy_cp_arguments(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_legacy_cp_arguments
-
-        handle_legacy_cp_arguments(self)
-
-    def _handle_context_parallelism(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
-
-        handle_context_parallelism(self)
-
-    def _handle_dwdp(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_dwdp
-
-        handle_dwdp(self)
-
-    def _handle_data_parallelism(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_data_parallelism
-
-        handle_data_parallelism(self)
-
-    def _handle_moe_kernel_config(self):
-        from sglang.srt.arg_groups.moe_hook import handle_moe_kernel_config
-
-        handle_moe_kernel_config(self)
 
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
@@ -4654,33 +4483,6 @@ class ServerArgs:
             tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
         return tokens
 
-    def _validate_cutedsl_a2a_token_budget(self):
-        from sglang.srt.arg_groups.moe_hook import validate_cutedsl_a2a_token_budget
-
-        validate_cutedsl_a2a_token_budget(self)
-
-    def _validate_deepep_v2_dispatch_token_budget(self) -> None:
-        from sglang.srt.arg_groups.moe_hook import (
-            validate_deepep_v2_dispatch_token_budget,
-        )
-
-        validate_deepep_v2_dispatch_token_budget(self)
-
-    def _validate_deepep_v2_model_architecture(self) -> None:
-        from sglang.srt.arg_groups.moe_hook import validate_deepep_v2_model_architecture
-
-        validate_deepep_v2_model_architecture(self)
-
-    def _validate_deepep_v2_speculative_draft(self) -> None:
-        from sglang.srt.arg_groups.moe_hook import validate_deepep_v2_speculative_draft
-
-        validate_deepep_v2_speculative_draft(self)
-
-    def _handle_a2a_moe(self):
-        from sglang.srt.arg_groups.moe_hook import handle_a2a_moe
-
-        handle_a2a_moe(self)
-
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
         """Max tokens a single rank dispatches through MoRI in one forward."""
         cfg = resolving_view(self)
@@ -4694,30 +4496,7 @@ class ServerArgs:
             required = max(required, cfg.cuda_graph_max_bs_decode)
         return required
 
-    def _handle_eplb_and_dispatch(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_eplb_and_dispatch
-
-        handle_eplb_and_dispatch(self)
-
-    def _handle_elastic_ep(self):
-        from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
-
-        handle_elastic_ep(self)
-
-    def _validate_experimental_sgl_marlin(self):
-        from sglang.srt.arg_groups.validation_hook import (
-            validate_experimental_sgl_marlin,
-        )
-
-        validate_experimental_sgl_marlin(self)
         # ===== END TO BE REFACTORED ====
-
-    def _handle_expert_distribution_metrics(self):
-        from sglang.srt.arg_groups.parallel_hook import (
-            handle_expert_distribution_metrics,
-        )
-
-        handle_expert_distribution_metrics(self)
 
     def _handle_pipeline_parallelism(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -4728,70 +4507,6 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
-
-    def _validate_prefill_only_disable_kv_cache_args(self):
-        from sglang.srt.arg_groups.kv_cache_hook import (
-            validate_prefill_only_disable_kv_cache_args,
-        )
-
-        validate_prefill_only_disable_kv_cache_args(self)
-
-    def _handle_prefill_only_disable_kv_cache(self):
-        from sglang.srt.arg_groups.kv_cache_hook import (
-            handle_prefill_only_disable_kv_cache,
-        )
-
-        handle_prefill_only_disable_kv_cache(self)
-
-    def _handle_hicache_ratio_default(self):
-        from sglang.srt.arg_groups.hicache_hook import handle_hicache_ratio_default
-
-        handle_hicache_ratio_default(self)
-
-    def _handle_hicache(self):
-        from sglang.srt.arg_groups.hicache_hook import handle_hicache
-
-        handle_hicache(self)
-
-    def _validate_hicache_host_memory_mode(self):
-        from sglang.srt.arg_groups.hicache_hook import validate_hicache_host_memory_mode
-
-        validate_hicache_host_memory_mode(self)
-
-    def _resolve_hicache_dcp_compatibility(self):
-        from sglang.srt.arg_groups.hicache_hook import resolve_hicache_dcp_compatibility
-
-        resolve_hicache_dcp_compatibility(self)
-
-    def _resolve_layout_io_compatibility(self):
-        from sglang.srt.arg_groups.hicache_hook import resolve_layout_io_compatibility
-
-        resolve_layout_io_compatibility(self)
-
-    def _resolve_storage_layout_compatibility(self):
-        from sglang.srt.arg_groups.hicache_hook import (
-            resolve_storage_layout_compatibility,
-        )
-
-        resolve_storage_layout_compatibility(self)
-
-    def _resolve_hf_gguf_model_path(self):
-        from sglang.srt.arg_groups.model_path_hook import resolve_hf_gguf_model_path
-
-        resolve_hf_gguf_model_path(self)
-
-    def _handle_expert_pack(self):
-        from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
-
-        handle_expert_pack(self)
-
-    def _handle_load_format(self):
-        # The quantization side of the gguf coupling moved to the pipeline
-        # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
-        # genuine config (runtime user updates write it) and stays imperative.
-        from sglang.srt.arg_groups.model_path_hook import handle_load_format
-
-        handle_load_format(self)
 
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
@@ -4855,95 +4570,10 @@ class ServerArgs:
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
 
-    def _handle_language_model_only(self):
-        from sglang.srt.arg_groups.model_hook import handle_language_model_only
-
-        handle_language_model_only(self)
-
-    def _handle_encoder_disaggregation(self):
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_encoder_disaggregation,
-        )
-
-        handle_encoder_disaggregation(self)
-
-    def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
-        from sglang.srt.arg_groups.validation_hook import validate_ib_devices
-
-        return validate_ib_devices(self, device_str)
-
-    def _handle_tokenizer_batching(self):
-        from sglang.srt.arg_groups.serving_hook import handle_tokenizer_batching
-
-        handle_tokenizer_batching(self)
-
-    def _handle_multimodal_feature_transport(self):
-        from sglang.srt.arg_groups.serving_hook import (
-            handle_multimodal_feature_transport,
-        )
-
-        handle_multimodal_feature_transport(self)
-
-    def _handle_environment_variables(self):
-        from sglang.srt.arg_groups.serving_hook import handle_environment_variables
-
-        handle_environment_variables(self)
-
-    def _handle_cache_compatibility(self):
-        from sglang.srt.arg_groups.kv_cache_hook import handle_cache_compatibility
-
-        handle_cache_compatibility(self)
-
-    def _handle_deterministic_inference(self):
-        from sglang.srt.arg_groups.attention_hook import handle_deterministic_inference
-
-        handle_deterministic_inference(self)
-
-    def _handle_unified_memory_pool(self):
-        from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
-
-        handle_unified_memory_pool(self)
-        # The strided-layout Triton requirement is enforced via
-        # --enable-page-major-kv-layout (implied by the unified pool in
-        # _handle_page_major_kv_layout); the model-family gate is enforced at pool
-        # construction in model_runner_kv_cache_mixin._init_pools.
-
-    def _handle_page_major_kv_layout(self):
-        from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
-
-        handle_page_major_kv_layout(self)
-
-    def _handle_dllm_inference(self):
-        from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
-
-        handle_dllm_inference(self)
-
-    def _handle_asr_validation(self):
-        from sglang.srt.arg_groups.serving_hook import handle_asr_validation
-
-        handle_asr_validation(self)
-
-    def _validate_prefill_decode_interval(self):
-        from sglang.srt.arg_groups.validation_hook import (
-            validate_prefill_decode_interval,
-        )
-
-        validate_prefill_decode_interval(self)
-
-    def _handle_other_validations(self):
-        from sglang.srt.arg_groups.serving_hook import handle_other_validations
-
-        handle_other_validations(self)
-
-    def _handle_crash_dump_env(self):
-        from sglang.srt.arg_groups.serving_hook import handle_crash_dump_env
-
-        handle_crash_dump_env(self)
-
-    def _handle_debug_utils(self):
-        from sglang.srt.arg_groups.serving_hook import handle_debug_utils
-
-        handle_debug_utils(self)
+    # The strided-layout Triton requirement is enforced via
+    # --enable-page-major-kv-layout (implied by the unified pool in
+    # _handle_page_major_kv_layout); the model-family gate is enforced at pool
+    # construction in model_runner_kv_cache_mixin._init_pools.
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -5480,39 +5110,10 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
 
-    def _check_two_batch_overlap(self):
-        # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
-        # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
-        # the other ubatch's compute), which requires DP attention. Enabling it
-        # there needs no extra opt-in env flag.
-        from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
-
-        check_two_batch_overlap(self)
-
     def check_server_args(self):
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-
-    def check_load_publish_args(self):
-        from sglang.srt.arg_groups.validation_hook import check_load_publish_args
-
-        check_load_publish_args(self)
-
-    def check_lora_server_args(self):
-        from sglang.srt.arg_groups.lora_hook import check_lora_server_args
-
-        check_lora_server_args(self)
-
-    def _check_lora_speculative_compatibility(self):
-        from sglang.srt.arg_groups.lora_hook import check_lora_speculative_compatibility
-
-        check_lora_speculative_compatibility(self)
-
-    def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
-        from sglang.srt.arg_groups.validation_hook import validate_buckets_rule
-
-        validate_buckets_rule(self, arg_name, buckets_rule)
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         cfg = resolving_view(self)
@@ -5553,11 +5154,6 @@ class ServerArgs:
             "adjust_mem_fraction_for_vlm",
             mem_fraction_static=original_server_arg_mem_fraction * final_overall_factor,
         )
-
-    def validate_transfer_engine(self):
-        from sglang.srt.arg_groups.model_path_hook import validate_transfer_engine
-
-        return validate_transfer_engine(self)
 
     @property
     def _parsed_modelexpress_config(self) -> dict:

@@ -33,16 +33,16 @@ def handle_hicache(server_args: Any):
     ):
         return
 
-    server_args._validate_hicache_host_memory_mode()
+    validate_hicache_host_memory_mode(server_args)
 
     # Step 1: Initial layout-io compatibility normalization.
-    server_args._resolve_layout_io_compatibility()
+    resolve_layout_io_compatibility(server_args)
 
     # Step 2: Storage-layout normalization without changing io backend.
-    server_args._resolve_storage_layout_compatibility()
+    resolve_storage_layout_compatibility(server_args)
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
-    server_args._resolve_hicache_dcp_compatibility()
+    resolve_hicache_dcp_compatibility(server_args)
 
 
 def handle_hicache_ratio_default(server_args: Any):

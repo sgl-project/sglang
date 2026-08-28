@@ -93,7 +93,7 @@ def handle_model_specific_adjustments(server_args: Any):
 
     _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
     if _hybrid_spec is not None and _hybrid_spec.uses_mamba_radix_cache:
-        server_args._handle_mamba_radix_cache(model_arch=model_arch)
+        handle_mamba_radix_cache(server_args, model_arch)
 
     # Collect the declarative model overrides (registry) on the
     # pristine config and stash them for publish-time flags resolution;
@@ -561,7 +561,7 @@ def handle_model_specific_adjustments(server_args: Any):
     # for them this re-invocation is an idempotent no-op plus validation.
     # Kept ahead of the sparse-head pass: the legacy per-branch calls
     # resolved before that tail write of disable_overlap_schedule.
-    server_args._handle_mamba_radix_cache(model_arch=model_arch)
+    handle_mamba_radix_cache(server_args, model_arch)
 
     from sglang.srt.arg_groups.overrides import (
         _sparse_head_overlap_disable,
@@ -585,6 +585,10 @@ def handle_model_specific_adjustments(server_args: Any):
 
 
 def handle_model_capability_adjustments(server_args: Any):
+    from sglang.srt.arg_groups.kv_cache_hook import (
+        validate_prefill_only_disable_kv_cache_args,
+    )
+
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
@@ -725,7 +729,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 "_handle_model_capability_adjustments",
                 prefill_only_disable_kv_cache=True,
             )
-            server_args._validate_prefill_only_disable_kv_cache_args()
+            validate_prefill_only_disable_kv_cache_args(server_args)
         declare_resolution(
             server_args,
             "_handle_model_capability_adjustments",
@@ -808,6 +812,10 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
     # _mamba_radix_cache_resolution), invoked here at each legacy call
     # slot; this handler keeps the validation.
+    from sglang.srt.arg_groups.mamba_hook import (
+        validate_mamba_extra_buffer,
+        validate_mamba_no_buffer,
+    )
     from sglang.srt.arg_groups.overrides import (
         _mamba_radix_cache_resolution,
         mamba_extra_buffer_of,
@@ -820,9 +828,13 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
         return
 
     if mamba_extra_buffer_of(view):
-        server_args._validate_mamba_extra_buffer(view, model_arch)
+        validate_mamba_extra_buffer(
+            view,
+            model_arch,
+            mamba_cache_chunk_size_of=lambda: server_args.mamba_cache_chunk_size,
+        )
     else:
-        server_args._validate_mamba_no_buffer(view, model_arch)
+        validate_mamba_no_buffer(view, model_arch)
 
 
 def handle_language_model_only(server_args: Any):
