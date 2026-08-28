@@ -133,6 +133,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
             req=req,
             workload=(128, 96, 9, 2),
             baseline_allocated_bytes=3,
+            baseline_reserved_bytes=3,
             succeeded=True,
         )
 
@@ -176,6 +177,7 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
             req=req,
             workload=(64, 64, 1, 1),
             baseline_allocated_bytes=3,
+            baseline_reserved_bytes=12,
             succeeded=True,
         )
 
@@ -201,6 +203,7 @@ def test_server_warmup_normalizes_profile_stage_names_for_residency_timing():
     residency_manager.current_device_components.return_value = ("transformer_2",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
+    device_module.max_memory_reserved.return_value = 8
     req = SimpleNamespace(
         metrics=SimpleNamespace(
             total_duration_ms=12.0,
@@ -221,6 +224,7 @@ def test_server_warmup_normalizes_profile_stage_names_for_residency_timing():
             req=req,
             workload=(64, 64, 1, 1),
             baseline_allocated_bytes=3,
+            baseline_reserved_bytes=3,
             succeeded=True,
         )
 
