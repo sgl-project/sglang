@@ -47,15 +47,18 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
-    """trtllm-gen paged decode for the post-gather sparse attention.
+    """FlashInfer paged decode for the post-gather sparse attention.
 
     On Blackwell the FA4 cute varlen fallback runs a prefill-shaped kernel
-    at decode row counts; the trtllm-gen decode kernel over a page-aligned
-    scratch measures ~35% faster for the gather+attention pair.
+    at decode row counts. FlashInfer's paged decode API avoids that fallback
+    while keeping the gathered scratch page-aligned.
     """
-    from sglang.srt.utils import is_sm100_supported, is_sm121
+    from sglang.srt.utils import is_sm100_supported, is_sm120
 
-    if not (is_sm100_supported() or is_sm121()):
+    # This path is numerically validated on SM100 and SM120. Do not widen it
+    # to every SM12x device: it silently corrupts long-context decode on
+    # SM121/GB10.
+    if not (is_sm100_supported() or is_sm120()):
         return None
     try:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
@@ -1529,7 +1532,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         trtllm_decode,
     ) -> torch.Tensor:
         """Selected KV packs into page-aligned row strides so a static
-        arange block table can drive the trtllm-gen paged decode kernel;
+        arange block table can drive FlashInfer's paged decode API;
         per-row valid counts double as its seq_lens, so the varlen
         fallback's cu_seqlens prefix sum is not needed."""
         batch, topk = topk_indices.shape
