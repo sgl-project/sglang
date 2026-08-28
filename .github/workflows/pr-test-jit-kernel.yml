@@ -47,6 +47,10 @@ jobs:
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
     # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
     # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1]
     runs-on: 1-gpu-h100
     timeout-minutes: 240
     steps:
@@ -85,7 +89,10 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large
+          python3 run_suite.py --hw cuda \
+            --suite base-b-kernel-unit-test-1-gpu-large \
+            --auto-partition-id ${{ matrix.partition }} \
+            --auto-partition-size 2
 
   jit-kernel-multigpu-unit-test:
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the

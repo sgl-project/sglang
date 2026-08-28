@@ -3753,6 +3753,19 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+            "SGLANG_MORI_RECV_BOUND", "false"
+        ):
+            # Same bookkeeping, for the same reason. Bounding mori's receive
+            # buffer means baking a fan-in size into a captured graph, and the
+            # fan-in depends on what the *peers* send. Without a DP-synchronized
+            # bucket every rank buckets its own batch, so a rank on a narrow tier
+            # can be handed rows by a peer on a wider one; the only bound valid
+            # under that is the widest tier's, which is 4-16x looser than the
+            # batch actually being run and costs more in expert-GEMM tiles than
+            # the trim saves. With uniform buckets the per-tier fan-in is exact.
+            # Scoped to the opt-in gate so the default path is untouched.
+            return True
         else:
             return (
                 get_parallel().moe_dense_tp_size
