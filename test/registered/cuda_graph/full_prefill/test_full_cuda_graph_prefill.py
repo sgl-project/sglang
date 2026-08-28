@@ -18,6 +18,7 @@ import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.mock_model.utils import run_mock_model_bench_serving
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -27,8 +28,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# OSS FA4 coverage requires Blackwell. Each test still uses only one GPU.
-register_cuda_ci(est_time=170, stage="base-b", runner_config="4-gpu-b200")
+# OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
+# tests use one GPU.
+register_cuda_ci(est_time=240, stage="base-b", runner_config="4-gpu-b200")
 
 
 class TestFullCudaGraphPrefill(CustomTestCase):
@@ -66,6 +68,29 @@ class TestFullCudaGraphPrefill(CustomTestCase):
         print(f"mgsm_en accuracy with full prefill CUDA graph: {score:.3f}")
 
         self.assertGreaterEqual(score, 0.80)
+
+
+class TestFullCudaGraphPipelineParallel(CustomTestCase):
+    def test_pp_replays_full_prefill_cuda_graph(self) -> None:
+        result = run_mock_model_bench_serving(
+            extra_server_args=[
+                "--pp-size",
+                "2",
+                "--attention-backend",
+                "flashinfer",
+                "--cuda-graph-config",
+                '{"prefill":{"backend":"full","bs":[32,64],"max_bs":64,'
+                '"full_prefill_max_req":1}}',
+            ],
+            num_prompts=1,
+            random_input_len=47,
+            random_output_len=2,
+        )
+        self.assertRegex(
+            result.log_text,
+            r"Prefill batch.*cuda graph: True",
+            "The PP request did not replay a full prefill CUDA graph.",
+        )
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
