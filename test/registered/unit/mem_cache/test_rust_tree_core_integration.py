@@ -244,6 +244,29 @@ def test_lock_and_unlock_move_tokens_between_protected_and_evictable():
     assert core.evictable_size() == 5
 
 
+def test_try_lock_device_anchor_handles_live_evicted_and_stale_nodes():
+    core = _tree_core()
+    core.set_hicache_enabled()
+    _insert(core, [1, 2], [10, 11])
+    _insert(core, [1, 2, 3], [20, 21, 12])
+    parent = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).last_device_node
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3]))).last_device_node
+
+    lock = core.try_lock_device_anchor(parent)
+    assert lock is not None
+    assert core.protected_size() == 2
+    core.dec_lock_ref(parent, lock.to_dec_params())
+    assert core.protected_size() == 0
+
+    core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
+    _accumulate_step(core.demote(leaf), {}, {}, {})
+    assert core.try_lock_device_anchor(leaf) is None
+
+    _accumulate_step(core.drive_host_eviction(ComponentType.FULL, 1), {}, {}, {})
+    assert core.try_lock_device_anchor(leaf) is None
+    core.sanity_check([], [])
+
+
 def test_full_eviction_walk_drains_the_tree():
     core = _tree_core()
     _insert(core, [1, 2, 3], [10, 11, 12])
@@ -1053,31 +1076,6 @@ def _swa_cache(window: int = 8, page_size: int = 1):
             )
         )
     return cache, allocator
-
-
-def test_buffer_only_hicache_is_rejected_by_the_rust_cache():
-    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
-    cache, allocator = _swa_cache()
-    server_args = ServerArgs(
-        model_path="dummy",
-        page_size=1,
-        enable_hierarchical_cache=True,
-        hicache_host_memory_mode="buffer_only",
-        hicache_storage_backend="file",
-    )
-    set_global_server_args_for_scheduler(server_args)
-    params = CacheInitParams(
-        req_to_token_pool=cache.req_to_token_pool,
-        token_to_kv_pool_allocator=allocator,
-        page_size=1,
-        disable=False,
-        sliding_window_size=8,
-        tree_components=(ComponentType.FULL, ComponentType.SWA),
-    )
-
-    with pytest.raises(ValueError, match="buffer_only is not supported"):
-        cache.init_hicache(server_args, params)
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():

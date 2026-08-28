@@ -46,7 +46,6 @@ from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTr
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import RebuildFullToSWAMapping
 from sglang.srt.mem_cache.unified_cache.components import (
-    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
 )
@@ -693,18 +692,14 @@ class BufferModePipeline:
                 )
             return
         cache = self._cache
-        try:
-            node = cache.tree_core.node_by_id(anchor_node_id)
-        except KeyError:
-            return  # anchor deleted; fetch unlocked
-        if node.component_data[BASE_COMPONENT_TYPE].value is None:
+        lock_result = cache.tree_core.try_lock_device_anchor(anchor_node_id)
+        if lock_result is None:
             # Evicted since enqueue; fetch unlocked.
             logger.warning("HiCache anchor evicted before IO commit req=%s", req_id)
             return
-        lock_params = cache.inc_lock_ref(anchor_node_id).to_dec_params()
         self.anchor_locks[req_id] = _AnchorLock(
             node_id=anchor_node_id,
-            lock_params=lock_params,
+            lock_params=lock_result.to_dec_params(),
             tokens=matched_len,
         )
         self.anchor_locked_tokens_ += matched_len

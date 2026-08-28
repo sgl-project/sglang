@@ -10,7 +10,6 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -187,14 +186,6 @@ def validate_hicache_host_memory_mode(server_args: Any):
 
     if cfg.hicache_host_memory_mode == "cache":
         return
-
-    # TODO(Jialin): Support buffer_only with Rust after #34798 and #35769
-    # are ported.
-    if envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() == "rust":
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only is not supported with "
-            "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust"
-        )
 
     if cfg.hicache_storage_backend is None:
         raise ValueError(

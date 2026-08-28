@@ -370,14 +370,6 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            # TODO(Jialin): Support buffer_only with Rust after #34798 and
-            # #35769 are ported.
-            if self._tree_core_backend == "rust":
-                raise ValueError(
-                    "--hicache-host-memory-mode buffer_only is not supported "
-                    "by the Rust TreeCore"
-                )
-
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
             # follow-up to #34798 and #35769.
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on

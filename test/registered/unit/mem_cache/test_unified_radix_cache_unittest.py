@@ -3294,10 +3294,6 @@ class UnifiedRadixCacheSuite:
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
     ):
-        if _selected_tree_core_test_backend() == "rust":
-            # TODO(Jialin): Enable these tests after porting the buffer-only
-            # TreeCore integration from #34798 and #35769 to Rust.
-            self.skipTest("buffer_only is not yet supported by the Rust TreeCore")
         if self.cfg.has_mamba:
             self.skipTest(
                 "buffer_only is FULL/SWA-only (no Mamba state-handoff channel "

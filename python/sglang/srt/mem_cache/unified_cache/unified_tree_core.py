@@ -629,6 +629,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(node)
         return result
 
+    def try_lock_device_anchor(self, node_id: NodeId) -> Optional[IncLockRefResult]:
+        node = self._node_arena.get(node_id)
+        if node is None or node.component_data[BASE_COMPONENT_TYPE].value is None:
+            return None
+        return self.inc_lock_ref(node_id)
+
     def dec_lock_ref(
         self,
         node_id: NodeId,

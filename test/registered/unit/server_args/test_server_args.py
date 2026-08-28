@@ -1494,23 +1494,15 @@ class TestHiCacheArgs(unittest.TestCase):
                 expected_decode_backend,
             )
 
-    def test_buffer_only_rejects_rust_tree_core(self):
-        args = self._make_args(
-            enable_hierarchical_cache=True,
-            hicache_host_memory_mode="buffer_only",
-            hicache_storage_backend="file",
-        )
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "buffer_only is not supported"):
+    def test_buffer_only_accepts_both_tree_cores(self):
+        for backend in ("python", "rust"):
+            args = self._make_args(
+                enable_hierarchical_cache=True,
+                hicache_host_memory_mode="buffer_only",
+                hicache_storage_backend="file",
+            )
+            with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
                 handle_hicache(args)
-
-        args = self._make_args(
-            enable_hierarchical_cache=True,
-            hicache_host_memory_mode="buffer_only",
-            hicache_storage_backend="file",
-        )
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
-            handle_hicache(args)
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
