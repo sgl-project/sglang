@@ -197,6 +197,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.runtime_context import (
+    LoRABatchLayout,
     attention_backends,
     get_device,
     get_exec,
@@ -2547,6 +2548,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
+            lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
         ):
             with _mlp_ctx:
                 hidden_states = self.mlp(
@@ -3286,6 +3288,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
+        lora_batch_layout=LoRABatchLayout.TP_GLOBAL,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)
 

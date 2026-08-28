@@ -658,6 +658,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # point to their latest LoRARef objects, so that they can be
         # dynamically loaded if needed for inference
         self.lora_ref_cache: Dict[str, LoRARef] = {}
+        # Preserve the adapter ID across incomplete cleanup retries.
+        self.pending_lora_unloads: Dict[str, str] = {}
         if get_lora().lora_paths is not None:
             for lora_ref in get_lora().lora_paths:
                 self.lora_ref_cache[lora_ref.lora_name] = lora_ref

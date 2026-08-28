@@ -11,6 +11,7 @@ from sglang.srt.lora.utils import (
     get_batch_token_counts,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import LoRABatchLayout
 
 
 class BaseLoRABackend(LoRABackendLmHeadMixing):
@@ -26,6 +27,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
+    # Supporting backends must handle both eager execution and decode CUDA graphs.
+    supports_dp_attention: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -51,6 +54,19 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+
+    def get_batch_info(
+        self, layout: LoRABatchLayout | None = None
+    ) -> Optional[LoRABatchInfo]:
+        """Return routing metadata for the requested token layout.
+
+        Backends that support multiple layouts override this method.
+        """
+        return self.batch_info
+
+    def prepare_global_lora_batch(self, forward_batch: ForwardBatch) -> None:
+        """Prepare routing for TP-global sections of a DP-attention forward."""
+        pass
 
     def run_lora_a_embedding(
         self,
@@ -187,6 +203,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             num_tokens_per_req: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
+
+    def init_dp_attention_cuda_graph_batch_info(self, max_num_tokens: int) -> None:
+        """Allocate backend-specific TP-global metadata for decode graphs."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support DP attention "
+            "in the decode CUDA graph."
+        )
 
     def init_prefill_cuda_graph_batch_info(self, max_num_tokens: int):
         """Allocate static LoRA batch metadata for the prefill CUDA graph,

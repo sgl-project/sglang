@@ -1482,6 +1482,8 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+        if self.lora_manager is not None and self.lora_manager.enable_dp_attention:
+            self.lora_manager.prepare_lora_batch(forward_batch)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those

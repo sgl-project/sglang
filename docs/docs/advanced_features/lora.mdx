@@ -1,7 +1,7 @@
 ---
 title: "LoRA Serving"
 metatags:
-    description: "SGLang multi-LoRA serving: S-LoRA and Punica techniques, dynamic adapter loading, GPU pinning, overlap loading, Triton and CSGMV backends."
+    description: "SGLang multi-LoRA serving: S-LoRA and Punica techniques, DP attention, dynamic adapter loading, GPU pinning, overlap loading, Triton and CSGMV backends."
 ---
 SGLang enables the use of [LoRA adapters](https://arxiv.org/abs/2106.09685) with a base model. By incorporating techniques from [S-LoRA](https://arxiv.org/pdf/2311.03285) and [Punica](https://arxiv.org/pdf/2310.18547), SGLang can efficiently support multiple LoRA adapters for different sequences within a single batch of inputs.
 
@@ -411,6 +411,30 @@ server_process, port = launch_server_cmd(
 ```python Example
 terminate_process(server_process)
 ```
+
+## LoRA with DP attention
+
+SGLang supports LoRA serving with [data parallel attention (DPA)](/docs/advanced_features/dp_dpa_smg_guide). The model architecture must support DPA, and you must currently select the Triton LoRA backend. Other built-in LoRA backends reject this configuration at startup.
+
+The following NVIDIA CUDA example uses four attention-DP ranks:
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --tp 4 \
+    --dp-size 4 \
+    --enable-dp-attention \
+    --enable-lora \
+    --lora-backend triton \
+    --lora-paths ADAPTER_NAME=ADAPTER_PATH
+```
+
+Keep these constraints in mind:
+
+- Decode CUDA graphs are supported. LoRA prefill runs eagerly when DPA is enabled.
+- `--max-loras-per-batch` limits the union of adapters active across all DP ranks in a synchronized forward, not the adapters on one rank alone.
+- Dynamic load and unload requests are sent to every DP rank. An operation succeeds only if every rank reports success. After a partially successful load, retry unloading the same adapter name before loading it again.
+- The built-in LoRA memory pool does not support `--enable-lora-overlap-loading` with DPA. The server rejects that combination rather than allowing DP ranks to assign different GPU slots.
 
 ## LoRA Overlap Loading
 

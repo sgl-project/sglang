@@ -53,7 +53,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    LoRABatchLayout,
+    get_exec,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
@@ -672,7 +677,13 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        lora_batch_layout = (
+            LoRABatchLayout.TP_GLOBAL
+            if self.do_tensor_parallel_all_gather_dp_attn
+            else LoRABatchLayout.DP_LOCAL
+        )
+        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
+            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
