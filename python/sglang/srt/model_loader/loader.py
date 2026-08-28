@@ -45,6 +45,7 @@ from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    deregister_memory_region,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
@@ -307,6 +308,16 @@ def _post_load_weights(model: nn.Module) -> None:
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
         model.post_load_weights()
+
+
+def _process_weights_after_loading(
+    model: nn.Module, target_device: torch.device
+) -> None:
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
 
 
 class BaseModelLoader(ABC):
@@ -3254,6 +3265,21 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
+        # The seed's bytes land straight in these parameters, so the layout has
+        # to match its post-load one: mxfp4 rewrites bias bf16 -> fp32, scales
+        # uint8 -> float8_e4m3fn, and shuffles experts. The transforms are
+        # structural, so zeroed weights still yield the right layout.
+        if (
+            load_config.remote_instance_weight_loader_backend
+            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+        ):
+            post_tic = time.time()
+            _process_weights_after_loading(model, torch.device(device_config.device))
+            logger.info(
+                "Matched the seed's post-load weight layout in %.2fs.",
+                time.time() - post_tic,
+            )
+
         if (
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
@@ -3283,11 +3309,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 "TransferEngine registering memory regions (this may take a few seconds)..."
             )
             # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+            register_tic = time.time()
+            (
+                self.remote_instance_transfer_engine_weight_info,
+                registered_blocks,
+            ) = register_memory_region(
                 model, load_config.remote_instance_weight_loader_transfer_engine
             )
             logger.info(
-                "TransferEngine memory regions have been successfully registered."
+                "TransferEngine memory regions have been successfully registered "
+                "in %.2fs.",
+                time.time() - register_tic,
             )
 
             # transfer weights
@@ -3297,6 +3329,20 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
                 load_config.tp_rank,
             )
+            # The registration is dead weight once the reads are done, and it is
+            # charged against the KV pool, which sizes itself off the memory
+            # left after the weights.
+            if envs.SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE.get():
+                deregister_tic = time.time()
+                deregister_memory_region(
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    registered_blocks,
+                )
+                logger.info(
+                    "TransferEngine memory regions have been deregistered "
+                    "in %.2fs.",
+                    time.time() - deregister_tic,
+                )
             if not success:
                 raise RuntimeError(
                     "Failed to load weights from remote instance via transfer engine."
@@ -3415,6 +3461,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client_len_list.append(client_len)
 
         # load weights from source instance through TransferEngine
+        total_bytes = sum(client_len_list)
+        transfer_tic = time.time()
         ret = transfer_engine.batch_transfer_sync_read(
             seed_transfer_engine_session_id,
             client_ptr_list,
@@ -3424,6 +3472,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         if ret < 0:
             logger.error(f"batch transfer failed, error: {ret}")
             return False
+
+        transfer_elapsed = time.time() - transfer_tic
+        logger.info(
+            "RDMA transfer done: %.2f GiB in %.2fs (%.2f GiB/s) over %d tensors.",
+            total_bytes / (1 << 30),
+            transfer_elapsed,
+            total_bytes / (1 << 30) / max(transfer_elapsed, 1e-9),
+            len(client_len_list),
+        )
 
         _post_load_weights(model)
 

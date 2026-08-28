@@ -296,6 +296,16 @@ class Envs:
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
+    # Release the reader's RDMA registration once a remote-instance load is
+    # done: it is dead weight afterwards and charged against the KV pool, which
+    # sizes itself off the memory left after the weights. Unregistering scales
+    # with the NIC count the same way registering does (~0.7s over 4 NICs).
+    SGLANG_ENABLE_REMOTE_INSTANCE_MR_RELEASE = EnvBool(True)
+    # HCAs for remote-instance weight transfers, same formats MOONCAKE_DEVICE
+    # takes and falling back to it when unset. Separate because mooncake store
+    # has to match the HCA the rest of the cluster handshakes on, while this
+    # one wants a per-rank split to avoid contending on transfer.
+    SGLANG_REMOTE_INSTANCE_IB_DEVICE = EnvStr(None)
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
