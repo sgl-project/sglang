@@ -62,9 +62,6 @@ class TestQwen3Next(GSM8KAscendMixin, TestMMLU, CustomTestCase):
         # divide by dp size
         "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "3000",
         "DEEPEP_NORMAL_LONG_SEQ_ROUND": "10",
-        # In NPU scenarios, operators only support BF16 precision.
-        # This environment variable needs to be set for quantizing weights.
-        "SGLANG_DEEPEP_BF16_DISPATCH": "1",
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "STREAMS_PER_DEVICE": "32",
         "HCCL_OP_EXPANSION_MODE": "AIV",

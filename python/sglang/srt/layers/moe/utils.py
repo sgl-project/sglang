@@ -234,6 +234,7 @@ class DispatcherOutputDtype(Enum):
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
+    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     """
 
     BF16 = "bf16"
@@ -241,6 +242,7 @@ class DispatcherOutputDtype(Enum):
     INT8 = "int8"
     NVFP4 = "nvfp4"
     MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
 
 
 def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
@@ -271,6 +273,14 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
             "`--deepep-dispatcher-output-dtype bf16` argument instead."
         )
         return DispatcherOutputDtype.BF16
+
+    if envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.get():
+        logger.warning_once(
+            "Warning: The env variable DEEP_NORMAL_MODE_USE_INT8_QUANT deprecated "
+            "and will be removed in future releases. Please use "
+            "`--deepep-dispatcher-output-dtype int8` instead."
+        )
+        return DispatcherOutputDtype.INT8
 
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:

@@ -29,7 +29,6 @@ class TestAscendSpeculativeDraftAttentionAndMoeRunner(CustomTestCase):
     [Test Target] --speculative-draft-attention-backend; --speculative-moe-runner-backend
     """
 
-    os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
     os.environ["HCCL_BUFFSIZE"] = "2048"
     os.environ["SGLANG_ENABLE_OVERLAP_PLAN_SITEAM"] = "1"
     os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"

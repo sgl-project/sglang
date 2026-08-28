@@ -412,6 +412,20 @@ python3 -m sglang.launch_server \
 > - **Router gate**: msmodelslim may also quantize `mlp.gate` (`W8A8_MXFP8`). The gate is a `ReplicatedLinear`, so its quantization must be **description-driven**: for the offline `modelslim` path the gate is passed the quant config and dequantized correctly; the online path keeps it in BF16. Loading a quantized gate as BF16 without its block scale scrambles routing and produces garbage output.
 > - Where the activation quant happens depends on the dispatcher. On `ascend_tp` it is fused into routing as described above. DeepEP has no MXFP8 dispatch dtype, so it keeps dispatching BF16 and gmm1 quantizes the hidden states itself via `npu_dynamic_mx_quant` before the fused kernel — the two paths reach the same gmm1 input. Only the `ascend_tp` path has been validated end-to-end on Ascend A5.
 
+**DeepEP dispatcher output quantization:**
+
+DeepEP uses the same MXFP dispatcher names as the Ascend MoE path: `mxfp8` is FP8 E4M3 data with an E8M0 block scale, and `mxfp4` is packed FP4 E2M1 data with an E8M0 block scale. E5M2 is not part of the MXFP8 dispatcher API. Normal-mode MXFP dispatch requires the default (non-all-to-all) strategy. Low-latency MXFP4 requires `DEEP_USE_MODE=default`; the `ops` and `alltoall` strategies do not support its payload and scale contract.
+
+This naming aligns with the `mxfp8` value introduced by [PR #30768](https://github.com/sgl-project/sglang/pull/30768). When both changes are present, its DeepEP path can select `mxfp8` instead of the temporary BF16 fallback. The CLI value takes precedence over automatic selection:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path /path/to/mxfp-model \
+    --device npu --attention-backend ascend \
+    --moe-a2a-backend deepep --deepep-mode auto \
+    --deepep-dispatcher-output-dtype mxfp8
+```
+
 **MXFP4 W4A8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
 LLM dense W4A8 (MXFP4 4-bit weights + MXFP8 8-bit activations) Linear support was added in [PR #23650](https://github.com/sgl-project/sglang/pull/23650). Requires Ascend 950 Products or newer.
