@@ -1634,6 +1634,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
+            # Multimodal embedding preparation consumes ``mm_inputs`` and keeps
+            # the composed embeddings on the live ForwardBatch for later MTP
+            # draft-extend forwards.  Preserve that side channel when BCG/Full
+            # builds its replay view; otherwise a subsequent graph invocation
+            # sees neither the consumed inputs nor their embeddings.
+            mm_input_embeds=forward_batch.mm_input_embeds,
             temperature=forward_batch.temperature,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
