@@ -282,15 +282,19 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     global _STRATEGY
 
     if _STRATEGY is None:
+        # The reads are what raise, so they sit inside the guard.
         try:
-            parallel = get_parallel().config
-        except ValueError:
+            parallel = get_parallel()
+            enable_prefill_cp = parallel.enable_prefill_cp
+            cp_size = parallel.attn_cp_size
+            cp_strategy = parallel.cp_strategy
+        except (AssertionError, AttributeError, RuntimeError, ValueError):
             return None
-        if parallel.enable_prefill_cp:
+        if enable_prefill_cp:
             init_cp_strategy(
                 enable_prefill_cp=True,
-                cp_size=parallel.attn_cp_size,
-                cp_strategy=parallel.cp_strategy,
+                cp_size=cp_size,
+                cp_strategy=cp_strategy,
             )
     return _STRATEGY
 
