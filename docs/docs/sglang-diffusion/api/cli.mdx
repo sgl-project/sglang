@@ -131,7 +131,7 @@ pipeline's registered module name:
 | --- | --- | --- | --- |
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
-| Set load and compute precision | `--component-precisions.<component> {fp32|fp16|bf16}` | None | Override the family precision for one exact component key |
+| Set load and compute precision | `--component-precisions.<component> fp32\|fp16\|bf16` | None | Override the family precision for one exact component key |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
 
