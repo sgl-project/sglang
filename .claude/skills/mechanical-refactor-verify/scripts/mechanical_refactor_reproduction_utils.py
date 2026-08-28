@@ -150,9 +150,10 @@ def _find_def(tree: ast.AST, name: str) -> ast.AST | None:
 def _find_unique_def(
     tree: ast.AST, name: str, *, from_class: str | None = None, where: str
 ) -> ast.AST:
-    """Resolve ``def name`` and refuse ambiguity: with same-named defs in scope the
-    first-match lookup could silently cut the wrong body, so the caller must scope the
-    search with ``from_class``."""
+    """Resolve ``def name`` (or ``class name``) and refuse ambiguity: with same-named defs in
+    scope the first-match lookup could silently cut the wrong body, so the caller must scope
+    the search with ``from_class``."""
+    definition = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     root: ast.AST = tree
     if from_class is not None:
         cls = _find_class(tree, from_class)
@@ -162,16 +163,14 @@ def _find_unique_def(
         top_level = [
             node
             for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == name
+            if isinstance(node, definition) and node.name == name
         ]
         if len(top_level) == 1:
             return top_level[0]
     matches = [
         node
         for node in ast.walk(root)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == name
+        if isinstance(node, definition) and node.name == name
     ]
     assert matches, f"{name} not found in {where}"
     assert (
@@ -207,6 +206,19 @@ def _def_span(node: ast.AST) -> tuple[int, int]:
     """(first, last) 1-based line numbers of a def, including its decorators."""
     start = min([node.lineno] + [d.lineno for d in node.decorator_list])
     return start, node.end_lineno
+
+
+def _symbol_named(node: ast.AST, name: str) -> bool:
+    """Whether a top-level statement defines the symbol ``name`` -- a def/class by its name,
+    or a module-level assignment by one of its target names (so ``_is_hip = is_hip()`` is
+    found by ``_is_hip``)."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name == name
+    if isinstance(node, ast.AnnAssign):
+        return isinstance(node.target, ast.Name) and node.target.id == name
+    if isinstance(node, ast.Assign):
+        return any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+    return False
 
 
 def _byte_slice(line: str, start: int | None, end: int | None) -> str:
@@ -340,13 +352,20 @@ def _multiline_string_interior_lines(top_level_text: str) -> set[int]:
 
 
 def _audit_extract_header(
-    header: str, removed_assigns: dict[str, str | None], where: str
+    header: str,
+    removed_assigns: dict[str, str | None],
+    where: str,
+    rederivable: dict[str, str | None] | None = None,
 ) -> None:
     """Refuse header content the extraction cannot vouch for. The header of a scattered
     extraction is authored text reproduced from the target commit, so anything beyond
-    imports, a TYPE_CHECKING import block, a logger, or a byte-equivalent copy of an
-    assignment deleted from the source would let arbitrary new code ride into the new
+    imports, a TYPE_CHECKING import block, a logger, a byte-equivalent copy of an
+    assignment deleted from the source (``removed_assigns``), or a byte-equivalent copy of
+    a module constant that *survives* in the source (``rederivable`` -- re-derived
+    boilerplate such as ``_is_hip = is_hip()``, provably not fiction because the same
+    statement still exists in the source) would let arbitrary new code ride into the new
     module under a PASS verdict."""
+    rederivable = rederivable or {}
     header_assigned: set[str] = set()
     for stmt in ast.parse(header).body:
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
@@ -373,6 +392,10 @@ def _audit_extract_header(
                 n in removed_assigns and removed_assigns[n] == value_src for n in names
             ):
                 header_assigned.update(names)
+                continue
+            if names and all(
+                n in rederivable and rederivable[n] == value_src for n in names
+            ):
                 continue
         raise AssertionError(
             f"unverifiable header statement in {where}: {ast.unparse(stmt)!r} is "
@@ -446,6 +469,44 @@ class Repro:
                     call_src = _node_slice(text, node)
                     func_src = _node_slice(text, node.func)
                     return name + call_src[len(func_src) :]
+
+                _write_source(
+                    path,
+                    _rewrite_matching_calls(_read_source(path), predicate, rewrite),
+                )
+
+        self.ops.append(op)
+        return self
+
+    def route_call_sites_through_field(
+        self, name: str, *, field: str, paths: list[str], owner: str | None = None
+    ) -> "Repro":
+        """Rewrite ``<recv>.name(args)`` to ``<recv>.field.name(args)`` -- the method moved
+        onto a collaborator reached through ``self.field``, so its callers route through that
+        field. With ``owner`` given, only calls whose receiver text equals ``owner`` are
+        rewritten. A call already routed through ``field`` is skipped, so the pass converges.
+        """
+
+        def op(root: Path) -> None:
+            for rel in paths:
+                path = root / rel
+
+                def predicate(node: ast.Call) -> bool:
+                    return (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == name
+                        and not (
+                            isinstance(node.func.value, ast.Attribute)
+                            and node.func.value.attr == field
+                        )
+                        and (owner is None or ast.unparse(node.func.value) == owner)
+                    )
+
+                def rewrite(text: str, node: ast.Call) -> str:
+                    call_src = _node_slice(text, node)
+                    func_src = _node_slice(text, node.func)
+                    receiver_src = _node_slice(text, node.func.value)
+                    return receiver_src + f".{field}.{name}" + call_src[len(func_src) :]
 
                 _write_source(
                     path,
@@ -546,7 +607,13 @@ class Repro:
         return self
 
     def remove_imported_name(
-        self, rel: str, *, module: str | None, name: str, asname: str | None = None
+        self,
+        rel: str,
+        *,
+        module: str | None,
+        name: str,
+        asname: str | None = None,
+        keep_exploded: bool = False,
     ) -> "Repro":
         """Drop a single imported ``name`` from a module-level import: from a ``from module
         import a, b`` keep the rest and drop only ``name``; when it was the sole name -- or for
@@ -554,6 +621,12 @@ class Repro:
         home changed, so an importer that no longer references it loses exactly that name; the
         import sorter rewrites the surviving line. An import diff is always whitelisted, so this
         realises a lost name directly instead of relying on the formatter to prune it.
+
+        Removing down to a single surviving name collapses the import to one line by default
+        (the common case). Pass ``keep_exploded`` when the target kept the sole survivor
+        exploded (its magic trailing comma preserved): the alias line is then merely deleted
+        so the surviving name keeps its comma and the formatter leaves the import multi-line.
+        The choice is the commit author's and cannot be inferred from the source.
         """
 
         def alias_text(alias: ast.alias) -> str:
@@ -584,16 +657,26 @@ class Repro:
                     edits.append((node.lineno, node.end_lineno, None))
                     continue
                 stmt_lines = lines[node.lineno - 1 : node.end_lineno]
-                if any("#" in ln for ln in stmt_lines):
-                    own = dropped_alias.lineno
-                    own_line = lines[own - 1]
-                    assert own_line.strip().rstrip(",").strip() == alias_text(
-                        dropped_alias
-                    ), (
+                own = dropped_alias.lineno
+                own_line = lines[own - 1]
+                on_own_line = own_line.strip().rstrip(",").strip() == alias_text(
+                    dropped_alias
+                )
+                has_comments = any("#" in ln for ln in stmt_lines)
+                # Preserve the exploded form -- delete just this alias's line -- when the
+                # import stays multi-line: 2+ surviving names keep the magic trailing comma
+                # exploded, and an import carrying comments must not be rebuilt (a rebuild
+                # would drop them). Both match how the target was edited (a flat rebuild
+                # would drop the magic comma and collapse an import the target left
+                # multi-line). A lone surviving name collapses to one line by default, unless
+                # keep_exploded says the target preserved the magic comma for it too.
+                if on_own_line and (len(kept) >= 2 or has_comments or keep_exploded):
+                    edits.append((own, own, None))
+                elif has_comments and not on_own_line:
+                    raise AssertionError(
                         f"cannot drop {name!r}: it shares a line with other text and "
                         f"the import holds comments that a rebuild would delete"
                     )
-                    edits.append((own, own, None))
                 else:
                     keyword = "import " if module is None else f"from {module} import "
                     rebuilt = keyword + ", ".join(alias_text(a) for a in kept) + nl
@@ -609,15 +692,81 @@ class Repro:
         self.ops.append(op)
         return self
 
-    def add_import(self, rel: str, import_stmt: str) -> "Repro":
+    def add_imported_name(
+        self, rel: str, *, module: str, name: str, asname: str | None = None
+    ) -> "Repro":
+        """Add a single ``name`` to an existing module-level ``from module import a, b`` --
+        the dual of ``remove_imported_name``. A relocated symbol gains a new importer that
+        already imports other names from the same module, so the target extends that line
+        rather than adding a fresh statement (which the sorter would not merge across an
+        intervening non-import statement). The import sorter rewrites the surviving line; an
+        import carrying comments is refused, since a rebuild would drop them."""
+
+        def alias_text(target_name: str, target_asname: str | None) -> str:
+            return target_name + (f" as {target_asname}" if target_asname else "")
+
+        def op(root: Path) -> None:
+            path = root / rel
+            lines = _split_keepends(_read_source(path))
+            nl = _newline_style("".join(lines))
+            for node in ast.parse("".join(lines)).body:
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                if "." * node.level + (node.module or "") != module:
+                    continue
+                stmt_lines = lines[node.lineno - 1 : node.end_lineno]
+                if any("#" in ln for ln in stmt_lines):
+                    raise AssertionError(
+                        f"cannot add {name!r} to the import from {module!r} in {rel}: "
+                        f"it holds comments that a rebuild would delete"
+                    )
+                existing = [alias_text(a.name, a.asname) for a in node.names]
+                added = alias_text(name, asname)
+                assert (
+                    added not in existing
+                ), f"{name!r} already imported from {module!r} in {rel}"
+                rebuilt = f"from {module} import " + ", ".join(existing + [added]) + nl
+                lines[node.lineno - 1 : node.end_lineno] = [rebuilt]
+                _write_source(path, "".join(lines))
+                return
+            raise AssertionError(f"no `from {module} import` statement in {rel}")
+
+        self.ops.append(op)
+        return self
+
+    def add_import(
+        self, rel: str, import_stmt: str, *, after: str | None = None
+    ) -> "Repro":
         """Append an import after the last top-level import; the formatter's import sorter
-        places it (so the exact insertion point does not matter)."""
+        places it (so the exact insertion point does not matter). When ``after`` is given,
+        insert immediately after the top-level import statement whose source text contains
+        that substring instead -- needed for a file whose imports are split into separate
+        isort sections by an intervening statement (e.g. ``_is_hip = is_hip()``), where the
+        sorter will not carry the new import across the boundary into the intended block.
+        """
 
         def op(root: Path) -> None:
             path = root / rel
             lines = _split_keepends(_read_source(path))
             nl = _newline_style("".join(lines))
             body = ast.parse("".join(lines)).body
+            if after is not None:
+                anchor = None
+                for node in body:
+                    if isinstance(
+                        node, (ast.Import, ast.ImportFrom)
+                    ) and after in "".join(lines[node.lineno - 1 : node.end_lineno]):
+                        anchor = node
+                        break
+                if anchor is None:
+                    raise AssertionError(
+                        f"no top-level import containing {after!r} in {rel}"
+                    )
+                at = anchor.end_lineno
+                _write_source(
+                    path, "".join(lines[:at] + [import_stmt + nl] + lines[at:])
+                )
+                return
             last = 0
             if (
                 body
@@ -639,24 +788,53 @@ class Repro:
     def add_typechecking_import(self, rel: str, import_stmt: str) -> "Repro":
         """Append ``import_stmt`` inside the file's ``if TYPE_CHECKING:`` block -- a moved
         definition whose annotations reference a type needs that type imported there. The
-        import sorter orders the block, so the exact insertion point does not matter."""
+        import sorter orders the block, so the exact insertion point does not matter. A lone
+        ``pass`` placeholder (the block's only statement) is dropped: populating an empty
+        ``TYPE_CHECKING`` block makes its placeholder redundant, so the target removes it.
+        With no existing block, one is created after the trailing module import -- the
+        destination gains the guard together with its first import.
+        """
 
         def op(root: Path) -> None:
             path = root / rel
             lines = _split_keepends(_read_source(path))
+            nl = _newline_style("".join(lines))
             for node in ast.parse("".join(lines)).body:
                 if isinstance(node, ast.If) and ast.unparse(node.test) in (
                     "TYPE_CHECKING",
                     "typing.TYPE_CHECKING",
                 ):
                     indent = " " * node.body[0].col_offset
-                    at = node.body[-1].end_lineno
-                    lines.insert(
-                        at, indent + import_stmt + _newline_style("".join(lines))
+                    lone_pass = len(node.body) == 1 and isinstance(
+                        node.body[0], ast.Pass
                     )
+                    if lone_pass:
+                        placeholder = node.body[0]
+                        lines[placeholder.lineno - 1 : placeholder.end_lineno] = [
+                            indent + import_stmt + nl
+                        ]
+                    else:
+                        lines.insert(
+                            node.body[-1].end_lineno, indent + import_stmt + nl
+                        )
                     _write_source(path, "".join(lines))
                     return
-            raise AssertionError(f"no `if TYPE_CHECKING:` block in {rel}")
+            tree = ast.parse("".join(lines))
+            imports = [
+                node
+                for node in tree.body
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+            ]
+            assert (
+                imports
+            ), f"no imports to anchor a new `if TYPE_CHECKING:` block in {rel}"
+            insert_at = imports[-1].end_lineno
+            lines[insert_at:insert_at] = [
+                nl,
+                "if TYPE_CHECKING:" + nl,
+                "    " + import_stmt + nl,
+            ]
+            _write_source(path, "".join(lines))
 
         self.ops.append(op)
         return self
@@ -697,6 +875,80 @@ class Repro:
         self.ops.append(op)
         return self
 
+    def move_assign(
+        self,
+        name: str,
+        *,
+        src: str,
+        dst: str,
+        before: str | None = None,
+    ) -> "Repro":
+        """Cut the module-level assignment binding ``name`` from ``src`` and paste it verbatim
+        into ``dst`` at module level -- a module constant relocated together with the code
+        that reads it. Pasted immediately above the top-level statement named ``before``
+        when given, else after the last top-level import."""
+
+        def op(root: Path) -> None:
+            src_path = root / src
+            dst_path = root / dst
+            src_lines = _split_keepends(_read_source(src_path))
+            node = None
+            for cand in ast.parse("".join(src_lines)).body:
+                if (
+                    isinstance(cand, ast.Assign)
+                    and len(cand.targets) == 1
+                    and isinstance(cand.targets[0], ast.Name)
+                    and cand.targets[0].id == name
+                ) or (
+                    isinstance(cand, ast.AnnAssign)
+                    and isinstance(cand.target, ast.Name)
+                    and cand.target.id == name
+                ):
+                    node = cand
+            assert node is not None, f"module assignment {name} not found in {src}"
+            block = "".join(src_lines[node.lineno - 1 : node.end_lineno])
+            _write_source(
+                src_path,
+                "".join(src_lines[: node.lineno - 1] + src_lines[node.end_lineno :]),
+            )
+
+            dst_lines = _split_keepends(_read_source(dst_path))
+            dst_nl = _newline_style("".join(dst_lines))
+            dst_tree = ast.parse("".join(dst_lines))
+            at = None
+            if before is not None:
+                for cand in dst_tree.body:
+                    cand_name = getattr(cand, "name", None) or (
+                        cand.targets[0].id
+                        if isinstance(cand, ast.Assign)
+                        and len(cand.targets) == 1
+                        and isinstance(cand.targets[0], ast.Name)
+                        else None
+                    )
+                    if cand_name == before:
+                        at = (
+                            min(
+                                [d.lineno for d in getattr(cand, "decorator_list", [])],
+                                default=cand.lineno,
+                            )
+                            - 1
+                        )
+                        break
+                assert at is not None, f"before={before!r} not found in {dst}"
+                dst_lines[at:at] = [block, dst_nl]
+            else:
+                imports = [
+                    n
+                    for n in dst_tree.body
+                    if isinstance(n, (ast.Import, ast.ImportFrom))
+                ]
+                at = imports[-1].end_lineno if imports else 0
+                dst_lines[at:at] = [dst_nl, block]
+            _write_source(dst_path, "".join(dst_lines))
+
+        self.ops.append(op)
+        return self
+
     def move_symbol(
         self,
         name: str,
@@ -708,16 +960,23 @@ class Repro:
         dedent: int = 0,
         drop_self_annotation: bool = False,
         before: str | None = None,
+        after: str | None = None,
         leave_delegate: str | None = None,
         delegate_name: str | None = None,
     ) -> "Repro":
         """Cut ``def name`` (with decorators) from ``src`` and paste it into ``dst`` --
         immediately above the sibling def ``before`` when given (so the relocated def lands in
-        the chain's order), else at the end of ``into_class`` (or module level when None) --
-        dropping a move decorator and dedenting by ``dedent``. When ``drop_self_annotation``,
-        the moved method's ``self: Target`` annotation is dropped (redundant inside the class).
-        The body is moved verbatim; the formatter normalises the surrounding blank lines.
+        the chain's order), immediately below the top-level symbol ``after`` when given (a
+        sibling def/class or a module-level assignment target -- used to land the def just
+        before a following ``if TYPE_CHECKING:`` guard, which is not a nameable anchor), else
+        at the end of ``into_class`` (or module level when None) -- dropping a move decorator
+        and dedenting by ``dedent``. When ``drop_self_annotation``, the moved method's
+        ``self: Target`` annotation is dropped (redundant inside the class). The body is moved
+        verbatim; the formatter normalises the surrounding blank lines.
         """
+        assert (
+            before is None or after is None
+        ), "move_symbol: before and after are mutually exclusive"
 
         def op(root: Path) -> None:
             src_path = root / src
@@ -731,10 +990,20 @@ class Repro:
             block = src_lines[start - 1 : end]
             decorator_lines = node.lineno - start
             if leave_delegate is not None:
-                assert not any(
-                    ln.strip() in _MOVE_DECORATORS for ln in block[:decorator_lines]
-                ), f"leave_delegate on a {_MOVE_DECORATORS} method has no self to forward"
                 args = node.args
+                has_move_decorator = any(
+                    ln.strip() in _MOVE_DECORATORS for ln in block[:decorator_lines]
+                )
+                arg_list = args.posonlyargs + args.args
+                self_annotated = (
+                    bool(arg_list)
+                    and arg_list[0].arg == "self"
+                    and arg_list[0].annotation is not None
+                )
+                assert not has_move_decorator or self_annotated, (
+                    f"leave_delegate on a {_MOVE_DECORATORS} method has no self to "
+                    "forward (a de-self'd staticmethod must annotate its self param)"
+                )
                 parts = [p.arg for p in args.posonlyargs + args.args if p.arg != "self"]
                 if args.vararg is not None:
                     parts.append(f"*{args.vararg.arg}")
@@ -750,7 +1019,27 @@ class Repro:
                     - 1
                     + _def_header_end("".join(src_lines[node.lineno - 1 : end]))
                 )
-                signature = src_lines[start - 1 : header_end]
+                sig_start = node.lineno - 1 if has_move_decorator else start - 1
+                signature_text = "".join(src_lines[sig_start:header_end])
+                # The stub drops the self annotation only when it names the class the
+                # def moved into (now redundant); an unrelated annotation (a mixin's
+                # `self: ModelRunner`) is part of the surviving header and stays.
+                ann = arg_list[0].annotation if self_annotated else None
+                ann_name = None
+                if isinstance(ann, ast.Name):
+                    ann_name = ann.id
+                elif isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+                    ann_name = ann.value.split(".")[-1]
+                elif isinstance(ann, ast.Attribute):
+                    ann_name = ann.attr
+                if self_annotated and ann_name == into_class:
+                    sig_indent = len(signature_text) - len(signature_text.lstrip(" "))
+                    parsable = signature_text + " " * sig_indent + "    pass" + src_nl
+                    stripped = _drop_self_annotation(parsable, name)
+                    assert stripped.endswith(" " * sig_indent + "    pass" + src_nl)
+                    signature_text = stripped[
+                        : -len(" " * sig_indent + "    pass" + src_nl)
+                    ]
                 body_indent = " " * node.body[0].col_offset
                 returning = (
                     "return await"
@@ -761,7 +1050,7 @@ class Repro:
                     f"{body_indent}{returning} self.{leave_delegate}."
                     f"{delegate_name or name}({', '.join(parts)})" + src_nl
                 )
-                delegate = "".join(signature) + forward
+                delegate = signature_text + forward
                 _write_source(
                     src_path,
                     "".join(src_lines[: start - 1] + [delegate] + src_lines[end:]),
@@ -810,7 +1099,18 @@ class Repro:
                     None,
                 )
                 assert target is not None, f"before={before!r} not found in {dst}"
-            if target is not None:
+            if after is not None:
+                anchor = next(
+                    (n for n in container if _symbol_named(n, after)),
+                    None,
+                )
+                assert anchor is not None, f"after={after!r} not found in {dst}"
+                at = anchor.end_lineno
+                _write_source(
+                    dst_path,
+                    "".join(dst_lines[:at] + [dst_nl, method_text] + dst_lines[at:]),
+                )
+            elif target is not None:
                 at = _def_span(target)[0] - 1
                 _write_source(
                     dst_path,
@@ -992,8 +1292,23 @@ class Repro:
             assert (
                 found_assigns == dropped
             ), f"{dropped - found_assigns} not assigned in {src}"
+            rederivable: dict[str, str | None] = {}
+            for node in tree.body:
+                targets = (
+                    node.targets
+                    if isinstance(node, ast.Assign)
+                    else [node.target] if isinstance(node, ast.AnnAssign) else []
+                )
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                if not names or set(names) & dropped:
+                    continue
+                value_src = ast.unparse(node.value) if node.value is not None else None
+                for kept_name in names:
+                    rederivable[kept_name] = value_src
             if header.strip() or removed_assigns:
-                _audit_extract_header(header, removed_assigns, where=dst)
+                _audit_extract_header(
+                    header, removed_assigns, where=dst, rederivable=rederivable
+                )
             cuts = [(start, end, None) for start, end in spans.values()]
             cuts += [(start, end, None) for start, end in assign_spans]
             cuts += assign_rewrites
@@ -1130,8 +1445,15 @@ class Repro:
     def delete_file(self, path: str) -> "Repro":
         """Delete a source module that its symbols' relocation left empty (the chain deletes
         the leftover scaffolding-only file). Run after the moves that empty it. Refuses a
-        file that still holds anything beyond a docstring, imports, or a TYPE_CHECKING
-        block -- deleting live code is not a relocation."""
+        file that still holds anything beyond a docstring, imports, a TYPE_CHECKING block, or
+        a bare module ``logger`` -- deleting live code is not a relocation."""
+
+        def is_module_logger(stmt: ast.stmt) -> bool:
+            return (
+                isinstance(stmt, ast.Assign)
+                and stmt.value is not None
+                and ast.unparse(stmt.value) == "logging.getLogger(__name__)"
+            )
 
         def op(root: Path) -> None:
             target = root / path
@@ -1152,6 +1474,7 @@ class Repro:
                         and ast.unparse(stmt.test)
                         in ("TYPE_CHECKING", "typing.TYPE_CHECKING")
                     )
+                    or is_module_logger(stmt)
                 )
             ]
             assert not leftover, (

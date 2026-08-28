@@ -1,15 +1,25 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.network import NetworkAddress, get_free_port
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+)
+from sglang.srt.utils.network import NetworkAddress, get_free_port, get_local_ip_auto
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
-_mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
+_mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
 
 
 def parse_ib_device_config(
@@ -295,3 +305,57 @@ def init_mooncake_transfer_engine(
 def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
     """Return the shared MooncakeTransferEngine if initialized, else None."""
     return _mooncake_transfer_engine
+
+
+def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
+    """
+    Need MooncakeTransferEngine when:
+    1) PD disaggregation uses mooncake for KV transfer (prefill/decode)
+    2) HiCache uses mooncake storage backend
+    3) Encoder disaggregation uses mooncake
+    """
+    use_mooncake_te = (
+        (
+            get_disagg().disaggregation_mode != "null"
+            and get_disagg().disaggregation_transfer_backend == "mooncake"
+        )
+        or (
+            get_memory().enable_hierarchical_cache
+            and get_memory().hicache_storage_backend == "mooncake"
+            and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+        )
+        or (
+            get_disagg().encoder_only
+            and get_disagg().encoder_transfer_backend == "mooncake"
+        )
+        or (
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "mooncake"
+        )
+        or (
+            get_exec().moe.enable_elastic_expert_backup
+            and get_exec().moe.elastic_ep_backend is not None
+        )
+        or get_exec().moe.elastic_ep_backend == "mooncake"
+    )
+
+    if use_mooncake_te:
+        init_mooncake_transfer_engine(
+            hostname=get_local_ip_auto(),
+            gpu_id=gpu_id,
+            ib_device=(
+                get_disagg().disaggregation_ib_device
+                or get_exec().moe.mooncake_ib_device
+            ),
+        )
+
+        if get_exec().moe.elastic_ep_backend == "mooncake":
+            try:
+                from mooncake.pg import set_transfer_engine
+            except ImportError as e:
+                raise ImportError(
+                    "Failed to import 'set_transfer_engine' from 'mooncake.pg'. "
+                    "Please upgrade your 'mooncake-transfer-engine' "
+                    "installation to 0.3.11 or above."
+                ) from e
+            set_transfer_engine(_mooncake_transfer_engine.engine)

@@ -114,7 +114,6 @@ print(f"{tok-tik:.6f} s")
 operations = [
     PrefetchOperation(
         f"{i}",
-        torch.tensor(list(range(i, i + op_size))),
         list(range(i, i + op_size)),
         f"{i}",
     )
@@ -122,6 +121,7 @@ operations = [
 ]
 
 for operation in operations:
+    operation.host_indices = torch.tensor(operation.token_ids)
     operation.hash_value = [
         f"{j}"
         for j in range(

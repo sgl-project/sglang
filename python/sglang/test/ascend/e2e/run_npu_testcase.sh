@@ -34,7 +34,7 @@ if [ -n "${TRANSFORMERS_VERSION_FOR_SGLANG}" ];then
     echo "Install transformers ${TRANSFORMERS_VERSION_FOR_SGLANG} locally."
     TRANSFORMERS_PKG_PATH_TARGET=/tmp/transformers/${TRANSFORMERS_VERSION_FOR_SGLANG}
     mkdir -p "${TRANSFORMERS_PKG_PATH_TARGET}"
-    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/*" "${TRANSFORMERS_PKG_PATH_TARGET}/"
+    cp "${TRANSFORMERS_PKG_PATH_SOURCE}/"* "${TRANSFORMERS_PKG_PATH_TARGET}/"
     pip install --no-index --find-links="${TRANSFORMERS_PKG_PATH_TARGET}" transformers=="${TRANSFORMERS_VERSION_FOR_SGLANG}"
   fi
   echo "===== Install transformers for sglang in virtual env - End ====="
@@ -114,10 +114,11 @@ fi
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
 tc_name=${tc_name%.*}
-current_date=$(date +%Y%m%d)
-log_path="/root/sglang/debug/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+run_label="${RUN_LABEL:-unknown}"
+log_path="/root/sglang/debug/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
 if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-    log_path="/root/.cache/tests/logs/log/${current_date}/${tc_name}/${HOSTNAME}"
+    # In CI, persist logs under /root/.cache/tests/logs so they can be collected
+    log_path="/root/.cache/tests/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
 fi
 rm -rf "${log_path}"
 mkdir -p "${log_path}"
@@ -134,6 +135,7 @@ echo "Finished test case ${test_case}"
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
+    # Archive the test log into the output directory for result collection
     cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
     echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
 fi

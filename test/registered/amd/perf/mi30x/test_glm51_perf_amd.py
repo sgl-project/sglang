@@ -47,7 +47,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 GLM51_MODEL_PATH = os.environ.get("GLM51_MODEL_PATH", "zai-org/GLM-5.1-FP8")
-PROFILE_DIR = "performance_profiles_glm51"
+RESULT_DIR = "performance_results_glm51"
 
 
 class TestNightlyGLM51Performance(unittest.TestCase):
@@ -94,8 +94,8 @@ class TestNightlyGLM51Performance(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_glm51(self):
@@ -113,7 +113,6 @@ class TestNightlyGLM51Performance(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

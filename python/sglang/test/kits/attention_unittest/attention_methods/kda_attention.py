@@ -10,12 +10,13 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-from sglang.srt.layers.attention.linear.utils import initialize_linear_attn_config
+from sglang.srt.layers.attention.linear.utils import resolve_linear_attn_backends
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -188,11 +189,17 @@ class TinyKDAModelConfig:
         self.attention_chunk_size = None
         self.sliding_window_size = None
         self.hf_config = SimpleNamespace(architectures=["TinyKDAForCausalLM"])
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
-        assert self.num_key_value_heads % tp_size == 0
-        return self.num_key_value_heads // tp_size
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
+        kv_tp_size = tp_size // dcp_size
+        assert self.num_key_value_heads % kv_tp_size == 0
+        return self.num_key_value_heads // kv_tp_size
 
 
 class MockKDAModelRunner(ModelRunner):
@@ -215,7 +222,14 @@ class MockKDAModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         self.kv_cache_dtype = dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
+        self.ps = ParallelState.trivial()
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
@@ -595,7 +609,9 @@ def build_kda_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    initialize_linear_attn_config(runner.server_args)
+    # Standing in for `attn_backend_wrapper`, which is what stamps this on a
+    # runner before building the backend that reads it.
+    runner.linear_attn_backends = resolve_linear_attn_backends()
     linear_backend = KDAAttnBackend(runner)
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
     actual_module = ProjectedKDAAttention(

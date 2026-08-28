@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
@@ -25,7 +25,7 @@ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
 if is_flashinfer_available():
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
+    from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
@@ -46,21 +46,19 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
+    fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
         self.flashinfer_mxfp4_moe_precision = (
-            get_server_args().flashinfer_mxfp4_moe_precision
+            get_exec().moe.flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        assert (
-            swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -303,7 +301,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     value=0.0,
                 )
         elif precision == "default":
-            x_quant, x_scale = mxfp8_quantize(
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
+
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
                 hidden_states,
                 False,
                 alignment=hidden_size,
@@ -314,6 +316,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             )
         else:
             raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            trtllm_moe_enable_pdl,
+        )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -357,6 +363,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
             output=symm_output,
+            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )[0]
 
         return StandardCombineInput(hidden_states=output)
@@ -373,6 +380,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
         Mxfp4FlashinferCutlassMoEMethod,
     )
@@ -386,11 +394,16 @@ def maybe_fuse_routed_scale_and_shared_add(
             Mxfp4FlashinferTrtllmMoEMethod,
             Mxfp4FlashinferCutlassMoEMethod,
             Mxfp4MarlinMoEMethod,
+            ExpertPackMoEMethod,
         ),
     )
     if fused:
+        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
         if shared is not None:
-            return shared.add_(routed, alpha=routed_scaling_factor)
+            alpha = 1.0 if already_scaled else routed_scaling_factor
+            return shared.add_(routed, alpha=alpha)
+        if already_scaled:
+            return routed
         return routed.mul_(routed_scaling_factor)
     if shared is not None:
         routed += shared

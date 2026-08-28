@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
+from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -133,6 +134,14 @@ class SpeculativeAlgorithm(Enum):
         graphs in the decode cuda graph runner."""
         return self.is_dspark()
 
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
+        # from a host corpus lookup, so it stays synchronous by design.
+        # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
+        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no
@@ -164,7 +173,6 @@ class SpeculativeAlgorithm(Enum):
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
@@ -173,8 +181,14 @@ class SpeculativeAlgorithm(Enum):
                 build_eagle_disagg_draft_input,
             )
 
-            return build_eagle_disagg_draft_input(
-                batch, server_args, last_tokens_tensor, future_map
+            return build_eagle_disagg_draft_input(batch, last_tokens_tensor, future_map)
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_disaggregation import (
+                build_dspark_disagg_draft_input,
+            )
+
+            return build_dspark_disagg_draft_input(
+                batch, last_tokens_tensor, future_map
             )
         return None
 
@@ -240,6 +254,9 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        cfg = resolving_view(server_args)
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -269,7 +286,7 @@ class SpeculativeAlgorithm(Enum):
 
         # EAGLE / EAGLE3 / STANDALONE / MULTI_LAYER always use the V2 worker,
         # even with overlap disabled (scheduler drives it synchronously).
-        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+        if self.is_eagle() and cfg.enable_multi_layer_eagle:
             from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
                 MultiLayerEagleWorkerV2,
             )
@@ -281,9 +298,7 @@ class SpeculativeAlgorithm(Enum):
 
             return EAGLEWorkerV2
         elif self.is_standalone():
-            from sglang.srt.speculative.standalone_worker_v2 import (
-                StandaloneWorkerV2,
-            )
+            from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
 
             return StandaloneWorkerV2
         elif self.is_ngram():
@@ -316,6 +331,19 @@ class SpecInput(ABC):
     # assignment, so an init-time default would clobber the passed layout.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
+    # Uniform per-request token width of this forward (and its logits-row
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
+    # (ragged forwards carry 1 there). -1 = not set by this flow.
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
+
+    # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
+    # ragged_verify_layout) so scheduler/relay/attention code reads them
+    # uniformly on any SpecInput; only the EAGLE-family inputs override them.
+    dsa_topk_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -339,30 +367,39 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
         }
 
-    @abstractmethod
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        pass
 
-    def get_spec_adjusted_global_num_tokens(
-        self, batch: ScheduleBatch
-    ) -> Tuple[List[int], List[int]]:
-        c1, c2 = self.get_spec_adjust_token_coefficient()
-        global_num_tokens = [x * c1 for x in batch.global_num_tokens]
-        global_num_tokens_for_logprob = [
-            x * c2 for x in batch.global_num_tokens_for_logprob
-        ]
-        return global_num_tokens, global_num_tokens_for_logprob
+def spec_scale_global_num_tokens(
+    spec_info: SpecInput,
+    global_num_tokens: List[int],
+    global_num_tokens_for_logprob: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Scale the raw per-rank sync values (request counts on decode-family
+    rounds) into this forward's token units using the spec input's uniform
+    per-request widths."""
+    return (
+        [x * spec_info.num_tokens_per_req for x in global_num_tokens],
+        [
+            x * spec_info.num_tokens_for_logprob_per_req
+            for x in global_num_tokens_for_logprob
+        ],
+    )
 
 
 def create_dummy_verify_input(
     spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
     custom_mask: torch.Tensor,
     num_tokens_per_req: int,
     is_draft_worker: bool,
 ) -> Optional[SpecInput]:
-    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
+    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch).
+
+    The tree shape comes from the bags so the dummy matches the step config
+    being captured; adaptive spec captures each candidate with that config's
+    leaves overridden.
+    """
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec = get_spec_config()
 
     spec_info = None
     if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
@@ -379,9 +416,9 @@ def create_dummy_verify_input(
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
                 retrieve_cum_len=None,
-                spec_steps=server_args.speculative_num_steps,
-                topk=server_args.speculative_eagle_topk,
-                draft_token_num=server_args.speculative_num_draft_tokens,
+                spec_steps=spec.speculative_num_steps,
+                topk=spec.speculative_eagle_topk,
+                draft_token_num=spec.speculative_num_draft_tokens,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
@@ -393,7 +430,7 @@ def create_dummy_verify_input(
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+            draft_token_num=spec.speculative_num_draft_tokens,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

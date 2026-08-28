@@ -1,14 +1,8 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     make_mla_cases,
@@ -27,6 +21,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_mla_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 MLA_SHAPE_KWARGS = dict(
     kv_lora_rank=512,

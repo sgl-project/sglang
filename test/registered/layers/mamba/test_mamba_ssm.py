@@ -13,8 +13,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.layers.attention.mamba.ops.mamba_ssm import selective_state_update
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import selective_state_update
 from sglang.srt.utils import get_device, is_sm100_supported
 
 

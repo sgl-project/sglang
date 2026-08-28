@@ -19,6 +19,7 @@ class CountingDedupStage(PipelineStage):
     deduplicated_output_fields = ("prompt_embeds",)
     deduplicated_tensor_tree_output_fields = ("timesteps",)
     deduplicated_deepcopy_output_fields = ("scheduler",)
+    deduplicated_extra_output_keys = ("shared",)
     deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(self):
@@ -36,6 +37,7 @@ class CountingDedupStage(PipelineStage):
         batch.prompt_embeds = [torch.tensor([value])]
         batch.timesteps = torch.tensor([value])
         batch.scheduler = {"state": [value]}
+        batch.extra["shared"] = {"tensor": batch.prompt_embeds[0]}
         batch.extra["mu"] = torch.tensor([value])
         return batch
 
@@ -159,12 +161,20 @@ class TestMultiOutputGrouping(unittest.TestCase):
             self.assertTrue(torch.equal(req.prompt_embeds[0], torch.tensor([1.0])))
             self.assertTrue(torch.equal(req.timesteps, torch.tensor([1.0])))
             self.assertEqual(req.scheduler, {"state": [1.0]})
+            self.assertTrue(
+                torch.equal(req.extra["shared"]["tensor"], torch.tensor([1.0]))
+            )
             self.assertTrue(torch.equal(req.extra["mu"], torch.tensor([1.0])))
 
         self.assertIsNot(reqs[0].prompt_embeds, reqs[1].prompt_embeds)
         self.assertIs(reqs[0].prompt_embeds[0], reqs[1].prompt_embeds[0])
         self.assertIsNot(reqs[0].timesteps, reqs[1].timesteps)
         self.assertIsNot(reqs[0].scheduler, reqs[1].scheduler)
+        self.assertIsNot(reqs[0].extra["shared"], reqs[1].extra["shared"])
+        self.assertIs(
+            reqs[0].extra["shared"]["tensor"],
+            reqs[1].extra["shared"]["tensor"],
+        )
         self.assertIsNot(reqs[0].extra["mu"], reqs[1].extra["mu"])
 
     def test_declarative_stage_dedup_runs_distinct_fingerprints_separately(self):

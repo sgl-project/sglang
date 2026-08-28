@@ -37,7 +37,8 @@ Caveats discovered in the pilot:
   `--expert-parallel-size N` to `--ep N` (alias, see table above) so the knob
   can recognize/strip it.
 - `multiNodeHints` only for hw whose fabric needs manual NIC env (gb200-class);
-  standard-IB H100 multi-node needs none.
+  standard-IB H100 multi-node needs none. Hints show on both run modes, so
+  `docker run` flags go in the hardware entry's `multiNodeDockerFlags` instead.
 - `dockerImages`: only the tags the legacy page pinned. CPU/Xeon stays unmapped
   (`:dev` fallback) with a "install from source" tip.
 - **Accuracy-degrading flags** (`--kv-cache-dtype fp8_e4m3`, W4A4-style

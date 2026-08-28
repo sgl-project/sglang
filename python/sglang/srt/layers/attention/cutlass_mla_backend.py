@@ -13,11 +13,11 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import (
+from sglang.kernels.ops.attention.utils import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
 )
+from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
@@ -77,7 +77,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.v_head_dim = model_runner.model_config.v_head_dim
-        self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim

@@ -82,15 +82,20 @@ class TimestepPreparationStage(PipelineStage):
         """
         Prepare timesteps for the diffusion process.
 
-
-
         Returns:
             The batch with prepared timesteps.
         """
         if batch.scheduler is not None and batch.timesteps is not None:
             return batch
 
-        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        if batch.rollout:
+            from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+                get_or_create_rollout_request_scheduler,
+            )
+
+            scheduler = get_or_create_rollout_request_scheduler(batch, self.scheduler)
+        else:
+            scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps

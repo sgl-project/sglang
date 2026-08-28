@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
+from sglang.kernels.ops.speculative.ngram_corpus import get_ngram_corpus_cls
 
 logger = logging.getLogger(__name__)
 
