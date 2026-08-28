@@ -199,12 +199,12 @@ def _prune_unconstrained_states(
 def _optimize_unconstrained(
     grouped: Mapping[str, list[PlacementOption]],
     *,
-    placement_cost_dimensions: int,
+    preference_dimensions: int,
     estimated_latency_tolerance: int,
     require_selection_from_every_group: bool,
 ) -> _State:
     """Solve the exact global latency window after every budget is non-binding."""
-    zero_cost = (0,) * placement_cost_dimensions
+    zero_cost = (0,) * preference_dimensions
     frontier: list[_UnconstrainedState] = [(0, zero_cost, ())]
     maximum_utility = 0
 
@@ -218,7 +218,7 @@ def _optimize_unconstrained(
         group_states = [
             (
                 group_maximum - option.estimated_latency_savings,
-                option.placement_cost_bytes or zero_cost,
+                option.preference_cost or zero_cost,
                 (option,),
             )
             for option in alternatives
@@ -350,7 +350,7 @@ def optimize_placement(
     if not resource_names:
         best = _optimize_unconstrained(
             grouped,
-            placement_cost_dimensions=placement_cost_dimensions,
+            preference_dimensions=preference_dimensions,
             estimated_latency_tolerance=estimated_latency_tolerance,
             require_selection_from_every_group=require_selection_from_every_group,
         )
@@ -363,7 +363,7 @@ def optimize_placement(
         return PlacementPlan(
             resource_delta_bytes=full_resource_deltas,
             estimated_latency_savings=best[1],
-            placement_cost_bytes=best[2],
+            preference_cost=best[2],
             selections=list(best[3]),
         )
 
