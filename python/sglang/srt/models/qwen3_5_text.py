@@ -168,15 +168,28 @@ class Qwen3_5ForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if name.startswith(_MODEL_PREFIX):
                 body_weights.append((name[len(_MODEL_PREFIX) :], loaded_weight))
-            elif name == "lm_head.weight":
+            elif name in ("lm_head.weight", "lm_head.qweight"):
                 if self.config.tie_word_embeddings:
                     continue
-                if "lm_head.weight" not in params_dict:
+                # GGUF loads the quantized lm_head into a "lm_head.qweight"
+                # parameter (via GGUFLinearMethod); safetensors uses "weight".
+                _pd_key = (
+                    "lm_head.qweight"
+                    if "lm_head.qweight" in params_dict
+                    else "lm_head.weight"
+                )
+                if _pd_key not in params_dict:
                     continue
-                param = params_dict["lm_head.weight"]
+                param = params_dict[_pd_key]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-                loaded_params.add("lm_head.weight")
+                loaded_params.add(_pd_key)
+            elif name == "lm_head.qweight_type":
+                if "lm_head.qweight_type" in params_dict:
+                    param = params_dict["lm_head.qweight_type"]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add("lm_head.qweight_type")
 
         body_loaded = self.model.load_weights(body_weights)
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)

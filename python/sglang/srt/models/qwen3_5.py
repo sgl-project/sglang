@@ -2013,6 +2013,21 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
+                # GGUF conv1d data is already [dim, kernel] dim-major
+                # (data[dim][kernel]); the SGLang conv1d kernel expects a
+                # [dim, 1, kernel] layout, so only unsqueeze is needed.
+                if "conv1d.weight" in name and loaded_weight.ndim == 2:
+                    loaded_weight = loaded_weight.contiguous().unsqueeze(1)
+                # GGUF ssm_a stores raw negative decay rates; the model keeps
+                # A_log in log-space: -exp(A_log) = ssm_a.
+                if "A_log" in name and loaded_weight.dtype == torch.float32:
+                    loaded_weight = torch.log(-loaded_weight)
+                # GGUF shared_expert_gate is [hidden] but the model expects
+                # [1, hidden].
+                if "shared_expert_gate" in name and loaded_weight.ndim == 1:
+                    loaded_weight = loaded_weight.unsqueeze(0)
+
                 weight_loader(param, loaded_weight)
                 if (
                     self.config.tie_word_embeddings
