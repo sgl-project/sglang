@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -1875,21 +1875,45 @@ def build_inner_fb_view(
 
 
 class PPProxyTensors:
-    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
-    tensors: Dict[str, torch.Tensor]
+    # adapted from vLLM IntermediateTensors, including its lazy PP comm wait.
+    def __init__(
+        self,
+        tensors: Dict[str, torch.Tensor],
+        comm_works: Optional[List[Any]] = None,
+        comm_postprocess: Optional[List[Callable[[], None]]] = None,
+    ):
+        self._tensors = tensors
+        self._comm_works = comm_works or []
+        self._comm_postprocess = comm_postprocess or []
+        self._comm_waited = not (self._comm_works or self._comm_postprocess)
 
-    def __init__(self, tensors):
-        # manually define this function, so that
-        # Dynamo knows `IntermediateTensors()` comes from this file.
-        # Otherwise, dataclass will generate this function by evaluating
-        # a string, and we will lose the information about the source file.
-        self.tensors = tensors
+    def wait_for_comm(self) -> None:
+        if self._comm_waited:
+            return
+        for p2p_work in self._comm_works:
+            p2p_work.work.wait()
+        for fn in self._comm_postprocess:
+            fn()
+        self._comm_works.clear()
+        self._comm_postprocess.clear()
+        self._comm_waited = True
+
+    @property
+    def tensors(self) -> Dict[str, torch.Tensor]:
+        self.wait_for_comm()
+        return self._tensors
+
+    @tensors.setter
+    def tensors(self, value: Dict[str, torch.Tensor]) -> None:
+        self._tensors = value
 
     def __getitem__(self, key: Union[str, slice]):
+        tensors = self.tensors
         if isinstance(key, str):
-            return self.tensors[key]
-        elif isinstance(key, slice):
-            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+            return tensors[key]
+        if isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in tensors.items()})
+        raise TypeError(f"Unsupported PPProxyTensors key: {type(key)}")
 
     def __setitem__(self, key: str, value: torch.Tensor):
         self.tensors[key] = value
