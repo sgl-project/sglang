@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -7,7 +8,8 @@ import shutil
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any, Generator, List, Optional, Union
+from functools import cache
+from typing import Any, Generator, List, Literal, Optional, Union
 
 import httpx
 from fastapi import HTTPException, UploadFile
@@ -115,7 +117,12 @@ def _parse_request_extra_container(value: Any) -> dict[str, Any]:
 
 
 def request_extra_value(request: Any, field_name: str) -> Any:
-    """Read an extension field while preserving top-level precedence."""
+    """Read an extension field while preserving top-level precedence.
+
+    This function only handles transport compatibility. Callers must first use
+    the active SamplingParams subclass to decide which model-owned fields are
+    valid; transport helpers must not introduce per-model allowlists.
+    """
 
     extra = dict(getattr(request, "model_extra", None) or {})
     direct = {
@@ -132,6 +139,31 @@ def request_extra_value(request: Any, field_name: str) -> Any:
         if field_name in nested and nested[field_name] is not None:
             return nested[field_name]
     return None
+
+
+@cache
+def get_declared_request_extra_fields(
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> frozenset[str]:
+    """Return and validate the active model's API extension declaration."""
+
+    if api == "image":
+        declared = sampling_params_cls.image_request_extra_fields()
+    else:
+        declared = sampling_params_cls.video_request_extra_fields()
+
+    init_fields = {
+        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
+    }
+    missing = declared - init_fields
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        raise TypeError(
+            f"{sampling_params_cls.__name__}.{api}_request_extra_fields() "
+            f"declares non-init field(s): {missing_names}"
+        )
+    return declared
 
 
 @contextmanager
@@ -219,7 +251,11 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
 
 def resolve_sampling_params_cls(server_args: Any) -> type[SamplingParams]:
-    """Resolve the sampling-parameter type selected for the current server."""
+    """Resolve the model-owned sampling contract selected for this server.
+
+    Shared API code must dispatch through this type instead of branching on a
+    model ID or importing individual model configurations.
+    """
 
     sampling_params_cls = SamplingParams
     if server_args.pipeline_class_name:

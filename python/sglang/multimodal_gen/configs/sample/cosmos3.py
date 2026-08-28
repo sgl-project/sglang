@@ -196,6 +196,14 @@ class Cosmos3SamplingParams(SamplingParams):
         )
 
     @classmethod
+    def default_image_output_format(cls) -> str:
+        return "png"
+
+    @classmethod
+    def default_image_response_format(cls) -> str:
+        return "b64_json"
+
+    @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
         return cls.image_request_extra_fields() | frozenset(
             {

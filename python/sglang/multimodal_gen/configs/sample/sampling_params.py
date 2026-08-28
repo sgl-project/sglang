@@ -97,10 +97,17 @@ class DataType(Enum):
 @dataclass
 class SamplingParams:
     """
-    Sampling parameters for generation.
+    Model-agnostic sampling parameters for generation.
 
     Dynamic batching compares these fields for compatibility, except fields
     marked with `batch_sig_exclude`.
+
+    New fields in this base class must be shared across model families; legacy
+    compatibility fields are not precedent. A model-specific field belongs on
+    that model's SamplingParams subclass and, when accepted by an online
+    endpoint, must also be declared via ``image_request_extra_fields`` or
+    ``video_request_extra_fields``. Do not add model fields here merely to make
+    the common API transport accept them.
     """
 
     data_type: DataType = DataType.VIDEO
@@ -370,15 +377,36 @@ class SamplingParams:
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:
-        """Declare model-specific JSON fields accepted by the image API."""
+        """Declare model-owned JSON fields accepted by the image API.
+
+        Every returned name must be an init field on ``cls``. The common
+        endpoint resolves the active subclass before reading these fields, so
+        model-specific extraction and defaults stay out of the API layer.
+        """
 
         return frozenset()
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
-        """Declare model-specific multipart video fields accepted by this type."""
+        """Declare model-owned JSON or multipart fields accepted by the video API.
+
+        Every returned name must be an init field on ``cls``. Aliases and value
+        lowering also belong on the subclass, in ``lower_video_request_kwargs``.
+        """
 
         return frozenset()
+
+    @classmethod
+    def default_image_output_format(cls) -> str | None:
+        """Return a model-owned default format for the image API, if any."""
+
+        return None
+
+    @classmethod
+    def default_image_response_format(cls) -> str | None:
+        """Return a model-owned default response format for the image API, if any."""
+
+        return None
 
     @classmethod
     def lower_video_request_kwargs(
@@ -884,7 +912,13 @@ class SamplingParams:
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
-        """Add CLI arguments for SamplingParam fields"""
+        """Add CLI arguments for SamplingParam fields.
+
+        This shared parser still contains legacy model-specific flags because
+        argparse is constructed before the active model is resolved. Do not add
+        new model-specific dataclass fields to ``SamplingParams`` or new API
+        special cases here; model request ownership remains on subclasses.
+        """
 
         def add_argument(*name_or_flags, **kwargs):
             kwargs.setdefault("default", argparse.SUPPRESS)

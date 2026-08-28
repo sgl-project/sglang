@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import contextlib
-import dataclasses
 import os
 import time
 from typing import Any, List, Optional
@@ -37,6 +36,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
+    get_declared_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
@@ -68,15 +68,10 @@ def _image_request_model_kwargs(
     request: ImageGenerationsRequest,
     sampling_params_cls: type[SamplingParams],
 ) -> dict[str, Any]:
-    """Extract only model-declared image API extension fields."""
+    """Extract fields owned and declared by the active model contract."""
 
-    sampling_fields = {
-        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
-    }
     kwargs = {}
-    for field_name in (
-        sampling_params_cls.image_request_extra_fields() & sampling_fields
-    ):
+    for field_name in get_declared_request_extra_fields(sampling_params_cls, "image"):
         value = _get_extra_field(request, field_name)
         if value is not None:
             kwargs[field_name] = value
@@ -273,12 +268,12 @@ async def generations(
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
-    is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
-    ext = (
-        "png"
-        if is_cosmos3 and request.output_format is None
-        else choose_output_image_ext(request.output_format, request.background)
+    output_format = (
+        request.output_format
+        if request.output_format is not None
+        else sampling_params_cls.default_image_output_format()
     )
+    ext = choose_output_image_ext(output_format, request.background)
 
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = build_sampling_params(
@@ -344,13 +339,12 @@ async def generations(
         )
         save_file_path = save_file_path_list[0]
         response_resize = _get_response_resize(sampling, save_file_path)
-        resp_format = (request.response_format or "b64_json").lower()
-        if (
-            is_cosmos3
-            and "response_format" not in request.model_fields_set
-            and request.response_format == "url"
-        ):
-            resp_format = "b64_json"
+        response_format = request.response_format
+        if "response_format" not in request.model_fields_set:
+            response_format = (
+                sampling_params_cls.default_image_response_format() or response_format
+            )
+        resp_format = (response_format or "b64_json").lower()
 
         # read b64 before cloud upload may delete the local file
         b64_list = (

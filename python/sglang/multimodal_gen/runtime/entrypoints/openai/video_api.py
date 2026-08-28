@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
-import dataclasses
 import json
 import os
 import shutil
@@ -41,6 +40,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     flatten_extra_params,
+    get_declared_request_extra_fields,
     merge_image_input_list,
     process_generation_batch,
     request_extra_value,
@@ -107,15 +107,10 @@ def _video_request_model_kwargs(
     request: VideoGenerationsRequest,
     sampling_params_cls: type[SamplingParams],
 ) -> dict[str, Any]:
-    """Extract only model-declared video API extension fields."""
+    """Extract fields owned and declared by the active model contract."""
 
-    sampling_fields = {
-        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
-    }
     kwargs = {}
-    for field_name in (
-        sampling_params_cls.video_request_extra_fields() & sampling_fields
-    ):
+    for field_name in get_declared_request_extra_fields(sampling_params_cls, "video"):
         value = _extra_value(request, field_name)
         if value is not None:
             kwargs[field_name] = value
@@ -148,7 +143,9 @@ def _multipart_extra_form_keys(
             (
                 *VideoGenerationsRequest.model_fields,
                 *_MULTIPART_EXTRA_FORM_FIELDS,
-                *sorted(sampling_params_cls.video_request_extra_fields()),
+                *sorted(
+                    get_declared_request_extra_fields(sampling_params_cls, "video")
+                ),
             )
         )
     )
