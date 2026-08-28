@@ -70,7 +70,12 @@ def _dominates(candidate: _State, other: _State) -> bool:
     return (
         candidate[1] >= other[1]
         and all(left <= right for left, right in zip(candidate[0], other[0]))
-        and all(left <= right for left, right in zip(candidate[2], other[2]))
+        # Preference costs are summed and compared lexicographically by the
+        # final objective. Lexicographic order is translation invariant, so a
+        # lexicographically better prefix remains better after any suffix is
+        # added; requiring every individual dimension to improve only retains
+        # dominated HostPin-prefix states.
+        and candidate[2] <= other[2]
     )
 
 

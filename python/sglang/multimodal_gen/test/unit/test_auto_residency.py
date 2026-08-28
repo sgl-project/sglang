@@ -1189,6 +1189,57 @@ class TestPlanAutoResidency:
             LAYERWISE_OFFLOAD
         ]
 
+    def test_pre_warmup_plan_keeps_feasible_current_placement(self):
+        current = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=GIB_BYTES,
+            current_placement=True,
+        )
+        component_offload = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=11 * GIB_BYTES,
+            target_device_weight_bytes=0,
+        )
+        less_layerwise = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=7 * GIB_BYTES,
+            target_layerwise_resident_layers=(0,),
+            target_layerwise_pinned_layers=((),),
+            target_device_weight_bytes=0,
+        )
+        candidates = [current, less_layerwise, component_offload]
+
+        plan = plan_auto_residency(
+            reports=[
+                _report(
+                    budget_gib=12,
+                    estimated_gib=2,
+                    phase_peaks_gib={"static:transformer": 2},
+                    phase_components={"static:transformer": ("transformer",)},
+                    candidates=candidates,
+                    require_feasible_placement=True,
+                    estimated_request_duration_ns=1,
+                    candidate_latency_savings_ns={
+                        candidate.option_key(): 0 for candidate in candidates
+                    },
+                )
+            ]
+        )
+
+        assert plan.changes == []
+
     def test_pre_warmup_targets_defer_device_weight_promotion(self):
         current = ResidencyTarget(
             component_name="text_encoder",
@@ -1277,6 +1328,8 @@ class TestPlanAutoResidency:
         assert report.estimated_peak_bytes == 10 * GIB_BYTES
         assert report.candidates == [current]
         assert report.skip_reason is None
+        assert report.estimated_request_duration_ns == 1
+        assert report.candidate_latency_savings_ns == {current.option_key(): 0}
 
     def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
         from sglang.multimodal_gen.runtime.managers import gpu_worker

@@ -2617,12 +2617,8 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 resource_delta_bytes=resource_deltas,
                 estimated_latency_savings=estimated_latency_savings,
                 preference_cost=(
-                    (
-                        0
-                        if candidate.current_placement
-                        or candidate.target_residency_mode == candidate.residency_mode
-                        else 1
-                    ),
+                    int(not candidate.current_placement)
+                    + int(candidate.target_residency_mode != candidate.residency_mode),
                     _layerwise_policy_preference_cost(candidate),
                     candidate.target_device_weight_bytes
                     or max(0, candidate.target_resident_weight_bytes),

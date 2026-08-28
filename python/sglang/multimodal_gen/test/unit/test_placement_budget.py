@@ -313,6 +313,32 @@ def test_latency_tolerance_is_global_not_per_option():
     assert plan.estimated_latency_savings == 60
 
 
+def test_lexicographic_preference_prunes_irrelevant_later_dimension():
+    plan = optimize_placement(
+        [
+            PlacementOption(
+                group_key="dit",
+                option_key="partial-pin",
+                resource_delta_bytes={"gpu": 1},
+                estimated_latency_savings=90,
+                preference_cost=(0, -90, 5),
+            ),
+            PlacementOption(
+                group_key="dit",
+                option_key="full-pin",
+                resource_delta_bytes={"gpu": 1},
+                estimated_latency_savings=100,
+                preference_cost=(0, -100, 10),
+            ),
+        ],
+        resource_budget_bytes={"gpu": 1},
+        estimated_latency_tolerance=20,
+        require_selection_from_every_group=True,
+    )
+
+    assert [option.option_key for option in plan.selections] == ["full-pin"]
+
+
 def test_one_static_placement_satisfies_all_observed_phase_constraints():
     plan = optimize_placement(
         [

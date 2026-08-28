@@ -1694,6 +1694,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             device_transition_allocated_bytes=baseline_allocated,
             candidates=candidates,
             require_feasible_placement=True,
+            # Static weight accounting establishes feasibility, but contains no
+            # latency observation. Tie utility so the solver preserves the
+            # current placement whenever it fits and only makes the minimum
+            # necessary demotion before the first target-shape probe.
+            estimated_request_duration_ns=1,
+            candidate_latency_savings_ns={
+                candidate.option_key(): 0 for candidate in candidates
+            },
         )
 
     def _build_auto_residency_report(
