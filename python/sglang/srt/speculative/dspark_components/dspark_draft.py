@@ -184,6 +184,8 @@ class DraftBlockProposer:
         self._dp_moe_sync = dp_moe_sync
         self._reuse_static_inputs = str(draft_model_runner.device).startswith("npu")
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        self._num_token_non_padded_cache_key = None
+        self._num_token_non_padded_cache_value = None
         self._dp_sync_metadata_cache_key = None
         self._dp_sync_metadata_cache_value = None
 
@@ -372,7 +374,7 @@ class DraftBlockProposer:
             num_token_non_padded=(
                 None
                 if self._reuse_static_inputs and self._dp_moe_sync
-                else _make_num_token_non_padded(draft_num_tokens, device)
+                else self._get_num_token_non_padded(draft_num_tokens, device)
             ),
             num_token_non_padded_cpu=draft_num_tokens,
         )
@@ -416,6 +418,19 @@ class DraftBlockProposer:
             )
             self._draft_block_ids_buf = buf
         return buf[:bs]
+
+    def _get_num_token_non_padded(self, num_tokens: int, device):
+        if not self._reuse_static_inputs:
+            return _make_num_token_non_padded(num_tokens, device)
+        if not enable_num_token_non_padded():
+            return None
+        cache_key = (num_tokens, str(device))
+        if self._num_token_non_padded_cache_key != cache_key:
+            self._num_token_non_padded_cache_key = cache_key
+            self._num_token_non_padded_cache_value = torch.tensor(
+                num_tokens, dtype=torch.int32, device=device
+            )
+        return self._num_token_non_padded_cache_value
 
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch

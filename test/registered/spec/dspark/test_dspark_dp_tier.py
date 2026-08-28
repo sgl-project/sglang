@@ -54,6 +54,24 @@ class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
 
 
 class TestDraftDpSyncMetadata(CustomTestCase):
+    def test_npu_dense_num_token_input_is_reused_and_invalidated(self):
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._reuse_static_inputs = True
+        proposer._num_token_non_padded_cache_key = None
+        proposer._num_token_non_padded_cache_value = None
+
+        with patch(
+            "sglang.srt.speculative.dspark_components.dspark_draft.enable_num_token_non_padded",
+            return_value=True,
+        ):
+            first = proposer._get_num_token_non_padded(15, "cpu")
+            second = proposer._get_num_token_non_padded(15, "cpu")
+            third = proposer._get_num_token_non_padded(30, "cpu")
+
+        self.assertIs(first, second)
+        self.assertIsNot(second, third)
+        self.assertEqual(first.dtype, torch.int32)
+
     def test_preserves_unscaled_request_counts_for_cuda_graph_admission(self):
         proposer = DraftBlockProposer.__new__(DraftBlockProposer)
         proposer._dp_moe_sync = True
