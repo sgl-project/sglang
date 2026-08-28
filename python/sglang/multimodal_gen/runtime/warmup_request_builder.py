@@ -611,7 +611,13 @@ def build_warmup_reqs(
                     "Warmup image path is required for image-input model"
                 )
             req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
-            req_kwargs["image_path"] = [warmup_input_path]
+            default_image_path = sampling_defaults.image_path
+            image_count = (
+                len(default_image_path)
+                if isinstance(default_image_path, (list, tuple))
+                else 1
+            )
+            req_kwargs["image_path"] = [warmup_input_path] * max(1, image_count)
         if server_args.enable_cfg_parallel:
             if not req_kwargs.get("negative_prompt"):
                 req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT

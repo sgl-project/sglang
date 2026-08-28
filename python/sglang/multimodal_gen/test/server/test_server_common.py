@@ -48,6 +48,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     get_model_task_type_for_server_args,
     get_perf_baseline_update_path,
+    get_sampling_param_field_names_for_server_args,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -118,25 +119,32 @@ def _case_warmup_sampling_params(case: DiffusionTestCase) -> dict[str, Any]:
     sampling = case.sampling_params
     if sampling is None:
         return {}
-    overrides: dict[str, Any] = {}
+    sampling_field_names = get_sampling_param_field_names_for_server_args(
+        case.server_args
+    )
+    overrides = {
+        name: value
+        for name, value in sampling.extras.items()
+        if name in sampling_field_names
+    }
     if sampling.output_size:
         width, height = sampling.output_size.lower().split("x", 1)
         overrides.update(width=int(width), height=int(height))
-    if case.server_args.modality == "image":
+    if sampling.num_frames is not None:
+        overrides["num_frames"] = sampling.num_frames
+    elif case.server_args.modality == "image":
         # Omni pipelines can expose a video-oriented model default even when
         # this case calls /v1/images, whose implicit temporal extent is one.
         overrides["num_frames"] = 1
-    elif sampling.num_frames is not None:
-        overrides["num_frames"] = sampling.num_frames
     else:
         # /v1/videos resolves an omitted num_frames from seconds * fps.
         overrides["num_frames"] = sampling.seconds * (sampling.fps or DEFAULT_FPS)
     if sampling.fps is not None:
         overrides["fps"] = sampling.fps
-    for name in ("num_inference_steps", "guidance_scale", "true_cfg_scale"):
-        value = sampling.extras.get(name)
-        if value is not None:
-            overrides[name] = value
+    if sampling.num_outputs_per_prompt > 1:
+        overrides["num_outputs_per_prompt"] = sampling.num_outputs_per_prompt
+    if isinstance(sampling.image_path, (list, tuple)):
+        overrides["image_path"] = ["warmup"] * len(sampling.image_path)
     return overrides
 
 
