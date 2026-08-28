@@ -49,9 +49,9 @@ if TYPE_CHECKING:
     from sglang.srt.rust_extensions._server import (
         MmSpec,
         Server,
+        ServerArgs,
     )
-    from sglang.srt.rust_extensions._server import ServerArgs as RustServerArgs
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.server_args import ServerArgs as PythonServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ class NativeMmHost:
     def __init__(
         self,
         *,
-        server_args: ServerArgs,
+        server_args: PythonServerArgs,
         model_config: ModelConfig,
         processor: Any = None,
     ):
@@ -412,7 +412,7 @@ class RustServer:
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
             http_addr = f"{get_serving().host}:{server_args.port + dp_rank}"
-        renderer_sidecar, http_addr = cls._prepare_renderer(scheduler, http_addr)
+        renderer_sidecar, http_addr = cls.prepare_renderer(scheduler, http_addr)
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -463,7 +463,7 @@ class RustServer:
                 )
             server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
 
-        cls._start_renderer(renderer_sidecar, server, server_cores)
+        cls.start_renderer(renderer_sidecar, server, server_cores)
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -487,7 +487,7 @@ class RustServer:
         return cls(server, mm_spec=mm_spec, renderer_sidecar=renderer_sidecar)
 
     @staticmethod
-    def _prepare_renderer(
+    def prepare_renderer(
         scheduler: Scheduler, public_addr: str
     ) -> Tuple[Optional[RustRendererSidecar], str]:
         if not envs.SGLANG_RUST_RENDERER.get():
@@ -504,7 +504,7 @@ class RustServer:
         return renderer, renderer.internal_server_addr.to_host_port_str()
 
     @staticmethod
-    def _start_renderer(
+    def start_renderer(
         renderer: Optional[RustRendererSidecar],
         server: Server,
         cores: Optional[List[int]],
@@ -794,7 +794,7 @@ class RustServer:
         )
 
     @staticmethod
-    def _build_server_args(scheduler: Scheduler) -> RustServerArgs:
+    def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         """The typed launch handoff for the scheduler's embedded Rust server:
         the ``server_args`` fields it reads, the already-resolved
         ``model_config``, and launch-time facts — as the Rust extension's own
