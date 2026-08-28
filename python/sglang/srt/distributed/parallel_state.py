@@ -482,8 +482,11 @@ class GroupCoordinator:
                 )
 
                 # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
+                # Autotuning is the other way round: it rendezvouses on the host.
                 self.pcie_ipc_comm = PcieIpcCommunicator(
-                    group=self.device_group, device=self.device
+                    group=self.device_group,
+                    device=self.device,
+                    cpu_group=self.cpu_group,
                 )
             except Exception as e:
                 logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
