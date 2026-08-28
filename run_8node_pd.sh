@@ -2,6 +2,11 @@
 
 # ===== Cleanup =====
 unset https_proxy http_proxy HTTPS_PROXY HTTP_PROXY ASCEND_LAUNCH_BLOCKING
+# Benchmark-only simulation knobs alter token acceptance and MoE routing.
+# Keep them unset for correctness runs, including when inherited by the shell.
+unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
+unset SGLANG_SIMULATE_ACC_TOKEN_MODE SGLANG_SIMULATE_UNIFORM_EXPERTS
+unset SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS
 
 pkill -9 python  2>/dev/null || true
 pkill -9 sglang 2>/dev/null || true
@@ -186,9 +191,6 @@ for i in "${!D_IPS[@]}"; do
     # [MTP]
     export SGLANG_ENABLE_SPEC_V2=1
     export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-    export SGLANG_SIMULATE_ACC_LEN=2.5
-    export SGLANG_SIMULATE_ACC_METHOD="multinomial"
-    export SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS=1
     export SGLANG_NPU_USE_MULTI_STREAM=1
 
     echo "========================================"

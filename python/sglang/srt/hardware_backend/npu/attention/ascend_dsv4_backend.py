@@ -2326,7 +2326,7 @@ class DeepseekV4AscendAttnBackend(
         abs_positions = start_positions.view(-1, 1) + torch.arange(
             n_draft, dtype=start_positions.dtype
         ).view(1, -1)
-        boundary_mask = abs_positions % ratio == 0
+        boundary_mask = (abs_positions % ratio == 0) & (seq_lens_cpu.view(-1, 1) > 0)
         indices = torch.nonzero(boundary_mask.flatten(), as_tuple=False).flatten()
 
         if indices.numel() == 0:
@@ -2335,7 +2335,11 @@ class DeepseekV4AscendAttnBackend(
         # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
         # surface later as an unrelated CopyKernel stream failure.
         indices = indices[: dst.numel()].to(device=positions.device)
-        dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
+        # ``indices`` selects the final token of each newly completed group.
+        # The compressed KV applies RoPE at the group's first token, matching
+        # the decode path and ``comp_pos = (position // ratio) * ratio``.
+        compressed_positions = torch.gather(positions, 0, indices) + (1 - ratio)
+        dst[: indices.numel()].copy_(compressed_positions)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int]
