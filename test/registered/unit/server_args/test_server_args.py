@@ -1242,7 +1242,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             dispatch_type="auto",
             runner_backend="flashinfer_trtllm",
         )
-        server_args._handle_a2a_moe()
+        handle_a2a_moe(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "moe_runner_backend"),
@@ -1254,7 +1254,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_auto_resolves_modelopt_fp4_to_nvfp4(self):
         server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="auto")
-        server_args._handle_a2a_moe()
+        handle_a2a_moe(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
@@ -1265,7 +1265,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         server_args.get_model_config = MagicMock(
             return_value=SimpleNamespace(nvfp4_moe_meta={})
         )
-        server_args._handle_a2a_moe()
+        handle_a2a_moe(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
@@ -1273,7 +1273,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_unspecified_preserves_legacy_nvfp4_auto_enable(self):
         server_args = self._make_args(quantization="modelopt_fp4")
-        server_args._handle_a2a_moe()
+        handle_a2a_moe(server_args)
 
         self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
         self.assertTrue(envs.SGLANG_MOE_NVFP4_DISPATCH.get())
@@ -1300,7 +1300,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         server_args.get_model_config = MagicMock(
             return_value=SimpleNamespace(nvfp4_moe_meta={})
         )
-        server_args._handle_a2a_moe()
+        handle_a2a_moe(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "nvfp4"
@@ -1308,7 +1308,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_explicit_bf16_overrides_auto(self):
         server_args = self._make_args(quantization="modelopt_fp4", dispatch_type="bf16")
-        server_args._handle_a2a_moe()
+        handle_a2a_moe(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "flashinfer_a2a_dispatch_type"), "bf16"
@@ -1317,12 +1317,12 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
     def test_legacy_env_maps_to_dispatch_type(self):
         with envs.SGLANG_MOE_NVFP4_DISPATCH.override("1"):
             server_args = self._make_args(quantization="modelopt_fp4")
-            server_args._handle_a2a_moe()
+            handle_a2a_moe(server_args)
         self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
 
         with envs.SGLANG_MOE_NVFP4_DISPATCH.override("0"):
             server_args = self._make_args(quantization="modelopt_fp4")
-            server_args._handle_a2a_moe()
+            handle_a2a_moe(server_args)
         self.assertIsNone(server_args.flashinfer_a2a_dispatch_type)
 
     def test_legacy_env_conflicts_with_explicit_cli(self):
@@ -1333,12 +1333,12 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             with self.assertRaisesRegex(
                 ValueError, "SGLANG_MOE_NVFP4_DISPATCH cannot be set"
             ):
-                server_args._handle_a2a_moe()
+                handle_a2a_moe(server_args)
 
     def test_mxfp8_dispatch_requires_mxfp8_quantization(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="mxfp8")
         with self.assertRaisesRegex(ValueError, "requires --quantization mxfp8"):
-            server_args._handle_a2a_moe()
+            handle_a2a_moe(server_args)
 
     def test_explicit_dispatch_type_requires_flashinfer_a2a(self):
         server_args = ServerArgs(
@@ -1347,7 +1347,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             flashinfer_a2a_dispatch_type="bf16",
         )
         with self.assertRaisesRegex(ValueError, "requires --moe-a2a-backend"):
-            server_args._handle_a2a_moe()
+            handle_a2a_moe(server_args)
 
 
 class TestFlashinferMegaMoeConfig(CustomTestCase):
@@ -1416,14 +1416,14 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         )
         for architecture in supported:
             with self.subTest(architecture=architecture):
-                self._make_args(architecture)._handle_a2a_moe()
+                handle_a2a_moe(self._make_args(architecture))
 
     def test_megamoe_rejects_unaudited_model_architecture(self):
         with self.assertRaisesRegex(
             ValueError,
             "not validated for model architectures.*UnsupportedMoeForCausalLM",
         ):
-            self._make_args("UnsupportedMoeForCausalLM")._handle_a2a_moe()
+            handle_a2a_moe(self._make_args("UnsupportedMoeForCausalLM"))
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     def test_megamoe_accepts_supported_quantization_formats(self, _):
@@ -1435,24 +1435,26 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         )
         for config in supported:
             with self.subTest(config=config):
-                self._make_args(**config)._handle_a2a_moe()
+                handle_a2a_moe(self._make_args(**config))
 
     def test_megamoe_rejects_standard_fp8(self):
         with self.assertRaisesRegex(ValueError, "Standard FP8 MoE checkpoints"):
-            self._make_args(quantization="fp8")._handle_a2a_moe()
+            handle_a2a_moe(self._make_args(quantization="fp8"))
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
     def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
         with self.assertRaisesRegex(ValueError, "requires an SM100-family"):
-            self._make_args(quantization="fp8", is_fp4_experts=True)._handle_a2a_moe()
+            handle_a2a_moe(
+                self._make_args(quantization="fp8", is_fp4_experts=True)
+            )
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_accepts_quantized_values(self, _):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
-            self._make_args()._handle_a2a_moe()
+            handle_a2a_moe(self._make_args())
 
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("mxfp8"):
-            self._make_args()._handle_a2a_moe()
+            handle_a2a_moe(self._make_args())
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_rejects_invalid_value(self, _):
@@ -1460,14 +1462,14 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             with self.assertRaisesRegex(
                 ValueError, "SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE"
             ):
-                self._make_args()._handle_a2a_moe()
+                handle_a2a_moe(self._make_args())
 
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=True)
     def test_megamoe_combine_dtype_conflicts_with_ikr(self, _):
         with envs.SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE.override("nvfp4"):
             with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
                 with self.assertRaisesRegex(ValueError, "incompatible"):
-                    self._make_args()._handle_a2a_moe()
+                    handle_a2a_moe(self._make_args())
 
 
 class TestPortArgs(unittest.TestCase):
