@@ -2178,7 +2178,7 @@ def collect_residency_targets(
             uses_per_streamed_layer=uses_per_request,
             layer_uses=layer_uses,
         )
-        full_weight_bytes = _module_weight_bytes(module)
+        full_weight_bytes = max(_module_weight_bytes(module), managed_weight_bytes)
         unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
         component_transfer_work = (
             PAGEABLE_H2D_COST_MULTIPLIER * full_weight_bytes if component_used else 0

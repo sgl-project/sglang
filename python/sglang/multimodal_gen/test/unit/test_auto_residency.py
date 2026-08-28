@@ -3055,7 +3055,7 @@ class TestSizeAccounting:
         runtime = component_runtime_weight_bytes({"transformer": module})
 
         assert runtime["transformer"] == (
-            module.layers[0].cache.untyped_storage().nbytes()
+            module.unmanaged.numel() * module.unmanaged.element_size()
             + manager.peak_managed_device_weight_bytes()
         )
 
