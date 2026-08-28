@@ -32,6 +32,8 @@ _GROUP_SIZE = 32
 class Mxfp4FlashinferCutlassMoEMethod:
     """FlashInfer MXFP4 MoE: W4A16 on SM90 and W4A8 on SM120."""
 
+    fuse_routed_scaling_factor_in_topk = True
+
     def __init__(self, fp8_method, prefix: str):
         if not is_flashinfer_available():
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
@@ -39,6 +41,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self._fp8 = fp8_method
         self.prefix = prefix
         self._swiglu_limit_tensor: torch.Tensor | None = None
+        self._use_swiglu_step = False
         self._mxfp4_weight_global_scale_tensor: torch.Tensor | None = None
 
     @property
@@ -89,10 +92,20 @@ class Mxfp4FlashinferCutlassMoEMethod:
             )
 
         # FlashInfer defaults alpha/beta to 1/0, so DSv4 only supplies its clamp.
+        # Bailing clamps after SiLU (gemm1_clamp_limit), which the kernel only
+        # implements in its SwigluStep variant.
         swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
-        if swiglu_limit is not None:
+        gemm1_clamp_limit = getattr(moe_runner_config, "gemm1_clamp_limit", None)
+        self._use_swiglu_step = (
+            gemm1_clamp_limit is not None
+            and getattr(moe_runner_config, "gemm1_alpha", None) is None
+        )
+        clamp_limit = (
+            gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+        )
+        if clamp_limit is not None:
             self._swiglu_limit_tensor = torch.full(
-                (E,), float(swiglu_limit), dtype=torch.float32, device=device
+                (E,), float(clamp_limit), dtype=torch.float32, device=device
             )
         else:
             self._swiglu_limit_tensor = None
@@ -190,6 +203,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
             swiglu_alpha=None,
             swiglu_beta=None,
             swiglu_limit=self._swiglu_limit_tensor,
+            use_swiglu_step=self._use_swiglu_step,
             moe_tp_size=layer.moe_tp_size,
             moe_tp_rank=layer.moe_tp_rank,
             moe_ep_size=layer.moe_ep_size,

@@ -19,7 +19,6 @@ Server is started with ``sglang serve`` (``--model-impl sglang``).
 
 from __future__ import annotations
 
-import os
 import unittest
 
 import openai
@@ -83,7 +82,6 @@ class TestGemma4E2BXPU(CustomTestCase):
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
 
         _empty_xpu_cache()
         cls.process = popen_launch_server(
