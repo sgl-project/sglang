@@ -455,6 +455,9 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
                     f"prefix={self.prefix!r}; the checkpoint scale names likely did "
                     f"not match {weight_prefix}_weight_scale_inv."
                 )
+
+        for weight_prefix in ("w13", "w2"):
+            weight_scale = getattr(layer, f"{weight_prefix}_weight_scale_inv")
             weight, scale = prepare_w4a8_mxfp_weight(
                 getattr(layer, f"{weight_prefix}_weight").data.view(torch.uint8),
                 weight_scale.data,
