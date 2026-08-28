@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.placement_budget imp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     auto_residency_static_skip_reason,
+    fixed_loading_residency_components,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -142,7 +143,15 @@ def maybe_seed_initial_residency(
         server_args,
         inventory,
         available_bytes=int(available_gib * GIB_BYTES),
-        excluded_components=excluded_components,
+        excluded_components=(
+            excluded_components
+            | frozenset(
+                fixed_loading_residency_components(
+                    server_args,
+                    (item.component_name for item in inventory),
+                )
+            )
+        ),
     )
     for component_name in selected:
         server_args.set_auto_residency_mode(component_name, RESIDENT)

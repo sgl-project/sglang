@@ -36,6 +36,10 @@ class _Args:
         self.modes = modes or {}
         self.explicit = set(explicit)
         self.selected = {}
+        self.quantization = None
+        self.component_quantizations = {}
+        self.nunchaku_config = None
+        self.direct_gpu_weight_loading = False
 
     def residency_mode(self, component_name):
         return self.selected.get(
@@ -199,6 +203,27 @@ def test_initial_seed_applies_one_reversible_override():
         distributed=False,
         empty_cache=False,
     )
+
+
+def test_initial_seed_preserves_fixed_quantized_dit_loading():
+    args = _Args()
+    args.quantization = "fp8"
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.auto_residency_static_skip_reason",
+            return_value=None,
+        ),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "initial_residency.current_platform"
+        ) as platform,
+    ):
+        platform.is_cuda.return_value = True
+        platform.get_available_gpu_memory.return_value = 40
+        maybe_seed_initial_residency(args, [_weight("transformer", 8)])
+
+    assert args.selected == {}
 
 
 def test_initial_seed_preserves_unselected_layerwise_setup():

@@ -4,7 +4,7 @@ ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    is_dit_component_name,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -89,22 +90,6 @@ def auto_residency_static_skip_reason(server_args: ServerArgs) -> str | None:
         return "cache-dit enabled"
     if server_args.batching_max_size > 1:
         return "dynamic batching enabled"
-    nunchaku = server_args.nunchaku_config
-    svdquant_enabled = nunchaku is not None and (
-        not isinstance(nunchaku, NunchakuSVDQuantArgs) or nunchaku.enable_svdquant
-    )
-    if (
-        server_args.quantization is not None
-        or server_args.component_quantizations
-        or svdquant_enabled
-    ):
-        # Explicit and online quantization require a fixed loading path.
-        # A transformer weight-path override alone is not a quantization mode.
-        # Self-describing pre-quantized checkpoints are also safe to move after
-        # loading: residency changes storage location, not quantized values.
-        return "quantized checkpoint"
-    if server_args.direct_gpu_weight_loading:
-        return "direct GPU weight loading requires a fixed resident placement"
     if not current_platform.is_cuda():
         return "requires CUDA"
     return None
@@ -118,6 +103,33 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
     if server_args.warmup_mode != "server":
         return "no synthetic server warmup to calibrate from"
     return None
+
+
+def fixed_loading_residency_components(
+    server_args: ServerArgs, component_names: Iterable[str]
+) -> set[str]:
+    """Components whose loader-selected storage must remain unchanged.
+
+    Explicit/online quantization and direct GPU loading constrain their target
+    DiTs, not the unrelated encoders and VAEs in the same pipeline. Keep those
+    components outside auto residency while still calibrating the rest.
+    """
+    fixed = set(server_args.component_quantizations)
+    nunchaku = server_args.nunchaku_config
+    fixed_dit_loading = (
+        server_args.quantization is not None
+        or server_args.direct_gpu_weight_loading
+        or (
+            nunchaku is not None
+            and (
+                not isinstance(nunchaku, NunchakuSVDQuantArgs)
+                or nunchaku.enable_svdquant
+            )
+        )
+    )
+    if fixed_dit_loading:
+        fixed.update(name for name in component_names if is_dit_component_name(name))
+    return fixed
 
 
 class ServerArgsAutoTuner:
