@@ -171,10 +171,9 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.active_requests, [3, 5])
 
-    def test_pending_refresh_waits_for_latest_dispatch_ack(self):
+    def test_pending_refresh_carries_unacknowledged_dispatch(self):
         budget = DPBudget(dp_size=2)
-        budget.active_requests[0] = 1
-        self.assertEqual(budget.record_dispatch(0), 1)
+        self.assertEqual(budget.record_dispatch(0, 30), 1)
         budget.update_budget(
             [
                 _load(dp_rank=0, timestamp=1.0, last_dp_dispatch_seq=0),
@@ -184,16 +183,25 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
             project_pending=True,
         )
         self.assertEqual(budget.active_requests, [1, 0])
+        self.assertEqual(budget.active_tokens, [30, 0])
+        self.assertEqual(budget.last_timestamp, [1.0, 1.0])
 
         budget.update_budget(
             [
-                _load(dp_rank=0, timestamp=2.0, last_dp_dispatch_seq=1),
+                _load(
+                    dp_rank=0,
+                    timestamp=2.0,
+                    num_running_reqs=4,
+                    num_assigned_input_tokens=80,
+                    last_dp_dispatch_seq=1,
+                ),
                 _load(dp_rank=1, timestamp=2.0, last_dp_dispatch_seq=0),
             ],
             require_full_refresh=True,
             project_pending=True,
         )
-        self.assertEqual(budget.active_requests, [0, 0])
+        self.assertEqual(budget.active_requests, [4, 0])
+        self.assertEqual(budget.active_tokens, [80, 0])
 
 
 class TestDPBudgetDispatch(CustomTestCase):

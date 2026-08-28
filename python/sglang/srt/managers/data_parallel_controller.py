@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import deque
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
@@ -112,10 +113,15 @@ class DPBudget:
         self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
         self.last_dispatched_seq = [0] * dp_size
+        self.pending_dispatches = [deque() for _ in range(dp_size)]
+        self.pending_dispatch_tokens = [0] * dp_size
 
-    def record_dispatch(self, rank: int) -> int:
+    def record_dispatch(self, rank: int, estimated_tokens: int) -> int:
         self.last_dispatched_seq[rank] += 1
-        return self.last_dispatched_seq[rank]
+        seq = self.last_dispatched_seq[rank]
+        self.pending_dispatches[rank].append((seq, estimated_tokens))
+        self.pending_dispatch_tokens[rank] += estimated_tokens
+        return seq
 
     def update_budget(
         self,
@@ -128,10 +134,6 @@ class DPBudget:
             loads_by_rank = {load.dp_rank: load for load in loads}
             if len(loads_by_rank) != self.dp_size or any(
                 load.timestamp == self.last_timestamp[rank]
-                or (
-                    project_pending
-                    and load.last_dp_dispatch_seq < self.last_dispatched_seq[rank]
-                )
                 for rank, load in loads_by_rank.items()
             ):
                 return
@@ -139,18 +141,28 @@ class DPBudget:
         for load in loads:
             if load.timestamp == self.last_timestamp[load.dp_rank]:
                 continue
-            self.last_timestamp[load.dp_rank] = load.timestamp
-            self.total_requests[load.dp_rank] = (
-                load.num_running_reqs + load.num_waiting_reqs
-            )
-            self.active_requests[load.dp_rank] = (
-                load.num_running_reqs + load.num_waiting_reqs
+            rank = load.dp_rank
+            pending_requests = 0
+            pending_tokens = 0
+            if project_pending:
+                pending = self.pending_dispatches[rank]
+                while pending and pending[0][0] <= load.last_dp_dispatch_seq:
+                    _, tokens = pending.popleft()
+                    self.pending_dispatch_tokens[rank] -= tokens
+                pending_requests = len(pending)
+                pending_tokens = self.pending_dispatch_tokens[rank]
+
+            self.last_timestamp[rank] = load.timestamp
+            snapshot_requests = load.num_running_reqs + load.num_waiting_reqs
+            self.total_requests[rank] = snapshot_requests + pending_requests
+            self.active_requests[rank] = (
+                snapshot_requests + pending_requests
                 if project_pending
                 else load.num_running_reqs
             )
-            self.total_tokens[load.dp_rank] = load.num_total_tokens
-            self.active_tokens[load.dp_rank] = (
-                load.num_assigned_input_tokens
+            self.total_tokens[rank] = load.num_total_tokens + pending_tokens
+            self.active_tokens[rank] = (
+                load.num_assigned_input_tokens + pending_tokens
                 if project_pending
                 else load.num_running_input_tokens
             )
@@ -889,7 +901,9 @@ class DataParallelController:
             max_requests=self._active_token_request_cap,
         )
         if self._project_pending_load:
-            req.dp_dispatch_seq = self.dp_budget.record_dispatch(target_worker)
+            req.dp_dispatch_seq = self.dp_budget.record_dispatch(
+                target_worker, len(req.input_ids)
+            )
         sock_send(self.workers[target_worker], req)
 
     def dispatch_generate_burst(self, requests):
