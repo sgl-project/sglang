@@ -518,7 +518,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             # logits when config.enable_lm_head_fp32 is set.
             quant_config=quant_config,
             prefix=f"{prefix}.lm_head",
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
