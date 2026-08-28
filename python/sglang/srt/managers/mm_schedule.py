@@ -8,6 +8,9 @@ import torch
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_ONCE_KEY,
+)
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
@@ -318,6 +321,12 @@ def _batch_encode_per_image_misses(
                 hash_to_embedding[item.hash] = cached.embedding
             elif item.hash not in unique_misses:
                 token_count = end - start + 1
+                if (
+                    start >= chunk_start
+                    and end < chunk_end
+                    and item.can_defer_cuda_ipc_feature_reconstruction()
+                ):
+                    item.model_specific_data[BORROW_CUDA_IPC_FEATURE_ONCE_KEY] = True
                 unique_misses[item.hash] = (item, token_count)
 
     # Phase 1b: single ViT call for all unique cache misses

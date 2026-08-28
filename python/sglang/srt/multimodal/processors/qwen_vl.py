@@ -901,7 +901,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             input_ids_list, mm_items
         )
         mm_items = self._prepare_mm_items_for_transport(mm_items)
-        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
         return MultimodalProcessorOutput(
             input_ids=input_ids_list,
             padded_input_ids=padded_input_ids,
@@ -1010,7 +1010,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
-        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+        self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
 
         audio_feature_lengths = None
 
@@ -1156,10 +1156,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         )
         return self.compose_image_artifacts(input_text, artifacts)
 
-    def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
+    def _mark_cuda_ipc_features_for_deferred_reconstruction(self, mm_items):
+        supports_deferred_reconstruction = self.server_args.mm_enable_dp_encoder or (
+            self.server_args.tp_size == 1
+            and self.model_type in ("qwen3_vl", "qwen3_vl_moe")
+        )
         if not (
             self.keep_mm_features_on_device
-            and self.server_args.mm_enable_dp_encoder
+            and supports_deferred_reconstruction
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):

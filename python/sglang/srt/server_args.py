@@ -5447,6 +5447,16 @@ class ServerArgs:
         )
         if self.mm_feature_transport is None and not cache_retention_enabled:
             updates["mm_feature_transport"] = "cuda_ipc"
+        if (
+            not envs.SGLANG_MM_FEATURE_CACHE_MB.is_set()
+            and self.max_running_requests is not None
+            and self.max_running_requests >= 400
+            and not cache_retention_enabled
+            and self.mm_feature_transport in (None, "cuda_ipc")
+        ):
+            # Keep a full high-concurrency wave GPU-resident instead of
+            # falling back to CPU transport while the scheduler drains it.
+            envs.SGLANG_MM_FEATURE_CACHE_MB.set(3 * 1024)
         if self.radix_eviction_policy == "lru":
             updates["radix_eviction_policy"] = "priority"
         if self.prefill_decode_interval is None:
