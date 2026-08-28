@@ -273,6 +273,7 @@ class RankResidencyReport(msgspec.Struct, frozen=True):
     # budget and must not become retroactively infeasible after a rollback.
     planning_headroom_correction_bytes: int = 0
     target_workload_measured: bool = False
+    observed_reserved_bytes: int = 0
     estimated_peak_bytes_by_phase: dict[str, int] = {}
     active_components_by_phase: dict[str, tuple[str, ...]] = {}
     used_components_by_phase: dict[str, tuple[str, ...]] = {}
@@ -2556,7 +2557,12 @@ def current_placement_reserve_shortfall_bytes(
                 *report.estimated_peak_bytes_by_phase.values(),
             ]
         )
-        shortfalls.append(measured_peak + reserve - report.budget_bytes)
+        # Candidate deltas are intentionally solved against live allocated
+        # bytes, so reclaimable allocator cache is not charged twice. Once a
+        # placement has actually run, however, its mapped allocator footprint
+        # must still leave the same reserve for the next request.
+        realized_footprint = max(measured_peak, report.observed_reserved_bytes)
+        shortfalls.append(realized_footprint + reserve - report.budget_bytes)
     return max(0, max(shortfalls, default=0))
 
 

@@ -200,6 +200,9 @@ class PipelineConfig:
 
     task_type: ModelTaskType = ModelTaskType.I2I
     skip_input_image_preprocess: bool = False
+    # False when changing component placement after a calibration request is
+    # known to alter the pipeline's numerical path.
+    supports_auto_residency: bool = True
 
     model_path: str = ""
     pipeline_config_path: str | None = None

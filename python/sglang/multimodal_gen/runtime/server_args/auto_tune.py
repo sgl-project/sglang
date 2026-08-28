@@ -76,6 +76,8 @@ def auto_residency_static_skip_reason(server_args: ServerArgs) -> str | None:
     task_type = server_args.pipeline_config.task_type
     if not (task_type.is_visual_gen() or task_type.is_mesh_gen()):
         return "no synthetic server warmup to calibrate from"
+    if not server_args.pipeline_config.supports_auto_residency:
+        return "pipeline does not support post-warmup residency changes"
     if has_realtime_model_adapter(server_args):
         return "realtime serving has no representative synthetic warmup"
     if server_args.backend == "diffusers":
@@ -108,17 +110,19 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
 def fixed_loading_residency_components(
     server_args: ServerArgs, component_names: Iterable[str]
 ) -> set[str]:
-    """Components whose loader-selected storage must remain unchanged.
+    """Components whose selected residency must remain unchanged.
 
     Explicit/online quantization and direct GPU loading constrain their target
-    DiTs, not the unrelated encoders and VAEs in the same pipeline. Keep those
-    components outside auto residency while still calibrating the rest.
+    DiTs. LTX-2 two-stage ``original`` mode also relies on its offloaded DiT
+    while swapping the stage LoRA. Keep those components outside auto
+    residency while still calibrating unrelated encoders and VAEs.
     """
     fixed = set(server_args.component_quantizations)
     nunchaku = server_args.nunchaku_config
     fixed_dit_loading = (
         server_args.quantization is not None
         or server_args.direct_gpu_weight_loading
+        or server_args.ltx2_two_stage_device_mode == "original"
         or (
             nunchaku is not None
             and (

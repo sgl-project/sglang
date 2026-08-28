@@ -815,8 +815,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if request_allocated_peak > max(phase_allocated_peaks.values(), default=0):
             # Work after the residency-managed stage timeline (for example,
             # output materialization) must remain a placement constraint.
-            # A reserved-only increase is reclaimable allocator cache, not a
-            # second live placement, and is covered by the explicit reserve.
+            # A reserved-only increase is not a second live placement. Record
+            # it separately so post-placement validation can still require
+            # allocator headroom without charging cache to candidate deltas.
             phase_allocated_peaks["request:untracked"] = request_allocated_peak
             phase_components["request:untracked"] = untracked_active_components
             phase_used_components["request:untracked"] = ()
@@ -1841,6 +1842,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         modules = self._auto_residency_modules()
         target_units = workload.workload_units()
         assert target_units is not None
+        target_records = [
+            record
+            for record in records
+            if record.succeeded and record.workload_units() >= target_units
+        ]
         warmup_oom = any(
             not record.succeeded and record.workload_units() <= target_units
             for record in records
@@ -2071,9 +2077,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             budget_bytes=budget_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
             planning_headroom_correction_bytes=allocator_headroom_bytes,
-            target_workload_measured=any(
-                record.succeeded and record.workload_units() >= target_units
-                for record in records
+            target_workload_measured=bool(target_records),
+            observed_reserved_bytes=max(
+                (record.peak_reserved_bytes for record in target_records), default=0
             ),
             estimated_peak_bytes_by_phase=estimated_phase_peaks,
             active_components_by_phase=active_components_by_phase,

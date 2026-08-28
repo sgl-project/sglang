@@ -957,6 +957,7 @@ def _report(
     budget_gib: float = 100,
     estimated_gib: float | None = 50,
     planning_headroom_correction_gib: int = 0,
+    observed_reserved_gib: float = 0,
     candidates: list[ResidencyTarget] | None = None,
     skip_reason: str | None = None,
     phase_peaks_gib: dict[str, float] | None = None,
@@ -988,6 +989,7 @@ def _report(
             planning_headroom_correction_gib * GIB_BYTES
         ),
         target_workload_measured=target_workload_measured,
+        observed_reserved_bytes=observed_reserved_gib * GIB_BYTES,
         estimated_peak_bytes_by_phase={
             name: int(value * GIB_BYTES)
             for name, value in (phase_peaks_gib or {}).items()
@@ -2302,6 +2304,16 @@ class TestPlanAutoResidency:
             target_workload_measured=True,
             phase_peaks_gib={"decode": 28},
             warmup_oom=True,
+        )
+
+        assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
+
+    def test_validation_preserves_reserve_beyond_allocator_mapped_footprint(self):
+        report = _report(
+            budget_gib=80,
+            estimated_gib=60,
+            observed_reserved_gib=78,
+            target_workload_measured=True,
         )
 
         assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
@@ -4939,7 +4951,11 @@ class TestAutoResidencySkipReason:
             transformer_weights_path=None,
             nunchaku_config=None,
             direct_gpu_weight_loading=False,
-            pipeline_config=SimpleNamespace(task_type=ModelTaskType.T2V),
+            ltx2_two_stage_device_mode=None,
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                supports_auto_residency=True,
+            ),
         )
         for key, value in overrides.items():
             setattr(args, key, value)
@@ -4988,6 +5004,15 @@ class TestAutoResidencySkipReason:
             # resident aux components on CPU): its peaks are not serving peaks
             ({"enable_torch_compile": True}, "stripped memory layout"),
             ({"batching_max_size": 4}, "batching"),
+            (
+                {
+                    "pipeline_config": SimpleNamespace(
+                        task_type=ModelTaskType.T2V,
+                        supports_auto_residency=False,
+                    )
+                },
+                "post-warmup residency changes",
+            ),
         ],
     )
     def test_excluded_paths(self, monkeypatch, overrides, expected_fragment):
@@ -5029,6 +5054,17 @@ class TestAutoResidencySkipReason:
         assert (
             fixed_loading_residency_components(
                 self._base_args(transformer_weights_path="/x.safetensors"),
+                component_names,
+            )
+            == set()
+        )
+        assert fixed_loading_residency_components(
+            self._base_args(ltx2_two_stage_device_mode="original"),
+            component_names,
+        ) == {"transformer", "transformer_2"}
+        assert (
+            fixed_loading_residency_components(
+                self._base_args(ltx2_two_stage_device_mode="resident"),
                 component_names,
             )
             == set()

@@ -160,6 +160,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
 
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 9
+    assert record.peak_reserved_bytes == 12
     assert (record.width, record.height, record.num_frames) == (128, 96, 9)
     assert record.num_inference_steps == 2
     assert record.phase_peak_allocated_bytes["request:untracked"] == 9
