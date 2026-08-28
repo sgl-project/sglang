@@ -279,6 +279,20 @@ def get_processor(
                 revision=revision,
                 **kwargs,
             )
+        elif config.model_type == "glm5_next":
+            # The matching Miles plugin backports the official GLM-5.3 image
+            # processor while this branch remains pinned to Transformers 5.12.1.
+            # Reuse it so rollout and training produce identical pixels/tokens.
+            from miles_plugins.models.glm5_next.processor import (
+                load_glm5_next_processor,
+            )
+
+            processor = load_glm5_next_processor(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
         else:
             if config.model_type in _CUSTOMIZED_MM_PROCESSOR:
                 processor = _CUSTOMIZED_MM_PROCESSOR[config.model_type].from_pretrained(
