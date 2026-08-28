@@ -286,6 +286,7 @@ class TransformerLoader(ComponentLoader):
             component_name=component_name,
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
+            arch_config=dit_config.arch_config,
         )
         if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
