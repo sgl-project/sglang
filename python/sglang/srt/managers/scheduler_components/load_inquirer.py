@@ -98,6 +98,8 @@ class SchedulerLoadInquirer:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
         running_reqs = self.get_running_batch().reqs
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            running_reqs = [req for req in running_reqs if not req.finished()]
         num_running_reqs = len(running_reqs)
         num_running_input_tokens = sum(
             len(req.origin_input_ids) for req in running_reqs

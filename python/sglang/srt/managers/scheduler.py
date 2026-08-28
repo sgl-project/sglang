@@ -4054,7 +4054,12 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        publish_after_result = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and batch.forward_mode.is_decode()
+        )
+        if not publish_after_result:
+            self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -4069,6 +4074,12 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        if publish_after_result:
+            # In overlap mode, running_batch is already the next scheduled batch.
+            # Publish after decode finish states are committed so completed
+            # requests are not reported as active for the next placement wave.
+            self.publish_load_snapshot()
 
         self._record_step_counters(batch, result)
 
