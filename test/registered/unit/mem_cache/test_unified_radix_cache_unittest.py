@@ -6733,6 +6733,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         # translate the source full to SWA and store it on the node (no free)
         alloc.translate_loc_from_full_to_swa.assert_called_once_with(source_value)
         alloc.free.assert_not_called()
+        alloc.free_full.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
         )
@@ -6767,7 +6768,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
-        alloc.full_attn_allocator.free.assert_called_once_with(incoming_full)
+        alloc.free_full.assert_called_once_with(incoming_full)
+        # not the inner allocator (skips the free-group defer) and not both halves
+        alloc.full_attn_allocator.free.assert_not_called()
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value

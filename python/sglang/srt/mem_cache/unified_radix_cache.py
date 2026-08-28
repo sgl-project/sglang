@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeComponentDeviceSlot,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
 )
 
@@ -1052,6 +1053,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
+        elif isinstance(action, FreeDeviceKVFullOnly):
+            for indices in action.indices:
+                self.token_to_kv_pool_allocator.free_full(indices)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
         else:

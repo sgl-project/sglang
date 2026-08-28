@@ -293,7 +293,7 @@ jobs:
 
   base-c-test-acc-2-npu-a3:
     name: base-c-test-acc-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -307,7 +307,7 @@ jobs:
 
   base-c-test-acc-4-npu-a3:
     name: base-c-test-acc-4-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -320,7 +320,7 @@ jobs:
 
   base-c-test-acc-8-npu-a3:
     name: base-c-test-acc-8-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -333,7 +333,7 @@ jobs:
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -346,7 +346,7 @@ jobs:
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3 ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -359,7 +359,7 @@ jobs:
 
   base-c-test-perf-4-npu-a3:
     name: base-c-test-perf-4-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-4-npu-a3 ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -372,7 +372,7 @@ jobs:
 
   base-c-test-perf-8-npu-a3:
     name: base-c-test-perf-8-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-8-npu-a3 ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -385,7 +385,7 @@ jobs:
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
-    needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-16-npu-a3 ]
+    needs: [ check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3, base-c-test-acc-2-npu-a3, base-c-test-acc-4-npu-a3, base-c-test-acc-8-npu-a3, base-c-test-acc-16-npu-a3 ]
     if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:

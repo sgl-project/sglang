@@ -129,7 +129,7 @@ def init_torch_distributed(
         # included in later KV-cache sizing instead of appearing during capture.
         if (
             device == "cuda"
-            and get_parallel().config.enable_tp_lm_head_all_to_all
+            and get_parallel().enable_tp_lm_head_all_to_all
             and ps.tp_size > 1
         ):
             _prewarm_tp_lm_head_all_to_all()
@@ -267,7 +267,7 @@ def _init_parallel_groups(
         duplicate_attn_cp_group=(
             is_hip()
             and server_args.enable_two_batch_overlap
-            and get_parallel().config.enable_dsa_prefill_context_parallel
+            and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
