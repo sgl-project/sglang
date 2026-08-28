@@ -1357,9 +1357,7 @@ def tilelang_sparse_fwd(
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     if _is_hip or is_fp8_kv:
-        assert (
-            not return_lse
-        ), "tilelang partial+combine sparse fwd does not return LSE"
+        assert not return_lse, "tilelang partial+combine sparse fwd does not return LSE"
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)

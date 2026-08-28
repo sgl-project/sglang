@@ -651,6 +651,7 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
     """tilelang's fp8 KV path stores the raw MLA layout (nope + rope cast to
     fp8_e4m3, no per-tile scales). On ROCm/HIP it is the default DSA path. On
@@ -665,6 +666,13 @@ def _check_tilelang_dsa_fp8_kv(
         or "tilelang" not in {prefill_backend, decode_backend}
     ):
         return
+    if dcp_size > 1:
+        raise ValueError(
+            "The tilelang DSA fp8_e4m3 KV path on CUDA stores the raw MLA "
+            "layout and its fused-quant writer does not apply the DCP rank "
+            "filter, so it is incompatible with --dcp-size > 1. Use "
+            "--kv-cache-dtype bfloat16 with DCP, or dcp_size 1 with fp8."
+        )
     if prefill_backend != decode_backend:
         raise ValueError(
             "On CUDA, an fp8_e4m3 KV cache with a tilelang DSA backend requires "
@@ -768,7 +776,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_tilelang_dsa_fp8_kv(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
