@@ -391,7 +391,7 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         self._current_batch_is_warmup = batch.is_warmup
         if warmup_metrics is not None:
-            warmup_metrics.active_stage_name = stage_name
+            warmup_metrics.active_stage_name = self._component_stage_name()
         try:
             with StageProfiler(
                 stage_name,
