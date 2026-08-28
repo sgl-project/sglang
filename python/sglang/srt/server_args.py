@@ -1283,6 +1283,14 @@ class ServerArgs:
         "connection (1 to 2^32 - 1). Only applies with --enable-http2.",
         NS("serving"),
     ] = 200
+    http2_initial_connection_window_size: A[
+        int,
+        "Initial connection-level HTTP/2 receive window in bytes (1024 to "
+        "2^31 - 1). Only applies with --enable-http2.",
+        NS("serving"),
+    ] = (
+        1024 * 1024
+    )
 
     # -------------------------------------------------------------------------
     # SSL/TLS
