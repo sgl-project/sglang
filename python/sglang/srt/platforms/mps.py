@@ -13,6 +13,7 @@ from __future__ import annotations
 import platform as _platform
 from typing import Optional
 
+import psutil
 import torch
 
 from sglang.srt.platforms.device_mixin import (
