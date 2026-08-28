@@ -276,10 +276,9 @@ def _halve_num_frames(server_args: ServerArgs, num_frames: int) -> int:
     """Halve the latent frame count, keeping the model's frame arithmetic."""
     if num_frames <= 1:
         return num_frames
-    arch_config = getattr(
-        getattr(server_args.pipeline_config, "vae_config", None), "arch_config", None
+    ratio = (
+        server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
     )
-    ratio = getattr(arch_config, "temporal_compression_ratio", None)
     if not ratio or ratio <= 1:
         return max(1, num_frames // 2)
     latent_frames = (num_frames - 1) // ratio + 1
@@ -299,13 +298,13 @@ def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
     if params is None:
         return None
 
-    num_frames = getattr(params, "num_frames", None) or 1
+    num_frames = params.num_frames or 1
     lighter_frames = _halve_num_frames(server_args, num_frames)
     if lighter_frames < num_frames:
         return _replace_warmup_workload(req, num_frames=lighter_frames)
 
-    width = getattr(params, "width", None)
-    height = getattr(params, "height", None)
+    width = params.width
+    height = params.height
     if not width or not height:
         return None
     alignment = _warmup_resolution_alignment(server_args)
