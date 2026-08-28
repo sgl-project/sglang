@@ -133,6 +133,9 @@ class SchedulerLoadInquirer:
             )
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        num_assigned_input_tokens = num_running_input_tokens + sum(
+            len(req.origin_input_ids) for queue in waiting_queues for req in queue
+        )
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
         )
@@ -227,6 +230,7 @@ class SchedulerLoadInquirer:
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,
             num_running_input_tokens=num_running_input_tokens,
+            num_assigned_input_tokens=num_assigned_input_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

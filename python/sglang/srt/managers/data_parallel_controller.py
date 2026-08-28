@@ -112,7 +112,12 @@ class DPBudget:
         self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
 
-    def update_budget(self, loads, require_full_refresh: bool = False):
+    def update_budget(
+        self,
+        loads,
+        require_full_refresh: bool = False,
+        project_pending: bool = False,
+    ):
         """Update budget from shm snapshots, skipping stale reads."""
         if require_full_refresh:
             loads_by_rank = {load.dp_rank: load for load in loads}
@@ -129,9 +134,17 @@ class DPBudget:
             self.total_requests[load.dp_rank] = (
                 load.num_running_reqs + load.num_waiting_reqs
             )
-            self.active_requests[load.dp_rank] = load.num_running_reqs
+            self.active_requests[load.dp_rank] = (
+                load.num_running_reqs + load.num_waiting_reqs
+                if project_pending
+                else load.num_running_reqs
+            )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
-            self.active_tokens[load.dp_rank] = load.num_running_input_tokens
+            self.active_tokens[load.dp_rank] = (
+                load.num_assigned_input_tokens
+                if project_pending
+                else load.num_running_input_tokens
+            )
 
     def dispatch(
         self,
@@ -365,12 +378,14 @@ class DataParallelController:
         if now - self._last_refresh_time < 0.02:
             return
         self._last_refresh_time = now
+        project_pending = (
+            self.load_balance_method == LoadBalanceMethod.ACTIVE_TOKENS
+            and get_disagg().disaggregation_mode == "decode"
+        )
         self.dp_budget.update_budget(
             self.load_snapshot_reader.read_all(),
-            require_full_refresh=(
-                self.load_balance_method == LoadBalanceMethod.ACTIVE_TOKENS
-                and get_disagg().disaggregation_mode == "decode"
-            ),
+            require_full_refresh=project_pending,
+            project_pending=project_pending,
         )
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
