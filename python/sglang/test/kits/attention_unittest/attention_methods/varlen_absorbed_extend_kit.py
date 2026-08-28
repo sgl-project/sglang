@@ -1,14 +1,19 @@
 """Shared numerical-test scaffolding for the varlen absorbed-MLA extend path.
 
-test_trtllm_mla_piecewise.py and test_trtllm_mla_breakable.py exercise the
-same cases and assertions under the two halves of TRTLLMMLABackend's
-use_varlen_absorbed predicate (is_in_tc_piecewise_cuda_graph() vs
-is_in_breakable_cuda_graph()). Only the capture-mode kwarg and the case-name
-prefix differ, so both files import from here instead of maintaining two
-copies of the same case list and assertions.
+test_trtllm_mla_piecewise.py and test_trtllm_mla_breakable.py (both under
+test/registered/attention/unittests/mla/) exercise the same cases and
+assertions under the two halves of TRTLLMMLABackend's use_varlen_absorbed
+predicate (is_in_tc_piecewise_cuda_graph() vs is_in_breakable_cuda_graph()).
+Only the capture-mode kwarg and the case-name prefix differ, so both files
+import from here instead of maintaining two copies of the same case list and
+assertions.
 
-Leading underscore keeps this out of the test collector: it has no
-TestCase subclasses of its own.
+Lives under python/sglang/test/kits/ rather than test/registered/: files
+under test/registered/ must each carry a CI registry call
+(scripts/lint/check_registered_tests.py enforces this), which does not fit a
+shared-helper module with no TestCase classes of its own -- the same reason
+run_mla_attention_case() etc. live in mla_attention.py in this same
+directory rather than in test/registered/.
 """
 
 from __future__ import annotations
