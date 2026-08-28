@@ -10,18 +10,19 @@ mod suite {
 
     use axum::{
         Json, Router,
-        body::{Body, to_bytes},
+        body::{Body, Bytes, to_bytes},
         extract::State,
-        http::{Request, StatusCode},
+        http::{HeaderMap, Request, StatusCode},
         response::sse::{Event, Sse},
-        routing::post,
+        response::{IntoResponse, Redirect},
+        routing::{get, post},
     };
     use tokio::sync::Barrier;
     use tower::ServiceExt;
 
     use super::super::{
         ChatCompletionRequest, CompletionRequest, HttpGenerateClient, OpenAIHttpFrontend,
-        standalone_routes,
+        hosted_routes, standalone_routes,
     };
     use crate::openai::protocol::{
         lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
@@ -448,6 +449,122 @@ mod suite {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hosted_routes_leave_rust_server_routes_authoritative() {
+        async fn native(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+            (
+                StatusCode::ACCEPTED,
+                [("x-rust-server", "native")],
+                format!(
+                    "{}:{}",
+                    headers
+                        .get("x-request-marker")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default(),
+                    String::from_utf8_lossy(&body)
+                ),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/health",
+                        get(|| async {
+                            (
+                                StatusCode::IM_A_TEAPOT,
+                                [("x-rust-server", "health")],
+                                "rust health",
+                            )
+                        }),
+                    )
+                    .route("/native", post(native))
+                    .route(
+                        "/redirect",
+                        get(|| async { Redirect::temporary("/native") }),
+                    )
+                    .route("/generate", post(generate))
+                    .fallback(|| async {
+                        (
+                            StatusCode::NOT_FOUND,
+                            [("x-rust-server", "fallback")],
+                            "rust missing",
+                        )
+                    })
+                    .with_state(EngineState {
+                        requests: Arc::new(Mutex::new(Vec::new())),
+                    }),
+            )
+            .into_future(),
+        );
+        let renderer = Arc::new(RendererService::with_tokenizer(
+            renderer_config(),
+            Arc::new(WordTokenizer),
+            2,
+            2,
+        ));
+        let client =
+            HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
+        let app = hosted_routes(
+            OpenAIHttpFrontend::new(renderer, client),
+            format!("http://{address}"),
+        )
+        .unwrap();
+
+        let health = app
+            .clone()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(health.headers()["x-rust-server"], "health");
+        assert_eq!(
+            to_bytes(health.into_body(), 1024).await.unwrap(),
+            "rust health"
+        );
+
+        let native = app
+            .clone()
+            .oneshot(
+                Request::post("/native?room=7")
+                    .header("x-request-marker", "forwarded")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(native.status(), StatusCode::ACCEPTED);
+        assert_eq!(native.headers()["x-rust-server"], "native");
+        assert_eq!(
+            to_bytes(native.into_body(), 1024).await.unwrap(),
+            "forwarded:payload"
+        );
+
+        let redirect = app
+            .clone()
+            .oneshot(Request::get("/redirect").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(redirect.headers()["location"], "/native");
+
+        let missing = app
+            .oneshot(Request::get("/missing").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        upstream.abort();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.headers()["x-rust-server"], "fallback");
+        assert_eq!(
+            to_bytes(missing.into_body(), 1024).await.unwrap(),
+            "rust missing"
+        );
     }
 
     #[tokio::test]

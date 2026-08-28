@@ -22,10 +22,13 @@ use super::{
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
     Router::new()
-        .route("/health", get(health))
         .route("/v1/chat/completions/render", post(render_chat))
         .route("/v1/completions/render", post(render_completions))
         .with_state(renderer)
+}
+
+pub(super) fn health_route() -> Router<()> {
+    Router::new().route("/health", get(health))
 }
 
 async fn health() -> StatusCode {

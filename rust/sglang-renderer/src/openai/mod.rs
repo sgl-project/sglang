@@ -66,5 +66,22 @@ pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> Co
 
 pub(crate) fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
-    inference_routes(frontend).merge(render::routes(renderer))
+    inference_routes(frontend)
+        .merge(render::routes(renderer))
+        .merge(render::health_route())
+}
+
+pub(crate) fn hosted_routes(
+    frontend: OpenAIHttpFrontend,
+    fallback_url: String,
+) -> Result<Router<()>, String> {
+    let renderer = frontend.renderer.clone();
+    let proxy = crate::runtime::RustServerProxy::new(fallback_url)?;
+    Ok(inference_routes(frontend)
+        .merge(render::routes(renderer))
+        .fallback(move |request| {
+            let proxy = proxy.clone();
+            async move { proxy.forward(request).await }
+        })
+        .layer(axum::extract::DefaultBodyLimit::disable()))
 }

@@ -563,7 +563,7 @@ class TestOpenAICompletionWithRust(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            env={"SGLANG_RUST_SERVER": "1"},
+            env={"SGLANG_RUST_SERVER": "1", "SGLANG_RUST_RENDERER": "1"},
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)

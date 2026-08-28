@@ -10,6 +10,8 @@ mod config;
 mod engine;
 mod error;
 #[cfg(feature = "http")]
+mod launcher;
+#[cfg(feature = "http")]
 mod openai;
 mod preprocessing;
 mod response;
@@ -24,6 +26,8 @@ pub(crate) use engine::{
     MatchedStop, PositionLogprobs, TokenLogprob,
 };
 pub use error::{RendererError, RendererErrorKind};
+#[cfg(feature = "http")]
+pub use launcher::run_cli;
 pub(crate) use preprocessing::ChatFormatter;
 #[cfg(feature = "http")]
 pub(crate) use preprocessing::SamplingParamsOverrides;

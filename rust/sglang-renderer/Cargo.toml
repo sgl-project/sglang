@@ -14,10 +14,13 @@ debug = false
 default = []
 http = [
     "dep:axum",
+    "dep:clap",
     "dep:reqwest",
     "dep:tokio",
     "dep:tracing-subscriber",
     "dep:uuid",
+    "hf-hub/rustls-tls",
+    "hf-hub/tokio",
 ]
 
 [[bin]]
@@ -37,6 +40,7 @@ tokio = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 axum = { version = "0.8.9", features = ["json"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"], optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 dynamo-parsers = "7.0.1"

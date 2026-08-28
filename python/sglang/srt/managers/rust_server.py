@@ -44,6 +44,7 @@ from sglang.version import __version__
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
+    from sglang.srt.managers.rust_renderer import RustRendererHost
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
     from sglang.srt.server_args import ServerArgs
@@ -364,10 +365,12 @@ class RustServer:
         self,
         server: Server,
         mm_spec: Optional[NativeMmSpec] = None,
+        renderer_host: Optional[RustRendererHost] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
         self.mm_spec = mm_spec
+        self.renderer_host = renderer_host
         self._max_per_poll = max_per_poll
 
     @classmethod
@@ -405,6 +408,17 @@ class RustServer:
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
             http_addr = f"{get_serving().host}:{server_args.port + dp_rank}"
+        renderer_host = None
+        if envs.SGLANG_RUST_RENDERER.get():
+            from sglang.srt.managers.rust_renderer import RustRendererHost
+
+            renderer_host = RustRendererHost(
+                resolving_view(server_args),
+                scheduler.model_config,
+                http_addr,
+                compute_num_reserved_tokens(),
+            )
+            http_addr = renderer_host.internal_server_addr.to_host_port_str()
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -455,6 +469,13 @@ class RustServer:
                 )
             server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
 
+        if renderer_host is not None:
+            try:
+                renderer_host.start(server_cores)
+            except BaseException:
+                server.shutdown()
+                raise
+
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
             try:
@@ -474,7 +495,7 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec)
+        return cls(server, mm_spec=mm_spec, renderer_host=renderer_host)
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -536,6 +557,11 @@ class RustServer:
                     obj.mm_inputs = NativeMmHost.build_native_mm(self.mm_spec, native)
             out.append(obj)
         return out
+
+    def close(self) -> None:
+        """Release optional processes owned by this server wrapper."""
+        if self.renderer_host is not None:
+            self.renderer_host.stop()
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

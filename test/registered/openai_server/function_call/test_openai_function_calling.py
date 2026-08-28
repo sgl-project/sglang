@@ -936,7 +936,7 @@ class TestOpenAIFunctionCallingWithRust(TestOpenAIServerFunctionCalling):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=["--tool-call-parser", "llama3"],
-            env={"SGLANG_RUST_SERVER": "1"},
+            env={"SGLANG_RUST_SERVER": "1", "SGLANG_RUST_RENDERER": "1"},
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
@@ -960,7 +960,7 @@ class TestOpenAIPythonicFunctionCallingWithRust(TestOpenAIPythonicFunctionCallin
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=["--tool-call-parser", "pythonic"],
-            env={"SGLANG_RUST_SERVER": "1"},
+            env={"SGLANG_RUST_SERVER": "1", "SGLANG_RUST_RENDERER": "1"},
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)

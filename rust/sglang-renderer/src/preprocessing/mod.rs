@@ -25,3 +25,5 @@ pub(crate) fn load_test_chat_formatter(name: &str) -> ChatFormatter {
     template::load_chat_formatter(None, None, Some(name)).unwrap()
 }
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+#[cfg(feature = "http")]
+pub(crate) use tokenizer::{resolve_model_file, resolve_tokenizer_file};
