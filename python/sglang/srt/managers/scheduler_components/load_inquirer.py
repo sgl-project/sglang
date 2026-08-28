@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _num_origin_input_tokens(req) -> int:
+    req = getattr(req, "req", req)
+    return len(req.origin_input_ids)
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
@@ -135,7 +140,9 @@ class SchedulerLoadInquirer:
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
         num_assigned_input_tokens = num_running_input_tokens + sum(
-            len(req.origin_input_ids) for queue in waiting_queues for req in queue
+            _num_origin_input_tokens(req)
+            for queue in waiting_queues
+            for req in queue
         )
         num_used_tokens, kv_token_usage = (
             self.pool_stats_observer.get_pool_stats().get_kv_token_stats()

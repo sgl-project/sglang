@@ -9,6 +9,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
+    _num_origin_input_tokens,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -64,6 +65,11 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
             120,
         )
+
+    def test_origin_input_tokens_accept_decode_request_wrapper(self):
+        req = SimpleNamespace(origin_input_ids=[1, 2, 3])
+
+        self.assertEqual(_num_origin_input_tokens(SimpleNamespace(req=req)), 3)
 
 
 if __name__ == "__main__":
