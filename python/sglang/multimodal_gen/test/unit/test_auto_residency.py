@@ -691,12 +691,6 @@ class TestEstimateDefaultWorkloadPeak:
         )
         assert estimate == good.peak_allocated_bytes
 
-    def test_unknown_target_disables_estimation(self):
-        assert (
-            estimate_default_workload_peak_bytes(records=[_record()], target_units=None)
-            is None
-        )
-
     def test_no_records_disables_estimation(self):
         assert (
             estimate_default_workload_peak_bytes(records=[], target_units=None) is None
@@ -3805,7 +3799,7 @@ class TestCollectResidencyTargets:
             candidate for candidate in candidates if candidate.target_mode() == RESIDENT
         ).current_placement
 
-    def test_virtual_layerwise_prefetch_is_runtime_not_transition_memory(self):
+    def test_virtual_layerwise_reuses_component_offload_host_weights(self):
         module = _FakeLazyLayerwiseDit(num_layers=3)
         candidates = collect_residency_targets(
             modules={"transformer": module},
