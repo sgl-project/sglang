@@ -24,7 +24,12 @@ export const config = {
   ],
 
   isRecommendedSelection(s) {
-    const pairing = ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw)
+    // Hopper: BF16 KV with the DSA backend left to auto-detection (measured +9.0% output
+    // tok/s and -12.7% TTFT p95 on 8x H200 vs pinning TileLang). ROCm keeps the TileLang
+    // pin, which is its validated default. Blackwell keeps FP8 + TRT-LLM.
+    const pairing = ["h100", "h200"].includes(s.hw)
+      ? "bf16-auto"
+      : ["mi300x", "mi325x", "mi355x"].includes(s.hw)
       ? "bf16-tilelang"
       : "fp8-trtllm";
     return (
@@ -55,6 +60,18 @@ export const config = {
           hints: ["Measured on GB300: faster than BF16 + TileLang with about 1.8x the KV token capacity."],
         },
         {
+          id: "bf16-auto",
+          label: "BF16 + auto DSA",
+          disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
+          disableReason:
+            "Auto-detected DSA has not been validated on ROCm for this model; the AMD recipes pin TileLang.",
+          stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
+          flags: ["--kv-cache-dtype bfloat16"],
+          hints: [
+            "Leaves the DSA backend to auto-detection, which resolves to flashmla_sparse prefill + fa3 decode on Hopper (SM90) and flashmla_sparse + trtllm on Blackwell (SM100+). Measured on 8x H200 (TP8/EP8, real weights, warmed plateau, 24k shared-prefix multi-turn traffic): 589.9 vs 541.1 output tok/s at concurrency 32 (+9.0%) and 346.5 vs 299.8 at concurrency 128 (+15.6%), with TTFT p95 20.98s vs 24.04s (-12.7%). Run-to-run spread was 0.07-0.26%. The gain scales with context length: on random 1024/256 the same swap is worth only +1.4% to +5.1%.",
+          ],
+        },
+        {
           id: "bf16-tilelang",
           label: "BF16 + TileLang",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
@@ -62,6 +79,9 @@ export const config = {
             "--kv-cache-dtype bfloat16",
             "--dsa-prefill-backend tilelang",
             "--dsa-decode-backend tilelang",
+          ],
+          hints: [
+            "Pins TileLang for both DSA phases. This is the validated default on ROCm. On CUDA it is measurably slower than auto-detection on long-context traffic (see BF16 + auto DSA) and is retained here for reproducing the earlier published numbers.",
           ],
         },
       ],
@@ -407,8 +427,6 @@ sgl-eval run gsm8k \\
         "--tp-size 8",
         "--ep-size 8",
         "--mem-fraction-static 0.70",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
         "--speculative-algorithm EAGLE",
@@ -434,8 +452,6 @@ sgl-eval run gsm8k \\
         "--tp-size 8",
         "--ep-size 8",
         "--mem-fraction-static 0.75",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
         "--reasoning-parser glm45",
@@ -458,8 +474,6 @@ sgl-eval run gsm8k \\
         "--tp-size 8",
         "--ep-size 8",
         "--mem-fraction-static 0.75",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
         "--speculative-algorithm EAGLE",
@@ -484,8 +498,6 @@ sgl-eval run gsm8k \\
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--ep-size 8",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
         "--reasoning-parser glm45",

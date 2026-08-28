@@ -188,7 +188,9 @@ export const benchmarks = [
     sglang_version: "f040cc72e6",
     accuracy: { gsm8k_pct: 97.50 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.50% for the recommended selection; 97.27-97.50% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.50% for the recommended selection; 97.27-97.50% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement. " +
+      "DSA backend selection on this cell is NOT MEASURED ON H100. The `--dsa-*-backend tilelang` pin was dropped here on two grounds: (1) `_dsa_split_backend_resolution` in python/sglang/srt/arg_groups/overrides.py branches only on `torch.cuda.get_device_capability()[0]`, and H100 and H200 are both SM90, so auto-detection resolves to the identical flashmla_sparse + fa3 pair on either card; (2) the swap was measured on 8x H200 at +9.0% output tok/s / -12.7% TTFT p95 with GSM8K parity. Both cards are the same GH100 die and differ only in HBM, so the kernel path is the same, but no H100 node was available to confirm the delta or re-run the accuracy gate. Treat the H100 speed claim as inherited from H200, not verified. " +
+      "Note also that 80 GB cards are materially more pool-constrained than the 141 GB H200: after ~38 GB/rank of weights and the fp32 KDA state pool, an 8x H100 node serves roughly 36-45 concurrent requests at ~30k context (derived, not measured), so `--mamba-full-memory-ratio` matters more here than on H200 -- see the note on the h200 cell.",
   },
   {
     match: { hw: "h200", strategy: "low-latency" },
@@ -202,7 +204,11 @@ export const benchmarks = [
     sglang_version: "f040cc72e6",
     accuracy: { gsm8k_pct: 97.35 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.35% for the recommended selection; 97.19-97.57% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+      "Full GSM8K (all 1,319 problems) on 8x H200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.35% for the recommended selection; 97.19-97.57% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. " +
+      "DSA backend selection (measured on 8x H200 TP8/EP8, real weights, lmsysorg/sglang:glm-5.3-flash, warmed plateau with the first rep discarded, 24k shared-prefix 3-turn traffic at 16k chunked prefill): leaving DSA to auto-detection -- which resolves to flashmla_sparse prefill + fa3 decode on SM90 -- gave 589.9 output tok/s at concurrency 32 and 346.5 at 128, versus 541.1 and 299.8 with the previously published `--dsa-*-backend tilelang` pin: +9.0% and +15.6%, TTFT p95 20.98s vs 24.04s (-12.7%). Rep-to-rep spread 0.07-0.26%. " +
+      "Accuracy parity for that swap was checked on the same box and weights with a 5-shot completion GSM8K over all 1,319 problems: 91.9% auto vs 92.2% pinned, a 0.3-point gap against a 0.75-point binomial standard error, zero invalid generations in either arm. That harness is completion-style and is NOT comparable to the 97.35% chat-style figure above; it is an A/B control only. " +
+      "The gain is context-dependent: on random 1024/256 the same swap is worth only +1.4% to +5.1%, consistent with index_topk=2048 exceeding a 1k prompt entirely. " +
+      "Measured and deliberately NOT changed: `--moe-runner-backend triton` is 6.3% (c=32) and 11.9% (c=128) slower than deep_gemm on this workload even after tuning a fused-MoE config for this model's E=36/N=2048 geometry, so deep_gemm remains the recommendation.",
   },
   {
     match: { hw: "b200", strategy: "low-latency" },
