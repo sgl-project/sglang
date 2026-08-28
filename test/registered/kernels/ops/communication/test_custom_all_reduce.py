@@ -34,6 +34,11 @@ from sglang.kernels.ops.communication.all_reduce import (
     get_all_reduce_module,
 )
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+    _MULTINODE_LAMPORT,
+    get_all_reduce_config,
+    get_supported_world_sizes,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     _ALIGN_BYTES,
     CustomAllReduceV2,
@@ -237,8 +242,7 @@ def test_custom_all_reduce(
 
 
 def test_empty_input_dispatches_like_the_smallest_one() -> None:
-    """A zero-byte all-reduce must not take a different code path.
-    """
+    """A zero-byte all-reduce must not take a different code path."""
     comm = _init_comm_once()
     for can_use_graph in (True, False):
         empty, smallest = (
@@ -248,6 +252,28 @@ def test_empty_input_dispatches_like_the_smallest_one() -> None:
             f"{can_use_graph=}: empty input picked {empty}, 16 bytes picked "
             f"{smallest}"
         )
+
+
+def test_multinode_only_retunes_the_eager_lamport_band() -> None:
+    cuda_major, _ = torch.cuda.get_device_capability()
+    tuned = {
+        world_size: band
+        for (major, world_size), band in _MULTINODE_LAMPORT.items()
+        if major == cuda_major
+    }
+    for world_size in get_supported_world_sizes():
+        single = get_all_reduce_config(world_size)
+        multi = get_all_reduce_config(world_size, multinode=True)
+        band = tuned.get(world_size)
+        if band is None:
+            assert multi == single, f"{world_size=} has no multi-node entry"
+            continue
+        assert multi.eager.lamport == band
+        assert multi == single._replace(
+            eager=single.eager._replace(lamport=band)
+        ), f"{world_size=} multi-node override reached past eager.lamport"
+        # the band has to stay inside the pull workspace it stages through
+        assert band.max_bytes <= multi.eager.max_pull_bytes
 
 
 @torch.inference_mode()

@@ -156,7 +156,13 @@ class CustomAllReduceV2:
         self.device = device
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-        base_config = get_all_reduce_config(self.world_size)
+        # A multi-node (MNNVL) group keeps the symm-mem workspace plane but
+        # loses graph zero-copy input registration (cudaIpc / node-local VMM
+        # remap), and its crossovers differ from a single node at the same
+        # world size — so it picks both a different config and eager-only
+        # dispatch below.
+        is_multinode = not all(in_the_same_node_as(group, source_rank=0))
+        base_config = get_all_reduce_config(self.world_size, multinode=is_multinode)
         if max_pull_size is None:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
@@ -220,10 +226,6 @@ class CustomAllReduceV2:
             max_lamport_bytes=self.max_lamport_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
-        # On a multi-node (MNNVL) group the symm-mem workspace plane works
-        # across nodes, but graph zero-copy input registration (cudaIpc /
-        # node-local VMM remap) does not — force eager pull inside graphs.
-        is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
         # device-side pointer table: one row of world_size pointers per
@@ -314,9 +316,7 @@ class CustomAllReduceV2:
                 self.rank,
                 self.world_size,
                 workspaces=slice_all([pull_bytes], pull_offset),
-                semaphores=slice_all(
-                    [num_sem_blocks, _SEMAPHORE_BYTES], sem_offset
-                ),
+                semaphores=slice_all([num_sem_blocks, _SEMAPHORE_BYTES], sem_offset),
                 mc_workspace=mc_at(pull_offset),
                 mc_semaphore=mc_at(sem_offset),
             )

@@ -341,11 +341,29 @@ def get_supported_world_sizes() -> tuple[int, ...]:
     return tuple(_get_all_reduce_configs())
 
 
+_MULTINODE_LAMPORT: dict[tuple[int, int], Range] = {
+    # 2 x GB200 (4 GPUs each). lamport beats mc 2shot_pull by 3-30% here and
+    # loses to it from 4 MB up; below 512 KB 1shot_push is still ahead.
+    (10, 8): Range(512 * KB, int(3.5 * MB)),
+}
+
+
 @cache
-def get_all_reduce_config(world_size: int) -> AllReduceConfig:
+def get_all_reduce_config(world_size: int, multinode: bool = False) -> AllReduceConfig:
     """Tuned thresholds and block counts for the current arch / world size.
 
     Only SM90, SM100 and SM107 are benchmarked so far; other archs get a
     conservative default (1 MB one-shot crossovers, no multicast).
+
+    ``multinode`` swaps in a separately tuned ``2shot_lamport`` band where one
+    exists. Only the eager row can differ: a multi-node group forces eager
+    anyway, because graph zero-copy input registration is node-local.
     """
-    return _get_all_reduce_configs()[world_size]
+    config = _get_all_reduce_configs()[world_size]
+    if not multinode:
+        return config
+    cuda_major, _ = torch.cuda.get_device_capability()
+    band = _MULTINODE_LAMPORT.get((cuda_major, world_size))
+    if band is None:
+        return config
+    return config._replace(eager=config.eager._replace(lamport=band))

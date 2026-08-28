@@ -38,7 +38,10 @@ WORLD_SIZES = list(range(2, 9)) + [16]
 MAX_BYTES = max(MESSAGE_SIZES_KB) * 1024
 # trtllm allreduce_fusion only supports these world sizes.
 FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
-# AOT custom_all_reduce (v1) only supports these world sizes.
+# AOT custom_all_reduce (v1) only supports these world sizes -- and only within
+# one node: it publishes its workspace through cudaIpc, so
+# `can_use_custom_all_reduce_with_nvlink` disables it on a multi-node group.
+# The v2 planes rendezvous over fabric handles and do cross nodes.
 AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
 # jit-eager times the naive-loop dispatch (eager heuristics); jit-graph
 # captures the calls in a CUDA graph (graph heuristics + pointer table).
@@ -207,6 +210,13 @@ BACKEND_FACTORY = {
 
 
 @cache_once
+def _is_multinode() -> bool:
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+    return not all(in_the_same_node_as(_init_cpu_group(), source_rank=0))
+
+
+@cache_once
 def _init_all_backends() -> None:
     """Pre-build every supported backend before any timed iteration so JIT
     compilation / IPC setup don't bleed into the first measured size.
@@ -219,6 +229,8 @@ def _init_all_backends() -> None:
     factories = dict(BACKEND_FACTORY)
     if world_size not in AOT_SUPPORTED_WORLD_SIZES:
         factories.pop("aot")
+    if _is_multinode():
+        factories.pop("aot", None)  # cudaIpc: cannot leave the node
     if world_size not in FI_SUPPORTED_WORLD_SIZES:
         factories.pop("fi")
     for fn in factories.values():
@@ -248,6 +260,10 @@ def benchmark(message_KB: int, provider: str):
         marker.skip(
             f"AOT custom_all_reduce needs world_size in " f"{AOT_SUPPORTED_WORLD_SIZES}"
         )
+    if provider == "aot" and _is_multinode():
+        marker.skip("AOT custom_all_reduce is cudaIpc-based: single node only")
+    if provider == "jit-graph" and _is_multinode():
+        marker.skip("no graph context across nodes: jit-graph == jit-eager")
     _init_all_backends()
     backend = BACKEND_FACTORY[provider]()
     message_bytes = message_KB * 1024
@@ -272,6 +288,18 @@ def benchmark(message_KB: int, provider: str):
 
 
 if __name__ == "__main__":
+    # `python bench_custom_all_reduce.py [--num-gpu N,...]` relaunches itself
+    # under a single-node torchrun, once per world size. For more GPUs than one
+    # node has, drive it with your own torchrun instead -- `multigpu_launch`
+    # detects that and runs the sweep in place:
+    #
+    #   torchrun --nnodes=2 --nproc_per_node=4 --node_rank=$R \
+    #     --master_addr=$MASTER --master_port=$PORT --rdzv_backend=static \
+    #     bench_custom_all_reduce.py
+    #
+    # A multi-node group needs a VMM-backed allocator for the v2 planes to
+    # rendezvous (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`), and
+    # reports `aot` / `jit-graph` as skipped for the reasons above.
     multigpu_bench_main(
         name=__name__,
         file=__file__,
