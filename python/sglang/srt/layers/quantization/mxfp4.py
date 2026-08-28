@@ -40,6 +40,10 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.moonmath_mxfp4_moe import (
+    repack_moonmath_mxfp4_weights,
+    use_moonmath_mxfp4_moe,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
@@ -877,6 +881,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .contiguous()
                         .view(-1, n)
                     )
+
+            layer.mxfp4_moonmath = use_moonmath_mxfp4_moe(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size_per_partition,
+                activation=layer.moe_runner_config.activation,
+                apply_router_weight_on_input=(
+                    layer.moe_runner_config.apply_router_weight_on_input
+                ),
+                has_bias=self.with_bias,
+            )
+            if layer.mxfp4_moonmath:
+                repack_moonmath_mxfp4_weights(layer)
+                return
 
             k3_situ_a8w4 = (
                 os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
@@ -1732,6 +1749,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 quant_type=AiterQuantType.PER_1X32,
                 w13_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                mxfp4_moonmath=getattr(layer, "mxfp4_moonmath", False),
+                ep_rank=layer.moe_ep_rank,
                 b13=layer.w13_weight_bias if self.with_bias else None,
                 b2=layer.w2_weight_bias if self.with_bias else None,
                 expert_mask=layer.dispatcher.expert_mask_gpu,

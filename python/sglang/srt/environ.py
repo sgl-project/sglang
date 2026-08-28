@@ -750,6 +750,10 @@ class Envs:
     # has no kernel past qseqlen 4, so a larger draft window aborts without it.
     # Set false to force the aiter path for A/B.
     SGLANG_MOONMATH_MLA_MULTIQ_VERIFY = EnvBool(True)
+    # Route gfx942 MXFP4 MoE through moonmath_amd's hand-written GEMMs. On by
+    # default where they apply; the route additionally requires gfx942, the
+    # package, and a shape the kernels are compiled for. Set false to opt out.
+    SGLANG_USE_MOONMATH_MXFP4_MOE = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

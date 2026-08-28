@@ -60,6 +60,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    mxfp4_moonmath: bool = False
+    ep_rank: int = 0
 
 
 @dataclass
@@ -148,6 +150,37 @@ class AiterRunnerCore(MoeRunnerCore):
                     )
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
+
+        if quant_info.mxfp4_moonmath:
+            # aiter.fused_moe below has no gfx942 a4w4 path and aborts; these
+            # hand-written HIP GEMMs do run on CDNA3. The route reads a repacked
+            # weight layout, so which layers got it was decided at weight load.
+            from sglang.srt.layers.moe.moe_runner.moonmath_mxfp4_moe import (
+                fused_moe_mxfp4_moonmath,
+            )
+
+            out = fused_moe_mxfp4_moonmath(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                situ_beta=(
+                    float(self.config.gemm1_alpha)
+                    if self.config.gemm1_alpha is not None
+                    else 4.0
+                ),
+                situ_linear_beta=(
+                    float(self.config.gemm1_clamp_limit)
+                    if self.config.gemm1_clamp_limit is not None
+                    else 25.0
+                ),
+                num_global_experts=self.config.num_experts,
+                ep_rank=quant_info.ep_rank,
+            )
+            return AiterRunnerOutput(hidden_states=out)
 
         from aiter.fused_moe import fused_moe
 
