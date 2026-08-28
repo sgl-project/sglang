@@ -92,7 +92,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
-    is_dit_component_name,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
@@ -1825,10 +1824,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _latest_auto_residency_round_supports_short_validation(self) -> bool:
         """Whether one full-shape step covers every changed execution path."""
-        changes = self._latest_auto_residency_round()
-        return self._latest_auto_residency_round_is_resident_only() and all(
-            not is_dit_component_name(change.component_name) for change in changes
-        )
+        return self._latest_auto_residency_round_is_resident_only()
 
     def _rollback_applied_residency_changes(
         self, *, latest_round_only: bool = False

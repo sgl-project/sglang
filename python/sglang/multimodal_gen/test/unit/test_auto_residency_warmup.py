@@ -171,7 +171,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         plan.assert_not_called()
         apply.assert_not_called()
 
-    def test_aux_resident_promotion_uses_short_validation_but_dit_does_not(self):
+    def test_resident_promotions_use_short_validation(self):
         worker = GPUWorker.__new__(GPUWorker)
         worker.server_args = SimpleNamespace(residency_mode=lambda _name: RESIDENT)
         worker._auto_residency_round_sizes = [1]
@@ -184,9 +184,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._auto_residency_applied = [
             AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
         ]
-        self.assertFalse(
-            worker._latest_auto_residency_round_supports_short_validation()
-        )
+        self.assertTrue(worker._latest_auto_residency_round_supports_short_validation())
 
     def test_worker_rollback_response_rewarms_the_restored_layout(self):
         actions = []
