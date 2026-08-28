@@ -72,16 +72,31 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "PetitNvFp4Config":
-        quant_config = cls.get_from_keys(config, ["quantization"])
+        quant_config = config.get("quantization", config)
         quant_method = quant_config["quant_algo"]
         group_size = quant_config.get("group_size", None)
+        if group_size is None:
+            config_groups = quant_config.get("config_groups", {})
+            first_group = next(iter(config_groups.values()), {})
+            group_size = first_group.get("weights", {}).get("group_size")
+        if group_size is None and quant_method == "NVFP4":
+            group_size = 16
         verify_petit_nvfp4_supported(quant_method, group_size)
 
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
-        kv_cache_quant_algo = quant_config["kv_cache_quant_algo"]
+        kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
+        kv_cache_scheme = quant_config.get("kv_cache_scheme")
+        if kv_cache_quant_algo is None and isinstance(kv_cache_scheme, dict):
+            if (
+                kv_cache_scheme.get("type") == "float"
+                and kv_cache_scheme.get("num_bits") == 8
+            ):
+                kv_cache_quant_algo = "FP8"
         if not kv_cache_quant_algo:
             kv_cache_quant_algo = "auto"
-        exclude_modules = quant_config.get("exclude_modules", None)
+        exclude_modules = quant_config.get(
+            "exclude_modules", quant_config.get("ignore")
+        )
         if not (group_size and kv_cache_quant_algo and (exclude_modules is not None)):
             logger.warning(
                 f"group_size: {group_size},"
@@ -252,4 +267,5 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,
+            backend=layer.nvfp4_backend,
         )

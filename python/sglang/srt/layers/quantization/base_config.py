@@ -200,6 +200,17 @@ class QuantizationConfig(ABC):
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 
+        if quant_algo == "NVFP4":
+            if user_quant == "petit_nvfp4":
+                return user_quant
+
+            if torch.version.hip is not None and user_quant in (
+                None,
+                "modelopt",
+                "modelopt_fp4",
+            ):
+                return "petit_nvfp4"
+
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
             canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
