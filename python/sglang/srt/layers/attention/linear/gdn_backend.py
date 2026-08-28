@@ -421,9 +421,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        super().init_forward_metadata_out_graph(
-            forward_batch, in_capture=in_capture
-        )
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -467,14 +465,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and getattr(mamba_pool, "replayssm_cache_base", None) is not None
             and is_gdn_replayssm
         )
-        self._use_strided_target_verify_qkv = (
-            self._target_verify_supports_strided_qkv(
-                retrieve_parent_token=metadata.retrieve_parent_token,
-                use_replayssm_fold=use_replayssm_fold,
-                use_replayssm_spec=use_replayssm_spec,
-                ssm_dtype=mamba_cache.temporal.dtype,
-                draft_token_num=forward_batch.spec_info.draft_token_num,
-            )
+        self._use_strided_target_verify_qkv = self._target_verify_supports_strided_qkv(
+            retrieve_parent_token=metadata.retrieve_parent_token,
+            use_replayssm_fold=use_replayssm_fold,
+            use_replayssm_spec=use_replayssm_spec,
+            ssm_dtype=mamba_cache.temporal.dtype,
+            draft_token_num=forward_batch.spec_info.draft_token_num,
         )
 
     def _replayssm_fold_uses_cutedsl(
