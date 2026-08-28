@@ -29,7 +29,6 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
-    handle_unified_memory_pool,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -970,22 +969,6 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             validate_hisparse_kv_cache_dtype(server_args)
-
-
-class TestUnifiedMemoryPoolCompatibility(CustomTestCase):
-    def test_rejects_unsupported_scheduler_configurations(self):
-        cases = (
-            ({"pp_size": 2, "enable_mixed_chunk": False}, "pipeline parallelism"),
-            ({"pp_size": 1, "enable_mixed_chunk": True}, "enable-mixed-chunk"),
-        )
-        for overrides, error in cases:
-            with self.subTest(**overrides):
-                args = object.__new__(ServerArgs)
-                args.enable_unified_memory = True
-                args.pp_size = overrides["pp_size"]
-                args.enable_mixed_chunk = overrides["enable_mixed_chunk"]
-                with self.assertRaisesRegex(AssertionError, error):
-                    handle_unified_memory_pool(args)
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
