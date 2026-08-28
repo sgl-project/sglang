@@ -300,6 +300,50 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         self.assertTrue(torch.all(output[:2] == 3))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
+    def test_impl_rank4_query_restores_token_axis_before_narrowing(self):
+        # Regression: Gemma3 can supply Q/output as [1, padded_tokens, heads, dim].
+        # Treating dim 0 as tokens leaves Q untrimmed, violates the ragged-attention
+        # row-count invariant, and prevents the padded output tail from being zeroed.
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer])
+        context.num_tokens = 4
+        context.raw_num_tokens = 2
+        backend = _RecordingAttentionBackend(return_lse=False)
+        query = torch.zeros((1, 4, 2, 3))
+        key = torch.zeros((4, 2, 3))
+        value = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                key,
+                value,
+                output,
+                False,
+                0,
+                False,
+                False,
+            )
+
+        call_record = backend.calls[-1]
+        self.assertIsNone(lse)
+        self.assertEqual(call_record.query.shape, (2, 2, 3))
+        self.assertEqual(call_record.key.shape, (2, 2, 3))
+        self.assertEqual(call_record.value.shape, (2, 2, 3))
+        self.assertEqual(call_record.output.shape, (2, 2, 3))
+        self.assertTrue(torch.all(output[:, :2] == 3))
+        self.assertTrue(torch.all(output[:, 2:] == 0))
+
     def test_impl_zero_real_tokens_returns_zeroed_lse(self):
         # Regression: an idle DP rank whose fabricated EXTEND batch is masked to
         # 0 real tokens skips attention entirely. The skip must still honor the

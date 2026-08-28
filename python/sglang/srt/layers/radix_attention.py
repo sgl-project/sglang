@@ -76,6 +76,22 @@ def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
             buf.zero_()
 
 
+def _restore_token_axis(
+    query: torch.Tensor, output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Remove a singleton model batch axis before token-based PCG slicing."""
+    if query.ndim <= 3:
+        return query, output
+
+    assert query.ndim == 4
+    assert query.shape[0] == 1
+    query = query.squeeze(0)
+    if output.ndim == 4:
+        assert output.shape[0] == 1
+        output = output.squeeze(0)
+    return query, output
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -338,6 +354,7 @@ def _unified_attention_with_output_impl(
             )
         return None
 
+    query, output = _restore_token_axis(query, output)
     query = query[:real_query_num_tokens]
     if key is not None:
         key = key[:key_value_num_tokens]
