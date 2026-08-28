@@ -46,6 +46,62 @@ def _jit_topk_v2_module():
     )
 
 
+@cache_once
+def _jit_dcp_topk_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("dcp_topk"),
+        *args,
+        cuda_files=["deepseek_v4/dcp_topk.cuh"],
+        cuda_wrappers=[
+            ("dcp_topk_candidates", f"DCPTopKKernel<{args}>::candidates"),
+            ("dcp_topk_merge", f"DCPTopKKernel<{args}>::merge"),
+        ],
+    )
+
+
+def dcp_topk_candidates(
+    scores: torch.Tensor,
+    local_lens: torch.Tensor,
+    out_candidates: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    if not is_hip_runtime():
+        raise NotImplementedError("The packed DCP C4 candidate kernel requires ROCm")
+    _jit_dcp_topk_module().dcp_topk_candidates(
+        scores,
+        local_lens,
+        out_candidates,
+        dcp_size,
+        dcp_rank,
+    )
+
+
+def dcp_topk_merge(
+    gathered_candidates: torch.Tensor,
+    local_page_table: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    out_local_lens: torch.Tensor,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    out_local_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    if not is_hip_runtime():
+        raise NotImplementedError("The packed DCP C4 merge kernel requires ROCm")
+    _jit_dcp_topk_module().dcp_topk_merge(
+        gathered_candidates,
+        local_page_table,
+        out_page_indices,
+        out_local_lens,
+        page_size,
+        dcp_size,
+        dcp_rank,
+        out_local_raw_indices,
+    )
+
+
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
