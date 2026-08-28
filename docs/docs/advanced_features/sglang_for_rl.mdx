@@ -591,20 +591,7 @@ A request can outlive a version change: the RL flow retracts it with `pause_gene
 ```
 
 - Ranges are half-open `[start, end)` over output-token indices, prompt excluded. The usual case is a single span.
-
-### Prefill KV Weight Version Attribution
-
-`--enable-prefill-weight-versions` adds the same span list for the **prompt** tokens, so a prefix-cache hit on KV computed under older weights is visible:
-
-```json Output
-"prefill_weight_versions": [
-    {"version": "41", "start": 0, "end": 512},
-    {"version": "42", "start": 512, "end": 640}
-]
-```
-
-- A leading stale span is a radix-cache hit; its `end` equals `meta_info["cached_tokens"]`.
-- Present only once the prefill finished; KV the tracker never saw (HiCache reloads, PD transfers) fails the request.
+- `--enable-prefill-weight-versions` adds `prefill_weight_versions`, the same span list over the prompt tokens, so KV reused from the prefix cache under older weights is visible.
 
 ## Easy To Postpone Generation
 
