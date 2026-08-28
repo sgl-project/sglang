@@ -5,7 +5,7 @@ use crate::{
     GenerationFinishReason, GenerationOutput, GenerationStream, MatchedStop, ResponseError,
 };
 
-use super::openai::completions::SubmittedChoice;
+use super::completions::SubmittedChoice;
 
 fn submission() -> (
     GenerationStream,

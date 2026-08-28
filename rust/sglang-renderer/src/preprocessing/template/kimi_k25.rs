@@ -372,7 +372,10 @@ impl ObjectType {
                         name: name.clone(),
                         kind: parse_type(schema, registry),
                         optional: !required.contains(&name.as_str()),
-                        default: schema.get("default").cloned(),
+                        default: schema
+                            .get("default")
+                            .filter(|value| !value.is_null())
+                            .cloned(),
                     })
                     .collect()
             })
@@ -696,5 +699,27 @@ mod tests {
             }
         }]);
         assert!(encode_tools_to_typescript(tools.as_array().unwrap()).is_none());
+    }
+
+    #[test]
+    fn null_default_is_omitted_like_checkpoint_python() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "optional_value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": ["string", "null"], "default": null}
+                    }
+                }
+            }
+        }]);
+        let encoded = encode_tools_to_typescript(tools.as_array().unwrap()).unwrap();
+        assert_eq!(
+            encoded,
+            "# Tools\n\n## functions\nnamespace functions {\ntype optional_value = (_: {\n  value?: string | null\n}) => any;\n}\n"
+        );
+        assert!(!encoded.contains("Default"));
     }
 }

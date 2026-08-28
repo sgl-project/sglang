@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use super::{completion_usage, unix_seconds_u32};
-use crate::http::{
-    CompletionRequest, OpenAIHttpFrontend,
+use super::{
+    CompletionRequest, OpenAIHttpFrontend, completion_usage,
     error::{error_payload, openai_error, renderer_status},
+    protocol::{lower_text_completion_request, lower_token_ids_completion_request},
     submission::{collect_output, merge_indexed, submit_generate_requests},
+    unix_seconds_u32,
 };
-use crate::protocol::openai::{lower_text_completion_request, lower_token_ids_completion_request};
 use crate::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream, MatchedStop,
 };
@@ -517,7 +517,7 @@ mod tests {
         unary_completion,
     };
     use crate::GenerationOutputExtras;
-    use crate::http::test_utils::{chunk, submitted};
+    use crate::openai::test_utils::{chunk, submitted};
     use crate::{PositionLogprobs, TokenLogprob};
     use axum::http::StatusCode;
     use dynamo_protocols::types::{Choice, CreateCompletionResponse};

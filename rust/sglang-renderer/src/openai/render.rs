@@ -3,9 +3,6 @@
 use std::sync::Arc;
 
 use crate::RendererService;
-use crate::protocol::openai::{
-    lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
-};
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
@@ -18,6 +15,9 @@ use dynamo_protocols::types::Prompt;
 use super::{
     ChatCompletionRequest, CompletionRequest,
     error::{openai_error, renderer_status},
+    protocol::{
+        lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
+    },
 };
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {

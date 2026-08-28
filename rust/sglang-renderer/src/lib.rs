@@ -5,50 +5,41 @@
 //! The optional `http` feature owns OpenAI wire lowering and a standalone
 //! frontend backed by SGLang's `/generate` endpoint.
 
-mod chat;
 mod config;
+#[cfg(feature = "http")]
+mod engine;
 mod error;
 #[cfg(feature = "http")]
-mod generation;
+mod openai;
+mod preprocessing;
+mod response;
 #[cfg(feature = "http")]
-mod http;
-mod kimi_k25;
-mod output;
-#[cfg(feature = "http")]
-mod protocol;
-mod request;
-mod sampling;
-mod service;
-mod template;
-mod tokenizer;
+mod runtime;
 mod types;
 
-mod regex;
-
-pub(crate) use chat::ChatPreprocessor;
-pub(crate) use chat::LoweredChat;
-pub use chat::{ChatRequest, ReasoningEffort};
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
-pub use error::{RendererError, RendererErrorKind};
 #[cfg(feature = "http")]
-pub(crate) use generation::{
+pub(crate) use engine::{
     GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
     MatchedStop, PositionLogprobs, TokenLogprob,
 };
+pub use error::{RendererError, RendererErrorKind};
+pub(crate) use preprocessing::ChatFormatter;
 #[cfg(feature = "http")]
-pub use http::{RendererRuntimeConfig, serve};
-pub use output::{
-    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
-    ResponseError,
+pub(crate) use preprocessing::SamplingParamsOverrides;
+pub(crate) use preprocessing::{ChatPreprocessor, LoweredChat};
+pub use preprocessing::{
+    ChatRequest, DynamoTokenizer, PreparedChat, ReasoningEffort, RendererService, SamplingParams,
+    TextTokenizer, load_tokenizer,
 };
-pub use request::{
+pub use preprocessing::{
     GenerateRequest, GenerateRequestMetadata, GenerateSamplingParams, GenerationOptions,
     TextRequest, TokenIdsRequest,
 };
-pub use sampling::SamplingParams;
+pub use response::{
+    ChatEvent, ChatFinishReason, ChatResponseProcessor, ChatToolCallDelta, DecodedChatEvent,
+    ResponseError,
+};
 #[cfg(feature = "http")]
-pub(crate) use sampling::SamplingParamsOverrides;
-pub use service::{PreparedChat, RendererService};
-pub(crate) use template::ChatFormatter;
-pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
+pub use runtime::{RendererRuntimeConfig, serve};
 pub use types::{OneOrMany, TokenIds};

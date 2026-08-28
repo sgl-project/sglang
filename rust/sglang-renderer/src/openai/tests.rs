@@ -1,55 +1,6 @@
-//! Optional standalone HTTP frontend built on the reusable renderer service.
+//! Integration tests for the assembled OpenAI frontend.
 
-use std::sync::Arc;
-
-use crate::protocol::openai::{ChatCompletionRequest, CompletionRequest};
-use axum::Router;
-
-mod error;
-mod generate_client;
-mod openai;
-mod render;
-mod runtime;
-mod submission;
-mod tokenize;
-
-pub(crate) use generate_client::HttpGenerateClient;
-pub use runtime::{RendererRuntimeConfig, serve};
-#[cfg(test)]
-mod test_utils;
-
-pub(crate) struct OpenAIHttpFrontend {
-    pub(crate) renderer: Arc<crate::RendererService>,
-    pub(crate) generate_client: HttpGenerateClient,
-}
-
-impl OpenAIHttpFrontend {
-    pub(crate) fn new(
-        renderer: Arc<crate::RendererService>,
-        generate_client: HttpGenerateClient,
-    ) -> Self {
-        Self {
-            renderer,
-            generate_client,
-        }
-    }
-}
-
-pub(crate) fn inference_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
-    let renderer = frontend.renderer.clone();
-    Router::new()
-        .merge(openai::routes())
-        .with_state(Arc::new(frontend))
-        .merge(tokenize::routes(renderer))
-}
-
-pub(crate) fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
-    let renderer = frontend.renderer.clone();
-    inference_routes(frontend).merge(render::routes(renderer))
-}
-
-#[cfg(test)]
-mod tests {
+mod suite {
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
 
@@ -63,11 +14,11 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{
+    use super::super::{
         ChatCompletionRequest, CompletionRequest, HttpGenerateClient, OpenAIHttpFrontend,
         standalone_routes,
     };
-    use crate::protocol::openai::{
+    use crate::openai::protocol::{
         lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
     };
     use crate::{

@@ -15,10 +15,12 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::protocol::openai::normalize_reasoning_inputs;
 use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService};
 
-use super::error::{error_payload, renderer_status};
+use super::{
+    error::{error_payload, renderer_status},
+    protocol::normalize_reasoning_inputs,
+};
 
 pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
     Router::new()

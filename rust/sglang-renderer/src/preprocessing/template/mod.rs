@@ -23,7 +23,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::OneOrMany;
-use crate::kimi_k25::{deep_sort, encode_tools_to_typescript};
+
+use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
+
+mod kimi_k25;
 
 const DSV4_BOS: &str = "<｜begin▁of▁sentence｜>";
 const DSV4_OFFICIAL_MAX: &str = concat!(
@@ -65,7 +68,7 @@ const SUPPORTED_STYLES: &[&str] = &[
 /// A chat prompt formatter: either the model's HuggingFace Jinja template or a
 /// legacy SGLang conversation template.
 #[derive(Clone)]
-pub enum ChatFormatter {
+pub(crate) enum ChatFormatter {
     HuggingFace(PromptFormatter),
     KimiK25(PromptFormatter),
     DeepSeekV4 {
@@ -77,7 +80,7 @@ pub enum ChatFormatter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeepSeekV4Profile {
+pub(crate) enum DeepSeekV4Profile {
     Preview,
     Official,
 }
@@ -888,7 +891,7 @@ pub(super) enum TemplateError {
     UnsupportedRole { role: &'static str },
 }
 
-pub(crate) fn load_chat_formatter(
+pub(super) fn load_chat_formatter(
     config_file: Option<&str>,
     model_path: Option<&str>,
     chat_template_arg: Option<&str>,

@@ -21,7 +21,7 @@ use dynamo_protocols::types::{
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::chat::dynamo_parser_name;
+use crate::preprocessing::dynamo_parser_name;
 
 /// Engine-neutral terminal reason understood by chat response processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

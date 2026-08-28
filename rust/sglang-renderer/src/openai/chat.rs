@@ -28,13 +28,13 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 
-use super::{completion_usage, unix_seconds_u32};
-use crate::http::{
-    ChatCompletionRequest, OpenAIHttpFrontend,
+use super::{
+    ChatCompletionRequest, OpenAIHttpFrontend, completion_usage,
     error::{error_payload, openai_error, renderer_status},
+    protocol::lower_chat_request,
     submission::{merge_indexed, submit_generate_requests},
+    unix_seconds_u32,
 };
-use crate::protocol::openai::lower_chat_request;
 
 pub(super) fn routes() -> Router<Arc<OpenAIHttpFrontend>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -535,9 +535,9 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
 #[cfg(test)]
 mod tests {
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
-    use crate::http::test_utils::{chat_submitted, chunk};
-    use crate::protocol::openai::ChatCompletionRequest;
-    use crate::protocol::openai::{chat_sampling_params, lower_chat_request};
+    use crate::openai::protocol::ChatCompletionRequest;
+    use crate::openai::protocol::{chat_sampling_params, lower_chat_request};
+    use crate::openai::test_utils::{chat_submitted, chunk};
     use crate::{
         ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
         SamplingDefaults, TokenLogprob,
@@ -585,7 +585,7 @@ mod tests {
         let (_, chat) = lower_chat_request(&config, request).unwrap();
         ChatPreprocessor::new(
             &config,
-            Some(crate::template::load_chat_formatter(None, None, Some("chatml")).unwrap()),
+            Some(crate::preprocessing::load_test_chat_formatter("chatml")),
         )
         .preprocess(chat)
         .unwrap()

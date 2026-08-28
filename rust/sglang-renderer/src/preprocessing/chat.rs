@@ -677,7 +677,10 @@ mod tests {
         };
         ChatPreprocessor::new(
             &config,
-            Some(crate::template::load_chat_formatter(None, None, Some("chatml")).unwrap()),
+            Some(
+                crate::preprocessing::template::load_chat_formatter(None, None, Some("chatml"))
+                    .unwrap(),
+            ),
         )
     }
 

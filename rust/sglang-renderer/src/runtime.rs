@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DynamoTokenizer, RendererConfig, RendererService, TextTokenizer, load_tokenizer};
 
-use super::{HttpGenerateClient, OpenAIHttpFrontend, standalone_routes};
+use crate::engine::HttpGenerateClient;
+use crate::openai::{OpenAIHttpFrontend, standalone_routes};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RendererRuntimeConfig {

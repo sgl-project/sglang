@@ -6,7 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::{error::RendererError as Error, regex::RegexPattern, types::OneOrMany};
+use crate::{error::RendererError as Error, types::OneOrMany};
+
+use super::regex::RegexPattern;
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
 const SAMPLING_EPS: f64 = 1e-6;

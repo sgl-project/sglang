@@ -7,8 +7,8 @@ use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 use futures::future::try_join_all;
 
-use crate::template::{DeepSeekV4Profile, load_chat_formatter};
-use crate::tokenizer::{
+use super::template::{DeepSeekV4Profile, load_chat_formatter};
+use super::tokenizer::{
     PooledTokenizer, TextTokenizer, check_total_tokens, resolve_chat_template_file,
     resolve_model_file, validate_text_request, validate_token_ids_request,
 };
@@ -324,15 +324,123 @@ fn resolve_dsv4_profile(
     let Ok(source) = std::fs::read_to_string(encoder) else {
         return Ok(DeepSeekV4Profile::Preview);
     };
-    if source.contains("DEFAULT_REASONING_EFFORT")
-        && source.contains("REASONING_EFFORT_PROMPTS")
-        && source.contains("Beyond maximum")
-        && source.contains("\"low\"")
+    let default = top_level_python_assignment(&source, "DEFAULT_REASONING_EFFORT")
+        .and_then(python_string_literal);
+    let prompt_keys = top_level_python_assignment(&source, "REASONING_EFFORT_PROMPTS")
+        .and_then(python_dict_keys)
+        .unwrap_or_default();
+    if default.as_deref() == Some("low")
+        && ["low", "high", "max"]
+            .iter()
+            .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
     {
         Ok(DeepSeekV4Profile::Official)
     } else {
         Ok(DeepSeekV4Profile::Preview)
     }
+}
+
+fn top_level_python_assignment<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if !trimmed.starts_with(char::is_whitespace)
+            && let Some((target, _)) = trimmed.split_once('=')
+            && target
+                .split(':')
+                .next()
+                .is_some_and(|target| target.trim() == name)
+        {
+            let equals = line.find('=')?;
+            return Some(&source[offset + equals + 1..]);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn python_string_literal(source: &str) -> Option<String> {
+    let source = source.trim_start();
+    let quote = source.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let mut escaped = false;
+    let mut value = String::new();
+    for character in source[quote.len_utf8()..].chars() {
+        if escaped {
+            value.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == quote {
+            return Some(value);
+        } else {
+            value.push(character);
+        }
+    }
+    None
+}
+
+fn python_dict_keys(source: &str) -> Option<Vec<String>> {
+    let source = source.trim_start();
+    if !source.starts_with('{') {
+        return None;
+    }
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    let bytes = source.as_bytes();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' | b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' | b')' => {
+                depth = depth.checked_sub(1)?;
+                index += 1;
+                if depth == 0 {
+                    return Some(keys);
+                }
+            }
+            quote @ (b'\'' | b'"') => {
+                let start = index + 1;
+                index = start;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    if escaped {
+                        escaped = false;
+                    } else if bytes[index] == b'\\' {
+                        escaped = true;
+                    } else if bytes[index] == quote {
+                        break;
+                    }
+                    index += 1;
+                }
+                if index == bytes.len() {
+                    return None;
+                }
+                let value = std::str::from_utf8(&bytes[start..index]).ok()?;
+                index += 1;
+                if depth == 1 {
+                    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                        index += 1;
+                    }
+                    if bytes.get(index) == Some(&b':') {
+                        keys.push(value.to_owned());
+                    }
+                }
+            }
+            b'#' => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -683,8 +791,8 @@ mod tests {
         std::fs::create_dir_all(directory.join("encoding")).unwrap();
         std::fs::write(
             directory.join("encoding/encoding_dsv4.py"),
-            r#"DEFAULT_REASONING_EFFORT = "low"
-REASONING_EFFORT_PROMPTS = {"low": "", "high": "absolute", "max": "Beyond maximum"}"#,
+            "DEFAULT_REASONING_EFFORT: str = 'low'\n\
+REASONING_EFFORT_PROMPTS = {'low': '', 'high': 'absolute', 'max': 'beyond'}",
         )
         .unwrap();
         let source = directory.to_string_lossy();
@@ -705,6 +813,17 @@ REASONING_EFFORT_PROMPTS = {"low": "", "high": "absolute", "max": "Beyond maximu
             ..Default::default()
         };
         assert!(resolve_dsv4_profile(&invalid, &source, None).is_err());
+
+        std::fs::write(
+            directory.join("encoding/encoding_dsv4.py"),
+            r#"DEFAULT_REASONING_EFFORT = "high"
+REASONING_EFFORT_PROMPTS = {"low": "", "high": "absolute", "max": "Beyond maximum"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_dsv4_profile(&ModelIdentity::default(), &source, None).unwrap(),
+            DeepSeekV4Profile::Preview
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
