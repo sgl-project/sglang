@@ -46,7 +46,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -56,7 +56,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 
 # ===============================
 # Base image 942 with rocm724 and args (Python 3.12 + torch 2.11)
@@ -66,7 +66,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -90,7 +90,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -100,7 +100,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 
 # ===============================
 # Base image 950 with rocm724 and args (Python 3.12 + torch 2.11)
@@ -110,7 +110,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV AITER_COMMIT_DEFAULT="c16d44b93a528b2a4bfd6d8d3409116d465872a9"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
@@ -246,7 +246,7 @@ RUN set -eux; \
     case "${GPU_ARCH}" in \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
-        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key \
           | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
         && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.2.4/ubuntu noble main' \
           > /etc/apt/sources.list.d/amdgpu-graphics.list \
@@ -263,7 +263,7 @@ RUN set -eux; \
         ;; \
       *) \
         echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
-        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key \
           | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
         && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
           > /etc/apt/sources.list.d/amdgpu-graphics.list \
@@ -351,9 +351,9 @@ ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
 # AITER's .gitattributes (*.csv text eol=lf, added in ROCm/aiter#3370) does not
-# block switching to commits that predate that rule (e.g. the current default
-# AITER_COMMIT_DEFAULT). The working tree was just produced by a fresh
-# `git clone` above, so there are no real user changes to preserve.
+# block AITER_COMMIT overrides that predate that rule. The working tree was just
+# produced by a fresh `git clone` above, so there are no real user changes to
+# preserve.
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
@@ -436,7 +436,7 @@ RUN pip install IPython \
 # (sglang.srt.rust_extensions._multimodal) during the sglang pip install below
 # and later by sgl-model-gateway. Must precede the sglang install.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-delay 3 --retry-all-errors -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
 ENV CARGO_BUILD_JOBS=4
 
@@ -552,7 +552,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   done; \
   if [ -z "$LLVM_CONFIG_PATH" ]; then \
     echo "[TileLang] ROCm llvm-config not found; installing LLVM 18..."; \
-    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
+    curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg; \
     echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" > /etc/apt/sources.list.d/llvm.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends llvm-18; \
@@ -626,7 +626,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     none) \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
-      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
       echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/amdainic.list; \
       apt-get update && apt-get install -y --no-install-recommends \
@@ -635,7 +635,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       install -m 0755 -d /etc/apt/keyrings \
-      && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+      && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
       && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
       && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
       && apt-get update \
@@ -646,7 +646,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     ainic) \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
-      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
       echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
         > /etc/apt/sources.list.d/amdainic.list; \
       apt-get update && apt-get install -y --no-install-recommends \
@@ -660,7 +660,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
        apt-get update \
        && apt-get install -y --no-install-recommends ca-certificates curl \
        && install -m 0755 -d /etc/apt/keyrings \
-       && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+       && curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
        && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
        && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
        && apt-get update \

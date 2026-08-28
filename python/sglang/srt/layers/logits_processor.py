@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.aux_hidden_states import (
@@ -53,6 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -136,6 +138,10 @@ class LogitsProcessorOutput:
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
+    # Beam search only: raw pre-sample logits for the scheduler-side joint
+    # selection; see beam_search.logits_capture.
+    beam: Optional[BeamLogitsCapture] = None
+
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -144,6 +150,9 @@ class LogitsProcessorOutput:
     # workaround since ForwardBatch is local to forward_batch_generation().
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
+
+    # Scheduler-local output copied alongside the ordinary generation result.
+    auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
 
 @dataclasses.dataclass
