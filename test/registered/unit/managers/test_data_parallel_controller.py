@@ -175,6 +175,13 @@ class TestDPBudgetDispatch(CustomTestCase):
         self.assertEqual(rank, 1)
         self.assertEqual(budget.active_tokens[1], 80)
 
+    def test_active_tokens_respects_request_soft_cap(self):
+        budget = DPBudget(dp_size=3)
+        budget.active_tokens = [0, 50, 100]
+        budget.total_requests = [2, 1, 1]
+        rank = budget.dispatch(LoadBalanceMethod.ACTIVE_TOKENS, max_requests=2)
+        self.assertEqual(rank, 1)
+
     def test_dispatch_returns_none_for_methods_not_handled(self):
         """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
         only handles the load-aware variants."""

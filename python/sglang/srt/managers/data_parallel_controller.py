@@ -123,7 +123,12 @@ class DPBudget:
             self.total_tokens[load.dp_rank] = load.num_total_tokens
             self.active_tokens[load.dp_rank] = load.num_active_tokens
 
-    def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
+    def dispatch(
+        self,
+        method: LoadBalanceMethod,
+        estimated_tokens: int = 0,
+        max_requests: Optional[int] = None,
+    ):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method in (
@@ -135,8 +140,17 @@ class DPBudget:
                 if method == LoadBalanceMethod.TOTAL_TOKENS
                 else self.active_tokens
             )
+            candidates = (
+                range(self.dp_size)
+                if max_requests is None
+                else (
+                    rank
+                    for rank in range(self.dp_size)
+                    if self.total_requests[rank] < max_requests
+                )
+            )
             target_rank = min(
-                range(self.dp_size),
+                candidates,
                 key=lambda i: (tokens[i], self.total_requests[i]),
             )
         else:
@@ -201,6 +215,7 @@ class DataParallelController:
         )
 
         self.dp_budget = DPBudget(get_parallel().dp_size)
+        self._active_token_request_cap = None
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -823,7 +838,9 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(
-            LoadBalanceMethod.ACTIVE_TOKENS, estimated_tokens=len(req.input_ids)
+            LoadBalanceMethod.ACTIVE_TOKENS,
+            estimated_tokens=len(req.input_ids),
+            max_requests=self._active_token_request_cap,
         )
         sock_send(self.workers[target_worker], req)
 
@@ -831,8 +848,19 @@ class DataParallelController:
         """Balance an already-ready request burst with longest inputs first."""
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
-        for req in sorted(requests, key=lambda req: len(req.input_ids), reverse=True):
-            self.dispatching_with_trace(req, refresh_load_budget=False)
+        request_counts = self.dp_budget.total_requests
+        self._active_token_request_cap = max(
+            (sum(request_counts) + len(requests) + self.dp_budget.dp_size - 1)
+            // self.dp_budget.dp_size,
+            max(request_counts),
+        )
+        try:
+            for req in sorted(
+                requests, key=lambda req: len(req.input_ids), reverse=True
+            ):
+                self.dispatching_with_trace(req, refresh_load_budget=False)
+        finally:
+            self._active_token_request_cap = None
 
     def event_loop(self):
         while True:
