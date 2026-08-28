@@ -52,6 +52,23 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(kwargs["extend_num_tokens"], 512)
         self.assertEqual(kwargs["swa_tail_len"], 128)
 
+    def test_free_full_defers_inside_a_free_group(self):
+        """The forward to the logical allocator waits for the barrier."""
+        allocator = object.__new__(DeepSeekV4HiSparseTokenToKVPoolAllocator)
+        logical_allocator = MagicMock(spec=["free_full"])
+        allocator.logical_attn_allocator = logical_allocator
+
+        indices = torch.tensor([3, 4, 5], dtype=torch.int64)
+
+        allocator.free_group_begin()
+        allocator.free_full(indices)
+        logical_allocator.free_full.assert_not_called()
+
+        allocator.free_group_end()
+        logical_allocator.free_full.assert_called_once()
+        (freed,), _ = logical_allocator.free_full.call_args
+        self.assertTrue(torch.equal(freed, indices))
+
     def test_hisparse_budget_uses_full_logical_capacity_for_swa_tail(self):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 

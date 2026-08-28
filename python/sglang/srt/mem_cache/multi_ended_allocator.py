@@ -2133,6 +2133,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []
+        self.full_free_group: List[torch.Tensor] = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -2483,6 +2484,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         side alone -- the caller already tombstoned it (`swa.v2p_page == -1`)."""
         if free_index is None or free_index.numel() == 0:
             return
+        if not self.is_not_in_free_group:
+            self.full_free_group.append(self._copy_for_free_group(free_index))
+            return
         self.full_attn_allocator.free(free_index.detach().to(torch.int64))
         self.full_attn_allocator.clear_inverse_history()
 
@@ -2504,6 +2508,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.full_free_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -2511,12 +2516,17 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.full_free_group:
+            merged = torch.cat(self.full_free_group)
+            self.full_free_group = []
+            self.free_full(merged)
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.full_free_group = []
 
     # -- Lazy compaction hooks --
 
