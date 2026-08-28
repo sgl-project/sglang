@@ -81,37 +81,6 @@ def _field_reads(fn, holders):
             yield node.lineno, node.attr
 
 
-def _resolution_handlers():
-    """The `ServerArgs` methods the dispatcher reaches, transitively."""
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
-    cls = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == "ServerArgs"
-    )
-    methods = {
-        node.name: node
-        for node in cls.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert "_run_resolution_pipeline" in methods, "the dispatcher was renamed"
-    seen, stack = set(), ["_run_resolution_pipeline"]
-    while stack:
-        name = stack.pop()
-        if name in seen or name not in methods:
-            continue
-        seen.add(name)
-        for node in ast.walk(methods[name]):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-            ):
-                stack.append(node.func.attr)
-    return {name: methods[name] for name in seen}
-
-
 _DECLARERS = frozenset(
     {
         "_declare",
@@ -469,35 +438,30 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
             + "\n  ".join(offenders),
         )
 
-    def test_no_handler_reads_a_field_off_self(self):
-        handlers = _resolution_handlers()
-        # What the dispatcher reaches inside the class is these read wrappers;
-        # the package side is covered by
-        # `test_no_hook_reads_a_field_off_the_record`. Pinned rather than
-        # counted: a walk that collapsed to the wrappers would clear any floor
-        # low enough to admit them.
-        self.assertEqual(
-            set(handlers),
-            {
-                "_run_resolution_pipeline",
-                "_handle_hardware_runtime_validation",
-                "_handle_page_size",
-                "_handle_pipeline_parallelism",
-                "_handle_sampling_backend",
-            },
-            f"the walk reached {sorted(handlers)}; if the dispatcher grew or "
-            "lost a handler, add it here after checking it reads the view",
+    def test_the_record_hosts_no_resolution_handler(self):
+        """The pipeline and every step it runs live under `arg_groups/`.
+
+        While a step was a method, it could read a raw field off `self` and
+        `test_no_handler_reads_a_field_off_self` had to say it could not. There
+        is no such method left, so the invariant is now the stronger one: the
+        record hosts none of them. What the steps read is checked on the
+        package side, by `test_no_hook_reads_a_field_off_the_record`.
+        """
+        handlers = sorted(
+            name
+            for name, node in _record_members().items()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (
+                name.split(".")[-1].startswith(("_handle_", "_validate_"))
+                or "resolution_pipeline" in name
+            )
         )
-        offenders = []
-        for name, fn in sorted(handlers.items()):
-            for lineno, field in _field_reads(fn, {"self"}):
-                offenders.append(f"server_args.py:{lineno} {name} reads self.{field}")
         self.assertEqual(
-            offenders,
+            handlers,
             [],
-            "a resolution handler reads its own field; the field holds the raw "
-            "input. Bind `cfg = resolving_view(self)` and read that:\n  "
-            + "\n  ".join(offenders),
+            "a resolution handler is back on the record; it belongs in an "
+            "`arg_groups` family, where the package-side guards can see it:\n  "
+            + "\n  ".join(handlers),
         )
 
     def test_no_member_recomputes_from_a_raw_field(self):

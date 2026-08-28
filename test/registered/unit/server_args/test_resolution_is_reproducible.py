@@ -445,14 +445,16 @@ class TestResolutionIsReproducible(_RestoresProcessState, CustomTestCase):
         record.resolve_once()
 
         entries = []
-        original = ServerArgs._run_resolution_pipeline
+        from sglang.srt.arg_groups import pipeline as pipeline_module
 
-        def counted(self):
+        original = pipeline_module.run_resolution_pipeline
+
+        def counted(server_args):
             entries.append(1)
-            return original(self)
+            return original(server_args)
 
         with unittest.mock.patch.object(
-            ServerArgs, "_run_resolution_pipeline", counted
+            pipeline_module, "run_resolution_pipeline", counted
         ):
             record.resolve_once()
         self.assertEqual(
@@ -964,7 +966,7 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         for path in sorted(package_root.rglob("*.py")):
             try:
                 source = path.read_text()
-                if "_run_resolution_pipeline" not in source:
+                if "run_resolution_pipeline" not in source:
                     continue
                 tree = ast.parse(source)
             except SyntaxError:
@@ -984,8 +986,8 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_run_resolution_pipeline"
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "run_resolution_pipeline"
                 ):
                     rel = path.relative_to(package_root).as_posix()
                     callers.append((rel, ".".join(scopes.get(id(node), ()))))
@@ -1131,12 +1133,14 @@ class TestResolutionStaysLazy(CustomTestCase):
         import sglang
 
         srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
-        tree = ast.parse((srt / "server_args.py").read_text(encoding="utf-8-sig"))
+        tree = ast.parse(
+            (srt / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
+        )
         dispatch = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_run_resolution_pipeline"
+            and node.name == "run_resolution_pipeline"
         )
         early_return = min(
             (
