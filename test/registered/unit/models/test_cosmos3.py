@@ -187,6 +187,10 @@ class TestCosmos3Config(CustomTestCase):
 
     def test_registered_with_autoconfig(self):
         # Importing common runs the AutoConfig registration side effects.
+        # Newer transformers ship a native Cosmos3OmniConfig owning this model
+        # type, and sglang's registration deliberately yields to it — so assert
+        # the contract the Qwen3-VL stack needs from whichever class resolves,
+        # not one implementation class.
         from transformers import AutoConfig
 
         import sglang.srt.utils.hf_transformers.common  # noqa: F401
@@ -194,8 +198,13 @@ class TestCosmos3Config(CustomTestCase):
         cfg = AutoConfig.for_model(
             "cosmos3_omni",
             text_config={"hidden_size": 128, "num_hidden_layers": 2},
+            vision_config={"hidden_size": 64},
         )
-        self.assertIsInstance(cfg, Cosmos3Config)
+        self.assertEqual(cfg.model_type, "cosmos3_omni")
+        # Sub-configs must resolve to attribute-accessible objects, not dicts:
+        # the inference stack reads e.g. `config.vision_config.hidden_size`.
+        self.assertEqual(cfg.text_config.hidden_size, 128)
+        self.assertEqual(cfg.vision_config.hidden_size, 64)
 
 
 class TestCosmos3MropeIndex(CustomTestCase):
