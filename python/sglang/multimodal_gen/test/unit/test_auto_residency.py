@@ -68,6 +68,7 @@ def _record(
     stage_duration_ms=None,
     step_duration_ms=(),
     phase_active_components=None,
+    phase_used_components=None,
     phase_full_weight_transition_components=None,
     layerwise_layer_uses=None,
 ) -> WarmupMemoryRecord:
@@ -83,6 +84,7 @@ def _record(
         stage_duration_ms=stage_duration_ms or {},
         step_duration_ms=step_duration_ms,
         phase_active_components=phase_active_components or {},
+        phase_used_components=phase_used_components or {},
         phase_full_weight_transition_components=(
             phase_full_weight_transition_components or {}
         ),
@@ -228,6 +230,28 @@ class TestEstimateLayerwiseLayerUses:
             "encoder.down_blocks": (0, 0),
             "decoder.up_blocks": (1, 1),
         }
+
+    def test_stage_role_scales_nonstandard_denoiser_but_not_encoder_repeats(self):
+        record = _record(
+            num_inference_steps=2,
+            phase_used_components={
+                "0:TextEncodingStage:use:custom_encoder": ("custom_encoder",),
+                "1:CustomDenoisingStage:use:custom_refiner": ("custom_refiner",),
+            },
+            layerwise_layer_uses={
+                "custom_encoder": {"layers": (2, 2)},
+                "custom_refiner": {"blocks": (2, 2)},
+            },
+        )
+
+        uses = estimate_layerwise_layer_uses(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=10,
+        )
+
+        assert uses["custom_encoder"]["layers"] == (2, 2)
+        assert uses["custom_refiner"]["blocks"] == (10, 10)
 
 
 class TestEstimateDefaultWorkloadPeak:

@@ -356,6 +356,19 @@ def estimate_layerwise_layer_uses(
     estimated: dict[str, dict[str, list[int]]] = {}
     for record in successful:
         source_steps = max(1, record.num_inference_steps)
+        denoising_components: set[str] = set()
+        phase_components = (
+            record.phase_used_components or record.phase_active_components
+        )
+        for phase_name, component_names in phase_components.items():
+            fields = phase_name.split(":", 2)
+            if len(fields) < 2 or not fields[0].isdigit():
+                continue
+            stage_name = fields[1]
+            if stage_name.endswith("DenoisingStage") and not stage_name.endswith(
+                "BeforeDenoisingStage"
+            ):
+                denoising_components.update(component_names)
         for component_name, groups in record.layerwise_layer_uses.items():
             component = estimated.setdefault(component_name, {})
             for layer_name, counts in groups.items():
@@ -365,7 +378,10 @@ def estimate_layerwise_layer_uses(
                 for layer_index, count in enumerate(counts):
                     scaled = count
                     if (
-                        is_dit_component_name(component_name)
+                        (
+                            is_dit_component_name(component_name)
+                            or component_name in denoising_components
+                        )
                         and count > 1
                         and target_num_inference_steps > source_steps
                     ):
