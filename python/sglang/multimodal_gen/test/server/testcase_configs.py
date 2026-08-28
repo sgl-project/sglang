@@ -811,6 +811,13 @@ def get_model_task_type_for_server_args(
     return pipeline_config_cls.task_type
 
 
+def supports_auto_residency_for_server_args(
+    server_args: DiffusionServerArgs,
+) -> bool:
+    pipeline_config_cls, _ = _get_config_classes_for_server_args(server_args)
+    return pipeline_config_cls.supports_auto_residency
+
+
 def get_sampling_param_field_names_for_server_args(
     server_args: DiffusionServerArgs,
 ) -> frozenset[str]:
