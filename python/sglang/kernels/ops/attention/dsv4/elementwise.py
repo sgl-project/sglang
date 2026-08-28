@@ -64,7 +64,13 @@ def _jit_main_k_norm_rope_flashmla_module(
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache
     (or, with uniform_fp8_store, plain e4m3 rows in the uniform 512B pool)."""
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl(), uniform_fp8_store
+        dtype,
+        head_dim,
+        rope_dim,
+        page_size,
+        layout.cpp_name,
+        is_arch_support_pdl(),
+        uniform_fp8_store,
     )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
