@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_context,
     get_disagg,
     get_exec,
@@ -282,11 +283,7 @@ class KVCacheConfigurator:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
             if not cpu_has_amx_support():
                 raise ValueError("CPU FP8 KV cache requires Intel AMX support.")
-            configured_backends = {
-                self.server_args.attention_backend,
-                self.server_args.prefill_attention_backend,
-                self.server_args.decode_attention_backend,
-            } - {None}
+            configured_backends = set(attention_backends())
             if configured_backends - {"intel_amx"}:
                 raise ValueError(
                     "CPU FP8 KV cache requires the intel_amx attention backend."
