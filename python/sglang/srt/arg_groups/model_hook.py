@@ -300,7 +300,7 @@ def handle_model_specific_adjustments(server_args: Any):
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
             if is_deepseek_dsa(hf_config):
-                # The fused top-k v2 kernel (topk_transform_512_v2) is a
+                # The fused top-k v2 kernel (topk_transform_paged_v2) is a
                 # CUDA/Hopper-only path: its JIT source includes
                 # <cooperative_groups.h> and uses cg::this_cluster()
                 # (thread-block clusters), neither of which exists on ROCm,
