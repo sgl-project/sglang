@@ -10,7 +10,7 @@ use crate::components::TreeComponent;
 use crate::components::{ComponentType, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
-use crate::node::{NodeId, NodeIdx_, ValueSlotIdx};
+use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
 use crate::unified_tree_core::{
     CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
     IncLockRefResult, InsertParams, InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult,
@@ -508,12 +508,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
         _last_hash: Option<&str>,
-    ) -> Option<Vec<PoolTransfer>> {
-        match phase {
+    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
+        Ok(match phase {
             CacheTransferPhase::BackupHost => {
                 let node = tree_core.arena.node(node_id);
                 if node.has_host_value(MAMBA) {
-                    return None;
+                    return Ok(None);
                 }
                 node.try_device_value(MAMBA).map(|value| {
                     vec![PoolTransfer {
@@ -526,7 +526,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             CacheTransferPhase::LoadBack => {
                 let node = tree_core.arena.node(node_id);
                 if node.has_device_value(MAMBA) {
-                    return None;
+                    return Ok(None);
                 }
                 let mut transfers = Vec::new();
                 // restore single node if host_value exists
@@ -558,8 +558,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             }
             CacheTransferPhase::BackupStorage => {
                 let node = tree_core.arena.node(node_id);
-                let host_value = node.try_host_value(MAMBA)?;
-                let hash_value = node.hash_value.as_ref().filter(|h| !h.is_empty())?;
+                let Some(host_value) = node.try_host_value(MAMBA) else {
+                    return Ok(None);
+                };
+                let Some(hash_value) = node.hash_value.as_ref().filter(|h| !h.is_empty()) else {
+                    return Ok(None);
+                };
                 Some(vec![PoolTransfer {
                     name: PoolName::Mamba,
                     host_indices: Some(host_value.shallow_clone()),
@@ -579,7 +583,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     ..Default::default()
                 }])
             }
-        }
+        })
     }
 
     /// Post-transfer mamba bookkeeping for the given phase.

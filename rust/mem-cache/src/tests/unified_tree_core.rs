@@ -3393,6 +3393,33 @@ fn demote_panics_on_an_unbackuped_node() {
 }
 
 #[test]
+fn try_demote_rejects_unbackuped_and_evicted_nodes() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    let leaf = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+
+    assert!(matches!(
+        tc.try_demote(leaf),
+        Err(TreeCoreRuntimeError::InvalidDemoteState {
+            node_id,
+            evicted: false,
+            backuped: false,
+        }) if node_id == leaf
+    ));
+
+    tc.commit_backup(leaf, Tensor::from_slice(&[20i64]), HashMap::new());
+    tc.demote(leaf);
+    assert!(matches!(
+        tc.try_demote(leaf),
+        Err(TreeCoreRuntimeError::InvalidDemoteState {
+            node_id,
+            evicted: true,
+            backuped: true,
+        }) if node_id == leaf
+    ));
+}
+
+#[test]
 fn match_prefix_with_hicache_splits_a_host_only_backuped_node() {
     let mut tc = core();
     tc.set_hicache_enabled();

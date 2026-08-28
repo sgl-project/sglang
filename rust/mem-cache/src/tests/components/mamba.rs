@@ -1093,6 +1093,7 @@ fn load_back_build_adds_the_per_request_cow_transfer() {
             0,
             None,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(transfers.len(), 2);
     // The CoW transfer copies the host slot into the request's device slot.

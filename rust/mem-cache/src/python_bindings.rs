@@ -1304,17 +1304,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let component_type = parse_component_type(component_type)?;
         let phase = parse_transfer_phase(phase)?;
         let host_indices = host_indices.map(|t| t.0);
-        let transfers = py.allow_threads(|| {
-            self.core().build_hicache_transfers(
-                component_type,
-                node_id,
-                phase,
-                host_indices,
-                token_ids.as_deref(),
-                prefetch_tokens,
-                last_hash.as_deref(),
-            )
-        });
+        let transfers = py
+            .allow_threads(|| {
+                self.core().try_build_hicache_transfers(
+                    component_type,
+                    node_id,
+                    phase,
+                    host_indices,
+                    token_ids.as_deref(),
+                    prefetch_tokens,
+                    last_hash.as_deref(),
+                )
+            })
+            .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
         transfers
             .map(|transfers| {
                 transfers
@@ -1438,8 +1440,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let req = Req {
             mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
         };
-        let (kv_xfer, comp_xfers) =
-            py.allow_threads(move || self.core().build_load_back_spec(node_id, Some(&req)));
+        let (kv_xfer, comp_xfers) = py
+            .allow_threads(move || self.core().try_build_load_back_spec(node_id, Some(&req)))
+            .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
         Ok((
             transfer_to_py(py, kv_xfer)?,
             comp_xfers_to_py(py, comp_xfers)?,
@@ -1467,7 +1470,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 
     /// Release a node's device KV once its host copy exists.
     fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
-        let result = py.allow_threads(move || self.core().demote(node_id));
+        let result = py
+            .allow_threads(move || self.core().try_demote(node_id))
+            .map_err(|error| PyAssertionError::new_err(error.to_string()))?;
         Ok(DemoteResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,

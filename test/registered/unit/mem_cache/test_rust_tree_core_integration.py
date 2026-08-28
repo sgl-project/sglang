@@ -407,6 +407,22 @@ def test_hicache_write_through_and_load_back_round_trip():
     core.sanity_check([], [])
 
 
+def test_invalid_demote_states_raise_assertion_error():
+    core = _tree_core()
+    core.set_hicache_enabled()
+    _insert(core, [1], [10])
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+
+    with pytest.raises(AssertionError):
+        core.demote(leaf)
+
+    core.commit_backup(leaf, torch.tensor([100], dtype=torch.int64), {})
+    tracker = {ComponentType.FULL: 0}
+    _accumulate_step(core.demote(leaf), tracker, {}, {})
+    with pytest.raises(AssertionError):
+        core.demote(leaf)
+
+
 def test_write_through_load_back_is_unpinned_and_refreshes_duplicate_tracking():
     core = _tree_core()
     core.set_hicache_enabled()
@@ -909,6 +925,23 @@ def test_swa_core_builds_with_a_window():
     (action,) = result.cache_actions
     assert isinstance(action, SWARebuild)
     assert action.source_value.tolist() == [10, 11, 12]
+
+
+def test_swa_load_back_missing_value_raises_assertion_error():
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    core = _swa_tree_core(window=4)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    inserted = _insert(core, [1], [10])
+    node = inserted.cache_actions[0].node_id
+
+    with pytest.raises(AssertionError):
+        core.build_hicache_transfers(
+            ComponentType.SWA, node, CacheTransferPhase.LOAD_BACK
+        )
+    with pytest.raises(AssertionError):
+        core.build_load_back_spec(node)
 
 
 def test_swa_straddling_insert_crosses_the_boundary_actions():

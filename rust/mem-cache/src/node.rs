@@ -581,6 +581,18 @@ pub enum TreeCoreRuntimeError {
     /// `alloc_child` under a parent that already has a child at the same key.
     #[error("cannot add a child under parent {parent}: key {key} already has a child")]
     DuplicateChildKey { parent: NodeId, key: String },
+    /// `demote` requires a device-resident Full value with a completed host backup.
+    #[error(
+        "cannot demote node {node_id}: expected device-resident Full value with host backup (evicted={evicted}, backuped={backuped})"
+    )]
+    InvalidDemoteState {
+        node_id: NodeId,
+        evicted: bool,
+        backuped: bool,
+    },
+    /// SWA load-back cannot cross a node that has no value on either tier.
+    #[error("SWA load-back traversal reached node {node_id} without a device or host value")]
+    SwaLoadBackMissingValue { node_id: NodeId },
 }
 
 // Unigram and bigram child keys.

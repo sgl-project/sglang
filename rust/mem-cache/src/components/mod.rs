@@ -5,9 +5,7 @@ use std::collections::HashMap;
 
 use tch::Tensor;
 
-use crate::node::ChildKeyType;
-use crate::node::NodeArena;
-use crate::node::NodeIdx_;
+use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
     CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
     InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
@@ -371,7 +369,7 @@ pub trait TreeComponent<K: ChildKeyType> {
         token_ids: Option<&[i64]>,
         prefetch_tokens: usize,
         last_hash: Option<&str>,
-    ) -> Option<Vec<PoolTransfer>> {
+    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         // Python reference — tree_component.py::TreeComponent.build_hicache_transfers:
         //     def build_hicache_transfers(
         //         self,

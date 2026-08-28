@@ -2149,6 +2149,36 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         result
     }
 
+    /// Fallible variant of [`Self::demote`].
+    pub fn try_demote(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<EvictionStepResult, TreeCoreRuntimeError> {
+        let node_id = self.arena.resolve(node_id);
+        let mut result = EvictionStepResult::default();
+        // Skip a deferred demote when a load-back now pins the device indices.
+        if self.arena.node(node_id).is_load_back_pending() {
+            return Ok(result);
+        }
+        {
+            let node = self.arena.node(node_id);
+            if node.evicted() || !node.backuped() {
+                return Err(TreeCoreRuntimeError::InvalidDemoteState {
+                    node_id: node.id,
+                    evicted: node.evicted(),
+                    backuped: node.backuped(),
+                });
+            }
+        }
+        self.demote_(
+            node_id,
+            &mut result.tracker,
+            &mut result.device_frees,
+            &mut result.host_frees,
+        );
+        Ok(result)
+    }
+
     /// Drop a backed-up node's device value, keeping the host copy.
     pub fn demote_(
         &mut self,
@@ -2750,16 +2780,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if component_type == BASE_COMPONENT_TYPE {
                 continue;
             }
-            let transfers = self.components[i].build_hicache_transfers(
-                self,
-                node.idx,
-                CacheTransferPhase::BackupHost,
-                /* mamba_pool_idx = */ None,
-                /* host_indices = */ None,
-                /* token_ids = */ None,
-                /* prefetch_tokens = */ 0,
-                /* last_hash = */ None,
-            );
+            let transfers = self.components[i]
+                .build_hicache_transfers(
+                    self,
+                    node.idx,
+                    CacheTransferPhase::BackupHost,
+                    /* mamba_pool_idx = */ None,
+                    /* host_indices = */ None,
+                    /* token_ids = */ None,
+                    /* prefetch_tokens = */ 0,
+                    /* last_hash = */ None,
+                )
+                .unwrap();
             if let Some(transfers) = transfers
                 && !transfers.is_empty()
             {
@@ -2787,16 +2819,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             if component_type == BASE_COMPONENT_TYPE {
                 continue;
             }
-            let transfers = self.components[i].build_hicache_transfers(
-                self,
-                node_id,
-                CacheTransferPhase::BackupStorage,
-                /* mamba_pool_idx = */ None,
-                /* host_indices = */ None,
-                /* token_ids = */ None,
-                /* prefetch_tokens = */ 0,
-                /* last_hash = */ None,
-            );
+            let transfers = self.components[i]
+                .build_hicache_transfers(
+                    self,
+                    node_id,
+                    CacheTransferPhase::BackupStorage,
+                    /* mamba_pool_idx = */ None,
+                    /* host_indices = */ None,
+                    /* token_ids = */ None,
+                    /* prefetch_tokens = */ 0,
+                    /* last_hash = */ None,
+                )
+                .unwrap();
             if let Some(transfers) = transfers
                 && !transfers.is_empty()
             {
@@ -2823,6 +2857,28 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         prefetch_tokens: usize,
         last_hash: Option<&str>,
     ) -> Option<Vec<PoolTransfer>> {
+        self.try_build_hicache_transfers(
+            component_type,
+            node_id,
+            phase,
+            host_indices,
+            token_ids,
+            prefetch_tokens,
+            last_hash,
+        )
+        .unwrap()
+    }
+
+    pub fn try_build_hicache_transfers(
+        &self,
+        component_type: ComponentType,
+        node_id: NodeId,
+        phase: CacheTransferPhase,
+        host_indices: Option<Tensor>,
+        token_ids: Option<&[i64]>,
+        prefetch_tokens: usize,
+        last_hash: Option<&str>,
+    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         let node_id = self.arena.resolve(node_id);
         self.component_by_type_(component_type)
             .build_hicache_transfers(
@@ -2843,6 +2899,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node_id: NodeId,
         req: Option<&Req>,
     ) -> (PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>) {
+        self.try_build_load_back_spec(node_id, req).unwrap()
+    }
+
+    pub fn try_build_load_back_spec(
+        &self,
+        node_id: NodeId,
+        req: Option<&Req>,
+    ) -> Result<(PoolTransfer, HashMap<ComponentType, Vec<PoolTransfer>>), TreeCoreRuntimeError>
+    {
         let anchor_id = node_id;
         let node_id = self.arena.resolve(node_id);
         // Component hooks take primitives, not Req: extract its fields here.
@@ -2858,7 +2923,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* token_ids = */ None,
                 /* prefetch_tokens = */ 0,
                 /* last_hash = */ None,
-            )
+            )?
             .unwrap();
         let kv_xfer = kv_transfers.remove(0);
         let mut comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>> = HashMap::new();
@@ -2876,7 +2941,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 /* token_ids = */ None,
                 /* prefetch_tokens = */ 0,
                 /* last_hash = */ None,
-            );
+            )?;
             if let Some(transfers) = transfers
                 && !transfers.is_empty()
             {
@@ -2908,9 +2973,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 nodes_to_load: Some(Vec::new()),
                 ..Default::default()
             };
-            return (empty_kv, HashMap::new());
+            return Ok((empty_kv, HashMap::new()));
         }
-        (kv_xfer, comp_xfers)
+        Ok((kv_xfer, comp_xfers))
     }
 
     /// The anchor node's namespace; None for the default namespace.

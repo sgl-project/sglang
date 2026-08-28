@@ -3480,6 +3480,7 @@ fn backup_storage_transfers_carry_trailing_page_keys() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(transfers[0].name, PoolName::Swa);
@@ -3510,11 +3511,11 @@ fn backup_storage_is_none_without_host_value_or_hashes() {
             /* last_hash = */ None,
         )
     };
-    assert!(build(&tc).is_none());
+    assert!(build(&tc).unwrap().is_none());
     tc.arena
         .set_host_value(a, SWA, Tensor::from_slice(&[21i64]));
     tc.arena.node_mut(a).hash_value = None;
-    assert!(build(&tc).is_none());
+    assert!(build(&tc).unwrap().is_none());
 }
 
 #[test]
@@ -3524,25 +3525,29 @@ fn build_transfers_are_gated_off_until_the_swa_host_pool_is_wired() {
     let [a] = chain::<1>(&mut tc);
     set_swa_device(&mut tc, a);
     for phase in [CacheTransferPhase::BackupHost, CacheTransferPhase::LoadBack] {
-        let transfers = swa_component(4).build_hicache_transfers(
-            &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
-            /* token_ids = */ None, /* prefetch_tokens = */ 0,
-            /* last_hash = */ None,
-        );
+        let transfers = swa_component(4)
+            .build_hicache_transfers(
+                &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
+                /* token_ids = */ None, /* prefetch_tokens = */ 0,
+                /* last_hash = */ None,
+            )
+            .unwrap();
         assert!(transfers.is_none());
     }
     // Wiring the pool opens the gate.
     tc.set_has_swa_host_pool();
-    let transfers = swa_component(4).build_hicache_transfers(
-        &tc,
-        a,
-        CacheTransferPhase::BackupHost,
-        /* mamba_pool_idx = */ None,
-        /* host_indices = */ None,
-        /* token_ids = */ None,
-        /* prefetch_tokens = */ 0,
-        /* last_hash = */ None,
-    );
+    let transfers = swa_component(4)
+        .build_hicache_transfers(
+            &tc,
+            a,
+            CacheTransferPhase::BackupHost,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap();
     assert!(transfers.is_some());
 }
 
@@ -3563,6 +3568,7 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(transfers.len(), 1);
     let xfer = &transfers[0];
@@ -3578,16 +3584,18 @@ fn backup_host_build_wraps_the_device_value_as_int64() {
 fn backup_host_build_returns_none_for_a_tombstone() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
-    let transfers = swa_component(4).build_hicache_transfers(
-        &tc,
-        a,
-        CacheTransferPhase::BackupHost,
-        /* mamba_pool_idx = */ None,
-        /* host_indices = */ None,
-        /* token_ids = */ None,
-        /* prefetch_tokens = */ 0,
-        /* last_hash = */ None,
-    );
+    let transfers = swa_component(4)
+        .build_hicache_transfers(
+            &tc,
+            a,
+            CacheTransferPhase::BackupHost,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap();
     assert!(transfers.is_none());
 }
 
@@ -3635,6 +3643,7 @@ fn load_back_build_collects_host_only_nodes_within_the_window() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(transfers.len(), 1);
     let xfer = &transfers[0];
@@ -3674,6 +3683,7 @@ fn load_back_build_stops_at_the_window_boundary() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     // The two-token window covers c and b; a stays out of the transfer.
     let xfer = &transfers[0];
@@ -3695,34 +3705,67 @@ fn load_back_build_returns_none_when_the_window_is_on_device() {
     let [a, b] = chain::<2>(&mut tc);
     set_swa_device(&mut tc, a);
     set_swa_device(&mut tc, b);
-    let transfers = swa_component(4).build_hicache_transfers(
-        &tc,
-        b,
-        CacheTransferPhase::LoadBack,
-        /* mamba_pool_idx = */ None,
-        /* host_indices = */ None,
-        /* token_ids = */ None,
-        /* prefetch_tokens = */ 0,
-        /* last_hash = */ None,
-    );
+    let transfers = swa_component(4)
+        .build_hicache_transfers(
+            &tc,
+            b,
+            CacheTransferPhase::LoadBack,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap();
     assert!(transfers.is_none());
 }
 
 #[test]
-#[should_panic(expected = "value: Swa/host slot has no value")]
-fn load_back_build_panics_on_a_bare_window_node() {
+fn load_back_build_rejects_a_bare_window_node() {
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a] = chain::<1>(&mut tc);
-    swa_component(4).build_hicache_transfers(
-        &tc,
-        a,
-        CacheTransferPhase::LoadBack,
-        /* mamba_pool_idx = */ None,
-        /* host_indices = */ None,
-        /* token_ids = */ None,
-        /* prefetch_tokens = */ 0,
-        /* last_hash = */ None,
-    );
+    assert!(matches!(
+        swa_component(4).build_hicache_transfers(
+            &tc,
+            a,
+            CacheTransferPhase::LoadBack,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        ),
+        Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id })
+            if node_id == tc.arena.node(a).id
+    ));
+}
+
+#[test]
+fn fallible_load_back_boundaries_reject_a_bare_window_node() {
+    let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
+    let [a] = chain::<1>(&mut tc);
+    tc.arena
+        .set_device_value(a, FULL, Tensor::from_slice(&[10i64]));
+    let node_id = tc.arena.node(a).id;
+
+    assert!(matches!(
+        tc.try_build_hicache_transfers(
+            SWA,
+            node_id,
+            CacheTransferPhase::LoadBack,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* last_hash = */ None,
+        ),
+        Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id: missing })
+            if missing == node_id
+    ));
+    assert!(matches!(
+        tc.try_build_load_back_spec(node_id, /* req = */ None),
+        Err(TreeCoreRuntimeError::SwaLoadBackMissingValue { node_id: missing })
+            if missing == node_id
+    ));
 }
 
 #[test]
@@ -3936,6 +3979,7 @@ fn prefetch_build_wraps_the_host_buffer_with_placeholder_keys() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(transfers.len(), 1);
     assert_eq!(

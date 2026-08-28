@@ -2648,11 +2648,13 @@ fn build_hicache_transfers_returns_none_for_non_load_back_phases() {
         CacheTransferPhase::BackupStorage,
         CacheTransferPhase::Prefetch,
     ] {
-        let transfers = FullComponent.build_hicache_transfers(
-            &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
-            /* token_ids = */ None, /* prefetch_tokens = */ 0,
-            /* last_hash = */ None,
-        );
+        let transfers = FullComponent
+            .build_hicache_transfers(
+                &tc, a, phase, /* mamba_pool_idx = */ None, /* host_indices = */ None,
+                /* token_ids = */ None, /* prefetch_tokens = */ 0,
+                /* last_hash = */ None,
+            )
+            .unwrap();
         assert!(transfers.is_none());
     }
 }
@@ -2672,6 +2674,7 @@ fn load_back_build_collects_the_evicted_suffix_ancestors_first() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(transfers.len(), 1);
     let xfer = &transfers[0];
@@ -2705,6 +2708,7 @@ fn load_back_build_returns_an_empty_cpu_transfer_for_a_device_backed_node() {
             /* prefetch_tokens = */ 0,
             /* last_hash = */ None,
         )
+        .unwrap()
         .unwrap();
     let host_indices = transfers[0].host_indices.as_ref().unwrap();
     assert_eq!(host_indices.numel(), 0);
@@ -2727,7 +2731,7 @@ fn load_back_build_panics_on_an_evicted_unbacked_node() {
             /* extra_key = */ None,
         )
         .unwrap();
-    FullComponent.build_hicache_transfers(
+    let _ = FullComponent.build_hicache_transfers(
         &tc,
         a,
         CacheTransferPhase::LoadBack,
