@@ -180,7 +180,9 @@ class TestRustRendererSidecar(unittest.TestCase):
                 "sglang.srt.managers.rust_renderer.http.client.HTTPConnection",
                 side_effect=connections,
             ) as connect,
-            mock.patch("sglang.srt.managers.rust_renderer.time.monotonic", return_value=0),
+            mock.patch(
+                "sglang.srt.managers.rust_renderer.time.monotonic", return_value=0
+            ),
             mock.patch("sglang.srt.managers.rust_renderer.time.sleep"),
         ):
             sidecar = RustRendererSidecar(
@@ -192,9 +194,7 @@ class TestRustRendererSidecar(unittest.TestCase):
 
         self.assertEqual(connect.call_count, 2)
         for connection in connections:
-            connection.request.assert_called_once_with(
-                "GET", "/_sglang_renderer/ready"
-            )
+            connection.request.assert_called_once_with("GET", "/_sglang_renderer/ready")
             connection.close.assert_called_once_with()
 
     def test_rejects_modes_the_embedded_renderer_cannot_preserve(self):
