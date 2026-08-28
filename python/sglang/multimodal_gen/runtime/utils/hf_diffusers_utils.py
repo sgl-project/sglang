@@ -486,7 +486,9 @@ def _split_hf_subfolder(path: str) -> tuple[str, str | None]:
     return path, None
 
 
-def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
+def prepare_diffusers_component_path_for_loading(
+    component_path: str, revision: str | None = None
+) -> str:
     """Download component repos if needed and patch legacy flat ModelOpt configs."""
     if os.path.exists(component_path):
         local_component_path = component_path
@@ -497,10 +499,13 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
             local_repo = maybe_download_model(
                 repo_id,
                 allow_patterns=[f"{subfolder}/**", f"{subfolder}/*"],
+                revision=revision,
             )
             local_component_path = os.path.join(local_repo, subfolder)
         else:
-            local_component_path = maybe_download_model(component_path)
+            local_component_path = maybe_download_model(
+                component_path, revision=revision
+            )
     config_path = os.path.join(local_component_path, "config.json")
     if not os.path.exists(config_path):
         return local_component_path
@@ -543,10 +548,13 @@ def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
 
 def get_diffusers_component_config(
     component_path: str,
+    revision: str | None = None,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
     # Download from HuggingFace Hub if path doesn't exist locally
-    component_path = prepare_diffusers_component_path_for_loading(component_path)
+    component_path = prepare_diffusers_component_path_for_loading(
+        component_path, revision=revision
+    )
 
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler

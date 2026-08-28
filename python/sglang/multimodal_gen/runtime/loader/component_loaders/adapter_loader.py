@@ -43,7 +43,9 @@ class AdapterLoader(PlainStateDictComponentLoader):
         component_name: str = "connectors",
         *args,
     ):
-        config = self.load_component_config(component_model_path, component_name)
+        config = self.load_component_config(
+            component_model_path, component_name, revision=server_args.revision
+        )
         component_weights_path = self.resolve_component_weights_path(
             component_model_path, server_args, component_name
         )

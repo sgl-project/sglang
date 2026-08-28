@@ -43,7 +43,9 @@ class SchedulerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
         """Load the scheduler based on the model path, and inference args."""
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = get_diffusers_component_config(
+            component_path=component_model_path, revision=server_args.revision
+        )
 
         checkpoint_class_name = config.pop("_class_name", None)
         class_name = (

@@ -710,10 +710,12 @@ class TextEncoderLoader(ComponentLoader):
             component_name,
         )
         diffusers_pretrained_config = get_config(
-            component_model_path, trust_remote_code=True
+            component_model_path,
+            trust_remote_code=True,
+            revision=server_args.revision,
         )
         model_config = get_diffusers_component_config(
-            component_path=component_model_path
+            component_path=component_model_path, revision=server_args.revision
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch

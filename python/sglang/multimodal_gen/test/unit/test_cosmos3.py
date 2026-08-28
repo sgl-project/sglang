@@ -370,7 +370,8 @@ class TestCosmos3SchedulerConfig(unittest.TestCase):
             pipeline_config=types.SimpleNamespace(
                 scheduler_class_override="FlowUniPCMultistepScheduler",
                 flow_shift=None,
-            )
+            ),
+            revision=None,
         )
         with (
             mock.patch.object(

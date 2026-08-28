@@ -6,6 +6,11 @@ import modelscope
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    AutoProcessorLoader,
+    ImageProcessorLoader,
+    TokenizerLoader,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -27,7 +32,8 @@ def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
     server_args = SimpleNamespace(
         component_paths={
             "text_encoder_2": "diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2"
-        }
+        },
+        revision="pinned-revision",
     )
 
     with patch(
@@ -45,6 +51,61 @@ def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
     download.assert_called_once_with(
         "diffusers/FLUX.1-dev-bnb-4bit",
         allow_patterns=["text_encoder_2/**", "text_encoder_2/*"],
+        revision="pinned-revision",
+    )
+
+
+def test_component_override_pins_top_level_hub_repo_revision(tmp_path):
+    component_root = tmp_path / "component"
+    component_root.mkdir()
+
+    with patch(
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model",
+        return_value=str(component_root),
+    ) as download:
+        resolved = hf_diffusers_utils.prepare_diffusers_component_path_for_loading(
+            "owner/component", revision="pinned-revision"
+        )
+
+    assert resolved == str(component_root)
+    download.assert_called_once_with("owner/component", revision="pinned-revision")
+
+
+@pytest.mark.parametrize(
+    ("loader", "component_name", "native_class", "expected_kwargs"),
+    (
+        (
+            ImageProcessorLoader(),
+            "image_processor",
+            "AutoImageProcessor",
+            {"backend": "torchvision"},
+        ),
+        (AutoProcessorLoader(), "processor", "AutoProcessor", {}),
+        (
+            TokenizerLoader(),
+            "tokenizer",
+            "AutoTokenizer",
+            {"padding_side": "right", "use_fast": True},
+        ),
+    ),
+)
+def test_non_weight_component_loaders_pin_revision(
+    loader, component_name, native_class, expected_kwargs
+):
+    with patch(
+        "sglang.multimodal_gen.runtime.loader.component_loaders."
+        f"component_loader.{native_class}"
+    ) as native_loader:
+        loader.load_customized(
+            "owner/component",
+            SimpleNamespace(revision="pinned-revision"),
+            component_name,
+        )
+
+    native_loader.from_pretrained.assert_called_once_with(
+        "owner/component",
+        revision="pinned-revision",
+        **expected_kwargs,
     )
 
 

@@ -323,7 +323,9 @@ class VAELoader(ComponentLoader):
             server_args,
             component_name,
         )
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = get_diffusers_component_config(
+            component_path=component_model_path, revision=server_args.revision
+        )
         server_args.model_paths[component_name] = component_model_path
         native_only = component_name in getattr(
             server_args.pipeline_config, "native_only_components", ()

@@ -35,6 +35,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             component_weights_paths={},
             component_quantizations={},
             encoder_parallel="replicate",
+            revision=None,
             resolve_component_attention_backend=lambda _name: (None, None),
         )
 

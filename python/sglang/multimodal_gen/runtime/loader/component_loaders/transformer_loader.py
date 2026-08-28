@@ -205,7 +205,9 @@ class TransformerLoader(ComponentLoader):
         )
 
         # 1. hf config
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = get_diffusers_component_config(
+            component_path=component_model_path, revision=server_args.revision
+        )
 
         gguf_file = resolve_transformer_gguf_to_load(
             component_server_args, component_name

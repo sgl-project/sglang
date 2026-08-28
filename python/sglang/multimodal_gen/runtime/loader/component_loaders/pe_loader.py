@@ -163,6 +163,7 @@ class PELoader(ComponentLoader):
 
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
+            revision=server_args.revision,
             trust_remote_code=server_args.trust_remote_code,
         )
         if tokenizer.pad_token_id is None:
@@ -170,6 +171,7 @@ class PELoader(ComponentLoader):
 
         model = Ministral3ForCausalLM.from_pretrained(
             component_model_path,
+            revision=server_args.revision,
             torch_dtype=torch.bfloat16,
             trust_remote_code=server_args.trust_remote_code,
         )

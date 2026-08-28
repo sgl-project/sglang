@@ -101,7 +101,7 @@ class Flux2NvfpPipeline(Flux2Pipeline):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            return maybe_download_model(override_path)
+            return maybe_download_model(override_path, revision=server_args.revision)
 
         # get non-transformer components from the base FLUX.2 repo explicitly.
         # e.g.:

@@ -224,7 +224,7 @@ class Ideogram4Nvfp4Pipeline(Ideogram4Pipeline):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            return maybe_download_model(override_path)
+            return maybe_download_model(override_path, revision=server_args.revision)
 
         component_model_path = os.path.join(
             self._get_model_resolution(server_args).base_model_path,
@@ -307,7 +307,7 @@ class Ideogram4DistilledPipeline(Ideogram4Pipeline):
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
         if override_path is not None:
-            return maybe_download_model(override_path)
+            return maybe_download_model(override_path, revision=server_args.revision)
         if module_name == "transformer":
             return self._resolve_distilled_transformer_path()
         return os.path.join(

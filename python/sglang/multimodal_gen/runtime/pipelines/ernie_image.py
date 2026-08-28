@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
     maybe_download_model_index,
+    prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -38,14 +39,16 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     ]
 
-    def _has_pe_in_model_index(self, server_args) -> bool:
+    def _has_pe_in_model_index(self, model_path: str) -> bool:
         try:
-            model_index = maybe_download_model_index(server_args.model_path)
+            model_index = maybe_download_model_index(model_path)
             return "pe" in model_index and model_index["pe"] is not None
         except Exception:
             return False
 
-    def _read_tokenizer_model_max_length(self, model_path: str):
+    def _read_tokenizer_model_max_length(
+        self, model_path: str, revision: str | None = None
+    ):
         """Read model_max_length from tokenizer/tokenizer_config.json.
 
         Supports both local paths and HuggingFace Hub model IDs.
@@ -73,6 +76,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     repo_id=model_path,
                     filename=tokenizer_config_subpath,
                     local_dir=tmp_dir,
+                    revision=revision,
                 )
                 with open(config_path, encoding="utf-8") as f:
                     config = json.load(f)
@@ -88,6 +92,10 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         pe_component_path = server_args.component_paths.get(
             "pe", os.path.join(model_path, "pe")
         )
+        if "pe" in server_args.component_paths:
+            pe_component_path = prepare_diffusers_component_path_for_loading(
+                pe_component_path, revision=server_args.revision
+            )
         if os.path.exists(os.path.join(pe_component_path, "tokenizer_config.json")):
             return pe_component_path
         pe_tokenizer_dir = os.path.join(model_path, "pe_tokenizer")
@@ -101,7 +109,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         if not os.path.exists(model_path):
             try:
                 model_path = maybe_download_model(
-                    model_path, force_diffusers_model=True
+                    model_path,
+                    force_diffusers_model=True,
+                    revision=server_args.revision,
                 )
             except Exception as e:
                 logger.warning(
@@ -127,7 +137,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         return None
 
     def load_modules(self, server_args, loaded_modules=None):
-        has_pe = self._has_pe_in_model_index(server_args)
+        has_pe = self._has_pe_in_model_index(self.model_path)
         if has_pe:
             if "pe" not in self._required_config_modules:
                 self._required_config_modules.insert(0, "pe")
@@ -137,7 +147,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
         # --- Text encoder max_length ---
         text_model_max_length = self._read_tokenizer_model_max_length(
-            server_args.model_path
+            self.model_path, revision=server_args.revision
         )
         if text_model_max_length is not None:
             # 1. Update arch_config.text_len so the model knows the true sequence length
@@ -169,7 +179,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         # --- PE model_max_length ---
         if has_pe:
             pe_model_max_length = self._read_pe_model_max_length(
-                server_args.model_path, server_args
+                self.model_path, server_args
             )
             if pe_model_max_length is not None:
                 pipeline_config.pe_model_max_length = pe_model_max_length
@@ -205,6 +215,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 pe_tokenizer = AutoTokenizer.from_pretrained(
                     pe_tokenizer_path,
+                    revision=server_args.revision,
                     trust_remote_code=server_args.trust_remote_code,
                 )
             self.add_stage(

@@ -378,7 +378,7 @@ class ComponentLoader(ABC):
             from diffusers import AutoModel
 
             component_model_path = prepare_diffusers_component_path_for_loading(
-                component_model_path
+                component_model_path, revision=server_args.revision
             )
             return AutoModel.from_pretrained(
                 component_model_path,
@@ -530,9 +530,14 @@ class PlainStateDictComponentLoader(ComponentLoader):
         )
 
     def load_component_config(
-        self, component_model_path: str, component_name: str
+        self,
+        component_model_path: str,
+        component_name: str,
+        revision: str | None = None,
     ) -> dict[str, Any]:
-        config = get_diffusers_component_config(component_path=component_model_path)
+        config = get_diffusers_component_config(
+            component_path=component_model_path, revision=revision
+        )
         self.ensure_plain_state_dict_checkpoint(config, component_name)
         return config
 
@@ -560,7 +565,9 @@ class ImageProcessorLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
         return AutoImageProcessor.from_pretrained(
-            component_model_path, backend="torchvision"
+            component_model_path,
+            backend="torchvision",
+            revision=server_args.revision,
         )
 
 
@@ -573,7 +580,9 @@ class AutoProcessorLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        return AutoProcessor.from_pretrained(component_model_path)
+        return AutoProcessor.from_pretrained(
+            component_model_path, revision=server_args.revision
+        )
 
 
 class TokenizerLoader(ComponentLoader):
@@ -593,7 +602,9 @@ class TokenizerLoader(ComponentLoader):
             self.component_architecture is not None
             and self.component_architecture.endswith("Processor")
         ):
-            return AutoProcessor.from_pretrained(component_model_path)
+            return AutoProcessor.from_pretrained(
+                component_model_path, revision=server_args.revision
+            )
 
         # Qwen-Image's model_index declares Qwen2Tokenizer; using the fast class
         # changes text preprocessing and shifts official GT comparisons.
@@ -602,6 +613,7 @@ class TokenizerLoader(ComponentLoader):
             return AutoTokenizer.from_pretrained(
                 component_model_path,
                 padding_side="right",
+                revision=server_args.revision,
                 use_fast=use_fast,
             )
         except TypeError as e:
@@ -615,6 +627,7 @@ class TokenizerLoader(ComponentLoader):
                 return _load_auto_tokenizer_with_roberta_processing_compat(
                     component_model_path,
                     padding_side="right",
+                    revision=server_args.revision,
                     use_fast=False,
                 )
             raise

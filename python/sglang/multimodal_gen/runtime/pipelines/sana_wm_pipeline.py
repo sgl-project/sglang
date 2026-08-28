@@ -34,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SanaWMStreamingRefinerStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    prepare_diffusers_component_path_for_loading,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # Stage-2 refiner sub-modules live under `<model_path>/refiner/...`, not at the
@@ -208,6 +211,9 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
             component_path = self._resolve_refiner_component_path(
                 server_args, module_name, subpath
             )
+            component_path = prepare_diffusers_component_path_for_loading(
+                component_path, revision=server_args.revision
+            )
             logger.info(
                 "SANA-WM loading refiner component %s from %s",
                 module_name,
@@ -243,6 +249,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
             module = LTX2VideoTransformer3DModel.from_pretrained(
                 component_path,
+                revision=server_args.revision,
                 torch_dtype=dtype,
             ).eval()
             module = OfficialDiffusersLTX2RefinerModule(module)
@@ -251,6 +258,7 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
 
             module = LTX2TextConnectors.from_pretrained(
                 component_path,
+                revision=server_args.revision,
                 torch_dtype=dtype,
             ).eval()
         elif module_name == "text_encoder_2":
@@ -260,12 +268,15 @@ class SanaWMTwoStagePipeline(SanaWMPipeline):
                 component_path,
                 torch_dtype=dtype,
                 low_cpu_mem_usage=True,
+                revision=server_args.revision,
             ).eval()
             module = OfficialGemma3TextEncoderModule(module)
         elif module_name == "tokenizer_2":
             from transformers import AutoTokenizer
 
-            module = AutoTokenizer.from_pretrained(component_path)
+            module = AutoTokenizer.from_pretrained(
+                component_path, revision=server_args.revision
+            )
         else:
             raise ValueError(f"Unsupported SANA-WM refiner component: {module_name}")
 

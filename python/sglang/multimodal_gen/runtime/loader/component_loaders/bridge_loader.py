@@ -31,7 +31,9 @@ class BridgeLoader(PlainStateDictComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
-        config = self.load_component_config(component_model_path, component_name)
+        config = self.load_component_config(
+            component_model_path, component_name, revision=server_args.revision
+        )
         hf_config = deepcopy(config)
         class_name = config.pop("_class_name", None)
         if class_name is None:

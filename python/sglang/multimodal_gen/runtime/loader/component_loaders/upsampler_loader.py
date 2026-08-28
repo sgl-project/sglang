@@ -52,7 +52,7 @@ def _download_hf_file(repo_id: str, filename: str, revision: str = "main") -> st
     return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
 
 
-def _find_safetensors_file(path: str) -> str:
+def _find_safetensors_file(path: str, revision: str | None = None) -> str:
     """Resolve path to a single safetensors file (local path, directory, HF URL, or HF repo id)."""
     if os.path.isfile(path) and path.endswith(".safetensors"):
         return path
@@ -72,7 +72,7 @@ def _find_safetensors_file(path: str) -> str:
         return _download_hf_file(repo_id, filename, revision)
 
     try:
-        maybe_downloaded = maybe_download_model(path)
+        maybe_downloaded = maybe_download_model(path, revision=revision)
         if os.path.isdir(maybe_downloaded):
             files = sorted(glob.glob(os.path.join(maybe_downloaded, "*.safetensors")))
             if len(files) == 1:
@@ -204,7 +204,9 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ):
-        safetensors_path = _find_safetensors_file(component_model_path)
+        safetensors_path = _find_safetensors_file(
+            component_model_path, revision=server_args.revision
+        )
         raw_config = _load_explicit_config(safetensors_path, component_model_path)
         if raw_config is not None:
             self.ensure_plain_state_dict_checkpoint(raw_config, component_name)

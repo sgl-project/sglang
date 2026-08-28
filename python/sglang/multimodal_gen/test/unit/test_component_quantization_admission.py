@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.sound_tokenizer_load
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.upsampler_loader import (
     UpsamplerLoader,
+    _find_safetensors_file,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vocoder_loader import (
     VocoderLoader,
@@ -64,10 +65,15 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             "sglang.multimodal_gen.runtime.loader.component_loaders."
             "component_loader.get_diffusers_component_config",
             return_value=config,
-        ):
-            loaded = _TestLoader().load_component_config("/model/component", "test")
+        ) as get_config:
+            loaded = _TestLoader().load_component_config(
+                "/model/component", "test", revision="pinned-revision"
+            )
 
         self.assertIs(loaded, config)
+        get_config.assert_called_once_with(
+            component_path="/model/component", revision="pinned-revision"
+        )
 
     def test_all_quantization_metadata_layouts_fail_closed(self):
         configs = {
@@ -132,7 +138,11 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             ) as resolve_model,
             self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
-            AdapterLoader().load_customized("/model/connectors", None, "connectors")
+            AdapterLoader().load_customized(
+                "/model/connectors",
+                SimpleNamespace(revision="pinned-revision"),
+                "connectors",
+            )
 
         resolve_model.assert_not_called()
 
@@ -164,6 +174,26 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             )
 
         load_weights.assert_not_called()
+
+    def test_upsampler_repo_resolution_pins_revision(self):
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "upsampler_loader.maybe_download_model",
+                return_value="/cache/component",
+            ) as download,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "upsampler_loader.glob.glob",
+                return_value=["/cache/component/model.safetensors"],
+            ),
+        ):
+            resolved = _find_safetensors_file(
+                "owner/component", revision="pinned-revision"
+            )
+
+        self.assertEqual(resolved, "/cache/component/model.safetensors")
+        download.assert_called_once_with("owner/component", revision="pinned-revision")
 
 
 if __name__ == "__main__":
