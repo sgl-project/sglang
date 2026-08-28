@@ -99,7 +99,7 @@ def test_initial_seed_stays_conservative_for_unknown_fixed_resident_weights():
     assert selected == set()
 
 
-def test_initial_seed_keeps_explicit_placement_and_can_select_auxiliary_components():
+def test_initial_seed_keeps_explicit_placement_and_auxiliary_load_semantics():
     args = _Args(
         modes={"transformer": LAYERWISE_OFFLOAD},
         explicit={"transformer"},
@@ -111,10 +111,10 @@ def test_initial_seed_keeps_explicit_placement_and_can_select_auxiliary_componen
         denoising_steps=8,
     )
 
-    assert selected == {"vae"}
+    assert selected == set()
 
 
-def test_initial_seed_selects_all_known_components_when_they_fit():
+def test_initial_seed_selects_only_dits_when_all_components_fit():
     args = _Args(modes={"transformer": LAYERWISE_OFFLOAD})
 
     selected = choose_initial_resident_components(
@@ -128,7 +128,7 @@ def test_initial_seed_selects_all_known_components_when_they_fit():
         denoising_steps=8,
     )
 
-    assert selected == {"transformer", "text_encoder", "vae"}
+    assert selected == {"transformer"}
 
 
 def test_initial_seed_packs_reused_dits_under_the_common_reserve():
@@ -146,7 +146,7 @@ def test_initial_seed_packs_reused_dits_under_the_common_reserve():
         denoising_steps=40,
     )
 
-    assert selected == {"transformer", "transformer_2", "vae"}
+    assert selected == {"transformer", "transformer_2"}
 
 
 def test_initial_seed_can_bypass_model_default_layerwise_initialization():
@@ -201,7 +201,7 @@ def test_initial_seed_applies_one_reversible_override():
     )
 
 
-def test_initial_seed_defers_unselected_layerwise_setup():
+def test_initial_seed_preserves_unselected_layerwise_setup():
     args = _Args(
         modes={
             "transformer": LAYERWISE_OFFLOAD,
@@ -234,8 +234,6 @@ def test_initial_seed_defers_unselected_layerwise_setup():
     assert args.selected == {
         "transformer": RESIDENT,
         "transformer_2": RESIDENT,
-        "text_encoder": COMPONENT_OFFLOAD,
-        "vae": RESIDENT,
     }
 
 

@@ -7,8 +7,6 @@ from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    COMPONENT_OFFLOAD,
-    LAYERWISE_OFFLOAD,
     RESIDENT,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_weight_inventory import (
@@ -61,8 +59,8 @@ def choose_initial_resident_components(
     """Choose resident startup components without removing runtime options.
 
     This is a load-feasibility seed, not a second serving-placement planner.
-    Native weighted components can still be demoted by warmup calibration.
-    Unknown weights, pipeline exclusions, and explicit choices retain their
+    Native DiTs can still be demoted by warmup calibration. Auxiliary modules,
+    unknown weights, pipeline exclusions, and explicit choices retain their
     configured loading semantics. A model-default layerwise placement remains
     eligible because avoiding that initialization is the point of this seed.
     """
@@ -93,19 +91,17 @@ def choose_initial_resident_components(
             weight_bytes is None
             or weight_bytes <= 0
             or item.component_name in excluded_components
+            or not is_dit_component_name(item.component_name)
             or server_args.residency_mode(item.component_name) == RESIDENT
             or server_args.explicit_residency_mode(item.component_name) is not None
         ):
             continue
-        uses_per_request = (
-            denoising_steps if is_dit_component_name(item.component_name) else 1
-        )
         options.append(
             PlacementOption(
                 group_key=item.component_name,
                 option_key=f"{item.component_name}:resident",
                 resource_delta_bytes={"gpu:load": weight_bytes},
-                estimated_latency_savings=weight_bytes * uses_per_request,
+                estimated_latency_savings=weight_bytes * denoising_steps,
                 preference_cost=(weight_bytes,),
             )
         )
@@ -148,26 +144,13 @@ def maybe_seed_initial_residency(
         available_bytes=int(available_gib * GIB_BYTES),
         excluded_components=excluded_components,
     )
-    coarse_offload = {
-        item.component_name
-        for item in inventory
-        if item.component_name not in selected
-        and item.component_name not in excluded_components
-        and server_args.explicit_residency_mode(item.component_name) is None
-        and server_args.residency_mode(item.component_name) == LAYERWISE_OFFLOAD
-    }
-
     for component_name in selected:
         server_args.set_auto_residency_mode(component_name, RESIDENT)
-    for component_name in coarse_offload:
-        server_args.set_auto_residency_mode(component_name, COMPONENT_OFFLOAD)
-    if not selected and not coarse_offload:
+    if not selected:
         return
     logger.info(
-        "Initial auto residency: resident=%s, component-offload=%s "
-        "(minimum free VRAM=%.1f GiB); warmup may rebalance this "
-        "load-safe seed.",
+        "Initial auto residency: resident=%s (minimum free VRAM=%.1f GiB); "
+        "warmup may rebalance this load-safe seed.",
         sorted(selected),
-        sorted(coarse_offload),
         available_gib,
     )
