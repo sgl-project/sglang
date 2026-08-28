@@ -851,5 +851,48 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         tree.sanity_check()
 
 
+class TestFreeFullPartition(CustomTestCase):
+    """`free_full` releases only the full side of a hybrid SWA allocator."""
+
+    def setUp(self):
+        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.full_baseline = self.allocator.full_available_size()
+        self.swa_baseline = self.allocator.swa_available_size()
+
+    def _sizes(self):
+        return (
+            self.allocator.full_available_size(),
+            self.allocator.swa_available_size(),
+        )
+
+    def test_free_full_keeps_the_swa_peers_allocated(self):
+        indices = _swa_alloc(self.allocator, 4)
+        self.allocator.free_full(indices)
+
+        full_avail, swa_avail = self._sizes()
+        self.assertEqual(full_avail, self.full_baseline)
+        self.assertEqual(swa_avail, self.swa_baseline - 4)
+
+    def test_free_full_leaves_the_mapping_intact(self):
+        indices = _swa_alloc(self.allocator, 4)
+        before = self.allocator.full_to_swa_index_mapping[indices].clone()
+        self.allocator.free_full(indices)
+
+        self.assertTrue(bool((before > 0).all()))
+        self.assertTrue(
+            torch.equal(self.allocator.full_to_swa_index_mapping[indices], before)
+        )
+
+    def test_free_full_is_deferred_inside_a_free_group(self):
+        indices = _swa_alloc(self.allocator, 4)
+
+        self.allocator.free_group_begin()
+        self.allocator.free_full(indices)
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline - 4)
+        self.allocator.free_group_end()
+
+        self.assertEqual(self.allocator.full_available_size(), self.full_baseline)
+
+
 if __name__ == "__main__":
     unittest.main()
