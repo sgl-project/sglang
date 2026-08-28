@@ -1234,6 +1234,11 @@ class ServerArgs:
         "Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
         NS("device"),
     ] = None
+    tokenizer_event_loop_watchdog_timeout: A[
+        Optional[float],
+        "Set tokenizer event loop watchdog timeout in seconds. If the event loop stops responding, the server will dump information for debugging.",
+        NS("serving"),
+    ] = None
     sleep_on_idle: A[bool, "Reduce CPU usage when sglang is idle.", NS("device")] = (
         False
     )

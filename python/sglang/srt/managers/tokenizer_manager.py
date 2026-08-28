@@ -733,19 +733,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if get_observability().gc_warning_threshold_secs > 0.0:
             configure_gc_warning(get_observability().gc_warning_threshold_secs)
-        soft_watchdog_timeout = get_device().soft_watchdog_timeout
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
-            watchdog_timeout=soft_watchdog_timeout,
+            watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
-        self.event_loop_watchdog = Watchdog.create(
-            debug_name="TokenizerManager event loop",
-            watchdog_timeout=soft_watchdog_timeout,
-            soft=True,
+        self.event_loop_watchdog_timeout = (
+            get_serving().tokenizer_event_loop_watchdog_timeout
         )
-        self.event_loop_watchdog_enabled = soft_watchdog_timeout is not None
+        self.event_loop_watchdog = None
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -2152,7 +2149,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
-        if self.event_loop_watchdog_enabled:
+        if self.event_loop_watchdog_timeout is not None:
+            self.event_loop_watchdog = Watchdog.create(
+                debug_name="TokenizerManager event loop",
+                watchdog_timeout=self.event_loop_watchdog_timeout,
+                soft=True,
+            )
             self.asyncio_tasks.add(
                 loop.create_task(print_exception_wrapper(self.event_loop_watchdog_loop))
             )
@@ -2173,9 +2175,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     async def event_loop_watchdog_loop(self):
+        interval = min(1.0, self.event_loop_watchdog_timeout / 2)
         while True:
             self.event_loop_watchdog.feed()
-            await asyncio.sleep(1)
+            await asyncio.sleep(interval)
 
     async def handle_loop(self):
         """The event loop that handles requests"""

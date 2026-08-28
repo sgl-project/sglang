@@ -150,7 +150,10 @@ class WatchdogRaw:
         if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")
 
-        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        try:
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            logger.exception(f"{self.debug_name} failed to dump local traceback")
         pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
