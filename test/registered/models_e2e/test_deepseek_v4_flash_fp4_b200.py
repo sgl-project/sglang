@@ -167,10 +167,7 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
 ):
     """BCG recipe: TP=4, DP=4, DeepEP, DP attention, mixed chunk."""
 
-    # Lowered from 0.93 to 0.80 due to BCG nondeterminism from #30898
-    # (idle-rank dummy extend's hidden states vary run-to-run, perturbing
-    # real tokens' logits through shared EP grouped GEMMs). See #31125.
-    gsm8k_accuracy_thres = 0.80
+    gsm8k_accuracy_thres = 0.93
 
     @unittest.skip(
         "Flaky: temp-0 outputs are nondeterministic under this recipe "
