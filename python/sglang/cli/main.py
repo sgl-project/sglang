@@ -24,6 +24,7 @@ def main():
         help="Run inference on a multimodal model.",
         add_help=False,
     )
+
     # simple commands
     version_parser = subparsers.add_parser(
         "version",
