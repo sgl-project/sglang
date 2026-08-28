@@ -85,15 +85,6 @@ class FakeKVSender(BaseKVSender):
             f"FakeKVSender send with kv_indices: {kv_indices}, state_indices: {state_indices}"
         )
 
-    def send_with_draft_indices(
-        self,
-        kv_indices: npt.NDArray[np.int32],
-        draft_kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
-    ):
-        self.send(kv_indices, state_indices, num_kv_tokens)
-
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 
@@ -141,16 +132,6 @@ class FakeKVReceiver(BaseKVReceiver):
         logger.debug(
             f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
         )
-
-    def send_metadata_with_draft_indices(
-        self,
-        kv_indices: npt.NDArray[np.int32],
-        draft_kv_indices: npt.NDArray[np.int32],
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        decode_prefix_len: Optional[int] = None,
-    ):
-        self.send_metadata(kv_indices, aux_index, state_indices, decode_prefix_len)
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")

@@ -234,7 +234,6 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
-        kv_args.num_target_kv_data_ptrs = len(kv_data_ptrs)
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled
@@ -244,8 +243,8 @@ class PrefillBootstrapQueue:
         draft_kv_pool = self.draft_token_to_kv_pool if transfer_draft_cache else None
         num_draft_entries = 0
         if draft_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
+            # Draft KV shares target virtual ids. Unified target KV is transferred
+            # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 draft_kv_pool.get_contiguous_buf_infos()
             )

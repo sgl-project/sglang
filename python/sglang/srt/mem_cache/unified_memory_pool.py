@@ -636,11 +636,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Map physical token ids to this pool's page-envelope row ids."""
-        return (
-            (indices // self.page_size)
-            * (self.page_size * self.kernel_page_blocks)
-            + indices % self.page_size
-        )
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         """Copy rows addressed by physical token ids from page envelopes."""
@@ -648,9 +646,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         """Restore rows addressed by physical token ids into page envelopes."""
-        super().load_cpu_copy(
-            kv_cache_cpu, self._physical_to_kernel_indices(indices)
-        )
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
