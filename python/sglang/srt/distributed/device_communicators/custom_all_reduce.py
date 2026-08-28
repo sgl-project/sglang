@@ -53,6 +53,7 @@ class CustomAllreduce:
         group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_size=_MAX_CAR_SIZE,
+        enable_register_for_capturing: bool = True,
     ) -> None:
         """
         Args:
@@ -60,6 +61,8 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bind to f"cuda:{local_rank}".
+            enable_register_for_capturing: directly register graph-owned input
+                buffers instead of staging them through the shared input buffer.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -142,6 +145,9 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        self.enable_register_for_capturing = (
+            enable_register_for_capturing and not self.tms_cudagraph
+        )
 
     @staticmethod
     def create_shared_buffer(
@@ -313,7 +319,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(
+                    input, registered=self.enable_register_for_capturing
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -369,6 +377,7 @@ def dispatch_custom_allreduce(
         return CustomAllreduce
 
     assert _is_hip
+    enable_register_for_capturing = _enable_register_for_capturing()
 
     if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
@@ -387,7 +396,10 @@ def dispatch_custom_allreduce(
     # On AMD with 1-stage AR, use sglang's CustomAllreduce
     # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
     if _use_amd_deterministic_impl():
-        return CustomAllreduce
+        return partial(
+            CustomAllreduce,
+            enable_register_for_capturing=enable_register_for_capturing,
+        )
 
     if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
@@ -396,10 +408,11 @@ def dispatch_custom_allreduce(
             )
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
-            tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            if not enable_register_for_capturing:
+                logger.info("[AR] Using copy-in buffers during CUDA graph capture")
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=enable_register_for_capturing,
             )
         except ImportError as e:
             logger.warning(
@@ -407,9 +420,34 @@ def dispatch_custom_allreduce(
                 "falling back to sglang CustomAllreduce. Details: %s",
                 e,
             )
-            return CustomAllreduce
+            return partial(
+                CustomAllreduce,
+                enable_register_for_capturing=enable_register_for_capturing,
+            )
 
-    return CustomAllreduce
+    return partial(
+        CustomAllreduce,
+        enable_register_for_capturing=enable_register_for_capturing,
+    )
+
+
+def _enable_register_for_capturing() -> bool:
+    """Whether custom AR may bind graph-owned input pointers directly.
+
+    DSA DP-attention lanes may replay different decode graphs at the same time.
+    Direct registration bakes a peer-pointer tuple for one captured graph into
+    each custom-AR call. If another rank replays a different graph, that tuple
+    still points at the peer buffer from the original graph and reads stale
+    data. Copy-in uses one pre-registered address per rank across every graph,
+    so independently selected graph variants remain compatible.
+    """
+    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+        return False
+
+    from sglang.srt.runtime_context import attention_backends, get_parallel
+
+    _prefill_backend, decode_backend = attention_backends()
+    return not (get_parallel().enable_dp_attention and decode_backend == "dsa")
 
 
 def _use_amd_deterministic_impl() -> bool:
