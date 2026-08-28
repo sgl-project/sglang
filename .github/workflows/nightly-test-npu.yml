@@ -320,7 +320,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800t-16-
+      runner: linux-aarch64-a3-800t-16
       test_type: 'accuracy'
       test_suite: nightly-acc-16-npu-a3-dsv4-gpqa
       is_nightly_pipeline_job: true
