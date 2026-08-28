@@ -3,7 +3,6 @@ This unittest is introduced in #22360, preventing duplicate transformer safetens
 """
 
 import json
-import os
 import sys
 import tempfile
 import types
@@ -100,8 +99,8 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
     _resolve_quant_config,
+    resolve_transformer_checkpoint_files,
     resolve_transformer_quant_load_spec,
-    resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
@@ -262,50 +261,69 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertIsNone(backend)
 
-    def test_resolve_transformer_safetensors_to_load_uses_single_override_file(self):
+    def test_resolve_transformer_checkpoint_files_uses_single_override_file(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             server_args = self._make_server_args(transformer_weights_path=f.name)
-            resolved = resolve_transformer_safetensors_to_load(
+            resolved = resolve_transformer_checkpoint_files(
                 server_args, "/unused/component/path"
             )
 
-        self.assertEqual(resolved, [f.name])
+        self.assertEqual(resolved.safetensors, (f.name,))
+        self.assertIsNone(resolved.config_path)
 
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.hf_hub_download",
-        return_value="/cache/model.safetensors",
-    )
-    def test_resolve_transformer_safetensors_to_load_uses_hf_file_reference(
-        self, mock_download
-    ):
-        filename = "diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors"
+    def test_resolve_transformer_checkpoint_files_uses_one_hf_revision(self):
+        filename = "weights/model.safetensors"
         references = (
             (
-                f"https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/{filename}",
+                f"https://huggingface.co/owner/repo/resolve/main/{filename}",
                 "main",
             ),
-            (f"Comfy-Org/MiniMax-H3/{filename}", "test-revision"),
+            (f"owner/repo/{filename}", "test-revision"),
         )
 
         for reference, revision in references:
             with self.subTest(reference=reference):
-                server_args = self._make_server_args(transformer_weights_path=reference)
-                with patch(
-                    "os.path.isfile",
-                    side_effect=lambda path: path == "/cache/model.safetensors",
-                ):
-                    self.assertEqual(
-                        resolve_transformer_safetensors_to_load(
-                            server_args, "/unused/component/path"
-                        ),
-                        ["/cache/model.safetensors"],
-                    )
-                mock_download.assert_called_once_with(
-                    repo_id="Comfy-Org/MiniMax-H3",
-                    filename=filename,
+                server_args = self._make_server_args(
+                    transformer_weights_path=reference,
                     revision=revision,
                 )
-                mock_download.reset_mock()
+                model_info = SimpleNamespace(
+                    sha="immutable-sha",
+                    siblings=[
+                        SimpleNamespace(rfilename=filename),
+                        SimpleNamespace(rfilename="weights/config.json"),
+                    ],
+                )
+
+                def download(*, filename, **_kwargs):
+                    return f"/cache/{filename.rsplit('/', 1)[-1]}"
+
+                with (
+                    patch(
+                        "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+                        return_value=model_info,
+                    ) as model_info_call,
+                    patch(
+                        "sglang.multimodal_gen.runtime.weights.source.hf_hub_download",
+                        side_effect=download,
+                    ) as download,
+                ):
+                    resolved = resolve_transformer_checkpoint_files(
+                        server_args, "/unused/component/path"
+                    )
+                self.assertEqual(resolved.safetensors, ("/cache/model.safetensors",))
+                self.assertEqual(resolved.config_path, "/cache/config.json")
+                model_info_call.assert_called_once_with("owner/repo", revision=revision)
+                self.assertEqual(
+                    {call.kwargs["filename"] for call in download.call_args_list},
+                    {filename, "weights/config.json"},
+                )
+                self.assertTrue(
+                    all(
+                        call.kwargs["revision"] == "immutable-sha"
+                        for call in download.call_args_list
+                    )
+                )
 
     def test_inspect_minimax_h3_safetensors_detects_curve_and_comfy_format(self):
         marker = json.dumps(
@@ -739,13 +757,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 checkpoint_quant_config=ComfyFp8Config({}),
             )
 
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
-        side_effect=lambda path, **kw: path,
-    )
-    def test_resolve_transformer_safetensors_to_load_prefers_mixed_export(
-        self, _mock_download
-    ):
+    def test_resolve_transformer_override_prefers_single_mixed_export(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             mixed = f"{tmpdir}/flux2-dev-nvfp4-mixed.safetensors"
             full = f"{tmpdir}/flux2-dev-nvfp4.safetensors"
@@ -753,39 +765,11 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             open(full, "a").close()
 
             server_args = self._make_server_args(transformer_weights_path=tmpdir)
-            resolved = resolve_transformer_safetensors_to_load(
+            resolved = resolve_transformer_checkpoint_files(
                 server_args, "/unused/component/path"
             )
 
-        self.assertEqual(resolved, [mixed])
-
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.snapshot_download",
-    )
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
-    )
-    def test_resolve_transformer_safetensors_to_load_refreshes_empty_cached_repo(
-        self, mock_download_model, mock_snapshot_download
-    ):
-        with tempfile.TemporaryDirectory() as cached_dir:
-            repo_id = "black-forest-labs/FLUX.2-dev-NVFP4"
-            mixed = os.path.join(cached_dir, "flux2-dev-nvfp4-mixed.safetensors")
-            mock_download_model.return_value = cached_dir
-
-            def _snapshot_download(**_kwargs):
-                open(mixed, "a").close()
-                return cached_dir
-
-            mock_snapshot_download.side_effect = _snapshot_download
-
-            server_args = self._make_server_args(transformer_weights_path=repo_id)
-            resolved = resolve_transformer_safetensors_to_load(
-                server_args, "/unused/component/path"
-            )
-
-        self.assertEqual(resolved, [mixed])
-        mock_snapshot_download.assert_called_once()
+        self.assertEqual(resolved.safetensors, (mixed,))
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [
