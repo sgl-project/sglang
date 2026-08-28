@@ -17,9 +17,11 @@ class AttentionAndMoeLayers(NamedTuple):
     dsa_indexers: list[Any]
     mha_companion_layers: list[Any]
 
+
 def _get_loop_num(hf_config: Any) -> int:
     # Nanbeige uses num_loops; IQuestLoopCoder uses loop_num.
     return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
+
 
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     attention_layers: list[Any] = []

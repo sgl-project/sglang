@@ -9,7 +9,6 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -18,7 +17,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -30,11 +29,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
+
 
 class NanbeigeRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -51,7 +49,8 @@ class NanbeigeRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-    
+
+
 class NanbeigeMLP(nn.Module):
     def __init__(
         self,
@@ -82,7 +81,7 @@ class NanbeigeMLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-    
+
     def forward(self, x, use_reduce_scatter: bool = False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
@@ -91,14 +90,18 @@ class NanbeigeMLP(nn.Module):
             skip_all_reduce=use_reduce_scatter,
         )
         return x
-    
+
+
 class NanbeigeAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: NanbeigeConfig, 
-                 layer_id: Optional[int] = None,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = "",):
+    def __init__(
+        self,
+        config: NanbeigeConfig,
+        layer_id: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
@@ -108,13 +111,21 @@ class NanbeigeAttention(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0, "num_attention_heads must be divisible by tp_size."
+        assert (
+            self.total_num_heads % tp_size == 0
+        ), "num_attention_heads must be divisible by tp_size."
         self.num_heads = self.total_num_heads // tp_size
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.total_num_heads)
+        self.head_dim = getattr(
+            config, "head_dim", self.hidden_size // self.total_num_heads
+        )
 
         self.total_num_kv_heads = config.num_key_value_heads
-        assert self.total_num_kv_heads >= tp_size, "num_key_value_heads must be greater than tp_size."
-        assert self.total_num_kv_heads % tp_size == 0, "num_key_value_heads must be divisible by tp_size."
+        assert (
+            self.total_num_kv_heads >= tp_size
+        ), "num_key_value_heads must be greater than tp_size."
+        assert (
+            self.total_num_kv_heads % tp_size == 0
+        ), "num_key_value_heads must be divisible by tp_size."
         self.num_kv_heads = config.num_key_value_heads // tp_size
 
         self.q_size = self.num_heads * self.head_dim
@@ -126,7 +137,6 @@ class NanbeigeAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.total_layers = config.num_hidden_layers
         self.num_loops = config.num_loops
-
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -183,7 +193,8 @@ class NanbeigeAttention(nn.Module):
         attn_output = self.attn[loop_idx](q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
-    
+
+
 class NanbeigeDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -195,10 +206,12 @@ class NanbeigeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.self_attn = NanbeigeAttention(config=config, 
-                                           layer_id=layer_id, 
-                                           quant_config=quant_config, 
-                                           prefix=add_prefix("self_attn", prefix))
+        self.self_attn = NanbeigeAttention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+        )
 
         self.mlp = NanbeigeMLP(
             hidden_size=config.hidden_size,
@@ -208,7 +221,9 @@ class NanbeigeDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -218,7 +233,7 @@ class NanbeigeDecoderLayer(nn.Module):
         loop_idx: int,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -236,7 +251,8 @@ class NanbeigeDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
-    
+
+
 class NanbeigeModel(nn.Module):
     def __init__(
         self,
@@ -251,7 +267,9 @@ class NanbeigeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         pp_size = self.pp_group.world_size
-        assert pp_size == 1, "The NanbeigeModel only supports a pipeline parallelism (PP) value of 1."
+        assert (
+            pp_size == 1
+        ), "The NanbeigeModel only supports a pipeline parallelism (PP) value of 1."
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -259,7 +277,7 @@ class NanbeigeModel(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 use_attn_tp_group=is_dp_attention_enabled(),
-                prefix=add_prefix("embed_tokens", prefix)
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -320,7 +338,9 @@ class NanbeigeModel(nn.Module):
                 logical_id = loop_idx * num_physical_layers + i
                 if logical_id in self.layers_to_capture:
                     aux_hidden_states.append(
-                        hidden_states + residual if residual is not None else hidden_states.clone()
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states.clone()
                     )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -362,8 +382,8 @@ class NanbeigeModel(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
-    
-            
+
+
 class NanbeigeForCausalLM(nn.Module):
     def __init__(
         self,
@@ -418,7 +438,7 @@ class NanbeigeForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-    
+
     @torch.no_grad()
     def forward(
         self,
@@ -453,7 +473,7 @@ class NanbeigeForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-    
+
     @property
     def start_layer(self):
         return self.model.start_layer
@@ -461,7 +481,7 @@ class NanbeigeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
-        
+
     @torch.no_grad()
     def forward_split_prefill(
         self,
