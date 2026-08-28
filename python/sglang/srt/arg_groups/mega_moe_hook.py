@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
     handle_w4a4_mxfp4_megamoe_env(server_args)
+    handle_rocm_megamoe(server_args)
 
 
 def handle_moe_runner_backend_alias(server_args: ServerArgs) -> None:
@@ -47,3 +48,39 @@ def handle_w4a4_mxfp4_megamoe_env(server_args: ServerArgs) -> None:
 
     os.environ["DG_USE_FP4_ACTS"] = "1"
     os.environ["DG_USE_MXF4_KIND"] = "1"
+
+
+def handle_rocm_megamoe(server_args: ServerArgs) -> None:
+    if server_args.moe_a2a_backend != "megamoe":
+        return
+
+    from sglang.srt.environ import envs
+    from sglang.srt.utils import is_hip
+
+    if not is_hip():
+        return
+
+    mtpr = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if mtpr <= 0 or (mtpr & (mtpr - 1)) != 0:
+        raise ValueError(
+            "MegaMoE on ROCm requires "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to be a "
+            f"positive power of two (AITER MegaMoEV2 P2P wire format), got {mtpr}"
+        )
+    if not envs.SGLANG_USE_AITER.get():
+        raise ValueError(
+            "MegaMoE on ROCm requires SGLANG_USE_AITER=1 and an AITER build "
+            "that exports aiter.ops.flydsl.kernels.mega_moe.MegaMoEV2 "
+            "(ROCm/aiter#4439)."
+        )
+    if os.environ.get("MORI_SHMEM_MODE", "").lower() == "isolation":
+        raise ValueError(
+            "MegaMoE on ROCm does not support MORI_SHMEM_MODE=ISOLATION. "
+            "MegaMoEV2 uses the pure symmetric-address API (shmem_ptr_p2p), "
+            "which requires static heap mode or MORI_SHMEM_MODE=VMM_HEAP."
+        )
+    logger.info(
+        "MegaMoE on ROCm: using AITER FlyDSL MegaMoEV2 (mtpr=%s, ep_size=%s).",
+        mtpr,
+        server_args.ep_size,
+    )

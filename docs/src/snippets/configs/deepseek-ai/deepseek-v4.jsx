@@ -245,7 +245,7 @@ sgl-eval run aime25 \\
           // strategy for experimentation (docs recommend it on high-throughput).
           { id: "megamoe",           label: "MegaMoE",
             flags: ["--moe-a2a-backend megamoe"],
-            requiresHw: ["b200", "b300", "gb200", "gb300"] },
+            requiresHw: ["b200", "b300", "gb200", "gb300", "mi355x"] },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
             flags: ["--moe-runner-backend flashinfer_mxfp4"] },
           { id: "marlin",            label: "Marlin (W4A16)",
