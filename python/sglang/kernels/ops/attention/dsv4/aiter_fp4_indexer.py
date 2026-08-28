@@ -190,8 +190,11 @@ def aiter_fp4_paged_mqa_logits(
     page_table = page_table.to(dtype=torch.int32).contiguous()
     logical_page_table_width = page_table.shape[1]
     padded_page_table_width = max(4, (logical_page_table_width + 3) // 4 * 4)
+    # FlyDSL pipelines one 256-token chunk ahead, so keep one zero page-id
+    # chunk after the scheduled table width for its final speculative load.
+    guarded_page_table_width = padded_page_table_width + 4
     padded_page_table = page_table.new_zeros(
-        (num_tokens, padded_page_table_width), dtype=torch.int32
+        (num_tokens, guarded_page_table_width), dtype=torch.int32
     )
     padded_page_table[:, :logical_page_table_width].copy_(page_table)
     c4_seq_lens = c4_seq_lens.reshape(-1).to(dtype=torch.int32).contiguous()

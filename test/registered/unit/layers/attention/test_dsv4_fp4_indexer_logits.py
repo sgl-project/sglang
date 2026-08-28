@@ -188,7 +188,7 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         self.assertTrue(args[5].is_contiguous())
         torch.testing.assert_close(args[5], case.raw_weights)
         padded_width = max(4, (case.page_table.shape[1] + 3) // 4 * 4)
-        self.assertEqual(args[4].shape, (case.q_fp4.shape[0], padded_width))
+        self.assertEqual(args[4].shape, (case.q_fp4.shape[0], padded_width + 4))
         self.assertEqual(args[-1], padded_width * 64)
         self.assertEqual(
             call_args.kwargs,
@@ -224,7 +224,7 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         self.assertEqual(args[0].data_ptr(), case.q_fp4.data_ptr())
         self.assertEqual(args[1].shape, (2, 1, 1, 4, 16, 4))
         self.assertEqual(args[1].dtype, torch.uint8)
-        expected_page_table = torch.zeros((2, 4), dtype=torch.int32)
+        expected_page_table = torch.zeros((2, 8), dtype=torch.int32)
         expected_page_table[:, :2] = case.page_table[:2]
         torch.testing.assert_close(args[4], expected_page_table)
         torch.testing.assert_close(args[6], case.c4_seq_lens[:2])
@@ -251,7 +251,7 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                 self.assertIs(args[1], case.q_scale)
                 self.assertEqual(args[0].shape, (3, 64, 64))
                 self.assertEqual(args[1].shape, (3, 1, 4, 16, 4))
-                expected_page_table = torch.zeros((3, 4), dtype=torch.int32)
+                expected_page_table = torch.zeros((3, 8), dtype=torch.int32)
                 expected_page_table[:2, :2] = case.page_table
                 torch.testing.assert_close(args[4], expected_page_table)
                 torch.testing.assert_close(args[6], torch.arange(3, dtype=torch.int32))
@@ -327,11 +327,11 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
 
                     padded_page_table = selected_kernel.call_args.args[4]
                     expected_page_table = torch.zeros(
-                        (num_tokens, padded_width), dtype=torch.int32
+                        (num_tokens, padded_width + 4), dtype=torch.int32
                     )
                     expected_page_table[:, :page_table_width] = page_table
                     self.assertEqual(
-                        padded_page_table.shape, (num_tokens, padded_width)
+                        padded_page_table.shape, (num_tokens, padded_width + 4)
                     )
                     self.assertEqual(padded_page_table.dtype, torch.int32)
                     self.assertTrue(padded_page_table.is_contiguous())
@@ -382,7 +382,11 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         flydsl.flydsl_pa_mqa_logits_fp4_prefill.assert_called_once()
         args = flydsl.flydsl_pa_mqa_logits_fp4_prefill.call_args.args
         torch.testing.assert_close(
-            args[4], torch.tensor([[0, 1, 0, 0], [2, 3, 0, 0]], dtype=torch.int32)
+            args[4],
+            torch.tensor(
+                [[0, 1, 0, 0, 0, 0, 0, 0], [2, 3, 0, 0, 0, 0, 0, 0]],
+                dtype=torch.int32,
+            ),
         )
         torch.testing.assert_close(args[6], torch.arange(2, dtype=torch.int32))
         torch.testing.assert_close(args[7], torch.zeros(2, dtype=torch.int32))

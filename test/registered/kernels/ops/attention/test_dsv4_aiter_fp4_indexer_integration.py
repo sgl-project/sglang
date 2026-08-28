@@ -825,5 +825,58 @@ def test_dsv4_aiter_fp4_indexer_prefill_above_persistent_grid_floor() -> None:
     _assert_logits(logits[-1:], final_reference, c4_seq_lens[-1:])
 
 
+@torch.inference_mode()
+def test_dsv4_aiter_fp4_indexer_68k_lookahead_guard() -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(20260829)
+    c4_seq_len = 17_000
+    num_pages = math.ceil(c4_seq_len / KV_BLOCK_SIZE)
+
+    q_fp4 = torch.randint(
+        0,
+        256,
+        (1, HEADS, HEAD_DIM // 2),
+        device=device,
+        dtype=torch.uint8,
+        generator=generator,
+    ).view(torch.float4_e2m1fn_x2)
+    q_scale = torch.full((1, 1, GROUPS, 16, 4), 127, device=device, dtype=torch.uint8)
+    k_payload = torch.randint(
+        0,
+        256,
+        (num_pages, 1, GROUPS, KV_BLOCK_SIZE, GROUP_SIZE // 2),
+        device=device,
+        dtype=torch.uint8,
+        generator=generator,
+    ).view(torch.float4_e2m1fn_x2)
+    k_scale = torch.full(
+        (num_pages, 1, GROUPS, KV_BLOCK_SIZE),
+        127,
+        device=device,
+        dtype=torch.uint8,
+    )
+    weights = torch.ones((1, HEADS), device=device, dtype=torch.bfloat16)
+    page_table = torch.arange(num_pages, device=device, dtype=torch.int32)[None]
+    c4_seq_lens = torch.tensor([c4_seq_len], device=device, dtype=torch.int32)
+
+    for is_decode in (True, False):
+        logits = aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=k_payload,
+            k_scale=k_scale,
+            weights=weights,
+            page_table=page_table,
+            c4_seq_lens=c4_seq_lens,
+            weight_scale=1.0 / math.sqrt(HEAD_DIM * HEADS),
+            is_decode=is_decode,
+        )
+        torch.cuda.synchronize()
+
+        assert logits.shape == (1, num_pages * KV_BLOCK_SIZE)
+        assert torch.isfinite(logits[0, :c4_seq_len]).all()
+        assert torch.isneginf(logits[0, c4_seq_len:]).all()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
