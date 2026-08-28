@@ -11,7 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The arguments of the server."""
+"""Server argument declarations, resolution, and CLI registration.
+
+Keep this file in the following top-level order:
+
+1. Imports and the module logger.
+2. Public extension-point choice lists, with each legacy ``add_*`` alias
+   immediately below the choice list it extends.
+3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
+   aliases. A choice list used by only one field belongs inline in that field.
+4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
+   registration and small query helpers. New resolution steps are appended at
+   the end of ``_run_resolution_pipeline``, immediately before resolution is
+   marked complete, unless an earlier dependency is documented explicitly.
+5. Module-level ``ServerArgs`` construction/runtime shims.
+6. Networking constants and ``PortArgs``.
+
+Model- or vendor-specific utilities belong in ``sglang.srt.arg_groups`` (or
+their owning subsystem), not before ``ServerArgs`` in this module.
+"""
 
 from __future__ import annotations
 
@@ -67,6 +85,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     default_cuda_graph_config,
     parse_cuda_graph_config_arg,
+    with_phase,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -110,12 +129,14 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-# Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+# --------------------------------------------------------------------------
+# Extension points: out-of-tree platforms and plugins extend these lists
+# before ServerArgs is constructed. Each list owns its adder on the line
+# below it. A list with no adder is not an extension point -- inline it into
+# the field's Arg(choices=...) instead of hoisting it here.
+# --------------------------------------------------------------------------
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
-if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-    SAMPLING_BACKEND_CHOICES.add("token_oracle")
+# --- Model loading and quantization ---
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -142,6 +163,7 @@ LOAD_FORMAT_CHOICES = [
     "private",
     "runai_streamer",
 ]
+add_load_format_choices = LOAD_FORMAT_CHOICES.extend
 # NOTE: LoadFormat.IPC_CACHE intentionally has no public --load-format choice.
 # It is an internal dispatch format set automatically by ModelRunner when the
 # weight cache is enabled (weight_cache_mode != "off"). Exposing it as a CLI
@@ -186,6 +208,9 @@ QUANTIZATION_CHOICES = [
     "unquant",
     "humming",
 ]
+add_quantization_method_choices = QUANTIZATION_CHOICES.extend
+
+# --- Attention backends ---
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -218,6 +243,7 @@ ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "intel_xpu",
 ]
+add_attention_backend_choices = ATTENTION_BACKEND_CHOICES.extend
 
 # trtllm_mha is valid for decode-only dense-MQA drafts. DFLASH rejects it
 # earlier when its per-layer attention requirements are not met.
@@ -229,6 +255,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "trtllm_mha",
 ]
+add_draft_attention_backend_choices = DRAFT_ATTENTION_BACKEND_CHOICES.extend
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
 # Out-of-tree platforms may extend this list (via
@@ -244,6 +271,9 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "tokenspeed_mla",
 ]
+add_chunked_prefix_cache_attention_backend = (
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append
+)
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
@@ -253,8 +283,16 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
     "triton",
 ]
+add_deterministic_attention_backend_choices = (
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend
+)
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+add_radix_supported_deterministic_attention_backend_choices = (
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
+)
+
+# --- Transport ---
 
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
@@ -264,15 +302,16 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mori",
     "mooncake_tcp",
 ]
+add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
+
+# --- Sampling and grammar ---
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+add_grammar_backend_choices = GRAMMAR_BACKEND_CHOICES.extend
 
-# Placeholder token inserted between items in Multi-Item Scoring sequences:
-# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
-# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
-# attention mask compat and logprob column indexing. Will be removed once the
-# attention backend supports position-only MIS.
-MIS_DELIMITER_TOKEN_ID = 9999
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+
+# --- MoE and GEMM runners ---
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -292,30 +331,9 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
+    "intel_xpu",
 ]
-
-MOE_A2A_BACKEND_CHOICES = [
-    "none",
-    "deepep",
-    "mooncake",
-    "nixl",
-    "mori",
-    "ascend_fuseep",
-    "flashinfer",
-    "megamoe",
-    "deepep_v2",
-    "pplx",
-    "ascend_tp",
-]
-
-# These architectures take the A2A MoE path and skip post-expert all-reduce.
-_DEEPEP_V2_VALIDATED_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV3ForCausalLM",
-        "DeepseekV4ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    }
-)
+add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.extend
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
@@ -323,6 +341,7 @@ MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
+add_mxfp8_moe_runner_backend_choices = MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -335,6 +354,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "triton",
     "aiter",
 ]
+add_fp8_gemm_runner_backend_choices = FP8_GEMM_RUNNER_BACKEND_CHOICES.extend
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -344,76 +364,19 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
     "marlin",
 ]
+add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.extend
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
+# --- Cache and scheduling policy ---
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
-RETRACTION_POLICY_CHOICES = ["length", "priority"]
+add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.extend
+
+# --- Reinforcement learning ---
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.extend
 
-# Speculative algorithms whose verify forward presents a uniform per-request
-# token width, which is what the LoRA segment layout assumes.
-_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
-
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
-
-ENCODER_TRANSFER_BACKEND_CHOICES = [
-    "auto",
-    "zmq_to_scheduler",
-    "zmq_to_tokenizer",
-    "mooncake",
-]
-
-
-def resolve_encoder_transfer_backend(
-    backend: str, model_arch: str, tp_size: int
-) -> str:
-    if backend != "auto":
-        return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
-        return "zmq_to_tokenizer"
-    return "zmq_to_scheduler"
-
-
-DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
-NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
-
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
-
-DEFAULT_LORA_EVICTION_POLICY = "lru"
-
-DSA_CHOICES = [
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-    "flashmla_kv",
-    "flashmla_auto",
-    "flashinfer_sparse_mla",
-    "fa3",
-    "tilelang",
-    "aiter",
-    "trtllm",
-]
-NSA_CHOICES = DSA_CHOICES  # deprecated alias
-
-DSV4_PREFILL_BACKEND_CHOICES = [
-    "auto",
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-]
-
-DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
-
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
-
-MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
-    "auto",
-    "no_buffer",
-    "extra_buffer",
-    "extra_buffer_lazy",
-]
-
-MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+# --- Linear attention ---
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
@@ -425,71 +388,13 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "helion",
     "intel_xpu",
 ]
+add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend
 
-
-# Allow external code to add more choices
-def add_load_format_choices(choices):
-    LOAD_FORMAT_CHOICES.extend(choices)
-
-
-def add_quantization_method_choices(choices):
-    QUANTIZATION_CHOICES.extend(choices)
-
-
-def add_attention_backend_choices(choices):
-    ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_draft_attention_backend_choices(choices):
-    DRAFT_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-
-
-def add_deterministic_attention_backend_choices(choices):
-    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_supported_deterministic_attention_backend_choices(choices):
-    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
-
-
-def add_disagg_transfer_backend_choices(choices):
-    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
-
-
-def add_grammar_backend_choices(choices):
-    GRAMMAR_BACKEND_CHOICES.extend(choices)
-
-
-def add_moe_runner_backend_choices(choices):
-    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_mxfp8_moe_runner_backend_choices(choices):
-    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp8_gemm_runner_backend_choices(choices):
-    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp4_gemm_runner_backend_choices(choices):
-    FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_eviction_policy_choices(choices):
-    RADIX_EVICTION_POLICY_CHOICES.extend(choices)
-
-
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
-
-
-def add_linear_attn_kernel_backend_choices(choices):
-    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+# --------------------------------------------------------------------------
+# Add new extension points at the end of the matching group above. A new
+# choice list is inlined into its field by default; hoisting one here makes
+# it public API for out-of-tree code and is a deliberate decision.
+# --------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -935,7 +840,7 @@ class ServerArgs:
                 "requests first, using the same priority direction as priority "
                 "scheduling."
             ),
-            choices=RETRACTION_POLICY_CHOICES,
+            choices=["length", "priority"],
         ),
         NS("schedule"),
     ] = "length"
@@ -1374,6 +1279,8 @@ class ServerArgs:
         "defaults to --port + 10000.",
         NS("serving"),
     ] = None
+    # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
+    grpc_worker_threads: A[Optional[int], Arg(no_cli=True), NS("serving")] = None
     sidecar: A[
         Optional[str],
         "Start a locally managed sidecar against the native gRPC server. "
@@ -1609,9 +1516,7 @@ class ServerArgs:
             nargs="*",
         ),
         NS("observability"),
-    ] = dataclasses.field(
-        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
-    )
+    ] = dataclasses.field(default_factory=list)
     crash_dump_folder: A[
         Optional[str],
         "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
@@ -1710,7 +1615,12 @@ class ServerArgs:
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
+        NS("observability"),
+    ] = None
+    load_publish_endpoint: A[
+        Optional[str],
+        "Opt in to the runtime-load PUB socket that load-aware routers subscribe to. Off by default (unset or 'off'). Use 'auto' to reserve the dp_size ports packed after the --kv-events-config range, or a wildcard-host TCP address (e.g. tcp://*:6000) to place it explicitly; rank r binds port+r and /server_info advertises the base under the kv_events block. Requires --kv-events-config to describe a publisher (routers discover the base through /server_info); startup fails if this is set without one, is not bindable, or overlaps the KV range. Note: 'auto' reserves 2*dp_size ports from the KV base — space co-hosted engines accordingly. The router-facing update cadence follows --load-snapshot-publish-interval (shared to avoid double-collecting the snapshot), so a large value there also staleness-caps this feed.",
         NS("observability"),
     ] = None
     enable_forward_pass_metrics: A[
@@ -1802,7 +1712,7 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Choose the kernels for sampling layers.",
-            choices=SAMPLING_BACKEND_CHOICES,
+            no_cli=True,
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1863,7 +1773,7 @@ class ServerArgs:
         Arg(
             help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the CuTe DSL kernel and cuBLAS), 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
-            choices=BF16_GEMM_BACKEND_CHOICES,
+            choices=["auto", "cutedsl", "gemv", "torch"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1871,7 +1781,17 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1884,7 +1804,7 @@ class ServerArgs:
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
                 "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
             ),
-            choices=DSV4_PREFILL_BACKEND_CHOICES,
+            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1892,7 +1812,17 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             resolvable=True,
         ),
         NS("exec.kernel"),
@@ -1901,7 +1831,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
-            choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
+            choices=["auto", "deepgemm", "cutedsl", "aiter"],
         ),
         NS("exec.kernel"),
     ] = "auto"
@@ -1909,7 +1839,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=DSA_TOPK_BACKEND_CHOICES,
+            choices=["sgl-kernel", "torch", "flashinfer"],
         ),
         NS("exec.kernel"),
     ] = "sgl-kernel"
@@ -1932,7 +1862,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
-            choices=MAMBA_BACKEND_CHOICES,
+            choices=["triton", "flashinfer"],
         ),
         NS("exec.mamba"),
     ] = "triton"
@@ -2279,7 +2209,7 @@ class ServerArgs:
         str,
         Arg(
             help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=DSA_TOPK_BACKEND_CHOICES,
+            choices=["sgl-kernel", "torch", "flashinfer"],
         ),
         NS("spec"),
     ] = "sgl-kernel"
@@ -2315,7 +2245,19 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Choose the backend for MoE A2A in speculative decoding",
-            choices=MOE_A2A_BACKEND_CHOICES,
+            choices=[
+                "none",
+                "deepep",
+                "mooncake",
+                "nixl",
+                "mori",
+                "ascend_fuseep",
+                "flashinfer",
+                "megamoe",
+                "deepep_v2",
+                "pplx",
+                "ascend_tp",
+            ],
             resolvable=True,
         ),
         NS("spec"),
@@ -2459,7 +2401,19 @@ class ServerArgs:
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
-            choices=MOE_A2A_BACKEND_CHOICES,
+            choices=[
+                "none",
+                "deepep",
+                "mooncake",
+                "nixl",
+                "mori",
+                "ascend_fuseep",
+                "flashinfer",
+                "megamoe",
+                "deepep_v2",
+                "pplx",
+                "ascend_tp",
+            ],
             resolvable=True,
         ),
         NS("exec.moe"),
@@ -2688,7 +2642,7 @@ class ServerArgs:
         str,
         Arg(
             help="The strategy to use for mamba radix cache.",
-            choices=MAMBA_RADIX_CACHE_STRATEGY_CHOICES,
+            choices=["auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"],
             resolvable=True,
         ),
         NS("exec.mamba"),
@@ -3057,7 +3011,7 @@ class ServerArgs:
         str,
         Arg(
             help="Choose the kernel backend for multi-LoRA serving.",
-            choices=LORA_BACKEND_CHOICES,
+            choices=["triton", "csgmv", "ascend", "torch_native"],
         ),
         NS("lora"),
     ] = "csgmv"
@@ -3312,10 +3266,10 @@ class ServerArgs:
         str,
         Arg(
             help="The backend for encoder disaggregation transfer. Auto selects a model- and TP-aware backend.",
-            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+            choices=["auto", "zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"],
         ),
         NS("disagg"),
-    ] = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    ] = "auto"
     encoder_urls: A[List[str], "List of encoder server urls.", NS("disagg")] = (
         dataclasses.field(default_factory=list)
     )
@@ -3744,7 +3698,7 @@ class ServerArgs:
         except BaseException:
             # The handlers that ran already declared, and they are not
             # idempotent over their own output.
-            object.__setattr__(self, "_resolution_failed", True)
+            self._resolution_failed = True
             raise
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
@@ -3795,8 +3749,8 @@ class ServerArgs:
 
         # Everything outside the fields, enumerated from the instance: the raw
         # snapshot, the stash, and what resolution memoized -- including the
-        # `get_model_config()` cache, which a resolved copy can no longer fill
-        # (the read-only guard refuses the write).
+        # `get_model_config()` memo, which the copy carries over rather than
+        # rebuild.
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
             if name in field_names or name == "_resolution_finished":
@@ -4104,8 +4058,18 @@ class ServerArgs:
             )
             # cuda_graph_config was already parsed from the legacy boolean, so
             # flipping the boolean alone would not stop graph capture.
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "HRM-Text (prefix_lm) detected: forcing --attention-backend "
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
@@ -4188,9 +4152,19 @@ class ServerArgs:
                     prefill_only_disable_kv_cache=True,
                 )
                 self._validate_prefill_only_disable_kv_cache_args()
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
             if is_cuda() and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                cfg.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
+                    ),
+                )
                 # CUDA-graph sizing has already run by this point and derives
                 # its generic maximum from the 8K chunked-prefill default.
                 # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
@@ -4206,21 +4180,32 @@ class ServerArgs:
                     self, "_cuda_graph_config_locked", set()
                 )
                 if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
-                    prefill_config.max_bs = max(
-                        prefill_config.max_bs or 0,
-                        model_config.context_len,
-                        16384,
-                    )
-                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
-                        prefill_config.bs = (
-                            self._generate_prefill_cuda_graph_batch_sizes(
-                                prefill_config.max_bs
-                            )
+                    sizing = {
+                        "max_bs": max(
+                            prefill_config.max_bs or 0,
+                            model_config.context_len,
+                            16384,
                         )
+                    }
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        sizing["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
+                            sizing["max_bs"]
+                        )
+                    self._declare(
+                        "_handle_model_capability_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config, Phase.PREFILL, **sizing
+                        ),
+                    )
             elif not is_cuda():
                 # BCG is CUDA-only. Other graph backends do not support this
                 # encoder-style prefill, so retain the eager Triton path.
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
             logger.info(
                 "EmbeddingGemma detected: disabling radix cache and chunked "
                 "prefill; using breakable CUDA graph for CUDA prefill."
@@ -4489,7 +4474,10 @@ class ServerArgs:
 
         # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
         # native server, falling back to SGLANG_GRPC_PORT.
-        self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
+        self._declare(
+            "_handle_deprecated_args",
+            grpc_worker_threads=envs.SGLANG_GRPC_WORKER_THREADS.get(),
+        )
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
         if cfg.grpc_port is None and grpc_port_env is not None:
@@ -4513,10 +4501,10 @@ class ServerArgs:
                     "--grpc-port / SGLANG_GRPC_PORT "
                     f"({cfg.grpc_port}) must be between 1 and 65535"
                 )
-            if self.grpc_worker_threads < 1:
+            if cfg.grpc_worker_threads is not None and cfg.grpc_worker_threads < 1:
                 raise ValueError(
                     "SGLANG_GRPC_WORKER_THREADS "
-                    f"({self.grpc_worker_threads}) must be >= 1"
+                    f"({cfg.grpc_worker_threads}) must be >= 1"
                 )
 
         # Native gRPC is incompatible with launch paths it doesn't wire into.
@@ -4765,7 +4753,12 @@ class ServerArgs:
                     "At this moment Ascend platform only support prefill graph compilation with "
                     "cuda_graph_config[prefill].tc_compiler='eager'."
                 )
-                cfg.cuda_graph_config.prefill.tc_compiler = "eager"
+                self._declare(
+                    "_handle_npu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, tc_compiler="eager"
+                    ),
+                )
 
     def _handle_mps_backends(self):
         cfg = resolving_view(self)
@@ -4783,7 +4776,12 @@ class ServerArgs:
             # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
             # disabled so the default startup doesn't require graph capture.
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_xpu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
             elif cfg.cuda_graph_config.decode.backend not in (
                 Backend.DISABLED,
                 Backend.FULL,
@@ -4793,7 +4791,12 @@ class ServerArgs:
                     "disabling unsupported decode backend '%s'.",
                     cfg.cuda_graph_config.decode.backend,
                 )
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_xpu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -4837,12 +4840,8 @@ class ServerArgs:
 
     def _handle_cuda_graph_config(self):
         cfg = resolving_view(self)
-        from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
         self._parse_cuda_graph_config()
-        # Reads the resolved per-phase backends; must precede the compat rules
-        # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
-        disable_kimi_k3_symm_mem(self)
         self._apply_cuda_graph_compatibility()
         self._apply_deepep_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
@@ -4878,8 +4877,15 @@ class ServerArgs:
                     sorted(bs),
                     aligned,
                 )
-                cfg.cuda_graph_config.prefill.bs = aligned
-                cfg.cuda_graph_config.prefill.max_bs = aligned[-1]
+                self._declare(
+                    "_apply_deepep_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        bs=aligned,
+                        max_bs=aligned[-1],
+                    ),
+                )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4975,7 +4981,12 @@ class ServerArgs:
                 "Using tc_piecewise CUDA graph for validated multimodal "
                 "decoder prefill."
             )
-            cfg.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+            self._declare(
+                "_apply_cuda_graph_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.TC_PIECEWISE
+                ),
+            )
 
         if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
@@ -4988,10 +4999,20 @@ class ServerArgs:
         cfg = resolving_view(self)
         if cfg.disaggregation_mode == "prefill":
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_apply_cuda_graph_disaggregation_roles",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
         elif cfg.disaggregation_mode == "decode":
             if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_apply_cuda_graph_disaggregation_roles",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         """TcPiecewise (torch.compile + piecewise) is incompatible with
@@ -5067,7 +5088,15 @@ class ServerArgs:
         ]
         for _name, predicate in rules:
             if predicate():
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_tc_piecewise_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
+                # One decision, one declaration: every rule declares the same
+                # value, so a later match would only append a duplicate entry.
+                break
 
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
@@ -5120,7 +5149,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_breakable_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
                 return
 
     def _disable_full_prefill_cudagraph_if_incompatible(self):
@@ -5134,7 +5168,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_full_prefill_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
                 return
 
     def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
@@ -5164,7 +5203,12 @@ class ServerArgs:
             "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
             cfg.cuda_graph_config.prefill.backend,
         )
-        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self._declare(
+            "_disable_prefill_cuda_graph_for_deepseek_trtllm_mla",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
     def _validate_cuda_graph_config(self):
         cfg = resolving_view(self)
@@ -5192,8 +5236,18 @@ class ServerArgs:
 
         if cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
             logger.warning("CUDA graph is disabled because --enable-mis is set.")
-        cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self._declare(
+            "_handle_multi_item_scoring",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        self._declare(
+            "_handle_multi_item_scoring",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
         if not cfg.disable_radix_cache:
             logger.warning("Radix cache is disabled because --enable-mis is set.")
@@ -5241,8 +5295,10 @@ class ServerArgs:
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
         cfg = resolving_view(self)
-        decode_cuda_graph_config = cfg.cuda_graph_config.decode
-        prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
+        # A copy, so an earlier declaration keeps the value it recorded.
+        cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
+        decode_cuda_graph_config = cuda_graph_config.decode
+        prefill_cuda_graph_config = cuda_graph_config.prefill
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -5387,6 +5443,11 @@ class ServerArgs:
                 self._generate_prefill_cuda_graph_batch_sizes(
                     prefill_cuda_graph_config.max_bs
                 )
+            )
+
+        if cuda_graph_config != cfg.cuda_graph_config:
+            self._declare(
+                "_handle_gpu_memory_settings", cuda_graph_config=cuda_graph_config
             )
 
         if cfg.mem_fraction_static is None:
@@ -5828,7 +5889,14 @@ class ServerArgs:
                         # The DSA CP field declarations moved to the override
                         # registry (arg_groups/overrides.py:
                         # _deepseek_family_overrides).
-                        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                        self._declare(
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                         if cfg.dp_size < cfg.tp_size:
@@ -5911,7 +5979,14 @@ class ServerArgs:
                 # the override registry (arg_groups/overrides.py:
                 # _deepseek_family_overrides).
                 if cfg.enable_prefill_cp and self.use_mla_backend():
-                    cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                    self._declare(
+                        "_handle_model_specific_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.PREFILL,
+                            backend=Backend.DISABLED,
+                        ),
+                    )
 
             # Set moe backend for DeepSeek: the sm100 quant/moe resolution
             # moved to the resolution pipeline (arg_groups/overrides.py:
@@ -6407,15 +6482,35 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
 
         if attention_backend == "flex_attention":
             logger.warning(
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             assert (
                 cfg.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
@@ -7177,7 +7272,6 @@ class ServerArgs:
             "_handle_dwdp",
             ep_size=cfg.dwdp_size,
         )
-        self.moe_ep_size = cfg.dwdp_size
         self._declare(
             "_handle_dwdp",
             moe_dp_size=1,
@@ -7196,7 +7290,7 @@ class ServerArgs:
 
         logger.info(
             f"DWDP enabled: dwdp_size={cfg.dwdp_size}, "
-            f"auto-forced dp_size={cfg.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"auto-forced dp_size={cfg.dp_size}, ep_size={cfg.dwdp_size}, "
             f"moe_dense_tp_size=1, moe_a2a_backend=none, "
             f"dp_attention_local_control_broadcast=True, "
             f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
@@ -7261,11 +7355,17 @@ class ServerArgs:
                 and prefill_cfg.max_bs > cfg.chunked_prefill_size
                 and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
             ):
-                prefill_cfg.max_bs = cfg.chunked_prefill_size
+                clamped = {"max_bs": cfg.chunked_prefill_size}
                 if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
-                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
-                        prefill_cfg.max_bs
+                    clamped["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
+                        clamped["max_bs"]
                     )
+                self._declare(
+                    "_handle_data_parallelism",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, **clamped
+                    ),
+                )
 
         # Resolve the phase-aware TP LM-head default before validating the
         # resulting DP/TP LM-head configuration.
@@ -7503,10 +7603,17 @@ class ServerArgs:
         )
 
         architecture = architectures[0] if architectures else None
-        if architecture not in _DEEPEP_V2_VALIDATED_ARCHITECTURES:
+        # These architectures take the A2A MoE path and skip post-expert
+        # all-reduce.
+        validated_architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "Qwen3MoeForCausalLM",
+        )
+        if architecture not in validated_architectures:
             raise ValueError(
                 f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-                f"architectures are {sorted(_DEEPEP_V2_VALIDATED_ARCHITECTURES)}. "
+                f"architectures are {sorted(validated_architectures)}. "
                 "Other model workflows may require an all-reduce after A2A "
                 "combine. Use --moe-a2a-backend deepep."
             )
@@ -7575,8 +7682,18 @@ class ServerArgs:
                     )
             if cfg.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_a2a_moe",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
+                self._declare(
+                    "_handle_a2a_moe",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
         if a2a_backend == "deepep_v2":
             self._validate_deepep_v2_model_architecture()
@@ -7616,7 +7733,12 @@ class ServerArgs:
                     "--moe-a2a-backend deepep_v2."
                 )
             # Prefill reads host counts and is not graph-capturable.
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_a2a_moe",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
             )
@@ -9341,8 +9463,18 @@ class ServerArgs:
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_dllm_inference",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
+                self._declare(
+                    "_handle_dllm_inference",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
         from sglang.srt.arg_groups.overrides import (
             _dllm_attention_backend,
@@ -9478,8 +9610,18 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             self._declare("_handle_other_validations", skip_server_warmup=True)
 
         if cfg.msprobe_dump_config is not None:
@@ -9488,8 +9630,18 @@ class ServerArgs:
                 "cuda graph is disabled because msProbe only supports dump in eager mode, "
                 "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             self._declare("_handle_other_validations", skip_server_warmup=True)
 
         # Validate limit_mm_per_prompt modalities
@@ -9579,6 +9731,17 @@ class ServerArgs:
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
+        sampling_backend_choices = set(SAMPLING_BACKEND_CHOICES)
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            sampling_backend_choices.add("token_oracle")
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=sampling_backend_choices,
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
+
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
@@ -9657,7 +9820,17 @@ class ServerArgs:
             new_flag="--dsa-prefill-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             help="[Deprecated] Use --dsa-prefill-backend instead.",
         )
         parser.add_argument(
@@ -9667,7 +9840,17 @@ class ServerArgs:
             new_flag="--dsa-decode-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(
@@ -9797,7 +9980,7 @@ class ServerArgs:
             new_flag="--cp-strategy",
             type=str,
             default=ServerArgs.dsa_prefill_cp_mode,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split", "round-robin-split"],
             help=(
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
                 "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
@@ -9811,7 +9994,7 @@ class ServerArgs:
             new_flag="--cp-strategy",
             type=str,
             default=argparse.SUPPRESS,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split", "round-robin-split"],
             help="[Deprecated] Use --cp-strategy instead.",
         )
         parser.add_argument(
@@ -9821,7 +10004,7 @@ class ServerArgs:
             new_flag="--cp-strategy",
             type=str,
             default=ServerArgs.prefill_cp_mode,
-            choices=PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split"],
             help=(
                 "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
                 "'in-seq-split' maps to 'zigzag'."
@@ -9915,7 +10098,7 @@ class ServerArgs:
         cfg = resolving_view(self)
         from sglang.srt.configs.model_config import ModelConfig
 
-        memo = getattr(self, "model_config", None)
+        memo = getattr(self, "_model_config", None)
         if memo is not None:
             # The key is the path this record carried when the cache was
             # filled. The GGUF and ModelScope handlers declare a different
@@ -9929,7 +10112,7 @@ class ServerArgs:
                 return memo
 
         model_config = ModelConfig.from_server_args(self)
-        self.model_config = model_config
+        self._model_config = model_config
         self._model_config_built_from = cfg.model_path
         if model_config.is_hybrid_swa:
             logger.info(
@@ -9964,7 +10147,6 @@ class ServerArgs:
         if (
             getattr(self, "_resolution_finished", False)
             and not getattr(self, "_internal_write", False)
-            and name not in _CACHE_SLOTS
             and (not name.startswith("_") or name in _underscore_field_names())
         ):
             raise AttributeError(
@@ -10044,7 +10226,7 @@ class ServerArgs:
             # is supported.
             result = max(candidate_steps) + 1
         if getattr(self, "_resolution_finished", False):
-            object.__setattr__(self, "_max_speculative_num_draft_tokens", result)
+            self._max_speculative_num_draft_tokens = result
         return result
 
     @property
@@ -10303,6 +10485,50 @@ class ServerArgs:
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )
 
+        self.check_load_publish_args()
+
+    def check_load_publish_args(self):
+        """Fail fast at the entrypoint on a --load-publish-endpoint the
+        scheduler would decline (no active kv-events publisher to advertise
+        through, unbindable, overlapping the KV range, u16 overflow) rather
+        than only warning — or silently doing nothing — from a scheduler
+        subprocess. Routes through the same resolver the scheduler binds and
+        /server_info advertises with."""
+        mode = (self.load_publish_endpoint or "").strip()
+        if not mode or mode.lower() == "off":
+            return  # disabled; nothing to validate
+
+        server_cfg = resolving_view(self)
+
+        from sglang.srt.disaggregation.kv_events import (
+            KVEventsConfig,
+            resolve_load_pub_range,
+        )
+
+        if not self.kv_events_config:
+            raise ValueError(
+                "--load-publish-endpoint requires --kv-events-config: routers"
+                " discover the load range through /server_info's kv_events"
+                " block, absent without a publisher."
+            )
+        try:
+            cfg = KVEventsConfig.from_cli(self.kv_events_config)
+        except Exception as e:
+            raise ValueError(f"--kv-events-config is not parseable: {e}")
+        if cfg.publisher == "null" or not cfg.endpoint:
+            raise ValueError(
+                "--load-publish-endpoint needs an active --kv-events-config"
+                " publisher; got publisher='null' or an empty endpoint."
+            )
+        _, reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=server_cfg.dp_size,
+            load_publish_endpoint=mode,
+        )
+        if reason:
+            raise ValueError(reason)
+
     def check_lora_server_args(self):
         cfg = resolving_view(self)
 
@@ -10453,7 +10679,10 @@ class ServerArgs:
         if cfg.speculative_algorithm in ["NGRAM", None]:
             return
 
-        if cfg.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
+        # These algorithms present a uniform per-request token width during
+        # verify, which is what the LoRA segment layout assumes.
+        lora_spec_algorithms = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+        if cfg.speculative_algorithm not in lora_spec_algorithms:
             promoted = (
                 " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
                 "promoted to FROZEN_KV_MTP, which does not support LoRA)"
@@ -10621,7 +10850,7 @@ class ServerArgs:
             result = json.loads(self.modelexpress_config)
         else:
             result = self.modelexpress_config
-        object.__setattr__(self, "_mx_config_cache", result)
+        self._mx_config_cache = result
         return result
 
     @property
@@ -10678,6 +10907,19 @@ class ServerArgs:
                                                   # DCP shards within a rank
                                                   # rather than adding
                                                   # publishers
+                "load_endpoint_port_base": <resolved>,
+                                                  # base TCP port of the load
+                                                  # range (load rank r = base
+                                                  # + r). Consumers MUST read
+                                                  # this key, not re-derive
+                                                  # it; present only when
+                                                  # --load-publish-endpoint
+                                                  # opted in and a range
+                                                  # resolved
+                "load_topic": "load",             # SUB filter for the load
+                                                  # socket; present iff
+                                                  # load_endpoint_port_base
+                                                  # is present
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -10688,17 +10930,27 @@ class ServerArgs:
           block_size would cause silent KV-cache misses by hashing
           prompts at the wrong granularity on the router side),
         * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, or port outside
-          1..65535).
+          ipc://, missing port, non-integer port, port outside
+          1..65535, or a bare unbracketed IPv6 host, which is
+          ambiguous).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
+        NOTE for load-socket consumers: pair the load port with the worker's
+        own URL host, as with the KV SUB endpoints — endpoint_host is a
+        wildcard ("*", "0.0.0.0", "::") whenever the default packing applies,
+        so splicing it yields tcp://*:PORT and connects to nothing.
+
+        Reuses parse_advertisable_tcp and resolve_load_pub_range — the same
+        helpers the scheduler binds through — so the advertisement cannot
+        drift from the sockets.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+        from sglang.srt.disaggregation.kv_events import (
+            LOAD_TOPIC,
+            KVEventsConfig,
+            parse_advertisable_tcp,
+            resolve_load_pub_range,
+        )
 
         resolved = resolving_view(self)
         raw = resolved.kv_events_config
@@ -10714,21 +10966,12 @@ class ServerArgs:
             return None
         if cfg.publisher == "null" or not cfg.endpoint:
             return None
-        if not cfg.endpoint.startswith("tcp://"):
+        resolved_kv = parse_advertisable_tcp(cfg.endpoint)
+        if resolved_kv is None:
             return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
-            return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
+        host, port = resolved_kv
 
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -10736,6 +10979,19 @@ class ServerArgs:
             "block_size": resolved.kv_event_block_size,
             "dp_size": resolved.dp_size,
         }
+        # Load range, from the same resolver SchedulerLoadPublisher binds
+        # with (so the two can't drift). The decline reason is logged once at
+        # startup, not here — this runs per /server_info request.
+        resolved_range, _reason = resolve_load_pub_range(
+            kv_endpoint=cfg.endpoint,
+            replay_endpoint=cfg.replay_endpoint,
+            dp_size=resolved.dp_size,
+            load_publish_endpoint=self.load_publish_endpoint,
+        )
+        if resolved_range is not None:
+            descriptor["load_endpoint_port_base"] = resolved_range[1]
+            descriptor["load_topic"] = LOAD_TOPIC
+        return descriptor
 
     def should_report_expert_balancedness(self) -> bool:
         cfg = resolving_view(self)
@@ -10752,20 +11008,31 @@ class ServerArgs:
         return cfg.expert_balancedness_report_mode in ("prometheus", "both")
 
 
-def compute_world_size(config) -> int:
-    """Return the total GPU count across all data-parallel replicas.
+# --------------------------------------------------------------------------
+# Module-level ServerArgs helpers and runtime shims.
+# --------------------------------------------------------------------------
 
-    Takes the resolved topology -- the published `parallel` bag, or a view over
-    the declarations. `enable_dp_attention` and `dp_size` are both resolution's
-    answers (`_handle_dwdp` fills the pair, DeepSeek MLA context parallelism
-    turns DP attention on), so a raw-record read would size the world from what
-    the operator typed.
+
+def resolve_encoder_transfer_backend(
+    backend: str, model_arch: str, tp_size: int
+) -> str:
+    if backend != "auto":
+        return backend
+    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+        return "zmq_to_tokenizer"
+    return "zmq_to_scheduler"
+
+
+def compute_world_size(
+    *, enable_dp_attention: bool, dp_size: int, tp_size: int, pp_size: int
+) -> int:
+    """Total GPU count across all data-parallel replicas.
+
+    Takes the values rather than a config object: the two sizes are the widths
+    the launch asked for, which the Ray driver needs before any process group
+    exists, and passing a context would hand it the live groups instead.
     """
-    return (
-        (1 if config.enable_dp_attention else config.dp_size)
-        * config.tp_size
-        * config.pp_size
-    )
+    return (1 if enable_dp_attention else dp_size) * tp_size * pp_size
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
@@ -10788,14 +11055,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
         and is_sm100_supported()
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
-
-
-# Caches, which the read-only guard lets through: a value the record derived
-# from itself is not resolved configuration, and a key that can invalidate on a
-# resolved record needs the refill to be storable there. Only the public-named
-# ones are listed -- a cache key spelled with a leading underscore is already
-# exempt.
-_CACHE_SLOTS = frozenset({"model_config"})
 
 
 # NOTE: The process-wide ServerArgs is owned by the runtime context
@@ -10862,7 +11121,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
-        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+        from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
         # Extract boolean actions from the parser to handle them correctly
         config_merger = ConfigArgumentMerger(parser)
@@ -10880,6 +11139,11 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     )
 
     return ServerArgs.from_cli_args(raw_args)
+
+
+# --------------------------------------------------------------------------
+# Networking constants and PortArgs.
+# --------------------------------------------------------------------------
 
 
 ZMQ_TCP_PORT_DELTA = 233

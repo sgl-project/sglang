@@ -13,16 +13,13 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
-``get_parallel()`` returns a ``ParallelContext`` whose bare attributes — tp / dcp
-/ pp / moe / attn size and rank, plus the process-group handles — each delegate
-live to the canonical getter in ``distributed.parallel_state`` /
-``layers.dp_attention``. Returned values are exactly what those getters return;
-this is a read-through wrapper, not a cache. It gives call-sites one import and
-one naming scheme in place of a dozen free functions, plus a test-only
-``override()`` hook to force a topology without monkeypatching the underlying
-getters. The resolved parallel **configuration** is the same object's ``config``
-hop (``get_parallel().config.tp_size``), which reads the published ``parallel``
-bag: bare is the live group, ``config`` is what was configured.
+``get_parallel()`` returns a ``ParallelContext``. Ranks and process-group handles
+read through **live** to the canonical getter in ``distributed.parallel_state`` /
+``layers.dp_attention`` — exactly what those getters return, a read-through
+wrapper and not a cache. Every other name, the sizes included, is a leaf of the
+published ``parallel`` bag. It gives call-sites one import and one naming scheme
+in place of a dozen free functions, plus an ``override()`` hook to force a
+topology without monkeypatching the underlying getters.
 
 ``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
 user's raw input, kept **read-only** for debug and reproduction; what
@@ -79,6 +76,23 @@ def _dp():
     return dp_attention
 
 
+@functools.lru_cache(maxsize=1)
+def _parallel_config_leaves() -> frozenset:
+    """Names under the ``parallel`` namespace, for the unpublished error path.
+
+    Read from the field metadata rather than the bag, which is what does not
+    exist yet when this is needed.
+    """
+    from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.server_args import ServerArgs
+
+    return frozenset(
+        field
+        for field, path in namespace_of(ServerArgs).items()
+        if path.split(".")[0] == "parallel"
+    )
+
+
 _PARALLEL_FIELDS = frozenset(
     {
         "world_size",
@@ -118,21 +132,26 @@ _PARALLEL_FIELDS = frozenset(
 
 
 class ParallelContext:
-    """Parallel-topology namespace: the live groups bare, configuration under
-    ``config``.
+    """Parallel-topology namespace: one spelling per name.
 
-    ``get_parallel().tp_size`` and its size / rank / group siblings are
-    read-through ``@property`` over the canonical getters, so they answer with
-    the **live** process groups and raise before distributed init. The resolved
-    parallel **configuration** is one hop away, on the published bag:
-    ``get_parallel().config.tp_size``, ``.config.nccl_port``. It answers in any
-    process at any point after publish, and follows a post-publish ``override``.
+    Ranks and group handles are read-through ``@property`` over the canonical
+    getters, so they answer with the **live** process groups and raise before
+    distributed init. Every other name — ``tp_size`` and its size siblings
+    included, alongside config-only leaves such as ``nccl_port`` — is answered
+    from the published ``parallel`` bag, in any process at any point after
+    publish.
 
-    The two disagree by design, so which one a call site wants is spelled at the
-    call site — no ``config`` means live. Elastic EP scales the live world away
-    from the configured one, and ``initialize_model_parallel`` aliases
-    ``_MOE_DP`` to ``_ATTN_CP`` when ``attn_cp_size > moe_dp_size``, which makes
-    a live comparison of that pair degenerate.
+    A size is read from the configuration because the groups are built at
+    exactly the configured widths. Two things do not follow that rule and are
+    asked of the group itself: ``initialize_model_parallel`` aliases ``_MOE_DP``
+    to ``_ATTN_CP`` when ``attn_cp_size > moe_dp_size``, so a reader that means
+    the MoE communicator's width calls ``get_moe_cp_size()``; and
+    ``patch_tensor_parallel_group`` runs a scope under a different TP group,
+    which it declares by overriding ``tp_size``, ``tp_rank`` and ``tp_group``
+    for its duration. Elastic EP is a third case, and it needs no rule here: it
+    scales ``ep_size`` / ``dp_size`` on the published bag while the group
+    coordinators keep the width they were constructed with, so the two are
+    different names rather than two answers to one name.
     """
 
     __slots__ = ("_overrides", "_config")
@@ -141,36 +160,21 @@ class ParallelContext:
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
 
-    @property
-    def config(self) -> _ConfigBag:
-        """The published ``parallel`` config bag.
-
-        Reads the slot directly: ``parallel`` sits outside the per-role
-        namespace table (every process reads topology config), so no role check
-        applies here. The body stays
-        dynamo-traceable — ``get_parallel().config.moe_dense_tp_size`` and the
-        gate helpers over it run inside compiled model forwards.
-        """
-        config = self._config
-        if config is None:
-            raise ValueError("config namespace 'parallel' not published")
-        return config
-
     def __getattr__(self, name):
-        # Reached only for names that are neither a live @property nor a slot.
-        # Config leaves are read under ``config``, so naming one here is a
-        # call-site mistake and this only builds the error that says so.
         if name.startswith("_"):
             # This also breaks the recursion when the ``_config`` slot itself is
             # still unset (pickle/copy protocols probe attributes before
             # __init__ runs).
             raise AttributeError(name)
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
         config = self._config
-        if config is not None and name in config._fields:
-            raise AttributeError(
-                f"{name!r} is a parallel config leaf, not live topology; read it "
-                f"as get_parallel().config.{name}"
-            )
+        if config is not None:
+            if name in config._fields:
+                return getattr(config, name)
+        elif name in _parallel_config_leaves():
+            raise ValueError("config namespace 'parallel' not published")
         raise AttributeError(f"ParallelContext has no {name!r}")
 
     def _v(self, name, getter):
@@ -200,16 +204,8 @@ class ParallelContext:
         return self._v("world_rank", _ps().get_world_rank)
 
     @property
-    def tp_size(self) -> int:
-        return self._v("tp_size", _ps().get_tensor_model_parallel_world_size)
-
-    @property
     def tp_rank(self) -> int:
         return self._v("tp_rank", _ps().get_tensor_model_parallel_rank)
-
-    @property
-    def pp_size(self) -> int:
-        return self._v("pp_size", _ps().get_pipeline_model_parallel_world_size)
 
     @property
     def pp_rank(self) -> int:
@@ -222,10 +218,6 @@ class ParallelContext:
     @property
     def moe_ep_rank(self) -> int:
         return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
-
-    @property
-    def moe_dp_size(self) -> int:
-        return self._v("moe_dp_size", _ps().get_moe_data_parallel_world_size)
 
     @property
     def moe_dp_rank(self) -> int:
@@ -248,16 +240,8 @@ class ParallelContext:
         return self._v("attn_tp_rank", _ps().get_attn_tensor_model_parallel_rank)
 
     @property
-    def attn_cp_size(self) -> int:
-        return self._v("attn_cp_size", _ps().get_attn_context_model_parallel_world_size)
-
-    @property
     def attn_cp_rank(self) -> int:
         return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
-
-    @property
-    def dcp_size(self) -> int:
-        return self._v("dcp_size", _ps().get_dcp_world_size)
 
     @property
     def dcp_rank(self) -> int:
@@ -268,14 +252,15 @@ class ParallelContext:
         def getter():
             if _ps().get_dcp_group_no_assert() is None:
                 return False
-            return self.dcp_size > 1
+            return _ps().get_dcp_world_size() > 1
 
         return self._v("dcp_enabled", getter)
 
     @property
     def attn_dcp_size(self) -> int:
         return self._v(
-            "attn_dcp_size", lambda: self.dcp_size if self.dcp_enabled else 1
+            "attn_dcp_size",
+            lambda: _ps().get_dcp_world_size() if self.dcp_enabled else 1,
         )
 
     @property
@@ -1148,8 +1133,8 @@ def get_forward() -> ForwardFlags:
 # --- Resolved config namespaces -------------------------
 # Each returns the top-level snapshot bag; reads are `get_exec().moe.field` etc.
 # All fail with ValueError("... not published") until publish has projected them.
-# ``parallel`` has no getter of its own: its bag is reached as
-# ``get_parallel().config``, alongside the live topology it belongs to.
+# ``parallel`` has no bag getter: ``get_parallel()`` answers its leaves
+# directly, alongside the live topology they belong to.
 def get_device() -> _ConfigBag:
     return _CONTEXT.config_bag("device")
 
@@ -1200,7 +1185,7 @@ def get_observability() -> _ConfigBag:
 # table declares which top-level config namespaces each role reads. ``None``
 # means the full tree — either the role genuinely needs everything (scheduler)
 # or its deployment shape has not been audited yet (restrict only what smoke
-# coverage can verify). ``parallel`` is served by ``get_parallel().config`` and
+# coverage can verify). ``parallel`` is served by ``get_parallel()`` and
 # every process legitimately reads topology config, so it is not in this table.
 #
 # ``SGLANG_ROLE_NAMESPACES`` selects the mode (read once at import):
@@ -1596,11 +1581,7 @@ def max_prefill_buffer_tokens() -> int:
         else 0
     )
     tokens = chunked
-    if (
-        schedule.enable_dynamic_chunking
-        and get_parallel().config.pp_size > 1
-        and chunked
-    ):
+    if schedule.enable_dynamic_chunking and get_parallel().pp_size > 1 and chunked:
         tokens = max(
             tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
         )
@@ -1630,7 +1611,7 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
         activation_tokens = max(schedule.chunked_prefill_size, 2048)
     else:
         activation_tokens = max(schedule.max_prefill_tokens, 2048)
-    parallel = get_parallel().config
+    parallel = get_parallel()
     reserved_mem = (
         512 + activation_tokens * 1.5 + parallel.tp_size * parallel.pp_size / 8 * 1024
     )
