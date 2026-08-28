@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     RankResidencyReport,
     ResidencyTarget,
     WarmupMemoryRecord,
+    _layerwise_pin_targets,
     _layerwise_resident_targets,
     apply_residency_changes,
     collect_residency_targets,
@@ -2891,6 +2892,46 @@ class TestCollectResidencyTargets:
 
         assert (2, 2) in targets
         assert (1, 2) in targets
+
+    def test_host_pin_frontier_includes_non_prefix_packings(self):
+        manager = SimpleNamespace(
+            num_layers=3,
+            residency_policy="leading",
+            pin_cpu_memory=True,
+            layer_weight_bytes=lambda: {0: 6, 1: 4, 2: 4},
+            layer_host_store_bytes=lambda: {0: 6, 1: 4, 2: 4},
+            pinnable_layer_indices=lambda: (0, 1, 2),
+        )
+
+        targets = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(0,),
+            current_pinned_layers=((),),
+            uses_per_streamed_layer=1,
+        )
+
+        assert ((0,),) in targets
+        assert ((1, 2),) in targets
+
+    def test_host_pin_frontier_coalesces_equal_transformer_layers(self):
+        layer_bytes = {index: 8 for index in range(40)}
+        manager = SimpleNamespace(
+            num_layers=40,
+            residency_policy="leading",
+            pin_cpu_memory=True,
+            layer_weight_bytes=lambda: layer_bytes,
+            layer_host_store_bytes=lambda: layer_bytes,
+            pinnable_layer_indices=lambda: tuple(layer_bytes),
+        )
+
+        targets = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(0,),
+            current_pinned_layers=((),),
+            uses_per_streamed_layer=20,
+        )
+
+        assert len(targets) == 41
 
     def test_filters_and_sizes(self):
         te = nn.Linear(8, 8)
