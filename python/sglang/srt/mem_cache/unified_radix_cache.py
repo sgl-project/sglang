@@ -1792,13 +1792,27 @@ class UnifiedRadixCache(BasePrefixCache):
             + len(operation.hash_value) * self.prefetch_timeout_per_page
         )
 
-    def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+    @rank_consensus(same_results=True)
+    def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
         if self.prefetch_stop_policy == "best_effort":
             return True
         if self.prefetch_stop_policy == "wait_complete":
             return False
         elif self.prefetch_stop_policy == "timeout":
-            return self._prefetch_timeout_check_linear_func(operation)
+            # Wall-clock time may differ among ranks, all-reduce is needed to ensure
+            # all ranks reach the same final result. Otherwise PP/TP ranks will diverge.
+            #
+            # For TP, if any rank reaches the timeout, the final result is timeout.
+            #
+            # For PP, PP0 makes the decision and other ranks follow PP0's decision.
+            should_terminate = False
+            if self.pp_rank == 0:
+                should_terminate = self._prefetch_timeout_check_linear_func(operation)
+            should_terminate_tensor = torch.tensor(
+                int(should_terminate), dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
+            return should_terminate_tensor.item() == 1
         else:
             return True
 
@@ -1809,18 +1823,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
 
-        # Determine whether or not we should terminate this prefetch request.  Make all
-        # ranks agree on the decision.  When running with PP, PPn will follow PP0's decision.
-        should_terminate = False
-        if self.pp_rank == 0:
-            should_terminate = operation.is_terminated() or self.can_terminate_prefetch(
-                operation
-            )
-        should_terminate_tensor = torch.tensor(
-            int(should_terminate), dtype=torch.int, device="cpu"
+        # Determine whether or not we should terminate this prefetch request.
+        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
+            operation
         )
-        self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-        should_terminate = should_terminate_tensor.item() == 1
 
         if not should_terminate:
             return False
