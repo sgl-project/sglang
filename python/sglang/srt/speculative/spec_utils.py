@@ -913,22 +913,24 @@ def commit_mamba_states_after_verify(
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        replay_indices = batch.req_pool_indices
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
             accept_lens=accept_lens,
             draft_token_num=draft_token_num,
         )
-        # Advance the per-slot circular cursors by the accepted count (incl. the
+        # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
-            write_pos=mamba_pool.replayssm_write_pos,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             num_accepted=accept_lens,  # [bs], includes the bonus token
-            state_batch_indices=state_batch_indices,
+            replay_indices=replay_indices,
             max_cache_len=spec_state.replayssm_d.shape[-2],
             max_spec_len=draft_token_num,
+            fold_every_commit=spec_state.temporal.dtype != torch.float32,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         # Capacity rows fold all layers in one launch; track rows snapshot the
@@ -938,8 +940,11 @@ def commit_mamba_states_after_verify(
             d_cache=spec_state.replayssm_d,
             k_cache=spec_state.replayssm_k,
             g_cache=spec_state.replayssm_g,
+            d_residual_cache=spec_state.replayssm_rawv,
+            k_residual_cache=spec_state.replayssm_rawk,
             state_batch_indices=state_batch_indices,
-            write_pos=mamba_pool.replayssm_write_pos,
+            replay_indices=replay_indices,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             accept_lens=accept_lens,

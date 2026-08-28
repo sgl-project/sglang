@@ -665,6 +665,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mamba_pool=mamba_pool,
                     layer_cache=mamba_cache_params,
                     cache_indices=cache_indices,
+                    replay_indices=forward_batch.req_pool_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                 )
@@ -828,6 +829,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_pool: MambaPool,
         layer_cache: "MambaPool.SpeculativeState",
         cache_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,
     ) -> torch.Tensor:
@@ -835,15 +837,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         Reconstructs the verify output for the whole draft window from the frozen
         checkpoint (``temporal``) + the per-slot circular ``(d, k, g)`` ring, and
-        appends this window's drafts to the rings (chunked ``d`` for output
-        reconstruction; raw ``v`` / pre-norm ``k`` / fp32 ``beta`` for the
-        closed-loop exact fold that replays the recurrent update into the fp32
-        checkpoint at flush). The rings are PER-LAYER
-        (sliced via ``mamba2_layer_cache``), while the cursors (write_pos,
-        cache_base, is_flush) are PER-SLOT pool attributes shared by all GDN layers
-        of the step; the cursors persist across steps and are advanced once per step
-        by the worker (commit_gdn_replayssm_spec) -- here we only read them and
-        write this step's ring entries. GDN has K == V, so ``temporal``
+        appends this window's drafts to the compact ``(d, k, g)`` rings. BF16
+        checkpoints also keep low parts for compensated materialization. The rings
+        are per-layer (sliced via ``mamba2_layer_cache``), while the cursors
+        (write_pos, cache_base, is_flush) are request-slot pool attributes shared
+        by all GDN layers of the step. The cursors advance once per accepted step;
+        here we only read them and write this step's ring entries. GDN has K == V,
+        so ``temporal``
         ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
         checkpoint.
         """
@@ -876,21 +876,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             d_cache=d_cache,
             k_cache=layer_cache.replayssm_k,
             g_cache=layer_cache.replayssm_g,
-            # Closed-loop exact-fold rings: raw v / raw pre-norm k / fp32 beta.
-            # The flush replays these through the recurrent update (bit-identical
-            # to the recurrent baseline) instead of folding `d` open-loop.
+            # BF16 compact D/K low parts; None for fp32 checkpoints.
             rawv_cache=layer_cache.replayssm_rawv,
             rawk_cache=layer_cache.replayssm_rawk,
             beta_cache=layer_cache.replayssm_beta,
             out=out,
             query_start_loc=query_start_loc,
             ssm_state_indices=cache_indices,
-            # Per-slot cursors live on the pool (shared across all GDN layers),
-            # NOT in forward_metadata: the verify kernel reads/writes them
-            # block-keyed via ssm_state_indices and must NOT advance write_pos
-            # (the worker does that after acceptance), so the decode-path
+            replay_indices=replay_indices,
+            # Request-slot cursors live on the pool (shared across all GDN layers)
+            # and advance only after acceptance, so the decode-path
             # forward_metadata.replayssm_write_pos snapshot is not used here.
-            write_pos=mamba_pool.replayssm_write_pos,
+            write_pos=mamba_pool.replayssm_spec_write_pos,
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             max_cache_len=max_cache_len,
