@@ -301,7 +301,11 @@ class LPLBSolver:
         self._A_base_row_sum.copy_(self._A_full[:, : self.nv - 1].sum(dim=1))
         self.log2phy.copy_(log2phy.to(torch.int64))
 
-    def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
+    def solve(
+        self,
+        topk_ids: torch.Tensor,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Full LPLB pipeline: count -> all-reduce -> LP solve -> return log2phy_prob.
 
@@ -312,7 +316,13 @@ class LPLBSolver:
 
         Args:
             topk_ids: (num_tokens, topk) int32 tensor of logical expert IDs.
-                      Can be empty (shape (0, topk)) for idle ranks.
+                      Can be empty (shape (0, topk)) for idle ranks. Rows at
+                      index >= ``num_token_non_padded`` are batch padding and
+                      hold whatever the router left there.
+            num_token_non_padded: (,) int32 tensor giving how many rows of
+                      ``topk_ids`` are real tokens. Required whenever the batch
+                      is padded (i.e. under CUDA graph capture); omitting it
+                      counts the padded rows.
 
         Returns:
             log2phy_prob: (num_logical, max_copies) float32 probability tensor.
@@ -320,19 +330,33 @@ class LPLBSolver:
         device = topk_ids.device
 
         # Step 1: Count local tokens per logical expert.
-        # topk_ids comes from the router and is by construction in
-        # [0, num_logical), so we can scatter_add directly without filtering.
-        # Boolean masking + numel() (the previous defensive form) forced a
-        # GPU->host sync on every forward pass via aten::nonzero and a
-        # tensor-shape read; scatter_add on the flattened tensor is async
-        # and a no-op when topk_ids is empty (DP-attention idle rank case).
+        #
+        # Only the first `num_token_non_padded` rows are real tokens. The rest
+        # are batch padding, and the caller has not masked them yet: the topk
+        # path fills padded rows with -1 only AFTER the logical->physical remap,
+        # which happens after this call. So on those rows topk_ids holds either
+        # a top-k of stale logits (in range, meaningless) or, on the
+        # custom_routing_function path, genuine garbage that need not be in
+        # [0, num_logical) at all. Counting them puts phantom load into the LP,
+        # and an out-of-range id would make scatter_add_ write out of bounds.
+        #
+        # Masking is done entirely on device. The defensive form this replaces
+        # used boolean indexing + numel(), which forced a GPU->host sync every
+        # forward via aten::nonzero and a tensor-shape read; arange + compare
+        # has static shapes and no sync, so it stays CUDA-graph safe. Padded
+        # slots contribute 0 through `src` and are pinned to index 0 so they
+        # cannot address outside the counts.
         local_counts = torch.zeros(self.num_logical, dtype=torch.int32, device=device)
         flat_ids = topk_ids.flatten()
-        local_counts.scatter_add_(
-            0,
-            flat_ids.long(),
-            torch.ones_like(flat_ids, dtype=torch.int32),
-        )
+        if num_token_non_padded is None:
+            index = flat_ids.long()
+            src = torch.ones_like(flat_ids, dtype=torch.int32)
+        else:
+            rows = torch.arange(topk_ids.shape[0], device=device).unsqueeze(1)
+            valid = (rows < num_token_non_padded).expand_as(topk_ids).flatten()
+            index = flat_ids.masked_fill(~valid, 0).long()
+            src = valid.to(torch.int32)
+        local_counts.scatter_add_(0, index, src)
 
         # Step 2: All-reduce to get global counts across all EP ranks.
         # All EP ranks must participate — empty-token ranks contribute zeros.

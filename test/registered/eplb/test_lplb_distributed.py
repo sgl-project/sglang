@@ -231,6 +231,39 @@ def test_solver_buffers_are_stable_across_rebalance():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_batch_padding_rows_do_not_reach_the_counts():
+    """Rows past ``num_token_non_padded`` must not enter the LP's load counts.
+
+    ``solve()`` reads ``topk_ids`` in ``_post_process_topk_ids`` BEFORE
+    ``_mask_topk_ids_padded_region`` fills the padded rows, so at that point
+    they hold whatever the router left: a top-k of stale logits on the fused
+    path, or outright garbage on the custom_routing_function path. Counting
+    them puts phantom load into the LP -- and under CUDA graph capture the
+    padded fraction can be most of the batch.
+
+    Garbage here is deliberately out of range as well as wrong, since that is
+    the other half of the failure: an unmasked scatter_add_ would index
+    outside the counts buffer.
+    """
+    solver = _single_rank_solver(_make_metadata())
+    real = torch.tensor([[0, 1], [0, 2], [3, 0]], dtype=torch.int32, device="cuda")
+    n_real = real.shape[0]
+
+    # Same batch padded to 8 rows, padding filled with out-of-range garbage.
+    padded = torch.full((8, 2), 9999, dtype=torch.int32, device="cuda")
+    padded[:n_real] = real
+    num_token_non_padded = torch.tensor(n_real, dtype=torch.int32, device="cuda")
+
+    from_padded = solver.solve(padded, num_token_non_padded).clone()
+    from_real = solver.solve(real).clone()
+
+    assert torch.equal(from_padded, from_real), (
+        "padded rows changed the LP result, so they reached the load counts: "
+        f"max abs diff {(from_padded - from_real).abs().max().item():.3e}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
 def test_padded_lp_matches_unpadded_lp():
     """Zero-padding the LP must not change the solution it encodes.
 

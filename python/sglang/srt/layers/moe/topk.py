@@ -1939,7 +1939,10 @@ def _post_process_topk_ids(
 
             lplb_solver = get_global_lplb_solver(layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
+                # Padded rows are still unmasked at this point -- the fill
+                # below runs after the remap -- so the solver has to be told
+                # where the real tokens stop or it counts them.
+                log2phy_prob = lplb_solver.solve(topk_ids, num_token_non_padded)
 
         if log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(
