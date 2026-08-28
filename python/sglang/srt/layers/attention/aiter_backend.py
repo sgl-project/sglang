@@ -97,12 +97,6 @@ _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
 )
 
-# Route context-chunk prefill (extend with a prefix) to the gfx950 ASM fmha.
-_use_asm_context_prefill = (
-    get_bool_env_var("SGLANG_AITER_ASM_CONTEXT_PREFILL", "True")
-    and is_gfx95_supported()
-)
-
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
 # intra_batch_mode=False if _use_mla_ps_kernel else True
@@ -2481,7 +2475,7 @@ class AiterAttnBackend(AttentionBackend):
             # buffer costs only ~20 us per layer at 70k context. The no-prefix
             # first chunk already takes the ASM branch below.
             if (
-                _use_asm_context_prefill
+                is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
                 and forward_batch.extend_prefix_lens_cpu is not None
                 and any(forward_batch.extend_prefix_lens_cpu)
