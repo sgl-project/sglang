@@ -920,6 +920,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
     def test_source_with_pp_registers_proxy_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
+            build_prefill_registry,
         )
 
         hs = torch.zeros((8, 2), dtype=torch.int32)
@@ -963,6 +964,25 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         )
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
+
+        hs.fill_(2)
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            source=src,
+        )
+        reg.fill_from(
+            fb,
+            raw_bs=3,
+            padded_bs=4,
+            raw_num_tokens=3,
+            padded_num_tokens=8,
+            pp_proxy_tensors=pp,
+        )
+        self.assertTrue(torch.all(hs[:3] == 1))
+        self.assertTrue(torch.all(hs[3:] == 0))
 
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
