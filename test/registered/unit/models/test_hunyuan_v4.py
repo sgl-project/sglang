@@ -130,6 +130,24 @@ def test_attention_gate_non_bf16_model_fallback_parity():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(("supported", "expected"), [(True, "hpc"), (False, "triton")])
+def test_attention_gate_defaults_to_hpc_when_supported(
+    monkeypatch, supported, expected
+):
+    attention = hunyuan_v4.HYV4Attention.__new__(hunyuan_v4.HYV4Attention)
+    nn.Module.__init__(attention)
+    attention.hidden_size = 6144
+    attention.local_gate_width = 256
+    attention.linear_gate = TupleLinear(6144, 256, torch.bfloat16)
+    monkeypatch.setattr(
+        attention,
+        "_hpc_gated_mla_supported",
+        lambda *args: supported,
+    )
+
+    assert attention._resolve_gate_backend("elementwise", "triton") == expected
+
+
 def test_hpc_attention_gate_is_bf16_only(monkeypatch):
     fake_hpc = SimpleNamespace(
         gemm=SimpleNamespace(gated_mla_gemm=object()), __version__="test"
@@ -150,6 +168,34 @@ def test_hpc_attention_gate_is_bf16_only(monkeypatch):
         assert not supported("elementwise", torch.float32, (256, 6144), 256, 6144)
     finally:
         supported.cache_clear()
+
+
+def test_hpc_ihc_dispatch_guards(monkeypatch):
+    from sglang.kernels.ops.layernorm import hy4_ihc
+    from sglang.srt import utils
+
+    op = object()
+    monkeypatch.setitem(
+        sys.modules,
+        "hpc",
+        SimpleNamespace(fuse_ihc_pre=op, __version__="test"),
+    )
+    monkeypatch.setattr(utils, "get_device_capability", lambda: (10, 3))
+    hy4_ihc._hpc_ihc_op.cache_clear()
+    try:
+        assert hy4_ihc._hpc_ihc_op("fuse_ihc_pre", 4, 6144) is op
+        assert hy4_ihc._hpc_ihc_op("fuse_ihc_head", 4, 6144) is None
+
+        hy4_ihc._hpc_ihc_op.cache_clear()
+        monkeypatch.setattr(utils, "get_device_capability", lambda: (8, 0))
+        assert hy4_ihc._hpc_ihc_op("fuse_ihc_pre", 4, 6144) is None
+
+        hy4_ihc._hpc_ihc_op.cache_clear()
+        monkeypatch.setattr(utils, "get_device_capability", lambda: (10, 3))
+        assert hy4_ihc._hpc_ihc_op("fuse_ihc_pre", 2, 6144) is None
+        assert hy4_ihc._hpc_ihc_op("fuse_ihc_pre", 4, 8192) is None
+    finally:
+        hy4_ihc._hpc_ihc_op.cache_clear()
 
 
 def test_vocab_embeddings_follow_attention_tp(monkeypatch):
