@@ -424,7 +424,7 @@ class DeepseekSparseAttnBackend(
 
         # `flashmla_sparse_q8` is prefill-only (FP8 decode goes through
         # `flashmla_kv`); reject it as a decode backend, since argparse accepts it
-        # via the shared DSA_CHOICES list.
+        # via the shared CLI choices.
         if self.dsa_decode_impl == "flashmla_sparse_q8":
             raise ValueError(
                 "--dsa-decode-backend flashmla_sparse_q8 is not supported: "
