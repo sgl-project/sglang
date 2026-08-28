@@ -349,9 +349,9 @@ def pre_warmup_residency_targets(
     """Keep only weight-safe choices before activation memory is measured.
 
     Static planning knows complete component weights but not the runtime
-    working set. It may demote an unsafe configured layout or redistribute
-    HostPin at the same device footprint, but a pure residency promotion can
-    consume activation headroom that only the first shape probe can reveal.
+    working set. It may demote an unsafe configured layout, but a pure
+    residency promotion can consume activation headroom that only the first
+    shape probe can reveal.
 
     A layerwise layout can require a small persistent non-layer footprint even
     when the coarse component-offload state keeps every weight on the host.

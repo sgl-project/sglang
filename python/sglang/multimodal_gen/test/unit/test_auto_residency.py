@@ -1487,6 +1487,12 @@ class TestPlanAutoResidency:
             current_placement=True,
         )
         modules = {"transformer": object()}
+        collect_calls = []
+
+        def collect_targets(_workload, *, allow_host_pin_reallocation=True):
+            collect_calls.append(allow_host_pin_reallocation)
+            return [current]
+
         worker = SimpleNamespace(
             rank=0,
             pipeline=SimpleNamespace(preload_residency_excluded_components=frozenset()),
@@ -1497,7 +1503,7 @@ class TestPlanAutoResidency:
                 host_pin_budget=lambda: None,
             ),
             _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
-            _collect_auto_residency_targets=lambda _workload: [current],
+            _collect_auto_residency_targets=collect_targets,
             _auto_residency_modules=lambda: modules,
         )
         monkeypatch.setattr(
@@ -1541,6 +1547,7 @@ class TestPlanAutoResidency:
         assert report.skip_reason is None
         assert report.estimated_request_duration_ns == 1
         assert report.candidate_latency_savings_ns == {current.option_key(): 1}
+        assert collect_calls == [False]
 
     def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
         from sglang.multimodal_gen.runtime.managers import gpu_worker
@@ -1576,7 +1583,10 @@ class TestPlanAutoResidency:
                 host_pin_budget=lambda: None,
             ),
             _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
-            _collect_auto_residency_targets=lambda _workload: [transformer, vae],
+            _collect_auto_residency_targets=lambda _workload, **_kwargs: [
+                transformer,
+                vae,
+            ],
             _auto_residency_modules=lambda: modules,
         )
         monkeypatch.setattr(

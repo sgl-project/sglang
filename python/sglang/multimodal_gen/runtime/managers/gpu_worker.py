@@ -1675,6 +1675,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self,
         workload: DefaultWorkload,
         *,
+        allow_host_pin_reallocation: bool = True,
         used_components: set[str] | None = None,
         layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
         host_pin_headroom_bytes: int | None = None,
@@ -1693,7 +1694,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             explicit_residency_mode_of=self.server_args.explicit_residency_mode,
             custom_strategy_names=self._fixed_custom_residency_strategy_names(),
             num_inference_steps=workload.num_inference_steps,
-            allow_host_pin_reallocation=True,
+            allow_host_pin_reallocation=allow_host_pin_reallocation,
             mixed_dtype_components=self._mixed_dtype_residency_components(),
             required_resident_components={
                 name
@@ -1734,7 +1735,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         budget_bytes = self._auto_residency_budget_bytes()
-        all_candidates = self._collect_auto_residency_targets(workload)
+        all_candidates = self._collect_auto_residency_targets(
+            workload,
+            # static weights cannot score pin placement; keep the current layout
+            allow_host_pin_reallocation=False,
+        )
         candidates = pre_warmup_residency_targets(
             all_candidates,
             excluded_components=(self.pipeline.preload_residency_excluded_components),
