@@ -57,6 +57,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _align_pipeline_layers(layers: list, layer_model) -> list:
+    has_start_layer = hasattr(layer_model, "start_layer")
+    has_end_layer = hasattr(layer_model, "end_layer")
+    assert (
+        has_start_layer == has_end_layer
+    ), "pipeline layer ranges must define start_layer and end_layer together"
+    start_layer = layer_model.start_layer if has_start_layer else 0
+    end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
+    assert isinstance(start_layer, int) and isinstance(
+        end_layer, int
+    ), "pipeline layer ranges must define integer start_layer and end_layer"
+    assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
+        f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
+        f"{len(layer_model.layers)} layers"
+    )
+    assert (
+        len(layers) <= end_layer - start_layer
+    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
+    return (
+        [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
+    )
+
+
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
     runner: Optional[BaseRunner]
     memory_phase: str
@@ -370,6 +393,9 @@ def capture_prefill_graph(
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
 
+    model_runner.attention_layers = _align_pipeline_layers(
+        model_runner.attention_layers, layer_model
+    )
     if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
@@ -377,6 +403,10 @@ def capture_prefill_graph(
             "Disable prefill CUDA graph because some layers do not apply Standard GQA",
         )
         return result(None)
+
+    model_runner.mha_companion_layers = _align_pipeline_layers(
+        model_runner.mha_companion_layers, layer_model
+    )
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

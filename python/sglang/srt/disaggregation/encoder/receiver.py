@@ -1734,7 +1734,7 @@ class MMReceiverBase(ABC):
         self.host = get_local_ip_auto(get_serving().host)
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-        self.tp_size = get_parallel().config.tp_size
+        self.tp_size = get_parallel().tp_size
         self.tp_group = tp_group
         self.nnodes = server_args.nnodes
         self.hostname = get_local_ip_auto()

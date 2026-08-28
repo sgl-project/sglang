@@ -101,13 +101,14 @@ contains `[Diffusion BCG] captured` and contains no support-disable,
 capture-failure, serving-signature-miss, or late quality-fusion marker. In
 particular, a request-scoped DiT fusion mounted after lossless warmup capture
 would be bypassed by replay; reject that row even when capture and signature
-checks pass. `--warmup-resolutions` only declares width and height: a video
-request can still miss because its frame count differs from the model's
-synthetic warmup contract. Treat that as Eager fallback, not as a valid BCG
-measurement.
+checks pass. For video presets, the helper declares both the request resolution
+and `--warmup-num-frames` so the synthetic BCG warmup captures the requested
+temporal shape. Treat any remaining temporal or conditioning signature miss as
+Eager fallback, not as a valid BCG measurement.
 
 A zero process exit is not sufficient evidence: every accepted row must also
-contain its requested perf dump and a generated image, video, or audio file.
+contain its requested perf dump and a generated image, video, audio, or 3D mesh
+file.
 The helper gives every cell a unique output name and rejects missing artifacts.
 
 On machines with a read-only Hugging Face cache, combine
