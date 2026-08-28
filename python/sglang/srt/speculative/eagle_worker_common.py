@@ -22,6 +22,7 @@ from sglang.srt.speculative.eagle_utils import (
     eagle_prepare_for_verify,
     eagle_sample,
 )
+from sglang.srt.speculative.hybrid_ragged import scatter_hybrid_verify_outputs
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -146,6 +147,21 @@ def prepare_for_draft_extend(
             )
     else:
         batch.input_ids = predict
+        # This branch REUSES the cache map the previous stage (target verify)
+        # left on the shared ScheduleBatch: on the fixed-width path both stages
+        # address the same bs * num_draft_tokens slots, so rebuilding it would
+        # be redundant. That makes it an unstated cross-stage invariant, and a
+        # stage that installs a narrower map (e.g. hybrid retrieval's compact ragged
+        # verify window) silently hands this forward more tokens than locations.
+        # Cheap enough to check on every decode.
+        if not batch.forward_mode.is_idle():
+            assert batch.out_cache_loc.numel() == extend_num_tokens, (
+                f"draft-extend needs a fixed-width cache map of "
+                f"{extend_num_tokens} (= bs {bs} * {num_window_tokens}) entries, "
+                f"got {batch.out_cache_loc.numel()}: a previous stage left a "
+                "compact/ragged map on the shared ScheduleBatch without "
+                "restoring the fixed-width one."
+            )
     maybe_detect_oob(
         batch.input_ids,
         0,
@@ -501,6 +517,31 @@ def run_eagle_verify(
             target_worker,
         )
 
+    # A ragged verify that did NOT get a graph must have an EXACT layout. With
+    # slack, the eager DSV4 path runs padded_to_bucket(padded_bs=bs) with no pad
+    # requests, so the substrate folds the whole remainder into the LAST REAL
+    # request -- widening its attention window past num_draft_tokens and past the
+    # KV slots the scheduler reserved for it. The planner prevents this (it caps
+    # the non-DP tier at bs * num_draft_tokens, and the DP vote makes the graph a
+    # precondition), so reaching here means an admission condition changed under
+    # the planner. Say so loudly rather than let it read stale KV silently.
+    _layout = verify_input.ragged_verify_layout
+    if (
+        _layout is not None
+        and not can_run_cuda_graph
+        and not batch.forward_mode.is_idle()
+        and _layout.verify_lens_cpu is not None
+        and _layout.graph_num_tokens > sum(_layout.verify_lens_cpu)
+    ):
+        raise RuntimeError(
+            "ragged verify fell back to eager while carrying tier slack "
+            f"(tier={_layout.graph_num_tokens}, "
+            f"sum(forward_lens)={sum(_layout.verify_lens_cpu)}, bs={_layout.bs}): "
+            "the eager path would widen the last request past its reserved KV "
+            "window. The planner's graph-admission predicate and the runner's "
+            "can_run_graph decision have diverged."
+        )
+
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
@@ -565,6 +606,53 @@ def run_eagle_verify(
         is_verify=True,
     )
     logits_output = forward_batch_output.logits_output
+
+    # ---- THE RAGGED SEAM ----------------------------------------------------
+    # Ragged verify ran the forward on sum(w_r) compact rows. Restore the FULL
+    # fixed-width view HERE, before anything else touches the batch or the
+    # outputs, so every consumer below (sampling, accept, logprob, draft-extend,
+    # the scheduler's stride arithmetic) sees the exact rectangle it sees on the
+    # fixed-width path.
+    #
+    # "Full view" means more than the two output tensors. `batch.out_cache_loc`
+    # is also part of it: `prepare_for_draft_extend`'s non-widening branch
+    # deliberately does NOT rebuild the cache map -- on the fixed-width path
+    # verify and draft-extend address the same bs*L slots, so it reuses whatever
+    # verify left on the shared ScheduleBatch. Leaving the compact map there
+    # hands draft-extend bs*L tokens against sum(w_r) locations.
+    #
+    # The ordering is load-bearing, not cosmetic: eagle_sample sizes its
+    # `predict` buffer from next_token_logits.shape[:-1] while retrieve_index
+    # carries global row ids up to bs * num_draft_tokens - 1, so a compact
+    # logits tensor here means an out-of-bounds write inside the verify kernel.
+    #
+    # An IDLE batch is excluded even when it carries a layout. Under DP attention
+    # an idle rank rides the busy ranks' agreed tier so it enters the same
+    # captured graph, but it has no requests: the runner hands back zero logits
+    # rows, and the layout's single fake request describes the graph's shape, not
+    # anything to scatter. Scattering here would inflate an empty tensor to
+    # `[1 * num_draft_tokens, V]` of fill values and hand that to `eagle_sample`.
+    if (
+        verify_input.ragged_verify_layout is not None
+        and not batch.forward_mode.is_idle()
+    ):
+        assert verify_input.ragged_verify_layout.bs == bs, (
+            f"ragged verify layout describes {verify_input.ragged_verify_layout.bs} "
+            f"requests but the batch has {bs}: ScatterCompactToStrided sizes its "
+            "output as layout.bs * num_draft_tokens, while retrieve_index carries "
+            "global row ids up to bs * num_draft_tokens - 1, so a mismatch is an "
+            "out-of-bounds write inside the verify kernel. (A padded_to_bucket "
+            "layout must never reach the spec input.)"
+        )
+        scatter_hybrid_verify_outputs(
+            logits_output=logits_output,
+            layout=verify_input.ragged_verify_layout,
+            verify_width=num_draft_tokens,
+        )
+        if verify_input.ragged_fixed_cache_loc is not None:
+            batch.out_cache_loc = verify_input.ragged_fixed_cache_loc
+            batch.out_cache_loc_dsv4 = verify_input.ragged_fixed_cache_loc_dsv4
+            record_stream_each((batch.out_cache_loc,), fwd_stream)
 
     # Generate vocab mask for constrained decoding
     grammar_mask = None

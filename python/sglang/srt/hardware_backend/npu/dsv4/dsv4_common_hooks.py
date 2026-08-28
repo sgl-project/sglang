@@ -201,12 +201,18 @@ def maybe_build_dsv4_verify_bundle(
     draft_token_num: int,
     *,
     live_seq_lens_cpu: torch.Tensor | None = None,
+    verify_lens_cpu: list[int] | None = None,
 ):
     """Build the DSV4 cache-location view for one target-verify pass.
 
     Spec-v2 reserves cache ahead of time, so target verify must select only the
     current draft interval from the per-request DSV4 tables instead of reusing
     the larger allocation bundle produced during decode preparation.
+
+    ``verify_lens_cpu`` is the hybrid retrieval ragged per-request width ``w_r``; when
+    given, request r's interval is ``[seq_len, seq_len + w_r)`` instead of the
+    uniform ``[seq_len, seq_len + draft_token_num)``, matching the compact rows
+    the forward actually writes.
     """
     pool = batch.req_to_token_pool
     if not hasattr(pool, "req_to_c128_sidecar"):
@@ -216,14 +222,22 @@ def maybe_build_dsv4_verify_bundle(
         return None
 
     req_indices = batch.req_pool_indices_cpu.tolist()
-
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens_cpu
     if live_seq_lens_cpu is None:
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
-    verify_lens = [int(draft_token_num)] * len(req_indices)
+    verify_lens = (
+        [int(w) for w in verify_lens_cpu]
+        if verify_lens_cpu is not None
+        else [int(draft_token_num)] * len(req_indices)
+    )
+    if len(verify_lens) != len(req_indices):
+        raise ValueError(
+            "verify_lens_cpu must have one entry per request: "
+            f"got {len(verify_lens)} lengths for {len(req_indices)} requests"
+        )
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         page_size = pool.c128_page_size

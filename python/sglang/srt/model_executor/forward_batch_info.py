@@ -1631,6 +1631,97 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     spec_info.hidden_states, num_tokens
                 )
 
+    def _undo_idle_padding(self) -> None:
+        """Exact inverse of `_pad_inputs_to_size` for a rank with NO requests.
+
+        Under DP attention an idle rank still joins every forward. Whether its
+        inputs get stretched depends on arithmetic it does not control:
+        `DpPaddingMode.get_dp_padding_mode` picks MAX_LEN as soon as
+        `sum_len * 2 >= max_len * dp_size`, which for one draft row per busy rank
+        means "at least half the ranks are busy" -- 4 busy out of 8 flips it,
+        1 busy out of 8 does not. Under MAX_LEN this rank's 0-row tensors are
+        padded up to the global max.
+
+        `post_forward_mlp_sync_batch` truncates the OUTPUT back to zero rows, but
+        the padded INPUT tensors stay on the batch, and the batch is reused:
+        `EagleDraftWorker.draft_forward` runs `speculative_num_steps` forwards on
+        one ForwardBatch and pairs `forward_batch.positions` with the logits the
+        forward returned (`draft_topk1_postprocess` asserts the two agree, and
+        the fused kernel advances positions in place). A padded `positions`
+        therefore kills every idle rank the moment the padding mode flips --
+        which is what it did: 4 of 8 DP ranks asserted in `draft_forward` on the
+        first decode step after four requests landed on the other four.
+
+        The inverse is exact rather than "close enough": every field below is
+        sliced under the SAME `is not None` guard the padding used, so a field
+        that was None stays None, and slicing a padded tensor to zero rows
+        reproduces the empty tensor that was there before (a 0-row original
+        contributes nothing to the `torch.cat`). Which is also why this is
+        restricted to genuinely empty batches -- see the caller's guard.
+
+        Two things are deliberately NOT undone here:
+          * `spec_info.hidden_states` -- owned by `hidden_states_backup`, which
+            holds the pre-padding tensor and is restored by the caller.
+          * the fabricated-row conversion in `prepare_mlp_sync_batch` (hybrid-SSM
+            and prefill-breakable-graph idle ranks), which invents a whole dummy
+            request (`extend_*`, `orig_seq_lens`, `num_token_non_padded`) instead
+            of padding. Undoing half of that would leave a batch that is neither
+            empty nor the dummy request, so the caller skips this method
+            entirely for a converted batch.
+        """
+        assert self.batch_size == 0, (
+            f"_undo_idle_padding on a non-empty batch (batch_size="
+            f"{self.batch_size}); it restores EMPTY shapes and would drop rows"
+        )
+        self.input_ids = self.input_ids[:0]
+        self.req_pool_indices = self.req_pool_indices[:0]
+        if self.lora_ids is not None:
+            self.lora_ids = []
+        if self.seq_lens_sum is not None:
+            # The padding added `seq_len_fill_value * bs`; an empty batch sums to
+            # zero. Not folded into the slice below because seq_lens_sum is a
+            # plain int that the attention backends size allocations from.
+            self.seq_lens_sum = 0
+        self.seq_lens = self.seq_lens[:0]
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self.seq_lens_cpu[:0]
+        self.out_cache_loc = self.out_cache_loc[:0]
+        if self.encoder_lens is not None:
+            self.encoder_lens = self.encoder_lens[:0]
+        self.positions = self.positions[:0]
+        if self.mamba_track_indices is not None:
+            self.mamba_track_indices = self.mamba_track_indices[:0]
+        if self.mamba_track_mask is not None:
+            self.mamba_track_mask = self.mamba_track_mask[:0]
+        if self.mamba_track_seqlens is not None:
+            self.mamba_track_seqlens = self.mamba_track_seqlens[:0]
+        if self.mrope_positions is not None:
+            self.mrope_positions = self.mrope_positions[:, :0]
+        if self.extend_seq_lens is not None:
+            self.extend_seq_lens = self.extend_seq_lens[:0]
+        if self.rids_int is not None:
+            self.rids_int = self.rids_int[:0]
+            if self.sampling_info is not None:
+                self.sampling_info.rids_int = self.rids_int
+        if self.bootstrap_room_ids_int is not None:
+            self.bootstrap_room_ids_int = self.bootstrap_room_ids_int[:0]
+            if self.sampling_info is not None:
+                self.sampling_info.bootstrap_room_ids_int = self.bootstrap_room_ids_int
+        if self.spec_info is not None and self.spec_info.is_draft_input():
+            spec_info = self.spec_info
+            # getattr for the same reason the padding side uses it: spec_info is
+            # EagleDraftInput | EagleDraftExtendInput and each carries a disjoint
+            # subset of these fields.
+            if getattr(spec_info, "topk_p", None) is not None:
+                spec_info.topk_p = spec_info.topk_p[:0]
+            if getattr(spec_info, "topk_index", None) is not None:
+                spec_info.topk_index = spec_info.topk_index[:0]
+            if getattr(spec_info, "draft_probs", None) is not None:
+                spec_info.draft_probs = spec_info.draft_probs[:0]
+            if getattr(spec_info, "num_correct_drafts", None) is not None:
+                spec_info.num_correct_drafts = spec_info.num_correct_drafts[:0]
+                spec_info.num_accept_tokens = spec_info.num_accept_tokens[:0]
+
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
         from sglang.srt.layers.communicator import get_attn_tp_context
 
@@ -1715,6 +1806,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+        # The output is back to its real row count; the INPUTS are still padded.
+        # For a rank with requests that is fine (the branches above restore what
+        # the decode loop reads), but an idle rank's batch is reused by the draft
+        # loop against these tensors, so give it back the empty shapes it came
+        # in with -- last, so this is the final word on every field, including
+        # the two `*_backup` re-assignments above.
+        #
+        # `_original_forward_mode is not None` means prepare_mlp_sync_batch
+        # CONVERTED this idle rank into a fabricated one-request EXTEND /
+        # TARGET_VERIFY batch instead of padding an empty one; see
+        # _undo_idle_padding for why those keep their fabricated shape.
+        if self.forward_mode.is_idle() and self._original_forward_mode is None:
+            self._undo_idle_padding()
 
     @property
     def can_run_tbo(self):

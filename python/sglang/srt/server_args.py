@@ -2373,6 +2373,91 @@ class ServerArgs:
         NS("spec"),
     ] = 10000000
 
+    # Speculative decoding (hybrid MTP + retrieval, chain-only)
+    # -------------------------------------------------------------------------
+    # MTP heads the chain; chain positions whose draft prob falls below that
+    # position's tau are truncated and refilled by ngram retrieval up to
+    # speculative_num_draft_tokens (= L > num_steps + 1). EAGLE family + topk==1
+    # only. See python/sglang/srt/speculative/hybrid_chain.py.
+    speculative_hybrid_retrieval: A[
+        bool,
+        "Enable hybrid MTP + ngram-retrieval speculative decoding (chain-only): MTP heads the chain, low-draft-prob positions are truncated and refilled by retrieval up to --speculative-num-draft-tokens. EAGLE family + topk==1 only.",
+        NS("spec"),
+    ] = False
+    speculative_hybrid_tau: A[
+        float,
+        "Draft-prob truncation threshold applied to verify columns 2..num_steps when --speculative-hybrid-tau-per-pos is not given: keep the leading MTP positions whose top-1 prob >= tau, refill the rest by retrieval.",
+        NS("spec"),
+    ] = 0.4
+    speculative_hybrid_tau_per_pos: A[
+        str,
+        "Per-position truncation thresholds indexed by VERIFY-CHAIN COLUMN (column 0 = the bonus token, columns 1..S = the S MTP drafts), so it takes exactly --speculative-num-steps + 1 comma-separated entries. An entry of off/disabled/none/0 never truncates at that column; columns 0 and 1 MUST both be disabled (column 0 is the bonus token; column 1's draft logprob comes from the previous iteration's draft-extend). For --speculative-num-steps 3 the DSV4-calibrated setting is 'off,off,0.40,0.55'. Empty = use the scalar --speculative-hybrid-tau on columns >= 2.",
+        NS("spec"),
+    ] = ""
+    speculative_hybrid_tau_min: A[
+        float,
+        "Lower bound of the dynamic tau range (minimal truncation ~ pure MTP).",
+        NS("spec"),
+    ] = 0.05
+    speculative_hybrid_dynamic_tau: A[
+        bool,
+        "Adapt each position's hybrid truncation tau between --speculative-hybrid-tau-min and its configured tau via an EMA of the retrieval-extension rate, so a workload where retrieval never grafts pays no truncation cost.",
+        NS("spec"),
+    ] = False
+    speculative_hybrid_index_prompt: A[
+        bool,
+        Arg(
+            help="Insert the full prompt into the ngram trie at prefill so hybrid retrieval can copy from the prompt (RAG / long-context / code-with-context). Use --no-speculative-hybrid-index-prompt to disable.",
+            action=argparse.BooleanOptionalAction,
+        ),
+        NS("spec"),
+    ] = True
+    speculative_hybrid_full_cuda_graph: A[
+        bool,
+        "Also capture the draft-loop and draft-extend cuda graphs under hybrid (per-step draft logprobs go through a graph-safe static buffer). Off = eager draft, target-verify graph only.",
+        NS("spec"),
+    ] = False
+    speculative_hybrid_overlap: A[
+        bool,
+        "Run hybrid under the overlap scheduler. The retrieval query stops reading req.output_ids (which lags one batch under overlap) and uses a self-maintained shadow verified context fed by an async accepted-token relay from each verify. Off (default) forces --disable-overlap-schedule.",
+        NS("spec"),
+    ] = False
+    speculative_hybrid_ragged: A[
+        bool,
+        "Run the hybrid target-verify forward RAGGED: a request whose retrieval graft failed verifies only its 1 + num_steps MTP columns instead of being padded to --speculative-num-draft-tokens. Compact rows are scattered back to the fixed [bs, L] stride right after the forward, so every downstream consumer is unchanged. DeepSeek-V4 + greedy only.",
+        NS("spec"),
+    ] = False
+    speculative_hybrid_ragged_floor: A[
+        Optional[int],
+        "Starting point of each per-batch-size series in the ragged GRAPH-TIER GRID. Defaults to speculative_num_steps + 1, the width a request whose graft failed actually needs. NOTE: this only moves the grid anchors -- it does NOT change any request's verify width w_r, which is always derived from speculative_num_steps and the retrieval chain length. Set it away from the default only to reshape the tier grid.",
+        NS("spec"),
+    ] = None
+    speculative_hybrid_ragged_tier_step: A[
+        Optional[int],
+        "Spacing of the ragged graph-tier grid, in tokens. Defaults to one QUANTUM = speculative_num_draft_tokens - floor, the extra tokens one request costs when its graft succeeds, which is the spacing the step totals actually move on. Larger values capture fewer graphs and collect less of the saving.",
+        NS("spec"),
+    ] = None
+    speculative_hybrid_ragged_max_tiers: A[
+        int,
+        "Cap on the number of captured ragged verify graphs. -1 (default) = auto = max(16, 2 * number of captured batch sizes), which keeps small deployments on the exact quantum grid while stopping a large --cuda-graph-max-bs from producing thousands of captures (the per-batch-size union is nearly one tier per integer). 0 = genuinely unlimited. When the derived grid exceeds the cap, the TIER STEP is widened first and the captured batch sizes are thinned only as a last resort -- thinning punches holes in the grid, which costs far more than a coarse step. The startup log reports the effective step and the anchor count actually used; if even the coarsest combination does not fit, the full grid is captured and a warning names the count.",
+        NS("spec"),
+    ] = -1
+    speculative_hybrid_ragged_tiers: A[
+        str,
+        "Explicit comma-separated ragged tier grid, e.g. '16,21,26,31,36'. Non-empty completely overrides floor/tier-step/max-tiers. Must be strictly increasing, positive, and must END at max(capture_bs) * speculative_num_draft_tokens -- a step total above the last tier has no captured graph and falls back to eager. Intermediate bs * num_draft_tokens values need NOT be members: a batch may round up past its own bs * L, and the substrate then hands the surplus to padding requests. Escape hatch for reproducing a parameter sweep without code changes.",
+        NS("spec"),
+    ] = ""
+    speculative_hybrid_ragged_tier_policy: A[
+        str,
+        "How the ragged graph tier is chosen. Only 'sync' is currently supported; it copies the exact per-request widths to the host each step and rounds their sum up to a captured tier.",
+        NS("spec"),
+    ] = "sync"
+    speculative_hybrid_ragged_dp_tier: A[
+        bool,
+        "Agree the ragged graph tier across DP-attention ranks with a per-step gloo all-gather, so all ranks replay the same token-keyed verify graph. Required to combine --speculative-hybrid-ragged with --enable-dp-attention: without the agreement the ranks pick different graphs and the group hangs with no assertion firing first, so this is opt-in rather than implied.",
+        NS("spec"),
+    ] = False
+
     # -------------------------------------------------------------------------
     # Expert parallelism
     # -------------------------------------------------------------------------
@@ -10283,6 +10368,334 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def check_hybrid_retrieval_server_args(self):
+        """Validate hybrid MTP + retrieval and its co-requisites."""
+        from sglang.srt.speculative.hybrid_chain import parse_position_thresholds
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+        assert algo.is_eagle(), (
+            "speculative_hybrid_retrieval requires an EAGLE-family speculative "
+            f"algorithm (got {self.speculative_algorithm})."
+        )
+        assert self.speculative_eagle_topk == 1, (
+            "speculative_hybrid_retrieval requires --speculative-eagle-topk 1 "
+            f"(chain-only); got {self.speculative_eagle_topk}."
+        )
+        assert (
+            self.speculative_num_steps is not None and self.speculative_num_steps >= 1
+        ), (
+            "speculative_hybrid_retrieval requires speculative_num_steps >= 1; at 0 "
+            "steps there is no MTP chain to truncate and verify routes through the "
+            f"1-token trivial path. Got {self.speculative_num_steps}."
+        )
+        assert (
+            self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens >= self.speculative_num_steps + 1
+        ), (
+            "speculative_hybrid_retrieval requires speculative_num_draft_tokens (L) "
+            ">= speculative_num_steps + 1 so retrieval has slots to fill; got "
+            f"L={self.speculative_num_draft_tokens}, "
+            f"num_steps={self.speculative_num_steps}."
+        )
+        assert 0.0 < self.speculative_hybrid_tau <= 1.0, (
+            "speculative_hybrid_tau must be in (0, 1]; got "
+            f"{self.speculative_hybrid_tau}."
+        )
+        assert 0.0 < self.speculative_hybrid_tau_min <= 1.0, (
+            "speculative_hybrid_tau_min must be in (0, 1]; got "
+            f"{self.speculative_hybrid_tau_min}."
+        )
+        # Fail at startup, not on the first decode step, if the per-position
+        # threshold list is malformed.
+        parse_position_thresholds(
+            self.speculative_hybrid_tau_per_pos,
+            self.speculative_hybrid_tau,
+            self.speculative_num_steps,
+        )
+
+        # The truncation reads the real per-step draft logprob, which is only
+        # assembled on the fused topk=1 CUDA chain fast path in draft_forward.
+        # Each condition below silently routes the draft loop off that path, so
+        # reject them at startup instead of failing on the first decode step.
+        assert self.device == "cuda", (
+            "speculative_hybrid_retrieval needs the fused topk=1 CUDA chain fast "
+            f"path for the per-step draft logprobs; got device={self.device}."
+        )
+        assert not self.speculative_use_rejection_sampling, (
+            "speculative_hybrid_retrieval is incompatible with "
+            "--speculative-use-rejection-sampling: the spliced chain carries "
+            "retrieval tokens that have no draft proposal distribution, and the "
+            "rejection-sampling kernel requires one for every candidate."
+        )
+        assert self.speculative_token_map is None, (
+            "speculative_hybrid_retrieval is incompatible with "
+            "--speculative-token-map: a reduced (hot) draft vocab routes the "
+            "draft loop off the fused topk=1 chain fast path."
+        )
+        assert not self.speculative_adaptive, (
+            "speculative_hybrid_retrieval is incompatible with "
+            "--speculative-adaptive: adaptive spec re-captures the worker at "
+            "other speculative_num_steps values, but the per-position tau vector "
+            "is sized once from the launch-time num_steps."
+        )
+        if self.speculative_hybrid_ragged:
+            self._check_hybrid_ragged_server_args()
+
+        # Mutations (ngram breadth, overlap) live in the speculative hook's
+        # _handle_hybrid_retrieval so they land while config is still resolving.
+
+    def _check_hybrid_ragged_server_args(self):
+        """Validate the ragged (variable-length) verify support matrix.
+
+        Every condition below either has no ragged implementation at all, or --
+        worse -- has one that would silently produce a fixed-width fallback and
+        make the option ineffective. Reject them at startup.
+        """
+        from sglang.srt.arg_groups.overrides import attention_backends_of
+
+        # Only the DSV4 backend resolves a RaggedVerifyLayout off the spec input
+        # (deepseek_v4_backend.py::_resolve_verify_layout). Any other backend
+        # would build fixed-width [bs*L] attention metadata for a compact
+        # forward -- shapes would mismatch, or worse, quietly mis-attend.
+        # This runs from check_server_args, i.e. post-resolution, so the fields
+        # already carry their final values.
+        _prefill_backend, decode_backend = attention_backends_of(self)
+        assert decode_backend == "dsv4", (
+            "speculative_hybrid_ragged is implemented on the DeepSeek-V4 "
+            f"attention backend only; got decode attention backend "
+            f"{decode_backend!r}."
+        )
+
+        assert not self.speculative_hybrid_overlap, (
+            "speculative_hybrid_ragged does not support "
+            "--speculative-hybrid-overlap yet; the accepted-token relay and the "
+            "ragged tier planner currently require synchronous scheduling."
+        )
+        self._check_hybrid_ragged_tier_server_args()
+        assert not self.enable_two_batch_overlap, (
+            "speculative_hybrid_ragged is incompatible with two-batch-overlap "
+            "(the compact ragged cuda-graph runner rejects it at construction)."
+        )
+        assert not self.enable_lora, (
+            "speculative_hybrid_ragged is incompatible with LoRA (the compact "
+            "ragged cuda-graph runner rejects it at construction)."
+        )
+        assert not self.disable_cuda_graph_padding, (
+            "speculative_hybrid_ragged is incompatible with "
+            "--disable-cuda-graph-padding."
+        )
+        assert self.attn_cp_size == 1, (
+            "speculative_hybrid_ragged does not support context parallel "
+            "(deepseek_v4_backend::_resolve_verify_layout raises on CP); got "
+            f"attn_cp_size={self.attn_cp_size}."
+        )
+        assert not self.speculative_use_rejection_sampling, (
+            "speculative_hybrid_ragged is greedy-only: the accept cutoff is a "
+            "port of DSPARK's CapCorrectLen, which operates on a greedy "
+            "correct_len. (Non-greedy BATCHES are handled at runtime by falling "
+            "back to the fixed-width path for that step.)"
+        )
+
+        from sglang.srt.environ import envs
+
+        # With the plan stream on, eagle_prepare_for_verify runs off the compute
+        # stream (so the compact window tensors would need their own
+        # record_stream) AND the backend's update_verify_buffers_to_fill_after_
+        # draft refills `positions` assuming the fixed [bs * L] stride, which
+        # ragged has just rebound to the compact window.
+        assert not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get(), (
+            "speculative_hybrid_ragged requires "
+            "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0; the verify plan stream rebinds "
+            "verify buffers at the fixed width."
+        )
+
+        # PREP=0 routes the DSV4 backend to init_forward_metadata_target_verify_old,
+        # which reads layout.verify_lens_cpu -- but the backend has by then run
+        # layout.padded_to_bucket(), and that rebuilds the layout through
+        # _assemble_device() WITHOUT the host fields, so verify_lens_cpu is None
+        # and compute_ragged_extend_lengths does list(None). Failing here beats
+        # failing with a TypeError on the first request, after the weights load.
+        # Supporting PREP=0 would require padded_to_bucket to retain host lengths.
+        assert envs.SGLANG_PREP_IN_CUDA_GRAPH.get(), (
+            "speculative_hybrid_ragged requires SGLANG_PREP_IN_CUDA_GRAPH=1: with "
+            "it off the DSV4 backend takes the host-metadata path, whose "
+            "verify_lens_cpu is dropped by RaggedVerifyLayout.padded_to_bucket() "
+            "-- the first ragged verify would die with "
+            "\"TypeError: 'NoneType' object is not iterable\"."
+        )
+        assert not (
+            envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            and envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
+        ), (
+            "speculative_hybrid_ragged is incompatible with online c128 MTP "
+            "(SGLANG_OPT_USE_ONLINE_COMPRESS + SGLANG_EXPERIMENTAL_ONLINE_C128_MTP): "
+            "DSV4's _resolve_verify_layout raises NotImplementedError for that "
+            "combination on the first ragged verify."
+        )
+
+    def _check_hybrid_ragged_tier_server_args(self):
+        """Validate graph-tier knobs and the DP tier agreement.
+
+        The grid itself is only buildable once ``capture_bs`` is known (in the
+        decode cuda-graph runner), so this checks what can be checked from the
+        args alone -- and, more importantly, refuses the combinations whose
+        failure mode is a hung cluster rather than an exception.
+        """
+        assert self.speculative_hybrid_ragged_tier_policy == "sync", (
+            "speculative_hybrid_ragged_tier_policy must be 'sync' for now; got "
+            f"{self.speculative_hybrid_ragged_tier_policy!r}. The 'ema' policy "
+            "is not implemented yet; accepting it here would "
+            "silently run the exact policy under an ema name."
+        )
+        floor = self.speculative_hybrid_ragged_floor
+        if floor is not None:
+            assert 1 <= floor <= self.speculative_num_draft_tokens, (
+                "speculative_hybrid_ragged_floor must be in "
+                f"[1, speculative_num_draft_tokens={self.speculative_num_draft_tokens}]; "
+                f"got {floor}."
+            )
+        tier_step = self.speculative_hybrid_ragged_tier_step
+        if tier_step is not None:
+            assert tier_step >= 1, (
+                "speculative_hybrid_ragged_tier_step must be >= 1; got " f"{tier_step}."
+            )
+        assert self.speculative_hybrid_ragged_max_tiers >= -1, (
+            "speculative_hybrid_ragged_max_tiers must be >= -1 (-1 = auto, "
+            f"0 = unlimited); got {self.speculative_hybrid_ragged_max_tiers}."
+        )
+        if self.speculative_hybrid_ragged_tiers.strip():
+            # Parse here so a typo fails at startup rather than inside the
+            # cuda-graph capture loop, after the weights are already resident.
+            tiers = [
+                int(piece)
+                for piece in self.speculative_hybrid_ragged_tiers.split(",")
+                if piece.strip()
+            ]
+            assert tiers and tiers == sorted(set(tiers)) and tiers[0] >= 1, (
+                "speculative_hybrid_ragged_tiers must be a strictly increasing "
+                f"list of positive ints; got {self.speculative_hybrid_ragged_tiers!r}."
+            )
+            # The runtime grid validator also checks this, but it runs while
+            # constructing the decode runner after weights are resident.  When
+            # max-running is explicit, the effective
+            # capture ceiling is already known here and a bad endpoint must be
+            # rejected before the model load.
+            max_running_requests = getattr(self, "max_running_requests", None)
+            if max_running_requests is not None:
+                effective_max_bs = max_running_requests
+                if self.enable_dp_attention:
+                    assert effective_max_bs % self.dp_size == 0, (
+                        "max_running_requests must be divisible by dp_size for "
+                        "the DP capture grid; got "
+                        f"{effective_max_bs} and dp_size={self.dp_size}."
+                    )
+                    effective_max_bs //= self.dp_size
+                ceiling = effective_max_bs * self.speculative_num_draft_tokens
+                assert tiers[-1] == ceiling, (
+                    "speculative_hybrid_ragged_tiers must end at the pre-weight "
+                    "capture ceiling max_effective_bs * "
+                    f"speculative_num_draft_tokens = {ceiling}; got {tiers[-1]}."
+                )
+
+        from sglang.srt.environ import envs
+
+        # This test-only knob replaces the token-tier capture layout with a
+        # uniform rectangle.  That is a different mechanism, not a supported
+        # configuration; in DP it can additionally strand an idle rank in a
+        # collective.  Refuse it for both non-DP and DP before the early return.
+        assert not envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get(), (
+            "speculative_hybrid_ragged is incompatible with "
+            "SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE=1: the knob "
+            "bypasses the token-tier capture layout."
+        )
+
+        if not self.enable_dp_attention:
+            assert not self.speculative_hybrid_ragged_dp_tier, (
+                "--speculative-hybrid-ragged-dp-tier does nothing without "
+                "--enable-dp-attention; drop it rather than leave a knob on that "
+                "has no effect."
+            )
+            return
+
+        # DP attention: the tier MUST be agreed, or the ranks replay different
+        # graphs and the group hangs inside the in-graph MoE all-gather with no
+        # assertion firing first.
+        assert self.speculative_hybrid_ragged_dp_tier, (
+            "speculative_hybrid_ragged with --enable-dp-attention requires "
+            "--speculative-hybrid-ragged-dp-tier: the ragged verify graph is "
+            "keyed by the layout's token count and the decode runner takes no "
+            "cross-rank max of its own, so each rank would pick its own graph "
+            "and the group would hang."
+        )
+        # DERIVED, not a field: ServerArgs has tp_size / dp_size / attn_cp_size
+        # but no attn_tp_size. Same formula as compute_dp_attention_world_info
+        # (layers/dp_attention.py) and the MiMoV2 check in this file.
+        attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+        attn_tp_size = self.tp_size // attn_dp_size // self.attn_cp_size
+        assert attn_tp_size == 1, (
+            "speculative_hybrid_ragged DP tier agreement requires "
+            f"attn_tp_size == 1 (got {attn_tp_size} from tp_size={self.tp_size}, "
+            f"dp_size={self.dp_size}, attn_cp_size={self.attn_cp_size}): the "
+            "all-gather runs over the tp group, and only with one rank per DP "
+            "rank is the gathered vector the per-DP-rank vector."
+        )
+
+        # The whole mechanism is the token-tier graph's cross-rank agreement, so
+        # without decode cuda graphs there is no tier to agree on: every rank
+        # would vote VETO and drop to fixed width, every step, forever -- and the
+        # eager-fallback counter that would say so lives on the decode runner,
+        # which does not exist either. A permanent silent no-op that still
+        # reports "ragged + dp-tier enabled" is worse than a refusal.
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
+        decode_backend = getattr(self.cuda_graph_config, Phase.DECODE).backend
+        assert decode_backend != Backend.DISABLED, (
+            "speculative_hybrid_ragged with --enable-dp-attention requires the "
+            "decode CUDA graph: the DP tier IS the captured graph's token count, "
+            "so with graphs off every rank votes VETO, every step falls back to "
+            "fixed width, and the feature is a permanent silent no-op (the "
+            "eager-fallback counter that would say so lives on the decode runner, "
+            "which does not exist either). Drop --disable-cuda-graph / "
+            "--disable-decode-cuda-graph, or run this arm without "
+            "--enable-dp-attention -- non-DP ragged IS supported eager."
+        )
+
+        # The runtime gate (hybrid_ragged_dp_tier_enabled) also requires this.
+        # Checking it HERE too is the point: if the two ever disagree, startup
+        # succeeds, the per-step all-gather silently never happens, and each rank
+        # picks its own tier -- the exact hang this whole mechanism exists to
+        # prevent, reached by passing validation. It is true for the DSV4 shapes
+        # hybrid retrieval targets (enable_dp_attention with moe_dense_tp_size unset),
+        # but that is a property of the config, not something to rely on.
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
+        assert require_mlp_tp_gather(self), (
+            "speculative_hybrid_ragged DP tier agreement requires an MLP TP "
+            "gather (require_mlp_tp_gather); without it the runtime gate turns "
+            "the per-step tier all-gather off while DP attention stays on, and "
+            "the ranks would each choose their own graph tier. Check "
+            "--moe-dense-tp-size / --enable-dp-lm-head / the MoE a2a backend."
+        )
+        assert not self.speculative_skip_dp_mlp_sync, (
+            "speculative_hybrid_ragged DP tier agreement needs the MLP sync: the "
+            "tier vote reads is_extend_in_batch / can_run_dp_cuda_graph, which "
+            "only the sync makes dp-global."
+        )
+        assert self.disaggregation_mode == "null" and self.pp_size == 1, (
+            "speculative_hybrid_ragged DP tier agreement is not supported with "
+            f"disaggregation ({self.disaggregation_mode!r}) or pp_size="
+            f"{self.pp_size}: both change which ranks reach the per-step "
+            "all-gather."
+        )
+
+        assert not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get(), (
+            "speculative_hybrid_ragged DP tier agreement requires the scheduler "
+            "all-gather (SGLANG_SCHEDULER_SKIP_ALL_GATHER=0); with it skipped "
+            "is_extend_in_batch and can_run_dp_cuda_graph are local values and "
+            "the ranks can vote differently."
+        )
+
     def check_server_args(self):
         cfg = resolving_view(self)
 
@@ -10346,6 +10759,22 @@ class ServerArgs:
             assert (
                 not cfg.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+
+        # Checked OUTSIDE the hybrid gate below: --speculative-hybrid-ragged on
+        # its own would otherwise never reach a single check and silently do
+        # nothing, which only shows up as "the run saved no tokens" after a full
+        # experiment.
+        assert not (
+            self.speculative_hybrid_ragged and not self.speculative_hybrid_retrieval
+        ), (
+            "--speculative-hybrid-ragged only applies to the hybrid MTP+retrieval "
+            "verify chain; pass --speculative-hybrid-retrieval as well (without it "
+            "the flag would be silently ignored and the run would fall back to "
+            "plain fixed-width EAGLE)."
+        )
+
+        if self.speculative_hybrid_retrieval:
+            self.check_hybrid_retrieval_server_args()
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

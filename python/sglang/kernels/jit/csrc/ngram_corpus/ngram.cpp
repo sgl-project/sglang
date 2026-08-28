@@ -144,9 +144,14 @@ void Ngram::insertWorker() {
 Result Ngram::batchMatch(
     const std::vector<int64_t>& state_ids,
     const std::vector<std::vector<int32_t>>& tokens,
-    const std::vector<size_t>& total_lens) {
+    const std::vector<size_t>& total_lens,
+    std::vector<int32_t>* valid_lens) {
   if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
     throw std::runtime_error("batchMatch expects state_ids, tokens, and total_lens to match in size");
+  }
+  if (valid_lens != nullptr) {
+    valid_lens->clear();
+    valid_lens->reserve(state_ids.size());
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
@@ -188,6 +193,9 @@ Result Ngram::batchMatch(
           suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+      if (valid_lens != nullptr) {
+        valid_lens->emplace_back(res.num_valid);
+      }
       continue;
     }
 
@@ -202,6 +210,9 @@ Result Ngram::batchMatch(
 
     merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());
     merged.mask.insert(merged.mask.end(), combined.mask.begin(), combined.mask.end());
+    if (valid_lens != nullptr) {
+      valid_lens->emplace_back(combined.num_valid);
+    }
   }
   return merged;
 }

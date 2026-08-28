@@ -63,10 +63,16 @@ class Ngram {
 
   std::vector<std::pair<std::string, int64_t>> listExternalCorpora() const;
 
+  // `valid_lens`, when non-null, receives one entry per request: the number of
+  // REAL nodes that request's result carries (see Result::num_valid). The
+  // merged Result concatenates every request's padded block, so its own
+  // num_valid is meaningless -- this out-param is the only way to recover the
+  // per-request counts. Defaulted to nullptr so existing callers are unchanged.
   Result batchMatch(
       const std::vector<int64_t>& state_ids,
       const std::vector<std::vector<int32_t>>& tokens,
-      const std::vector<size_t>& total_lens);
+      const std::vector<size_t>& total_lens,
+      std::vector<int32_t>* valid_lens = nullptr);
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 

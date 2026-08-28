@@ -508,34 +508,83 @@ def eagle_prepare_for_verify(
         ForwardBatch,
         ForwardMode,
     )
+    from sglang.srt.speculative.hybrid_ragged import build_hybrid_ragged_window
     from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
         bs = len(batch.req_pool_indices)
-        batch.input_ids = verify_input.draft_token
+        device = batch.device
+        layout = verify_input.ragged_verify_layout
+        if layout is None:
+            batch.input_ids = verify_input.draft_token
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
+        else:
+            # Ragged verify (hybrid retrieval): the forward runs on sum(w_r) compact
+            # rows. `verify_input.draft_token` / `.positions` stay the fixed
+            # [bs * L] stride -- eagle_sample reshapes draft_token into
+            # `candidates` AFTER the scatter seam, so compacting them here would
+            # break acceptance. Only the batch-level forward inputs change.
+            #
+            # Only w_r of the L pre-reserved KV slots are written. The remaining
+            # [seq_len + w_r, seq_len + L) slots keep stale contents, but they
+            # sit past new_seq_lens = seq_len + accept_len (accept_len <= w_r,
+            # enforced by cap_accept_to_verify_lens) so nothing ever reads them,
+            # and the next iteration re-allocates from the new seq_len.
+            #
+            # The compact cache map is scoped to THIS FORWARD ONLY. The fixed
+            # [bs * L] map is stashed on the verify input and put back by the
+            # scatter seam in run_eagle_verify, because draft-extend reuses
+            # whatever map verify leaves on the shared batch.
+            window = build_hybrid_ragged_window(
+                batch=batch,
+                layout=layout,
+                draft_token=verify_input.draft_token,
+                verify_width=verify_input.draft_token_num,
+                req_to_token=req_to_token_pool.req_to_token,
+                device=device,
+            )
+            #
+            # `positions` IS rebound, because ForwardBatch.init_new copies
+            # spec_info.positions straight into the forward and the compact rows
+            # need their own absolute positions. The fixed-stride positions that
+            # build_tree_kernel_efficient produced have no consumer past this
+            # point (only the overlap plan-stream refill reads them back, and
+            # ragged asserts overlap off).
+            batch.input_ids = window.verify_ids
+            batch.out_cache_loc = window.verify_cache_loc
+            verify_input.positions = window.positions
+            verify_input.ragged_fixed_cache_loc = window.fixed_cache_loc
         maybe_detect_oob(
             batch.input_ids,
             0,
             batch.model_config.vocab_size,
             "v2 prepare_for_verify input_ids",
         )
-        device = batch.device
-        # Uniform variant: end offsets (= start + draft_token_num) are computed
-        # inside the kernel, keeping the eager `seq_lens + N` add off the host
-        # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
-
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
-            batch, verify_input.draft_token_num
+            batch,
+            verify_input.draft_token_num,
+            verify_lens_cpu=(None if layout is None else layout.verify_lens_cpu),
         )
+        if layout is not None:
+            # Same story as out_cache_loc: build the fixed-width bundle too and
+            # let the seam restore it. The helper reads `batch.out_cache_loc` for
+            # its `out_full_loc`, so point it at the fixed map while building.
+            # (No-op on CUDA, where the helper returns None -- the DSV4 per-req
+            # compression tables are an NPU-only path.)
+            compact_loc = batch.out_cache_loc
+            batch.out_cache_loc = window.fixed_cache_loc
+            verify_input.ragged_fixed_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+                batch, verify_input.draft_token_num
+            )
+            batch.out_cache_loc = compact_loc
 
         prepare_mamba_track_for_verify(batch)
 
@@ -669,6 +718,7 @@ def eagle_sample(
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
+    from sglang.srt.speculative.hybrid_ragged import cap_accept_to_verify_lens
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -904,6 +954,32 @@ def eagle_sample(
             bs=bs,
             spec_steps=verify_input.max_tree_depth - 1,
         )
+
+    if verify_input.ragged_verify_layout is not None:
+        # Ragged verify: columns >= w_r hold no real candidate. Either they were
+        # never computed (the scatter seam filled them with `fill_value`) or --
+        # for the columns graph-tier padding added -- they were computed over the
+        # spliced chain's zero padding. Both are token 0 against a logits row
+        # whose argmax is also 0 on the fill path, and `0 == 0` chains acceptance
+        # all the way to L, so the failure mode is systematic rather than
+        # occasional. This is the one place a ragged forward could produce WRONG
+        # OUTPUT. Clamp correct_len to w_r - 1 (DSPARK's CapCorrectLen) against
+        # the ACCEPT widths, never the layout's padded forward widths, and drop
+        # the out-of-range accept_index entries.
+        accept_verify_lens = verify_input.ragged_accept_verify_lens
+        assert accept_verify_lens is not None or batch.forward_mode.is_idle(), (
+            "ragged verify carries a layout but no accept widths; the cutoff "
+            "would have to clamp against the tier-padded forward widths and could "
+            "accept a zero-padded column. Only an IDLE DP rank may carry a "
+            "layout without them -- it rides the agreed tier to enter the same "
+            "captured graph and has nothing to accept."
+        )
+        if accept_verify_lens is not None:
+            num_correct_drafts, accept_index = cap_accept_to_verify_lens(
+                num_correct_drafts=num_correct_drafts,
+                accept_index=accept_index,
+                verify_lens=accept_verify_lens,
+            )
 
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
