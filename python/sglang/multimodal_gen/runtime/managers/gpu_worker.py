@@ -70,6 +70,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     commit_residency_changes,
     component_current_device_weight_bytes,
     component_runtime_weight_bytes,
+    current_placement_reserve_shortfall_bytes,
     describe_error,
     estimate_allocator_headroom_bytes,
     estimate_candidate_latency_savings_ns,
@@ -218,11 +219,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
         self._auto_residency_applied: list[AppliedResidencyChange] = []
         self._auto_residency_round_sizes: list[int] = []
-        self._auto_residency_budget_correction_bytes = 0
         self._auto_residency_last_applied_plan: AutoResidencyPlan | None = None
-        # Keep every round on one serving objective. Re-warm measurements
-        # validate and refine memory constraints, but placement-dependent
-        # latency must not rewrite the utility function and cause oscillation.
+        # Keep the serving solve and its validation on one objective. The
+        # measured candidate layout may be accepted or rolled back, but does
+        # not rewrite utility and start another search.
         self._auto_residency_reference_request_duration_ns: int | None = None
         self._auto_residency_reference_stage_duration_ns: dict[str, int] = {}
         self._auto_residency_reference_component_stages: dict[str, tuple[str, ...]] = {}
@@ -1311,7 +1311,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._build_pre_warmup_auto_residency_report(workload=workload)
                 if pre_warmup
                 else self._build_auto_residency_report(
-                    workload=workload, records=records
+                    workload=workload,
+                    records=records,
+                    include_candidates=not validate_only,
                 )
             )
         except Exception as e:
@@ -1383,59 +1385,36 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     already_failed=False,
                     latest_round_only=True,
                 )
-        plan = plan_auto_residency(reports=reports)
-        if (
-            not pre_warmup
-            and self._auto_residency_round_sizes
-            and not recovering_from_oom
-            and plan.current_placement_reserve_shortfall_bytes > 0
-        ):
-            self._record_auto_residency_budget_correction(
-                plan.current_placement_reserve_shortfall_bytes
-            )
-            shortfall_gib = plan.current_placement_reserve_shortfall_bytes / GIB_BYTES
-            if self.is_output_rank:
-                logger.warning(
-                    "Auto residency calibration exceeded the VRAM reserve by "
-                    "%.1f GiB; rolling back the latest adjustment round.",
-                    shortfall_gib,
-                )
-            return self._rollback_everywhere(
-                cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
-                already_failed=False,
-                latest_round_only=True,
-                retryable=True,
-            )
         if validate_only:
+            shortfall_bytes = current_placement_reserve_shortfall_bytes(reports)
+            if shortfall_bytes > 0:
+                shortfall_gib = shortfall_bytes / GIB_BYTES
+                if self.is_output_rank:
+                    logger.warning(
+                        "Auto residency calibration exceeded the VRAM reserve by "
+                        "%.1f GiB; rolling back the latest adjustment round.",
+                        shortfall_gib,
+                    )
+                return self._rollback_everywhere(
+                    cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
+                    already_failed=False,
+                    latest_round_only=True,
+                )
+            plan = self._auto_residency_last_applied_plan
+            if plan is None:
+                return self._rollback_everywhere(
+                    cause="post-adjustment validation lost the selected plan",
+                    already_failed=False,
+                    latest_round_only=True,
+                )
             latest_round = self._latest_auto_residency_round()
             short_validation = (
                 self._latest_auto_residency_round_supports_short_validation()
             )
-            commit_modules = (
-                self._auto_residency_modules()
-                if any(
-                    change.previous_layerwise_resident_layers is not None
-                    for change in latest_round
-                )
-                else {}
-            )
-            commit_error = None
-            try:
-                commit_residency_changes(
-                    applied=latest_round,
-                    modules=commit_modules,
-                    server_args=self.server_args,
-                )
-            except Exception as e:
-                commit_error = describe_error(e)
-            commit_errors = self._auto_residency_all_gather(commit_error)
-            if any(error is not None for error in commit_errors):
-                raise RuntimeError(
-                    "post-validation residency commit failed: "
-                    + next(error for error in commit_errors if error is not None)
-                )
+            self._commit_auto_residency_changes(latest_round)
             self._auto_residency_applied = []
             self._auto_residency_round_sizes = []
+            self._auto_residency_last_applied_plan = None
             if self.is_output_rank:
                 reference_ns = local_report.estimated_request_duration_ns
                 measured_ns = local_report.measured_request_duration_ns
@@ -1460,6 +1439,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     plan=plan, status=PLACEMENT_STATUS_VALIDATED
                 )
             )
+        plan = plan_auto_residency(reports=reports)
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
@@ -1485,7 +1465,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 raise RuntimeError("placement plan applied no residency changes")
             self._auto_residency_applied.extend(newly_applied)
             self._auto_residency_round_sizes[-1] = len(newly_applied)
-            self._auto_residency_last_applied_plan = plan
         except AutoResidencyRollbackError as e:
             logger.error(
                 "Auto residency adjustment failed on rank %d and the rank "
@@ -1518,6 +1497,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._invalidate_component_strategies(
             [candidate.component_name for candidate in plan.changes]
         )
+        if pre_warmup:
+            self._commit_auto_residency_changes(self._latest_auto_residency_round())
+            self._auto_residency_applied = []
+            self._auto_residency_round_sizes = []
+            self._auto_residency_last_applied_plan = None
+        else:
+            self._auto_residency_last_applied_plan = plan
         if self.is_output_rank:
             logger.info("%s", summary)
             logger.info("%s", format_applied_changes(plan=plan))
@@ -1537,13 +1523,39 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             cause=None, already_failed=False, latest_round_only=True
         )
 
+    def _commit_auto_residency_changes(
+        self, changes: list[AppliedResidencyChange]
+    ) -> None:
+        modules = (
+            self._auto_residency_modules()
+            if any(
+                change.previous_layerwise_resident_layers is not None
+                for change in changes
+            )
+            else {}
+        )
+        commit_error = None
+        try:
+            commit_residency_changes(
+                applied=changes,
+                modules=modules,
+                server_args=self.server_args,
+            )
+        except Exception as error:
+            commit_error = describe_error(error)
+        commit_errors = self._auto_residency_all_gather(commit_error)
+        if any(error is not None for error in commit_errors):
+            raise RuntimeError(
+                "residency commit failed: "
+                + next(error for error in commit_errors if error is not None)
+            )
+
     def _rollback_everywhere(
         self,
         *,
         cause: str | None,
         already_failed: bool,
         latest_round_only: bool = False,
-        retryable: bool = False,
     ) -> OutputBatch:
         """Roll this rank back and gather the replica-wide outcome.
 
@@ -1580,10 +1592,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 error=(
                     f"auto residency adjustment failed; {restored} restored: {cause}"
                 ),
-                output={
-                    "status": PLACEMENT_STATUS_ROLLED_BACK,
-                    "retryable": retryable,
-                },
+                output={"status": PLACEMENT_STATUS_ROLLED_BACK},
             )
         if self.is_output_rank:
             if self._auto_residency_applied:
@@ -1598,30 +1607,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     "changes remain)."
                 )
         return OutputBatch(output={"status": PLACEMENT_STATUS_ROLLED_BACK})
-
-    def _record_auto_residency_budget_correction(self, shortfall_bytes: int) -> None:
-        """Exclude a layout whose calibrated peak exceeded its VRAM model."""
-        previous_plan = self._auto_residency_last_applied_plan
-        if previous_plan is None:
-            return
-        runtime_resources = [
-            resource_name
-            for resource_name in previous_plan.resource_budget_bytes
-            if resource_name.startswith("gpu:")
-            and not resource_name.endswith(":placement-transition")
-        ]
-        if not runtime_resources:
-            return
-        minimum_slack = min(
-            previous_plan.resource_budget_bytes[resource_name]
-            - previous_plan.resource_delta_bytes.get(resource_name, 0)
-            for resource_name in runtime_resources
-        )
-        correction = max(
-            shortfall_bytes,
-            max(0, minimum_slack) + 64 * 1024**2,
-        )
-        self._auto_residency_budget_correction_bytes += correction
 
     def _auto_residency_budget_bytes(self) -> int:
         # Free VRAM plus this process's reserved allocator pool excludes memory
@@ -1757,7 +1742,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
 
     def _build_auto_residency_report(
-        self, *, workload: DefaultWorkload, records: List[WarmupMemoryRecord]
+        self,
+        *,
+        workload: DefaultWorkload,
+        records: List[WarmupMemoryRecord],
+        include_candidates: bool = True,
     ) -> RankResidencyReport:
         skip_reason = None
         if self.pipeline is None:
@@ -1818,7 +1807,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 component_weight_bytes=runtime_weights_by_component,
             )
         budget_bytes = self._auto_residency_budget_bytes()
-        candidates = self._collect_auto_residency_targets(workload)
+        candidates = (
+            self._collect_auto_residency_targets(workload) if include_candidates else []
+        )
         if warmup_oom:
             dit_candidate_deltas: dict[str, list[tuple[int, int, int]]] = {}
             for candidate in candidates:
@@ -1890,17 +1881,21 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         estimated_request_duration_ns = (
             reference_request_duration_ns or measured_request_duration_ns
         )
-        candidate_latency_savings_ns = estimate_candidate_latency_savings_ns(
-            candidates=candidates,
-            request_duration_ns=estimated_request_duration_ns,
-            stage_duration_ns=(
-                self._auto_residency_reference_stage_duration_ns
-                or measured_stage_duration_ns
-            ),
-            component_stages=(
-                self._auto_residency_reference_component_stages
-                or measured_component_stages
-            ),
+        candidate_latency_savings_ns = (
+            estimate_candidate_latency_savings_ns(
+                candidates=candidates,
+                request_duration_ns=estimated_request_duration_ns,
+                stage_duration_ns=(
+                    self._auto_residency_reference_stage_duration_ns
+                    or measured_stage_duration_ns
+                ),
+                component_stages=(
+                    self._auto_residency_reference_component_stages
+                    or measured_component_stages
+                ),
+            )
+            if include_candidates
+            else {}
         )
         local_worker_count = max(
             1, self.server_args.num_gpus // self.server_args.nnodes
@@ -1910,9 +1905,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             rank=self.rank,
             budget_bytes=budget_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
-            planning_headroom_correction_bytes=(
-                self._auto_residency_budget_correction_bytes + allocator_headroom_bytes
-            ),
+            planning_headroom_correction_bytes=allocator_headroom_bytes,
             target_workload_measured=any(
                 record.succeeded and record.workload_units() >= target_units
                 for record in records
@@ -1926,21 +1919,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             current_device_weight_bytes_by_component=(
                 component_current_device_weight_bytes(modules)
+                if include_candidates
+                else {}
             ),
             current_active_weight_bytes_by_component=runtime_weights_by_component,
             node_rank=self.server_args.node_rank,
-            pinned_host_bytes=layerwise_pinned_host_bytes(
-                modules, pin_budget=pin_budget
+            pinned_host_bytes=(
+                layerwise_pinned_host_bytes(modules, pin_budget=pin_budget)
+                if include_candidates
+                else 0
             ),
-            host_pin_capacity_bytes=layerwise_host_pin_capacity_bytes(
-                modules, pin_budget=pin_budget
+            host_pin_capacity_bytes=(
+                layerwise_host_pin_capacity_bytes(modules, pin_budget=pin_budget)
+                if include_candidates
+                else 0
             ),
-            host_transition_headroom_bytes=max(
-                0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
-            )
-            // local_worker_count,
-            device_transition_allocated_bytes=int(
-                torch.get_device_module().memory_allocated()
+            host_transition_headroom_bytes=(
+                max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
+                // local_worker_count
+                if include_candidates
+                else 0
+            ),
+            device_transition_allocated_bytes=(
+                int(torch.get_device_module().memory_allocated())
+                if include_candidates
+                else 0
             ),
             estimated_request_duration_ns=estimated_request_duration_ns,
             measured_request_duration_ns=measured_request_duration_ns,
@@ -2048,6 +2051,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         else:
             self._auto_residency_applied = []
             self._auto_residency_round_sizes = []
+        self._auto_residency_last_applied_plan = None
         return None
 
     @staticmethod

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Choose a reversible residency seed before component loading."""
+"""Choose a replaceable residency seed before component loading."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ def maybe_seed_initial_residency(
     *,
     excluded_components: frozenset[str] = frozenset(),
 ) -> None:
-    """Apply a reversible resident seed for warmup-calibrated auto mode."""
+    """Apply a replaceable resident seed for warmup-calibrated auto mode."""
     if (
         auto_residency_static_skip_reason(server_args) is not None
         or server_args.use_fsdp_inference
