@@ -75,10 +75,9 @@ if TYPE_CHECKING:
 def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
+    # TODO(Jialin): Support cache_salt with Rust after porting #30827.
     if key.cache_salt is not None:
-        raise ValueError(
-            "cache_salt is not supported by the experimental Rust unified tree core"
-        )
+        raise ValueError("cache_salt is not supported by the Rust TreeCore")
     token_ids = key.raw_token_ids()
     assert (
         isinstance(token_ids, array) and token_ids.typecode == "q"
@@ -283,6 +282,29 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
 
+        # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
+        if params.enable_session_radix_cache:
+            raise ValueError(
+                "--enable-session-radix-cache is not supported by the Rust TreeCore"
+            )
+
+        # TODO(Jialin): Port custom component registration from #25754 and
+        # C128 support from #33676.
+        unsupported_components = set(self.tree_components) - {
+            ComponentType.FULL,
+            ComponentType.SWA,
+            ComponentType.MAMBA,
+        }
+        if unsupported_components:
+            names = ", ".join(
+                sorted(component.name for component in unsupported_components)
+            )
+            raise ValueError(f"Rust TreeCore does not support components: {names}")
+        if params.component_registry_override:
+            raise ValueError(
+                "Rust TreeCore does not support component_registry_override"
+            )
+
         self._page_size = params.page_size
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
@@ -355,6 +377,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
+        # TODO(Jialin): Move the remaining Python-node consumers to
+        # backend-neutral APIs: sessions (#29173), C128 (#33676), buffer-only
+        # HiCache (#34798/#35769), DFS-weight (#2571/#29901), and PD decode
+        # HiCache (#26227/#29901).
         raise NotImplementedError("node_by_id: not yet ported to the Rust tree core")
 
     @property

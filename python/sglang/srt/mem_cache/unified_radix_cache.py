@@ -191,8 +191,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
+        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
         self.tree_core = create_tree_core(
-            name=envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(),
+            name=self._tree_core_backend,
             params=params,
             components=self.components,
         )
@@ -369,6 +370,14 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
+            # TODO(Jialin): Support buffer_only with Rust after #34798 and
+            # #35769 are ported.
+            if self._tree_core_backend == "rust":
+                raise ValueError(
+                    "--hicache-host-memory-mode buffer_only is not supported "
+                    "by the Rust TreeCore"
+                )
+
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
             # the admission-time load-back read path and is not layer-gated.
             # Lifting the fence also needs the admission charge: a staged

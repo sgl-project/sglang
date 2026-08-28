@@ -54,7 +54,10 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_tokenizer_batching,
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
-from sglang.srt.arg_groups.validation_hook import check_two_batch_overlap
+from sglang.srt.arg_groups.validation_hook import (
+    check_server_args,
+    check_two_batch_overlap,
+)
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -787,6 +790,18 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "mooncake",
         )
 
+    def test_pd_decode_hicache_rejects_rust_tree_core(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            with self.assertRaisesRegex(ValueError, "PD decode HiCache"):
+                handle_pd_disaggregation(server_args)
+
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
@@ -1478,6 +1493,30 @@ class TestHiCacheArgs(unittest.TestCase):
                 resolution_result(args, "decode_attention_backend"),
                 expected_decode_backend,
             )
+
+    def test_buffer_only_rejects_rust_tree_core(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_host_memory_mode="buffer_only",
+            hicache_storage_backend="file",
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            with self.assertRaisesRegex(ValueError, "buffer_only is not supported"):
+                handle_hicache(args)
+
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_host_memory_mode="buffer_only",
+            hicache_storage_backend="file",
+        )
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+            handle_hicache(args)
+
+    def test_dfs_weight_rejects_rust_tree_core(self):
+        args = self._make_args(schedule_policy="dfs-weight")
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+            with self.assertRaisesRegex(ValueError, "schedule-policy dfs-weight"):
+                check_server_args(args)
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [

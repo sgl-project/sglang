@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_hip, is_npu, torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
@@ -24,6 +25,17 @@ def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
     cfg = resolving_view(server_args)
+
+    # TODO(Jialin): Port DFS-weight traversal from #2571/#29901 to
+    # backend-neutral TreeCore APIs.
+    if (
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() == "rust"
+        and cfg.schedule_policy == "dfs-weight"
+    ):
+        raise ValueError(
+            "--schedule-policy dfs-weight is not supported with "
+            "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust"
+        )
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

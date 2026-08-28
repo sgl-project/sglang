@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+    # TODO(Jialin): Port PD decode HiCache from #26227/#29901 to
+    # backend-neutral TreeCore APIs.
+    if (
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() == "rust"
+        and cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.enable_hierarchical_cache
+    ):
+        raise ValueError(
+            "PD decode HiCache is not supported with "
+            "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust"
+        )
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.

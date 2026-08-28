@@ -110,6 +110,13 @@ def _selected_tree_core_test_backend() -> str:
     return _TREE_CORE_TEST_BACKEND or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
 
 
+def _session_radix_cache_test_values() -> tuple[bool, ...]:
+    # TODO(Jialin): Restore the session-enabled case after porting #29173 to Rust.
+    if _selected_tree_core_test_backend() == "rust":
+        return (False,)
+    return False, True
+
+
 @dataclass(frozen=True)
 class CacheConfig:
     # Tree
@@ -760,7 +767,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
 
     def test_allocation_target_stops_after_one_internal_tombstone(self):
         for component_type in (ComponentType.SWA, ComponentType.MAMBA):
-            for enable_session_radix_cache in (False, True):
+            for enable_session_radix_cache in _session_radix_cache_test_values():
                 with self.subTest(
                     component_type=component_type,
                     enable_session_radix_cache=enable_session_radix_cache,
@@ -790,7 +797,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
 
     def test_explicit_evict_continues_across_internal_steps(self):
         for component_type in (ComponentType.SWA, ComponentType.MAMBA):
-            for enable_session_radix_cache in (False, True):
+            for enable_session_radix_cache in _session_radix_cache_test_values():
                 with self.subTest(
                     component_type=component_type,
                     enable_session_radix_cache=enable_session_radix_cache,
