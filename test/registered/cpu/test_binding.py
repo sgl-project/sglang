@@ -38,7 +38,7 @@ class TestInitThreadsBinding(unittest.TestCase):
 
     @patch(
         "sglang.srt.utils.numa_utils.get_cpu_ids_by_node",
-        return_value=["0,1,2,3", "4,5,6,7", "8,9,10,11", "12,13,14,15"],
+        return_value=(0, ["0,1,2,3", "4,5,6,7", "8,9,10,11", "12,13,14,15"]),
     )
     @patch.dict(os.environ, {"SGLANG_CPU_OMP_THREADS_BIND": "all"})
     def test_dp_ranks_get_distinct_numa_nodes(self, _mock_nodes):
@@ -48,7 +48,7 @@ class TestInitThreadsBinding(unittest.TestCase):
 
     @patch(
         "sglang.srt.utils.numa_utils.get_cpu_ids_by_node",
-        return_value=["0,1,2,3", "4,5,6,7"],
+        return_value=(0, ["0,1,2,3", "4,5,6,7"]),
     )
     @patch.dict(os.environ, {"SGLANG_CPU_OMP_THREADS_BIND": "0-1|4-5"})
     def test_explicit_bind_list_indexed_by_numa_index(self, _mock_nodes):
@@ -57,7 +57,7 @@ class TestInitThreadsBinding(unittest.TestCase):
 
     @patch(
         "sglang.srt.utils.numa_utils.get_cpu_ids_by_node",
-        return_value=["0,1", "2,3", "4,5"],
+        return_value=(0, ["0,1", "2,3", "4,5"]),
     )
     @patch.dict(os.environ, {"SGLANG_CPU_OMP_THREADS_BIND": "0-1|2-3|4-5"})
     def test_router_worker_uses_global_numa_index(self, _mock_nodes):
