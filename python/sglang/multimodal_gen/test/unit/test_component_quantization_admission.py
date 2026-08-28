@@ -165,6 +165,32 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
 
         load_weights.assert_not_called()
 
+    def test_upsampler_uses_exact_component_weight_override(self):
+        server_args = SimpleNamespace(
+            component_weights_paths={"spatial_upsampler": "owner/repo/upsampler"}
+        )
+        with (
+            patch.object(
+                UpsamplerLoader,
+                "resolve_component_weights_path",
+                return_value="/cache/upsampler.safetensors",
+            ) as resolve_weights,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "upsampler_loader._find_safetensors_file",
+                side_effect=RuntimeError("stop after routing"),
+            ) as find_weights,
+            self.assertRaisesRegex(RuntimeError, "stop after routing"),
+        ):
+            UpsamplerLoader().load_customized(
+                "/base/spatial_upsampler", server_args, "spatial_upsampler"
+            )
+
+        resolve_weights.assert_called_once_with(
+            "/base/spatial_upsampler", server_args, "spatial_upsampler"
+        )
+        find_weights.assert_called_once_with("/cache/upsampler.safetensors")
+
 
 if __name__ == "__main__":
     unittest.main()

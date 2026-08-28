@@ -204,7 +204,10 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
         server_args: ServerArgs,
         component_name: str,
     ):
-        safetensors_path = _find_safetensors_file(component_model_path)
+        component_weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
+        safetensors_path = _find_safetensors_file(component_weights_path)
         raw_config = _load_explicit_config(safetensors_path, component_model_path)
         if raw_config is not None:
             self.ensure_plain_state_dict_checkpoint(raw_config, component_name)
