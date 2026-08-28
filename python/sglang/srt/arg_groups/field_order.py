@@ -360,6 +360,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_linear_replayssm_spec",
     "enable_hierarchical_cache",
     "hicache_host_memory_mode",
+    "enable_mla_hicache_host_dedup",
     "hicache_ratio",
     "hicache_size",
     "hicache_write_policy",
