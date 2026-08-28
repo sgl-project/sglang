@@ -35,7 +35,7 @@ These hold for every step below.
 - **ASCII only in C++ and CUDA sources.** Write `--`, `->`, `<=` instead of `—`, `→`, `≤`, including in comments. `grep -nP '[^\x00-\x7F]' <file>` before committing.
 - **`namespace details` is private.** Anything inside one is an implementation detail of its own header, free to change without notice. Do not name `details::` from another module, and never `using namespace details`. If you find yourself wanting something in there, that is the signal to promote it to a documented name instead.
 - **`const T* __restrict__` for read-only pointers.** This is what `csrc/` does throughout, and it lets the compiler emit non-coherent (`LDG`) loads.
-- **Watch the register budget.** For memory-bound kernels, keep to roughly 64 registers per thread so occupancy does not become the limit. Build once with `extra_cuda_cflags=["-Xptxas", "-v"]` to see the actual count, and prefer recomputing a value over letting it spill.
+- **Watch the register budget.** For memory-bound kernels, keep to roughly 64 registers per thread so occupancy does not become the limit; prefer recomputing a value over letting it spill. Run `SGLANG_JIT_LOG_RESOURCE_USAGE=1 SGLANG_JIT_FORCE_RECOMPILE=1` to log per-kernel registers, spills and shared memory at INFO. Both halves are load-bearing: a cache hit has no compiler output to report, and passing `-Xptxas -v` by hand does nothing on its own because the build captures compiler output and replays it only on failure.
 - **Alignment is a contract you enforce, not a property you hope for.** A vectorized copy derives its access width from the row *size* (`load_bytes` picks 16B for a 1024B row), but the address it lands on is `base + index * row_stride` — and a stride is not constrained by the size. `TensorMatcher` admits any stride unless you say otherwise, so a padded cache row silently produces `misaligned address`. Every kernel that vectorizes is highly recommended to end its validation with `.ensure_alignment(w)`, where `w` is the width the kernel actually uses.
 
 ---
@@ -622,7 +622,7 @@ Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/j
   - `graph_clone_args` / `graph_clone_kwargs`: which inputs to clone per CUDA-graph iteration to defeat L2 cache reuse. Defaults to `"all"` — pass an iterable of indices/keys to limit to the *read* args (writes don't need cloning).
   - `use_cuda_graph=False` for kernels that can't be captured.
   - `metrics=(0.5, "avg")` controls reported quantiles (the first metric becomes the table latency column).
-  - `disable_log_bandwidth` (defaults from `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1`) skips the bandwidth column entirely.
+  - `disable_log_bandwidth` (defaults from `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH=1`) skips the bandwidth column entirely.
 - **`utils.create_random(*shape)` / `utils.create_empty(*shape)`** — shorthand for `torch.randn` / `torch.empty` with `DEFAULT_DTYPE` (`bfloat16`) and `DEFAULT_DEVICE` (`"cuda"`). Override via the `dtype=` / `device=` kwargs.
 - **`utils.get_benchmark_range(full_range, ci_range)`** — returns the smaller `ci_range` under CI (`is_in_ci()`), the `full_range` locally. Still available for the `benchmark(...)` column axis (which has no `ci_vals`); for `parametrize` row axes prefer the built-in `ci_vals` argument.
 
@@ -676,7 +676,7 @@ if __name__ == "__main__":
 - The `line_arg` name passed to `benchmark` (`"impl"` here) must match a parameter on `benchmark(...)`; same for every `parametrize` name (`"size"`).
 - Stack `@parametrize` once per swept axis. The required `@marker.benchmark` is the **innermost** decorator (bottom of the stack, directly above the function) — `@parametrize` rows go above it.
 - Prefer `create_random` / `create_empty` from `utils.py` over open-coding `torch.randn(..., dtype=..., device=...)`.
-- The GB/s column appears by default (`memory_args="all"` + `memory_output="out"`). For memory-bound kernels it's the most informative number; scope `memory_args` / `memory_output` to the tensors actually touched if the defaults over- or under-count. For compute-bound kernels where bandwidth is misleading, set `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH=1` (or `disable_log_bandwidth=True`).
+- The GB/s column appears by default (`memory_args="all"` + `memory_output="out"`). For memory-bound kernels it's the most informative number; scope `memory_args` / `memory_output` to the tensors actually touched if the defaults over- or under-count. For compute-bound kernels where bandwidth is misleading, set `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH=1` (or `disable_log_bandwidth=True`).
 - For in-place kernels (which return `None`), pass the written tensors via `memory_output=(...)` since the `"out"` default would capture nothing.
 - Tune `graph_clone_args` / `graph_clone_kwargs` to all the arguments that might be read by the kernel. We can only skip cloning for write-only args. For in-place modified args, we still need to clone them to get accurate timing (reusing the same buffer keeps it L2-hot and skews results).
 - Call `benchmark.run()` (no `print_data=` kwarg — the marker framework prints directly).
@@ -701,7 +701,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/kernels/jit/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `marker.do_bench` uses CUDA-graph-based timing by default; set `use_cuda_graph=False` only if the kernel can't be captured. `graph_clone_args` defaults to `"all"`; if you narrow it, it must still cover every *read* tensor — reusing a single buffer keeps it L2-hot and skews results. Keep *write* tensors in it too: they are what sets the rotation count, and a shared output buffer stays L2-hot the same way.
-- **Missing GB/s column**: the column is on by default; check that `SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
+- **Missing GB/s column**: the column is on by default; check that `SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH` is not `1` and `disable_log_bandwidth` is not `True`. For in-place kernels (return `None`) the `memory_output="out"` default counts nothing — pass the written tensors via `memory_output=(...)`
 
 ---
 

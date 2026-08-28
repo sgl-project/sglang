@@ -3,7 +3,6 @@ import contextlib
 import inspect
 import itertools
 import math
-import os
 from typing import (
     Any,
     Callable,
@@ -23,6 +22,7 @@ from typing import (
 import torch
 
 from sglang.kernels.jit.utils import cache_once
+from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., "BenchResult"])
@@ -30,8 +30,8 @@ Metric: TypeAlias = "float | Literal['avg']"
 BENCH_CONFIG: TypeAlias = "List[Tuple[Tuple[str, ...], List[Tuple[Any, ...]]]]"
 UNIT_SCALE = {"us": 1e-6, "ms": 1e-3, "s": 1.0}
 TYPE_LIST = (bool, int, float, str, torch.dtype, torch.device, None.__class__)
-DISABLE_LOG_BANDWIDTH = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_BANDWIDTH") == "1"
-DISABLE_LOG_FLOPS = os.environ.get("SGLANG_KERNEL_DISABLE_LOG_FLOPS") == "1"
+DISABLE_LOG_BANDWIDTH = envs.SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH.get()
+DISABLE_LOG_FLOPS = envs.SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS.get()
 PATTERN: TypeAlias = "Literal['pow2']"
 
 __all__ = [
@@ -42,6 +42,7 @@ __all__ = [
     "parametrize",
     "do_bench",
     "skip",
+    "range",
 ]
 
 
