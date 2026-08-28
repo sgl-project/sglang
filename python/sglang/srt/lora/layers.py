@@ -490,8 +490,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if getattr(self, "_grouped_output_dim", None) != group_output_dim:
             is_capturing = (
-                self.output_offset.is_cuda
-                and torch.cuda.is_current_stream_capturing()
+                self.output_offset.is_cuda and torch.cuda.is_current_stream_capturing()
             )
             if is_capturing:
                 raise RuntimeError(
@@ -569,8 +568,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             group_output_dim,
             lora_rank,
         ).reshape(num_adapters * num_groups, group_output_dim, lora_rank)
-        group_output_offset, group_output_offset_cpu = (
-            self._get_grouped_output_offsets(group_output_dim)
+        group_output_offset, group_output_offset_cpu = self._get_grouped_output_offsets(
+            group_output_dim
         )
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,

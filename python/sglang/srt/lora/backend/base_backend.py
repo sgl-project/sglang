@@ -93,8 +93,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         source = self._get_sgemm_batch_info()
         is_capturing = (
-            source.seg_indptr.is_cuda
-            and torch.cuda.is_current_stream_capturing()
+            source.seg_indptr.is_cuda and torch.cuda.is_current_stream_capturing()
         )
         if getattr(self, "_grouped_sgemm_capture_state", False) != is_capturing:
             # Full CUDA-graph capture invokes the model for eager warmup before
@@ -162,8 +161,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         b_info = dataclasses.replace(
             source,
             weight_indices=(
-                source_weight_indices.unsqueeze(0) * num_groups
-                + group_ids.unsqueeze(1)
+                source_weight_indices.unsqueeze(0) * num_groups + group_ids.unsqueeze(1)
             ).reshape(-1),
             lora_ranks=source.lora_ranks.repeat_interleave(num_groups),
             scalings=source.scalings.repeat_interleave(num_groups),
