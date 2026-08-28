@@ -28,6 +28,9 @@ def _view_with_pointer_mod(
 
 def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
     kernel = object.__new__(FlashInferGDNKernel)
+    # Match the SM100 path used by the CPU-only fake prefill tests. Real
+    # instances initialize this from the detected SM architecture in __init__.
+    kernel._prefill_needs_fp32_state = False
     kernel._aligned_input_buffers = {}
     kernel._aligned_parameter_cache = {}
     kernel._verify_intermediate_buffers = {}
