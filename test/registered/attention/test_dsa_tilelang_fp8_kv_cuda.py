@@ -15,13 +15,16 @@ fail when the path is broken:
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+
 tilelang_kernel = pytest.importorskip(
     "sglang.kernels.ops.attention.dsa.tilelang_kernel"
 )
 
 requires_fp8_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() < (8, 9),
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
     reason="needs CUDA SM89+ for fp8 tensor-core MMA",
 )
 
@@ -83,12 +86,8 @@ def test_fp8_spread_within_budget_and_negative_control_fails():
     assert rel < 0.04, f"spread-case rel err {rel:.5f} exceeds fp8-prob budget"
 
     idx_bad = idx.clone()
-    idx_bad[:, :, : TOPK // 2] = idx[:, :, TOPK // 2 : TOPK].flip(-1)[
-        :, :, : TOPK // 2
-    ]
-    out_bad = tilelang_kernel.tilelang_sparse_fwd(
-        q, kv_fp8, idx_bad, SM_SCALE, d_v=DV
-    )
+    idx_bad[:, :, : TOPK // 2] = idx[:, :, TOPK // 2 : TOPK].flip(-1)[:, :, : TOPK // 2]
+    out_bad = tilelang_kernel.tilelang_sparse_fwd(q, kv_fp8, idx_bad, SM_SCALE, d_v=DV)
     torch.cuda.synchronize()
     rel_bad = _rel_err(out_bad.reshape(S, H, DV), ref)
     assert rel_bad > 0.04, (
