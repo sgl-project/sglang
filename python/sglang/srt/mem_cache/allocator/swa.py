@@ -96,10 +96,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.need_sort = need_sort
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
+        self.free_group = None
         self.swa_free_group = []
-        self.free_segments_group = []
+        self.free_segments_group = None
         self.swa_free_segments_group = []
 
         self._kvcache = kvcache
@@ -324,7 +323,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             self.full_attn_allocator.free(free_index)
             self._free_swa_legacy(free_index)
         else:
@@ -448,7 +447,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.page_size == 1:
             self.free_swa(free_index)
             return
-        if not self.is_not_in_free_group:
+        if self.free_group is not None:
             self.swa_free_segments_group.append(
                 (self._copy_for_free_group(free_index), start_pos)
             )
@@ -472,7 +471,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
-        if not self.is_not_in_free_group:
+        if self.free_group is not None:
             # Resolve ownership now. A cache action later in this group may
             # install a new mapping for the same full index.
             self.swa_free_group.append(swa_indices)
@@ -486,12 +485,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_free_segments_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self.free(torch.cat(pending))
 
-        segment_groups = self.free_segments_group
-        self.free_segments_group = []
+        segment_groups, self.free_segments_group = self.free_segments_group, None
         for segments, swa_evicted_seqlen in segment_groups:
             if swa_evicted_seqlen is None:
                 self.free_segments(segments)
@@ -536,10 +534,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
-        self.is_not_in_free_group = True
-        self.free_group = []
+        self.free_group = None
         self.swa_free_group = []
-        self.free_segments_group = []
+        self.free_segments_group = None
         self.swa_free_segments_group = []
 
     def get_cpu_copy(self, indices, mamba_indices=None):
@@ -590,9 +587,8 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.free_segments_group = []
+        self.free_group = None
+        self.free_segments_group = None
 
         self._kvcache = kvcache
         self.swa_attn_allocator.clear()
@@ -636,7 +632,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
@@ -645,11 +641,13 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        if self.is_not_in_free_group:
+        if self.free_group is None:
             self.swa_attn_allocator.free(free_index[free_index > 0])
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
+    # Not inherited: the SWA parent's hooks drive swa_free_group,
+    # which this pure-SWA variant does not have.
     def free_group_begin(self):
         BaseTokenToKVPoolAllocator.free_group_begin(self)
 
@@ -658,6 +656,5 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def clear(self):
         self.swa_attn_allocator.clear()
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.free_segments_group = []
+        self.free_group = None
+        self.free_segments_group = None

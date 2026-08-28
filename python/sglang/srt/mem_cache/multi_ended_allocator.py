@@ -288,8 +288,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.free_virtual_ids = None
-        self.is_not_in_free_group = True
-        self.free_group: List[torch.Tensor] = []
+        self.free_group = None
         self._inverse_history.clear()
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self._pending_reuse.clear()
@@ -980,7 +979,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
-            if not self.is_not_in_free_group:
+            if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
             if self.lazy_compaction:
@@ -1703,19 +1702,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"Caller: {callers}."
         )
 
-    # -- free-group --
-
-    def free_group_begin(self) -> None:
-        self.is_not_in_free_group = False
-        self.free_group = []
-
-    def free_group_end(self) -> None:
-        self.is_not_in_free_group = True
-        if self.free_group:
-            merged = torch.cat(self.free_group)
-            self.free_group = []
-            self.free(merged)
-
 
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair.
@@ -1786,8 +1772,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # pure PHYSICAL store. The full-attn KV pool needs no allocator either —
         # write locations are resolved in the attention metadata.
 
-        self.is_not_in_free_group = True
-        self.free_group: List[torch.Tensor] = []
+        self.free_group = None
         # Base init left these None; we use watermark math, not free-lists.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -1970,7 +1955,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         with record_function("UnifiedMambaAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
-            if not self.is_not_in_free_group:
+            if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
             self.full_attn_allocator.free(free_index)
@@ -1978,30 +1963,16 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.clear_inverse_history()
 
     def free_group_begin(self) -> None:
-        self.is_not_in_free_group = False
-        self.free_group = []
-        self.free_segments_group = []
+        BaseTokenToKVPoolAllocator.free_group_begin(self)
 
     def free_group_end(self) -> None:
-        self.is_not_in_free_group = True
-        if self.free_group:
-            merged = torch.cat(self.free_group)
-            self.free_group = []
-            self.full_attn_allocator.free(merged)
-            self.full_attn_allocator.clear_inverse_history()
-            self.mamba_allocator.clear_inverse_history()
-        if self.free_segments_group:
-            segment_groups = self.free_segments_group
-            self.free_segments_group = []
-            for segments, swa_evicted_seqlen in segment_groups:
-                self.free_segments(segments, swa_evicted_seqlen=swa_evicted_seqlen)
+        BaseTokenToKVPoolAllocator.free_group_end(self)
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.free_segments_group = []
+        self.free_group = None
+        self.free_segments_group = None
 
     # -- Lazy compaction hooks --
 
@@ -2138,8 +2109,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             swa_allocator=self.swa_attn_allocator,
         )
 
-        self.is_not_in_free_group = True
-        self.free_group: List[torch.Tensor] = []
+        self.free_group = None
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -2446,7 +2416,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         with record_function("UnifiedSWAAlloc.free"):
             if free_index is None or free_index.numel() == 0:
                 return
-            if not self.is_not_in_free_group:
+            if self.free_group is not None:
                 self.free_group.append(self._copy_for_free_group(free_index))
                 return
             # Free both peers; the per-sub-pool v2p IS the mapping, so order isn't
@@ -2522,28 +2492,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- free-group --
 
     def free_group_begin(self) -> None:
-        self.is_not_in_free_group = False
-        self.free_group = []
-        self.free_segments_group = []
+        BaseTokenToKVPoolAllocator.free_group_begin(self)
 
     def free_group_end(self) -> None:
-        self.is_not_in_free_group = True
-        if self.free_group:
-            merged = torch.cat(self.free_group)
-            self.free_group = []
-            self.free(merged)
-        if self.free_segments_group:
-            segment_groups = self.free_segments_group
-            self.free_segments_group = []
-            for segments, swa_evicted_seqlen in segment_groups:
-                self.free_segments(segments, swa_evicted_seqlen=swa_evicted_seqlen)
+        BaseTokenToKVPoolAllocator.free_group_end(self)
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.free_segments_group = []
+        self.free_group = None
+        self.free_segments_group = None
 
     # -- Lazy compaction hooks --
 

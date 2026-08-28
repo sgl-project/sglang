@@ -246,10 +246,9 @@ class TestSWADenseSegmentRelease(unittest.TestCase):
         alloc.full_to_swa_index_mapping = torch.zeros(
             NUM_PAGES * PAGE_SIZE + PAGE_SIZE + 1, dtype=torch.int64
         )
-        alloc.is_not_in_free_group = True
-        alloc.free_group = []
+        alloc.free_group = None
         alloc.swa_free_group = []
-        alloc.free_segments_group = []
+        alloc.free_segments_group = None
         alloc.swa_free_segments_group = []
         return alloc
 
@@ -342,9 +341,8 @@ class TestUnifiedCompositeSegmentGroups(unittest.TestCase):
     def test_mamba_group_drains_deferred_segments(self):
         alloc = object.__new__(UnifiedMambaTokenToKVPoolAllocator)
         alloc.page_size = 1
-        alloc.is_not_in_free_group = True
-        alloc.free_group = []
-        alloc.free_segments_group = []
+        alloc.free_group = None
+        alloc.free_segments_group = None
         alloc.full_attn_allocator = _RecordingSubAllocator()
         alloc.mamba_allocator = _RecordingSubAllocator()
 
@@ -359,14 +357,13 @@ class TestUnifiedCompositeSegmentGroups(unittest.TestCase):
 
         self.assertEqual(len(alloc.full_attn_allocator.freed), 1)
         self.assertTrue(torch.equal(alloc.full_attn_allocator.freed[0], expected))
-        self.assertEqual(alloc.free_segments_group, [])
+        self.assertIsNone(alloc.free_segments_group)
 
     def test_shared_swa_group_drains_each_request_segment_set(self):
         alloc = object.__new__(UnifiedSWATokenToKVPoolAllocator)
         alloc.page_size = PAGE_SIZE
-        alloc.is_not_in_free_group = True
-        alloc.free_group = []
-        alloc.free_segments_group = []
+        alloc.free_group = None
+        alloc.free_segments_group = None
 
         first = torch.arange(4, 8, dtype=torch.int64)
         second = torch.arange(12, 16, dtype=torch.int64)
@@ -380,7 +377,7 @@ class TestUnifiedCompositeSegmentGroups(unittest.TestCase):
             alloc.free_group_end()
 
         self.assertEqual(free_impl.call_count, 2)
-        self.assertEqual(alloc.free_segments_group, [])
+        self.assertIsNone(alloc.free_segments_group)
 
 
 if __name__ == "__main__":

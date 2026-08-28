@@ -44,9 +44,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         self.free_pages = None
         self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.free_segments_group = []
+        # None: free right away. A list: hold frees until free_group_end().
+        self.free_group: list[torch.Tensor] | None = None
+        self.free_segments_group: list[tuple[list, int | None]] | None = None
 
     @property
     def size_full(self):
@@ -62,19 +62,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def free_group_begin(self):
-        self.is_not_in_free_group = False
         self.free_group = []
         self.free_segments_group = []
 
     def free_group_end(self):
-        self.is_not_in_free_group = True
-        if self.free_group:
-            free_group = self.free_group
-            self.free_group = []
-            self.free(torch.cat(free_group))
-        if self.free_segments_group:
-            segment_groups = self.free_segments_group
-            self.free_segments_group = []
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self.free(torch.cat(pending))
+        segment_groups, self.free_segments_group = self.free_segments_group, None
+        if segment_groups:
             for segments, swa_evicted_seqlen in segment_groups:
                 self.free_segments(segments, swa_evicted_seqlen=swa_evicted_seqlen)
 
@@ -164,7 +160,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         ]
         if not segments:
             return
-        if not self.is_not_in_free_group:
+        if self.free_segments_group is not None:
             self.free_segments_group.append(
                 (
                     [
