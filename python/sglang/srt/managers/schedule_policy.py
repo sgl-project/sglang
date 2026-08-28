@@ -656,10 +656,6 @@ class PrefillAdder:
         self.dllm_block_size = dllm_config.block_size
         max_running_reqs = dllm_config.max_running_requests
         if dllm_config.needs_full_prefill:
-            # Keep the existing dLLM batch-level prefill budget. Dream may
-            # exceed it only as the first request in a batch because its full
-            # canvas cannot be split; _get_dllm_remain_tokens still gates it
-            # against the real KV capacity.
             self.rem_dllm_tokens = self.rem_input_tokens
         else:
             self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
@@ -856,6 +852,12 @@ class PrefillAdder:
             no_token = self.rem_mamba_slots <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
+
+        if self.dllm_config is not None and self.dllm_config.needs_full_prefill:
+            # Dream's full canvas cannot be chunked, so the batch-level
+            # max_prefill/dLLM budgets are not admission limits. The allocator
+            # checks above remain authoritative.
+            return AddReqResult.CONTINUE
 
         if self.rem_input_tokens <= 0:
             return AddReqResult.OTHER
@@ -1194,7 +1196,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if self.dllm_config is not None:
-            if self.rem_dllm_tokens <= 0:
+            if not self.dllm_config.needs_full_prefill and self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
 
             if (
@@ -1321,9 +1323,13 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
+        is_dream_full_prefill = (
+            self.dllm_config is not None and self.dllm_config.needs_full_prefill
+        )
         if (
             self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
+            and not is_dream_full_prefill
             and real_input_tokens >= self.rem_input_tokens
         ):
             # If without chunked prefill:
@@ -1390,6 +1396,7 @@ class PrefillAdder:
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
+                and not is_dream_full_prefill
                 and input_tokens >= self.rem_input_tokens
             ):
                 # If without chunked prefill:
@@ -1398,7 +1405,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
+                if not is_dream_full_prefill and self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
                 assert (
