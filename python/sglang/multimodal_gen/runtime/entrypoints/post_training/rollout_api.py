@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-import msgspec
 import torch
 from fastapi import APIRouter, HTTPException, Response
+from fastapi.responses import StreamingResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -14,8 +15,16 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutRequest,
     RolloutResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
+    STAGES_HEADER,
+    TIMING_HEADER,
+    RequestStamps,
+    stages_header,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
+    _quantize_video_uint8,
+    msgpack_encode_spliced,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -195,7 +204,12 @@ def _serialize_rollout_trajectory(
 
 
 def _build_response(
-    request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
+    request_id: str,
+    prompt: str,
+    seed: int,
+    rollout: bool,
+    result: OutputBatch,
+    video_dtype: str | None = None,
 ) -> list[RolloutResponse]:
     """
     rollout: bool - set to False when evaluating the model
@@ -227,6 +241,8 @@ def _build_response(
     for sample_idx in range(batch_size):
         out_i = result.output[sample_idx]
         if isinstance(out_i, torch.Tensor):
+            if video_dtype == "uint8":
+                out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
@@ -317,7 +333,10 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     },
 )
 async def rollout_generate(request: RolloutRequest):
+    stamps = RequestStamps()
+    stamps.mark("srv_recv")
     request_id = generate_request_id()
+    stamps.request_id = request_id
     server_args = get_global_server_args()
     sampling_kwargs = _build_sampling_kwargs(request)
     try:
@@ -330,9 +349,10 @@ async def rollout_generate(request: RolloutRequest):
         server_args=server_args, sampling_params=sampling_params
     )
     try:
-        output_batch: OutputBatch = await async_scheduler_client.forward(
-            pipeline_request
-        )
+        with stamps.span("forward"):
+            output_batch: OutputBatch = await async_scheduler_client.forward(
+                pipeline_request
+            )
     except Exception as exc:
         logger.error("Rollout generation failed: %s", exc, exc_info=True)
         raise HTTPException(
@@ -340,11 +360,35 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
-    )
-    payload = [r.model_dump() for r in rollout_responses]
-    return Response(
-        content=msgspec.msgpack.encode(payload),
+    def _serialize_response() -> list[bytes]:
+        with stamps.span("build"):
+            rollout_responses = _build_response(
+                request_id,
+                request.prompt,
+                request.seed,
+                request.rollout,
+                output_batch,
+                video_dtype=request.rollout_video_dtype,
+            )
+        with stamps.span("dump"):
+            payload = [r.model_dump() for r in rollout_responses]
+        with stamps.span("msgpack"):
+            return msgpack_encode_spliced(payload)
+
+    # Off the event loop: building the response copies hundreds of MB
+    parts = await asyncio.to_thread(_serialize_response)
+
+    # Timing rides a header: the last marks postdate the encoded body. The
+    # explicit content-length keeps uvicorn on identity framing, not chunked.
+    headers = {
+        TIMING_HEADER: stamps.to_header(),
+        "content-length": str(sum(len(p) for p in parts)),
+    }
+    stages = stages_header(output_batch.metrics)
+    if stages:
+        headers[STAGES_HEADER] = stages
+    return StreamingResponse(
+        iter(parts),
         media_type="application/msgpack",
+        headers=headers,
     )
