@@ -19,17 +19,17 @@ pub struct RendererRuntimeConfig {
     pub queue_capacity: usize,
     /// Optional SGLang engine origin. When absent, inference routes are not mounted.
     pub engine_url: Option<String>,
-    /// Optional Rust-server origin for every route not owned by the renderer.
-    pub fallback_url: Option<String>,
+    /// Proxy routes not owned by the renderer to `engine_url`.
+    pub proxy_unhandled_routes: bool,
     pub renderer: RendererConfig,
 }
 
 pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
-    let mode = match (&config.engine_url, &config.fallback_url) {
-        (None, None) => "render-only",
-        (Some(_), None) => "serving",
-        (Some(_), Some(_)) => "hosted",
-        (None, Some(_)) => return Err("fallback_url requires engine_url".to_string()),
+    let mode = match (&config.engine_url, config.proxy_unhandled_routes) {
+        (None, false) => "render-only",
+        (Some(_), false) => "serving",
+        (Some(_), true) => "hosted",
+        (None, true) => return Err("proxy_unhandled_routes requires engine_url".to_string()),
     };
     let tokenizer_without_specials = load_tokenizer(
         (!config.renderer.tokenizer_path.is_empty())
@@ -53,20 +53,20 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
         config.tokenizer_workers,
         config.queue_capacity,
     ));
-    let app = match (config.engine_url, config.fallback_url) {
-        (None, None) => render_only_routes(renderer),
-        (Some(engine_url), None) => {
+    let app = match (config.engine_url, config.proxy_unhandled_routes) {
+        (None, false) => render_only_routes(renderer),
+        (Some(engine_url), false) => {
             let generate_client = HttpGenerateClient::new(engine_url, tokenizer_without_specials)?;
             standalone_routes(OpenAIHttpFrontend::new(renderer, generate_client))
         }
-        (Some(engine_url), Some(fallback_url)) => {
-            let generate_client = HttpGenerateClient::new(engine_url, tokenizer_without_specials)?;
+        (Some(engine_url), true) => {
+            let generate_client = HttpGenerateClient::new(&engine_url, tokenizer_without_specials)?;
             hosted_routes(
                 OpenAIHttpFrontend::new(renderer, generate_client),
-                fallback_url,
+                engine_url,
             )?
         }
-        (None, Some(_)) => unreachable!("runtime topology was validated above"),
+        (None, true) => unreachable!("runtime topology was validated above"),
     };
     let listener = tokio::net::TcpListener::bind(config.http_addr)
         .await
@@ -85,21 +85,21 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
 #[derive(Clone)]
 pub(crate) struct RustServerProxy {
     client: reqwest::Client,
-    fallback_url: String,
+    upstream_url: String,
 }
 
 impl RustServerProxy {
-    pub(crate) fn new(fallback_url: String) -> Result<Self, String> {
-        let fallback_url = fallback_url.trim_end_matches('/').to_owned();
-        reqwest::Url::parse(&fallback_url)
-            .map_err(|error| format!("invalid fallback_url {fallback_url:?}: {error}"))?;
+    pub(crate) fn new(upstream_url: String) -> Result<Self, String> {
+        let upstream_url = upstream_url.trim_end_matches('/').to_owned();
+        reqwest::Url::parse(&upstream_url)
+            .map_err(|error| format!("invalid proxy upstream {upstream_url:?}: {error}"))?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| format!("building Rust-server proxy client failed: {error}"))?;
         Ok(Self {
             client,
-            fallback_url,
+            upstream_url,
         })
     }
 
@@ -110,7 +110,7 @@ impl RustServerProxy {
             .uri
             .path_and_query()
             .map_or("/", axum::http::uri::PathAndQuery::as_str);
-        let upstream = format!("{}{path}", self.fallback_url);
+        let upstream = format!("{}{path}", self.upstream_url);
         let response = self
             .client
             .request(parts.method, upstream)

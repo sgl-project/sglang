@@ -87,10 +87,10 @@ pub(crate) fn render_only_routes(renderer: Arc<crate::RendererService>) -> Route
 
 pub(crate) fn hosted_routes(
     frontend: OpenAIHttpFrontend,
-    fallback_url: String,
+    upstream_url: String,
 ) -> Result<Router<()>, String> {
     let renderer = frontend.renderer.clone();
-    let proxy = crate::runtime::RustServerProxy::new(fallback_url)?;
+    let proxy = crate::runtime::RustServerProxy::new(upstream_url)?;
     Ok(inference_routes(frontend)
         .merge(renderer_routes(renderer))
         .merge(render::readiness_route())

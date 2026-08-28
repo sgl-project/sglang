@@ -30,9 +30,9 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     engine_url: Option<String>,
 
-    /// Optional origin for routes not owned by the renderer.
-    #[arg(long, value_name = "URL", requires = "engine_url")]
-    fallback_url: Option<String>,
+    /// Proxy routes not owned by the renderer to the SGLang engine origin.
+    #[arg(long, requires = "engine_url")]
+    proxy_unhandled_routes: bool,
 
     #[arg(long)]
     tokenizer_path: Option<String>,
@@ -89,7 +89,7 @@ enum SamplingDefaultsSource {
 struct DirectArgs {
     model: String,
     engine_url: Option<String>,
-    fallback_url: Option<String>,
+    proxy_unhandled_routes: bool,
     tokenizer_path: String,
     revision: Option<String>,
     served_model_name: String,
@@ -138,7 +138,7 @@ impl Cli {
         DirectArgs {
             model,
             engine_url: self.engine_url,
-            fallback_url: self.fallback_url,
+            proxy_unhandled_routes: self.proxy_unhandled_routes,
             tokenizer_path,
             revision: self.revision,
             served_model_name,
@@ -221,7 +221,7 @@ impl DirectArgs {
             tokenizer_workers: self.tokenizer_workers,
             queue_capacity: self.queue_capacity,
             engine_url: self.engine_url,
-            fallback_url: self.fallback_url,
+            proxy_unhandled_routes: self.proxy_unhandled_routes,
             renderer: RendererConfig {
                 served_model_name: self.served_model_name,
                 tokenizer_path: self.tokenizer_path,
@@ -584,14 +584,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_url_requires_an_engine_url() {
-        let error = Cli::try_parse_from([
-            "sglang-renderer",
-            "model",
-            "--fallback-url",
-            "http://127.0.0.1:30001",
-        ])
-        .unwrap_err();
+    fn proxying_unhandled_routes_requires_an_engine_url() {
+        let error = Cli::try_parse_from(["sglang-renderer", "model", "--proxy-unhandled-routes"])
+            .unwrap_err();
 
         assert_eq!(
             error.kind(),
@@ -627,8 +622,7 @@ mod tests {
             directory.to_str().unwrap(),
             "--engine-url",
             "http://127.0.0.1:30001",
-            "--fallback-url",
-            "http://127.0.0.1:30001",
+            "--proxy-unhandled-routes",
             "--served-model-name",
             "fixture",
             "--context-length",
@@ -643,11 +637,8 @@ mod tests {
         .unwrap();
         let config = cli.into_direct_args().resolve().await.unwrap();
 
-        assert_eq!(
-            config.fallback_url.as_deref(),
-            Some("http://127.0.0.1:30001")
-        );
         assert_eq!(config.engine_url.as_deref(), Some("http://127.0.0.1:30001"));
+        assert!(config.proxy_unhandled_routes);
         assert_eq!(config.renderer.served_model_name, "fixture");
         assert_eq!(config.renderer.limits.context_len, 2048);
         assert_eq!(config.renderer.limits.vocab_size, 256);

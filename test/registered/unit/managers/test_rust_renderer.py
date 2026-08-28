@@ -132,7 +132,8 @@ class TestRustRendererSidecar(unittest.TestCase):
 
         self.assertEqual(args[0], "resolved-model-path")
         self.assertEqual(values["--engine-url"], "http://127.0.0.1:31000")
-        self.assertEqual(values["--fallback-url"], "http://127.0.0.1:31000")
+        self.assertIn("--proxy-unhandled-routes", args)
+        self.assertNotIn("--fallback-url", args)
         self.assertEqual(values["--host"], "0.0.0.0")
         self.assertEqual(values["--port"], "30000")
         self.assertEqual(values["--tokenizer-path"], "resolved-model-path")
