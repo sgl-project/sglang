@@ -38,7 +38,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    evict_from_tree_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -50,6 +53,9 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     ReqToTokenPool,
+)
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -119,6 +125,37 @@ def _session_radix_cache_test_values() -> tuple[bool, ...]:
     if _selected_tree_core_test_backend() == "rust":
         return (False,)
     return False, True
+
+
+class TestUnifiedSWAEvictionPlanning(CustomTestCase):
+    def test_reclaims_only_needed_pages_from_each_side(self):
+        allocator = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+        allocator.page_size = 4
+        tree_cache = mock.MagicMock()
+        tree_cache.is_chunk_cache.return_value = False
+        tree_cache.token_to_kv_pool_allocator = allocator
+        tree_cache.full_evictable_size.return_value = 16
+        tree_cache.swa_evictable_size.return_value = 64
+
+        def can_reserve(
+            full_tokens,
+            swa_tokens,
+            *,
+            full_evictable_tokens=0,
+            swa_evictable_tokens=0,
+            **_,
+        ):
+            return tree_cache.evict.called or (
+                full_evictable_tokens >= 8 and swa_evictable_tokens >= 8
+            )
+
+        allocator.can_reserve = mock.Mock(side_effect=can_reserve)
+
+        evict_from_tree_cache(tree_cache, 4)
+
+        tree_cache.evict.assert_called_once_with(
+            EvictParams(num_tokens=8, swa_num_tokens=8)
+        )
 
 
 @dataclass(frozen=True)

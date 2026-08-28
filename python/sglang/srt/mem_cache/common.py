@@ -206,29 +206,24 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
                     lo = mid + 1
             return lo * page_size
 
-        if allocator.can_reserve(
-            num_tokens,
-            num_tokens,
-            swa_evictable_tokens=swa_evictable,
-        ):
-            full_reclaim = 0
-            swa_reclaim = minimum_reclaim(
-                swa_evictable,
-                lambda value: allocator.can_reserve(
-                    num_tokens, num_tokens, swa_evictable_tokens=value
-                ),
-            )
-        else:
-            swa_reclaim = swa_evictable
-            full_reclaim = minimum_reclaim(
-                full_evictable,
-                lambda value: allocator.can_reserve(
-                    num_tokens,
-                    num_tokens,
-                    full_evictable_tokens=value,
-                    swa_evictable_tokens=swa_reclaim,
-                ),
-            )
+        full_reclaim = minimum_reclaim(
+            full_evictable,
+            lambda value: allocator.can_reserve(
+                num_tokens,
+                num_tokens,
+                full_evictable_tokens=value,
+                swa_evictable_tokens=swa_evictable,
+            ),
+        )
+        swa_reclaim = minimum_reclaim(
+            swa_evictable,
+            lambda value: allocator.can_reserve(
+                num_tokens,
+                num_tokens,
+                full_evictable_tokens=full_reclaim,
+                swa_evictable_tokens=value,
+            ),
+        )
         evicted = tree_cache.evict_for_alloc(
             EvictParams(
                 num_tokens=full_reclaim,
