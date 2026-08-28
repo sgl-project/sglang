@@ -58,6 +58,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             return_logprob=False,
             input_ids=[1, 2, 3, 4],
             extend_prefix_lens_cpu=[0],
+            dllm_config=None,
         )
 
     def test_kimi_k25_lm_prefill_is_opted_in(self):
