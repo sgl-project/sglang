@@ -224,6 +224,7 @@ class ComponentResidencyManager:
         )
         self._track_warmup_memory = (
             self.state.batch_is_warmup
+            and self.server_args.pipeline_config.supports_auto_residency
             and current_platform.is_cuda()
             and torch.get_device_module().is_available()
         )
