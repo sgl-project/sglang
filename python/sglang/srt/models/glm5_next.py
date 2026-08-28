@@ -1076,9 +1076,14 @@ class Glm5NextModel(nn.Module):
         return self.embed_tokens
 
     def _prepare_aux_hidden_state(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor
+        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        aux_hidden_state = hidden_states + residual
+        # Under mHC the residual is folded into the widened hidden state, so the
+        # layer communicator hands back residual=None and hc_contract below does
+        # the merge. Only the plain residual-stream path has a tensor to add.
+        aux_hidden_state = (
+            hidden_states if residual is None else hidden_states + residual
+        )
         if self.dflash_capture and self.config.mhc:
             aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
         return aux_hidden_state
