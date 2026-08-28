@@ -39,21 +39,16 @@ _DP = "sglang.srt.layers.dp_attention"
 SIZE_RANK_DELEGATIONS = [
     ("world_size", f"{_PS}.get_world_size"),
     ("world_rank", f"{_PS}.get_world_rank"),
-    ("tp_size", f"{_PS}.get_tensor_model_parallel_world_size"),
     ("tp_rank", f"{_PS}.get_tensor_model_parallel_rank"),
-    ("dcp_size", f"{_PS}.get_dcp_world_size"),
     ("dcp_rank", f"{_PS}.get_dcp_rank"),
-    ("pp_size", f"{_PS}.get_pipeline_model_parallel_world_size"),
     ("pp_rank", f"{_PS}.get_pipeline_model_parallel_rank"),
     ("moe_ep_size", f"{_PS}.get_moe_expert_parallel_world_size"),
     ("moe_ep_rank", f"{_PS}.get_moe_expert_parallel_rank"),
-    ("moe_dp_size", f"{_PS}.get_moe_data_parallel_world_size"),
     ("moe_dp_rank", f"{_PS}.get_moe_data_parallel_rank"),
     ("moe_tp_size", f"{_PS}.get_moe_tensor_parallel_world_size"),
     ("moe_tp_rank", f"{_PS}.get_moe_tensor_parallel_rank"),
     ("attn_tp_size", f"{_PS}.get_attn_tensor_model_parallel_world_size"),
     ("attn_tp_rank", f"{_PS}.get_attn_tensor_model_parallel_rank"),
-    ("attn_cp_size", f"{_PS}.get_attn_context_model_parallel_world_size"),
     ("attn_cp_rank", f"{_PS}.get_attn_context_model_parallel_rank"),
     ("attn_dp_size", f"{_DP}.get_attention_dp_size"),
     ("attn_dp_rank", f"{_DP}.get_attention_dp_rank"),
@@ -897,9 +892,8 @@ class TestForwardFlags(_IsolatedServerArgs):
 
     def test_parallel_config_leaves_trace_under_torch_compile(self):
         # Regression: gate helpers such as ``enable_moe_dense_fully_dp()`` read
-        # parallel config leaves inside compiled model forwards through the
-        # `config` property, which must stay dynamo-traceable
-        # (``object.__getattribute__`` graph-breaks).
+        # parallel config leaves inside compiled model forwards, which must
+        # stay dynamo-traceable (``object.__getattribute__`` graph-breaks).
         # fullgraph=True turns any graph break back into a failure.
         import torch
 
@@ -911,11 +905,11 @@ class TestForwardFlags(_IsolatedServerArgs):
             @torch.compile(fullgraph=True, backend="eager", dynamic=False)
             def probe(x):
                 par = get_parallel()
-                if par.config.enable_prefill_context_parallel:
+                if par.enable_prefill_context_parallel:
                     x = x + 1
-                if par.config.moe_dense_tp_size == 1:
+                if par.moe_dense_tp_size == 1:
                     x = x + 2
-                if par.config.dwdp_size > 1:
+                if par.dwdp_size > 1:
                     x = x + 4
                 return x
 
@@ -1366,6 +1360,29 @@ class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):
                         f"{kind} -- the attribute access already produced the value"
                     )
         self.assertEqual([], wrong, "\n".join(wrong))
+
+
+class TestParallelLeafReads(_IsolatedServerArgs):
+    """The contract ``ParallelContext.__getattr__`` answers a parallel leaf on."""
+
+    def test_a_leaf_answers_what_resolution_decided(self):
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        with get_context().override_server_args() as server_args:
+            self.assertEqual(
+                resolution_result(server_args, "nccl_port"),
+                get_parallel().nccl_port,
+                "a parallel leaf read off the context disagreed with what "
+                "resolution decided",
+            )
+
+    def test_before_publish_the_error_names_the_namespace(self):
+        with self.assertRaisesRegex(ValueError, r"'parallel' not published"):
+            getattr(ParallelContext(), "nccl_port")
+
+    def test_an_unknown_name_is_still_an_attribute_error(self):
+        with self.assertRaisesRegex(AttributeError, r"has no 'not_a_leaf'"):
+            getattr(ParallelContext(), "not_a_leaf")
 
 
 if __name__ == "__main__":

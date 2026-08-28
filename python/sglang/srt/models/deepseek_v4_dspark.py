@@ -488,13 +488,15 @@ class DSparkV4MarkovHead(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            collect_corrected=collect_corrected,
         )
 
 
@@ -756,7 +758,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
             self.embed_tokens: Optional[nn.Module] = None
