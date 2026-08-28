@@ -45,7 +45,10 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    component_precision_overrides,
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.utils.vision import load_image as load_vision_image
 
 logger = init_logger(__name__)
@@ -371,7 +374,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         loaded_modules: dict[str, torch.nn.Module] | None = None,
         executor: PipelineExecutor | None = None,
     ):
-        if server_args.component_precisions:
+        if component_precision_overrides(server_args):
             raise ValueError(
                 "--component-precisions requires the native SGLang backend; "
                 "a whole Diffusers pipeline cannot guarantee per-component "

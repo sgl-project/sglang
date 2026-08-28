@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
+    component_precision_overrides,
     resolve_component_precision,
     resolve_decode_precision,
 )
@@ -348,7 +349,7 @@ class VAELoader(ComponentLoader):
                 f"Unsupported module name for VAE loader: {component_name}"
             )
         vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
-        vae_precision = server_args.component_precisions.get(
+        vae_precision = component_precision_overrides(server_args).get(
             component_name, legacy_vae_precision
         )
         resolved_vae_dtype = resolve_component_precision(server_args, component_name)

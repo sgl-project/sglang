@@ -152,6 +152,19 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported custom_precision"):
             precision_to_dtype("fp8", "custom_precision")
 
+    def test_component_precision_overrides_are_optional(self):
+        server_args = self._server_args()
+        del server_args.component_precisions
+
+        self.assertEqual(
+            resolve_precision(server_args, "vae", precision_attr="vae_precision"),
+            torch.float16,
+        )
+        self.assertIsNone(resolve_exact_component_precision(server_args, "vae"))
+        validate_shared_component_autocast(
+            server_args, ["transformer", "transformer_2"]
+        )
+
     def test_decode_precision_override_and_fallback(self):
         self.assertEqual(
             resolve_decode_precision(self._server_args()),

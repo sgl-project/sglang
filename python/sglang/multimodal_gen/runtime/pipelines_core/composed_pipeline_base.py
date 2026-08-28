@@ -57,6 +57,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    component_precision_overrides,
+)
 
 logger = init_logger(__name__)
 
@@ -112,8 +115,9 @@ class ComposedPipelineBase(ABC):
         self.executor = executor or self.build_executor(server_args=server_args)
         self.component_residency_manager: ComponentResidencyManager | None = None
 
+        precision_overrides = component_precision_overrides(server_args)
         preloaded_precision_overrides = set(loaded_modules or ()).intersection(
-            server_args.component_precisions
+            precision_overrides
         )
         if preloaded_precision_overrides:
             raise ValueError(
@@ -156,9 +160,7 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
         valid_precision_components = self._declared_component_names.union(self.modules)
-        unknown = set(server_args.component_precisions).difference(
-            valid_precision_components
-        )
+        unknown = set(precision_overrides).difference(valid_precision_components)
         if unknown:
             raise ValueError(
                 "Unknown component precision override(s): "
@@ -166,7 +168,7 @@ class ComposedPipelineBase(ABC):
             )
         unsupported = sorted(
             component_name
-            for component_name in server_args.component_precisions
+            for component_name in precision_overrides
             if component_name in self.modules
             and not isinstance(self.modules[component_name], torch.nn.Module)
         )

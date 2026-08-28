@@ -80,8 +80,7 @@ def test_causal_vae_decoding_stage_keeps_wan_decoder_cache(monkeypatch):
     vae = _WanVAE()
     vae.clear_cache()
     vae.clear_calls = 0
-    stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
-    stage.vae = vae
+    stage = CausalVaeDecodingStage(vae)
     server_args = SimpleNamespace(
         pipeline_config=_PipelineConfig(),
         disable_autocast=True,
@@ -158,8 +157,7 @@ def test_causal_vae_decoding_stage_prefers_native_causal_decode(monkeypatch):
     )
 
     vae = _NativeCausalVAE()
-    stage = CausalVaeDecodingStage.__new__(CausalVaeDecodingStage)
-    stage.vae = vae
+    stage = CausalVaeDecodingStage(vae)
     server_args = SimpleNamespace(
         pipeline_config=_PipelineConfig(),
         disable_autocast=True,

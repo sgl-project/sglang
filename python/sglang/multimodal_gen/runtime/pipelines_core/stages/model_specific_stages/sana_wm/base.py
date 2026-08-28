@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import (
+    precision_to_dtype,
     resolve_component_precision,
     resolve_precision,
 )
@@ -1089,9 +1090,11 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         if self.vae is None:
             return []
         stage_name = self._component_stage_name(stage_name)
-        vae_dtype = resolve_precision(
-            server_args, "vae", precision_attr="vae_precision"
-        )
+        vae_dtype = resolve_component_precision(server_args, "vae")
+        if vae_dtype is None:
+            vae_dtype = precision_to_dtype(
+                self.pipeline_config.vae_precision, "vae_precision"
+            )
         return [
             ComponentUse(
                 stage_name=stage_name,

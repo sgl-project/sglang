@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from typing import Iterator, Optional, Union
 
@@ -24,6 +25,11 @@ def precision_to_dtype(precision: str, field_name: str = "precision") -> torch.d
         ) from exc
 
 
+def component_precision_overrides(server_args: object) -> Mapping[str, str]:
+    overrides = vars(server_args).get("component_precisions")
+    return {} if overrides is None else overrides
+
+
 def resolve_precision(
     server_args,
     component_or_precision_attr: str,
@@ -31,8 +37,9 @@ def resolve_precision(
     precision_attr: Optional[str] = None,
     field_name: Optional[str] = None,
 ) -> torch.dtype:
-    component_precisions = vars(server_args).get("component_precisions", {})
-    component_precision = component_precisions.get(component_or_precision_attr)
+    component_precision = component_precision_overrides(server_args).get(
+        component_or_precision_attr
+    )
     if component_precision is not None:
         return precision_to_dtype(
             component_precision,
@@ -77,7 +84,7 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
     if exact_precision is not None:
         return exact_precision
 
-    pipeline_config = getattr(server_args, "pipeline_config", None)
+    pipeline_config = vars(server_args).get("pipeline_config")
     if pipeline_config is None:
         return None
 
@@ -90,13 +97,22 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
         precision_attr = "dit_precision"
     elif is_legacy_image_encoder_offload_component_name(module_name):
         precision_attr = "image_encoder_precision"
+    elif module_name == "text_encoder":
+        index = 0
+    elif module_name.startswith("text_encoder_"):
+        suffix = module_name.removeprefix("text_encoder_")
+        if not suffix.isdigit():
+            return None
+        index = max(int(suffix) - 1, 0)
     elif is_text_encoder_component_name(module_name):
+        return None
+    else:
+        return None
+
+    if is_text_encoder_component_name(module_name):
         precisions = vars(pipeline_config).get("text_encoder_precisions")
         if not precisions:
             return None
-        suffix = module_name.removeprefix("text_encoder")
-        numbered_suffix = suffix.removeprefix("_")
-        index = max(int(numbered_suffix) - 1, 0) if numbered_suffix.isdigit() else 0
         if index < 0 or index >= len(precisions):
             raise ValueError(
                 f"No configured precision for {module_name!r}; "
@@ -104,8 +120,6 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
             )
         precision = precisions[index]
         return precision_to_dtype(precision, f"text_encoder_precisions[{index}]")
-    else:
-        return None
 
     if precision_attr not in vars(pipeline_config):
         return None
@@ -115,15 +129,16 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
 def resolve_exact_component_precision(
     server_args, component_name: str
 ) -> Optional[torch.dtype]:
-    precision = vars(server_args).get("component_precisions", {}).get(component_name)
+    precision = component_precision_overrides(server_args).get(component_name)
     if precision is None:
         return None
     return precision_to_dtype(precision, f"component_precisions.{component_name}")
 
 
 def validate_shared_component_autocast(server_args, component_names: list[str]) -> None:
+    overrides = component_precision_overrides(server_args)
     if len(component_names) < 2 or not any(
-        name in server_args.component_precisions for name in component_names
+        name in overrides for name in component_names
     ):
         return
     precisions = {
@@ -139,11 +154,12 @@ def validate_shared_component_autocast(server_args, component_names: list[str]) 
 def explicit_component_autocast_context(
     server_args, component_name: str, dtype: torch.dtype
 ):
+    overrides = component_precision_overrides(server_args)
     return autocast_context(
         dtype,
         server_args.disable_autocast,
         enabled=(
-            component_name in server_args.component_precisions
+            component_name in overrides
             and autocast_enabled(dtype, server_args.disable_autocast)
         ),
     )

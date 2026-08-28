@@ -43,6 +43,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled as precision_autocast_enabled,
 )
+from sglang.multimodal_gen.runtime.utils.precision import (
+    component_precision_overrides,
+)
 
 logger = init_logger(__name__)
 
@@ -178,7 +181,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         component_name = self._component_name_for_stage_module(
             self.transformer, "transformer"
         )
-        precision = server_args.component_precisions.get(component_name)
+        precision = component_precision_overrides(server_args).get(component_name)
         if precision is not None and precision != "bf16":
             raise ValueError("Causal denoising supports only bf16 component precision")
         return torch.bfloat16

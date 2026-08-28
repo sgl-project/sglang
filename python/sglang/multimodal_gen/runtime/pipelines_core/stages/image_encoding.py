@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     autocast_context,
     autocast_enabled,
+    component_precision_overrides,
     explicit_component_autocast_context,
     resolve_component_precision,
     resolve_precision,
@@ -1082,7 +1083,7 @@ class ImageVAEEncodingStage(PipelineStage):
             width=batch.width,
             num_frames=batch.num_frames,
             encode_sample_mode=sample_mode,
-            vae_precision=server_args.component_precisions.get(
+            vae_precision=component_precision_overrides(server_args).get(
                 "vae", server_args.pipeline_config.vae_precision
             ),
             vae_tiling=bool(server_args.pipeline_config.vae_tiling),

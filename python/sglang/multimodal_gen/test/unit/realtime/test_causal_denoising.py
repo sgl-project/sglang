@@ -161,7 +161,10 @@ def test_causal_dmd_forward_context_uses_prepare_hooks(monkeypatch):
         seen["frame_shape"] = (h, w)
         return self.num_token_per_frame
 
-    stage._target_dtype = MethodType(lambda self: torch.float16, stage)
+    stage._target_dtype = MethodType(
+        lambda self, server_args: torch.float16,
+        stage,
+    )
     stage._autocast_enabled = MethodType(lambda self, dtype, server_args: False, stage)
     stage._get_causal_dmd_scheduler = MethodType(
         lambda self, batch, server_args: "scheduler", stage

@@ -45,7 +45,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    component_precision_overrides,
+    resolve_component_precision,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -315,7 +318,8 @@ class ComponentLoader(ABC):
             logger.error("Load %s failed", component_name)
             consumed = 0.0
         else:
-            if component_name in server_args.component_precisions and not isinstance(
+            precision_overrides = component_precision_overrides(server_args)
+            if component_name in precision_overrides and not isinstance(
                 component, nn.Module
             ):
                 raise ValueError(
