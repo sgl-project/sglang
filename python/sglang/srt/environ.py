@@ -305,6 +305,8 @@ class Envs:
     # In seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging.
     # Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
+    # Extra boot-warmup prefill length in tokens; 0 disables it.
+    SGLANG_WARMUP_PREFILL_TOKENS = EnvInt(0)
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")

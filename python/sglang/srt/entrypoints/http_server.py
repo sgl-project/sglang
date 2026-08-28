@@ -2185,6 +2185,24 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+def _resolve_warmup_prefill_tokens(
+    server_args: ServerArgs, configured_tokens: int, output_tokens: int
+) -> int:
+    """Cap the warmup prefill length to the server request limits."""
+    num_tokens = configured_tokens
+    if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0:
+        num_tokens = min(num_tokens, server_args.chunked_prefill_size)
+    if server_args.context_length:
+        max_prefill_tokens = server_args.context_length - output_tokens
+        if max_prefill_tokens <= 0:
+            raise ValueError(
+                "context_length must exceed the warmup output token count "
+                f"({output_tokens})"
+            )
+        num_tokens = min(num_tokens, max_prefill_tokens)
+    return num_tokens
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2310,6 +2328,42 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+
+            warmup_prefill_tokens = envs.SGLANG_WARMUP_PREFILL_TOKENS.get()
+            if model_info["is_generation"] and warmup_prefill_tokens > 0:
+                warmup_output_tokens = 8
+                num_tokens = _resolve_warmup_prefill_tokens(
+                    server_args, warmup_prefill_tokens, warmup_output_tokens
+                )
+                logger.info(
+                    "Triggering prefill warmup with %d input tokens and %d output "
+                    "tokens per sequence (configured input tokens: %d)",
+                    num_tokens,
+                    warmup_output_tokens,
+                    warmup_prefill_tokens,
+                )
+                warmup_ids = ([10, 11, 12, 13] * ((num_tokens + 3) // 4))[:num_tokens]
+                big_json_data = {
+                    "input_ids": (
+                        warmup_ids
+                        if get_parallel().dp_size == 1
+                        else [warmup_ids for _ in range(get_parallel().dp_size)]
+                    ),
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": warmup_output_tokens,
+                        "ignore_eos": True,
+                    },
+                }
+                res = requests.post(
+                    url + "/generate",
+                    json=big_json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
+
             # Skip server_status update for Rust server
             if not envs.SGLANG_RUST_SERVER.get():
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up

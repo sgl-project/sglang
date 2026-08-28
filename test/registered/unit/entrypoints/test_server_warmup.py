@@ -3,17 +3,38 @@
 import base64
 import struct
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.entrypoints.http_server import (
     KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64,
     KIMI_VLM_WARMUP_PNG_PICTURE_BASE64,
     MINIMUM_PNG_PICTURE_BASE64,
     _get_vlm_warmup_image_base64,
+    _resolve_warmup_prefill_tokens,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestPrefillWarmup(unittest.TestCase):
+    def test_caps_to_chunked_prefill_size(self):
+        server_args = SimpleNamespace(chunked_prefill_size=512, context_length=4096)
+        self.assertEqual(_resolve_warmup_prefill_tokens(server_args, 2048, 8), 512)
+
+    def test_caps_to_context_length(self):
+        server_args = SimpleNamespace(chunked_prefill_size=-1, context_length=1024)
+        self.assertEqual(_resolve_warmup_prefill_tokens(server_args, 2048, 8), 1016)
+
+    def test_preserves_configured_length_within_limits(self):
+        server_args = SimpleNamespace(chunked_prefill_size=4096, context_length=4096)
+        self.assertEqual(_resolve_warmup_prefill_tokens(server_args, 2048, 8), 2048)
+
+    def test_rejects_context_without_input_room(self):
+        server_args = SimpleNamespace(chunked_prefill_size=-1, context_length=8)
+        with self.assertRaisesRegex(ValueError, "context_length must exceed"):
+            _resolve_warmup_prefill_tokens(server_args, 2048, 8)
 
 
 class TestVlmWarmupImage(CustomTestCase):
