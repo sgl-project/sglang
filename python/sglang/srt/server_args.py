@@ -10364,6 +10364,25 @@ class ServerArgs:
                 not cfg.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
 
+            # NGRAM trie counts the root node against the configured capacity.
+            # When capacity == max_trie_depth, only depth-1 non-root nodes are
+            # available, but a suffix at maximum depth requires depth nodes. The
+            # first insertion then enters Trie::squeeze() with an empty LRU and
+            # crashes the native worker (issue #36495). Validate early.
+            if cfg.speculative_algorithm == "NGRAM":
+                assert (
+                    cfg.speculative_ngram_capacity
+                    > cfg.speculative_ngram_max_trie_depth
+                ), (
+                    "--speculative-ngram-capacity must be strictly greater than "
+                    "--speculative-ngram-max-trie-depth. The trie root node is "
+                    "counted against the capacity, so capacity <= max_trie_depth "
+                    "leaves insufficient nodes for a maximum-depth insertion and "
+                    "causes a crash in the native worker. "
+                    f"Got capacity={cfg.speculative_ngram_capacity}, "
+                    f"max_trie_depth={cfg.speculative_ngram_max_trie_depth}."
+                )
+
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
