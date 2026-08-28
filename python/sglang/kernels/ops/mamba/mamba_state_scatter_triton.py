@@ -250,9 +250,11 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
-    if not dst.is_cuda or not src.is_cuda:
+    dst_ok = dst.is_cuda or dst.is_xpu
+    src_ok = src.is_cuda or src.is_xpu
+    if not dst_ok or not src_ok:
         raise ValueError(
-            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
+            "fused_mamba_state_scatter_with_mask only supports CUDA/XPU tensors."
         )
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
@@ -410,10 +412,14 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
+    if not (
+        (dst.is_cuda or dst.is_xpu)
+        and (src.is_cuda or src.is_xpu)
+        and dst.device == src.device
+    ):
         raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
-            f"tensors on the same device ({dst.device=}, {src.device=})."
+            "fused_conv_window_scatter_with_mask requires dst and src to be "
+            f"CUDA/XPU tensors on the same device ({dst.device=}, {src.device=})."
         )
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
