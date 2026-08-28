@@ -226,19 +226,6 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
 ]
 
 
-def _is_fused_mhc_post_pre_enabled() -> bool:
-    # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
-    # not read that flag and dispatches independently for both small and large
-    # token batches, so the standalone pre flag must not veto the fused opt-in.
-    return (
-        envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
-        and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
-        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
-    )
-
-
-def _should_dequant_fp8_wo_a(quant_config) -> bool:
-    return not (_FP8_WO_A_GEMM or use_npu_arch35_mxfp8_wo_a(quant_config))
 # FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
 _FLASHINFER_MHC_PRE_SPLITS = (1, 2, 4, 8, 16)
 
@@ -3624,9 +3611,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
-        # while the layer allocated an FP8 parameter (or vice versa) fails the
-        # weight loader's dtype check.
         if not (_FP8_WO_A_GEMM or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
