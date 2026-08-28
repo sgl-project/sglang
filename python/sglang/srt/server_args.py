@@ -3243,11 +3243,11 @@ class ServerArgs:
         "KV pool usage ratio that enables proactive decode demotion.",
         NS("disagg"),
     ] = 0.95
-    proactive_decode_safe_cache_usage: A[
+    proactive_safe_cpu_demote_cache_usage: A[
         float,
-        "KV pool usage ratio at which proactive decode demotion stops.",
+        "Total KV that proactive demotion may keep offloaded to CPU, as a ratio of the GPU KV pool size.",
         NS("disagg"),
-    ] = 0.75
+    ] = 0.2
     candidate_demotion_output_len_threthold: A[
         float,
         "Output-length multiplier over P50 for proactive demotion candidates.",
@@ -4244,17 +4244,9 @@ class ServerArgs:
             raise ValueError(
                 "--proactive-decode-demotion-cache-usage must be in (0, 1]."
             )
-        if not 0.0 < self.proactive_decode_safe_cache_usage <= 1.0:
+        if self.proactive_safe_cpu_demote_cache_usage <= 0.0:
             raise ValueError(
-                "--proactive-decode-safe-cache-usage must be in (0, 1]."
-            )
-        if (
-            self.proactive_decode_safe_cache_usage
-            > self.proactive_decode_demotion_cache_usage
-        ):
-            raise ValueError(
-                "--proactive-decode-safe-cache-usage must not exceed "
-                "--proactive-decode-demotion-cache-usage."
+                "--proactive-safe-cpu-demote-cache-usage must be positive."
             )
         if self.candidate_demotion_output_len_threthold <= 0.0:
             raise ValueError(

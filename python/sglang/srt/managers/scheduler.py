@@ -1332,6 +1332,7 @@ class Scheduler(
         self.disagg_decode_transfer_queue = None
         self.decode_metric_collector = None
         self.if_output_len_imbalance = False
+        self.remain_cpu_demote_tokens = 0
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
@@ -1427,6 +1428,11 @@ class Scheduler(
             )
             if self.server_args.enable_proactive_decode_promotion:
                 self.decode_metric_collector = DecodeMetricCollector()
+                # Fixed demotion CPU offload budget in tokens
+                self.remain_cpu_demote_tokens = int(
+                    self.server_args.proactive_safe_cpu_demote_cache_usage
+                    * self.max_total_num_tokens
+                )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -4778,6 +4784,7 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
+                        self.remain_cpu_demote_tokens += entry.demoted_tokens
                         self.ipc_channels.send_to_tokenizer.send_output(
                             _make_abort_req(req), req
                         )
