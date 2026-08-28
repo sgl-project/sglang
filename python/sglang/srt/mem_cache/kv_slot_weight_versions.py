@@ -46,18 +46,20 @@ class KvSlotWeightVersions:
                 f"{slot_indices[is_unwritten].tolist()}"
             )
 
-        version_changes_at = (version_ids[1:] != version_ids[:-1]).nonzero().flatten()
-        run_starts = torch.cat([version_ids.new_zeros(1), version_changes_at + 1])
-        run_ends = torch.cat(
-            [run_starts[1:], version_ids.new_tensor([len(version_ids)])]
+        version_changes_at: List[int] = (
+            (version_ids[1:] != version_ids[:-1]).nonzero().flatten().tolist()
         )
-        runs = torch.stack([version_ids[run_starts], run_starts, run_ends]).tolist()
+        run_starts = [0] + [position + 1 for position in version_changes_at]
+        run_ends = run_starts[1:] + [len(version_ids)]
+        run_version_ids: List[int] = version_ids[run_starts].tolist()
 
         return [
             WeightVersionSpan(
                 version=self._version_str_by_id[version_id], start=start, end=end
             )
-            for version_id, start, end in zip(*runs, strict=True)
+            for version_id, start, end in zip(
+                run_version_ids, run_starts, run_ends, strict=True
+            )
         ]
 
     def _intern(self, version: str) -> int:
