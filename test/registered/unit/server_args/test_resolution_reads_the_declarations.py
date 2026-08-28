@@ -420,7 +420,7 @@ def reads_a_leaf_through_the_alias(runner):
 
 
 def hands_the_accessor_to_a_helper():
-    return compute_world_size(get_server_args())
+    return attention_backends_of(get_server_args())
 
 
 def reads_the_view(runner):
@@ -471,8 +471,22 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
 
     def test_no_handler_reads_a_field_off_self(self):
         handlers = _resolution_handlers()
-        self.assertGreater(
-            len(handlers), 50, f"only {len(handlers)} handlers were reached"
+        # What the dispatcher reaches inside the class is these read wrappers;
+        # the package side is covered by
+        # `test_no_hook_reads_a_field_off_the_record`. Pinned rather than
+        # counted: a walk that collapsed to the wrappers would clear any floor
+        # low enough to admit them.
+        self.assertEqual(
+            set(handlers),
+            {
+                "_run_resolution_pipeline",
+                "_handle_hardware_runtime_validation",
+                "_handle_page_size",
+                "_handle_pipeline_parallelism",
+                "_handle_sampling_backend",
+            },
+            f"the walk reached {sorted(handlers)}; if the dispatcher grew or "
+            "lost a handler, add it here after checking it reads the view",
         )
         offenders = []
         for name, fn in sorted(handlers.items()):
@@ -492,7 +506,9 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
             len(decided), 100, f"the declaration set derived only {len(decided)} fields"
         )
         members = _record_members()
-        self.assertGreater(len(members), 100, f"only {len(members)} members were found")
+        # The floor is here to catch the scan collapsing, not to pin the
+        # class's size.
+        self.assertGreater(len(members), 40, f"only {len(members)} members were found")
         offenders = []
         for name, fn in sorted(members.items()):
             holders = _holders(fn) | {"self"}
@@ -580,7 +596,7 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         """
         helpers = _config_reading_helpers()
         decided = _declared_fields()
-        for name in ("m3_fp8_attn_gemm_enabled", "compute_world_size"):
+        for name in ("m3_fp8_attn_gemm_enabled", "attention_backends_of"):
             self.assertIn(name, helpers, f"the helper derivation lost {name}")
         for field in ("speculative_num_draft_tokens", "attention_backend"):
             self.assertIn(field, decided, f"the declared set lost {field}")
@@ -598,8 +614,8 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
                 "sa_local.attention_backend",
                 "self._server_args.attention_backend",
                 "engine_args.attention_backend",
-                "compute_world_size(get_server_args())"
-                " reads " + ", ".join(helpers["compute_world_size"]),
+                "attention_backends_of(get_server_args())"
+                " reads " + ", ".join(helpers["attention_backends_of"]),
             },
             "the scan lost a spelling, or started flagging a legal one:\n  "
             + "\n  ".join(sorted(flagged)),
