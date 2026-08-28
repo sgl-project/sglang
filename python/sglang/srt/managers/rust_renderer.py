@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import multiprocessing as mp
 import os
 import shutil
 import signal
-import socket
 import time
 from collections.abc import Sequence
+from http import HTTPStatus
 
 from sglang.srt.utils.common import kill_itself_when_parent_died, kill_process_tree
 from sglang.srt.utils.network import NetworkAddress, get_free_port
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 STARTUP_TIMEOUT = 300.0
 SHUTDOWN_TIMEOUT = 10.0
+READINESS_PATH = "/_sglang_renderer/ready"
+READINESS_HEADER = "x-sglang-renderer"
 
 
 def find_renderer_binary() -> str:
@@ -40,14 +43,20 @@ def build_renderer_args(
     num_reserved_tokens: int,
 ) -> list[str]:
     """Translate resolved server state into the renderer-owned CLI subset."""
+    model_path = str(model_config.model_path)
+    tokenizer_path = (
+        model_path
+        if server_args.tokenizer_path == server_args.model_path
+        else str(server_args.tokenizer_path)
+    )
     args = [
-        str(server_args.model_path),
+        model_path,
         "--engine-url",
         internal_server_url,
         "--fallback-url",
         internal_server_url,
         "--tokenizer-path",
-        str(server_args.tokenizer_path),
+        tokenizer_path,
         "--served-model-name",
         server_args.served_model_name,
         "--host",
@@ -56,8 +65,8 @@ def build_renderer_args(
         str(public_addr.port),
         "--tokenizer-workers",
         str(server_args.tokenizer_worker_num),
-        "--sampling-defaults",
-        server_args.sampling_defaults,
+        "--resolved-sampling-params",
+        json.dumps(model_config.get_default_sampling_params(), separators=(",", ":")),
         "--context-length",
         str(model_config.context_len),
         "--vocab-size",
@@ -205,11 +214,21 @@ class RustRendererSidecar:
                     "sglang-renderer exited during startup with code "
                     f"{process.exitcode}"
                 )
+            connection = http.client.HTTPConnection(*address, timeout=0.2)
             try:
-                with socket.create_connection(address, timeout=0.2):
+                connection.request("GET", READINESS_PATH)
+                response = connection.getresponse()
+                response.read()
+                if (
+                    response.status == HTTPStatus.NO_CONTENT
+                    and response.getheader(READINESS_HEADER) == "ready"
+                ):
                     return
-            except OSError:
-                time.sleep(0.05)
+            except (OSError, http.client.HTTPException):
+                pass
+            finally:
+                connection.close()
+            time.sleep(0.05)
         raise TimeoutError(
             "sglang-renderer did not bind "
             f"{self.public_addr.to_host_port_str()} within {STARTUP_TIMEOUT:g} seconds"

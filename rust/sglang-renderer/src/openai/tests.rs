@@ -529,6 +529,18 @@ mod suite {
             "rust health"
         );
 
+        let readiness = app
+            .clone()
+            .oneshot(
+                Request::get("/_sglang_renderer/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::NO_CONTENT);
+        assert_eq!(readiness.headers()["x-sglang-renderer"], "ready");
+
         let native = app
             .clone()
             .oneshot(

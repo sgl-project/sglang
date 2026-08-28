@@ -31,8 +31,16 @@ pub(super) fn health_route() -> Router<()> {
     Router::new().route("/health", get(health))
 }
 
+pub(super) fn readiness_route() -> Router<()> {
+    Router::new().route("/_sglang_renderer/ready", get(readiness))
+}
+
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+async fn readiness() -> impl IntoResponse {
+    (StatusCode::NO_CONTENT, [("x-sglang-renderer", "ready")])
 }
 
 async fn render_chat(

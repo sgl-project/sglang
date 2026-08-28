@@ -42,6 +42,24 @@ def server_args(**overrides):
     return SimpleNamespace(**values)
 
 
+def model_config(**overrides):
+    values = {
+        "model_path": "resolved-model-path",
+        "vocab_size": 128,
+        "context_len": 4096,
+        "is_multimodal": False,
+        "get_default_sampling_params": lambda: {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 20,
+            "min_p": 0.1,
+            "repetition_penalty": 1.05,
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def flag_values(args):
     return {
         args[index]: args[index + 1]
@@ -78,11 +96,7 @@ class TestRustRendererSidecar(unittest.TestCase):
         ):
             sidecar = RustRendererSidecar(
                 server_args(),
-                SimpleNamespace(
-                    vocab_size=128,
-                    context_len=4096,
-                    is_multimodal=False,
-                ),
+                model_config(),
                 "0.0.0.0:30000",
                 32,
             )
@@ -105,25 +119,39 @@ class TestRustRendererSidecar(unittest.TestCase):
 
     def test_embedded_args_use_resolved_state_and_internal_server(self):
         args = build_renderer_args(
-            server_args(),
-            SimpleNamespace(vocab_size=128, context_len=4096),
+            server_args(
+                model_path="s3://bucket/model",
+                tokenizer_path="s3://bucket/model",
+            ),
+            model_config(),
             NetworkAddress("0.0.0.0", 30000),
             internal_server_url="http://127.0.0.1:31000",
             num_reserved_tokens=32,
         )
         values = flag_values(args)
 
-        self.assertEqual(args[0], "model-path")
+        self.assertEqual(args[0], "resolved-model-path")
         self.assertEqual(values["--engine-url"], "http://127.0.0.1:31000")
         self.assertEqual(values["--fallback-url"], "http://127.0.0.1:31000")
         self.assertEqual(values["--host"], "0.0.0.0")
         self.assertEqual(values["--port"], "30000")
-        self.assertEqual(values["--tokenizer-path"], "tokenizer")
+        self.assertEqual(values["--tokenizer-path"], "resolved-model-path")
         self.assertEqual(values["--served-model-name"], "served-model")
         self.assertEqual(values["--revision"], "revision")
         self.assertEqual(values["--context-length"], "4096")
         self.assertEqual(values["--vocab-size"], "128")
         self.assertEqual(values["--num-reserved-tokens"], "32")
+        self.assertEqual(
+            json.loads(values["--resolved-sampling-params"]),
+            {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 20,
+                "min_p": 0.1,
+                "repetition_penalty": 1.05,
+            },
+        )
+        self.assertNotIn("--sampling-defaults", args)
         self.assertEqual(
             json.loads(values["--default-chat-template-kwargs"]),
             {"thinking": False},
@@ -131,6 +159,43 @@ class TestRustRendererSidecar(unittest.TestCase):
         self.assertIn("--allow-auto-truncate", args)
         self.assertIn("--enable-return-hidden-states", args)
         self.assertIn("--stream-response-default-include-usage", args)
+
+    def test_readiness_rejects_an_unrelated_listener(self):
+        unrelated = mock.Mock(status=200)
+        unrelated.getheader.return_value = None
+        renderer = mock.Mock(status=204)
+        renderer.getheader.return_value = "ready"
+        connections = []
+        for response in (unrelated, renderer):
+            connection = mock.Mock()
+            connection.getresponse.return_value = response
+            connections.append(connection)
+
+        with (
+            mock.patch(
+                "sglang.srt.managers.rust_renderer.get_free_port",
+                return_value=31000,
+            ),
+            mock.patch(
+                "sglang.srt.managers.rust_renderer.http.client.HTTPConnection",
+                side_effect=connections,
+            ) as connect,
+            mock.patch("sglang.srt.managers.rust_renderer.time.monotonic", return_value=0),
+            mock.patch("sglang.srt.managers.rust_renderer.time.sleep"),
+        ):
+            sidecar = RustRendererSidecar(
+                server_args(), model_config(), "0.0.0.0:30000", 32
+            )
+            sidecar.process = mock.Mock()
+            sidecar.process.is_alive.return_value = True
+            sidecar._wait_until_listening()
+
+        self.assertEqual(connect.call_count, 2)
+        for connection in connections:
+            connection.request.assert_called_once_with(
+                "GET", "/_sglang_renderer/ready"
+            )
+            connection.close.assert_called_once_with()
 
     def test_rejects_modes_the_embedded_renderer_cannot_preserve(self):
         text_model = SimpleNamespace(is_multimodal=False)

@@ -79,6 +79,7 @@ pub(crate) fn hosted_routes(
     let proxy = crate::runtime::RustServerProxy::new(fallback_url)?;
     Ok(inference_routes(frontend)
         .merge(render::routes(renderer))
+        .merge(render::readiness_route())
         .fallback(move |request| {
             let proxy = proxy.clone();
             async move { proxy.forward(request).await }

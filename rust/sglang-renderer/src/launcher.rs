@@ -58,6 +58,10 @@ struct Cli {
     default_chat_template_kwargs: Option<HashMap<String, Value>>,
     #[arg(long, value_enum, default_value_t)]
     sampling_defaults: SamplingDefaultsSource,
+    /// Already-resolved sampling defaults. When set with context length and
+    /// vocabulary size, model metadata is not reopened by this process.
+    #[arg(long, value_parser = parse_sampling_defaults)]
+    resolved_sampling_params: Option<SamplingDefaults>,
     #[arg(long)]
     context_length: Option<u64>,
     #[arg(long)]
@@ -96,6 +100,7 @@ struct DirectArgs {
     reasoning_parser: Option<String>,
     default_chat_template_kwargs: HashMap<String, Value>,
     sampling_defaults: SamplingDefaultsSource,
+    resolved_sampling_params: Option<SamplingDefaults>,
     context_length: Option<u64>,
     vocab_size: Option<u64>,
     num_reserved_tokens: u64,
@@ -144,6 +149,7 @@ impl Cli {
             reasoning_parser: self.reasoning_parser,
             default_chat_template_kwargs: self.default_chat_template_kwargs.unwrap_or_default(),
             sampling_defaults: self.sampling_defaults,
+            resolved_sampling_params: self.resolved_sampling_params,
             context_length: self.context_length,
             vocab_size: self.vocab_size,
             num_reserved_tokens: self.num_reserved_tokens,
@@ -156,34 +162,55 @@ impl Cli {
 
 impl DirectArgs {
     async fn resolve(self) -> Result<RendererRuntimeConfig, String> {
-        let files =
-            resolve_required_files(&self.model, &self.tokenizer_path, self.revision.as_deref())
-                .await?;
-        let model_config = read_json(&files.config_path)?;
-        let derived_context_len = derive_context_len(&model_config)?;
-        let context_len = match self.context_length {
-            Some(context_len) if context_len > derived_context_len && !allow_longer_context() => {
-                return Err(format!(
-                    "user-specified context length {context_len} exceeds the model-derived context length {derived_context_len}; set SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 to allow it"
-                ));
+        let (context_len, vocab_size, default_sampling_params) = match self.resolved_sampling_params
+        {
+            Some(default_sampling_params) => {
+                let context_len = self.context_length.ok_or_else(|| {
+                    "--resolved-sampling-params requires --context-length".to_string()
+                })?;
+                let vocab_size = self.vocab_size.ok_or_else(|| {
+                    "--resolved-sampling-params requires --vocab-size".to_string()
+                })?;
+                (context_len, vocab_size, default_sampling_params)
             }
-            Some(context_len) => context_len,
-            None => derived_context_len,
-        };
-        let vocab_size = self
-            .vocab_size
-            .or_else(|| derive_vocab_size(&model_config))
-            .ok_or_else(|| {
-                "model config does not define vocab_size; pass --vocab-size explicitly".to_string()
-            })?;
-        let default_sampling_params = match self.sampling_defaults {
-            SamplingDefaultsSource::Openai => SamplingDefaults::default(),
-            SamplingDefaultsSource::Model => files
-                .generation_config_path
-                .as_deref()
-                .map(read_sampling_defaults)
-                .transpose()?
-                .unwrap_or_default(),
+            None => {
+                let files = resolve_required_files(
+                    &self.model,
+                    &self.tokenizer_path,
+                    self.revision.as_deref(),
+                )
+                .await?;
+                let model_config = read_json(&files.config_path)?;
+                let derived_context_len = derive_context_len(&model_config)?;
+                let context_len = match self.context_length {
+                    Some(context_len)
+                        if context_len > derived_context_len && !allow_longer_context() =>
+                    {
+                        return Err(format!(
+                            "user-specified context length {context_len} exceeds the model-derived context length {derived_context_len}; set SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 to allow it"
+                        ));
+                    }
+                    Some(context_len) => context_len,
+                    None => derived_context_len,
+                };
+                let vocab_size = self
+                    .vocab_size
+                    .or_else(|| derive_vocab_size(&model_config))
+                    .ok_or_else(|| {
+                        "model config does not define vocab_size; pass --vocab-size explicitly"
+                            .to_string()
+                    })?;
+                let default_sampling_params = match self.sampling_defaults {
+                    SamplingDefaultsSource::Openai => SamplingDefaults::default(),
+                    SamplingDefaultsSource::Model => files
+                        .generation_config_path
+                        .as_deref()
+                        .map(read_sampling_defaults)
+                        .transpose()?
+                        .unwrap_or_default(),
+                };
+                (context_len, vocab_size, default_sampling_params)
+            }
         };
 
         Ok(RendererRuntimeConfig {
@@ -481,6 +508,11 @@ fn parse_json_object(value: &str) -> Result<HashMap<String, Value>, String> {
     serde_json::from_str(value).map_err(|error| format!("expected a JSON object: {error}"))
 }
 
+fn parse_sampling_defaults(value: &str) -> Result<SamplingDefaults, String> {
+    serde_json::from_str(value)
+        .map_err(|error| format!("expected resolved sampling parameters as JSON: {error}"))
+}
+
 fn offline_mode() -> bool {
     std::env::var("HF_HUB_OFFLINE").ok().is_some_and(|value| {
         matches!(
@@ -550,6 +582,7 @@ mod tests {
         assert_eq!(args.tokenizer_workers, 1);
         assert_eq!(args.queue_capacity, 128);
         assert_eq!(args.sampling_defaults, SamplingDefaultsSource::Model);
+        assert_eq!(args.resolved_sampling_params, None);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -610,6 +643,47 @@ mod tests {
         assert_eq!(
             config.renderer.default_chat_template_kwargs,
             HashMap::from([("enable_thinking".to_string(), json!(false))])
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolved_metadata_does_not_reopen_a_gguf_model_source() {
+        let directory =
+            std::env::temp_dir().join(format!("sglang-renderer-{}", uuid::Uuid::new_v4()));
+        let tokenizer = directory.join("tokenizer");
+        let model = directory.join("model.gguf");
+        fs::create_dir_all(&tokenizer).unwrap();
+        fs::write(tokenizer.join("tokenizer.json"), "{}").unwrap();
+        fs::write(&model, "not needed by the renderer").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "sglang-renderer",
+            model.to_str().unwrap(),
+            "--engine-url",
+            "http://127.0.0.1:30001",
+            "--tokenizer-path",
+            tokenizer.to_str().unwrap(),
+            "--context-length",
+            "4096",
+            "--vocab-size",
+            "128",
+            "--resolved-sampling-params",
+            r#"{"temperature":0.7,"top_k":20}"#,
+        ])
+        .unwrap();
+        let config = cli.into_direct_args().resolve().await.unwrap();
+
+        assert_eq!(config.renderer.model_path, model.to_string_lossy());
+        assert_eq!(config.renderer.limits.context_len, 4096);
+        assert_eq!(config.renderer.limits.vocab_size, 128);
+        assert_eq!(
+            config.renderer.default_sampling_params,
+            SamplingDefaults {
+                temperature: Some(0.7),
+                top_k: Some(20),
+                ..SamplingDefaults::default()
+            }
         );
         fs::remove_dir_all(directory).unwrap();
     }
