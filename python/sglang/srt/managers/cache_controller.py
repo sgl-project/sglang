@@ -284,12 +284,6 @@ class PrefetchOperation(StorageOperation):
 
 class HiCacheController:
 
-    # Set by the scheduler to the forward stream; gates load-back H2D behind
-    # in-flight forwards (see start_loading). Declared on the class so that
-    # instances built without __init__ -- and Mock(spec=...) doubles -- still
-    # resolve it.
-    load_fence_stream = None
-
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -367,6 +361,9 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
+        # Set by the scheduler to the forward stream; gates load-back H2D
+        # behind in-flight forwards (see start_loading).
+        self.load_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -929,9 +926,9 @@ class HiCacheController:
         producer_event.start_event.record()
 
         if self.load_fence_stream is not None:
-            # Pages reallocated to this load can still take writes from rounds
-            # launched before their free; compute-stream consumers are ordered
-            # after those writes implicitly, this H2D load must fence.
+            # in overlap scheduling, reclaimed pages might still be written by the forward thread
+            # therefore a fence is needed for loading thread to prevent memory corruption
+            # todo: it's possible to use a finer-grained fence
             self.l2_transfer_engine.host_to_device_stream.wait_stream(
                 self.load_fence_stream
             )
