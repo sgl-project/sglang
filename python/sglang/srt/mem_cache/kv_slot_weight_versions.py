@@ -25,18 +25,18 @@ class KvSlotWeightVersions:
         self._version_str_by_id: List[str] = []
         self._version_id_by_str: Dict[str, int] = {}
 
-    def record(self, *, slot_indices: torch.Tensor, version: str) -> None:
+    def stamp_slots(self, *, slot_indices: torch.Tensor, version: str) -> None:
         self._slot_version_ids[slot_indices] = self._intern(version=version)
 
-    def record_req(self, req: Req) -> None:
+    def fill_req_prefill_weight_versions(self, req: Req) -> None:
         num_prompt_tokens = min(
             len(req.origin_input_ids), req.effective_kv_committed_len()
         )
-        req.prefill_weight_versions = self.lookup_spans(
+        req.prefill_weight_versions = self._lookup_spans(
             self._req_to_token_pool.req_to_token[req.req_pool_idx, :num_prompt_tokens]
         )
 
-    def lookup_spans(self, slot_indices: torch.Tensor) -> WeightVersionSpans:
+    def _lookup_spans(self, slot_indices: torch.Tensor) -> WeightVersionSpans:
         version_ids = self._slot_version_ids[slot_indices]
         if len(version_ids) == 0:
             return []

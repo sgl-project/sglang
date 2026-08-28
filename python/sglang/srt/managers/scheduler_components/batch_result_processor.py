@@ -267,7 +267,9 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
                     if self.kv_slot_weight_versions is not None:
-                        self.kv_slot_weight_versions.record_req(req)
+                        self.kv_slot_weight_versions.fill_req_prefill_weight_versions(
+                            req
+                        )
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
@@ -353,7 +355,9 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
                     if self.kv_slot_weight_versions is not None:
-                        self.kv_slot_weight_versions.record_req(req)
+                        self.kv_slot_weight_versions.fill_req_prefill_weight_versions(
+                            req
+                        )
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
                     req.update_finish_state()

@@ -46,26 +46,30 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_never_written_slots_fail_the_lookup(self):
         """Looking up a slot no forward ever stamped is a bug, not a version."""
         with self.assertRaisesRegex(ValueError, r"\[0, 1, 2\]"):
-            _table().lookup_spans(_slots(0, 1, 2))
+<<<<<<< ours
+            _table()._lookup_spans(_slots(0, 1, 2))
+=======
+            _table()._lookup_spans(_slots(0, 1, 2))
+>>>>>>> theirs
 
     def test_single_version_collapses_into_one_span(self):
         """Slots written by one version compress into a single span."""
         table = _table()
-        table.record(slot_indices=_slots(3, 4, 5), version="v0")
+        table.stamp_slots(slot_indices=_slots(3, 4, 5), version="v0")
 
         self.assertEqual(
-            table.lookup_spans(_slots(3, 4, 5)),
+            table._lookup_spans(_slots(3, 4, 5)),
             [WeightVersionSpan(version="v0", start=0, end=3)],
         )
 
     def test_rewriting_slots_under_a_new_version_splits_the_lookup(self):
         """Re-recording the tail of a sequence yields an old-version prefix and a new-version suffix."""
         table = _table()
-        table.record(slot_indices=_slots(1, 2, 3, 4), version="v0")
-        table.record(slot_indices=_slots(3, 4), version="v1")
+        table.stamp_slots(slot_indices=_slots(1, 2, 3, 4), version="v0")
+        table.stamp_slots(slot_indices=_slots(3, 4), version="v1")
 
         self.assertEqual(
-            table.lookup_spans(_slots(1, 2, 3, 4)),
+            table._lookup_spans(_slots(1, 2, 3, 4)),
             [
                 WeightVersionSpan(version="v0", start=0, end=2),
                 WeightVersionSpan(version="v1", start=2, end=4),
@@ -75,31 +79,35 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_one_unwritten_slot_among_written_ones_fails_the_lookup(self):
         """A single never-stamped slot inside a prompt is reported by index."""
         table = _table()
-        table.record(slot_indices=_slots(1, 3), version="v0")
+        table.stamp_slots(slot_indices=_slots(1, 3), version="v0")
 
         with self.assertRaisesRegex(ValueError, r"\[2\]"):
-            table.lookup_spans(_slots(1, 2, 3))
+<<<<<<< ours
+            table._lookup_spans(_slots(1, 2, 3))
+=======
+            table._lookup_spans(_slots(1, 2, 3))
+>>>>>>> theirs
 
     def test_non_adjacent_slots_with_the_same_version_merge(self):
         """Compression follows lookup order, not slot order, so the same version merges."""
         table = _table()
-        table.record(slot_indices=_slots(9, 2, 5), version="v0")
+        table.stamp_slots(slot_indices=_slots(9, 2, 5), version="v0")
 
         self.assertEqual(
-            table.lookup_spans(_slots(9, 2, 5)),
+            table._lookup_spans(_slots(9, 2, 5)),
             [WeightVersionSpan(version="v0", start=0, end=3)],
         )
 
     def test_version_ids_are_interned_and_never_reassigned(self):
         """Re-recording an already seen version reuses its id instead of growing the table."""
         table = _table()
-        table.record(slot_indices=_slots(0), version="v0")
-        table.record(slot_indices=_slots(1), version="v1")
-        table.record(slot_indices=_slots(2), version="v0")
+        table.stamp_slots(slot_indices=_slots(0), version="v0")
+        table.stamp_slots(slot_indices=_slots(1), version="v1")
+        table.stamp_slots(slot_indices=_slots(2), version="v0")
 
         self.assertEqual(table._version_str_by_id, ["v0", "v1"])
         self.assertEqual(
-            table.lookup_spans(_slots(0, 2, 1)),
+            table._lookup_spans(_slots(0, 2, 1)),
             [
                 WeightVersionSpan(version="v0", start=0, end=2),
                 WeightVersionSpan(version="v1", start=2, end=3),
@@ -108,18 +116,22 @@ class TestKvSlotWeightVersions(CustomTestCase):
 
     def test_empty_lookup_returns_no_spans(self):
         """Looking up an empty prompt yields an empty span list."""
-        self.assertEqual(_table().lookup_spans(_slots()), [])
+        self.assertEqual(_table()._lookup_spans(_slots()), [])
 
-    def test_record_req_resolves_the_prompt_slots_onto_the_request(
+<<<<<<< ours
+    def test_fill_req_prefill_weight_versions_resolves_the_prompt_slots_onto_the_request(
+=======
+    def test_fill_req_prefill_weight_versions_resolves_the_prompt_slots_onto_the_request(
+>>>>>>> theirs
         self,
     ):
         """The prompt's KV slots resolve to the versions that computed them."""
         table = _table(slots_of_req=[4, 5, 6, 7, 8])
-        table.record(slot_indices=_slots(4, 5), version="v0")
-        table.record(slot_indices=_slots(6), version="v1")
+        table.stamp_slots(slot_indices=_slots(4, 5), version="v0")
+        table.stamp_slots(slot_indices=_slots(6), version="v1")
         req = _ReqStub(num_prompt_tokens=3, kv_committed_len=5)
 
-        table.record_req(req)
+        table.fill_req_prefill_weight_versions(req)
 
         self.assertEqual(
             req.prefill_weight_versions,
@@ -129,15 +141,19 @@ class TestKvSlotWeightVersions(CustomTestCase):
             ],
         )
 
-    def test_record_req_is_clamped_to_the_committed_kv_length(
+<<<<<<< ours
+    def test_fill_req_prefill_weight_versions_is_clamped_to_the_committed_kv_length(
+=======
+    def test_fill_req_prefill_weight_versions_is_clamped_to_the_committed_kv_length(
+>>>>>>> theirs
         self,
     ):
         """A prompt whose KV is only partially committed reports only the committed tokens."""
         table = _table(slots_of_req=[4, 5])
-        table.record(slot_indices=_slots(4, 5), version="v0")
+        table.stamp_slots(slot_indices=_slots(4, 5), version="v0")
         req = _ReqStub(num_prompt_tokens=5, kv_committed_len=2)
 
-        table.record_req(req)
+        table.fill_req_prefill_weight_versions(req)
 
         self.assertEqual(
             req.prefill_weight_versions,

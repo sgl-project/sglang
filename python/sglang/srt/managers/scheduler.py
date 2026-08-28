@@ -3980,7 +3980,7 @@ class Scheduler(
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if self.kv_slot_weight_versions is not None and batch.out_cache_loc is not None:
-            self.kv_slot_weight_versions.record(
+            self.kv_slot_weight_versions.stamp_slots(
                 slot_indices=batch.out_cache_loc,
                 version=get_server_args().weight_version,
             )
