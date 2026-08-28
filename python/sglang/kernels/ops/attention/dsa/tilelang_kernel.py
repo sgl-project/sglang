@@ -71,6 +71,13 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+@lru_cache(maxsize=1)
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -1348,13 +1355,22 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        assert not return_lse, "tilelang HIP sparse fwd does not return LSE"
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
+        assert (
+            not return_lse
+        ), "tilelang partial+combine sparse fwd does not return LSE"
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                # CUDA: the fp8 partial kernel is generic TileLang (no HIP
+                # intrinsics). Tiles sized for the ~100 KB dynamic-smem class
+                # (SM12x): fp8 K tiles are half the bytes of bf16, so
+                # block_I=32/threads=128 uses ~25 KB smem and block_I=64
+                # would use ~42 KB; 32/128 is the shape validated on GB10.
+                block_I, threads, block_per_cu, cu = 32, 128, 1, _cuda_sm_count()
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304

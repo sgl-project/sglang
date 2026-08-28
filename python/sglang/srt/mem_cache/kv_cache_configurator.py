@@ -2481,6 +2481,16 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
+    # On CUDA, the TileLang DSA kernels likewise consume the raw MLA KV layout
+    # when the KV cache is fp8. Arg validation (_check_tilelang_dsa_fp8_kv)
+    # guarantees prefill == decode == tilelang whenever tilelang is combined
+    # with an fp8_e4m3 KV cache on CUDA, so no mixed-layout consumer exists.
+    if not _is_hip and (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
+    ):
+        return kv_cache_dim
+
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
