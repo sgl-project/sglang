@@ -49,6 +49,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     get_model_task_type_for_server_args,
     get_perf_baseline_update_path,
     get_sampling_param_field_names_for_server_args,
+    supports_auto_residency_for_server_args,
 )
 from sglang.multimodal_gen.test.test_utils import (
     SGL_TEST_FILES_CI_DATA_REVISION,
@@ -182,7 +183,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     has_explicit_warmup_workload = _has_server_option(
         extra_args, server_args.extras, "--warmup-sampling-params"
     )
-    if not has_explicit_warmup_workload:
+    if not has_explicit_warmup_workload and supports_auto_residency_for_server_args(
+        server_args
+    ):
         warmup_sampling_params = _case_warmup_sampling_params(case)
         if warmup_sampling_params:
             encoded = json.dumps(warmup_sampling_params, separators=(",", ":"))

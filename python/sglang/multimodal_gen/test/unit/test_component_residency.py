@@ -22,6 +22,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
+def _server_args(*, supports_auto_residency=True):
+    return SimpleNamespace(
+        enable_layerwise_nvtx_marker=False,
+        pipeline_config=SimpleNamespace(
+            supports_auto_residency=supports_auto_residency,
+        ),
+    )
+
+
 def test_component_offload_releases_preferred_component_after_request():
     strategy = ComponentOffloadStrategy()
     strategy.finish_use = Mock()
@@ -185,7 +194,7 @@ def test_group_warmup_state_requires_every_batch_to_be_warmup():
         _stage_name_mapping={},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
 
     manager.begin_request(
@@ -223,7 +232,7 @@ def test_reports_components_with_mixed_use_dtypes():
         },
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
 
     manager.begin_request(
@@ -269,7 +278,7 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
         _stage_name_mapping={"denoise": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.strategy_for = Mock(return_value=Mock())
     manager.refresh_pipeline(pipeline)
@@ -317,7 +326,7 @@ def test_failed_warmup_phase_survives_cleanup(monkeypatch):
         _stage_name_mapping={"denoise": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.refresh_pipeline(pipeline)
     manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
@@ -333,6 +342,32 @@ def test_failed_warmup_phase_survives_cleanup(monkeypatch):
         ("transformer",), 7, prefetched_components=("transformer",)
     )
     assert peaks["request:cleanup"] == WarmupPhasePeak((), 2)
+
+
+def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        reset_peak_memory_stats=Mock(),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args(supports_auto_residency=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+
+    manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
+    manager.before_stage(stage, 0, SimpleNamespace(is_warmup=True), server_args)
+    manager.finish_request()
+
+    assert manager._track_warmup_memory is False
+    assert manager.take_warmup_phase_peaks() == {}
+    device_module.reset_peak_memory_stats.assert_not_called()
 
 
 def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):
@@ -352,7 +387,7 @@ def test_warmup_records_full_weight_transition_without_preparing(monkeypatch):
         _stage_name_mapping={"lora_switch": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.strategy_for = Mock()
     manager.refresh_pipeline(pipeline)
@@ -392,7 +427,7 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
         _stage_name_mapping={"stage": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     strategy = Mock()
     manager.strategy_for = Mock(return_value=strategy)
@@ -436,7 +471,7 @@ def test_warmup_attributes_prefetch_peak_to_prefetched_component(monkeypatch):
         },
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     strategy = Mock()
     strategy.prefetch_for_use.return_value = True
@@ -486,7 +521,7 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
         _stage_name_mapping={"stage": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.strategy_for = Mock(return_value=Mock())
     manager.refresh_pipeline(pipeline)
@@ -520,7 +555,7 @@ def test_warmup_preserves_repeated_phase_layouts(monkeypatch):
         _stage_name_mapping={"stage": stage},
         component_residency_strategies={},
     )
-    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    server_args = _server_args()
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.refresh_pipeline(pipeline)
     manager.begin_request([stage], SimpleNamespace(is_warmup=True), server_args)
