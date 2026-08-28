@@ -395,7 +395,7 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
-        warm_worker_batch_size=args.warm_worker_batch_size,
+        fork_worker_batch_size=args.fork_worker_batch_size,
     )
 
 
@@ -489,18 +489,18 @@ def main():
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
     parser.add_argument(
-        "--warm-worker-batch-size",
+        "--fork-worker-batch-size",
         type=int,
         default=1,
         help=(
-            "Reuse one Python interpreter for this many consecutive test files "
-            "(default: 1, preserving one subprocess per file)."
+            "Preload common modules, then run this many files in isolated fork "
+            "children (default: 1, preserving one exec per file)."
         ),
     )
     args = parser.parse_args()
 
-    if args.warm_worker_batch_size <= 0:
-        parser.error("--warm-worker-batch-size must be positive")
+    if args.fork_worker_batch_size <= 0:
+        parser.error("--fork-worker-batch-size must be positive")
 
     # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):
