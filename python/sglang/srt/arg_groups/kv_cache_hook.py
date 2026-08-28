@@ -295,7 +295,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # exposes each layer as a DENSE contiguous per-layer view
     # (build_dense_mla_views), which the paged MLA kernels consume directly,
     # with their kv_indices / block tables remapped to dense ids. Names below
-    # are the RESOLVED ids from _resolved_attention_backends: "flashinfer" is
+    # are the RESOLVED ids from attention_backends_of: "flashinfer" is
     # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
     # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
     # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its

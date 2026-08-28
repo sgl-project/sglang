@@ -29,8 +29,10 @@ logger = logging.getLogger(__name__)
 def is_post_capture_kv_active(
     *, server_args: ServerArgs, is_draft_worker: bool
 ) -> bool:
+    from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
+
     return (
-        server_args.post_capture_kv_sizing_planned()
+        post_capture_kv_sizing_planned(server_args)
         and current_platform.is_cuda()
         and not is_draft_worker
     )

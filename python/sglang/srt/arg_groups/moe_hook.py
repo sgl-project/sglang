@@ -8,7 +8,10 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    cutedsl_moe_max_num_tokens,
     declare_resolution,
+    max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
     resolved_view,
     resolving_view,
 )
@@ -376,7 +379,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if view.disaggregation_mode != "decode":
-        prefill_tokens = server_args.max_prefill_buffer_tokens() or (
+        prefill_tokens = max_prefill_buffer_tokens(server_args) or (
             view.max_prefill_tokens or 0
         )
         if prefill_tokens > capacity:
@@ -400,7 +403,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
         graph_bs = min(graph_bs, per_rank_pool_bs)
     tokens_per_req = (
-        server_args.max_speculative_num_draft_tokens or 1
+        max_speculative_num_draft_tokens(server_args) or 1
         if view.speculative_algorithm
         else 1
     )
@@ -464,7 +467,7 @@ def validate_cutedsl_a2a_token_budget(server_args: Any):
         and cfg.disaggregation_mode != "decode"
     ):
         return
-    required_tokens = server_args.cutedsl_moe_max_num_tokens()
+    required_tokens = cutedsl_moe_max_num_tokens(server_args)
     max_dispatch_tokens_per_rank = (
         envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
     )

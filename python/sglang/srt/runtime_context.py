@@ -1672,7 +1672,7 @@ def max_prefill_buffer_tokens() -> int:
 
     Every input is a published leaf (``schedule`` plus the configured PP size),
     so this derives from the bags and follows a post-publish override;
-    ``ServerArgs.max_prefill_buffer_tokens`` is the pre-publish equivalent and
+    ``overrides.max_prefill_buffer_tokens`` is the pre-publish equivalent and
     ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
     """
     import math
@@ -1726,17 +1726,19 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 # --- Derived config accessors ------------------------------------------------
 #
 # A few values are computed from several config fields plus the HF config, so
-# they are ``ServerArgs`` members rather than namespace leaves. Business code
-# must not reach for the startup record to get them: these accessors are the
-# named home, and this module — which owns the slot — is the only place that
-# reads it. Each one keeps the member's exact semantics, including which model
+# they are derived accessors rather than namespace leaves. Business code must
+# not reach for the startup record to get them: these accessors are the named
+# home, and this module — which owns the slot — is the only place that reads
+# it. Each one keeps the pre-publish function's exact semantics, including which model
 # config it derives from (always the process's, i.e. the target's).
 
 
 def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""
-    return get_server_args().mamba_cache_chunk_size
+    from sglang.srt.arg_groups.overrides import mamba_cache_chunk_size as _of
+
+    return _of(get_server_args())
 
 
 def mamba_checkpoint_grid(tree_page: int) -> int:
@@ -1759,7 +1761,7 @@ def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 
     All three inputs are ``spec`` leaves, so this derives from the bags and
-    follows a post-publish override; ``ServerArgs.max_speculative_num_draft_tokens``
+    follows a post-publish override; ``overrides.max_speculative_num_draft_tokens``
     is the pre-publish equivalent. Adaptive spec resolves the count from its
     candidate-step table instead of the flat field.
     """
@@ -1798,7 +1800,7 @@ def attention_backends() -> tuple:
     back to ``attention_backend``.
 
     All three inputs are ``exec.kernel`` leaves, so this derives from the bags
-    and follows a post-publish override; ``ServerArgs.get_attention_backends``
+    and follows a post-publish override; ``overrides.attention_backends_of``
     is the pre-publish equivalent the resolution pipeline uses. A built runner
     stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
     read that when there is a runner in hand.
@@ -1822,7 +1824,7 @@ def cutedsl_moe_max_num_tokens() -> int:
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
     this derives from the bags and follows a post-publish override;
-    ``ServerArgs.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
+    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
     resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
     capture, and the decode/verify bound.
     """

@@ -47,7 +47,11 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         generate_decode_cuda_graph_batch_sizes,
         generate_prefill_cuda_graph_batch_sizes,
     )
-    from sglang.srt.arg_groups.overrides import model_config_of, use_mla_backend
+    from sglang.srt.arg_groups.overrides import (
+        model_config_of,
+        post_capture_kv_sizing_planned,
+        use_mla_backend,
+    )
 
     cfg = resolving_view(server_args)
     # A copy, so an earlier declaration keeps the value it recorded.
@@ -213,7 +217,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         )
 
     if cfg.mem_fraction_static is None:
-        if server_args.post_capture_kv_sizing_planned():
+        if post_capture_kv_sizing_planned(server_args):
             # Post-capture sizing measures free memory after graph capture, so
             # skip the graph/activation reserve; keep only the floor + parallel slack.
             reserved_mem = 1536
