@@ -59,9 +59,15 @@ import triton.language as tl
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_hip
 
 LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use exp2.
-_MAX_KV_SPLITS = 16  # Hard cap on kv_splits (see _kv_splits_heuristic).
+
+# Split-K heuristic constants. The (1.5, 16) pair is tuned for MI355X (see
+# _kv_splits_heuristic); CUDA is unmeasured here and keeps the prior (2.0, 64).
+_is_hip = is_hip()
+_MAX_KV_SPLITS = 16 if _is_hip else 64  # Hard cap on kv_splits.
+_TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
 #
@@ -141,7 +147,7 @@ def _kv_splits_heuristic(
     H: int,
     block_h: int,
     num_cu: int | None = None,
-    target_wg_per_cu: float = 1.5,
+    target_wg_per_cu: float = _TARGET_WG_PER_CU,
     max_kv_splits: int = _MAX_KV_SPLITS,
 ) -> int:
     """Pick KV_SPLITS to fill the GPU. CUDAGraph-safe: depends ONLY on
@@ -159,17 +165,18 @@ def _kv_splits_heuristic(
       else:                       splits = prev_pow2(min(target_wg/base_ctas,
                                                           max_kv_splits))
 
-    ``target_wg_per_cu`` is 1.5. At 2.0 the rule over-split by exactly one
-    power of two across the whole decode range: at H=128/block_h=64 it chose
-    8/4/2 splits for T=32/64/128 where 4/2/1 measure faster. Split-K only pays
-    while the base grid underfills the device, and each extra split adds a
-    partial-buffer write plus reduce-kernel work that the shrinking per-split
-    K no longer amortizes.
+    On HIP the tuned ``target_wg_per_cu`` is 1.5 (CUDA keeps 2.0, unmeasured
+    here). At 2.0 the rule over-split by exactly one power of two across the
+    whole decode range on MI355X: at H=128/block_h=64 it chose 8/4/2 splits for
+    T=32/64/128 where 4/2/1 measure faster. Split-K only pays while the base
+    grid underfills the device, and each extra split adds a partial-buffer write
+    plus reduce-kernel work that the shrinking per-split K no longer amortizes.
 
-    ``max_kv_splits`` (default 16) caps the number of split-kernel CTAs per
-    token. Higher values buy more parallelism for bs=1 long-ctx in principle,
-    but measured optima never exceed 16 even at T=1: when per-token K is short
-    most splits fall through and the launch plus reduce overhead dominates.
+    ``max_kv_splits`` caps the number of split-kernel CTAs per token (16 on HIP,
+    64 on CUDA). Higher values buy more parallelism for bs=1 long-ctx in
+    principle, but measured optima on MI355X never exceed 16 even at T=1: when
+    per-token K is short most splits fall through and the launch plus reduce
+    overhead dominates.
 
     Measured over T in {1..256} x kv_len in {128,512,1024} at H=128 on MI355X,
     scoring each candidate by distance from the per-shape optimum: (2.0, 64)

@@ -70,7 +70,7 @@ def test_splits_never_increase_with_token_count():
 def test_saturated_grid_does_not_split():
     """Once the base grid alone meets the target occupancy, splitting can only
     add partial-buffer writes and reduce work."""
-    # base_ctas = T * ceil(H/block_h); target_wg = 1.5 * num_cu by default.
+    # base_ctas = T * ceil(H/block_h); target_wg = target_wg_per_cu * num_cu.
     saturating_tokens = NUM_CU * 4  # 1024 tokens x 2 head blocks = 2048 CTAs
     assert _kv_splits_heuristic(saturating_tokens, HEADS, BLOCK_H, num_cu=NUM_CU) == 1
 
@@ -97,9 +97,21 @@ def test_does_not_read_tensors_only_capture_time_scalars():
     ],
 )
 def test_tuned_operating_points(tokens, expected):
-    """Values measured fastest on MI355X. Update alongside the constants if the
-    heuristic is re-tuned -- this is the one test that pins numbers."""
-    assert _kv_splits_heuristic(tokens, HEADS, BLOCK_H, num_cu=NUM_CU) == expected
+    """Values measured fastest on MI355X. The MI355X constants are passed
+    explicitly so the table holds on any CI runner (CUDA keeps 2.0/64); update
+    alongside the constants if the heuristic is re-tuned -- this is the one test
+    that pins numbers."""
+    assert (
+        _kv_splits_heuristic(
+            tokens,
+            HEADS,
+            BLOCK_H,
+            num_cu=NUM_CU,
+            target_wg_per_cu=1.5,
+            max_kv_splits=16,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize("num_cu", [64, 104, 128, 228, 256, 304])
