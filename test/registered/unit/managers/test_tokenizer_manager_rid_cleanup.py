@@ -14,25 +14,24 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import (  # noqa: E402
+from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
 )
-from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import (
     ReqState,
     TokenizerManager,
 )
-from sglang.srt.observability.req_time_stats import (  # noqa: E402
+from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
@@ -641,9 +640,7 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         self.assertEqual(out["text"], "hello")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-﻿class TestGenerateRequestCancellationCleanup(CustomTestCase):
+class TestGenerateRequestCancellationCleanup(CustomTestCase):
     """Cancellation must not orphan requests that reached the scheduler."""
 
     def test_cancelled_request_after_dispatch_keeps_state_for_abort_echo(self):
@@ -688,23 +685,35 @@ if __name__ == "__main__":
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_normal_stream_completion_does_not_dispatch_abort_or_metric(self):
-        tm = _make_tokenizer_manager(self)
-        obj = _make_generate_obj("completed", is_single=True)
+        tm = _make_tm_for_generate(self)
+        rid = "completed"
+        obj = GenerateReqInput(text="hello", rid=rid, sampling_params={})
+        tm._tokenize_one_request = AsyncMock(
+            return_value=MagicMock(input_ids=[1, 2, 3])
+        )
+        tm._send_one_request = Mock()
+
+        async def _completed_wait(*args, **kwargs):
+            yield {"text": "done"}
+            tm.rid_to_state.pop(rid)
+
+        tm._wait_one_response = _completed_wait
         tm.enable_metrics = True
         tm.metrics_collector = Mock()
         tm._dispatch_to_scheduler = Mock()
         serving = MagicMock(tokenizer_worker_num=1)
 
         async def drive():
+            responses = [response async for response in tm.generate_request(obj)]
+            self.assertEqual(responses, [{"text": "done"}])
             with patch(
                 "sglang.srt.managers.tokenizer_manager.get_serving",
                 return_value=serving,
+            ), patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                new=AsyncMock(),
             ):
-                with patch(
-                    "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
-                    new=AsyncMock(),
-                ):
-                    await tm.create_abort_task(obj)()
+                await tm.create_abort_task(obj)()
 
         asyncio.run(drive())
         tm._dispatch_to_scheduler.assert_not_called()
@@ -763,12 +772,11 @@ if __name__ == "__main__":
             with patch(
                 "sglang.srt.managers.tokenizer_manager.get_serving",
                 return_value=serving,
+            ), patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                new=AsyncMock(),
             ):
-                with patch(
-                    "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
-                    new=AsyncMock(),
-                ):
-                    await tm.create_abort_task(obj)()
+                await tm.create_abort_task(obj)()
 
         asyncio.run(abort())
         tm._dispatch_to_scheduler.assert_called_once()
@@ -836,3 +844,5 @@ if __name__ == "__main__":
         )
 
 
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

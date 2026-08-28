@@ -801,9 +801,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._init_req_state(obj, request)
         try:
             dispatched_rids = set()
-            # The delayed disconnect abort must target the scheduler request IDs,
-            # including batch and parallel-sampling IDs generated below.
-            obj._dispatched_rids = dispatched_rids
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
 
@@ -832,6 +829,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ):
                         yield response
         except (asyncio.CancelledError, GeneratorExit):
+            # Record scheduler request IDs only for a cancelled stream. The
+            # response background task runs after both cancellation and normal
+            # completion, so recording them earlier would dispatch an abort for
+            # a request that has already completed.
+            obj._dispatched_rids = dispatched_rids.copy()
             # Once sent to the scheduler, retain the state until the abort echo
             # removes it. Dropping it here makes the delayed disconnect abort
             # hit abort_request's missing-state guard, leaving the scheduler to
@@ -1778,9 +1780,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"]["response_sent_to_client_ts"] = (
-                        state.time_stats.get_response_sent_to_client_realtime()
-                    )
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1808,9 +1810,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"]["response_sent_to_client_ts"] = (
-                        state.time_stats.get_response_sent_to_client_realtime()
-                    )
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
                 yield out
             else:
                 if (
@@ -3322,9 +3324,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[
-            ScaleElasticEPReqOutput
-        ] = await self.scale_elastic_ep_communicator(obj)
+        responses: List[ScaleElasticEPReqOutput] = (
+            await self.scale_elastic_ep_communicator(obj)
+        )
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase
