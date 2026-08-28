@@ -432,12 +432,15 @@ class SchedulerBatchResultProcessor:
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph
-        self.metrics_reporter.report_prefill_stats(
-            batch=batch,
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        # None on decode->extend converted batches; they are decode work and
+        # have no prefill stats to report.
+        if batch.prefill_stats is not None:
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
         is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
