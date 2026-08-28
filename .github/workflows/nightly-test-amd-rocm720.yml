@@ -19,7 +19,6 @@ on:
           - 'all'
           - rocm724
           - rocm720
-          - rocm1000
       aiter_ref:
         description: 'Override AITER commit (optional, leave empty to use Dockerfile default)'
         required: false
@@ -140,8 +139,6 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
-  # ROCm 10.0.0 GA bring-up images are published to the scratch registry.
-  AMD_CI_IMAGE_REPO: ${{ inputs.rocm_version == 'rocm1000' && 'bingxche/sgl-test' || 'rocm/sgl-dev' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
@@ -445,14 +442,9 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Probe ROCm 10.0.0 GA runtime
-        if: matrix.rocm_version == 'rocm1000'
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh python3 -c 'import amdsmi, os, torch; image_arch = os.environ.get("GPU_ARCH"); count = torch.cuda.device_count(); archs = [getattr(torch.cuda.get_device_properties(i), "gcnArchName", "unknown") for i in range(count)]; props = [(torch.cuda.get_device_name(i), archs[i]) for i in range(count)]; amdsmi.amdsmi_init(); handles = amdsmi.amdsmi_get_processor_handles(); print({"torch": torch.__version__, "hip": torch.version.hip, "image_arch": image_arch, "devices": props, "amdsmi_handles": len(handles)}); amdsmi.amdsmi_shut_down(); assert image_arch == "gfx942-rocm1000" and count >= 2 and len(handles) > 0 and all(arch.startswith("gfx942") for arch in archs)'
-
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Performance Test ROCm (2-GPU Text Models)
+      - name: Performance Test (2-GPU Text Models)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1016,7 +1008,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
+      - name: Performance Test MI35x (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 150
         continue-on-error: true
         run: |

@@ -47,7 +47,7 @@ ARG BASE_IMAGE_942_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_re
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
-# The ROCm 10.0.0 GA flavors default to the rocm1000-base stage below rather
+# The ROCm 10.0.0 flavors default to the rocm1000-base stage below rather
 # than a published image; point these at one to build on a prebuilt base.
 ARG BASE_IMAGE_942_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_950_ROCM1000="rocm1000-base"
@@ -212,15 +212,14 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
 # ===============================
-# Shared ROCm 10.0.0 GA base for gfx942 and gfx950. Assemble the stack from
+# Shared ROCm 10.0.0 base for gfx942 and gfx950. Assemble the stack from
 # AMD's stable wheels on a plain Ubuntu base so each output image carries only
-# its own GPU device payload. This also keeps the GA comparison aligned with
-# the wheel-based RC4 images already validated by this workflow.
+# its own GPU device payload.
 # The SDK lands in site-packages instead of /opt/rocm, which the rest of this
 # Dockerfile and AITER both assume, hence the path fixups below.
 #
 # This is deliberately AMD's stable channel, not a prerelease or nightly.
-# Every ROCm/PyTorch artifact below is pinned to the 10.0.0 GA release.
+# Every ROCm/PyTorch artifact below is pinned to the 10.0.0 release.
 #
 # Python 3.12 (the Ubuntu 24.04 default) rather than 3.13/3.14: st_attn==0.0.7,
 # vsa==0.0.4, petit_kernel==0.0.2 and wave-lang==3.8.2 publish wheels only up to
@@ -272,7 +271,7 @@ RUN set -eux; \
     ROCM_DEVICE_ARCH="${GPU_ARCH%%-*}"; \
     case " ${ROCM_DEVICE_ARCH_LIST} " in \
       *" ${ROCM_DEVICE_ARCH} "*) ;; \
-      *) echo "Unsupported ROCm 10.0.0 GA GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
+      *) echo "Unsupported ROCm 10.0.0 GPU_ARCH=${GPU_ARCH}"; exit 1 ;; \
     esac; \
     python3 -m pip install --no-cache-dir \
         --index-url ${ROCM_INDEX_URL} \
@@ -346,7 +345,7 @@ RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.
 RUN ln -s ${ROCM_HOME} /opt/rocm
 
 # ===============================
-# Base image 942 with ROCm 10.0.0 GA and args (Python 3.12 + torch 2.11)
+# Base image 942 with ROCm 10.0.0 and args (Python 3.12 + torch 2.11)
 # BUILD_TRITON=0 keeps the Triton installed above, which is the build AMD ships
 # with this SDK; the BUILD_TRITON=1 path installs a ROCm 7.2 wheel instead.
 FROM $BASE_IMAGE_942_ROCM1000 AS gfx942-rocm1000
@@ -362,7 +361,7 @@ ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
 # ===============================
-# Base image 950 with ROCm 10.0.0 GA and args (Python 3.12 + torch 2.11)
+# Base image 950 with ROCm 10.0.0 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
@@ -517,14 +516,14 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # ubuntu24.04 base installs the `rocm` apt metapackage and does not; noble's
 # distro table has MI300 (74A*) but no MI355X (75A3), so gfx950-rocm724 would
 # otherwise report "AMD Radeon Graphics" and miss every name-keyed config.
-# The ROCm 10.0.0 GA flavors need nothing here: their libdrm comes from the pip SDK, which
+# The ROCm 10.0.0 flavors need nothing here: their libdrm comes from the pip SDK, which
 # links the ids table into libdrm_amdgpu.so itself (the .so carries the MI300X /
 # MI325X / MI355X names and never opens share/libdrm/amdgpu.ids).
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm1000*|*rocm7_14*) \
-        echo "pip ROCm SDK (GPU_ARCH=${GPU_ARCH}): libdrm has the ids table built in, skipping"; \
+      *rocm1000*) \
+        echo "ROCm 10.0.0 (GPU_ARCH=${GPU_ARCH}): pip SDK libdrm has the ids table built in, skipping"; \
         ;; \
       *rocm724*) \
         echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
@@ -565,7 +564,7 @@ RUN python -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
 # Install AMD SMI Python package from ROCm distribution.
-# Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10.0.0 GA
+# Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10.0.0
 # SDK pre-installs this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
@@ -576,7 +575,7 @@ RUN set -eux; \
         echo "ROCm 7.14 (GPU_ARCH=${GPU_ARCH}): skip amdsmi, see rocm1000-base libamd_smi note"; \
         ;; \
       *rocm720*|*rocm724*|*rocm1000*) \
-        echo "ROCm 7.2 / 10.0.0 GA flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        echo "ROCm 7.2 / 10.0.0 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
         && python3 -m pip install --no-cache-dir . \
         ;; \
