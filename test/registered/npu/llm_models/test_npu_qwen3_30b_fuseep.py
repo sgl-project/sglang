@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="per-commit-4-npu-a3")
 
 
-class TestQwen330Bw8a8FuseEPModel1(GSM8KAscendMixin, CustomTestCase):
+class TestQwen330Bw8a8FuseEPMode1(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the Qwen/Qwen3-30B-A3B-w8a8 model on the GSM8K dataset is no less than 0.90.
 
     [Test Category] Model
