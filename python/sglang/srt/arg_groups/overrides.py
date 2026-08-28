@@ -97,7 +97,7 @@ def register_model_override(architecture: str):
     The decorated callable receives ``(server_args, hf_config)``, must not
     mutate either, and returns a ``{field: resolved_value}`` dict (possibly
     empty when nothing applies). Providers needing derived model data beyond
-    the HF config go through ``server_args.get_model_config()`` (cached,
+    the HF config go through ``model_config_of(server_args)`` (cached,
     read-only) — never anything mutating.
     """
 
@@ -947,7 +947,7 @@ def _minimax_m2_overrides(server_args: Any, hf_config: Any) -> dict:
     if (
         is_sm100_supported()
         and cfg.moe_runner_backend == "auto"
-        and server_args.get_model_config().quantization == "modelopt_fp4"
+        and model_config_of(server_args).quantization == "modelopt_fp4"
     ):
         overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
         logger.info(
@@ -1268,7 +1268,7 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     elif cfg.attention_backend is None:
         overrides["attention_backend"] = default_attention_backend
     if is_sm100_supported() and cfg.moe_runner_backend == "auto":
-        if server_args.get_model_config().quantization == "modelopt_fp4":
+        if model_config_of(server_args).quantization == "modelopt_fp4":
             overrides["quantization"] = "modelopt_fp4"
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
@@ -1416,7 +1416,7 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
     if cfg.moe_runner_backend == "auto":
-        model_config = server_args.get_model_config()
+        model_config = model_config_of(server_args)
         # nvidia/DeepSeek-V4-Pro-NVFP4 uses the routed TRT-LLM runner.
         if model_config.nvfp4_moe_meta is not None:
             overrides["moe_runner_backend"] = "flashinfer_trtllm_routed"
@@ -1498,7 +1498,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     cache handling and the triton-backend assert stay in the arch branch)."""
     cfg = resolving_view(server_args)
     model_arch = hf_config.architectures[0]
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     overrides: Dict[str, Any] = {}
 
     is_modelopt = model_config.quantization in [
@@ -1610,14 +1610,14 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
         return {}
     sm100_default_attn_backend = "triton"
     # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
-    # _get_default_attn_backend handles the eagle_topk check.
+    # get_default_attn_backend handles the eagle_topk check.
     # There is only one case where page_size=1 is required,
     # which is when radix cache is enabled and both extra_buffer
     # and spec decoding are disabled.
     default_attn_backend = get_default_attn_backend(
         server_args,
         use_mla_backend=use_mla_backend(server_args),
-        model_config=server_args.get_model_config(),
+        model_config=model_config_of(server_args),
     )
     # The mamba radix-cache pass runs before this dispatch: read the
     # declared strategy through the view (the legacy branch observed the
@@ -1861,7 +1861,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         get_linear_attn_spec_by_arch,
     )
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
 
     in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
@@ -1899,7 +1899,7 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     PRISTINE dsa split backends (their resolution runs after this pass)."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):
@@ -1969,7 +1969,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     capability. The hisparse arm takes precedence under --enable-hisparse."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):
@@ -2069,7 +2069,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
     backend for DeepSeek"), NOT a dispatch-time declaration: the DSA
     kv-cache-dtype default earlier in the branch must read the PRISTINE
     quantization, so this resolution has to stay at its legacy slot."""
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
@@ -2156,7 +2156,7 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
     quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
     ep_size, exactly like the legacy in-branch writes."""
 
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
@@ -2202,7 +2202,7 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     """Slot pass in the DeepSeek V4 hook: default the kv-cache dtype to FP8
     (bfloat16 on NPU, where the pool geometry differs) and validate the
     result. The NPU split-backend writes stay in the hook."""
-    hf_config = view.get_model_config().hf_config
+    hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch != "DeepseekV4ForCausalLM":
         return {}
@@ -2275,7 +2275,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = view.get_model_config().hf_config.architectures[0]
+    model_arch = model_config_of(view).hf_config.architectures[0]
     if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -2349,7 +2349,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
     if parse_connector_type(view.model_path) == ConnectorType.INSTANCE:
         return False
     try:
-        hf_config = view.get_model_config().hf_config
+        hf_config = model_config_of(view).hf_config
         return hf_config.architectures[0] in [
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
@@ -2418,7 +2418,7 @@ def _attention_backend_default(view: Any) -> dict:
         return {"attention_backend": view.prefill_attention_backend}
     if view.attention_backend is None:
         backend = get_default_attn_backend(
-            view, use_mla_backend(view), view.get_model_config()
+            view, use_mla_backend(view), model_config_of(view)
         )
         logger.info(
             f"Attention backend not specified. Use {backend} backend by default."
@@ -2662,7 +2662,7 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
 @register_post_process
 def _attention_backend_dual_chunk(view: Any) -> dict:
     if (
-        getattr(view.get_model_config().hf_config, "dual_chunk_attention_config", None)
+        getattr(model_config_of(view).hf_config, "dual_chunk_attention_config", None)
         is not None
     ):
         if view.attention_backend is None:
@@ -3145,10 +3145,47 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
 def use_mla_backend(server_args: Any):
     from sglang.srt.configs.model_config import AttentionArch
 
-    model_config = server_args.get_model_config()
+    model_config = model_config_of(server_args)
     return model_config.attention_arch == AttentionArch.MLA
 
 
 def should_report_expert_balancedness(server_args: Any) -> bool:
     cfg = resolving_view(server_args)
     return cfg.expert_balancedness_report_mode != "off"
+
+
+def model_config_of(server_args: Any):
+    """The model configuration this record describes, built once and memoised.
+
+    Takes a view as readily as the record: a view is a read overlay of one
+    record, the memo has to live on that record either way, and the callers
+    that hold a view would otherwise all have to unwrap it themselves.
+    """
+    if isinstance(server_args, (ResolvedView, ResolvingConfig)):
+        server_args = record_of(server_args)
+    # Lazy init to avoid circular import
+    cfg = resolving_view(server_args)
+    from sglang.srt.configs.model_config import ModelConfig
+
+    memo = getattr(server_args, "_model_config", None)
+    if memo is not None:
+        # The key is the path this record carried when the cache was
+        # filled. The GGUF and ModelScope handlers declare a different
+        # `model_path`, and a configuration built before them describes
+        # another checkpoint. `ModelConfig` re-points its own `model_path`
+        # at the local pull directory when the weights sit behind an
+        # object-store URI, so its field is not the key. A configuration a
+        # fixture supplied carries no key and is handed back as it is.
+        built_from = getattr(server_args, "_model_config_built_from", None)
+        if built_from is None or built_from == cfg.model_path:
+            return memo
+
+    model_config = ModelConfig.from_server_args(server_args)
+    server_args._model_config = model_config
+    server_args._model_config_built_from = cfg.model_path
+    if model_config.is_hybrid_swa:
+        logger.info(
+            "Hybrid SWA model detected. architectures=%s",
+            model_config.hf_config.architectures,
+        )
+    return model_config

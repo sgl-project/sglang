@@ -186,6 +186,7 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
 
 def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.arg_groups.model_hook import handle_language_model_only
+    from sglang.srt.arg_groups.overrides import model_config_of
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
     from sglang.srt.server_args import resolve_encoder_transfer_backend
 
@@ -223,7 +224,7 @@ def handle_encoder_disaggregation(server_args: Any):
         )
 
     # Validate model type for encoder disaggregation
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(

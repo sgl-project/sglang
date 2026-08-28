@@ -110,7 +110,7 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.arg_groups.overrides import attention_backends_of, model_config_of
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
@@ -122,8 +122,10 @@ def apply_cuda_graph_compatibility(server_args: Any):
     # this runs first, so piecewise would otherwise silently win.
     if (
         cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and server_args.get_model_config().is_multimodal_piecewise_cuda_graph_supported
-        and not server_args.get_model_config().is_multimodal_breakable_cuda_graph_supported
+        and model_config_of(server_args).is_multimodal_piecewise_cuda_graph_supported
+        and not model_config_of(
+            server_args
+        ).is_multimodal_breakable_cuda_graph_supported
         # Keep trtllm_mla on the preferred breakable path, which now serves
         # MLA by falling back to the flashinfer MLA impl for extend.
         and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
@@ -151,12 +153,14 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
     """TcPiecewise (torch.compile + piecewise) is incompatible with
     these configurations. Most are torch.compile / dynamo limitations.
     """
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
 
     rules = [
         (
             "model-arch blacklist",
-            lambda: server_args.get_model_config().is_piecewise_cuda_graph_disabled_model,
+            lambda: model_config_of(server_args).is_piecewise_cuda_graph_disabled_model,
         ),
         ("DP attention", lambda: resolved_view(server_args).enable_dp_attention),
         ("full torch.compile mode", lambda: cfg.enable_torch_compile),
@@ -179,8 +183,10 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
         (
             "multimodal model",
-            lambda: server_args.get_model_config().is_multimodal
-            and not server_args.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+            lambda: model_config_of(server_args).is_multimodal
+            and not model_config_of(
+                server_args
+            ).is_multimodal_piecewise_cuda_graph_supported,
         ),
         (
             "GGUF quantization",
@@ -238,6 +244,8 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     memory-saver rejection in its own __init__; config-time rules can be
     added here as they're discovered.
     """
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -247,7 +255,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
         (
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
-            lambda: is_deepseek_v4(server_args.get_model_config().hf_config),
+            lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
         ),
         # CP all_gather replay size mismatch under BCG.
         (
@@ -273,8 +281,10 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
         (
             "multimodal model",
-            lambda: server_args.get_model_config().is_multimodal
-            and not server_args.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            lambda: model_config_of(server_args).is_multimodal
+            and not model_config_of(
+                server_args
+            ).is_multimodal_breakable_cuda_graph_supported,
         ),
     ]
     for name, predicate in rules:
@@ -321,7 +331,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.arg_groups.overrides import attention_backends_of, model_config_of
 
     cfg = resolving_view(server_args)
 
@@ -331,7 +341,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
         return
     if (
         "DeepseekV3ForCausalLM"
-        not in server_args.get_model_config().hf_config.architectures
+        not in model_config_of(server_args).hf_config.architectures
     ):
         return
     prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
@@ -393,6 +403,8 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     auto-disabled for this multimodal arch, and declarative model overrides
     materialize too late to steer cuda-graph resolution. Honors an explicit
     --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     if (
         cfg.cuda_graph_backend_prefill is not None
@@ -400,7 +412,7 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
-    arch = server_args.get_model_config().hf_config.architectures[0]
+    arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
@@ -413,13 +425,15 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
 
 
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     if (
         cfg.cuda_graph_max_bs_prefill is not None
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
-    arch = server_args.get_model_config().hf_config.architectures[0]
+    arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
         declare_resolution(
             server_args,

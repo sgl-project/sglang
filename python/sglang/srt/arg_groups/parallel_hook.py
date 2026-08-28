@@ -22,12 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
         from sglang.srt.configs.model_config import is_deepseek_dsa
         from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 
-        model_config = server_args.get_model_config()
+        model_config = model_config_of(server_args)
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
         if model_arch in CP_V2_DEFAULT_MODEL_CLASSES:

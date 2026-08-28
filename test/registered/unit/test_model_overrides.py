@@ -762,7 +762,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
-                get_model_config=lambda: model_config,
+                _model_config=model_config,
             ),
             hf_config,
         )
@@ -1310,7 +1310,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # dual-chunk config: mismatched explicit backend raises verbatim
         def _mc(dual):
             return SimpleNamespace(
-                get_model_config=lambda: SimpleNamespace(
+                _model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(dual_chunk_attention_config=dual)
                 ),
                 attention_backend="fa3",
@@ -1470,9 +1470,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 swa_full_tokens_ratio=ServerArgs.swa_full_tokens_ratio,
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
-                get_model_config=lambda: SimpleNamespace(
-                    is_fp4_experts=True, nvfp4_moe_meta=None
-                ),
+                _model_config=SimpleNamespace(is_fp4_experts=True, nvfp4_moe_meta=None),
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -1524,12 +1522,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         # FP8 checkpoints and non-CUDA platforms keep their platform-specific
         # auto-resolution paths.
-        fp8_model_config = lambda: SimpleNamespace(
-            is_fp4_experts=False, nvfp4_moe_meta=None
-        )
+        fp8_model_config = SimpleNamespace(is_fp4_experts=False, nvfp4_moe_meta=None)
         self.assertNotIn(
             "moe_runner_backend",
-            _deepseek_v4_overrides(_args(get_model_config=fp8_model_config), hf),
+            _deepseek_v4_overrides(_args(_model_config=fp8_model_config), hf),
         )
         self.assertNotIn(
             "moe_runner_backend",
@@ -1566,7 +1562,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _deepseek_v4_overrides(
                 _args(
-                    get_model_config=lambda: SimpleNamespace(
+                    _model_config=SimpleNamespace(
                         is_fp4_experts=False, nvfp4_moe_meta=object()
                     )
                 ),
@@ -1601,7 +1597,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
-                get_model_config=lambda: mc,
+                _model_config=mc,
             )
             defaults.update(kw)
             args = SimpleNamespace(**defaults)
@@ -1717,9 +1713,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
         with (
@@ -1813,9 +1807,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
         with (
@@ -1974,9 +1966,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
         with (
@@ -2020,9 +2010,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(kv_cache_dtype="auto", device="cuda")
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
         self.assertEqual(
@@ -2061,9 +2049,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
         with patch.object(overrides_module, "is_hip", return_value=True):
@@ -2131,9 +2117,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(
-                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-                )
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
         # arch guard: non-mamba arch declares nothing
@@ -2240,7 +2224,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
-                get_model_config=lambda: None,
                 mamba_radix_cache_strategy="auto",
                 disable_radix_cache=False,
                 speculative_algorithm=None,
@@ -2258,6 +2241,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             lambda server_args, **_: server_args.default_backend_for_test,
         ), patch.object(
             overrides_module, "use_mla_backend", return_value=False
+        ), patch.object(
+            overrides_module, "model_config_of", return_value=None
         ):
             # radix on + no extra buffer + no spec -> page_size=1 path
             self.assertEqual(
@@ -2465,7 +2450,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=1,
                 # `use_mla_backend` reads the model configuration; a non-MLA
                 # one keeps these assertions about the page constraints.
-                get_model_config=lambda: SimpleNamespace(attention_arch=None),
+                _model_config=SimpleNamespace(attention_arch=None),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -2551,9 +2536,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
-                    get_model_config=lambda: SimpleNamespace(
-                        attention_arch=AttentionArch.MLA
-                    ),
+                    _model_config=SimpleNamespace(attention_arch=AttentionArch.MLA),
                     page_size=16,  # MLA decode accepts 16
                 )
             ),
@@ -2665,7 +2648,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _quantization_explicitly_unset=False,
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
-                get_model_config=lambda: SimpleNamespace(
+                _model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(
                         architectures=[arch], quantization_config=quant_cfg
                     )

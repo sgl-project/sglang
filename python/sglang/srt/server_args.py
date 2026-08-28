@@ -3733,7 +3733,7 @@ class ServerArgs:
 
         # Everything outside the fields, enumerated from the instance: the raw
         # snapshot, the stash, and what resolution memoized -- including the
-        # `get_model_config()` memo, which the copy carries over rather than
+        # `model_config_of()` memo, which the copy carries over rather than
         # rebuild.
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
@@ -3759,6 +3759,8 @@ class ServerArgs:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
         False for any config the runtime won't post-capture-size, else it gets an
         under-reserved fraction."""
+        from sglang.srt.arg_groups.overrides import model_config_of
+
         cfg = resolving_view(self)
         # `ModelRunner` writes a bool named `use_mla_backend` onto the record
         # (see the FIXME there). At args time nothing has, and the answer comes
@@ -3806,7 +3808,7 @@ class ServerArgs:
 
         from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
-        hf_config = self.get_model_config().hf_config
+        hf_config = model_config_of(self).hf_config
         if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
             return False
 
@@ -4252,34 +4254,6 @@ class ServerArgs:
             return False
         return True
 
-    def get_model_config(self):
-        # Lazy init to avoid circular import
-        cfg = resolving_view(self)
-        from sglang.srt.configs.model_config import ModelConfig
-
-        memo = getattr(self, "_model_config", None)
-        if memo is not None:
-            # The key is the path this record carried when the cache was
-            # filled. The GGUF and ModelScope handlers declare a different
-            # `model_path`, and a configuration built before them describes
-            # another checkpoint. `ModelConfig` re-points its own `model_path`
-            # at the local pull directory when the weights sit behind an
-            # object-store URI, so its field is not the key. A configuration a
-            # fixture supplied carries no key and is handed back as it is.
-            built_from = getattr(self, "_model_config_built_from", None)
-            if built_from is None or built_from == cfg.model_path:
-                return memo
-
-        model_config = ModelConfig.from_server_args(self)
-        self._model_config = model_config
-        self._model_config_built_from = cfg.model_path
-        if model_config.is_hybrid_swa:
-            logger.info(
-                "Hybrid SWA model detected. architectures=%s",
-                model_config.hf_config.architectures,
-            )
-        return model_config
-
     def __setattr__(self, name, value):
         # Once resolution has finished the record is the READ-ONLY raw input
         # the config bags were projected from. Resolved config changes go to the bags via
@@ -4347,6 +4321,8 @@ class ServerArgs:
         # model never loads an HF config) is honored as-is; otherwise the memo
         # is only kept once the record is resolved, because `page_size` below
         # is resolution-written.
+        from sglang.srt.arg_groups.overrides import model_config_of
+
         if not hasattr(self, "_mamba_cache_chunk_size"):
 
             try:
@@ -4357,7 +4333,7 @@ class ServerArgs:
                 # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
                 FLA_CHUNK_SIZE = 64
 
-            hf_config = self.get_model_config().hf_config
+            hf_config = model_config_of(self).hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
             page_size = resolved_view(self).page_size
             assert (
