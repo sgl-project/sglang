@@ -153,6 +153,7 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
   __shared__ uint32_t threshold_key;
   __shared__ uint32_t greater_count;
   __shared__ uint32_t tie_count;
+  __shared__ uint32_t tie_min_index;
 
   device::PDLWaitPrimary<kUsePDL>();
 
@@ -162,6 +163,7 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
     threshold_key = 0xffffffffu;
     greater_count = 0;
     tie_count = 0;
+    tie_min_index = 0xffffffffu;
   }
   if (tx < params.topk) {
     page_indices[tx] = -1;
@@ -213,16 +215,38 @@ __global__ void dcp_topk_merge_kernel(const __grid_constant__ DCPTopKMergeParams
     if (tx == 0) {
       tie_count = params.topk - greater_count;
     }
-    for (uint32_t candidate_id = tx; candidate_id < candidate_count; candidate_id += kTopKBlockSize) {
-      const int32_t global_index = candidate_indices[candidate_id];
-      const bool is_threshold =
-          global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key;
-      candidate_scores[candidate_id] =
-          is_threshold ? -static_cast<float>(global_index) : __uint_as_float(0xff800000u);
-    }
     __syncthreads();
 
-    if (tie_count > 0) {
+    if (tie_count == 1) {
+      // Random model scores almost always have one item at the top-k boundary.
+      // Avoid a second full radix selection in that common case.
+      for (uint32_t candidate_id = tx; candidate_id < candidate_count;
+           candidate_id += kTopKBlockSize) {
+        const int32_t global_index = candidate_indices[candidate_id];
+        if (global_index >= 0 &&
+            ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key) {
+          atomicMin(&tie_min_index, static_cast<uint32_t>(global_index));
+        }
+      }
+      __syncthreads();
+      if (tx == 0 && tie_min_index % kDCPSize == params.dcp_rank) {
+        const uint32_t output_pos = atomicAdd(&output_count, 1u);
+        const uint32_t local_raw = tie_min_index / kDCPSize;
+        page_indices[output_pos] = page_to_indices(page_table, local_raw, params.page_bits);
+        if (local_raw_indices != nullptr) {
+          local_raw_indices[output_pos] = static_cast<int32_t>(local_raw);
+        }
+      }
+    } else if (tie_count > 1) {
+      for (uint32_t candidate_id = tx; candidate_id < candidate_count;
+           candidate_id += kTopKBlockSize) {
+        const int32_t global_index = candidate_indices[candidate_id];
+        const bool is_threshold =
+            global_index >= 0 && ordered_dcp_score(candidate_scores[candidate_id]) == threshold_key;
+        candidate_scores[candidate_id] =
+            is_threshold ? -static_cast<float>(global_index) : __uint_as_float(0xff800000u);
+      }
+      __syncthreads();
       radix_topk(candidate_scores, selected, candidate_count, tie_count);
       __syncthreads();
       if (tx < tie_count) {
