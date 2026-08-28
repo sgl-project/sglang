@@ -1980,6 +1980,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_segments_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -1989,12 +1990,18 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.free(merged)
             self.full_attn_allocator.clear_inverse_history()
             self.mamba_allocator.clear_inverse_history()
+        if self.free_segments_group:
+            segment_groups = self.free_segments_group
+            self.free_segments_group = []
+            for segments, swa_evicted_seqlen in segment_groups:
+                self.free_segments(segments, swa_evicted_seqlen=swa_evicted_seqlen)
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_segments_group = []
 
     # -- Lazy compaction hooks --
 
@@ -2491,11 +2498,33 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
         return
 
+    def _free_segments_impl(self, segments, *, swa_evicted_seqlen: int | None) -> None:
+        if swa_evicted_seqlen is None or self.page_size == 1:
+            BaseTokenToKVPoolAllocator._free_segments_impl(
+                self, segments, swa_evicted_seqlen=swa_evicted_seqlen
+            )
+            return
+
+        self.full_attn_allocator.free_segments(segments)
+
+        live_swa_segments = []
+        for free_index, start_pos in segments:
+            end_pos = start_pos + free_index.numel()
+            live_start = max(start_pos, swa_evicted_seqlen)
+            if live_start < end_pos:
+                live_swa_segments.append(
+                    (free_index[live_start - start_pos :], live_start)
+                )
+        self.swa_attn_allocator.free_segments(live_swa_segments)
+        self.full_attn_allocator.clear_inverse_history()
+        self.swa_attn_allocator.clear_inverse_history()
+
     # -- free-group --
 
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
         self.free_group = []
+        self.free_segments_group = []
 
     def free_group_end(self) -> None:
         self.is_not_in_free_group = True
@@ -2503,12 +2532,18 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+        if self.free_segments_group:
+            segment_groups = self.free_segments_group
+            self.free_segments_group = []
+            for segments, swa_evicted_seqlen in segment_groups:
+                self.free_segments(segments, swa_evicted_seqlen=swa_evicted_seqlen)
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []
+        self.free_segments_group = []
 
     # -- Lazy compaction hooks --
 

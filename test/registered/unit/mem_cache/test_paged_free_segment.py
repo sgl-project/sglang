@@ -15,6 +15,10 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -320,6 +324,63 @@ class TestSWADenseSegmentRelease(unittest.TestCase):
                 expected_swa_pages,
             )
         )
+
+
+class _RecordingSubAllocator:
+    def __init__(self):
+        self.freed = []
+        self.inverse_history_clears = 0
+
+    def free(self, indices):
+        self.freed.append(indices.detach().cpu().clone())
+
+    def clear_inverse_history(self):
+        self.inverse_history_clears += 1
+
+
+class TestUnifiedCompositeSegmentGroups(unittest.TestCase):
+    def test_mamba_group_drains_deferred_segments(self):
+        alloc = object.__new__(UnifiedMambaTokenToKVPoolAllocator)
+        alloc.page_size = 1
+        alloc.is_not_in_free_group = True
+        alloc.free_group = []
+        alloc.free_segments_group = []
+        alloc.full_attn_allocator = _RecordingSubAllocator()
+        alloc.mamba_allocator = _RecordingSubAllocator()
+
+        indices = torch.arange(11, 22, dtype=torch.int64)
+        expected = indices.clone()
+        alloc.free_group_begin()
+        alloc.free_segments([(indices, 0)], swa_evicted_seqlen=0)
+        self.assertEqual(alloc.full_attn_allocator.freed, [])
+
+        indices.zero_()
+        alloc.free_group_end()
+
+        self.assertEqual(len(alloc.full_attn_allocator.freed), 1)
+        self.assertTrue(torch.equal(alloc.full_attn_allocator.freed[0], expected))
+        self.assertEqual(alloc.free_segments_group, [])
+
+    def test_shared_swa_group_drains_each_request_segment_set(self):
+        alloc = object.__new__(UnifiedSWATokenToKVPoolAllocator)
+        alloc.page_size = PAGE_SIZE
+        alloc.is_not_in_free_group = True
+        alloc.free_group = []
+        alloc.free_segments_group = []
+
+        first = torch.arange(4, 8, dtype=torch.int64)
+        second = torch.arange(12, 16, dtype=torch.int64)
+        alloc.free_group_begin()
+        alloc.free_segments([(first, 0)], swa_evicted_seqlen=0)
+        alloc.free_segments([(second, 0)], swa_evicted_seqlen=0)
+
+        with patch.object(
+            UnifiedSWATokenToKVPoolAllocator, "_free_segments_impl"
+        ) as free_impl:
+            alloc.free_group_end()
+
+        self.assertEqual(free_impl.call_count, 2)
+        self.assertEqual(alloc.free_segments_group, [])
 
 
 if __name__ == "__main__":
