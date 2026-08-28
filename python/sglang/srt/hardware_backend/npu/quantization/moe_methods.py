@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 
 _E8M0_DTYPE = None
-_DEFAULT_DYNAMIC_QUANT = object()
 
 
 def _require_e8m0_dtype():
@@ -113,51 +112,6 @@ def reshape_mxfp_activation_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
     if scale.shape[-1] % 2 != 0:
         raise ValueError(f"Invalid MXFP per-token scale shape: {tuple(scale.shape)}")
     return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
-
-
-def w4a8_mxfp_gmm(
-    *,
-    input: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_list_type: int,
-    group_list: torch.Tensor,
-    output_dtype: torch.dtype,
-    scale_alg=None,
-    dynamic_quant_kwargs: Optional[Dict[str, Any]] = None,
-) -> torch.Tensor:
-    """Run the shared A5 FP4-weight × FP8-activation grouped matmul."""
-    group_list = group_list.to(torch.int64)
-    if input_scale is None:
-        if dynamic_quant_kwargs is None:
-            dynamic_quant_kwargs = {
-                "axis": 1,
-                "round_mode": "rint",
-                "dst_type": torch.float8_e4m3fn,
-                "block_size": 32,
-                "scale_alg": scale_alg,
-            }
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(input, **dynamic_quant_kwargs)
-    else:
-        x, x_scale = input, input_scale
-
-    return torch.ops.npu.npu_grouped_matmul(
-        [x],
-        [weight],
-        scale=None,
-        antiquant_scale=[weight_scale],
-        scale_dtype=None,
-        per_token_scale=[reshape_mxfp_activation_scale_for_npu(x_scale)],
-        split_item=2,
-        group_type=0,
-        group_list=group_list,
-        group_list_type=group_list_type,
-        output_dtype=output_dtype,
-        x_dtype=torch.float8_e4m3fn,
-        weight_dtype=_get_float4_e2m1fn_x2_dtype(),
-        per_token_scale_dtype=_require_e8m0_dtype(),
-    )[0]
 
 
 # DEPRECATED METHOD
@@ -286,9 +240,12 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
 
-    def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
+    def __init__(self):
         super().__init__(quant_config=None)
-        self.dynamic_quant_kwargs = dynamic_quant_kwargs
+        self.matmul = GroupedMatmul()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -301,9 +258,18 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
 
         weight = getattr(layer, f"{weight_prefix}_weight")
         weight_scale = getattr(layer, f"{weight_prefix}_weight_scale")
-        weight.data, weight_scale.data = prepare_w4a8_mxfp_weight(
-            weight.data, weight_scale.data
-        )
+        weight.data = npu_format_cast(
+            weight.data,
+            customize_dtype=torch.float8_e4m3fn,
+            input_dtype=fp4_dtype,
+        ).transpose(-1, -2)
+        scale = weight_scale.data.reshape(
+            weight_scale.shape[0],
+            weight_scale.shape[1],
+            weight_scale.shape[2] // 2,
+            2,
+        ).transpose(1, 2)
+        weight_scale.data = scale
 
         # The refactored Ascend dispatchers currently support BF16 and INT8.
         # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
@@ -320,22 +286,35 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         weight_prefix: str,
         group_list_type: int,
     ) -> torch.Tensor:
-        if pertoken_scale is not None:
-            pertoken_scale = reshape_mxfp_activation_scale_for_npu(pertoken_scale)
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+        e8m0_dtype = _require_e8m0_dtype()
 
-        dynamic_quant_kwargs = self.dynamic_quant_kwargs
-        if dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT:
-            dynamic_quant_kwargs = {"dst_type": torch.float8_e4m3fn}
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        elif pertoken_scale is not None:
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+            )
 
-        return w4a8_mxfp_gmm(
-            input=hidden_states,
-            input_scale=pertoken_scale,
-            weight=getattr(quant_info, f"{weight_prefix}_weight"),
-            weight_scale=getattr(quant_info, f"{weight_prefix}_weight_scale"),
+        return self.matmul.forward(
+            quant_info,
+            weight_prefix,
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            output_dtype,
             group_list_type=group_list_type,
-            group_list=expert_tokens,
-            output_dtype=output_dtype,
-            dynamic_quant_kwargs=dynamic_quant_kwargs,
+            transposed=True,
+            scale=None,
+            scale_dtype=None,
+            per_token_scale=[pertoken_scale],
+            antiquant_scale=[
+                getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+            ],
+            x_dtype=torch.float8_e4m3fn,
+            weight_dtype=fp4_dtype,
+            per_token_scale_dtype=e8m0_dtype,
         )
 
 
@@ -355,8 +334,8 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, prefix: str = ""):
         self.prefix = prefix
-        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
-        self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod()
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod()
         self.runner = None
 
     def create_weights(
