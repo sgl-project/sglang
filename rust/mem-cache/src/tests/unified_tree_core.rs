@@ -6059,6 +6059,22 @@ fn sanity_check_detects_a_dead_node() {
 }
 
 #[test]
+fn try_sanity_check_returns_a_dead_node_error() {
+    let mut tc = sane_tree();
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2, 9]))
+        .best_match_node_id;
+    let leaf_idx = tc.arena.resolve(leaf);
+    let _ = tc.arena.take_device_value(leaf_idx, FULL);
+
+    let error = tc.try_sanity_check(&[], &[]).unwrap_err();
+    assert!(error.starts_with("Sanity check FAILED"));
+    assert!(error.contains(&format!(
+        "node {leaf_idx} dead: no Full device and no Full host"
+    )));
+}
+
+#[test]
 #[should_panic(expected = "device present but parent")]
 fn sanity_check_detects_an_evicted_parent_prefix() {
     let mut tc = sane_tree();

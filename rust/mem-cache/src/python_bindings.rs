@@ -1132,11 +1132,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         ongoing_write_through: Vec<(i64, NodeId)>,
         ongoing_load_back: Vec<(i64, NodeId)>,
-    ) {
+    ) -> PyResult<()> {
         py.allow_threads(|| {
             self.core()
-                .sanity_check(&ongoing_write_through, &ongoing_load_back)
-        });
+                .try_sanity_check(&ongoing_write_through, &ongoing_load_back)
+        })
+        .map_err(PyAssertionError::new_err)
     }
 
     /// Concatenated FULL device values from from_node up to (exclusive) until_node.
@@ -2207,7 +2208,7 @@ macro_rules! tree_core_binding {
                 py: Python<'_>,
                 ongoing_write_through: Vec<(i64, NodeId)>,
                 ongoing_load_back: Vec<(i64, NodeId)>,
-            ) {
+            ) -> PyResult<()> {
                 self.inner
                     .sanity_check(py, ongoing_write_through, ongoing_load_back)
             }

@@ -3308,6 +3308,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         ongoing_write_through: &[(i64, NodeId)],
         ongoing_load_back: &[(i64, NodeId)],
     ) {
+        if let Err(message) = self.try_sanity_check(ongoing_write_through, ongoing_load_back) {
+            self.pretty_print();
+            panic!("{message}");
+        }
+    }
+
+    /// Fallible variant of [`Self::sanity_check`] for language bindings.
+    pub fn try_sanity_check(
+        &self,
+        ongoing_write_through: &[(i64, NodeId)],
+        ongoing_load_back: &[(i64, NodeId)],
+    ) -> Result<(), String> {
         let mut errors: Vec<String> = Vec::new();
         let all_nodes = self.collect_all_nodes_();
         let all_node_set: HashSet<NodeIdx_> = all_nodes.iter().copied().collect();
@@ -3720,8 +3732,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         if !errors.is_empty() {
-            self.pretty_print();
-            panic!(
+            return Err(format!(
                 "Sanity check FAILED ({} violations across {} nodes):\n{}",
                 errors.len(),
                 all_nodes.len(),
@@ -3730,8 +3741,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     .map(|e| format!("  {e}"))
                     .collect::<Vec<_>>()
                     .join("\n")
-            );
+            ));
         }
+        Ok(())
     }
 
     /// Every live node in the tree.

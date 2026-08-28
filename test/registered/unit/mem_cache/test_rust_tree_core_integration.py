@@ -264,6 +264,20 @@ def test_sanity_check_passes_after_the_full_flow():
     core.sanity_check([], [])
 
 
+def test_sanity_check_maps_invariant_failures_to_assertion_error():
+    core = _tree_core()
+    _insert(core, [1], [10])
+    leaf = core.match_prefix(MatchPrefixParams(key=_key([1]))).best_match_node
+
+    with pytest.raises(
+        AssertionError, match=r"(?s)Sanity check FAILED.*load_back node 8 lock_ref=0"
+    ):
+        core.sanity_check([], [(8, leaf)])
+
+    # A reported invariant failure does not poison the binding mutex.
+    core.sanity_check([], [])
+
+
 def test_short_value_tensor_raises_value_error():
     binding = _binding()
     params = mem_cache.InsertParamsBinding(
