@@ -5,43 +5,29 @@ import types
 import pytest
 
 from sglang.kernels.jit import cute_aot_cache
-from sglang.kernels.ops.attention.flash_attn.cute import cache_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def test_flash_attn_cache_config_preserves_legacy_env(monkeypatch, tmp_path):
-    calls = []
+def test_default_cache_dir_tracks_sglang_cache_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        cache_config,
-        "_get_jit_cache",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
+        cute_aot_cache,
+        "_resolve_target_arch",
+        lambda: pytest.fail("constructing a cache must not probe CUDA"),
     )
-    for name in (
-        "SGLANG_CUTE_AOT_CACHE_DIR",
-        "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED",
-        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("SGLANG_CUTE_AOT_CACHE_DIR", raising=False)
+    monkeypatch.setenv("SGLANG_CACHE_DIR", str(tmp_path))
+    cache = cute_aot_cache.get_jit_cache("consumer")
+    assert isinstance(cache, cute_aot_cache.JITPersistentCache)
 
-    cache_config.get_flash_attn_jit_cache("disabled")
-    assert calls[-1][1]["cache_dir"] is None
+    monkeypatch.setenv("SGLANG_CUTE_AOT_CACHE_DIR", str(tmp_path / "explicit"))
+    cache = cute_aot_cache.get_jit_cache("consumer")
+    assert isinstance(cache, cute_aot_cache.JITPersistentCache)
 
-    legacy_dir = tmp_path / "legacy"
-    monkeypatch.setenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
-    monkeypatch.setenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", str(legacy_dir))
-    cache_config.get_flash_attn_jit_cache("legacy")
-    assert calls[-1][1]["cache_dir"] == str(legacy_dir)
-
-    monkeypatch.delenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR")
-    cache_config.get_flash_attn_jit_cache("legacy-default")
-    assert calls[-1][1]["cache_dir"].name == "flash_attention_cute_dsl_cache"
-
-    shared_dir = tmp_path / "shared"
-    monkeypatch.setenv("SGLANG_CUTE_AOT_CACHE_DIR", str(shared_dir))
-    cache_config.get_flash_attn_jit_cache("shared")
-    assert calls[-1][1]["cache_dir"] == str(shared_dir)
+    monkeypatch.setenv("SGLANG_CUTE_AOT_CACHE_DIR", "")
+    cache = cute_aot_cache.get_jit_cache("consumer")
+    assert not isinstance(cache, cute_aot_cache.JITPersistentCache)
 
 
 def test_target_arch_prefers_env_then_detects_gpu(monkeypatch):
