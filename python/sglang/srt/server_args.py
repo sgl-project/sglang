@@ -5450,7 +5450,7 @@ class ServerArgs:
         if self.radix_eviction_policy == "lru":
             updates["radix_eviction_policy"] = "priority"
         if self.prefill_decode_interval is None:
-            updates["prefill_decode_interval"] = 24
+            updates["prefill_decode_interval"] = 22
         if self.attention_backend is None and self.decode_attention_backend is None:
             updates["decode_attention_backend"] = "flashinfer"
 
