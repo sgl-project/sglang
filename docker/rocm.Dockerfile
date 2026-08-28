@@ -318,6 +318,11 @@ ENV BUILD_MOONCAKE="1"
 # plus the four reverts applied at clone time are what the gfx1250 kernels were
 # brought up against.
 ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
+# Unused while BUILD_TRITON=0, recorded because gfx1250 is the arch most likely
+# to need it: this is the upstream Triton revision the bring-up was validated
+# against, and the known-good fallback if the SDK's Triton turns out to
+# miscompile a gfx1250 kernel.
+ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -948,7 +953,18 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # so it shadows nothing system-wide. Scope this explicitly to ROCm 10 so the
   # ROCm 7.2 and 7.2.4 MORI build paths remain byte-for-byte equivalent here.
   ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
-  if [ "${GPU_ARCH##*-}" = "rocm1000" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
+  if [ "${GPU_ARCH_LIST}" = "gfx1250" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
+    # gfx1250 was brought up needing the SDK's own cmake trees on the prefix
+    # path as well: that is what lets hsakmt-config.cmake resolve
+    # find_dependency(NUMA) without patching MORI's CMakeLists.
+    export PATH="${ROCM_HOME}/bin:${PATH}"; \
+    export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}/lib/cmake:${ROCM_SYSDEPS}:${ROCM_HOME}/lib/cmake:${ROCM_HOME}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
+    export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
+    export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
+    echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
+    ldconfig; \
+    echo "[MORI] rocm_sysdeps prefix: ${ROCM_SYSDEPS}"; \
+  elif [ "${GPU_ARCH##*-}" = "rocm1000" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
     export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
     export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
     export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
