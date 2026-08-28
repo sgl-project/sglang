@@ -39,6 +39,7 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    max_speculative_num_draft_tokens,
     resolution_result,
 )
 from sglang.srt.arg_groups.parallel_hook import (
@@ -1679,6 +1680,7 @@ class TestAdaptiveSpecArgs(CustomTestCase):
             )
 
             handle_speculative_decoding(args)
+            self.assertEqual(max_speculative_num_draft_tokens(args), 6)
 
         self.assertTrue(resolution_result(args, "speculative_adaptive"))
         self.assertEqual(resolution_result(args, "speculative_eagle_topk"), 1)

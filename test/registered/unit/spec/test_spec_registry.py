@@ -4,7 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import (
+    max_speculative_num_draft_tokens,
+    resolution_result,
+)
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
@@ -193,6 +196,55 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         server_args.disable_overlap_schedule = False
         with self.assertRaisesRegex(ValueError, "does not support overlap"):
             self.algo.create_worker(server_args)
+
+    def test_default_max_draft_tokens_is_the_startup_width(self):
+        server_args = SimpleNamespace(speculative_num_draft_tokens=7)
+        self.assertEqual(
+            self.algo.resolve_max_speculative_num_draft_tokens(server_args), 7
+        )
+
+    def test_config_helper_dispatches_to_custom_override(self):
+        class CustomDraftBound(CustomSpecAlgo):
+            def resolve_max_speculative_num_draft_tokens(self, server_args):
+                return 11
+
+        @SpeculativeAlgorithm.register(
+            "MY_DRAFT_BOUND", supports_overlap=True, spec_class=CustomDraftBound
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="MY_DRAFT_BOUND",
+            speculative_num_draft_tokens=7,
+        )
+        self.assertEqual(max_speculative_num_draft_tokens(server_args), 11)
+
+    def test_config_helper_rejects_a_custom_bound_below_the_active_width(self):
+        class InvalidDraftBound(CustomSpecAlgo):
+            def resolve_max_speculative_num_draft_tokens(self, server_args):
+                return 6
+
+        @SpeculativeAlgorithm.register(
+            "INVALID_DRAFT_BOUND",
+            supports_overlap=True,
+            spec_class=InvalidDraftBound,
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="INVALID_DRAFT_BOUND",
+            speculative_num_draft_tokens=7,
+        )
+        with self.assertRaisesRegex(ValueError, "below the configured"):
+            max_speculative_num_draft_tokens(server_args)
 
 
 class TestValidatorHook(_RegistryIsolated):
