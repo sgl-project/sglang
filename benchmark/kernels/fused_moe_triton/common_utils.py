@@ -137,6 +137,7 @@ def get_model_config(
         "BailingMoEForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV3ForCausalLM",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok

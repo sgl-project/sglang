@@ -47,7 +47,6 @@ from sglang.srt.model_executor.runner.flashinfer_autotune import (
     should_run_flashinfer_autotune,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_disagg,
     get_exec,
     get_flags,
@@ -217,10 +216,10 @@ class BaseRunner(ABC):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         # elastic-EP scale-up rewrites dp_size on the published config
         self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.pp_size = get_parallel().pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
@@ -350,9 +349,9 @@ class BaseRunner(ABC):
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
             dp_size=get_parallel().dp_size,
-            pp_size=configured_pp_size(),
+            pp_size=get_parallel().pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
-            require_mlp_tp_gather=require_mlp_tp_gather(mr.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
             encoder_len_fill_value=(
                 getattr(mr.model_config.hf_config, "max_source_positions", 0)
@@ -522,7 +521,7 @@ class BaseRunner(ABC):
             extend_prefix_lens = None
             extend_start_loc = None
 
-        if configured_pp_size() > 1:
+        if get_parallel().pp_size > 1:
             # PP0 already cp-split hidden_states before send.
             pp_hidden_tokens = num_tokens
             if (
@@ -536,9 +535,9 @@ class BaseRunner(ABC):
             )
 
         # TP-gather requirements for global token metadata.
-        require_mlp_tp_gather_ = require_mlp_tp_gather(mr.server_args)
-        require_attn_tp_gather_ = require_attn_tp_gather(mr.server_args)
-        if require_gathered_buffer(mr.server_args):
+        require_mlp_tp_gather_ = require_mlp_tp_gather()
+        require_attn_tp_gather_ = require_attn_tp_gather()
+        if require_gathered_buffer():
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
@@ -646,7 +645,7 @@ class BaseRunner(ABC):
 
             kwargs = {}
             if (
-                configured_pp_size() > 1
+                get_parallel().pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(

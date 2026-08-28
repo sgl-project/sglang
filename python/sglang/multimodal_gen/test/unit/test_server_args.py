@@ -679,6 +679,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         *,
         warmup_mode=None,
         warmup_resolutions=None,
+        warmup_num_frames=None,
         enable_torch_compile=False,
         enable_breakable_cuda_graph=False,
         disagg_role=None,
@@ -688,6 +689,7 @@ class TestWarmupModeNormalization(unittest.TestCase):
         sa = ServerArgs.__new__(ServerArgs)
         sa.warmup_mode = warmup_mode
         sa.warmup_resolutions = warmup_resolutions
+        sa.warmup_num_frames = warmup_num_frames
         sa.enable_torch_compile = enable_torch_compile
         sa.enable_breakable_cuda_graph = enable_breakable_cuda_graph
         sa.disagg_role = RoleType.MONOLITHIC if disagg_role is None else disagg_role
@@ -717,6 +719,16 @@ class TestWarmupModeNormalization(unittest.TestCase):
             warmup_resolutions=["512x512"],
         )
         self.assertEqual(sa.warmup_mode, "request")
+
+    def test_num_frames_forces_warmup_on(self):
+        sa = self._resolve(warmup_mode="off", warmup_num_frames=17)
+        self.assertEqual(sa.warmup_mode, "request")
+
+    def test_num_frames_must_be_positive(self):
+        for num_frames in (0, -1):
+            with self.subTest(num_frames=num_frames):
+                with self.assertRaisesRegex(ValueError, "positive"):
+                    self._resolve(warmup_num_frames=num_frames)
 
     def test_torch_compile_defaults_to_server_warmup(self):
         sa = self._resolve(enable_torch_compile=True)

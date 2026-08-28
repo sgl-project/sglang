@@ -119,10 +119,8 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
-    configured_tp_size,
     get_exec,
     get_parallel,
-    get_server_args,
 )
 from sglang.srt.utils import is_blackwell_supported, is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
@@ -149,6 +147,13 @@ def _uses_modelopt_fp8_pb_wo(
 ) -> bool:
     resolver = getattr(quant_config, "_resolve_quant_algo", None)
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
+
+
+def _uses_split_gguf_kv_b(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether a K3 checkpoint stores MLA K/V as separate GGUF tensors."""
+    return bool(getattr(quant_config, "supports_kimi_k3_split_gguf_kv_b", False))
 
 
 def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
@@ -1900,9 +1905,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        split_gguf_kv_b = getattr(
-            quant_config, "supports_kimi_k3_quantized_latent_projections", False
-        )
+        # ModelSlim can quantize K3 latent projections while still storing
+        # MLA kv_b_proj as one dense tensor; only GGUF expert packs split K/V.
+        split_gguf_kv_b = _uses_split_gguf_kv_b(quant_config)
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
@@ -2147,7 +2152,7 @@ class KimiK3DecoderLayer(nn.Module):
         self._dp_attention = is_dp_attention_enabled()
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to
         # attn_tp multiples; attention must then run on the real rows only.
-        self._trim_padded_attn = require_mlp_sync(get_server_args())
+        self._trim_padded_attn = require_mlp_sync()
         # A layer runs MoE (vs a plain dense MLP) iff it is past the dense
         # prefix and on the MoE cadence — same predicate the mlp construction
         # below uses.
@@ -2615,7 +2620,7 @@ class KimiK3LinearModel(nn.Module):
         self.pp_group = get_pp_group()
         self.dspark_layers_to_capture: Optional[list[int]] = None
         self._dp_attention = is_dp_attention_enabled()
-        self._trim_padded_attn = require_mlp_sync(get_server_args())
+        self._trim_padded_attn = require_mlp_sync()
 
         if self.pp_group.is_first_rank:
             embedding_quant_config = (
@@ -3230,6 +3235,24 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+
+    # Fused runtime module -> checkpoint shard names, so quant configs can
+    # match fused prefixes against per-shard exclude_modules
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+    }
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,
@@ -3384,7 +3407,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             # Match the configured TP consumer count captured when the
             # tokenizer creates MmItemMemoryPool. A live attention subgroup
             # size could leave acknowledgements missing and strand the lease.
-            ipc_consumer_count = max(configured_tp_size(), 1)
+            ipc_consumer_count = max(get_parallel().tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()

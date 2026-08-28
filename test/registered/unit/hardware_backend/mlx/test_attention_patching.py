@@ -877,6 +877,17 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(forked.tolist(), [3])
         self.assertEqual(restored[0].state[0].tolist(), [1.0])
         self.assertEqual(pool.available_size(), 3)
+        self.assertEqual(pool.schedulable_available_size(), 3)
+
+    def test_auxiliary_state_pool_returns_unused_group_slots(self):
+        pool = MlxAuxiliaryStatePool(size=4, device="cpu")
+
+        pool.alloc_group_begin(3)
+        allocated = pool.alloc(1)
+        pool.alloc_group_end()
+
+        self.assertEqual(allocated.tolist(), [1])
+        self.assertEqual(pool.available_size(), 3)
 
     def test_auxiliary_state_pool_restores_instance_meta_state(self):
         pool = MlxAuxiliaryStatePool(size=2, device="cpu")
@@ -916,6 +927,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsNotNone(auxiliary_state_idx)
         self.assertIsNone(req.req_pool_idx)
         self.assertIsNotNone(req.mamba_pool_idx)
+        self.assertIs(pool.mamba_allocator, pool.mamba_pool)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
         pool.free_auxiliary_state_cache(req)
         self.assertIsNone(req.mamba_pool_idx)
@@ -1188,10 +1200,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             disaggregation_mode=None,
             enable_overlap=False,
             enable_overlap_mlx=False,
-            server_args=SimpleNamespace(
-                disaggregation_decode_enable_offload_kvcache=False,
-                enable_hisparse=False,
-            ),
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
@@ -1208,6 +1216,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             logprob_result_processor=None,
             output_streamer=None,
+            beam_coordinator=None,
             abort_request=lambda req: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that

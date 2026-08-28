@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     is_multimodal_piecewise_cuda_graph_supported,
@@ -71,7 +72,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
     def test_supported_multimodal_model_upgrades_default_to_tc_piecewise(self):
         args = ServerArgs(model_path="dummy")
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal_breakable_cuda_graph_supported=False,
         )
@@ -90,14 +91,17 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         ):
             args._apply_cuda_graph_compatibility()
 
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.TC_PIECEWISE,
+        )
         disable_if_incompatible.assert_called_once()
 
     def test_trtllm_mla_stays_on_breakable(self):
         args = ServerArgs(model_path="dummy")
         # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
         # now serves MLA by falling back to the flashinfer MLA impl for extend.
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal=False,
             is_multimodal_breakable_cuda_graph_supported=False,
@@ -118,7 +122,10 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         ):
             args._apply_cuda_graph_compatibility()
 
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.BREAKABLE,
+        )
 
     def test_explicit_tc_piecewise_overrides_trtllm_mla_default(self):
         args = ServerArgs(model_path="dummy")
@@ -134,7 +141,10 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         ):
             args._apply_cuda_graph_compatibility()
 
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.TC_PIECEWISE)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.TC_PIECEWISE,
+        )
 
     def test_multimodal_inputs_keep_tc_piecewise_prefill_enabled(self):
         runner = self._make_prefill_runner(Backend.TC_PIECEWISE)
@@ -159,7 +169,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             is_embedding_gemma=True,
             is_multimodal=False,
             context_len=2048,
@@ -173,20 +183,26 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.chunked_prefill_size = 2048
 
         with (
-            patch.object(args, "get_model_config", return_value=args.model_config),
+            patch.object(args, "get_model_config", return_value=args._model_config),
             patch("sglang.srt.server_args.is_cuda", return_value=True),
         ):
             args._handle_model_capability_adjustments()
 
-        self.assertTrue(args.disable_radix_cache)
-        self.assertEqual(args.chunked_prefill_size, -1)
-        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.BREAKABLE)
+        self.assertTrue(resolution_result(args, "disable_radix_cache"))
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), -1)
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").decode.backend,
+            Backend.DISABLED,
+        )
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.BREAKABLE,
+        )
 
     def test_encoder_embedding_model_enables_embedding_mode_without_flag(self):
         args = ServerArgs(model_path="dummy")
         args.is_embedding = False
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             embedding_model_spec=resolve_embedding_model_spec(
                 ["BertModel"],
                 is_embedding_requested=False,
@@ -196,10 +212,10 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )
 
-        with patch.object(args, "get_model_config", return_value=args.model_config):
+        with patch.object(args, "get_model_config", return_value=args._model_config):
             args._handle_model_capability_adjustments()
 
-        self.assertTrue(args.is_embedding)
+        self.assertTrue(resolution_result(args, "is_embedding"))
 
 
 if __name__ == "__main__":

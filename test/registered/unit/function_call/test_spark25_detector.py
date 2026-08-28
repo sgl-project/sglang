@@ -149,7 +149,7 @@ class TestSpark25DetectorDetectAndParse(CustomTestCase):
         self.assertFalse(self.detector.supports_structural_tag())
         self.assertTrue(self.detector.parses_required_natively())
         self.assertIs(
-            FunctionCallParser(self.tools, "spark").get_structure_constraint(
+            FunctionCallParser(self.tools, "spark25").get_structure_constraint(
                 "required"
             ),
             None,
