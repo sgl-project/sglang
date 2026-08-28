@@ -114,7 +114,7 @@ export const benchmarks = [
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "main @ 26fd7fdaa273",
-    accuracy: { gsm8k_pct: 97.42 },
+    accuracy: { gsm8k_pct: 97.42, aime26_pct: 94.17 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 281, tpot_ms: 1.48, tokens_per_sec_per_gpu: 640 },
@@ -125,7 +125,7 @@ export const benchmarks = [
   {
     match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 26fd7fdaa273",
-    accuracy: { gsm8k_pct: 97.42 },
+    accuracy: { gsm8k_pct: 97.42, aime26_pct: 94.17 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
         ttft_ms: 5227, tpot_ms: 12.40, tokens_per_sec_per_gpu: 3748 },
@@ -136,7 +136,7 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "main @ 26fd7fdaa273",
-    accuracy: { gsm8k_pct: 97.42 },
+    accuracy: { gsm8k_pct: 97.42, aime26_pct: 94.17 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
         ttft_ms: 307, tpot_ms: 1.71, tokens_per_sec_per_gpu: 1113 },
@@ -147,7 +147,7 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 26fd7fdaa273",
-    accuracy: { gsm8k_pct: 97.42 },
+    accuracy: { gsm8k_pct: 97.42, aime26_pct: 94.17 },
     speed: [
       { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 64 },
         ttft_ms: 5828, tpot_ms: 16.69, tokens_per_sec_per_gpu: 6108 },

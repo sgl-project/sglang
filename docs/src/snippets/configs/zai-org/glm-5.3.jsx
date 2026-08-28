@@ -65,9 +65,9 @@ export const config = {
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
-      aime25_pct:
+      aime26_pct:
 `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
-sgl-eval run aime25 \\
+sgl-eval run aime26 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 64000 \\
   --temperature 1.0 --top-p 0.95 --thinking \\
@@ -78,7 +78,7 @@ sgl-eval run aime25 \\
   },
 
   accuracyLabels: [
-    ["aime25_pct", "AIME25",         "%"],
+    ["aime26_pct", "AIME26",         "%"],
     ["gsm8k_pct", "GSM8K (1-shot)", "%"],
   ],
 
