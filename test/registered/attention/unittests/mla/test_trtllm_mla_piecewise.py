@@ -10,33 +10,27 @@ the kit builds MLA shapes (576, 512), which they reject, so every case here woul
 skip.
 
 The case list and assertions are shared with test_trtllm_mla_breakable.py via
-_varlen_absorbed_extend_cases.py: the two exercise the same numerical contract
-under the two halves of use_varlen_absorbed (is_in_tc_piecewise_cuda_graph() vs
+sglang.test.kits.attention_unittest.attention_methods.varlen_absorbed_extend_kit:
+the two exercise the same numerical contract under the two halves of
+use_varlen_absorbed (is_in_tc_piecewise_cuda_graph() vs
 is_in_breakable_cuda_graph()), so only the capture-mode kwarg and the case-name
 prefix differ.
 """
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     varlen_absorbed_mla_supported,
 )
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _varlen_absorbed_extend_cases import (
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods.varlen_absorbed_extend_kit import (
     VarlenAbsorbedExtendMixin,
     cases,
     supported,
 )
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 _SUPPORTED, _SKIP_REASON = supported()
 

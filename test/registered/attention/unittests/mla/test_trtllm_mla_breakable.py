@@ -11,25 +11,19 @@ the kit builds MLA shapes (576, 512), which they reject, so every case here woul
 skip.
 
 The case list and assertions are shared with test_trtllm_mla_piecewise.py via
-_varlen_absorbed_extend_cases.py: see that module's docstring.
+sglang.test.kits.attention_unittest.attention_methods.varlen_absorbed_extend_kit:
+see that module's docstring.
 """
 
-import sys
 import unittest
-from pathlib import Path
 
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from _varlen_absorbed_extend_cases import (
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.attention_unittest.attention_methods.varlen_absorbed_extend_kit import (
     VarlenAbsorbedExtendMixin,
     cases,
     supported,
 )
-
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 _SUPPORTED, _SKIP_REASON = supported()
 
