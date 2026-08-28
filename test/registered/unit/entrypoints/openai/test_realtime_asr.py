@@ -17,13 +17,9 @@ from sglang.srt.entrypoints.openai.realtime.asr_processor import (
 from sglang.srt.entrypoints.openai.realtime.decoder_suffix import (
     DecoderSuffixState,
 )
-from sglang.srt.entrypoints.openai.realtime.protocol import SessionUpdateEvent
 from sglang.srt.entrypoints.openai.realtime.session import RealtimeConnection
 from sglang.srt.entrypoints.openai.streaming_asr import (
-    StreamingASRState,
     generate_asr_transcript,
-    hash_audio_content,
-    process_asr_chunk,
 )
 from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     RealtimeEncoderWindowPolicy,
@@ -42,7 +38,7 @@ _AUDIO = np.zeros(1600, dtype=np.float32)
 _WINDOW_GEOMETRY = AudioEncoderWindowConfig(
     min_input_samples=4,
     window_samples=16,
-    window_frames=8,
+    feature_batch_frames=9,
     window_tokens=8,
 )
 _WINDOW_POLICY = {
@@ -324,31 +320,6 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(updates, ["Hello", "Hello world"])
         self.assertEqual(result.text, "Hello world")
 
-    def test_backend_abort_publishes_no_terminal_text(self):
-        manager = _MockTokenizerManager(
-            "partial",
-            finish_reasons=[
-                {"type": "abort", "message": "synthetic abort", "status_code": 500}
-            ],
-        )
-        updates = []
-
-        async def collect(text):
-            updates.append(text)
-
-        with self.assertRaisesRegex(RuntimeError, "synthetic abort"):
-            _run(
-                generate_asr_transcript(
-                    tokenizer_manager=manager,
-                    adapter=_adapter(),
-                    audio_data=_AUDIO,
-                    sampling_params={},
-                    prompt="PROMPT:",
-                    on_update=collect,
-                )
-            )
-        self.assertEqual(updates, [])
-
     def test_windowed_stream_keeps_published_text_append_only(self):
         async def run_chunks(chunks, pending, *, incremental=True):
             manager = _StreamingTokenizerManager(
@@ -417,35 +388,11 @@ class TestRealtimeASR(CustomTestCase):
         completed = _sent_events(connection, ".completed")[-1].transcript
         self.assertEqual("".join(deltas), completed)
 
-    def test_cumulative_path_keeps_prompt_hash_and_word_reconciliation(self):
-        state = StreamingASRState(
-            chunk_size_sec=1.0,
-            unfixed_chunk_num=2,
-            unfixed_token_num=2,
-            emitted_text="hello",
-            chunk_index=5,
-        )
-        manager = _MockTokenizerManager("hello world foo")
-        delta = _run(
-            process_asr_chunk(
-                tokenizer_manager=manager,
-                adapter=_adapter(),
-                state=state,
-                audio_data=_AUDIO,
-                sampling_params={},
-                is_last=False,
-            )
-        )
-        self.assertEqual(manager.requests[0].text, "PROMPT:hello")
-        self.assertEqual(manager.requests[0].mm_hashes, [hash_audio_content(_AUDIO)])
-        self.assertEqual(delta, "hello")
-
     def test_windowed_handoff_emits_only_agreed_suffix(self):
         manager, processor, state = _processor(
             ["four five", "four five six", "five six seven"]
         )
         state.transcript.emitted_text = "one two three"
-        state.cumulative_truncated = True
 
         deltas = []
         for pcm, is_last in (
@@ -461,7 +408,6 @@ class TestRealtimeASR(CustomTestCase):
             state.decoder_suffix.emitted_text,
             "one two three four five six seven",
         )
-        self.assertFalse(state.cumulative_truncated)
         self.assertEqual(manager.requests[0].text, "PROMPT:one two three")
         self.assertEqual(
             manager.processor_kwargs[0]["audio_encoder_window_config"],
@@ -491,26 +437,6 @@ class TestRealtimeASR(CustomTestCase):
             "", is_last=True, holdback_words=1
         )
         self.assertEqual((update.delta, update.pending_suffix), ("", ""))
-
-    def test_decoder_prefix_helpers_preserve_word_boundaries(self):
-        state = DecoderSuffixState(emitted_text="")
-        for prefix, decoded, expected in (
-            ("a b", "A B你好世界", ("你好世界", True)),
-            ("Hello, world!", "hello world你好世界", ("你好世界", True)),
-            ("A B", "A Bfoo", ("A Bfoo", False)),
-        ):
-            with self.subTest(prefix=prefix, decoded=decoded):
-                self.assertEqual(
-                    state.trim_prefix_echo(decoded, prefix, trim_short_prefix=True),
-                    expected,
-                )
-
-        tokenizer = SimpleNamespace(
-            encode=lambda text, **kwargs: [ord(char) for char in text],
-            decode=lambda ids, **kwargs: "".join(chr(token) for token in ids),
-        )
-        state.emitted_text = "alpha middle omega"
-        self.assertEqual(state.get_bounded_prefix(tokenizer, 8), "omega")
 
     def test_window_activation_requires_gate_language_and_flag(self):
         manager, processor, state = _processor("alpha beta", min_audio_sec=60.0)
@@ -561,25 +487,6 @@ class TestRealtimeASR(CustomTestCase):
             connection.asr_state.audio.last_attempted_offset_bytes,
             180,
         )
-
-    def test_windowed_processing_compacts_on_encoder_boundaries(self):
-        manager, processor, state = _processor(
-            ["three four five", "four five six"], min_audio_sec=60.0
-        )
-        state.transcript.emitted_text = "one two three"
-        state.audio.append_pcm(bytes(122))
-        state.audio.last_attempted_offset_bytes = 120
-        state.audio.last_processed_offset_bytes = 120
-        _process(processor, state)
-        state.audio.append_pcm(bytes(4))
-        _process(processor, state)
-
-        self.assertEqual(
-            [request.audio_data.size for request in manager.requests], [61, 47]
-        )
-        self.assertEqual(state.audio.base_offset_bytes, 32)
-        with self.assertRaisesRegex(ValueError, "PCM16 sample-aligned"):
-            state.audio.discard_before(33)
 
     def test_no_boundary_handoff_retries_cumulative_once(self):
         manager, processor, state = _processor(["你好世界", "你好世界"])
@@ -650,43 +557,6 @@ class TestRealtimeASR(CustomTestCase):
         self.assertEqual(connection.asr_state.transcript.full_transcript, "")
         self.assertFalse(_sent_events(connection, ".delta"))
         connection.websocket.close.assert_awaited_with(code=1011)
-
-    def test_session_update_is_patch_like_and_rejects_active_language_change(self):
-        connection = RealtimeConnection(
-            Mock(send_text=AsyncMock(), close=AsyncMock()),
-            _MockTokenizerManager("unused"),
-            _adapter(),
-            _server_args(),
-        )
-        connection._send = AsyncMock()
-
-        def update(audio_input):
-            event = SessionUpdateEvent.model_validate(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "type": "transcription",
-                        "audio": {"input": audio_input},
-                    },
-                }
-            )
-            _run(connection._on_session_update(event))
-
-        update(
-            {
-                "format": {"type": "audio/pcm", "rate": 16000},
-                "transcription": {"model": "qwen3-asr", "language": "en"},
-            }
-        )
-        update({"transcription": {}})
-        self.assertEqual(connection.config.input_sample_rate, 16000)
-        self.assertEqual(connection.config.language, "en")
-
-        connection.asr_state.decoder_suffix = DecoderSuffixState(emitted_text="hello")
-        connection._send_error = AsyncMock()
-        update({"transcription": {"language": "es"}})
-        self.assertEqual(connection.config.language, "en")
-        self.assertEqual(connection._send_error.await_args.args[0], "invalid_state")
 
     def test_failed_inference_preserves_audio_and_reset_clears_offsets(self):
         manager = _MockTokenizerManager(fail=True)

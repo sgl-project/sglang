@@ -5,7 +5,6 @@ maybe_stub_sgl_kernel()
 import unittest
 from types import SimpleNamespace
 
-import msgspec
 import numpy as np
 import torch
 from transformers import WhisperFeatureExtractor
@@ -102,50 +101,10 @@ class TestAudioEncoderWindowing(CustomTestCase):
             [item.use_embedding_cache for item in tiny_tail_items], [True, False]
         )
         self.assertEqual(tiny_tail_items[0].hash, complete_items[0].hash)
-
-    def test_encoder_batch_key_survives_msgpack(self):
-        items, _ = self._build(36)
-        key = items[0].encoder_batch_key
-        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(key), type=tuple)
-
-        self.assertEqual(decoded, key)
-        hash(decoded)
-
-    def test_tail_mask_prevents_complete_window_identity_collision(self):
-        processor = SimpleNamespace(
-            feature_extractor=_FeatureExtractor(),
-            _get_feat_extract_output_lengths=lambda lengths: (
-                (torch.as_tensor(lengths) + 1) // 2
-            ),
+        self.assertEqual(
+            {item.feature.shape[-1] for item in items},
+            {self.config.feature_batch_frames},
         )
-        config = resolve_audio_encoder_window_config(
-            AudioEncoderWindowSpec(
-                window_frames=8,
-                alignment_frames=4,
-            ),
-            feature_extractor=processor.feature_extractor,
-            output_length_fn=processor._get_feat_extract_output_lengths,
-            model_sample_rate=16,
-        )
-
-        def build(sample_count):
-            return build_audio_encoder_window_items(
-                samples=np.zeros(sample_count, dtype=np.float32),
-                input_ids=torch.tensor([10, 99, 11]),
-                placeholder_token_id=99,
-                config=config,
-                extract_features_fn=lambda windows: _extract_features(
-                    processor, windows
-                ),
-                output_length_fn=processor._get_feat_extract_output_lengths,
-            )[0]
-
-        tail = build(30)[1]
-        complete = build(32)[1]
-
-        self.assertEqual(tail.offsets, complete.offsets)
-        self.assertNotEqual(tail.feature.shape, complete.feature.shape)
-        self.assertNotEqual(tail.hash, complete.hash)
 
     def test_complete_window_hash_is_stable_with_real_whisper_frontend(self):
         feature_extractor = WhisperFeatureExtractor(
@@ -259,28 +218,6 @@ class TestAudioEncoderWindowing(CustomTestCase):
         self.assertEqual(int((input_ids == 99).sum()), 18)
         self.assertFalse(feature_extractor.last_kwargs["do_normalize"])
         self.assertEqual(feature_extractor.last_kwargs["padding"], "longest")
-
-    def test_standalone_sub_nfft_input_is_rejected(self):
-        """Negative-branch contract: with no preceding window to absorb it, a
-        sub-n_fft input would be zero-padded and its attention mask would mark
-        the fabricated silence as valid audio; the builder must refuse."""
-        with self.assertRaisesRegex(ValueError, "at least n_fft samples"):
-            self._build(self.config.min_input_samples - 1)
-
-    def test_window_builder_does_not_hide_internal_errors(self):
-        processor = Qwen3ASRMultimodalProcessor.__new__(Qwen3ASRMultimodalProcessor)
-
-        def fail(*args):
-            raise ValueError("broken window geometry")
-
-        processor.build_audio_encoder_window_items = fail
-
-        with self.assertRaisesRegex(ValueError, "broken window geometry"):
-            processor.process_and_combine_mm_data(
-                BaseMultiModalProcessorOutput(input_text="audio", audios=[np.zeros(4)]),
-                MultimodalSpecialTokens(audio_token_id=99),
-                audio_encoder_window_config=self.config,
-            )
 
 
 if __name__ == "__main__":

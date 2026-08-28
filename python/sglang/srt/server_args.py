@@ -1427,7 +1427,10 @@ class ServerArgs:
         bool,
         "Enable encoder-aligned rolling context for supported realtime ASR "
         "models after the adapter's long-audio threshold. Raise "
-        "--asr-max-buffer-seconds above that threshold to process longer items.",
+        "--asr-max-buffer-seconds above that threshold to process longer items. "
+        "Models and languages without a compatible policy remain cumulative and "
+        "retain the adapter's long-audio limit. Validated on local single-GPU "
+        "execution; encoder disaggregation is not supported.",
         NS("serving"),
     ] = False
     asr_max_concurrent_sessions: A[

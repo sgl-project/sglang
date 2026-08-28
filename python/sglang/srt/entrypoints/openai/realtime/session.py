@@ -501,11 +501,9 @@ class RealtimeConnection:
             )
             return
 
-        # A truncated or skipped intermediate decode must not complete as-is:
-        # force one final decode so the item either recovers or fails closed.
-        has_new_audio = (
-            self.asr_state.has_new_audio or self.asr_state.cumulative_truncated
-        )
+        # A skipped or truncated intermediate decode leaves its audio unprocessed,
+        # forcing one final decode so the item either recovers or fails closed.
+        has_new_audio = self.asr_state.has_new_audio
         item_id = self.item.current_item_id
         prev_item_id = self.item.previous_item_id
 

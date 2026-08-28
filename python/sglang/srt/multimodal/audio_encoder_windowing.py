@@ -23,12 +23,12 @@ _ITEM_ATTENTION_MASK_KEY = "feature_attention_mask"
 
 
 class AudioEncoderWindowConfig(msgspec.Struct, frozen=True):
-    """Window geometry in samples and encoder tokens, resolved once from the
-    model config so every request splits audio identically."""
+    """Window geometry in samples, feature frames, and encoder tokens, resolved
+    once from the model config so every request splits audio identically."""
 
     min_input_samples: int
     window_samples: int
-    window_frames: int
+    feature_batch_frames: int
     window_tokens: int
 
 
@@ -68,15 +68,26 @@ def _extract_feature_batch(
     if any(count <= 0 for count in token_counts):
         raise ValueError("audio window produced no encoder tokens")
 
-    feature_frames = config.window_frames if complete else processed_features.shape[-1]
-    return [
-        _AudioWindowFeatures(
-            feature=processed_features[row : row + 1, :, :feature_frames].clone(),
-            attention_mask=processed_masks[row : row + 1, :feature_frames].clone(),
-            token_count=token_counts[row],
+    feature_frames = processed_features.shape[-1]
+    if feature_frames > config.feature_batch_frames:
+        raise ValueError("audio window feature width exceeds the configured maximum")
+
+    padding = config.feature_batch_frames - feature_frames
+    features = []
+    for row in range(len(windows)):
+        feature = processed_features[row : row + 1].clone()
+        attention_mask = processed_masks[row : row + 1].clone()
+        if padding:
+            feature = torch.nn.functional.pad(feature, (0, padding))
+            attention_mask = torch.nn.functional.pad(attention_mask, (0, padding))
+        features.append(
+            _AudioWindowFeatures(
+                feature=feature,
+                attention_mask=attention_mask,
+                token_count=token_counts[row],
+            )
         )
-        for row in range(len(windows))
-    ]
+    return features
 
 
 def resolve_audio_encoder_window_config(
@@ -98,10 +109,16 @@ def resolve_audio_encoder_window_config(
     if float(getattr(feature_extractor, "dither", 0.0)) != 0.0:
         raise ValueError("audio windowing requires deterministic feature extraction")
 
+    min_input_samples = int(feature_extractor.n_fft)
+    hop_length = int(feature_extractor.hop_length)
+    window_samples = spec.window_frames * hop_length
     return AudioEncoderWindowConfig(
-        min_input_samples=int(feature_extractor.n_fft),
-        window_samples=spec.window_frames * int(feature_extractor.hop_length),
-        window_frames=spec.window_frames,
+        min_input_samples=min_input_samples,
+        window_samples=window_samples,
+        # A sub-n_fft tail is attached to the preceding complete window. Pad
+        # every feature row to this maximum width so main's normal MM batch can
+        # concatenate complete windows and the mutable tail in one encoder call.
+        feature_batch_frames=(window_samples + min_input_samples - 1) // hop_length,
         window_tokens=int(output_length_fn([spec.window_frames])[0]),
     )
 
@@ -173,7 +190,7 @@ def _build_audio_window_items(
 ) -> tuple[list[MultimodalDataItem], torch.Tensor]:
     """Expand one audio placeholder and create feature-backed window items."""
     # Keep hashing local to avoid an import cycle through schedule_batch.
-    from sglang.srt.managers.mm_utils import hash_feature, hash_mm_item
+    from sglang.srt.managers.mm_utils import hash_feature
 
     input_ids = input_ids.flatten()
     token_counts = [window.token_count for window in window_features]
@@ -204,11 +221,7 @@ def _build_audio_window_items(
         # The encoder reads both tensors. Including the mask prevents padded
         # tails from sharing a Radix/cache identity with a complete window that
         # has identical zero-padded features but a different effective length.
-        item_hash = hash_mm_item(
-            feature_hash=hash_feature([window.feature, window.attention_mask]),
-            modality=Modality.AUDIO,
-            offsets=[(offset_start, offset_end)],
-        )
+        item_hash = hash_feature([window.feature, window.attention_mask])
         # The mutable tail changes every request and must not evict reusable
         # complete-window embeddings, even though its Radix identity is valid.
         use_embedding_cache = index < complete_window_count
@@ -217,14 +230,7 @@ def _build_audio_window_items(
             offsets=[(offset_start, offset_end)],
             feature=window.feature,
             use_embedding_cache=use_embedding_cache,
-            encoder_batch_key=(
-                "feature",
-                *(int(size) for size in window.feature.shape[1:]),
-                str(window.feature.dtype),
-                "attention_mask",
-                *(int(size) for size in window.attention_mask.shape[1:]),
-                str(window.attention_mask.dtype),
-            ),
+            separate_encoder_batch=True,
             model_specific_data={
                 _ITEM_ATTENTION_MASK_KEY: window.attention_mask,
             },

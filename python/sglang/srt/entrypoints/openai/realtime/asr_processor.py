@@ -87,9 +87,6 @@ class RealtimeASRState(msgspec.Struct):
     # Once text proves incompatible with word-based suffix reconciliation, this
     # item stays cumulative because switching back after compaction is unsafe.
     encoder_window_disabled: bool = False
-    # A truncated intermediate cumulative decode may stream, but the item must
-    # run one final decode at commit so truncation cannot become completed.
-    cumulative_truncated: bool = False
 
     @property
     def has_audio(self) -> bool:
@@ -181,7 +178,6 @@ class RealtimeASRProcessor:
         self.adapter = adapter
         self.model_sample_rate = adapter.model_sample_rate
         self.pcm_bytes_per_second = self.model_sample_rate * PCM_SAMPLE_WIDTH_BYTES
-        self.max_buffer_seconds = server_args.asr_max_buffer_seconds
 
         state = StreamingASRState(**self.adapter.chunked_streaming_config)
         if not math.isfinite(state.chunk_size_sec) or state.chunk_size_sec <= 0:
@@ -195,7 +191,9 @@ class RealtimeASRProcessor:
             raise ValueError(
                 "realtime ASR chunk_size_sec must resolve to whole PCM samples"
             )
-        self.max_buffer_bytes = self.max_buffer_seconds * self.pcm_bytes_per_second
+        self.max_buffer_bytes = (
+            server_args.asr_max_buffer_seconds * self.pcm_bytes_per_second
+        )
         self._encoder_window_policy = self._resolve_encoder_window_policy(
             state, enabled=server_args.enable_asr_encoder_window
         )
@@ -251,6 +249,7 @@ class RealtimeASRProcessor:
                 "[realtime] encoder windowing cannot activate before the "
                 "current ASR item limit; raise --asr-max-buffer-seconds"
             )
+            return None
         return _ResolvedEncoderWindowPolicy(
             geometry=encoder_window_config,
             adapter_policy=declared,
@@ -517,12 +516,11 @@ class RealtimeASRProcessor:
         delta = apply_cumulative_transcript(
             state.transcript, generation.text, is_last=step.is_last
         )
-        # A truncated intermediate decode keeps the pre-existing streaming
-        # behavior, but the item may not complete on it: the flag forces one
-        # final decode at commit, which fails closed if still truncated.
-        state.cumulative_truncated = generation.finish_reason == "length"
+        # Keep truncated audio unprocessed so the cursor state forces a clean
+        # final decode at commit. The cumulative transcript update above still
+        # preserves the existing intermediate streaming behavior.
         return _TranscriptionOutcome(
-            audio_processed=True,
+            audio_processed=generation.finish_reason != "length",
             cumulative_delta=delta,
         )
 
@@ -725,10 +723,6 @@ class RealtimeASRProcessor:
             state.decoder_suffix.apply(outcome.decoder_update)
         if not outcome.audio_processed:
             return
-        if step.uses_encoder_windows:
-            # A windowed decode supersedes the truncated cumulative snapshot; a
-            # stale flag would force a useless windowed final decode at commit.
-            state.cumulative_truncated = False
         audio.last_processed_offset_bytes = step.end_offset_bytes
         if step.is_last:
             return

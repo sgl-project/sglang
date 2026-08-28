@@ -195,52 +195,6 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
-def _apply_caller_mm_hashes(
-    mm_items: List[MultimodalDataItem], caller_mm_hashes: List[str]
-) -> None:
-    """Apply valid caller hashes unless duplicates disagree on token geometry."""
-    if len(caller_mm_hashes) != len(mm_items):
-        logger.warning(
-            "mm_hashes length (%d) != mm_items length (%d); "
-            "ignoring caller hashes for this request.",
-            len(caller_mm_hashes),
-            len(mm_items),
-        )
-        return
-
-    parsed = []
-    geometry_by_hash = {}
-    for item, hex_hash in zip(mm_items, caller_mm_hashes):
-        if not isinstance(item, MultimodalDataItem):
-            continue
-        try:
-            item_hash = int(hex_hash, 16)
-        except (TypeError, ValueError):
-            logger.warning(
-                "Ignoring malformed mm_hashes entry %r; "
-                "this item will fall back to hash_feature().",
-                hex_hash,
-            )
-            continue
-        geometry = (
-            item.modality,
-            tuple(end - start + 1 for start, end in item.offsets or ()),
-        )
-        previous_geometry = geometry_by_hash.get(item_hash)
-        if previous_geometry is not None and previous_geometry != geometry:
-            logger.warning(
-                "Duplicate mm_hashes value %r has incompatible token geometry; "
-                "ignoring caller hashes for this request.",
-                hex_hash,
-            )
-            return
-        geometry_by_hash[item_hash] = geometry
-        parsed.append((item, item_hash))
-
-    for item, item_hash in parsed:
-        item.set_hash(item_hash)
-
-
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
     disagg = get_disagg()
@@ -1166,7 +1120,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # malformed mm_hashes never blocks a request.
             caller_mm_hashes = getattr(obj, "mm_hashes", None)
             if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                _apply_caller_mm_hashes(mm_inputs.mm_items, caller_mm_hashes)
+                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
+                    logger.warning(
+                        "mm_hashes length (%d) != mm_items length (%d); "
+                        "ignoring caller hashes for this request.",
+                        len(caller_mm_hashes),
+                        len(mm_inputs.mm_items),
+                    )
+                else:
+                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
+                        if not isinstance(item, MultimodalDataItem):
+                            continue
+                        try:
+                            item.set_hash(int(hex_hash, 16))
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring malformed mm_hashes entry %r; "
+                                "this item will fall back to hash_feature().",
+                                hex_hash,
+                            )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
