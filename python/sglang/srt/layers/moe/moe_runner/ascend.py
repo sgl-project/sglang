@@ -121,6 +121,15 @@ class AscendRunnerCore(MoeRunnerCore):
             # 1. Choose the base activation according to the quant method
             if isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)):
                 inner = NPUSwigluQuant()
+            elif config.activation == "situ":
+                # Grouped SiTU (Kimi-K3). need_quant=False: the MXFP4 / BF16
+                # gmm2 requantizes the activations itself, so no quant is
+                # fused here. Matches the DeepEP branch below.
+                inner = NPUSitu(
+                    need_quant=False,
+                    beta=config.gemm1_alpha if config.gemm1_alpha is not None else 4.0,
+                    linear_beta=config.gemm1_clamp_limit,
+                )
             else:
                 if config.activation == "npu_swiglu_oai":
                     # NPUSwigluOAI requires the runner config to pass

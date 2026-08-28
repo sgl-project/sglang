@@ -453,14 +453,20 @@ class KimiK3MoE(nn.Module):
         # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
-        # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
-        # so FusedMoE's weight_loader uses the MXFP4 fast path
+        # For MXFP4 compressed-tensors on non-NPU, replace quant_config with
+        # Mxfp4Config so FusedMoE's weight_loader uses the MXFP4 fast path. On
+        # NPU the compressed-tensors config is kept so the scheme-based path
+        # selects NPUCompressedTensorsW4A8mxfp4MoE (see get_moe_scheme).
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None) and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
-            if "mxfp4" in quant_config.quant_format:
-                from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+        if (
+            quant_config is not None
+            and getattr(quant_config, "quant_format", None)
+            and "mxfp4" in quant_config.quant_format
+            and not _is_npu
+        ):
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-                moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+            moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
@@ -3196,7 +3202,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            if "weight_packed" in name and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
+            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
+            if "weight_packed" in name and not _is_npu:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
