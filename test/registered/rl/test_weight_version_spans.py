@@ -304,6 +304,9 @@ class TestWeightVersionSpans(CustomTestCase):
         self.assertEqual(spans[0]["version"], metadata["weight_version"])
         self.assertEqual(metadata["weight_version"], self._current_version())
         self.assertEqual(spans[0]["start"], 0)
+        _assert_prefill_spans_contiguous(
+            self, metadata, prompt_tokens=data["usage"]["prompt_tokens"]
+        )
 
     def test_05_aborted_retracted_requests_report_spans(self):
         """Requests aborted while retracted in the waiting queue still report their spans."""
@@ -685,6 +688,9 @@ class TestWeightVersionSpans(CustomTestCase):
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
             self.assertEqual(spans[0]["version"], previous_version)
+            prefill_spans = _assert_prefill_spans_contiguous(
+                self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+            )
             if len(spans) > 1:
                 split_count += 1
                 self.assertEqual(
@@ -692,6 +698,7 @@ class TestWeightVersionSpans(CustomTestCase):
                     [previous_version, "spec-v1"],
                 )
                 self.assertGreater(spans[0]["end"], 0)
+                self.assertEqual(prefill_spans[-1]["version"], "spec-v1")
 
         self.assertGreater(
             split_count,
