@@ -255,7 +255,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -269,25 +269,9 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.85",
-        // Large chunked-prefill is the main balanced-workload tuning lever;
+        // Large chunked-prefill is the main high-throughput tuning lever;
         // max-running should track the available KV capacity.
         "--chunked-prefill-size 32768",
-        "--max-running-requests 256",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "h200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
         "--max-running-requests 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -314,7 +298,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -328,25 +312,9 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.85",
-        // Large chunked-prefill is the main balanced-workload tuning lever;
+        // Large chunked-prefill is the main high-throughput tuning lever;
         // max-running should track the available KV capacity.
         "--chunked-prefill-size 32768",
-        "--max-running-requests 256",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b200", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
         "--max-running-requests 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -375,7 +343,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -389,26 +357,9 @@ sgl-eval run aime25 \\
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.85",
-        // Same prefill lever as H200/B200 balanced; max-running tracks the TP4 KV capacity.
+        // Same prefill lever as H200/B200; max-running tracks the TP4 KV capacity.
         "--chunked-prefill-size 32768",
         "--max-running-requests 256",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512",
-      ],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 4",
-        "--dp 4",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -435,7 +386,7 @@ sgl-eval run aime25 \\
       ],
     },
     {
-      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
       verified: true,
       env: [],
       flags: [
@@ -450,22 +401,6 @@ sgl-eval run aime25 \\
         "--speculative-num-draft-tokens 2",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 32768",
-        "--max-running-requests 256",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "b300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      env: [],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp 8",
-        "--dp 8",
-        "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
-        "--mem-fraction-static 0.85",
         "--max-running-requests 256",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

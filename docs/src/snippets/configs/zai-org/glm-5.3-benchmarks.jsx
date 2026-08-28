@@ -16,7 +16,7 @@ export const benchmarks = [
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=3.5 with the EAGLE 5/1/6 draft (measured accept length 3.496 at concurrency 1, 3.476 at concurrency 16). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
   },
   {
-    match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" },
+    match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 20a491d1d311",
     accuracy: { gsm8k_pct: 97.12, aime25_pct: 91.88 },
     speed: [
@@ -27,15 +27,6 @@ export const benchmarks = [
     ],
     notes:
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=2 with the EAGLE 1/1/2 draft (measured accept length 2.000 exactly at both concurrencies, saturating the 2-token draft). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
-  },
-  {
-    match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "main @ 20a491d1d311",
-    accuracy: { gsm8k_pct: 97.8 },
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 414862, tpot_ms: 86.67, tokens_per_sec_per_gpu: 1762 },
-    ],
   },
   {
     match: { hw: "b200",  variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" },
@@ -51,7 +42,7 @@ export const benchmarks = [
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=3.5 with the EAGLE 5/1/6 draft (measured accept length 3.507 at concurrency 1, 3.503 at concurrency 16). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
   },
   {
-    match: { hw: "b200",  variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" },
+    match: { hw: "b200",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 20a491d1d311",
     accuracy: { gsm8k_pct: 97.42, aime25_pct: 90.83 },
     speed: [
@@ -62,15 +53,6 @@ export const benchmarks = [
     ],
     notes:
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=2 with the EAGLE 1/1/2 draft (measured accept length 2.000 exactly at both concurrencies, saturating the 2-token draft). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
-  },
-  {
-    match: { hw: "b200",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "main @ 20a491d1d311",
-    accuracy: { gsm8k_pct: 97.27 },
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 180659, tpot_ms: 48.40, tokens_per_sec_per_gpu: 3997 },
-    ],
   },
   {
     match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" },
@@ -86,7 +68,7 @@ export const benchmarks = [
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=3.5 with the EAGLE 5/1/6 draft (measured accept length 3.489 at concurrency 1, 3.509 at concurrency 16). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
   },
   {
-    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" },
+    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 20a491d1d311",
     accuracy: { gsm8k_pct: 97.19, aime25_pct: 90.62 },
     speed: [
@@ -97,15 +79,6 @@ export const benchmarks = [
     ],
     notes:
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=2 with the EAGLE 1/1/2 draft (measured accept length 2.000 exactly at both concurrencies, saturating the 2-token draft). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
-  },
-  {
-    match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "main @ 20a491d1d311",
-    accuracy: { gsm8k_pct: 96.74 },
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 212443, tpot_ms: 89.15, tokens_per_sec_per_gpu: 6194 },
-    ],
   },
   {
     match: { hw: "b300",  variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" },
@@ -121,7 +94,7 @@ export const benchmarks = [
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=3.5 with the EAGLE 5/1/6 draft (measured accept length 3.485 at concurrency 1, 3.487 at concurrency 16). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
   },
   {
-    match: { hw: "b300",  variant: "default", quant: "fp8", strategy: "balanced",        nodes: "single" },
+    match: { hw: "b300",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 20a491d1d311",
     accuracy: { gsm8k_pct: 97.42, aime25_pct: 92.08 },
     speed: [
@@ -132,15 +105,6 @@ export const benchmarks = [
     ],
     notes:
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=2 with the EAGLE 1/1/2 draft (measured accept length 2.000 exactly at both concurrencies, saturating the 2-token draft). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
-  },
-  {
-    match: { hw: "b300",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
-    sglang_version: "main @ 20a491d1d311",
-    accuracy: { gsm8k_pct: 97.5 },
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1024 },
-        ttft_ms: 177265, tpot_ms: 47.19, tokens_per_sec_per_gpu: 4067 },
-    ],
   },
 
   // NVIDIA NVFP4, single node (RadixArk/GLM-5.3-NVFP4).
