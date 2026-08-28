@@ -1,25 +1,4 @@
-"""DP>1 readback of routed experts over DeepEP-class a2a backends.
-
-With DP attention + a DeepEP-class a2a backend, the MoE layer sees only the
-attention rank's DP-local tokens, so RoutedExpertsCapturer must gather at
-capture time and read back from the buffer head. If the backend is not
-recognized, requests owned by dp_rank > 0 read unwritten buffer rows and
-silently return garbage expert ids (dp_rank 0 sits at offset 0 and looks
-correct, which is why a DP>1 test is required).
-
-Oracle: solo-vs-concurrent consistency. A request served alone is correct
-even on a misclassifying tree (with the other rank empty, the global offset
-degenerates to 0), so its per-token expert sets form a valid baseline. The
-same prompts served concurrently must reproduce those sets; a misclassified
-backend instead reads whatever the offset region holds (often well-formed
-rows belonging to other tokens or graph warmup, which per-row validity
-checks cannot catch). Radix cache is disabled so the concurrent phase cannot
-serve cached prefix rows written by the solo phase.
-
-Uses a dummy-weight single-layer 24-expert DeepSeek-V3 so each server boots
-in seconds (same pattern as test_deepseek_v3_cutedsl_4gpu.py); generation
-quality is irrelevant — only the capture/readback plumbing is under test.
-"""
+"""DP>1 routed-expert readback parity for DeepEP-family A2A backends."""
 
 import concurrent.futures
 import json
@@ -29,6 +8,7 @@ import unittest
 import numpy as np
 import pybase64
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -39,16 +19,14 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
 
 _MODEL = os.environ.get("SGLANG_ROUTED_EXPERTS_TEST_MODEL", "deepseek-ai/DeepSeek-V3")
 _NUM_EXPERTS = 24
 _NUM_LAYERS = 1
-_TOPK = 8  # DeepSeek-V3 num_experts_per_tok
+_TOPK = 8
 
 _DUMMY_WEIGHT_ENV = {
-    # Dummy random weights legitimately produce NaN logits; sanitize instead
-    # of crashing (same rationale as test_deepseek_v3_cutedsl_4gpu.py).
     "SGLANG_ENABLE_ASYNC_ASSERT": "0",
     "SGLANG_SANITIZE_NAN_LOGITS": "1",
     "SGLANG_CUDA_COREDUMP": "0",
@@ -63,6 +41,14 @@ def _deep_ep_has(attr: str) -> bool:
     except ImportError:
         return False
     return hasattr(deep_ep, attr)
+
+
+def _deep_ep_nccl_compatible() -> bool:
+    try:
+        version = torch.cuda.nccl.version()
+    except (AttributeError, RuntimeError):
+        return False
+    return version is not None and version >= (2, 30, 7)
 
 
 class _ReadbackMixin:
@@ -93,6 +79,9 @@ class _ReadbackMixin:
             "--enable-return-routed-experts",
             "--disable-cuda-graph",
             "--disable-radix-cache",
+            # Keep the startup budget within the test's 256-token buffer.
+            "--chunked-prefill-size",
+            "256",
             "--mem-fraction-static",
             "0.5",
             *cls.backend_args,
@@ -112,7 +101,8 @@ class _ReadbackMixin:
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if getattr(cls, "process", None):
+            kill_process_tree(cls.process.pid)
 
     def _one_request(self, i: int):
         resp = requests.post(
@@ -145,14 +135,8 @@ class _ReadbackMixin:
     _N_REQ = 6
 
     def test_dp2_readback(self):
-        # Phase 1 — solo baselines: sequential requests leave the other DP
-        # rank empty, the global offset degenerates to 0, and the readback is
-        # correct even when the backend is misclassified.
         solo = [self._one_request(i) for i in range(self._N_REQ)]
 
-        # Phase 2 — the same prompts concurrently: joint forward batches give
-        # dp_rank > 0 requests a non-zero global offset, which is exactly the
-        # path a misclassified backend gets wrong.
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._N_REQ) as ex:
             conc = list(ex.map(self._one_request, range(self._N_REQ)))
 
@@ -192,14 +176,15 @@ class TestRoutedExpertsReadbackDeepEP(_ReadbackMixin, CustomTestCase):
 @unittest.skipUnless(
     _deep_ep_has("ElasticBuffer"), "DeepEP v2 (ElasticBuffer) not installed"
 )
+@unittest.skipUnless(
+    _deep_ep_nccl_compatible(), "DeepEP v2 requires NCCL runtime >= 2.30.7"
+)
 class TestRoutedExpertsReadbackDeepEPv2(_ReadbackMixin, CustomTestCase):
     backend_args = [
         "--moe-a2a-backend",
         "deepep_v2",
         "--deepep-v2-mode",
         "direct",
-        "--deepep-v2-dispatcher-output-dtype",
-        "fp8",
         "--moe-runner-backend",
         "deep_gemm",
     ]

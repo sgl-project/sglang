@@ -100,6 +100,29 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _deferred_finalize_info_logged = False
 
 
+def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
+    return (
+        getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
+        or (
+            isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
+            and not getattr(
+                quant_method, "_moe_runner_backend", get_moe_runner_backend()
+            ).is_marlin()
+        )
+        or (
+            isinstance(quant_method, Fp8MoEMethod)
+            and (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
+        )
+        or (
+            isinstance(quant_method, UnquantizedFusedMoEMethod)
+            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
+    )
+
+
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     """Copy a CPU tensor view into independent contiguous storage."""
     if loaded_weight.device.type != "cpu":
@@ -211,6 +234,34 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
             "(FP8 blockwise or per-tensor MoE), but this layer selected "
             f"{type(quant_method).__name__}. Remove --moe-runner-backend "
             "hpc_ops for this model."
+        )
+
+
+def _validate_deepep_v2_quant_method(quant_method) -> None:
+    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    config = (
+        quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
+    )
+    reason = None
+    if not isinstance(quant_method, Fp8MoEMethod):
+        reason = f"selected {type(quant_method).__name__}"
+    elif quant_method.use_mxfp8:
+        reason = "selected MXFP8 weights"
+    elif quant_method.is_fp4_expert:
+        reason = "selected FP4 experts"
+    elif list(quant_method.weight_block_size or []) != [128, 128]:
+        reason = f"has weight_block_size={quant_method.weight_block_size}"
+    elif config.activation_scheme != "dynamic":
+        reason = f"has activation_scheme={config.activation_scheme!r}"
+
+    if reason is not None:
+        raise ValueError(
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
+            f"experts with dynamic activation scaling, but this layer {reason}. "
+            "Use a compatible checkpoint or --moe-a2a-backend deepep."
         )
 
 
@@ -398,6 +449,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        _validate_deepep_v2_quant_method(self.quant_method)
         nvfp4_deferred = envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get() and isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         )
@@ -462,32 +514,7 @@ class FusedMoE(torch.nn.Module):
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            (
-                isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-                and not getattr(
-                    self.quant_method, "_moe_runner_backend", get_moe_runner_backend()
-                ).is_marlin()
-            )
-            or (
-                isinstance(self.quant_method, Fp8MoEMethod)
-                and (
-                    get_moe_runner_backend().is_cutlass()
-                    or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-                    # FlashInfer A2A materializes routing before TRT-LLM Gen
-                    # MoE.  The regular backend name therefore enters the same
-                    # packed routed kernel as flashinfer_trtllm_routed and must
-                    # use the same top-k scaling contract.  Keep the original
-                    # fused-routing behavior unchanged when A2A is disabled.
-                    or (
-                        get_moe_a2a_backend().is_flashinfer()
-                        and get_moe_runner_backend().is_flashinfer_trtllm()
-                    )
-                )
-            )
-            or (
-                isinstance(self.quant_method, UnquantizedFusedMoEMethod)
-                and get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            )
+            _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )
 
         self.routing_method_type = routing_method_type

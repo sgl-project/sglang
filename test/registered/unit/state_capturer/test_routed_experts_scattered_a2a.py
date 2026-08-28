@@ -1,13 +1,4 @@
-"""DeepEP-class backend recognition in RoutedExpertsCapturer.
-
-The capturer keys its buffer layout on the a2a backend: DeepEP-class
-dispatchers hand the MoE layer only the attention rank's DP-local tokens, so
-``capture()`` must attn-TP-gather and ``_get_local_slice()`` must read the
-buffer head instead of the global DP offset. These tests pin that DeepEP v2
-is classified like DeepEP (it shares that token topology); a miss makes
-dp_rank > 0 read unwritten rows (silent wrong data), see the DP>1 readback
-test in test/registered/ep/test_routed_experts_dp_readback.py.
-"""
+"""DeepEP-family backend recognition in RoutedExpertsCapturer."""
 
 import unittest
 from types import SimpleNamespace
@@ -17,17 +8,14 @@ import torch
 
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.state_capturer import routed_experts as re_mod
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestScatteredA2ABackendHelper(CustomTestCase):
     def test_classification(self):
-        # deepep_v2 shares DeepEP's scattered token topology. Other backends
-        # keep their existing classification (mooncake/mori are deliberately
-        # not reclassified here).
         expected = {
             "deepep": True,
             "deepep_v2": True,
@@ -44,7 +32,7 @@ class TestScatteredA2ABackendHelper(CustomTestCase):
 
 
 class TestGetLocalSliceBackendBranch(CustomTestCase):
-    T, L, K = 16, 3, 4  # buffer tokens, layers, top-k
+    T, L, K = 16, 3, 4
 
     def _capturer(self):
         cap = object.__new__(re_mod.RoutedExpertsCapturer)

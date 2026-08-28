@@ -55,6 +55,7 @@ class RadixLinearAttention(nn.Module):
         activation: str = "silu",
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
+        lower_bound: Optional[float] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -74,7 +75,7 @@ class RadixLinearAttention(nn.Module):
 
         self.A_log = A_log
         self.dt_bias = dt_bias
-        self.lower_bound = None
+        self.lower_bound = lower_bound
 
     def forward(
         self,

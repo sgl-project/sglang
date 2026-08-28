@@ -533,7 +533,8 @@ def _launch_fused_gate_sigmoid_mul(
     if num_tokens >= 1024:
         config["num_warps"] = min(config["num_warps"], 8)
 
-    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
         hidden_states,
@@ -542,6 +543,7 @@ def _launch_fused_gate_sigmoid_mul(
         output,
         hidden_dim=hidden_dim,
         DO_ADD=do_add,
+        USE_PDL=use_pdl,
         **config,
         **pdl_kwargs,
     )

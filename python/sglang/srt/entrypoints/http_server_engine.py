@@ -12,6 +12,10 @@ from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+    # Resolve here, not in the child: the pipeline probes the device, and a
+    # forked child cannot re-initialize CUDA if this process already has. The
+    # child's gate then finds nothing left to do.
+    server_args.resolve_once()
 
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
