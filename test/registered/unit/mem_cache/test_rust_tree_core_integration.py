@@ -801,11 +801,6 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
     assert result.device_indices.numel() == 0
     core.sanity_check([], [])
 
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
-
-
 # ==== SWA wiring ====
 
 
@@ -1683,3 +1678,7 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
                 value=torch.tensor([10, 11], dtype=torch.int64),
             ),
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
