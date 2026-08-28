@@ -533,6 +533,7 @@ class PlainStateDictComponentLoader(ComponentLoader):
         self,
         component_model_path: str,
         component_name: str,
+        *,
         revision: str | None = None,
     ) -> dict[str, Any]:
         config = get_diffusers_component_config(
