@@ -35,6 +35,8 @@ pub struct GenerateRequestMetadata {
 /// Generation options shared by text and token-ID inputs.
 pub struct GenerationOptions {
     pub sampling_params: SamplingParams,
+    /// Delay structured-output constraints until the model finishes reasoning.
+    pub require_reasoning: bool,
     pub stream: bool,
     pub return_logprob: bool,
     pub logprob_start_len: i64,
@@ -159,6 +161,8 @@ pub struct GenerateRequest {
     #[serde(flatten)]
     pub metadata: GenerateRequestMetadata,
     pub input_ids: TokenIds,
+    #[serde(default)]
+    pub require_reasoning: bool,
     pub sampling_params: GenerateSamplingParams,
     pub stream: bool,
     pub return_logprob: bool,
@@ -178,6 +182,7 @@ impl From<TokenIdsRequest> for GenerateRequest {
             rid: request.rid,
             metadata: request.metadata,
             input_ids: request.input_ids,
+            require_reasoning: options.require_reasoning,
             sampling_params: options.sampling_params.into(),
             stream: options.stream,
             return_logprob: options.return_logprob,
@@ -187,6 +192,31 @@ impl From<TokenIdsRequest> for GenerateRequest {
             return_hidden_states: options.return_hidden_states,
             return_text_in_logprobs: options.return_text_in_logprobs,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_reasoning_is_forwarded_as_a_boolean() {
+        let request = |require_reasoning| {
+            GenerateRequest::from(TokenIdsRequest::new(
+                "request",
+                vec![1, 2],
+                GenerationOptions {
+                    require_reasoning,
+                    ..Default::default()
+                },
+            ))
+        };
+
+        let enabled = serde_json::to_value(request(true)).unwrap();
+        assert_eq!(enabled["require_reasoning"], true);
+
+        let disabled = serde_json::to_value(request(false)).unwrap();
+        assert_eq!(disabled["require_reasoning"], false);
     }
 }
 

@@ -194,6 +194,11 @@ pub(crate) struct LoweredChat {
     pub response_processor: ChatResponseProcessor,
 }
 
+struct RenderPreparation {
+    require_reasoning: bool,
+    tools_enabled: bool,
+}
+
 /// Applies structured chat semantics before the shared text generation path.
 pub struct ChatPreprocessor {
     formatter: Option<ChatFormatter>,
@@ -220,16 +225,13 @@ impl ChatPreprocessor {
     }
 
     pub fn preprocess(&self, mut request: ChatRequest) -> Result<LoweredChat, RendererError> {
-        self.prepare_for_render(&mut request)?;
+        let preparation = self.prepare_for_render(&mut request)?;
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
         let tools = chat_tool_definitions(&request);
-        let parser = resolve_chat_parser(
-            self.tool_call_parser.as_deref(),
-            !tools.is_empty(),
-            &tool_choice,
-        )?;
+        let parser =
+            resolve_chat_parser(self.tool_call_parser.as_deref(), preparation.tools_enabled)?;
         if parser.is_some() {
             request.sampling_params.skip_special_tokens = false;
         }
@@ -245,6 +247,7 @@ impl ChatPreprocessor {
 
         let options = GenerationOptions {
             sampling_params: request.sampling_params.clone(),
+            require_reasoning: preparation.require_reasoning,
             stream: request.stream,
             return_logprob: request.return_logprob,
             logprob_start_len: -1,
@@ -283,7 +286,7 @@ impl ChatPreprocessor {
 
     /// Render chat for tokenization without creating generation/output state.
     pub fn lower_to_text(&self, mut request: ChatRequest) -> Result<TextRequest, RendererError> {
-        self.prepare_for_render(&mut request)?;
+        let preparation = self.prepare_for_render(&mut request)?;
         let prompt = self.render(&request)?;
         Ok(TextRequest::rendered(
             request.rid,
@@ -291,16 +294,37 @@ impl ChatPreprocessor {
             false,
             GenerationOptions {
                 sampling_params: request.sampling_params,
+                require_reasoning: preparation.require_reasoning,
                 ..Default::default()
             },
         )
         .with_metadata(request.metadata))
     }
 
-    fn prepare_for_render(&self, request: &mut ChatRequest) -> Result<(), RendererError> {
+    fn prepare_for_render(
+        &self,
+        request: &mut ChatRequest,
+    ) -> Result<RenderPreparation, RendererError> {
         validate_chat(request)?;
         self.normalize_template_args(request);
-        Ok(())
+        let tool_choice = dynamo_tool_choice(&request.tool_choice);
+        let tools_enabled = request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && tool_choice != DynamoToolChoice::None;
+        let named_tool_choice = matches!(tool_choice, DynamoToolChoice::Named(_));
+        let thinking = self.formatter.as_ref().and_then(|formatter| {
+            formatter.resolve_thinking(
+                &mut request.chat_template_args,
+                tools_enabled,
+                named_tool_choice,
+            )
+        });
+        Ok(RenderPreparation {
+            require_reasoning: self.reasoning_parser.is_some() && thinking == Some(true),
+            tools_enabled,
+        })
     }
 
     fn normalize_template_args(&self, request: &mut ChatRequest) {
@@ -312,10 +336,10 @@ impl ChatPreprocessor {
                 serde_json::to_value(reasoning_effort).expect("reasoning effort must serialize"),
             );
             let thinking = !reasoning_effort.disables_thinking();
-            if !request_args.contains_key("thinking") {
+            let has_explicit_toggle = request_args.contains_key("thinking")
+                || request_args.contains_key("enable_thinking");
+            if !has_explicit_toggle {
                 args.insert("thinking".into(), thinking.into());
-            }
-            if !request_args.contains_key("enable_thinking") {
                 args.insert("enable_thinking".into(), thinking.into());
             }
         }
@@ -462,10 +486,8 @@ fn merge_template_stops(sampling: &mut SamplingParams, formatter: Option<&ChatFo
 
 fn resolve_chat_parser(
     configured_parser: Option<&str>,
-    has_tools: bool,
-    tool_choice: &DynamoToolChoice,
+    tools_enabled: bool,
 ) -> Result<Option<String>, RendererError> {
-    let tools_enabled = has_tools && *tool_choice != DynamoToolChoice::None;
     if tools_enabled && configured_parser.is_none() {
         return Err("tool calls require --tool-call-parser".into());
     }
@@ -660,14 +682,27 @@ mod tests {
     }
 
     fn chat_preprocessor() -> ChatPreprocessor {
+        chat_preprocessor_with(
+            Some("llama3"),
+            None,
+            crate::preprocessing::template::load_chat_formatter(None, None, Some("chatml"))
+                .unwrap(),
+        )
+    }
+
+    fn chat_preprocessor_with(
+        tool_call_parser: Option<&str>,
+        reasoning_parser: Option<&str>,
+        formatter: ChatFormatter,
+    ) -> ChatPreprocessor {
         let config = RendererConfig {
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
             revision: None,
             model_path: String::new(),
             chat_template: Some("chatml".into()),
-            tool_call_parser: Some("llama3".into()),
-            reasoning_parser: None,
+            tool_call_parser: tool_call_parser.map(str::to_owned),
+            reasoning_parser: reasoning_parser.map(str::to_owned),
             default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
             default_sampling_params: SamplingDefaults::default(),
@@ -679,13 +714,7 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        ChatPreprocessor::new(
-            &config,
-            Some(
-                crate::preprocessing::template::load_chat_formatter(None, None, Some("chatml"))
-                    .unwrap(),
-            ),
-        )
+        ChatPreprocessor::new(&config, Some(formatter))
     }
 
     #[test]
@@ -777,5 +806,97 @@ mod tests {
                 .sampling_params
                 .skip_special_tokens
         );
+    }
+
+    #[test]
+    fn qwen_required_tools_forward_effective_template_thinking() {
+        let formatter = crate::preprocessing::template::test_hugging_face_formatter(
+            "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}{{ enable_thinking }}",
+        );
+        let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
+
+        let enabled = preprocessor
+            .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::Required)))
+            .unwrap();
+        assert!(enabled.text_requests[0].options.require_reasoning);
+
+        let mut disabled_request = chat_request(Some(ChatCompletionToolChoiceOption::Required));
+        disabled_request.reasoning_effort = Some(ReasoningEffort::Max);
+        disabled_request.chat_template_args = Some(HashMap::from([(
+            "enable_thinking".into(),
+            serde_json::Value::Bool(false),
+        )]));
+        let disabled = preprocessor.preprocess(disabled_request).unwrap();
+        assert!(!disabled.text_requests[0].options.require_reasoning);
+    }
+
+    #[test]
+    fn thinking_policy_uses_the_effective_tool_template() {
+        let formatter = crate::preprocessing::template::test_hugging_face_formatter_from_config(
+            serde_json::json!({
+                "chat_template": [
+                    {"default": "{{ enable_thinking | default(false) }}"},
+                    {"tool_use": "{{ enable_thinking | default(true) }}"}
+                ]
+            }),
+        );
+        let preprocessor = chat_preprocessor_with(Some("qwen"), Some("qwen3"), formatter);
+
+        let mut no_tools = chat_request(None);
+        no_tools.tools = None;
+        assert!(
+            !preprocessor.preprocess(no_tools).unwrap().text_requests[0]
+                .options
+                .require_reasoning
+        );
+
+        let mut empty_tools = chat_request(None);
+        empty_tools.tools = Some(Vec::new());
+        assert!(
+            !preprocessor.preprocess(empty_tools).unwrap().text_requests[0]
+                .options
+                .require_reasoning
+        );
+
+        assert!(
+            !preprocessor
+                .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::None)))
+                .unwrap()
+                .text_requests[0]
+                .options
+                .require_reasoning
+        );
+        assert!(
+            preprocessor
+                .preprocess(chat_request(Some(ChatCompletionToolChoiceOption::Required)))
+                .unwrap()
+                .text_requests[0]
+                .options
+                .require_reasoning
+        );
+    }
+
+    #[test]
+    fn always_on_channel_template_requires_reasoning() {
+        let formatter = crate::preprocessing::template::test_hugging_face_formatter(
+            "<|start|>assistant<|channel|>analysis<|message|>",
+        );
+        let preprocessor = chat_preprocessor_with(None, Some("gpt-oss"), formatter);
+        let mut request = chat_request(None);
+        request.tools = None;
+        request.response_format = Some(
+            serde_json::from_value(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"}
+                }
+            }))
+            .unwrap(),
+        );
+
+        let lowered = preprocessor.preprocess(request).unwrap();
+
+        assert!(lowered.text_requests[0].options.require_reasoning);
     }
 }

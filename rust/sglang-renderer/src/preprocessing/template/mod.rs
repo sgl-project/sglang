@@ -19,6 +19,7 @@ use dynamo_renderer::{
     ChatTemplate, ContextMixins, OAIChatLikeRequest, PromptContextMixin, PromptFormatter,
     RenderedPrompt,
 };
+use minijinja::machinery::{Token, tokenize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -69,8 +70,14 @@ const SUPPORTED_STYLES: &[&str] = &[
 /// legacy SGLang conversation template.
 #[derive(Clone)]
 pub(crate) enum ChatFormatter {
-    HuggingFace(PromptFormatter),
-    KimiK25(PromptFormatter),
+    HuggingFace {
+        formatter: PromptFormatter,
+        thinking: ThinkingTemplates,
+    },
+    KimiK25 {
+        formatter: PromptFormatter,
+        thinking: ThinkingTemplates,
+    },
     DeepSeekV4 {
         formatter: PromptFormatter,
         profile: DeepSeekV4Profile,
@@ -83,6 +90,297 @@ pub(crate) enum ChatFormatter {
 pub(crate) enum DeepSeekV4Profile {
     Preview,
     Official,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ThinkingPolicy {
+    #[default]
+    Unknown,
+    Always,
+    TemplateToggle {
+        key: &'static str,
+        default_enabled: bool,
+    },
+    NativeToggle {
+        default_enabled: bool,
+        named_tool_disables: bool,
+    },
+    ReasoningEffort,
+}
+
+impl ThinkingPolicy {
+    fn apply(
+        self,
+        args: &mut Option<HashMap<String, Value>>,
+        named_tool_choice: bool,
+    ) -> Option<bool> {
+        match self {
+            Self::Unknown => None,
+            Self::Always => Some(true),
+            Self::TemplateToggle {
+                key,
+                default_enabled,
+            } => {
+                let enabled = args
+                    .as_ref()
+                    .and_then(|args| args.get(key))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(default_enabled);
+                args.get_or_insert_default()
+                    .insert(key.to_owned(), Value::Bool(enabled));
+                Some(enabled)
+            }
+            Self::NativeToggle {
+                default_enabled,
+                named_tool_disables,
+            } => {
+                let enabled = if named_tool_disables && named_tool_choice {
+                    false
+                } else {
+                    dynamo_renderer::thinking_bool_from_args(args.as_ref())
+                        .unwrap_or(default_enabled)
+                };
+                args.get_or_insert_default()
+                    .insert("thinking".to_owned(), Value::Bool(enabled));
+                Some(enabled)
+            }
+            Self::ReasoningEffort => Some(
+                args.as_ref()
+                    .and_then(|args| args.get("reasoning_effort"))
+                    .is_some_and(|effort| effort.as_str() != Some("none")),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ThinkingTemplates {
+    default: ThinkingPolicy,
+    tool_use: Option<ThinkingPolicy>,
+}
+
+impl ThinkingTemplates {
+    pub(crate) fn native(default_enabled: bool, named_tool_disables: bool) -> Self {
+        let policy = ThinkingPolicy::NativeToggle {
+            default_enabled,
+            named_tool_disables,
+        };
+        Self {
+            default: policy,
+            tool_use: Some(policy),
+        }
+    }
+
+    pub(crate) fn always() -> Self {
+        Self {
+            default: ThinkingPolicy::Always,
+            tool_use: Some(ThinkingPolicy::Always),
+        }
+    }
+
+    fn for_request(self, tools_enabled: bool) -> ThinkingPolicy {
+        if tools_enabled {
+            self.tool_use.unwrap_or(self.default)
+        } else {
+            self.default
+        }
+    }
+
+    fn from_config(config: &Value) -> Self {
+        let Some(template) = config.get("chat_template") else {
+            return Self::default();
+        };
+        if let Some(template) = template.as_str() {
+            let policy = detect_thinking_policy(template);
+            return Self {
+                default: policy,
+                tool_use: Some(policy),
+            };
+        }
+        let mut policies = Self::default();
+        for templates in template.as_array().into_iter().flatten() {
+            let Some(templates) = templates.as_object() else {
+                continue;
+            };
+            for (name, template) in templates {
+                let Some(template) = template.as_str() else {
+                    continue;
+                };
+                match name.as_str() {
+                    "default" => policies.default = detect_thinking_policy(template),
+                    "tool_use" => {
+                        policies.tool_use = Some(detect_thinking_policy(template));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        policies
+    }
+}
+
+fn detect_thinking_policy(template: &str) -> ThinkingPolicy {
+    if template.contains("<|channel|>")
+        || ((!template.contains("enable_thinking") && !template.contains("thinking"))
+            && (template.contains(r"<|im_start|>assistant\n<think>\n")
+                || template.contains("<|im_start|>assistant\n<think>\n")))
+    {
+        return ThinkingPolicy::Always;
+    }
+
+    if template.contains("reasoning_effort") && template.contains("[THINK]") {
+        return ThinkingPolicy::ReasoningEffort;
+    }
+
+    let Some(tokens) = jinja_code_tokens(template) else {
+        return ThinkingPolicy::Unknown;
+    };
+    for key in ["enable_thinking", "thinking"] {
+        if let Some(default_enabled) = detect_toggle_default(&tokens, key) {
+            return ThinkingPolicy::TemplateToggle {
+                key,
+                default_enabled,
+            };
+        }
+    }
+    ThinkingPolicy::Unknown
+}
+
+fn jinja_code_tokens(template: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    for token in tokenize(template, false, Default::default(), Default::default()) {
+        let (token, _) = token.ok()?;
+        let value = match token {
+            Token::Ident(value) => value.to_owned(),
+            Token::Pipe => "|".to_owned(),
+            Token::Assign => "=".to_owned(),
+            Token::Comma => ",".to_owned(),
+            Token::ParenOpen => "(".to_owned(),
+            Token::ParenClose => ")".to_owned(),
+            Token::Dot => ".".to_owned(),
+            Token::BlockStart | Token::VariableStart => ";".to_owned(),
+            Token::BlockEnd | Token::VariableEnd => ";".to_owned(),
+            Token::TemplateData(_) | Token::Str(_) | Token::String(_) => continue,
+            _ => continue,
+        };
+        tokens.push(value);
+    }
+    Some(tokens)
+}
+
+fn detect_toggle_default(tokens: &[String], key: &str) -> Option<bool> {
+    if has_default_filter(tokens, key, false) || has_guarded_default(tokens, key, false) {
+        return Some(false);
+    }
+    if has_default_filter(tokens, key, true)
+        || has_guarded_default(tokens, key, true)
+        || contains_tokens(
+            tokens,
+            &[
+                "set", key, "=", key, "if", key, "is", "defined", "else", "true",
+            ],
+        )
+        || contains_tokens(tokens, &[key, "is", "defined", "and", key, "is", "false"])
+        || contains_tokens(tokens, &[key, "is", "defined", "and", "not", key])
+        || contains_tokens(tokens, &[key, "is", "not", "defined", "or", key])
+        || contains_after(tokens, &["namespace", "("], &[key, "=", "true"], None)
+    {
+        return Some(true);
+    }
+    None
+}
+
+fn has_default_filter(tokens: &[String], key: &str, expected: bool) -> bool {
+    for (index, token) in tokens.iter().enumerate() {
+        if token != key || index.checked_sub(1).is_some_and(|i| tokens[i] == ".") {
+            continue;
+        }
+        let Some(filter) = tokens.get(index + 1..index + 5) else {
+            continue;
+        };
+        if filter[0] != "|" || !matches!(filter[1].as_str(), "default" | "d") || filter[2] != "(" {
+            continue;
+        }
+        let Some(default_enabled) = jinja_bool(&filter[3]) else {
+            continue;
+        };
+        let mut cursor = index + 5;
+        let boolean_mode = match tokens.get(cursor).map(String::as_str) {
+            Some(")") => false,
+            Some(",") => {
+                cursor += 1;
+                match tokens.get(cursor).map(String::as_str) {
+                    Some("true") => true,
+                    Some("false") => false,
+                    Some("boolean") if tokens.get(cursor + 1).is_some_and(|token| token == "=") => {
+                        let Some(value) =
+                            tokens.get(cursor + 2).and_then(|value| jinja_bool(value))
+                        else {
+                            continue;
+                        };
+                        value
+                    }
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        if default_enabled == expected && !(default_enabled && boolean_mode) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_guarded_default(tokens: &[String], key: &str, enabled: bool) -> bool {
+    let value = if enabled { "true" } else { "false" };
+    for guard in [
+        ["if", "not", key, "is", "defined"],
+        ["if", key, "is", "not", "defined"],
+    ] {
+        if contains_after(tokens, &guard, &["set", key, "=", value], Some("endif")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_tokens(tokens: &[String], expected: &[&str]) -> bool {
+    tokens.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    })
+}
+
+fn contains_after(tokens: &[String], prefix: &[&str], suffix: &[&str], stop: Option<&str>) -> bool {
+    for start in 0..tokens.len().saturating_sub(prefix.len()).saturating_add(1) {
+        if !tokens[start..]
+            .iter()
+            .take(prefix.len())
+            .map(String::as_str)
+            .eq(prefix.iter().copied())
+        {
+            continue;
+        }
+        let remainder = &tokens[start + prefix.len()..];
+        let end = stop
+            .and_then(|stop| remainder.iter().position(|token| token == stop))
+            .unwrap_or(remainder.len());
+        if contains_tokens(&remainder[..end], suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+fn jinja_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" | "True" => Some(true),
+        "false" | "False" => Some(false),
+        _ => None,
+    }
 }
 
 impl ChatFormatter {
@@ -99,8 +397,8 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(formatter) => render_oai(formatter, request),
-            ChatFormatter::KimiK25(formatter) => {
+            ChatFormatter::HuggingFace { formatter, .. } => render_oai(formatter, request),
+            ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
                 if let Some(tools) = request.tools() {
                     let mut tools =
@@ -126,11 +424,15 @@ impl ChatFormatter {
                 let requested = args
                     .get("reasoning_effort")
                     .and_then(Value::as_str)
-                    .or(environment_effort.as_deref());
-                let thinking = dynamo_renderer::thinking_bool_from_args(Some(&args)) != Some(false);
-                let official_max =
-                    thinking && *profile == DeepSeekV4Profile::Official && requested == Some("max");
-                let mapped = match (*profile, requested) {
+                    .map(str::to_owned)
+                    .or_else(|| environment_effort.clone());
+                let thinking =
+                    dynamo_renderer::thinking_bool_from_args(Some(&args)).unwrap_or(false);
+                args.insert("thinking".into(), Value::Bool(thinking));
+                let official_max = thinking
+                    && *profile == DeepSeekV4Profile::Official
+                    && requested.as_deref() == Some("max");
+                let mapped = match (*profile, requested.as_deref()) {
                     (DeepSeekV4Profile::Preview, Some("max")) => "max",
                     (DeepSeekV4Profile::Official, Some("high")) => "max",
                     _ => "high",
@@ -162,10 +464,34 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_)
-            | ChatFormatter::KimiK25(_)
+            ChatFormatter::HuggingFace { .. }
+            | ChatFormatter::KimiK25 { .. }
             | ChatFormatter::DeepSeekV4 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
+        }
+    }
+
+    /// Resolve the template's effective thinking mode and materialize its
+    /// default under the exact kwarg the template consumes.
+    pub(super) fn resolve_thinking(
+        &self,
+        args: &mut Option<HashMap<String, Value>>,
+        tools_enabled: bool,
+        named_tool_choice: bool,
+    ) -> Option<bool> {
+        match self {
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => thinking
+                .for_request(tools_enabled)
+                .apply(args, named_tool_choice),
+            ChatFormatter::DeepSeekV4 { .. } => {
+                let enabled =
+                    dynamo_renderer::thinking_bool_from_args(args.as_ref()).unwrap_or(false);
+                args.get_or_insert_default()
+                    .insert("thinking".into(), Value::Bool(enabled));
+                Some(enabled)
+            }
+            ChatFormatter::Legacy(_) => None,
         }
     }
 }
@@ -1104,6 +1430,7 @@ fn set_chat_template(config: &mut Value, chat_template: Value) -> Result<(), Tem
 }
 
 fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError> {
+    let thinking = ThinkingTemplates::from_config(config);
     let template: ChatTemplate = serde_json::from_value(config.clone())
         .map_err(|source| TemplateError::Config { source })?;
     if template.chat_template.is_none() {
@@ -1117,7 +1444,20 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     .map_err(|error| TemplateError::Renderer {
         message: error.to_string(),
     })?;
-    Ok(ChatFormatter::HuggingFace(formatter))
+    Ok(ChatFormatter::HuggingFace {
+        formatter,
+        thinking,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn test_hugging_face_formatter(template: &str) -> ChatFormatter {
+    formatter_from_config(&serde_json::json!({"chat_template": template})).unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn test_hugging_face_formatter_from_config(config: Value) -> ChatFormatter {
+    formatter_from_config(&config).unwrap()
 }
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`
@@ -1498,8 +1838,8 @@ mod tests {
 
     use super::{
         ChatFormatter, DeepSeekV4Profile, LegacyFormatter, LegacySpec, OneOrMany,
-        TemplateArgsRequest, TemplateError, builtin_template,
-        infer_legacy_template_from_model_path, load_chat_formatter,
+        TemplateArgsRequest, TemplateError, ThinkingPolicy, builtin_template,
+        detect_thinking_policy, infer_legacy_template_from_model_path, load_chat_formatter,
     };
 
     fn request() -> CreateChatCompletionRequest {
@@ -1529,15 +1869,21 @@ mod tests {
 
     #[test]
     fn deepseek_v4_profiles_map_effort_without_coercing_unsupported_tiers() {
-        fn render(profile: DeepSeekV4Profile, effort: Option<&str>, thinking: bool) -> String {
+        fn render(
+            profile: DeepSeekV4Profile,
+            effort: Option<&str>,
+            thinking: Option<bool>,
+        ) -> String {
             let request = request();
             let mut args = HashMap::new();
             if let Some(effort) = effort {
                 args.insert("reasoning_effort".into(), serde_json::json!(effort));
             }
-            args.insert("thinking".into(), serde_json::json!(thinking));
+            if let Some(thinking) = thinking {
+                args.insert("thinking".into(), serde_json::json!(thinking));
+            }
             ChatFormatter::DeepSeekV4 {
-                formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_thinking())),
+                formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_chat())),
                 profile,
                 environment_effort: None,
             }
@@ -1548,25 +1894,119 @@ mod tests {
             .unwrap()
         }
 
-        let preview_default = render(DeepSeekV4Profile::Preview, None, true);
+        assert_eq!(
+            render(DeepSeekV4Profile::Preview, None, None),
+            render(DeepSeekV4Profile::Preview, None, Some(false))
+        );
+        let preview_default = render(DeepSeekV4Profile::Preview, None, Some(true));
         assert!(!preview_default.contains("Reasoning Effort:"));
         assert!(
-            render(DeepSeekV4Profile::Preview, Some("max"), true)
+            render(DeepSeekV4Profile::Preview, Some("max"), Some(true))
                 .contains("Reasoning Effort: Absolute maximum")
         );
         assert!(
-            render(DeepSeekV4Profile::Official, Some("high"), true)
+            render(DeepSeekV4Profile::Official, Some("high"), Some(true))
                 .contains("Reasoning Effort: Absolute maximum")
         );
         assert!(
-            render(DeepSeekV4Profile::Official, Some("max"), true)
+            render(DeepSeekV4Profile::Official, Some("max"), Some(true))
                 .contains("Reasoning Effort: Beyond maximum")
         );
         assert!(
-            !render(DeepSeekV4Profile::Official, Some("xhigh"), true).contains("Reasoning Effort:")
+            !render(DeepSeekV4Profile::Official, Some("xhigh"), Some(true))
+                .contains("Reasoning Effort:")
         );
         assert!(
-            !render(DeepSeekV4Profile::Official, Some("max"), false).contains("Reasoning Effort:")
+            !render(DeepSeekV4Profile::Official, Some("max"), Some(false))
+                .contains("Reasoning Effort:")
+        );
+    }
+
+    #[test]
+    fn thinking_toggle_detection_matches_template_defaults() {
+        assert_eq!(
+            detect_thinking_policy(
+                "{% if enable_thinking is not defined %}{% set enable_thinking = true %}{% endif %}"
+            ),
+            ThinkingPolicy::TemplateToggle {
+                key: "enable_thinking",
+                default_enabled: true,
+            }
+        );
+        assert_eq!(
+            detect_thinking_policy(
+                "{% if not thinking is defined %}{% set thinking = false %}{% endif %}"
+            ),
+            ThinkingPolicy::TemplateToggle {
+                key: "thinking",
+                default_enabled: false,
+            }
+        );
+        assert_eq!(
+            detect_thinking_policy("{{ messages }}"),
+            ThinkingPolicy::Unknown
+        );
+    }
+
+    #[test]
+    fn thinking_default_filters_match_python_semantics() {
+        let cases = [
+            ("{{ enable_thinking | d(true) }}", true),
+            ("{{ enable_thinking|default(false) }}", false),
+            ("{{ enable_thinking | default(true, false) }}", true),
+            ("{{ enable_thinking | default(false, true) }}", false),
+            (
+                "{{ enable_thinking | default(false, boolean=true) }}",
+                false,
+            ),
+            (
+                "{% if enable_thinking | default(false) %}x{% endif %}",
+                false,
+            ),
+        ];
+        for (template, default_enabled) in cases {
+            assert_eq!(
+                detect_thinking_policy(template),
+                ThinkingPolicy::TemplateToggle {
+                    key: "enable_thinking",
+                    default_enabled,
+                },
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_detection_ignores_non_executable_toggle_text() {
+        for template in [
+            "{# {{ enable_thinking | default(false) }} #}{{ enable_thinking | default(true) }}",
+            "{% raw %}{{ enable_thinking | default(false) }}{% endraw %}{{ enable_thinking | default(true) }}",
+            "{{ 'enable_thinking | default(false)' }}{{ enable_thinking | default(true) }}",
+        ] {
+            assert_eq!(
+                detect_thinking_policy(template),
+                ThinkingPolicy::TemplateToggle {
+                    key: "enable_thinking",
+                    default_enabled: true,
+                },
+                "{template}"
+            );
+        }
+        assert_eq!(
+            detect_thinking_policy("{{ enable_thinking | default(true, true) }}"),
+            ThinkingPolicy::Unknown
+        );
+        assert_eq!(
+            detect_thinking_policy("{% if enable_thinking %}think{% endif %}"),
+            ThinkingPolicy::Unknown
+        );
+    }
+
+    #[test]
+    fn channel_templates_are_always_on() {
+        assert_eq!(
+            detect_thinking_policy("<|start|>assistant<|channel|>analysis<|message|>"),
+            ThinkingPolicy::Always
         );
     }
 

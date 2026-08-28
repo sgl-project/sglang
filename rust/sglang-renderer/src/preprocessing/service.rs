@@ -7,7 +7,7 @@ use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 use futures::future::try_join_all;
 
-use super::template::{DeepSeekV4Profile, load_chat_formatter};
+use super::template::{DeepSeekV4Profile, ThinkingTemplates, load_chat_formatter};
 use super::tokenizer::{
     PooledTokenizer, TextTokenizer, check_total_tokens, resolve_chat_template_file,
     resolve_model_file, validate_request_id, validate_text_request, validate_token_ids_request,
@@ -221,7 +221,7 @@ fn load_chat_support(config: &RendererConfig) -> (Option<ChatFormatter>, Option<
                 };
             return (
                 Some(ChatFormatter::DeepSeekV4 {
-                    formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_thinking())),
+                    formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_chat())),
                     profile,
                     environment_effort: std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok(),
                 }),
@@ -230,16 +230,44 @@ fn load_chat_support(config: &RendererConfig) -> (Option<ChatFormatter>, Option<
         }
         if identity.is_deepseek_v32() {
             return (
-                Some(ChatFormatter::HuggingFace(PromptFormatter::OAI(Arc::new(
-                    DeepSeekV32Formatter::new_chat(),
-                )))),
+                Some(ChatFormatter::HuggingFace {
+                    formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
+                    thinking: ThinkingTemplates::native(false, false),
+                }),
                 None,
             );
         }
         if let Some(formatter) = kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true)
-            .or_else(|| native_formatter_for(&model_type_lower, &display_name_lower))
         {
-            return (Some(ChatFormatter::HuggingFace(formatter)), None);
+            return (
+                Some(ChatFormatter::HuggingFace {
+                    formatter,
+                    thinking: ThinkingTemplates::native(true, true),
+                }),
+                None,
+            );
+        }
+        if model_type_lower.as_deref() == Some("inkling_mm_model")
+            && let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower)
+        {
+            return (
+                Some(ChatFormatter::HuggingFace {
+                    formatter,
+                    thinking: ThinkingTemplates::always(),
+                }),
+                None,
+            );
+        }
+        if let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower) {
+            return (
+                Some(ChatFormatter::HuggingFace {
+                    formatter,
+                    // The remaining display-name fallback formatters are
+                    // constructed with their thinking mode enabled.
+                    thinking: ThinkingTemplates::native(true, false),
+                }),
+                None,
+            );
         }
     }
     let discovered_template = config
@@ -258,9 +286,15 @@ fn load_chat_support(config: &RendererConfig) -> (Option<ChatFormatter>, Option<
     ) {
         Ok(mut formatter) => {
             if identity.is_kimi_k25()
-                && let ChatFormatter::HuggingFace(inner) = formatter
+                && let ChatFormatter::HuggingFace {
+                    formatter: inner,
+                    thinking,
+                } = formatter
             {
-                formatter = ChatFormatter::KimiK25(inner);
+                formatter = ChatFormatter::KimiK25 {
+                    formatter: inner,
+                    thinking,
+                };
             }
             tracing::info!(
                 config = ?tokenizer_config_file.as_deref().unwrap_or("<built-in / inferred>"),
@@ -531,6 +565,30 @@ mod tests {
         }
     }
 
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            rid: "chatcmpl-test".into(),
+            model: "model".into(),
+            messages: serde_json::from_value(serde_json::json!([
+                {"role": "user", "content": "hello"}
+            ]))
+            .unwrap(),
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            reasoning_effort: None,
+            continue_final_message: false,
+            chat_template_args: None,
+            sampling_params: SamplingParams::default(),
+            choice_count: 1,
+            stream: false,
+            return_logprob: false,
+            top_logprobs_num: 0,
+            parallel_tool_calls: true,
+            metadata: GenerateRequestMetadata::default(),
+        }
+    }
+
     struct UnexpectedTokenizer;
 
     impl TextTokenizer for UnexpectedTokenizer {
@@ -719,6 +777,91 @@ mod tests {
     }
 
     #[test]
+    fn native_formatters_forward_their_effective_thinking_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "sglang-renderer-native-thinking-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let kimi = root.join("kimi");
+        std::fs::create_dir_all(&kimi).unwrap();
+        std::fs::write(kimi.join("config.json"), r#"{"model_type":"kimi_k3"}"#).unwrap();
+        let mut config = model_config(kimi.to_string_lossy().into_owned());
+        config.reasoning_parser = Some("kimi_k3".into());
+        config.tool_call_parser = Some("kimi_k3".into());
+        let service = RendererService::with_tokenizer(config, Arc::new(UnexpectedTokenizer), 1, 1);
+        let enabled = service.preprocess_chat(chat_request()).unwrap();
+        assert!(enabled.text_requests[0].options.require_reasoning);
+
+        let mut disabled_request = chat_request();
+        disabled_request.chat_template_args = Some(std::collections::HashMap::from([(
+            "thinking".into(),
+            serde_json::Value::Bool(false),
+        )]));
+        let disabled = service.preprocess_chat(disabled_request).unwrap();
+        assert!(!disabled.text_requests[0].options.require_reasoning);
+
+        let mut named_request = chat_request();
+        named_request.tools = serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]))
+        .unwrap();
+        named_request.tool_choice = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {"name": "get_weather"}
+        }))
+        .unwrap();
+        let named = service.preprocess_chat(named_request).unwrap();
+        assert!(!named.text_requests[0].options.require_reasoning);
+
+        let deepseek = root.join("deepseek");
+        std::fs::create_dir_all(&deepseek).unwrap();
+        std::fs::write(
+            deepseek.join("config.json"),
+            r#"{"model_type":"deepseek_v32"}"#,
+        )
+        .unwrap();
+        let mut config = model_config(deepseek.to_string_lossy().into_owned());
+        config.reasoning_parser = Some("deepseek-v3".into());
+        let service = RendererService::with_tokenizer(config, Arc::new(UnexpectedTokenizer), 1, 1);
+        let default = service.preprocess_chat(chat_request()).unwrap();
+        assert!(!default.text_requests[0].options.require_reasoning);
+
+        let mut explicit = chat_request();
+        explicit.chat_template_args = Some(std::collections::HashMap::from([(
+            "enable_thinking".into(),
+            serde_json::Value::Bool(true),
+        )]));
+        let explicit = service.preprocess_chat(explicit).unwrap();
+        assert!(explicit.text_requests[0].options.require_reasoning);
+
+        let mut effort = chat_request();
+        effort.reasoning_effort = Some(serde_json::from_value(serde_json::json!("high")).unwrap());
+        let effort = service.preprocess_chat(effort).unwrap();
+        assert!(effort.text_requests[0].options.require_reasoning);
+
+        let inkling = root.join("inkling");
+        std::fs::create_dir_all(&inkling).unwrap();
+        std::fs::write(
+            inkling.join("config.json"),
+            r#"{"model_type":"inkling_mm_model"}"#,
+        )
+        .unwrap();
+        let mut config = model_config(inkling.to_string_lossy().into_owned());
+        config.reasoning_parser = Some("inkling".into());
+        let service = RendererService::with_tokenizer(config, Arc::new(UnexpectedTokenizer), 1, 1);
+        let inkling = service.preprocess_chat(chat_request()).unwrap();
+        assert!(inkling.text_requests[0].options.require_reasoning);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn explicit_chat_template_overrides_native_model_detection() {
         for model_type in ["kimi_k3", "deepseek_v4", "deepseek_v32", "inkling_mm_model"] {
             let directory = std::env::temp_dir().join(format!(
@@ -763,7 +906,8 @@ mod tests {
             r#"{"model_type":"deepseek_v4"}"#,
         )
         .unwrap();
-        let config = model_config(directory.to_string_lossy().into_owned());
+        let mut config = model_config(directory.to_string_lossy().into_owned());
+        config.reasoning_parser = Some("deepseek-v4".into());
         let messages = serde_json::from_value(serde_json::json!([
             {"role": "user", "content": "hello"}
         ]))
@@ -788,8 +932,24 @@ mod tests {
         };
         let service = RendererService::with_tokenizer(config, Arc::new(UnexpectedTokenizer), 1, 1);
 
+        let mut default_request = request.clone();
+        default_request.reasoning_effort = None;
+        let default_chat = service.preprocess_chat(default_request.clone()).unwrap();
+        assert!(!default_chat.text_requests[0].options.require_reasoning);
+
+        default_request.chat_template_args = Some(std::collections::HashMap::from([(
+            "thinking".into(),
+            serde_json::Value::Bool(false),
+        )]));
+        let explicit_chat = service.preprocess_chat(default_request).unwrap();
+        assert_eq!(
+            default_chat.text_requests[0].prompt,
+            explicit_chat.text_requests[0].prompt
+        );
+
         let chat = service.preprocess_chat(request).unwrap();
 
+        assert!(chat.text_requests[0].options.require_reasoning);
         assert!(
             chat.text_requests[0]
                 .prompt

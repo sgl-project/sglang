@@ -242,6 +242,10 @@ impl ChatResponseProcessor {
             yield annotated_usage(prompt_tokens, completion_tokens);
         };
 
+        let suppress_qwen_post_tool_content = self
+            .tool_parser
+            .as_deref()
+            .is_some_and(|parser| dynamo_parser_name(parser) == "qwen25");
         let parsed: Pin<
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
@@ -273,27 +277,35 @@ impl ChatResponseProcessor {
                     }
                     for choice in response.choices {
                         let index = choice.index as usize;
+                        let had_tool_calls = tool_calls_seen.get(index).copied().unwrap_or(false);
                         let mut tool_calls = choice.delta.tool_calls.map(|calls| {
                             calls.into_iter().map(tool_call_delta).collect::<Vec<_>>()
                         });
                         if !parallel_tool_calls
                             && let Some(calls) = tool_calls.as_mut()
-                            && let Some(seen) = tool_calls_seen.get_mut(index)
                         {
-                            if *seen {
+                            if had_tool_calls {
                                 calls.clear();
                             } else {
                                 calls.truncate(1);
-                                *seen = !calls.is_empty();
                             }
                             if calls.is_empty() {
                                 tool_calls = None;
                             }
                         }
-                        let content = match choice.delta.content {
+                        let emitted_tool_calls = tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+                        if emitted_tool_calls
+                            && let Some(seen) = tool_calls_seen.get_mut(index)
+                        {
+                            *seen = true;
+                        }
+                        let mut content = match choice.delta.content {
                             Some(ChatCompletionMessageContent::Text(text)) => Some(text),
                             _ => None,
                         };
+                        if suppress_qwen_post_tool_content && had_tool_calls {
+                            content = None;
+                        }
                         if choice.delta.role.is_some()
                             && content.is_none()
                             && choice.delta.reasoning_content.is_none()
@@ -561,5 +573,62 @@ mod tests {
             _ => None,
         });
         assert_eq!(deltas.collect::<Vec<_>>(), vec![(0, "A"), (1, "B")]);
+    }
+
+    #[test]
+    fn qwen_tool_calls_drop_post_call_special_tokens() {
+        let events = futures::executor::block_on(
+            processor(Some("qwen"), None, 1)
+                .process_stream(stream::iter(vec![chunk(
+                    0,
+                    "Let me check.\n<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call><|im_end|>",
+                    true,
+                )]))
+                .collect::<Vec<_>>(),
+        );
+
+        let content = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    content: Some(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(content.contains("Let me check."));
+        assert!(!content.contains("<|im_end|>"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ChatEvent::Delta {
+                tool_calls: Some(calls),
+                ..
+            }) if calls.iter().any(|call| call.name.as_deref() == Some("get_weather"))
+        )));
+    }
+
+    #[test]
+    fn qwen_tool_calls_drop_split_terminal_special_tokens() {
+        let events = futures::executor::block_on(
+            processor(Some("qwen25"), None, 1)
+                .process_stream(stream::iter(vec![
+                    chunk(
+                        0,
+                        "<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{}}\n</tool_call>",
+                        false,
+                    ),
+                    chunk(0, "<|im_end|>", true),
+                ]))
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Ok(ChatEvent::Delta {
+                content: Some(text),
+                ..
+            }) if text.contains("<|im_end|>")
+        )));
     }
 }
