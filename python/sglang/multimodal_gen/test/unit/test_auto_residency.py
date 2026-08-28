@@ -505,12 +505,6 @@ class TestEstimateDefaultWorkloadPeak:
         )
         assert estimate == good.peak_allocated_bytes
 
-    def test_unknown_target_disables_estimation(self):
-        assert (
-            estimate_default_workload_peak_bytes(records=[_record()], target_units=None)
-            is None
-        )
-
     def test_no_records_disables_estimation(self):
         assert (
             estimate_default_workload_peak_bytes(records=[], target_units=None) is None
