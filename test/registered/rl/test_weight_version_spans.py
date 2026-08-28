@@ -458,7 +458,6 @@ class TestWeightVersionSpans(CustomTestCase):
         """A request aborted before producing a token still reports a well-formed span."""
         version = self._current_version()
 
-
         results = self._run_while_paused(
             num_requests=16,
             while_paused=self._abort_all,

@@ -165,7 +165,6 @@ from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import (
     add_weight_versions_to_meta_info,
-    compute_weight_version_spans,
     weight_version_spans_to_json,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
