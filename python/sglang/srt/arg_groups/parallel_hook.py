@@ -12,7 +12,6 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
-from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -327,6 +326,8 @@ def handle_dwdp(server_args: Any):
 
 
 def handle_elastic_ep(server_args: Any):
+    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+
     cfg = resolving_view(server_args)
     if cfg.elastic_ep_rejoin:
         if cfg.ep_join_mode is None:

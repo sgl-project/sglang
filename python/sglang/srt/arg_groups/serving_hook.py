@@ -10,7 +10,6 @@ import random
 import socket
 from typing import Any
 
-from sglang.srt.arg_groups.model_path_hook import handle_modelscope_paths
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolved_view,
@@ -572,6 +571,8 @@ def handle_other_validations(server_args: Any):
 
 
 def handle_missing_default_values(server_args: Any):
+    from sglang.srt.arg_groups.model_path_hook import handle_modelscope_paths
+
     cfg = resolving_view(server_args)
     if cfg.tokenizer_path is None:
         declare_resolution(
