@@ -1016,8 +1016,8 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # [E, K//64, N, 2] as strided transpose views — DO NOT call
         # .contiguous(). Beyond breaking the transpose-flag match above, it
         # measures slower on the same probe: making both sides contiguous costs
-        # 6.2% on decode. This matches NPUMXFP8LinearMethod, msmodelslim's
-        # offline layout and vllm-ascend's AscendW8A8MXFP8DynamicFusedMoEMethod.
+        # 6.2% on decode. This matches NPUMXFP8LinearMethod and msmodelslim's
+        # offline layout.
         setattr(
             layer,
             f"{weight_prefix}_weight",

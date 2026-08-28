@@ -819,9 +819,8 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
         → npu_dual_level_quant_matmul(act, weight, act_l0, w_l0, act_l1, w_l1)
 
-    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod`` / MindIE-SD
-    ``W4A4MXFP4DualQuantLinear``. Hardware: Ascend 950 (A5) only — the
-    ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
+    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: Ascend 950
+    (A5) only — the ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
