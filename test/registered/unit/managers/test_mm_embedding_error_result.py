@@ -1,7 +1,9 @@
+import inspect
 from http import HTTPStatus
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -15,6 +17,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (
+    SchedulerPPMixin,
     _pp_can_skip_output_comm,
     _pp_filter_failed_rows,
 )
@@ -186,15 +189,279 @@ def test_mm_failure_preserves_existing_finish_reason_while_fencing_cache():
     assert req.mm_embedding_abort_pending
 
 
-def test_marked_failure_cannot_enter_unfinished_radix_or_hicache():
-    req = SimpleNamespace(
-        skip_radix_cache_insert=False, mm_embedding_validation_count=1
+def test_short_mm_embedding_failure_cannot_enter_unfinished_radix_or_hicache():
+    req = Mock(
+        skip_radix_cache_insert=False,
+        mm_embedding_validation_count=1,
+        mm_embedding_abort_pending=False,
+        inflight_middle_chunks=1,
+        to_finish=None,
+    )
+    req.finished.return_value = False
+    scheduler = SimpleNamespace(
+        chunked_req=req,
+        _pending_chunked_abort_req=None,
+        disaggregation_mode=DisaggregationMode.NULL,
     )
     tree_cache = Mock()
 
+    Scheduler.defer_mm_embedding_abort(scheduler, req, 6, 2)
     maybe_cache_unfinished_req(req, tree_cache, chunked=True)
 
+    assert req.skip_radix_cache_insert
+    assert "expected 6 tokens, got 2" in req.to_finish.message
     tree_cache.cache_unfinished_req.assert_not_called()
+
+
+def test_failed_validation_while_parked_restores_pool_without_kv_send():
+    req = Mock()
+    req.mm_embedding_validation_count = 1
+    req.mm_embedding_abort_pending = False
+    req.inflight_middle_chunks = 0
+    req.finished.return_value = False
+    req.to_finish = None
+    req.time_stats = Mock()
+    pool = SimpleNamespace(available=9, baseline=10)
+    scheduler = SimpleNamespace(
+        chunked_req=req,
+        _pending_chunked_abort_req=req,
+        disaggregation_mode=DisaggregationMode.NULL,
+        enable_hicache_storage=False,
+        tree_cache=Mock(),
+        ipc_channels=SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=Mock())
+        ),
+        check_bootstrap=Mock(),
+        send_kv_chunk=Mock(),
+    )
+    Scheduler.defer_mm_embedding_abort(scheduler, req, 6, 2)
+
+    def free_once(*_args, **_kwargs):
+        pool.available += 1
+
+    with (
+        patch("sglang.srt.managers.scheduler.prepare_abort"),
+        patch(
+            "sglang.srt.managers.scheduler.release_kv_cache", side_effect=free_once
+        ) as release_kv_cache,
+        patch("sglang.srt.managers.scheduler._make_abort_req", return_value=Mock()),
+    ):
+        Scheduler.process_pending_chunked_abort(scheduler)
+        assert scheduler.chunked_req is None
+        assert pool.available == 9
+
+        complete_mm_embedding_validations([req], torch.tensor([[1, 0, 0, 0]]))
+        Scheduler.process_pending_chunked_abort(scheduler)
+        Scheduler.process_pending_chunked_abort(scheduler)
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            scheduler, None, SimpleNamespace(batch_is_full=True)
+        )
+
+    assert pool.available == pool.baseline
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
+    scheduler.check_bootstrap.assert_not_called()
+    scheduler.send_kv_chunk.assert_not_called()
+
+
+def test_disagg_prefill_gates_kv_send_but_not_bootstrap_on_validation():
+    req = Mock()
+    req.mm_embedding_validation_count = 1
+    req.extend_range = SimpleNamespace(end=8)
+    req.origin_input_ids = list(range(16))
+    req.tmp_end_idx = 2
+    scheduler = SimpleNamespace(
+        chunked_req=req,
+        tree_cache=Mock(),
+        check_bootstrap=Mock(return_value=True),
+        enable_overlap=False,
+        send_kv_chunk=Mock(),
+    )
+    running_batch = SimpleNamespace(batch_is_full=True)
+    last_batch = Mock()
+    last_batch.forward_mode.is_extend.return_value = True
+    last_batch.chunked_req = req
+    last_batch.batch_size.side_effect = [2, 1]
+
+    with patch(
+        "sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"
+    ) as cache_unfinished:
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            scheduler, last_batch, running_batch
+        )
+        for _ in range(2):
+            SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                scheduler, None, running_batch
+            )
+
+        assert scheduler.chunked_req is req
+        assert not running_batch.batch_is_full
+        assert req.tmp_end_idx == 2
+        assert scheduler.check_bootstrap.call_count == 3
+        scheduler.send_kv_chunk.assert_not_called()
+        assert cache_unfinished.call_count == 3
+        cache_unfinished.assert_called_with(req, scheduler.tree_cache, chunked=True)
+        last_batch.filter_batch.assert_called_once_with(chunked_req_to_exclude=[req])
+
+        complete_mm_embedding_validations([req], torch.tensor([[1, 0, 0, 0]]))
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            scheduler, None, running_batch
+        )
+
+    assert scheduler.check_bootstrap.call_count == 4
+    scheduler.check_bootstrap.assert_called_with(req)
+    scheduler.send_kv_chunk.assert_called_once_with(req)
+
+
+def test_overlap_pending_validation_keeps_boundary_and_yield_bookkeeping():
+    req = Mock()
+    req.mm_embedding_validation_count = 1
+    req.extend_range = SimpleNamespace(end=8)
+    req.origin_input_ids = list(range(16))
+    req.tmp_end_idx = 2
+    req.to_finish = None
+    req.finished_reason = None
+    scheduler = SimpleNamespace(
+        chunked_req=req,
+        tree_cache=Mock(),
+        check_bootstrap=Mock(return_value=True),
+        enable_overlap=True,
+        has_bootstrapped_waiting_req=Mock(return_value=False),
+        optimistic_release_and_requeue=Mock(),
+        send_kv_chunk=Mock(),
+    )
+    running_batch = SimpleNamespace(batch_is_full=True)
+
+    with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            scheduler, None, running_batch
+        )
+
+        assert req.tmp_end_idx == 8
+        assert scheduler.chunked_req is req
+        assert not running_batch.batch_is_full
+        scheduler.check_bootstrap.assert_called_once_with(req)
+        scheduler.send_kv_chunk.assert_not_called()
+
+        scheduler.check_bootstrap.return_value = False
+        scheduler.has_bootstrapped_waiting_req.return_value = True
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            scheduler, None, running_batch
+        )
+
+    assert scheduler.chunked_req is None
+    scheduler.has_bootstrapped_waiting_req.assert_called_once_with()
+    scheduler.optimistic_release_and_requeue.assert_not_called()
+    scheduler.send_kv_chunk.assert_not_called()
+
+
+def test_run_batch_registers_validation_before_optional_early_send():
+    validation_req = Mock()
+    validation_req.mm_embedding_validation_count = 0
+    validation_req.start_send_idx = 0
+    validation_req.extend_range = SimpleNamespace(end=8)
+    validation_req.origin_input_ids = list(range(16))
+    plain_req = SimpleNamespace(
+        mm_embedding_validation_count=0,
+        pending_bootstrap=False,
+        prefix_indices=[0, 1, 2, 3],
+        host_hit_length=0,
+        start_send_idx=0,
+    )
+    send_kv_chunk = Mock()
+    scheduler = SimpleNamespace(
+        forward_ct=0,
+        _sched_idled=False,
+        scripted_scheduler_hook=None,
+        profiler_manager=Mock(),
+        forward_sleep_time=None,
+        disaggregation_mode=DisaggregationMode.PREFILL,
+        enable_staging=False,
+        enable_overlap=False,
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        send_kv_chunk=send_kv_chunk,
+        is_generation=True,
+        enable_pdmux=False,
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        future_map=Mock(),
+    )
+    scheduler.maybe_send_cached_prefix_chunk = MethodType(
+        SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk,
+        scheduler,
+    )
+
+    def stop_at_forward(_batch, **_kwargs):
+        assert validation_req.mm_embedding_validation_count == 1
+        assert plain_req.mm_embedding_validation_count == 0
+        send_kv_chunk.assert_called_once_with(plain_req, last_chunk=False, end_idx=4)
+        raise RuntimeError("stop at model forward")
+
+    scheduler.model_worker = SimpleNamespace(
+        forward_batch_generation=Mock(side_effect=stop_at_forward)
+    )
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_prebuilt=lambda: False,
+            is_extend=lambda: True,
+            is_split_prefill=lambda: False,
+        ),
+        reqs=[validation_req, plain_req],
+        mm_embedding_validation_indices=lambda: [0],
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+    )
+
+    with (
+        envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True),
+        patch("sglang.srt.managers.scheduler.resolve_forward_inputs"),
+        pytest.raises(RuntimeError, match="stop at model forward"),
+    ):
+        inspect.unwrap(Scheduler.run_batch)(scheduler, batch)
+
+    assert validation_req.mm_embedding_validation_count == 1
+    assert validation_req.start_send_idx == 0
+    scheduler.model_worker.forward_batch_generation.assert_called_once()
+
+    complete_mm_embedding_validations([validation_req], torch.tensor([[1, 0, 0, 0]]))
+    send_kv_chunk.reset_mock()
+    scheduler.chunked_req = validation_req
+    scheduler.tree_cache = Mock()
+    scheduler.check_bootstrap = Mock(return_value=True)
+    running_batch = SimpleNamespace(batch_is_full=True)
+    with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):
+        SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+            scheduler, None, running_batch
+        )
+
+    send_kv_chunk.assert_called_once_with(validation_req)
+
+
+def test_pp_disagg_prefill_drains_pending_abort_before_chunk_processing():
+    order = []
+
+    def stop_after_chunk(**_kwargs):
+        order.append("chunk")
+        raise RuntimeError("stop loop")
+
+    scheduler = SimpleNamespace(
+        init_pp_loop_state=Mock(),
+        pp_loop_size=1,
+        running_mbs=[SimpleNamespace()],
+        last_mbs=[None],
+        ps=SimpleNamespace(pp_size=1),
+        request_receiver=SimpleNamespace(recv_requests=Mock(return_value=[])),
+        process_input_requests=Mock(),
+        pp_group=SimpleNamespace(is_last_rank=True),
+        _pp_pd_get_bootstrapped_ids=Mock(return_value=[]),
+        _pp_commit_comm_work=Mock(),
+        _pp_pd_get_prefill_transferred_ids=Mock(return_value=[]),
+        process_pending_chunked_abort=Mock(side_effect=lambda: order.append("abort")),
+        process_prefill_chunk=Mock(side_effect=stop_after_chunk),
+    )
+
+    with pytest.raises(RuntimeError, match="stop loop"):
+        inspect.unwrap(SchedulerPPMixin.event_loop_pp_disagg_prefill)(scheduler)
+
+    assert order == ["abort", "chunk"]
 
 
 def test_two_overlapped_mm_chunks_keep_cache_fenced_until_both_complete():
