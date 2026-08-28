@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -89,9 +90,7 @@ class FakePool:
     """Minimal stand-in for the QSA KV pool buffers used by the indexer."""
 
     def __init__(self, num_slots, num_compressed, device, dtype=torch.bfloat16):
-        self.key_state = torch.zeros(
-            num_slots, 1, HEAD_DIM, dtype=dtype, device=device
-        )
+        self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
             num_slots, 3, dtype=torch.int64, device=device
         )
@@ -186,9 +185,9 @@ def _run_case(
         positions = logical_positions
 
     # Distinct state slots per token; slot 0 is deliberately unused.
-    cache_loc = torch.randperm(max(num_tokens + 8, 4096), device=device)[
-        :num_tokens
-    ].long() + 1
+    cache_loc = (
+        torch.randperm(max(num_tokens + 8, 4096), device=device)[:num_tokens].long() + 1
+    )
     token_slot_table = torch.zeros(1, 65536, dtype=torch.int32, device=device)
     token_slot_table[0, logical_positions.long()] = cache_loc.to(torch.int32)
 
@@ -202,9 +201,7 @@ def _run_case(
     pool_new = FakePool(8192, 4096, device, dtype)
 
     # Reference: pre-fusion eager path (toggle the real switches off).
-    q_ref, token_k_ref, stored_ref = _force_eager(indexer).project_qk(
-        hidden, positions
-    )
+    q_ref, token_k_ref, stored_ref = _force_eager(indexer).project_qk(hidden, positions)
     assert not stored_ref
     indexer.update_key_state_and_compress(
         token_k_ref,
@@ -363,8 +360,8 @@ def test_decode_selection_equivalent():
     scores are fp32 sums of 128-dim dot products, so a 1-ulp change in one
     component only matters on exact ties.
     """
-    from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
     from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+    from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
 
     device = torch.device("cuda")
     dtype = torch.bfloat16

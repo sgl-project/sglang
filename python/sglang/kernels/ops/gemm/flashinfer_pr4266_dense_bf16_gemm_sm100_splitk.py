@@ -316,6 +316,7 @@ OWNER_RANK = 0
 def _sigmoid_f32(v):
     return cute_math.rcp(cute_math.exp(v * -1.0) + 1.0)
 
+
 #: Epilogue modes; "none" preserves the vendored store path byte-for-byte.
 _EPILOGUE_MODES = ("none", "silu", "gate")
 
@@ -370,9 +371,7 @@ class SplitKDenseGemmKernel:
                     f"{gate_out_elems} outputs; must be a multiple of 128"
                 )
             gate_smem = (
-                _align_up(
-                    _smem_bytes(tactic, tactic.ab_stages), _GATE_TILE_ALIGN_BYTES
-                )
+                _align_up(_smem_bytes(tactic, tactic.ab_stages), _GATE_TILE_ALIGN_BYTES)
                 + tactic.mma_m * tactic.mma_n * _FP32_BYTES
             )
             if gate_smem > _SMEM_CAPACITY_BYTES:
@@ -888,9 +887,7 @@ class SplitKDenseGemmKernel:
                 )
                 rSig.store(_sigmoid_f32(rAcc.load()))
                 sGate_epi = cute.flat_divide(gate_tile, epi_tile)
-                cute_ext.partition_and_copy(
-                    thr_t2r, rSig, sGate_epi[None, None, 0, 0]
-                )
+                cute_ext.partition_and_copy(thr_t2r, rSig, sGate_epi[None, None, 0, 0])
                 cute.arch.barrier(
                     barrier_id=_GATE_BARRIER_ID,
                     number_of_threads=self.epilog_threads,
@@ -912,9 +909,9 @@ class SplitKDenseGemmKernel:
                             sig = gate_tile[j_local * group + g, m_local]
                             xv = mX[m_global, g * hs + j_global].to(cutlass.Float32)
                             gated = gated + sig * xv
-                        mOut[m_global, j_global] = (
-                            gated * self.epilogue_scale
-                        ).to(c_dtype)
+                        mOut[m_global, j_global] = (gated * self.epilogue_scale).to(
+                            c_dtype
+                        )
             else:
                 rD.store(rAcc.load().to(c_dtype))
                 # Preserve TMEM coordinates; the copy predicates output tails.
@@ -1038,12 +1035,8 @@ def _make_compile_repr_tensors(
     if epilogue_mode == "gate":
         return (
             *tensors,
-            _from_dlpack_dynamic(
-                _torch.empty((n, m), dtype=dtype, device="cuda"), 1
-            ),
-            _from_dlpack_dynamic(
-                _torch.empty((n, m), dtype=dtype, device="cuda"), 1
-            ),
+            _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
+            _from_dlpack_dynamic(_torch.empty((n, m), dtype=dtype, device="cuda"), 1),
         )
     if not has_bias:
         return (*tensors, None)
@@ -1154,6 +1147,7 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
         tensor.dtype != a.dtype for tensor in tensors
     ):
         raise ValueError("a, b, out, and bias must share BF16 or FP16 dtype")
+
     def _is_dense_2d(tensor: _torch.Tensor) -> bool:
         rows, cols = tensor.shape
         return (tensor.stride(1) == 1 and tensor.stride(0) >= cols) or (

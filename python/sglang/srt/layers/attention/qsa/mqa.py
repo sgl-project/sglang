@@ -258,9 +258,7 @@ if HAS_TILELANG:
                                         0,
                                         :,
                                     ],
-                                    k_shared[
-                                        sp * page_size : (sp + 1) * page_size, :
-                                    ],
+                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
                                 )
                         T.gemm(
                             k_shared,
@@ -307,9 +305,7 @@ def tilelang_qsa_mqa_prefill(
     # Allocate the padded output once. Appending even a few padding rows with
     # torch.cat would allocate and copy the entire [rows, keys] FP32 matrix,
     # temporarily doubling the dominant prefill buffer for long contexts.
-    logits = torch.zeros(
-        (padded_rows, keys), dtype=torch.float32, device=q.device
-    )
+    logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
     q_padded = q.to(torch.bfloat16).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()

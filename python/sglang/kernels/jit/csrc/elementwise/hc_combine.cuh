@@ -38,8 +38,7 @@ struct HcCombineParams {
  * \tparam Float       Element type: bf16_t | fp16_t.
  */
 template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(256) void hc_combine_kernel(
-    const HcCombineParams __grid_constant__ params) {
+__global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams __grid_constant__ params) {
   using namespace device;
   using Float2 = packed_t<Float>;
   using Storage = AlignedVector<Float2, 4>;  // 8 elements, 16 bytes
@@ -54,15 +53,11 @@ __global__ __launch_bounds__(256) void hc_combine_kernel(
   const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
   const uint32_t m = blockIdx.x;
 
-  const auto y_ptr =
-      pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
-  const auto r_ptr =
-      pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
-  const auto n_ptr =
-      pointer::offset<Float>(params.normed_residual, static_cast<int64_t>(m) * kRowSize);
+  const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
+  const auto r_ptr = pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
+  const auto n_ptr = pointer::offset<Float>(params.normed_residual, static_cast<int64_t>(m) * kRowSize);
   const auto w_ptr = static_cast<const Float*>(params.inject_weight);
-  const auto out_ptr =
-      pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
+  const auto out_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -143,10 +138,8 @@ template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType>
 struct HcCombineKernel {
   static_assert(sizeof(DType) == 2, "HcCombine only supports 2-byte dtypes");
   static_assert(kHcCount > 0, "kHcCount must be positive");
-  static_assert(kHiddenSize > 0 && kHiddenSize % 8 == 0,
-                "kHiddenSize must be a multiple of 8");
-  static_assert((kHcCount * kHiddenSize) % (256 * 8) == 0,
-                "kHcCount * kHiddenSize must be a multiple of 2048");
+  static_assert(kHiddenSize > 0 && kHiddenSize % 8 == 0, "kHiddenSize must be a multiple of 8");
+  static_assert((kHcCount * kHiddenSize) % (256 * 8) == 0, "kHcCount * kHiddenSize must be a multiple of 2048");
   static constexpr auto kernel = hc_combine_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
   static constexpr uint32_t kBlockSize = 256;
 
@@ -198,7 +191,6 @@ struct HcCombineKernel {
   }
 };
 
-
 struct HcCombineSplitParams {
   const void* block_output;
   const void* residual;
@@ -230,8 +222,8 @@ constexpr uint32_t kVecLen = 8;
  * buffer clearing are needed.
  */
 template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(hc_combine_split_detail::kGateThreads)
-    void hc_combine_gate_kernel(const HcCombineSplitParams __grid_constant__ params) {
+__global__ __launch_bounds__(hc_combine_split_detail::kGateThreads) void hc_combine_gate_kernel(
+    const HcCombineSplitParams __grid_constant__ params) {
   using namespace device;
   using namespace hc_combine_split_detail;
   using Float2 = packed_t<Float>;
@@ -248,8 +240,7 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads)
   const uint32_t c = blockIdx.y % kHcCount;
   const uint32_t ref_tid = split * kGateThreads + threadIdx.x;
 
-  const auto n_ptr =
-      pointer::offset<Float>(params.normed_residual, static_cast<int64_t>(m) * kRowSize);
+  const auto n_ptr = pointer::offset<Float>(params.normed_residual, static_cast<int64_t>(m) * kRowSize);
   const auto w_ptr = static_cast<const Float*>(params.inject_weight);
 
   PDLWaitPrimary<kUsePDL>();
@@ -276,8 +267,7 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads)
     }
     sum = warp::reduce_sum(sum);
     if (threadIdx.x == 0) {
-      params.partials[(static_cast<int64_t>(m) * kSplit + split) * kHcCount + c] =
-          sum;
+      params.partials[(static_cast<int64_t>(m) * kSplit + split) * kHcCount + c] = sum;
     }
   }
 
@@ -292,8 +282,8 @@ __global__ __launch_bounds__(hc_combine_split_detail::kGateThreads)
  * per-CTA scalar.
  */
 template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
-__global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads)
-    void hc_combine_apply_kernel(const HcCombineSplitParams __grid_constant__ params) {
+__global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_combine_apply_kernel(
+    const HcCombineSplitParams __grid_constant__ params) {
   using namespace device;
   using namespace hc_combine_split_detail;
   using Float2 = packed_t<Float>;
@@ -310,20 +300,16 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads)
   const uint32_t vec_base = split * kVecsPerSplit;
   const uint32_t branch = vec_base / kVecsPerBranch;
 
-  const auto y_ptr =
-      pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
-  const auto r_ptr =
-      pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
-  const auto out_ptr =
-      pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
+  const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
+  const auto r_ptr = pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
+  const auto out_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
 
   PDLWaitPrimary<kUsePDL>();
 
   float total = 0.0f;
 #pragma unroll
   for (uint32_t s = 0; s < kSplit; ++s) {
-    total += params.partials[(static_cast<int64_t>(m) * kSplit + s) * kHcCount +
-                             branch];
+    total += params.partials[(static_cast<int64_t>(m) * kSplit + s) * kHcCount + branch];
   }
   const float a = 2.0f / (1.0f + math::exp(-total / kHcCount));
 
@@ -351,10 +337,8 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads)
 template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType>
 struct HcCombineSplitKernel {
   static_assert(sizeof(DType) == 2, "HcCombine only supports 2-byte dtypes");
-  static constexpr auto gate_kernel =
-      hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
-  static constexpr auto apply_kernel =
-      hc_combine_apply_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+  static constexpr auto gate_kernel = hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+  static constexpr auto apply_kernel = hc_combine_apply_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
 
   static void
   run(const tvm::ffi::TensorView block_output,
@@ -369,25 +353,16 @@ struct HcCombineSplitKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M, kHiddenSize})
-        .with_dtype<DType>()
-        .with_device(device)
-        .verify(block_output);
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
     TensorMatcher({M, kHcCount * kHiddenSize})
         .with_dtype<DType>()
         .with_device(device)
         .verify(residual)
         .verify(normed_residual)
         .verify(output);
-    TensorMatcher({kHcCount, kHcCount * kHiddenSize})
-        .with_dtype<DType>()
-        .with_device(device)
-        .verify(inject_weight);
+    TensorMatcher({kHcCount, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(inject_weight);
     auto part_rows = SymbolicSize{"partial_rows"};
-    TensorMatcher({part_rows, kSplit, kHcCount})
-        .with_dtype<fp32_t>()
-        .with_device(device)
-        .verify(partials);
+    TensorMatcher({part_rows, kSplit, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
 
     const auto params = HcCombineSplitParams{
         .block_output = block_output.data_ptr(),
@@ -399,11 +374,9 @@ struct HcCombineSplitKernel {
     };
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
-    LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads,
-                 device.unwrap())
+    LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
         .enable_pdl(kUsePDL)(gate_kernel, params);
-    LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(apply_kernel, params);
+    LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
   }
 };
 
