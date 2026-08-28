@@ -1410,22 +1410,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             )
         plan = plan_auto_residency(reports=reports)
-        if (
-            self._auto_residency_round_sizes
-            and plan.current_placement_reserve_shortfall_bytes > 0
-        ):
-            shortfall_gib = plan.current_placement_reserve_shortfall_bytes / GIB_BYTES
-            if self.is_output_rank:
-                logger.warning(
-                    "Auto residency calibration exceeded the VRAM reserve by "
-                    "%.1f GiB; rolling back the latest adjustment round.",
-                    shortfall_gib,
-                )
-            return self._rollback_everywhere(
-                cause=f"VRAM reserve exceeded by {shortfall_gib:.1f} GiB",
-                already_failed=False,
-                latest_round_only=True,
-            )
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:

@@ -10,14 +10,12 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    GIB_BYTES,
     PLACEMENT_STATUS_ADJUSTED,
     PLACEMENT_STATUS_ROLLBACK_FAILED,
     PLACEMENT_STATUS_ROLLED_BACK,
     PLACEMENT_STATUS_VALIDATED,
     AppliedResidencyChange,
     AutoResidencyPlan,
-    DefaultWorkload,
     RankResidencyReport,
     ResidencyTarget,
 )
@@ -88,53 +86,6 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         self.assertIn("10.00s to 20.00s", kwargs["cause"])
         self.assertFalse(kwargs["already_failed"])
         self.assertTrue(kwargs["latest_round_only"])
-
-    def test_new_placement_that_spends_the_reserve_rolls_back(self):
-        worker = GPUWorker.__new__(GPUWorker)
-        worker.rank = 0
-        worker.is_output_rank = False
-        worker.pipeline = SimpleNamespace(modules={})
-        worker.server_args = SimpleNamespace(
-            residency_mode=lambda _name: COMPONENT_OFFLOAD
-        )
-        worker._auto_residency_warmup_records = []
-        worker._auto_residency_round_sizes = [1]
-        worker._build_auto_residency_report = mock.Mock(
-            return_value=RankResidencyReport(
-                rank=0,
-                budget_bytes=30 * GIB_BYTES,
-                estimated_peak_bytes=28 * GIB_BYTES,
-            )
-        )
-        worker._auto_residency_all_gather = lambda value: [value]
-        expected = OutputBatch(output={"status": PLACEMENT_STATUS_ROLLED_BACK})
-        worker._rollback_everywhere = mock.Mock(return_value=expected)
-        workload = DefaultWorkload(832, 480, 24, 50)
-        plan = AutoResidencyPlan(
-            current_placement_reserve_shortfall_bytes=2 * GIB_BYTES
-        )
-
-        with (
-            mock.patch.object(
-                gpu_worker_module, "resolve_default_workload", return_value=workload
-            ),
-            mock.patch.object(
-                gpu_worker_module,
-                "resolve_measured_default_workload",
-                return_value=workload,
-            ),
-            mock.patch.object(
-                gpu_worker_module, "plan_auto_residency", return_value=plan
-            ),
-        ):
-            response = worker.apply_auto_residency()
-
-        self.assertIs(response, expected)
-        worker._rollback_everywhere.assert_called_once_with(
-            cause="VRAM reserve exceeded by 2.0 GiB",
-            already_failed=False,
-            latest_round_only=True,
-        )
 
     def test_worker_validation_does_not_apply_a_second_candidate_plan(self):
         worker = GPUWorker.__new__(GPUWorker)
