@@ -85,7 +85,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large
+          python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large --warm-worker-batch-size 10
 
   jit-kernel-multigpu-unit-test:
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the

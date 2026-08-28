@@ -23,6 +23,72 @@ class TestFile:
     estimated_time: float = 60
 
 
+class _WarmTestWorker:
+    """Persistent interpreter used for a bounded number of test files."""
+
+    def __init__(self):
+        result_read_fd, result_write_fd = os.pipe()
+        worker_path = os.path.join(os.path.dirname(__file__), "warm_test_worker.py")
+        self.process = subprocess.Popen(
+            [
+                "python3",
+                worker_path,
+                "--result-fd",
+                str(result_write_fd),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=None,
+            stderr=None,
+            text=True,
+            pass_fds=(result_write_fd,),
+        )
+        os.close(result_write_fd)
+        self.result_stream = os.fdopen(result_read_fd)
+        self.files_run = 0
+
+    def run(self, filename: str) -> tuple[int, float]:
+        tic = time.perf_counter()
+        if self.process.poll() is not None or self.process.stdin is None:
+            return 1, 0.0
+
+        try:
+            self.process.stdin.write(json.dumps({"filename": filename}) + "\n")
+            self.process.stdin.flush()
+            result_line = self.result_stream.readline()
+        except (BrokenPipeError, OSError):
+            return 1, time.perf_counter() - tic
+        if not result_line:
+            return 1, time.perf_counter() - tic
+
+        try:
+            result = json.loads(result_line)
+        except json.JSONDecodeError:
+            return 1, time.perf_counter() - tic
+        self.files_run += 1
+        return int(result["returncode"]), float(result["elapsed"])
+
+    def close(self, terminate: bool = False):
+        if self.process.poll() is None:
+            if terminate:
+                kill_process_tree(self.process.pid)
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            elif self.process.stdin is not None:
+                try:
+                    self.process.stdin.write(json.dumps({"command": "stop"}) + "\n")
+                    self.process.stdin.flush()
+                    self.process.wait(timeout=10)
+                except (BrokenPipeError, subprocess.TimeoutExpired):
+                    kill_process_tree(self.process.pid)
+
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        self.result_stream.close()
+
+
 # Patterns that indicate retriable accuracy/performance failures
 RETRIABLE_PATTERNS = [
     r"AssertionError:.*not greater than",
@@ -158,6 +224,7 @@ def run_unittest_files(
     enable_retry: bool = False,
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
+    warm_worker_batch_size: int = 1,
 ):
     """
     Run a list of test files.
@@ -172,6 +239,10 @@ def run_unittest_files(
                      assertion failures (not code errors).
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
+        warm_worker_batch_size: Number of consecutive files to execute in one
+                                interpreter. One keeps the existing subprocess
+                                behavior. Smart retry also uses subprocesses so
+                                failure output can be captured independently.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -185,6 +256,8 @@ def run_unittest_files(
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
+    warm_worker = None
+    use_warm_worker = warm_worker_batch_size > 1 and not enable_retry
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -203,7 +276,7 @@ def run_unittest_files(
         output_lines = []
 
         def run_one_file(filename, capture_output=False):
-            nonlocal process, output_lines
+            nonlocal process, output_lines, warm_worker
 
             full_path = os.path.join(os.getcwd(), filename)
             logger.info(
@@ -211,10 +284,24 @@ def run_unittest_files(
             )
             file_tic = time.perf_counter()
 
-            cmd = ["python3", full_path, "-f"]
-
-            if capture_output:
+            if use_warm_worker:
+                if (
+                    warm_worker is None
+                    or warm_worker.files_run >= warm_worker_batch_size
+                ):
+                    if warm_worker is not None:
+                        warm_worker.close()
+                    warm_worker = _WarmTestWorker()
+                process = warm_worker.process
+                ret_code, _ = warm_worker.run(full_path)
+                if ret_code != 0 or warm_worker.files_run >= warm_worker_batch_size:
+                    warm_worker.close()
+                    warm_worker = None
+                    process = None
+                elapsed = time.perf_counter() - file_tic
+            elif capture_output:
                 # Capture output for retry decision
+                cmd = ["python3", full_path, "-f"]
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -228,16 +315,20 @@ def run_unittest_files(
                     output_lines.append(line)
                 process.wait()
             else:
+                cmd = ["python3", full_path, "-f"]
                 process = subprocess.Popen(cmd, stdout=None, stderr=None)
                 process.wait()
+                ret_code = process.returncode
 
-            elapsed = time.perf_counter() - file_tic
+            if not use_warm_worker:
+                elapsed = time.perf_counter() - file_tic
+                ret_code = process.returncode
             file_elapsed[filename] = elapsed
 
             logger.info(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n"
             )
-            return process.returncode
+            return ret_code
 
         # Retry loop for each file
         attempt = 1
@@ -297,7 +388,11 @@ def run_unittest_files(
                     break
 
             except TimeoutError:
-                kill_process_tree(process.pid)
+                if warm_worker is not None:
+                    warm_worker.close(terminate=True)
+                    warm_worker = None
+                elif process is not None:
+                    kill_process_tree(process.pid)
                 time.sleep(5)
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
@@ -324,6 +419,9 @@ def run_unittest_files(
             success = False
             if not continue_on_error:
                 break
+
+    if warm_worker is not None:
+        warm_worker.close()
 
     elapsed_total = time.perf_counter() - tic
 
