@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
+    estimate_layerwise_layer_uses,
     estimate_workload_phase_peaks,
     format_applied_changes,
     plan_auto_residency,
@@ -68,6 +69,7 @@ def _record(
     step_duration_ms=(),
     phase_active_components=None,
     phase_full_weight_transition_components=None,
+    layerwise_layer_uses=None,
 ) -> WarmupMemoryRecord:
     return WarmupMemoryRecord(
         width=width,
@@ -84,6 +86,7 @@ def _record(
         phase_full_weight_transition_components=(
             phase_full_weight_transition_components or {}
         ),
+        layerwise_layer_uses=layerwise_layer_uses or {},
     )
 
 
@@ -193,6 +196,38 @@ class TestEstimateDefaultWorkloadTiming:
         assert savings[coarse.option_key()] == 0
         assert savings[resident.option_key()] == 416_666_666
         assert savings[virtual_layerwise.option_key()] == -5_000_000_000
+
+
+class TestEstimateLayerwiseLayerUses:
+    def test_scales_repeated_groups_but_not_one_shot_groups(self):
+        record = _record(
+            num_inference_steps=2,
+            layerwise_layer_uses={
+                "transformer": {
+                    "token_refiner.blocks": (1, 1),
+                    "blocks": (2, 2, 2),
+                },
+                "vae": {
+                    "encoder.down_blocks": (0, 0),
+                    "decoder.up_blocks": (1, 1),
+                },
+            },
+        )
+
+        uses = estimate_layerwise_layer_uses(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=10,
+        )
+
+        assert uses["transformer"] == {
+            "token_refiner.blocks": (1, 1),
+            "blocks": (10, 10, 10),
+        }
+        assert uses["vae"] == {
+            "encoder.down_blocks": (0, 0),
+            "decoder.up_blocks": (1, 1),
+        }
 
 
 class TestEstimateDefaultWorkloadPeak:
@@ -1620,6 +1655,7 @@ class _FakeLayerwiseManager:
         resident_layers: int = 0,
         event_log: list[str] | None = None,
         event_name: str = "manager",
+        layers_attr_str: str = "layers",
     ):
         self.enabled = True
         self._configured = True
@@ -1631,6 +1667,7 @@ class _FakeLayerwiseManager:
         self._pinned_layers: tuple[int, ...] = ()
         self._event_log = event_log
         self._event_name = event_name
+        self.layers_attr_str = layers_attr_str
         self.fail_load = False
         self.load_all_layers_calls = 0
         self.remove_hooks_calls = 0
@@ -1835,6 +1872,41 @@ class TestCollectResidencyTargets:
 
         assert (2, 2) in targets
         assert (1, 2) in targets
+
+    def test_measured_resident_frontier_allocates_repeated_groups_independently(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"first.{index}.w": torch.zeros(16) for index in range(3)}
+            ),
+            _FakeLayerwiseManager(
+                {f"second.{index}.w": torch.zeros(16) for index in range(2)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=((8, 8, 8), (8, 8)),
+        )
+
+        assert (0, 2) in targets
+        assert (3, 0) in targets
+
+    def test_measured_resident_frontier_streams_one_shot_and_unused_groups(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"encoder.{index}.w": torch.zeros(16) for index in range(3)}
+            ),
+            _FakeLayerwiseManager(
+                {f"decoder.{index}.w": torch.zeros(16) for index in range(2)}
+            ),
+        ]
+
+        targets = _layerwise_resident_targets(
+            managers,
+            layer_uses=((0, 0, 0), (1, 1)),
+        )
+
+        assert targets == [(0, 0)]
 
     def test_host_pin_frontier_includes_non_prefix_packings(self):
         manager = SimpleNamespace(
@@ -2069,6 +2141,45 @@ class TestCollectResidencyTargets:
         )
         assert component.target_layerwise_pinned_layers == ((),)
         assert component.pinned_host_delta_bytes == 0
+
+    def test_measured_vae_frontier_does_not_spend_on_unused_encoder_layers(self):
+        encoder = _FakeLayerwiseManager(
+            {f"encoder.{index}.w": torch.zeros(16) for index in range(2)},
+            layers_attr_str="encoder",
+        )
+        decoder = _FakeLayerwiseManager(
+            {f"decoder.{index}.w": torch.zeros(16) for index in range(3)},
+            layers_attr_str="decoder",
+        )
+        module = _FakeLayerwiseDit([encoder, decoder])
+
+        candidates = collect_residency_targets(
+            modules={"vae": module},
+            residency_mode_of=self._modes({"vae": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=20,
+            used_components={"vae"},
+            layerwise_layer_uses={
+                "vae": {
+                    "encoder": (0, 0),
+                    "decoder": (1, 1, 1),
+                }
+            },
+        )
+        layerwise = [
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        ]
+
+        assert layerwise
+        assert {
+            candidate.target_layerwise_resident_layers for candidate in layerwise
+        } == {(0, 0)}
+        assert all(
+            candidate.target_layerwise_pinned_layers[0] == () for candidate in layerwise
+        )
 
     def test_component_offload_frontier_can_expand_layerwise_lazily(self):
         module = _FakeLazyLayerwiseDit(num_layers=4)

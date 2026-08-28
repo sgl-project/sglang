@@ -74,6 +74,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
+    estimate_layerwise_layer_uses,
     estimate_workload_phase_peaks,
     format_applied_changes,
     format_plan_summary,
@@ -98,6 +99,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseUsageTracker,
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
@@ -589,6 +591,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             else None
         )
         warmup_baseline_allocated_bytes = 0
+        layerwise_usage_tracker: LayerwiseUsageTracker | None = None
         try:
             if measure_server_warmup:
                 # Drop the previous request's allocator pool so each probe
@@ -601,6 +604,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 warmup_baseline_allocated_bytes = (
                     torch.get_device_module().memory_allocated()
                 )
+                if (
+                    self.server_args.performance_mode == "auto"
+                    and self.pipeline is not None
+                ):
+                    layerwise_usage_tracker = LayerwiseUsageTracker(
+                        self.pipeline.modules
+                    )
 
             start_time = (
                 execution_start_time
@@ -718,11 +728,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # or the estimator would plan from the remaining partial data
             if measure_server_warmup:
                 assert warmup_workload is not None
+                layerwise_layer_uses = (
+                    layerwise_usage_tracker.finish()
+                    if layerwise_usage_tracker is not None
+                    else {}
+                )
                 self._record_server_warmup_memory(
                     req=req,
                     workload=warmup_workload,
                     baseline_allocated_bytes=warmup_baseline_allocated_bytes,
                     succeeded=output_batch is not None and output_batch.error is None,
+                    layerwise_layer_uses=layerwise_layer_uses,
                 )
         return output_batch
 
@@ -733,6 +749,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         workload: tuple[int, int, int, int],
         baseline_allocated_bytes: int,
         succeeded: bool,
+        layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
     ) -> None:
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
@@ -778,6 +795,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_full_weight_transition_components=(
                     phase_full_weight_transition_components
                 ),
+                layerwise_layer_uses=layerwise_layer_uses or {},
                 num_inference_steps=num_inference_steps,
                 total_duration_ms=(
                     float(metrics.total_duration_ms) if metrics is not None else 0.0
@@ -1602,6 +1620,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             target_units=target_units,
             component_weight_bytes=runtime_weights_by_component,
         )
+        measured_used_components = {
+            component_name
+            for component_names in used_components_by_phase.values()
+            for component_name in component_names
+        }
+        has_component_use_measurement = any(
+            record.phase_used_components for record in records if record.succeeded
+        )
+        layerwise_layer_uses = estimate_layerwise_layer_uses(
+            records=records,
+            target_units=target_units,
+            target_num_inference_steps=workload.num_inference_steps,
+        )
         # What this process may still grow into: free VRAM plus what its
         # allocator already reserved. Unlike the raw device total, this
         # excludes memory held by other processes on a shared GPU.
@@ -1632,6 +1663,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     self.server_args.layerwise_tuning_for(name, dit_group=dit_group)
                 ),
                 pin_cpu_memory=self.server_args.pin_cpu_memory,
+                used_components=(
+                    measured_used_components if has_component_use_measurement else None
+                ),
+                layerwise_layer_uses=layerwise_layer_uses,
             )
         measured_request_duration_ns, _, _ = estimate_default_workload_timing(
             records=records,
