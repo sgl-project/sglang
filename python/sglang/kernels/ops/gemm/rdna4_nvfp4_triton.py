@@ -38,8 +38,10 @@ def _rdna4_nvfp4_prefill_kernel(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # int64 row/column offsets: `offsets_m * size_n` reaches past 2**31 for a
+    # large prefill chunk against a wide projection, and int32 would wrap.
+    offsets_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    offsets_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.int64)
     offsets_k = tl.arange(0, BLOCK_K)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 

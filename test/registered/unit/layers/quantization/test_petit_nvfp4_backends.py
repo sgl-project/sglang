@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -15,6 +16,7 @@ from sglang.srt.layers.quantization.petit_utils import (
     prepare_nvfp4_layer_for_petit,
     select_nvfp4_backend,
 )
+from sglang.srt.utils import is_gfx1201_supported
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -22,42 +24,58 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestRdna4Nvfp4BackendSelection(CustomTestCase):
-    def test_gcn_arch_normalization(self):
-        self.assertEqual(
-            rdna4_nvfp4.normalize_gcn_arch_name("gfx1201:sramecc+:xnack-"),
-            "gfx1201",
-        )
-        self.assertEqual(
-            rdna4_nvfp4.normalize_gcn_arch_name("GFX942:xnack-"),
-            "gfx942",
+    def setUp(self):
+        super().setUp()
+        # is_gfx1201_supported caches per device; the mocked properties below
+        # would otherwise leak between subtests.
+        is_gfx1201_supported.cache_clear()
+        self.addCleanup(is_gfx1201_supported.cache_clear)
+
+    @staticmethod
+    def _mock_device(gcn_arch_name, hip="7.0"):
+        return (
+            mock.patch.object(torch.version, "hip", hip),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(gcnArchName=gcn_arch_name),
+            ),
         )
 
     def test_exact_gfx1201_device_detection(self):
-        with (
-            mock.patch.object(torch.version, "hip", "7.0"),
-            mock.patch.object(torch.cuda, "is_available", return_value=True),
-            mock.patch.object(
-                torch.cuda,
-                "get_device_properties",
-                return_value=SimpleNamespace(gcnArchName="gfx1201:sramecc+:xnack-"),
-            ),
-        ):
-            self.assertTrue(rdna4_nvfp4.is_rdna4_nvfp4_device("cuda:0"))
+        cases = (
+            # A feature suffix must not defeat the match; a near neighbour must.
+            ("gfx1201:sramecc+:xnack-", True),
+            ("GFX1201", True),
+            ("gfx1200", False),
+            ("gfx942", False),
+        )
+        for gcn_arch_name, expected in cases:
+            with self.subTest(gcn_arch_name=gcn_arch_name):
+                is_gfx1201_supported.cache_clear()
+                with contextlib.ExitStack() as stack:
+                    for patcher in self._mock_device(gcn_arch_name):
+                        stack.enter_context(patcher)
+                    self.assertEqual(
+                        rdna4_nvfp4.is_rdna4_nvfp4_device("cuda:0"), expected
+                    )
 
-        with (
-            mock.patch.object(torch.version, "hip", "7.0"),
-            mock.patch.object(torch.cuda, "is_available", return_value=True),
-            mock.patch.object(
-                torch.cuda,
-                "get_device_properties",
-                return_value=SimpleNamespace(gcnArchName="gfx942"),
-            ),
-        ):
+    def test_non_hip_and_non_gpu_devices_are_rejected(self):
+        with contextlib.ExitStack() as stack:
+            for patcher in self._mock_device("gfx1201", hip=None):
+                stack.enter_context(patcher)
             self.assertFalse(rdna4_nvfp4.is_rdna4_nvfp4_device("cuda:0"))
+
+        is_gfx1201_supported.cache_clear()
+        with contextlib.ExitStack() as stack:
+            for patcher in self._mock_device("gfx1201"):
+                stack.enter_context(patcher)
+            self.assertFalse(rdna4_nvfp4.is_rdna4_nvfp4_device("cpu"))
 
     def test_selector_preserves_petit_for_non_rdna4(self):
         with mock.patch(
-            "sglang.srt.layers.quantization.petit_utils." "is_rdna4_nvfp4_device",
+            "sglang.srt.layers.quantization.petit_utils.is_rdna4_nvfp4_device",
             return_value=False,
         ):
             self.assertEqual(select_nvfp4_backend(), PETIT_NVFP4_BACKEND)
@@ -79,15 +97,20 @@ class TestRdna4Nvfp4BackendSelection(CustomTestCase):
 
         with (
             mock.patch(
-                "sglang.srt.layers.quantization.petit_utils." "select_nvfp4_backend",
+                "sglang.srt.layers.quantization.petit_utils.select_nvfp4_backend",
                 return_value=RDNA4_NVFP4_BACKEND,
             ),
             mock.patch(
                 "sglang.srt.layers.quantization.petit_utils._load_petit_ops",
                 side_effect=AssertionError("Petit must not be imported"),
             ),
+            mock.patch(
+                "sglang.srt.layers.quantization.petit_utils.try_warmup_rdna4_nvfp4"
+            ) as warmup,
         ):
             prepare_nvfp4_layer_for_petit(layer)
+
+        warmup.assert_called_once()
 
         self.assertEqual(layer.nvfp4_backend, RDNA4_NVFP4_BACKEND)
         torch.testing.assert_close(layer.weight, expected_weight)
@@ -142,7 +165,7 @@ class TestRdna4Nvfp4BackendSelection(CustomTestCase):
         input_tensor = torch.randn(2, 16, dtype=torch.bfloat16)
         expected = torch.randn(2, 3, dtype=torch.bfloat16)
         with mock.patch(
-            "sglang.srt.layers.quantization.petit_utils." "rdna4_nvfp4_linear",
+            "sglang.srt.layers.quantization.petit_utils.rdna4_nvfp4_linear",
             return_value=expected,
         ) as rdna4_linear:
             output = apply_petit_nvfp4_linear(
@@ -246,25 +269,84 @@ class TestRdna4Nvfp4BackendSelection(CustomTestCase):
                     with self.assertRaisesRegex(error_type, message):
                         rdna4_nvfp4.rdna4_nvfp4_linear(**arguments)
 
-    def test_modelopt_nvfp4_routes_to_rocm_config(self):
+    def test_modelopt_declines_dense_nvfp4_on_rocm(self):
+        """The ModelOpt configs must step aside so Petit can claim the checkpoint."""
         config = {"quant_method": "modelopt_fp4", "quant_algo": "NVFP4"}
         with mock.patch.object(torch.version, "hip", "7.0"):
-            for requested_method in (None, "modelopt", "modelopt_fp4"):
+            for requested_method in (None, "modelopt", "modelopt_fp4", "petit_nvfp4"):
                 with self.subTest(requested_method=requested_method):
-                    override = (
+                    self.assertIsNone(
                         QuantizationConfig._modelopt_override_quantization_method(
                             config, requested_method
                         )
                     )
-                    self.assertEqual(override, "petit_nvfp4")
 
-    def test_explicit_petit_is_preserved_without_rdna4_detection(self):
-        config = {"quant_method": "modelopt_fp4", "quant_algo": "NVFP4"}
-        with mock.patch.object(torch.version, "hip", None):
-            override = QuantizationConfig._modelopt_override_quantization_method(
-                config, "petit_nvfp4"
+    def test_petit_claims_both_modelopt_method_spellings_on_rocm(self):
+        configs = (
+            {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+            {"quant_method": "modelopt_fp4", "quant_algo": "NVFP4"},
+        )
+        with mock.patch(
+            "sglang.srt.layers.quantization.petit._is_hip",
+            True,
+        ):
+            for config in configs:
+                with self.subTest(quant_method=config["quant_method"]):
+                    self.assertEqual(
+                        PetitNvFp4Config.override_quantization_method(config, None),
+                        "petit_nvfp4",
+                    )
+
+    def test_petit_declines_algorithms_it_cannot_serve(self):
+        # NVFP4_AWQ / W4A16_NVFP4 keep resolving to modelopt_fp4 and its
+        # explicit "not supported in ROCm" error rather than silently landing
+        # on a backend that only implements group-16 dense NVFP4.
+        with mock.patch("sglang.srt.layers.quantization.petit._is_hip", True):
+            for quant_algo in ("NVFP4_AWQ", "W4A16_NVFP4"):
+                with self.subTest(quant_algo=quant_algo):
+                    config = {
+                        "quant_method": "modelopt_fp4",
+                        "quant_algo": quant_algo,
+                    }
+                    self.assertIsNone(
+                        PetitNvFp4Config.override_quantization_method(config, None)
+                    )
+        with mock.patch.object(torch.version, "hip", "7.0"):
+            self.assertEqual(
+                QuantizationConfig._modelopt_override_quantization_method(
+                    {"quant_method": "modelopt_fp4", "quant_algo": "NVFP4_AWQ"}, None
+                ),
+                "modelopt_fp4",
             )
-        self.assertEqual(override, "petit_nvfp4")
+
+    def test_petit_declines_everything_off_rocm(self):
+        with mock.patch("sglang.srt.layers.quantization.petit._is_hip", False):
+            self.assertIsNone(
+                PetitNvFp4Config.override_quantization_method(
+                    {"quant_method": "modelopt_fp4", "quant_algo": "NVFP4"}, None
+                )
+            )
+
+    def test_quantized_moe_layers_fail_fast(self):
+        """A quantized expert must not silently fall through to unquantized MoE."""
+
+        class _FakeFusedMoE(nn.Module):
+            pass
+
+        config = PetitNvFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo="FP8",
+            group_size=16,
+            exclude_modules=["lm_head"],
+        )
+        with mock.patch(
+            "sglang.srt.layers.moe.fused_moe_triton.FusedMoE",
+            _FakeFusedMoE,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "does not support"):
+                config.get_quant_method(_FakeFusedMoE(), "model.layers.0.mlp.experts")
+            # An excluded expert stays unquantized instead of raising.
+            self.assertIsNone(config.get_quant_method(_FakeFusedMoE(), "lm_head"))
 
     def test_cuda_flagless_modelopt_nvfp4_routing_is_unchanged(self):
         config = {"quant_method": "modelopt_fp4", "quant_algo": "NVFP4"}
@@ -274,7 +356,7 @@ class TestRdna4Nvfp4BackendSelection(CustomTestCase):
             )
         self.assertEqual(override, "modelopt_fp4")
 
-    def test_flat_modelopt_config_is_supported(self):
+    def test_config_json_style_flat_quant_block_is_supported(self):
         config = PetitNvFp4Config.from_config(
             {
                 "quant_algo": "NVFP4",
