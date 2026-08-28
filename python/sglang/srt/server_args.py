@@ -9200,6 +9200,7 @@ class ServerArgs:
             # (arg_groups/overrides.py), invoked at their legacy slots.
             from sglang.srt.arg_groups.overrides import (
                 _deterministic_attention_backend,
+                _deterministic_quantized_kv_cache_warning,
                 _deterministic_sampling_backend,
                 run_post_process_pass,
             )
@@ -9224,6 +9225,10 @@ class ServerArgs:
 
             # Check attention backend
             run_post_process_pass(self, _deterministic_attention_backend)
+
+            # Must follow the backend pass: the warning is backend-specific and
+            # would otherwise read a None that the fallback above fills in.
+            run_post_process_pass(self, _deterministic_quantized_kv_cache_warning)
 
             attention_backend = resolved_view(self).attention_backend
             if is_deepseek_model:
