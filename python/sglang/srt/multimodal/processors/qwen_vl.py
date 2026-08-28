@@ -12,6 +12,7 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -43,7 +44,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -346,6 +346,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        self.uses_media_artifacts_without_cache = self.model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+        )
         if self.model_type in (
             "qwen2_vl",
             "qwen2_5_vl",
@@ -775,34 +779,60 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         if not entries:
             return []
 
-        synthetic_prompt = self.mm_tokens.image_token * len(entries)
-        base_output = BaseMultiModalProcessorOutput(
-            input_text=synthetic_prompt,
-            images=[entry.media for entry in entries],
-        )
-        mm_items, _, _ = self.process_and_combine_mm_data(
-            base_output,
-            self.mm_tokens,
-            processor=processor,
-            prepare_for_transport=False,
-        )
-        image_items = [item for item in mm_items if item.is_image()]
-        if len(image_items) != len(entries):
+        processor, _ = self._resolve_processor(processor)
+        image_kwargs = dict(self.image_config or {})
+        processor_device = None
+        if (
+            isinstance(processor.image_processor, BaseImageProcessor)
+            and not self.disable_fast_image_processor
+        ):
+            processor_device = self._fast_image_processor_device(processor)
+            if processor_device is not None:
+                image_kwargs["device"] = processor_device
+
+        with self._temporary_fast_processor_cuda_pool(processor_device):
+            result = processor.image_processor(
+                images=[entry.media for entry in entries],
+                return_tensors="pt",
+                **image_kwargs,
+            )
+            features = self._get_processor_output_value(result, "pixel_values")
+            image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
+            if (
+                isinstance(features, torch.Tensor)
+                and (
+                    self.mm_preprocess_cache.enabled
+                    or not self.keep_mm_features_on_device
+                )
+                and not self.precompute_hash_before_cpu_transfer
+            ):
+                features = features.cpu()
+
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("Qwen-VL image processor must return pixel_values")
+        if not isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = torch.as_tensor(image_grid_thw, dtype=torch.long)
+        if image_grid_thw.ndim != 2 or image_grid_thw.shape != (len(entries), 3):
             raise ValueError(
-                "Qwen-VL preprocessing must produce one image item per cache miss: "
-                f"{len(image_items)} != {len(entries)}"
+                "Qwen-VL image processor returned an invalid image_grid_thw shape: "
+                f"{tuple(image_grid_thw.shape)}"
+            )
+        feature_lengths = image_grid_thw.prod(dim=1).tolist()
+        if sum(feature_lengths) != features.shape[0]:
+            raise ValueError(
+                "Qwen-VL image processor feature count does not match image grids: "
+                f"{features.shape[0]} != {sum(feature_lengths)}"
             )
 
         artifacts = []
-        for entry, item in zip(entries, image_items):
-            feature = item.feature
-            if not isinstance(feature, torch.Tensor):
-                raise TypeError(
-                    "Qwen-VL image artifacts require a tensor processor feature"
-                )
-            if feature.device.type != "cpu":
-                feature = feature.cpu()
-            feature = feature.contiguous()
+        feature_offset = 0
+        for entry, grid, feature_length in zip(
+            entries, image_grid_thw, feature_lengths
+        ):
+            feature = features[
+                feature_offset : feature_offset + feature_length
+            ].contiguous()
+            feature_offset += feature_length
             # The artifact key already commits to the media content, processor
             # fingerprint, and every preprocessing kwarg. Derive the downstream
             # cache identity from it so independently preprocessed copies in
@@ -816,7 +846,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     artifact_key=entry.artifact_key,
                     feature_hash=feature_hash,
                     feature=feature,
-                    model_specific_data=deepcopy(item.model_specific_data),
+                    model_specific_data={"image_grid_thw": grid.unsqueeze(0)},
                 )
             )
         return artifacts
@@ -1107,15 +1137,22 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             or request_obj.video_data
             or request_obj.audio_data
             or any(self._is_preprocessed_input(item) for item in image_data)
-            or not self.mm_preprocess_cache.enabled
+            or (
+                not self.mm_preprocess_cache.enabled
+                and not self.uses_media_artifacts_without_cache
+            )
         ):
             return await self._process_mm_data_uncached(
                 image_data, input_text, request_obj, *args, **kwargs
             )
 
-        artifacts = await self.prepare_media_artifacts(
-            image_data,
-            content_hashes=getattr(request_obj, "mm_content_hashes", None),
+        prepare_artifacts = (
+            self.prepare_media_artifacts
+            if self.mm_preprocess_cache.enabled
+            else self.prepare_media_artifacts_without_cache
+        )
+        artifacts = await prepare_artifacts(
+            image_data, content_hashes=getattr(request_obj, "mm_content_hashes", None)
         )
         return self.compose_image_artifacts(input_text, artifacts)
 

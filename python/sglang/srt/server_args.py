@@ -5433,22 +5433,24 @@ class ServerArgs:
             return
 
         if not envs.SGLANG_VLM_CACHE_SIZE_MB.is_set():
-            embedding_cache_size_mb = 8192
-            logger.info(
-                "Using an %d MiB multimodal embedding cache for %s on a "
-                "large-memory GPU.",
-                embedding_cache_size_mb,
-                model_type,
-            )
-            envs.SGLANG_VLM_CACHE_SIZE_MB.set(embedding_cache_size_mb)
+            # Repeated-image traffic can opt in to embedding retention. Disable
+            # it by default for streaming traffic, where every image is used once.
+            envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)
 
         updates = {}
-        if self.mm_preprocess_cache_size_mb is None:
-            updates["mm_preprocess_cache_size_mb"] = 16384
+        preprocess_cache_size_mb = self.mm_preprocess_cache_size_mb
+        if preprocess_cache_size_mb is None:
+            preprocess_cache_size_mb = 0
+            updates["mm_preprocess_cache_size_mb"] = 0
+        cache_retention_enabled = (
+            preprocess_cache_size_mb > 0 or envs.SGLANG_VLM_CACHE_SIZE_MB.get() > 0
+        )
+        if self.mm_feature_transport is None and not cache_retention_enabled:
+            updates["mm_feature_transport"] = "cuda_ipc"
         if self.radix_eviction_policy == "lru":
             updates["radix_eviction_policy"] = "priority"
         if self.prefill_decode_interval is None:
-            updates["prefill_decode_interval"] = 32
+            updates["prefill_decode_interval"] = 24
         if self.attention_backend is None and self.decode_attention_backend is None:
             updates["decode_attention_backend"] = "flashinfer"
 

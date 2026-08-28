@@ -106,10 +106,11 @@ _is_hip = is_hip()
 # Eager multimodal prefills need transient device memory in addition to the
 # persistent embedding/transport caches. In particular, deepstack models hold
 # wider embedding buffers while the language-model MLP allocates its output.
-# Keep 2 GiB out of the KV pool for that overlap and for fragmentation between
-# the eager-prefill and decode CUDA-graph pools. The embedding-cache budget is
-# reserved separately below.
-_MM_RUNTIME_ACTIVATION_RESERVE_MB = 2048
+# Keep 6 GiB out of the KV pool for that overlap and for fragmentation between
+# the eager-prefill and decode CUDA-graph pools. This headroom is independent
+# of the embedding-cache budget: a disabled cache must not let KV allocation
+# consume the memory required by an uncached high-concurrency ViT prefill.
+_MM_RUNTIME_ACTIVATION_RESERVE_MB = 6144
 _MM_RUNTIME_ACTIVATION_RESERVE_MODEL_TYPES = frozenset({"qwen3_vl", "qwen3_vl_moe"})
 
 

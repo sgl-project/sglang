@@ -204,6 +204,9 @@ class BaseMultimodalProcessor(ABC):
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
+    # Artifact-based processors may keep their prompt/M-RoPE fast path even
+    # when artifact retention is disabled.
+    uses_media_artifacts_without_cache = False
     supports_mm_processor_concurrency = False
 
     def __init__(
@@ -249,15 +252,6 @@ class BaseMultimodalProcessor(ABC):
         )
         tokenizer_worker_num = max(int(self.server_args.tokenizer_worker_num), 1)
         worker_cache_bytes = total_cache_mb * 1024 * 1024 // tokenizer_worker_num
-        # Artifact hits otherwise still allocate and copy a fresh named SHM
-        # segment for every request. Reuse the same resolved, service-wide
-        # budget for transport unless the operator supplied an explicit SHM
-        # cache override.
-        from sglang.srt.managers.mm_utils import (
-            configure_reusable_shm_feature_cache,
-        )
-
-        configure_reusable_shm_feature_cache(total_cache_mb, tokenizer_worker_num)
         self.mm_preprocess_cache = MultimodalPreprocessCache(
             max_size_bytes=worker_cache_bytes,
             max_entries=8192,
@@ -268,6 +262,7 @@ class BaseMultimodalProcessor(ABC):
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
+            or self.uses_media_artifacts_without_cache
             else None
         )
         if self.mm_preprocess_cache.enabled:
@@ -1602,7 +1597,6 @@ class BaseMultimodalProcessor(ABC):
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
         processor=None,
-        prepare_for_transport: bool = True,
         **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
         """
@@ -1760,7 +1754,6 @@ class BaseMultimodalProcessor(ABC):
         all_collected_items = self._finalize_mm_items(
             all_collected_items,
             images=base_output.images,
-            prepare_for_transport=prepare_for_transport,
         )
 
         return all_collected_items, input_ids, ret
@@ -1770,7 +1763,6 @@ class BaseMultimodalProcessor(ABC):
         mm_items: List[MultimodalDataItem],
         *,
         images: Optional[List[Any]],
-        prepare_for_transport: bool = True,
     ) -> List[MultimodalDataItem]:
         mm_items = self._postprocess_mm_items_before_transport(
             mm_items,
@@ -1785,9 +1777,7 @@ class BaseMultimodalProcessor(ABC):
                 item.set_pad_value()
 
         self._precompute_hashes_before_cpu_transfer(mm_items)
-        if prepare_for_transport:
-            return self._prepare_mm_items_for_transport(mm_items)
-        return mm_items
+        return self._prepare_mm_items_for_transport(mm_items)
 
     def _postprocess_mm_items_before_transport(
         self,
