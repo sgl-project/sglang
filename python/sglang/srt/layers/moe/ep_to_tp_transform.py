@@ -73,7 +73,7 @@ def maybe_ep_to_tp_transform_all_layers(model: nn.Module) -> None:
 
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-    buf_cache: dict[tuple[torch.Size, torch.dtype], torch.Tensor] = {}
+    buf_cache: dict[tuple[torch.Size, torch.dtype, int], torch.Tensor] = {}
 
     if hasattr(model, "layers"):
         layers = model.layers[model.start_layer : model.end_layer]
@@ -104,7 +104,7 @@ def maybe_ep_to_tp_transform_all_layers(model: nn.Module) -> None:
         # Params sharing a (shape, dtype) within one layer must still get
         # distinct buffers — they are all live simultaneously — so the slot
         # index disambiguates. Across layers the same slots are reused.
-        claimed: dict[tuple, int] = {}
+        claimed: dict[tuple[torch.Size, torch.dtype], int] = {}
         for name, param in moe_layer.named_parameters():
             target_shape = moe_layer.ep_to_tp_target_shape(name, param)
 
