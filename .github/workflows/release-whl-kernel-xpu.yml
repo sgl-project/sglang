@@ -86,6 +86,8 @@ jobs:
             sgl_kernel_xpu_release_build \
             /bin/bash -lc '
               set -exo pipefail
+              . /miniforge3/bin/activate
+              conda activate py${{ matrix.python-version }}
               source /opt/intel/oneapi/setvars.sh --force
               command -v patchelf || (apt-get update && apt-get install -y patchelf)
               python scripts/build_rel_wheel.py

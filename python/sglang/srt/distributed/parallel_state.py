@@ -840,6 +840,7 @@ class GroupCoordinator:
         eps: float,
         group_size: int = 128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
@@ -853,6 +854,10 @@ class GroupCoordinator:
         ``(fp8, residual_out, scale, bf16)`` — used by GDN-style layers that
         need both an FP8 projection and a bf16 gating projection without
         launching a separate per-group quant kernel.
+
+        When ``transpose_scale=True`` the kernel writes the per-group scale in
+        the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
+        caller can skip the post-kernel scale transpose.
         """
         if not (is_hip() and is_gfx95_supported()):
             return None
@@ -899,6 +904,7 @@ class GroupCoordinator:
                 group_size,
                 use_1stage_ar,
                 emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
             )
         except Exception:
             return None
@@ -1079,7 +1085,8 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1259,7 +1266,8 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
@@ -2795,14 +2803,19 @@ _TP_STATE_PATCHED = False
 
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
+    """Run under a different tensor-parallel group until this scope ends.
 
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
+    This is for draft workers of speculative decoding, which run the draft model
+    at the target's attention-TP width rather than its global TP width.
+
+    The scope replaces both the module global that ``get_tp_group()`` reads and
+    the three members the runtime context answers with.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
+    from sglang.srt.runtime_context import get_parallel
+
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
@@ -2811,9 +2824,13 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     global _TP
     _TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
-        # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 

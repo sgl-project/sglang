@@ -26,6 +26,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_observability,
+    get_schedule,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
@@ -957,7 +963,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Prefill delayer
         # =================================================================
-        max_delay = server_args.prefill_delayer_max_delay_passes
+        max_delay = get_schedule().prefill_delayer_max_delay_passes
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
@@ -966,7 +972,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 set(
                     x
                     for x in (
-                        server_args.prefill_delayer_forward_passes_buckets
+                        get_schedule().prefill_delayer_forward_passes_buckets
                         or [5, 20, 50, 100, 200]
                     )
                     if x < max_delay
@@ -981,7 +987,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=sorted(
                 set(
-                    server_args.prefill_delayer_wait_seconds_buckets
+                    get_schedule().prefill_delayer_wait_seconds_buckets
                     or [1, 2, 5, 10, 20, 50, 100, 200, 500]
                 )
                 # Need bucket "<=0" for zero-delay cases
@@ -1077,13 +1083,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
-        enable_metrics = server_args.enable_metrics
+        enable_metrics = get_observability().enable_metrics
         is_stats_logging_rank = ps.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
-            is_stats_logging_rank or server_args.enable_metrics_for_all_schedulers
+            is_stats_logging_rank
+            or get_observability().enable_metrics_for_all_schedulers
         )
         enable_kv_cache_events = bool(
-            server_args.kv_events_config
+            get_observability().kv_events_config
             and ps.pp_rank == 0
             and ps.attn_tp_rank == 0
             and ps.attn_cp_rank == 0
@@ -1091,10 +1098,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
-                server_args.disaggregation_mode
+                get_disagg().disaggregation_mode
             )
             labels = {
-                "model_name": server_args.served_model_name,
+                "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
@@ -1104,8 +1111,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labels["priority"] = ""
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            if server_args.extra_metric_labels:
-                labels.update(server_args.extra_metric_labels)
+            if get_observability().extra_metric_labels:
+                labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
                 server_args, STAT_LOGGER_ROLE_SCHEDULER, cls
             )
@@ -1113,7 +1120,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labels=labels,
                 enable_lora=enable_lora,
                 enable_hierarchical_cache=enable_hierarchical_cache,
-                enable_streaming_session=server_args.enable_streaming_session,
+                enable_streaming_session=get_serving().enable_streaming_session,
                 server_args=server_args,
             )
         return SchedulerMetricsCollectorContext(
@@ -1568,7 +1575,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of prompt token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
-                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+                get_observability().prompt_tokens_buckets, default_bucket_prompt_tokens
             ),
         )
         self.uncached_prompt_tokens_histogram = Histogram(
@@ -1576,7 +1583,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of uncached (compute) prompt token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
-                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+                get_observability().prompt_tokens_buckets, default_bucket_prompt_tokens
             ),
         )
         self.generation_tokens_histogram = Histogram(
@@ -1584,7 +1591,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of generation token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
-                server_args.generation_tokens_buckets,
+                get_observability().generation_tokens_buckets,
                 default_bucket_prompt_tokens,
             ),
         )
@@ -1852,9 +1859,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         labels: Dict[str, str],
     ):
         from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
@@ -1868,6 +1877,21 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.backup_dropped_tokens_total = Counter(
+            name="sglang:hicache_backup_dropped_tokens_total",
+            documentation="Buffer-mode backup tokens dropped by write-path rate "
+            "limiting (backlog cap or dropped-parent cascade).",
+            labelnames=labels.keys(),
+        )
+
+        self.prefetch_aux_alloc_failed_tokens_total = Counter(
+            name="sglang:hicache_prefetch_aux_alloc_failed_tokens_total",
+            documentation="Prefetch tokens abandoned because an aux pool "
+            "(e.g. the SWA trailing window) could not allocate host staging "
+            "— the whole storage fetch is forfeited, not just the aux part.",
             labelnames=labels.keys(),
         )
 
@@ -1924,6 +1948,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_backup_dropped_tokens(self, dropped_tokens: int):
+        if dropped_tokens > 0:
+            self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+
+    def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
+        if num_tokens > 0:
+            self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
