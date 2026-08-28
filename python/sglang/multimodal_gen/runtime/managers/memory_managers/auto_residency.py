@@ -345,8 +345,15 @@ def pre_warmup_residency_targets(
 
     Static planning knows complete component weights but not the runtime
     working set. It may demote an unsafe configured layout or redistribute
-    HostPin at the same device footprint, but promoting more weights here can
+    HostPin at the same device footprint, but a pure residency promotion can
     consume activation headroom that only the first shape probe can reveal.
+
+    A layerwise layout can require a small persistent non-layer footprint even
+    when the coarse component-offload state keeps every weight on the host.
+    Keep that alternative when it reduces the component's active working set:
+    the joint solver still checks its inactive, transition, and HostPin costs.
+    Excluding it here would leave no pre-warmup escape when the full component
+    fits neither the device nor the representative request.
     """
     candidates = list(candidates)
     current_device_bytes = {
@@ -359,8 +366,14 @@ def pre_warmup_residency_targets(
         for candidate in candidates
         if candidate.component_name not in excluded_components
         and candidate.component_name in current_device_bytes
-        and candidate.target_device_weight_bytes
-        <= current_device_bytes[candidate.component_name]
+        and (
+            candidate.target_device_weight_bytes
+            <= current_device_bytes[candidate.component_name]
+            or (
+                candidate.target_residency_mode == LAYERWISE_OFFLOAD
+                and candidate.active_device_delta_bytes < 0
+            )
+        )
     ]
 
 

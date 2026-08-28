@@ -1262,6 +1262,33 @@ class TestPlanAutoResidency:
 
         assert pre_warmup_residency_targets([current, resident]) == [current]
 
+    def test_pre_warmup_targets_keep_active_working_set_demotion(self):
+        current = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        layerwise = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_device_weight_bytes=GIB_BYTES,
+            active_device_delta_bytes=-16 * GIB_BYTES,
+            inactive_device_delta_bytes=GIB_BYTES,
+            device_transition_delta_bytes=GIB_BYTES,
+        )
+
+        assert pre_warmup_residency_targets([current, layerwise]) == [
+            current,
+            layerwise,
+        ]
+
     def test_pre_warmup_report_uses_weight_model_below_legacy_threshold(
         self, monkeypatch
     ):
