@@ -24,6 +24,9 @@ ARG CUDA_PKG_VERSION
 ARG CUDA_PREVIEW_REPO
 ARG CUDA_PREVIEW_SUITE
 
+RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-net-hardening
+
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget gnupg \
@@ -333,7 +336,12 @@ RUN --mount=type=cache,id=cu134-sgl-kernel-ccache,target=/ccache \
            CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime \
            CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache \
            CMAKE_CUDA_COMPILER_LAUNCHER=ccache; \
-    if [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then \
+    if [ "$(uname -m)" = "aarch64" ]; then \
+        export CUDA_NVCC_FLAGS="-Xcudafe --threads=8"; \
+        export MAKEFLAGS="-j8"; \
+        export NINJAFLAGS="-j4"; \
+        export CMAKE_BUILD_PARALLEL_LEVEL=2; \
+    elif [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then \
         export CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_JOBS}"; \
     else \
         export CMAKE_BUILD_PARALLEL_LEVEL="$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk '{print ($1 < $2) ? $1 : $2}')"; \
@@ -384,7 +392,7 @@ ARG DEEPEP_SOURCE_REF
 ARG DEEPEP_PACKAGING_REF
 ARG SGL_DEEP_EP_VERSION
 ARG GDRCOPY_VERSION=2.5.1
-ARG MAX_JOBS=48
+ARG MAX_JOBS=8
 
 RUN yum install -y --nogpgcheck --enablerepo=powertools \
         cmake curl gcc gcc-c++ git infiniband-diags libfabric libfabric-devel \

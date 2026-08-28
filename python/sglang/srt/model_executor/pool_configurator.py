@@ -169,7 +169,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
             if has_kv_on_another_pp_stage
-            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+            else get_schedule().max_total_tokens or kvc.model_config.context_len
         )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -792,7 +792,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
-        if kvc.server_args.enable_hisparse:
+        if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(
