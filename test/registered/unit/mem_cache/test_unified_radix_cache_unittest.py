@@ -5617,32 +5617,33 @@ class UnifiedRadixCacheSuite:
         # Host-only suffix a -> b under a device-resident ancestor.
         a, b = chain[-2], chain[-1]
         for n in (a, b):
-            n.component_data[ComponentType.FULL].value = None
-            n.component_data[ComponentType.SWA].value = None
-            cache.tree_core.lru_lists[ComponentType.SWA].remove_node(n)
-            cache.tree_core.host_lru_lists[ComponentType.SWA].insert_mru(n)
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.FULL, None)
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.SWA, None)
+            if cache.tree_core.is_node_in_device_lru(n, ComponentType.SWA):
+                cache.tree_core.remove_node_from_device_lru(n, ComponentType.SWA)
+            cache.tree_core.insert_node_into_host_lru(n, ComponentType.SWA)
 
         # Anchor `a`: a Full-only load whose SWA slice stays host-only.
-        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a.id)
-        self.assertEqual(kv_xfer.nodes_to_load, [a.id])
+        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a)
+        self.assertEqual(kv_xfer.nodes_to_load, [a])
         device_indices = torch.arange(
             int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
         )
-        cache.tree_core.commit_load_back(a.id, device_indices, kv_xfer, {})
-        self.assertEqual(a.load_back_pending_id, a.id)
+        cache.tree_core.commit_load_back(a, device_indices, kv_xfer, {})
+        self.assertEqual(cache.tree_core.node_by_id(a).load_back_pending_id, a)
 
         # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
-        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b.id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
         self.assertEqual(int(kv_xfer.host_indices.numel()), 0)
         self.assertEqual(kv_xfer.nodes_to_load, [])
         self.assertEqual(comp_xfers, {})
 
         # After the ack unpins, the same spec builds fully.
-        cache.tree_core.finish_load_back(a.id)
-        self.assertIsNone(a.load_back_pending_id)
-        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b.id)
-        self.assertEqual(kv_xfer.nodes_to_load, [b.id])
-        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a.id, b.id])
+        cache.tree_core.finish_load_back(a)
+        self.assertIsNone(cache.tree_core.node_by_id(a).load_back_pending_id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(kv_xfer.nodes_to_load, [b])
+        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
 
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
