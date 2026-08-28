@@ -11,7 +11,6 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
@@ -21,9 +20,7 @@ LLAMA_SOURCE = ROOT / "python/sglang/srt/models/llama.py"
 
 
 def load_module():
-    spec = importlib.util.spec_from_file_location(
-        "_test_llama_flashinfer_agmm", SOURCE
-    )
+    spec = importlib.util.spec_from_file_location("_test_llama_flashinfer_agmm", SOURCE)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load llama_flashinfer_agmm.py")
     module = importlib.util.module_from_spec(spec)
@@ -96,9 +93,7 @@ def make_model():
             kv_size=256,
         )
         mlp = types.SimpleNamespace(gate_up_proj=gate_up, down_proj=down)
-        layers.append(
-            named_object("LlamaDecoderLayer", self_attn=attention, mlp=mlp)
-        )
+        layers.append(named_object("LlamaDecoderLayer", self_attn=attention, mlp=mlp))
     return types.SimpleNamespace(
         pp_group=types.SimpleNamespace(
             world_size=1, is_first_rank=True, is_last_rank=True
@@ -136,9 +131,7 @@ class EligibilityTests(unittest.TestCase):
         self.assertIsNone(self.module._forward_mode_reason(batch))
 
         batch.can_run_tbo = True
-        self.assertEqual(
-            self.module._forward_mode_reason(batch), "two_batch_overlap"
-        )
+        self.assertEqual(self.module._forward_mode_reason(batch), "two_batch_overlap")
         batch.can_run_tbo = False
         extend.is_target_verify = lambda: True
         self.assertEqual(self.module._forward_mode_reason(batch), "target_verify")
@@ -153,9 +146,7 @@ class EligibilityTests(unittest.TestCase):
 
         model_id, token = self.module._bind_model_contract(model, torch_stub)
         self.assertEqual(model_id, id(model))
-        self.assertIs(
-            getattr(model, self.module._MODEL_TOKEN_ATTRIBUTE), token
-        )
+        self.assertIs(getattr(model, self.module._MODEL_TOKEN_ATTRIBUTE), token)
         with self.assertRaisesRegex(RuntimeError, "already owns"):
             self.module._bind_model_contract(model, torch_stub)
 
@@ -192,12 +183,8 @@ class EligibilityTests(unittest.TestCase):
 class ServerArgumentTests(unittest.TestCase):
     def test_llama_reads_true_sp_flag_from_parallel_config(self):
         source = LLAMA_SOURCE.read_text()
-        self.assertIn(
-            "get_parallel().config.enable_flashinfer_agmm_true_sp", source
-        )
-        self.assertNotIn(
-            "get_parallel().enable_flashinfer_agmm_true_sp", source
-        )
+        self.assertIn("get_parallel().config.enable_flashinfer_agmm_true_sp", source)
+        self.assertNotIn("get_parallel().enable_flashinfer_agmm_true_sp", source)
 
     def test_true_sp_flag_parses_from_cli_and_yaml(self):
         from sglang.srt.server_args import ServerArgs
@@ -268,12 +255,8 @@ class PreparedBindingTests(unittest.TestCase):
         first = types.SimpleNamespace(shape=(1024, 8192))
         second = types.SimpleNamespace(shape=(1024, 8192))
 
-        self.assertEqual(
-            route._prepared_qkv(first, qkv, group), ("output", first)
-        )
-        self.assertEqual(
-            route._prepared_qkv(second, qkv, group), ("output", second)
-        )
+        self.assertEqual(route._prepared_qkv(first, qkv, group), ("output", first))
+        self.assertEqual(route._prepared_qkv(second, qkv, group), ("output", second))
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][3:], ("auto", False))
         self.assertEqual(launches, [first, second])

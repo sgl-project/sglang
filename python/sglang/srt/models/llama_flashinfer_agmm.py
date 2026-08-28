@@ -256,8 +256,7 @@ class LlamaFlashInferAgmmTrueSP:
             )
         if int(get_schedule().max_running_requests) != 1:
             raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires "
-                "--max-running-requests 1"
+                "--enable-flashinfer-agmm-true-sp requires " "--max-running-requests 1"
             )
         if get_exec().kernel.attention_backend != "flashinfer":
             raise RuntimeError(
@@ -327,9 +326,7 @@ class LlamaFlashInferAgmmTrueSP:
             raise RuntimeError("FlashInfer AGMM true-SP group has no stable name")
         device = model.layers[0].self_attn.qkv_proj.weight.device
         if tuple(self._torch.cuda.get_device_capability(device)) != (10, 3):
-            raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires an SM103 GPU"
-            )
+            raise RuntimeError("--enable-flashinfer-agmm-true-sp requires an SM103 GPU")
         if str(symm_mem.get_backend(device)).upper() != "NVSHMEM":
             raise RuntimeError(
                 "--enable-flashinfer-agmm-true-sp requires the NVSHMEM backend"
@@ -414,9 +411,7 @@ class LlamaFlashInferAgmmTrueSP:
         qkv_proj = layer.self_attn.qkv_proj
         if residual is None:
             residual = hidden_states
-            normalized = layer.input_layernorm(
-                hidden_states, quant_linear=qkv_proj
-            )
+            normalized = layer.input_layernorm(hidden_states, quant_linear=qkv_proj)
         else:
             normalized, residual = layer.input_layernorm(
                 hidden_states, residual, quant_linear=qkv_proj
