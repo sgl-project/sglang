@@ -3145,6 +3145,39 @@ class TestCollectResidencyTargets:
             for candidate in explicit_candidates
         )
 
+    def test_auto_dit_frontier_tunes_each_layer_group_policy(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+                resident_layers=2,
+            )
+            for _ in range(2)
+        ]
+        module = _FakeLayerwiseDit(managers)
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: False,
+        )
+
+        policies = {
+            candidate.target_layerwise_residency_policies
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2, 2)
+            and candidate.target_layerwise_pinned_layers == ((), ())
+        }
+        assert policies == {
+            (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_LEADING),
+            (RESIDENCY_POLICY_LEADING, RESIDENCY_POLICY_STRIDED),
+            (RESIDENCY_POLICY_STRIDED, RESIDENCY_POLICY_LEADING),
+            (RESIDENCY_POLICY_STRIDED, RESIDENCY_POLICY_STRIDED),
+        }
+
     def test_fully_pinned_component_can_release_hostpin_for_a_hotter_component(self):
         manager = _FakeLayerwiseManager(
             {

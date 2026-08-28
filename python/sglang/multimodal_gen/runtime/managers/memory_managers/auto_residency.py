@@ -1451,19 +1451,23 @@ def _layerwise_policy_targets(
     resident_layers: tuple[int, ...],
     tune_policy: bool,
 ) -> list[tuple[str, ...]]:
-    """Useful component-level policy choices for one resident-count target."""
+    """Useful per-group policy choices for one resident-count target."""
     current = tuple(manager.residency_policy for manager in managers)
     if not tune_policy or all(
         count in (0, manager.num_layers)
         for manager, count in zip(managers, resident_layers)
     ):
         return [current]
-    return list(
-        dict.fromkeys(
-            [current]
-            + [tuple(policy for _ in managers) for policy in RESIDENCY_POLICIES]
+
+    choices = tuple(
+        (
+            RESIDENCY_POLICIES
+            if 0 < count < manager.num_layers
+            else (manager.residency_policy,)
         )
+        for manager, count in zip(managers, resident_layers)
     )
+    return list(dict.fromkeys([current, *product(*choices)]))
 
 
 def _policy_affects_layerwise_layout(
