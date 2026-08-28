@@ -2110,6 +2110,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
         self.free_group = None
+        self.full_free_group = []
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
@@ -2504,15 +2505,21 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def free_group_begin(self) -> None:
         BaseTokenToKVPoolAllocator.free_group_begin(self)
+        self.full_free_group = []
 
     def free_group_end(self) -> None:
         BaseTokenToKVPoolAllocator.free_group_end(self)
+        if self.full_free_group:
+            full_free_group = self.full_free_group
+            self.full_free_group = []
+            self.free_full(torch.cat(full_free_group))
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.swa_attn_allocator.clear()
         self.free_group = None
         self.free_segments_group = None
+        self.full_free_group = []
 
     # -- Lazy compaction hooks --
 
