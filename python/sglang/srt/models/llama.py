@@ -53,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -416,7 +416,7 @@ class LlamaModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
         self.flashinfer_agmm_true_sp = None
-        if get_server_args().enable_flashinfer_agmm_true_sp:
+        if get_parallel().enable_flashinfer_agmm_true_sp:
             from sglang.srt.models.llama_flashinfer_agmm import (
                 LlamaFlashInferAgmmTrueSP,
             )
