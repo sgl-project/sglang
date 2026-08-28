@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    _dfs_weight_order,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
@@ -540,6 +541,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches; the single root serves every namespace."""
         return self.root_node.id
+
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""

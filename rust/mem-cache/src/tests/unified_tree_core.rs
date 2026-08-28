@@ -3720,6 +3720,45 @@ fn root_node_handle_is_namespace_independent() {
 }
 
 #[test]
+fn dfs_weight_order_groups_the_heaviest_subtree_first() {
+    let mut tc = core();
+    tc.insert(&insert_params(&vec![1, 10], &[10, 11]));
+    tc.insert(&insert_params(&vec![1, 11], &[10, 12]));
+    tc.insert(&insert_params(&vec![2, 20], &[20, 21]));
+
+    let branch_a = tc
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![1, 99],
+            extra_key: None,
+        })
+        .last_device_node_id;
+    let leaf_a1 = tc
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![1, 10],
+            extra_key: None,
+        })
+        .last_device_node_id;
+    let leaf_a2 = tc
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![1, 11],
+            extra_key: None,
+        })
+        .last_device_node_id;
+    let leaf_b = tc
+        .match_prefix(&MatchPrefixParams {
+            key: &vec![2, 20],
+            extra_key: None,
+        })
+        .last_device_node_id;
+
+    assert_eq!(
+        tc.dfs_weight_order(&[leaf_b, leaf_a2, leaf_a1, leaf_a1, branch_a]),
+        vec![2, 3, 1, 4, 0]
+    );
+    assert_eq!(tc.dfs_weight_order(&[leaf_b, leaf_a2]), vec![1, 0]);
+}
+
+#[test]
 fn get_hash_values_reads_the_nodes_own_hashes() {
     let mut tc = core();
     let (a, _b) = matched_chain(&mut tc);

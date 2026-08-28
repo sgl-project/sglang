@@ -3050,3 +3050,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node_handle(extra_key)
+
+    def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
+        return self.tree_core.dfs_weight_order(node_handles)

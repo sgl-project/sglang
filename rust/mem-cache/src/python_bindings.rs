@@ -1399,6 +1399,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().root_node_handle(extra_key.as_deref()))
     }
 
+    fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> Vec<usize> {
+        py.allow_threads(|| self.core().dfs_weight_order(&node_ids))
+    }
+
     /// Commit each component's HiCache transfers; returns the new cache actions.
     fn commit_hicache_transfers(
         &self,
@@ -2447,6 +2451,10 @@ macro_rules! tree_core_binding {
             #[pyo3(signature = (extra_key = None))]
             fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
                 self.inner.root_node_handle(py, extra_key)
+            }
+
+            fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> Vec<usize> {
+                self.inner.dfs_weight_order(py, node_ids)
             }
 
             /// Commit each component's HiCache transfers; returns the new cache actions.

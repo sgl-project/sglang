@@ -149,6 +149,27 @@ def test_root_node_handle_is_namespace_independent():
     assert missed.best_match_node == root
 
 
+def test_dfs_weight_order_groups_the_heaviest_subtree_first():
+    core = _tree_core()
+    _insert(core, [1, 10], [10, 11])
+    _insert(core, [1, 11], [10, 12])
+    _insert(core, [2, 20], [20, 21])
+
+    branch_a = core.match_prefix(MatchPrefixParams(key=_key([1, 99]))).last_device_node
+    leaf_a1 = core.match_prefix(MatchPrefixParams(key=_key([1, 10]))).last_device_node
+    leaf_a2 = core.match_prefix(MatchPrefixParams(key=_key([1, 11]))).last_device_node
+    leaf_b = core.match_prefix(MatchPrefixParams(key=_key([2, 20]))).last_device_node
+
+    assert core.dfs_weight_order([leaf_b, leaf_a2, leaf_a1, leaf_a1, branch_a]) == [
+        2,
+        3,
+        1,
+        4,
+        0,
+    ]
+    assert core.dfs_weight_order([leaf_b, leaf_a2]) == [1, 0]
+
+
 def test_get_hash_values_round_trips_through_insert_host():
     core = _tree_core()
     root = core.match_prefix(MatchPrefixParams(key=_key([99]))).best_match_node

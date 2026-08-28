@@ -3053,6 +3053,60 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.arena.node(self.arena.root()).id
     }
 
+    /// Return input indices in depth-first, subtree-weight order.
+    pub fn dfs_weight_order(&self, node_ids: &[NodeId]) -> Vec<usize> {
+        let mut node_to_indices: HashMap<NodeIdx_, Vec<usize>> = HashMap::new();
+        for (index, &node_id) in node_ids.iter().enumerate() {
+            let node_id = self.arena.resolve(node_id);
+            node_to_indices.entry(node_id).or_default().push(index);
+        }
+
+        let mut node_to_weight: HashMap<NodeIdx_, usize> = HashMap::new();
+        for (&node_id, indices) in &node_to_indices {
+            let mut cursor = node_id;
+            loop {
+                *node_to_weight.entry(cursor).or_default() += indices.len();
+                let Some(parent) = self.arena.node(cursor).try_parent() else {
+                    break;
+                };
+                cursor = parent;
+            }
+        }
+
+        let mut order = Vec::with_capacity(node_ids.len());
+        let mut stack = vec![(self.arena.root(), false)];
+        while let Some((node_id, emit)) = stack.pop() {
+            if emit {
+                if let Some(indices) = node_to_indices.get(&node_id) {
+                    order.extend(indices);
+                }
+                continue;
+            }
+
+            stack.push((node_id, true));
+            let mut children: Vec<NodeIdx_> = self
+                .arena
+                .node(node_id)
+                .children
+                .values()
+                .copied()
+                .filter(|child| node_to_weight.contains_key(child))
+                .collect();
+            children.sort_by(|left, right| {
+                node_to_weight[right]
+                    .cmp(&node_to_weight[left])
+                    .then_with(|| {
+                        self.arena
+                            .node(*left)
+                            .creation_counter
+                            .cmp(&self.arena.node(*right).creation_counter)
+                    })
+            });
+            stack.extend(children.into_iter().rev().map(|child| (child, false)));
+        }
+        order
+    }
+
     /// Build the backup action for a node and its unbacked ancestors.
     pub fn build_backup_kv_action_(&self, node: &Node<K>, write_back: bool) -> BackupKV {
         let mut chain = vec![node.id];

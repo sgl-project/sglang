@@ -373,8 +373,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def node_by_id(self, node_id: NodeId) -> UnifiedTreeNode:
         # TODO(Jialin): Move the remaining Python-node consumers to
         # backend-neutral APIs: sessions (#29173), C128 (#33676), buffer-only
-        # HiCache (#34798/#35769), DFS-weight (#2571/#29901), and PD decode
-        # HiCache (#26227/#29901).
+        # HiCache (#34798/#35769), and PD decode HiCache (#26227/#29901).
         raise NotImplementedError("node_by_id: not yet ported to the Rust tree core")
 
     @property
@@ -787,6 +786,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         return self._binding.root_node_handle(extra_key)
+
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        return self._binding.dfs_weight_order(list(node_ids))
 
     def commit_hicache_transfers(
         self,

@@ -197,6 +197,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        """Return input indices in depth-first, subtree-weight order."""
+        ...
+
+    @abstractmethod
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
     ) -> IncLockRefResult:

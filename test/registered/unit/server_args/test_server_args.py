@@ -55,7 +55,6 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
-    check_server_args,
     check_two_batch_overlap,
 )
 from sglang.srt.entrypoints.sidecar import (
@@ -1511,12 +1510,6 @@ class TestHiCacheArgs(unittest.TestCase):
         )
         with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
             handle_hicache(args)
-
-    def test_dfs_weight_rejects_rust_tree_core(self):
-        args = self._make_args(schedule_policy="dfs-weight")
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "schedule-policy dfs-weight"):
-                check_server_args(args)
 
     def test_hicache_io_backend_and_mem_layout_compatibility(self):
         cases = [
