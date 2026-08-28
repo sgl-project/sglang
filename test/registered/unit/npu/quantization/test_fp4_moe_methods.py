@@ -16,11 +16,9 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 # initialized, `_get_float8_e8m0fnu_dtype` not yet defined). Initializing the
 # package first mirrors how the engine loads quantization at model-config time.
 import sglang.srt.layers.quantization  # noqa: F401
-from sglang.srt.hardware_backend.npu.quantization import fp4_moe_methods
+from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluLimit
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
-    NPUW4A4Fp4MoEMethod,
-    _apply_swiglu_limit_npu,
-    npu_apply_without_routing_weights_w4a4_mxfp,
+    NPUW4A8MXFP4FusedMoEMethod,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     _pair_pack_mxfp_act_scale,
@@ -48,25 +46,34 @@ class TestFP4MethodGate(unittest.TestCase):
 
         self.assertIsInstance(method, Fp8MoEMethod)
 
+    def test_arch35_uses_ascend_runner_method(self):
+        config = Fp8Config(is_fp4_experts=True)
+        layer = FusedMoE.__new__(FusedMoE)
 
-class TestApplySwiGLULimitNpu(unittest.TestCase):
-    def test_clamps_gate_and_up_asymmetrically(self):
+        with (
+            patch("sglang.srt.layers.quantization.fp8.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.quantization.fp8.is_npu_arch35",
+                return_value=True,
+            ),
+        ):
+            method = config.get_quant_method(layer, "model.layers.0.experts")
+
+        self.assertIsInstance(method, NPUW4A8MXFP4FusedMoEMethod)
+
+
+class TestNPUSwigluLimit(unittest.TestCase):
+    def test_clamps_before_swiglu(self):
         # DeepSeek-V4 clamps gate (first half) to <= limit but only the upper
         # bound, while up (second half) is clamped symmetrically to [-limit, limit].
         # A regression that swapped these would silently change expert activations.
         gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
-        _apply_swiglu_limit_npu(gate_up, 7.0)
+        with patch.object(
+            torch.ops.npu, "npu_swiglu", return_value=torch.empty(1, 2), create=True
+        ) as swiglu:
+            NPUSwigluLimit(7.0)._apply_activation(gate_up)
         self.assertTrue(torch.equal(gate_up, torch.tensor([[7.0, -9.0, 7.0, -7.0]])))
-
-    def test_noop_when_limit_none(self):
-        gate_up = torch.tensor([[8.0, -9.0]])
-        _apply_swiglu_limit_npu(gate_up, None)
-        self.assertTrue(torch.equal(gate_up, torch.tensor([[8.0, -9.0]])))
-
-    def test_noop_when_limit_nonpositive(self):
-        gate_up = torch.tensor([[8.0, -9.0]])
-        _apply_swiglu_limit_npu(gate_up, 0.0)
-        self.assertTrue(torch.equal(gate_up, torch.tensor([[8.0, -9.0]])))
+        self.assertIs(swiglu.call_args.args[0], gate_up)
 
 
 class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):
@@ -113,7 +120,7 @@ class TestMxfp4ScaleWeightLoader(unittest.TestCase):
             loaded.append(loaded_weight.clone())
 
         layer = torch.nn.Module()
-        method = NPUW4A4Fp4MoEMethod(fp8_method=MagicMock(), prefix="test")
+        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
         method.create_weights(
             layer,
             num_experts=1,
@@ -218,52 +225,55 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         )
 
 
-class TestW4A8MxfpGmmChain(unittest.TestCase):
-    def test_applies_swiglu_limit_before_swiglu(self):
-        # The clamp must be wired in *before* npu_swiglu using the layer's
-        # configured swiglu_limit; dropping the clamp (or applying it after)
-        # silently changes routed-expert output on near-limit activations.
-        gate_up = torch.tensor([[8.0, -9.0, 9.0, -9.0]])
-        activated = torch.randn(1, 2)
-        expected = torch.randn(1, 2)
+class TestRunnerDelegation(unittest.TestCase):
+    def test_apply_delegates_with_dsv4_scale_names(self):
+        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        expected = object()
+        method.runner = MagicMock()
+        method.runner.run.return_value = expected
         layer = SimpleNamespace(
             w13_weight=MagicMock(),
             w13_weight_scale_inv=MagicMock(),
             w2_weight=MagicMock(),
             w2_weight_scale_inv=MagicMock(),
-            moe_runner_config=SimpleNamespace(swiglu_limit=7.0),
         )
+        dispatch_output = object()
 
-        with (
-            patch.object(
-                fp4_moe_methods, "w4a8_mxfp_gmm", side_effect=[gate_up, expected]
-            ) as gmm,
-            patch.object(
-                torch.ops.npu, "npu_swiglu", return_value=activated, create=True
-            ) as swiglu,
-        ):
-            output = npu_apply_without_routing_weights_w4a4_mxfp(
-                layer,
-                torch.randn(1, 4),
-                torch.ones(1, 1, 2),
-                group_list_type=1,
-                group_list=torch.tensor([1], dtype=torch.int64),
-                output_dtype=torch.bfloat16,
-            )
+        output = method.apply(layer, dispatch_output)
 
         self.assertIs(output, expected)
-        self.assertTrue(
-            torch.equal(
-                swiglu.call_args.args[0], torch.tensor([[7.0, -9.0, 7.0, -7.0]])
-            )
-        )
-        self.assertIs(gmm.call_args_list[1].kwargs["input"], activated)
+        method.runner.run.assert_called_once()
+        self.assertIs(method.runner.run.call_args.args[0], dispatch_output)
+        quant_info = method.runner.run.call_args.args[1]
+        self.assertIs(quant_info.w13_weight_scale, layer.w13_weight_scale_inv)
+        self.assertIs(quant_info.w2_weight_scale, layer.w2_weight_scale_inv)
+
+    def test_create_runner_installs_internal_kernels_before_runner(self):
+        method = NPUW4A8MXFP4FusedMoEMethod(prefix="test")
+        layer = SimpleNamespace()
+        config = SimpleNamespace(layer=None)
+        backend = MagicMock()
+        backend.is_auto.return_value = True
+
+        with (
+            patch("sglang.srt.layers.moe.moe_runner.runner.MoeRunner") as moe_runner,
+            patch(
+                "sglang.srt.layers.moe.utils.get_moe_runner_backend",
+                return_value=backend,
+            ),
+        ):
+            method.create_moe_runner(layer, config)
+
+        self.assertIs(layer.w13_kernel, method.w13_kernel)
+        self.assertIs(layer.w2_kernel, method.w2_kernel)
+        self.assertIs(config.layer, layer)
+        moe_runner.assert_called_once()
 
 
 class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
     @staticmethod
     def _method():
-        return NPUW4A4Fp4MoEMethod(fp8_method=MagicMock(), prefix="test")
+        return NPUW4A8MXFP4FusedMoEMethod(prefix="test")
 
     def test_raises_when_w13_scales_never_loaded(self):
         # An all-zero scale is the signature of a checkpoint whose scale names

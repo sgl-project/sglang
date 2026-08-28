@@ -1,23 +1,23 @@
 """MXFP4 routed-expert MoE method for Ascend A5 (Ascend 950).
 
 DeepSeek-V4's FP4 expert checkpoint stores block-32 MXFP4 weights with E8M0
-scales. This module wires those weights to the A5 grouped-matmul kernels, both
-for the plain (init-routing) path and for the DeepEP dispatch path.
+scales. This module adapts those checkpoint weights to the shared Ascend MoE
+runner and A5 grouped-matmul kernels.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUW4A8MXFP4MoEMethod,
     prepare_w4a8_mxfp_weight,
-    w4a8_mxfp_gmm,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 # MXFP4 group size, fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
@@ -32,17 +32,21 @@ def _wrap_mxfp4_scale_weight_loader(weight_loader):
     return load_scale
 
 
-class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
+class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
     """DeepSeek-V4 routed experts on Ascend A5: W4A8 MXFP weights.
 
-    Delegates nothing to ``fp8_method`` except the shared runner config; it is
-    held so the FP8 method sees the same ``moe_runner_config`` the layer built.
+    The checkpoint-specific loading remains here while execution is delegated
+    to the shared Ascend MoE runner.
     """
 
-    def __init__(self, fp8_method, prefix: str = ""):
-        self._fp8 = fp8_method
+    def __init__(self, prefix: str = ""):
         self.prefix = prefix
-        self.moe_runner_config = None
+        # ``None`` selects the full MX dynamic-quant defaults used by the
+        # original DeepSeek-V4 path; the shared ModelSlim path keeps its
+        # historical explicit ``dst_type`` behavior.
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.runner = None
 
     def create_weights(
         self,
@@ -112,8 +116,24 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
-        self.moe_runner_config = moe_runner_config
-        self._fp8.moe_runner_config = moe_runner_config
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import (
+            MoeRunnerBackend,
+            get_moe_runner_backend,
+        )
+
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        if not backend.is_ascend():
+            raise ValueError(
+                "NPU W4A8 MXFP4 requires the Ascend MoE runner, " f"got {backend.value}"
+            )
+
+        layer.w13_kernel = self.w13_kernel
+        layer.w2_kernel = self.w2_kernel
+        moe_runner_config.layer = layer
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
@@ -148,304 +168,16 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "DispatchOutput",
-    ) -> "CombineInput":
-        combine_input = npu_apply_w4a8_mxfp_moe_deepep(layer, dispatch_output)
-        if combine_input is not None:
-            return combine_input
+    def apply(self, layer: torch.nn.Module, dispatch_output: "DispatchOutput"):
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
 
-        combine_input = npu_apply_w4a4_mxfp_moe_ascend_tp(layer, dispatch_output)
-        if combine_input is not None:
-            return combine_input
+        if self.runner is None:
+            raise RuntimeError("The NPU FP4 MoE runner has not been initialized")
 
-        # Standard dispatch. Unreachable on NPU today — create_moe_dispatcher
-        # picks AscendTPDispatcher whenever is_npu() and no a2a backend is set —
-        # but kept so this method is not silently wrong if that changes.
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        hidden_states = dispatch_output.hidden_states
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(hidden_states.dtype)
-        moe_runner_config = layer.moe_runner_config
-
-        output = npu_fused_experts_w4a4_mxfp(
-            hidden_states,
-            layer.w13_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            moe_runner_config.top_k,
-            swiglu_limit=moe_runner_config.swiglu_limit,
+        quant_info = AscendQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_weight_scale=layer.w13_weight_scale_inv,
+            w2_weight_scale=layer.w2_weight_scale_inv,
         )
-        return StandardCombineInput(hidden_states=output)
-
-
-def _apply_swiglu_limit_npu(
-    gate_up: torch.Tensor, swiglu_limit: Optional[float]
-) -> None:
-    """Clamp the SwiGLU input in place before ``npu_swiglu`` (DeepSeek-V4).
-
-     gate (first half) <= limit; up (second half) in
-    [-limit, limit]. ``chunk`` returns views, so the in-place clamps mutate
-    ``gate_up`` directly. No-op when ``swiglu_limit`` is unset or <= 0.
-    """
-    if swiglu_limit is None or swiglu_limit <= 0:
-        return
-    gate, up = gate_up.chunk(2, dim=-1)
-    gate.clamp_(max=swiglu_limit)
-    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
-
-
-def npu_fused_experts_w4a4_mxfp(
-    hidden_states: torch.Tensor,
-    w13: torch.Tensor,
-    w13_weight_scale_inv: torch.Tensor,
-    w2: torch.Tensor,
-    w2_weight_scale_inv: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int,
-    swiglu_limit: Optional[float] = None,
-    **kwargs,
-):
-    if torch.npu.is_current_stream_capturing():
-        return npu_fused_experts_w4a4_mxfp_decode(
-            hidden_states=hidden_states,
-            w13=w13,
-            w13_weight_scale_inv=w13_weight_scale_inv,
-            w2=w2,
-            w2_weight_scale_inv=w2_weight_scale_inv,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=top_k,
-            swiglu_limit=swiglu_limit,
-            **kwargs,
-        )
-
-    original_shape = hidden_states.shape
-    original_dtype = hidden_states.dtype
-    if len(original_shape) == 3:
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    num_tokens = hidden_states.shape[0]
-    num_experts = w13.shape[0]
-    row_idx = (
-        torch.arange(
-            0, num_tokens * top_k, dtype=torch.int32, device=topk_weights.device
-        )
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
-    )
-    hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch.ops.npu.npu_moe_init_routing(
-            hidden_states,
-            row_idx=row_idx,
-            expert_idx=topk_ids,
-            active_num=num_tokens,
-        )
-    )
-    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
-        expanded_expert_idx, num_experts
-    ).to(torch.int64)
-
-    hidden_states = w4a8_mxfp_gmm(
-        input=hidden_states,
-        input_scale=None,
-        weight=w13,
-        weight_scale=w13_weight_scale_inv,
-        group_list_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a8_mxfp_gmm(
-        input=hidden_states,
-        input_scale=None,
-        weight=w2,
-        weight_scale=w2_weight_scale_inv,
-        group_list_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )
-    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
-        hidden_states,
-        skip1=None,
-        skip2=None,
-        bias=None,
-        scales=topk_weights,
-        expanded_src_to_dst_row=expanded_row_idx,
-        export_for_source_row=topk_ids,
-    )
-    if len(original_shape) == 3:
-        final_hidden_states = final_hidden_states.view(original_shape)
-    return final_hidden_states
-
-
-def npu_fused_experts_w4a4_mxfp_decode(
-    hidden_states: torch.Tensor,
-    w13: torch.Tensor,
-    w13_weight_scale_inv: torch.Tensor,
-    w2: torch.Tensor,
-    w2_weight_scale_inv: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int,
-    swiglu_limit: Optional[float] = None,
-    **kwargs,
-):
-    """Graph-capturable variant: routing v2 + token_unpermute, no host syncs."""
-    num_tokens = hidden_states.shape[:-1].numel()
-    global_num_experts = w13.shape[0]
-    original_shape = hidden_states.shape
-    original_dtype = hidden_states.dtype
-    group_list_type = 1
-
-    hidden_states, expanded_row_idx, expert_tokens, _ = (
-        torch.ops.npu.npu_moe_init_routing_v2(
-            hidden_states,
-            topk_ids,
-            active_num=num_tokens * top_k,
-            expert_num=global_num_experts,
-            expert_tokens_num_type=group_list_type,
-            expert_tokens_num_flag=True,
-            active_expert_range=[0, global_num_experts],
-            quant_mode=-1,
-        )
-    )
-    expert_tokens = expert_tokens.to(torch.int64)
-    hidden_states = w4a8_mxfp_gmm(
-        input=hidden_states,
-        input_scale=None,
-        weight=w13,
-        weight_scale=w13_weight_scale_inv,
-        group_list_type=group_list_type,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )
-    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    hidden_states = w4a8_mxfp_gmm(
-        input=hidden_states,
-        input_scale=None,
-        weight=w2,
-        weight_scale=w2_weight_scale_inv,
-        group_list_type=group_list_type,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )
-
-    final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
-        permuted_tokens=hidden_states,
-        sorted_indices=torch.abs(expanded_row_idx),
-        probs=topk_weights,
-    )
-    if len(original_shape) == 3:
-        final_hidden_states = final_hidden_states.view(original_shape)
-    return final_hidden_states
-
-
-def npu_apply_w4a4_mxfp_moe_ascend_tp(
-    layer: torch.nn.Module,
-    dispatch_output: "DispatchOutput",
-) -> Optional["CombineInput"]:
-    """Ascend TP path. Returns ``None`` when the dispatch is not an Ascend TP one.
-
-    AscendTPDispatcher already ran npu_moe_init_routing_v2 on dispatch and runs
-    npu_moe_finalize_routing (with topk_weights) on combine, so this only owns
-    the grouped-matmul chain in between — no permute, no routing-weight apply.
-    """
-    from sglang.srt.layers.moe.token_dispatcher import AscendTPCombineInput
-    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
-
-    if not DispatchOutputChecker.format_is_ascend_tp(dispatch_output):
-        return None
-
-    hidden_states = npu_apply_without_routing_weights_w4a4_mxfp(
-        layer,
-        dispatch_output.hidden_states,
-        dispatch_output.hidden_states_scale,
-        group_list_type=dispatch_output.group_list_type,
-        group_list=dispatch_output.expert_tokens,
-        output_dtype=torch.bfloat16,
-    )
-    return AscendTPCombineInput(hidden_states=hidden_states)
-
-
-def npu_apply_w4a8_mxfp_moe_deepep(
-    layer: torch.nn.Module,
-    dispatch_output: "DispatchOutput",
-) -> Optional["CombineInput"]:
-    """DeepEP path. Returns ``None`` when the dispatch is not a DeepEP one."""
-    from sglang.srt.layers.moe.token_dispatcher import (
-        DeepEPLLCombineInput,
-        DeepEPNormalCombineInput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
-
-    if not dispatch_output.format.is_deepep():
-        return None
-
-    if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-        hidden_states, hidden_states_scale, _, _, num_recv_tokens_per_expert = (
-            dispatch_output
-        )
-        group_list = torch.tensor(
-            num_recv_tokens_per_expert, dtype=torch.int64, device=hidden_states.device
-        )
-        combine_cls = DeepEPNormalCombineInput
-    else:
-        hidden_states, hidden_states_scale, _, _, group_list, _ = dispatch_output
-        group_list = group_list.to(torch.int64)
-        combine_cls = DeepEPLLCombineInput
-
-    hidden_states = npu_apply_without_routing_weights_w4a4_mxfp(
-        layer,
-        hidden_states,
-        hidden_states_scale,
-        group_list_type=1,
-        group_list=group_list,
-        output_dtype=torch.bfloat16,
-    )
-    return combine_cls(
-        hidden_states=hidden_states,
-        topk_ids=dispatch_output.topk_ids,
-        topk_weights=dispatch_output.topk_weights,
-    )
-
-
-def npu_apply_without_routing_weights_w4a4_mxfp(
-    layer,
-    hidden_states,
-    hidden_states_scale,
-    *,
-    group_list_type,
-    group_list,
-    output_dtype,
-):
-    hidden_states = w4a8_mxfp_gmm(
-        input=hidden_states,
-        input_scale=hidden_states_scale,
-        weight=layer.w13_weight,
-        weight_scale=layer.w13_weight_scale_inv,
-        group_list_type=group_list_type,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )
-    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    return w4a8_mxfp_gmm(
-        input=hidden_states,
-        input_scale=None,
-        weight=layer.w2_weight,
-        weight_scale=layer.w2_weight_scale_inv,
-        group_list_type=group_list_type,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )
+        return self.runner.run(dispatch_output, quant_info)
