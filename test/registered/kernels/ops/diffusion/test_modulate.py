@@ -18,6 +18,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_residual_gate_add_cuda,
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
+    fuse_scale_shift_kernel,
     ltx2_ada_values9,
     modulate_scale_shift,
     modulate_scale_shift_cuda,
@@ -92,6 +93,34 @@ def test_modulate_scale_shift_guards_reject_fp32():
     assert not can_use_modulate_scale_shift_cuda(x, row, row)
     # The public wrapper still returns the eager result on a rejected input.
     assert torch.equal(modulate_scale_shift(x, row, row), _eager_modulate(x, row, row))
+
+
+# Causal Wan and LingBot use per-frame 4D modulation with a per-token shift.
+SCALE_SHIFT_4D_CASES = [
+    ((1, 18, 96), 3),
+    ((2, 20, 384), 4),
+    ((1, 9, 1536), 3),
+    ((1, 4, 5120), 2),
+]
+
+
+@pytest.mark.parametrize("shape,num_frames", SCALE_SHIFT_4D_CASES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scale_constant", [0, 1])
+def test_scale_shift_4d_matches_torch(shape, num_frames, dtype, scale_constant):
+    batch, seq_len, hidden = shape
+    x = torch.randn(shape, device=DEVICE, dtype=dtype)
+    scale = torch.randn((batch, num_frames, 1, hidden), device=DEVICE, dtype=dtype)
+    shift = torch.randn_like(x)
+
+    frame_seqlen = seq_len // num_frames
+    expected = (
+        x.unflatten(1, (num_frames, frame_seqlen)) * (scale_constant + scale)
+        + shift.unflatten(1, (num_frames, frame_seqlen))
+    ).flatten(1, 2)
+    actual = fuse_scale_shift_kernel(x, scale, shift, scale_constant)
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
