@@ -3982,9 +3982,7 @@ class Scheduler(
         if (x := self.kv_weight_version_tracker) is not None and (
             slot_indices := batch.out_cache_loc
         ) is not None:
-            x.record(
-                slot_indices=slot_indices, version=get_server_args().weight_version
-            )
+            x.record(slot_indices=slot_indices, version=get_serving().weight_version)
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
