@@ -72,6 +72,15 @@ _ATTRIBUTE_SPELLED = _BAG_ACCESSORS - {"get_device"}
 _OWN = ("server_args.py", "runtime_context.py")
 
 
+def _pipeline_sources():
+    """The record plus every module under `arg_groups/`.
+
+    A handler that moved out of the record takes its imports with it, so
+    seeding the walk from two files would stop covering it.
+    """
+    return [_SRT / "server_args.py", *sorted((_SRT / "arg_groups").rglob("*.py"))]
+
+
 def _module_of(name):
     """`sglang.srt.a.b` -> the file, if it is one of ours."""
     if not name or not name.startswith("sglang.srt."):
@@ -196,9 +205,29 @@ def _functions_in(path):
     }
 
 
+def _locally_shadowed_accessors(path):
+    """Accessor names this file imports from somewhere that is not the context.
+
+    `get_device` is both the `device` bag accessor and the hardware probe in
+    `utils.common`. Matching the bare name would report the probe as a bag read,
+    so a name imported from elsewhere in this file is not the accessor.
+    """
+    shadowed = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.endswith("runtime_context"):
+                continue
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name in _BAG_ACCESSORS:
+                    shadowed.add(name)
+    return shadowed
+
+
 def _reaches_a_bag(path, entry):
     """Does `entry` in `path` reach a bag accessor, following calls in-module?"""
     functions = _functions_in(path)
+    shadowed = _locally_shadowed_accessors(path)
     seen = set()
 
     def walk(name):
@@ -216,7 +245,7 @@ def _reaches_a_bag(path, entry):
                 continue
             if not isinstance(node.func, ast.Name):
                 continue
-            if node.func.id in _BAG_ACCESSORS:
+            if node.func.id in _BAG_ACCESSORS and node.func.id not in shadowed:
                 return node.lineno
             found = walk(node.func.id)
             if found is not None:
@@ -241,9 +270,7 @@ class TestResolutionReadsNoBag(CustomTestCase):
 
     def test_the_walk_finds_something_to_walk(self):
         """A collapsed import map would make the pin vacuous."""
-        imported = _imported_symbols(
-            [_SRT / "server_args.py", _SRT / "arg_groups" / "overrides.py"]
-        )
+        imported = _imported_symbols(_pipeline_sources())
         self.assertGreater(
             len(imported),
             20,
@@ -282,9 +309,7 @@ class TestResolutionReadsNoBag(CustomTestCase):
         )
 
     def test_nothing_the_pipeline_calls_reads_a_bag(self):
-        imported = _imported_symbols(
-            [_SRT / "server_args.py", _SRT / "arg_groups" / "overrides.py"]
-        )
+        imported = _imported_symbols(_pipeline_sources())
         reachable = {
             (path, symbol) for path, symbols in imported.items() for symbol in symbols
         } | _registered_entries()

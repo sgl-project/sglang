@@ -1780,6 +1780,10 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
+        # Cache mode write-through keeps the anchor on the request's own path,
+        # so the namespace is already carried by ``last_host_node.key``.
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
