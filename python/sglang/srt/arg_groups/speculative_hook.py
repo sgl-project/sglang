@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     model_config_of,
     resolved_view,
     resolving_view,
+    routes_mamba_radix_cache,
     run_post_process_pass,
 )
 from sglang.srt.runtime_context import get_platform
@@ -36,6 +37,22 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     logger.warning(
         "Overlap schedule is not implemented for speculative decoding on CPU."
     )
+
+
+def _reject_mamba_radix_cache_for_cpu_spec(server_args: ServerArgs) -> None:
+    """CPU resolves the strategy to no_buffer, which has no spec-aware state
+    tracking, and has no extra_buffer FLA kernels to fall back on."""
+    cfg = resolving_view(server_args)
+    if cfg.device != "cpu" or cfg.disable_radix_cache:
+        return
+
+    hf_config = model_config_of(server_args).hf_config
+    model_arch = hf_config.architectures[0]
+    if routes_mamba_radix_cache(hf_config, model_arch):
+        raise ValueError(
+            f"Speculative decoding for {model_arch} is not compatible with "
+            "the mamba radix cache on CPU. Pass --disable-radix-cache."
+        )
 
 
 def _resolve_speculative_algorithm_alias(
@@ -661,6 +678,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
+    _reject_mamba_radix_cache_for_cpu_spec(server_args)
 
     if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
@@ -826,6 +844,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
+    _reject_mamba_radix_cache_for_cpu_spec(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(

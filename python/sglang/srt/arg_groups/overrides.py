@@ -550,6 +550,25 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     return False
 
 
+def routes_mamba_radix_cache(hf_config: Any, model_arch: str) -> bool:
+    """Whether ``model_arch`` routes through the hybrid-mamba radix cache
+    handling: either the linear-attention registry says so, or the arch is one
+    of the mamba-radix archs (GraniteMoeHybrid only when it has mamba layers).
+    Pure read."""
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
+    in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
+    if model_arch == "GraniteMoeHybridForCausalLM":
+        in_branch = any(
+            layer_type == "mamba"
+            for layer_type in getattr(hf_config, "layer_types", [])
+        )
+    spec = get_linear_attn_spec_by_arch(model_arch)
+    return (spec is not None and spec.uses_mamba_radix_cache) or in_branch
+
+
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
     """Resolve the hybrid-mamba radix cache fields (pure).
@@ -561,21 +580,10 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     guard replicates the union of the legacy call-site guards so the pass is
     self-sufficient in the end-state pass list.
     """
-    from sglang.srt.configs.linear_attn_model_registry import (
-        get_linear_attn_spec_by_arch,
-    )
-
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
 
-    in_branch = model_arch in _MAMBA_RADIX_CACHE_ARCHS
-    if model_arch == "GraniteMoeHybridForCausalLM":
-        in_branch = any(
-            layer_type == "mamba"
-            for layer_type in getattr(hf_config, "layer_types", [])
-        )
-    spec = get_linear_attn_spec_by_arch(model_arch)
-    if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
+    if not routes_mamba_radix_cache(hf_config, model_arch):
         return {}
 
     if view.disable_radix_cache:
