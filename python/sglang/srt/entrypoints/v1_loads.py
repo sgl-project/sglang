@@ -146,10 +146,10 @@ async def get_loads(
         "version": __version__,
         "accelerator": _accelerator_name(),
         "num_accelerators": _num_accelerators_per_dp_rank(
-            get_parallel().config.tp_size,
-            get_parallel().config.pp_size,
-            get_parallel().config.dp_size,
-            get_parallel().config.enable_dp_attention,
+            get_parallel().tp_size,
+            get_parallel().pp_size,
+            get_parallel().dp_size,
+            get_parallel().enable_dp_attention,
         ),
         "loads": loads,
     }
