@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx1201 = (
+    _is_hip
+    and torch.cuda.is_available()
+    and getattr(
+        torch.cuda.get_device_properties(torch.cuda.current_device()),
+        "gcnArchName",
+        "",
+    )
+    .split(":", 1)[0]
+    .lower()
+    == "gfx1201"
+)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -83,6 +95,13 @@ if _is_xpu:
         )
 
 
+def _should_force_native_rope() -> bool:
+    return _is_gfx1201 or (
+        publish_role() is not None
+        and get_exec().deterministic.rl_on_policy_target is not None
+    )
+
+
 class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
 
@@ -107,10 +126,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
         self.position_start = position_start
-        self._force_native = (
-            publish_role() is not None
-            and get_exec().deterministic.rl_on_policy_target is not None
-        )
+        self._force_native = _should_force_native_rope()
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
