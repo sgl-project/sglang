@@ -4119,7 +4119,7 @@ def parse_lscpu_topology():
                 logger.warning("Skipping malformed lscpu line: %s", line.strip())
                 continue
             # (cpu, core, socket, node, L3)
-            cpu_info.append(parts[: 4] + parts[-1])
+            cpu_info.append(parts[: 4] + [parts[-1]])
 
     # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
