@@ -4463,9 +4463,18 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+        if (
+            self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
+            # Raw MLA KV layout (nope + rope cast to fp8) without per-block
+            # scales: the HIP DSA kernels and the CUDA TileLang fp8 path.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+            if cache_k_rope is None:
+                cache_k_rope = cache_k_nope.new_empty(
+                    (*cache_k_nope.shape[:-1], 0)
+                )
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
                 loc,
