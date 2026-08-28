@@ -96,6 +96,21 @@ def _decode_width() -> Optional[int]:
         return None
 
 
+def _tune_cache_path(world_size: int) -> Optional[str]:
+    """Where FlashInfer should persist the measured tactics.
+
+    Named explicitly rather than left to default, because the tuning run has to
+    write the file for the *next* server to reuse it; a workspace built without
+    a cache path measures every start.
+    """
+    try:
+        from flashinfer.comm.pcie_ipc_tuning import default_cache_path
+
+        return str(default_cache_path(world_size))
+    except (AttributeError, ImportError):
+        return None
+
+
 def _tune_batches(max_rows: int) -> tuple[int, ...]:
     """Row counts to profile, bounded by what the workspace can actually take.
 
@@ -185,6 +200,7 @@ class PcieIpcCommunicator:
                 max_numel=max_numel,
                 dtype=torch.bfloat16,
                 tune_batches=_tune_batches(max_numel // hidden),
+                tune_cache=_tune_cache_path(self._world_size),
             )
         except Exception as e:
             logger.warning(
