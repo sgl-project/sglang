@@ -24,9 +24,9 @@ class AscendStateType(str, enum.Enum):
     """DSV4-on-NPU PD components without a cross-hardware equivalent."""
 
     DSV4_C128 = "dsv4_c128"
-    # C4 compress state ring (attention + indexer) addressed by req_pool_idx
-    # on A5 (CYCLE cache_mode).  Separate from StateType.SWA because the A5
-    # compressor derives the ring bank from req_pool_idx, not SWA page.
+    # C4 compress-state rows (attention + indexer) addressed within each
+    # req_pool_idx bank on A5 (CYCLE cache_mode).  Separate from StateType.SWA
+    # because each peer maps logical positions into its own local ring.
     DSV4_C4_STATE = "dsv4_c4_state"
 
 

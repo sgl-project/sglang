@@ -67,6 +67,104 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import DSV4NPUTokenToKVPool
+
+
+class TestVerifyCompressPositions(unittest.TestCase):
+    def test_uses_group_start_rope_position(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_compress_ratios = (4, 128)
+
+        # Two linear three-token verify trees.  Their completed C4 groups end
+        # at token positions 7 and 11, whose compressed RoPE positions are the
+        # corresponding group starts 4 and 8.
+        positions = torch.tensor([7, 8, 9, 10, 11, 12], dtype=torch.int64)
+        final_seq_lens = torch.tensor([10, 13], dtype=torch.int32)
+        dst = torch.full((4,), -1, dtype=torch.int64)
+
+        backend._fill_verify_positions_cmp_padding_one(
+            positions,
+            dst,
+            ratio=4,
+            seq_lens_cpu=final_seq_lens,
+            n_draft=3,
+        )
+
+        self.assertEqual(dst.tolist(), [4, 8, 0, 0])
+
+    def test_c128_uses_group_start_rope_position(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_compress_ratios = (4, 128)
+        dst = torch.full((2,), -1, dtype=torch.int64)
+
+        backend._fill_verify_positions_cmp_padding_one(
+            torch.tensor([126, 127, 128], dtype=torch.int64),
+            dst,
+            ratio=128,
+            seq_lens_cpu=torch.tensor([129], dtype=torch.int32),
+            n_draft=3,
+        )
+
+        self.assertEqual(dst.tolist(), [0, 0])
+
+    def test_no_completed_group_clears_destination(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_compress_ratios = (4, 128)
+        dst = torch.full((2,), -1, dtype=torch.int64)
+
+        backend._fill_verify_positions_cmp_padding_one(
+            torch.tensor([5, 6], dtype=torch.int64),
+            dst,
+            ratio=4,
+            seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+            n_draft=2,
+        )
+
+        self.assertEqual(dst.tolist(), [0, 0])
+
+    def test_zero_length_graph_padding_does_not_emit_a_position(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_compress_ratios = (4, 128)
+        dst = torch.full((2,), -1, dtype=torch.int64)
+
+        backend._fill_verify_positions_cmp_padding_one(
+            torch.tensor([0, 0, 0, 10, 11, 12], dtype=torch.int64),
+            dst,
+            ratio=4,
+            seq_lens_cpu=torch.tensor([0, 13], dtype=torch.int32),
+            n_draft=3,
+        )
+
+        self.assertEqual(dst.tolist(), [8, 0])
+
+
+class TestC4StateTransferLayout(unittest.TestCase):
+    def test_registers_single_rows_instead_of_request_banks(self):
+        attn_state = torch.empty((32, 5), dtype=torch.float32)
+        indexer_state = torch.empty((32, 7), dtype=torch.float32)
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool.compress_state_pools = [
+            SimpleNamespace(
+                ratio=4,
+                ring_size=8,
+                kv_score_buffer=SimpleNamespace(kv_score=attn_state),
+            )
+        ]
+        pool.indexer_compress_state_pools = [
+            SimpleNamespace(
+                ratio=4,
+                ring_size=8,
+                kv_score_buffer=SimpleNamespace(kv_score=indexer_state),
+            )
+        ]
+
+        _, data_lens, item_lens = pool.get_c4_state_buf_infos()
+
+        self.assertEqual(data_lens, [attn_state.nbytes, indexer_state.nbytes])
+        self.assertEqual(
+            item_lens,
+            [attn_state[0].nbytes, indexer_state[0].nbytes],
+        )
 
 
 class TestC4IndexerInitialization(unittest.TestCase):
