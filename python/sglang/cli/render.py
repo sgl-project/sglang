@@ -51,7 +51,7 @@ def render(args, extra_argv):
         "tokenizer_workers": server_args.tokenizer_worker_num,
         "queue_capacity": 128,
         "engine_url": engine_url,
-        "renderer": _build_renderer_config(
+        "renderer": build_renderer_config(
             server_args,
             model_config,
             defaults,
@@ -80,7 +80,7 @@ def render(args, extra_argv):
         raise SystemExit(return_code)
 
 
-def _build_renderer_config(server_args, model_config, defaults, num_reserved_tokens):
+def build_renderer_config(server_args, model_config, defaults, num_reserved_tokens):
     return {
         "served_model_name": server_args.served_model_name,
         "tokenizer_path": server_args.tokenizer_path,
@@ -95,14 +95,11 @@ def _build_renderer_config(server_args, model_config, defaults, num_reserved_tok
         "stream_response_default_include_usage": (
             server_args.stream_response_default_include_usage
         ),
-        "skip_tokenizer_init": False,
-        "vocab_size": model_config.vocab_size,
         "default_sampling_params": {
             "temperature": defaults.get("temperature"),
             "top_p": defaults.get("top_p"),
         },
         "limits": {
-            "skip_tokenizer_init": False,
             "vocab_size": model_config.vocab_size,
             "context_len": model_config.context_len,
             "num_reserved_tokens": num_reserved_tokens,

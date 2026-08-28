@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.cli.render import (
-    _build_renderer_config,
+    build_renderer_config,
     extract_engine_url,
     write_renderer_config,
 )
@@ -54,7 +54,7 @@ class TestStandaloneRendererCli(unittest.TestCase):
         )
         model_config = SimpleNamespace(vocab_size=128, context_len=4096)
 
-        config = _build_renderer_config(
+        config = build_renderer_config(
             server_args,
             model_config,
             {"temperature": 0.7, "top_p": 0.9},
@@ -64,6 +64,10 @@ class TestStandaloneRendererCli(unittest.TestCase):
         self.assertEqual(
             config["default_chat_template_kwargs"], {"enable_thinking": False}
         )
+        self.assertNotIn("skip_tokenizer_init", config)
+        self.assertNotIn("skip_tokenizer_init", config["limits"])
+        self.assertNotIn("vocab_size", config)
+        self.assertEqual(config["limits"]["vocab_size"], 128)
 
 
 if __name__ == "__main__":
