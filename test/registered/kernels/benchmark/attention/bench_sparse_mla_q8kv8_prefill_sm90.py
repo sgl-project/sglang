@@ -10,7 +10,7 @@ from sglang.kernels.jit.benchmark.utils import run_benchmark_no_cudagraph
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
     sparse_mla_q8kv8_prefill_fwd,
 )
-from sglang.srt.utils import is_sm90_supported
+from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -58,8 +58,8 @@ if HAS_Q16_FLASHMLA:
     STYLES.insert(0, ("orange", "--"))
 
 
-def _sm90_available() -> bool:
-    return is_sm90_supported()
+def _q8kv8_available() -> bool:
+    return is_sm90_supported() or is_sm100_supported()
 
 
 def _make_indices(s_q: int, s_kv: int, topk: int, d_qk: int) -> torch.Tensor:
@@ -115,7 +115,7 @@ def _make_q8_inputs(s_q: int, s_kv: int, h_q: int, d_qk: int, topk: int):
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="sparse-mla-q8kv8-prefill-sm90-performance",
+        plot_name="sparse-mla-q8kv8-prefill-performance",
         args={},
     )
 )
@@ -133,8 +133,10 @@ def bench_sparse_mla_q8kv8_prefill_sm90(
             return flash_mla_sparse_fwd(q, kv, indices, sm_scale, D_V)
 
     elif provider == "q8_fp8_jit":
-        if not _sm90_available():
-            raise RuntimeError("Q8KV8 sparse prefill benchmark requires SM90 CUDA")
+        if not _q8kv8_available():
+            raise RuntimeError(
+                "Q8KV8 sparse prefill benchmark requires SM90 or SM100 CUDA"
+            )
         q, kv, indices, sm_scale, q_scale, kv_scale = _make_q8_inputs(
             s_q, s_kv, h_q, d_qk, topk
         )

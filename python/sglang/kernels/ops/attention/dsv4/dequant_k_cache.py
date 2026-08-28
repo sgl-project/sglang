@@ -169,24 +169,30 @@ def cast_q_fp8_for_q8kv8_prefill(
     q: torch.Tensor,
     padded_num_heads: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
+    q_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cast DeepSeek-V4 sparse-prefill Q to the Q8KV8 kernel format.
 
     The incoming Q is the model-produced BF16/FP16 tensor already shaped as
     ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
 
-    The SM90 kernel processes query heads in 64-head blocks. Tensor parallelism
-    commonly leaves fewer than 64 local heads, so the active heads are copied
-    into a zero-padded 64/128-head FP8 tensor.
+    The SM90 kernel processes query heads in 64-head blocks and therefore uses
+    a zero-padded FP8 tensor. The SM100 backend may keep only the active local
+    heads in storage; its 32-row TMA tile supplies zeros for out-of-bounds rows.
     """
     assert q.ndim == 3
     assert q.shape[-1] == DIM_NOPE + DIM_ROPE
+    assert q.is_contiguous()
 
     num_tokens, num_heads, head_dim = q.shape
     if padded_num_heads is None:
         padded_num_heads = q8kv8_padded_num_heads(num_heads)
 
-    if padded_num_heads not in (64, 128) or padded_num_heads < num_heads:
+    if (
+        padded_num_heads < num_heads
+        or padded_num_heads > 128
+        or (padded_num_heads != num_heads and padded_num_heads % 32 != 0)
+    ):
         raise ValueError(
             f"invalid padded_num_heads={padded_num_heads} for num_heads={num_heads}"
         )
@@ -194,7 +200,7 @@ def cast_q_fp8_for_q8kv8_prefill(
     expected_shape = (num_tokens, padded_num_heads, head_dim)
 
     if out is None:
-        q_fp8 = torch.zeros(
+        q_fp8 = torch.empty(
             expected_shape,
             dtype=fp8_dtype,
             device=q.device,
@@ -211,12 +217,51 @@ def cast_q_fp8_for_q8kv8_prefill(
                 f"{tuple(out.shape)}/{out.dtype}/{out.device}"
             )
         q_fp8 = out
-        if padded_num_heads > num_heads:
-            q_fp8[:, num_heads:].zero_()
 
-    q_fp8[:, :num_heads].copy_(q)
-    q_scale = torch.ones((), dtype=torch.float32, device=q.device)
+    total_output = num_tokens * padded_num_heads * head_dim
+    block_size = 8192
+    _cast_q_fp8_and_zero_pad_kernel[(triton.cdiv(total_output, block_size),)](
+        q,
+        q_fp8,
+        num_heads,
+        padded_num_heads,
+        head_dim,
+        total_output,
+        BLOCK_SIZE=block_size,
+        num_warps=8,
+    )
+
+    if q_scale is None:
+        q_scale = torch.ones((), dtype=torch.float32, device=q.device)
+    elif (
+        q_scale.numel() != 1
+        or q_scale.dtype != torch.float32
+        or q_scale.device != q.device
+    ):
+        raise ValueError("q_scale must be a float32 scalar on q's device")
     return q_fp8, q_scale
+
+
+@triton.jit
+def _cast_q_fp8_and_zero_pad_kernel(
+    q_ptr,
+    out_ptr,
+    num_heads,
+    padded_num_heads,
+    head_dim,
+    total_output,
+    BLOCK_SIZE: tl.constexpr,
+):
+    output_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    output_mask = output_offsets < total_output
+    output_rows = output_offsets // head_dim
+    dim_offsets = output_offsets - output_rows * head_dim
+    head_offsets = output_rows % padded_num_heads
+    token_offsets = output_rows // padded_num_heads
+    active_mask = output_mask & (head_offsets < num_heads)
+    input_offsets = (token_offsets * num_heads + head_offsets) * head_dim + dim_offsets
+    values = tl.load(q_ptr + input_offsets, mask=active_mask, other=0.0)
+    tl.store(out_ptr + output_offsets, values, mask=output_mask)
 
 
 @triton.jit

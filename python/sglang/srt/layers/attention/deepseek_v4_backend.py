@@ -78,7 +78,13 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_sm90_supported, is_xpu
+from sglang.srt.utils import (
+    ceil_align,
+    is_cuda,
+    is_sm90_supported,
+    is_sm100_supported,
+    is_xpu,
+)
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -564,9 +570,10 @@ class DeepseekV4AttnBackend(
             model_runner.server_args, "dsv4_prefill_backend", "auto"
         )
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
-            if not is_sm90_supported():
+            if not (is_sm90_supported() or is_sm100_supported()):
                 raise ValueError(
-                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires an SM90 "
+                    "or SM100 CUDA GPU."
                 )
             if self.head_dim_v != 512:
                 raise ValueError(
@@ -1885,21 +1892,27 @@ class DeepseekV4AttnBackend(
         self,
         q: torch.Tensor,
         attn_sink: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        """Prepare compact FP8 Q storage and architecture-specific head tiles."""
         num_tokens, num_heads, head_dim = q.shape
-        padded_heads = q8kv8_padded_num_heads(num_heads)
+        kernel_heads = (
+            ceil_align(num_heads, 32)
+            if is_sm100_supported()
+            else q8kv8_padded_num_heads(num_heads)
+        )
+        q_storage_heads = num_heads if is_sm100_supported() else kernel_heads
 
         qpad = getattr(self, "_q8kv8_qpad_buf", None)
         if (
             qpad is None
             or qpad.shape[0] < num_tokens
-            or qpad.shape[1] != padded_heads
+            or qpad.shape[1] != q_storage_heads
             or qpad.shape[2] != head_dim
             or qpad.device != q.device
         ):
             qpad = torch.empty(
-                (num_tokens, padded_heads, head_dim),
+                (num_tokens, q_storage_heads, head_dim),
                 dtype=fp8_dtype,
                 device=q.device,
             )
@@ -1907,31 +1920,42 @@ class DeepseekV4AttnBackend(
 
         qpad = qpad[:num_tokens]
 
-        q_fp8, _ = cast_q_fp8_for_q8kv8_prefill(
-            q,
-            padded_num_heads=padded_heads,
-            out=qpad,
-        )
-
-        sink_pad = getattr(self, "_q8kv8_attn_sink_pad", None)
-        if (
-            sink_pad is None
-            or sink_pad.shape != (padded_heads,)
-            or sink_pad.device != q.device
-        ):
-            sink_pad = torch.zeros(padded_heads, dtype=torch.float32, device=q.device)
-            self._q8kv8_attn_sink_pad = sink_pad
-
-        sink_pad[:num_heads].copy_(attn_sink.reshape(-1)[:num_heads])
-        if padded_heads > num_heads:
-            sink_pad[num_heads:].zero_()
-
         scale = getattr(self, "_q8kv8_identity_scale", None)
         if scale is None or scale.device != q.device:
             scale = torch.ones((), dtype=torch.float32, device=q.device)
             self._q8kv8_identity_scale = scale
 
-        return q_fp8, sink_pad, scale, num_heads
+        q_kernel, _ = cast_q_fp8_for_q8kv8_prefill(
+            q,
+            padded_num_heads=q_storage_heads,
+            out=qpad,
+            q_scale=scale,
+        )
+
+        sink_cache = getattr(self, "_q8kv8_attn_sink_pad_cache", None)
+        if sink_cache is None:
+            sink_cache = {}
+            self._q8kv8_attn_sink_pad_cache = sink_cache
+        sink_entry = sink_cache.get(layer_id)
+        sink_version = getattr(attn_sink, "_version", 0)
+        if (
+            sink_entry is None
+            or sink_entry[0].shape != (kernel_heads,)
+            or sink_entry[0].device != q.device
+            or sink_entry[1] != attn_sink.data_ptr()
+            or sink_entry[2] != sink_version
+        ):
+            sink_pad = torch.zeros(kernel_heads, dtype=torch.float32, device=q.device)
+            sink_pad[:num_heads].copy_(attn_sink.reshape(-1)[:num_heads])
+            sink_cache[layer_id] = (
+                sink_pad,
+                attn_sink.data_ptr(),
+                sink_version,
+            )
+        else:
+            sink_pad = sink_entry[0]
+
+        return q_kernel, sink_pad, scale, num_heads, kernel_heads
 
     def _forward_prefill_sparse_q8kv8(
         self,
@@ -1946,15 +1970,12 @@ class DeepseekV4AttnBackend(
         """Experimental DeepSeek-V4 sparse prefill path using Q8KV8 kernels.
 
         This mirrors ``_forward_prefill_sparse``'s cache/index construction, but
-        writes the gathered KV workspace as FP8 and calls the SM90 Q8KV8 sparse
-        prefill kernel. The path is selected by ``--dsv4-prefill-backend
-        flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
-        override for focused runtime validation.
+        writes the gathered KV workspace as FP8 and calls the architecture-
+        specific SM90/SM100 Q8KV8 sparse prefill kernel. The path is selected
+        by ``--dsv4-prefill-backend flashmla_sparse_q8``;
+        ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug override for focused
+        runtime validation.
         """
-
-        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
-            sparse_mla_q8kv8_prefill_fwd,
-        )
 
         q_flat = q.squeeze(1)
         if q_flat.ndim != 3:
@@ -1968,18 +1989,20 @@ class DeepseekV4AttnBackend(
                 f"{q_flat.shape[1]} local heads"
             )
 
-        q_fp8, attn_sink_pad, identity_scale, active_heads = (
-            self._prepare_q8kv8_q_and_sink(q_flat, attn_sink)
+        q_kernel, attn_sink_pad, identity_scale, active_heads, kernel_heads = (
+            self._prepare_q8kv8_q_and_sink(q_flat, attn_sink, layer_id)
         )
 
         if not getattr(self, "_q8kv8_sparse_prefill_log_emitted", False):
             logger.info(
                 "DSV4_Q8KV8_SPARSE_PREFILL_HIT layer_id=%s "
-                "compress_ratio=%s q_shape=%s padded_heads=%s d_v=%s",
+                "compress_ratio=%s q_shape=%s q_storage_heads=%s "
+                "kernel_heads=%s d_v=%s",
                 layer_id,
                 compress_ratio,
                 tuple(q_flat.shape),
-                q_fp8.shape[1],
+                q_kernel.shape[1],
+                kernel_heads,
                 self.head_dim_v,
             )
             self._q8kv8_sparse_prefill_log_emitted = True
@@ -2017,8 +2040,7 @@ class DeepseekV4AttnBackend(
 
         if compress_ratio == 0:
             workspace = self.sparse_prefill_workspace.get(
-                cache.swa_token_ids.shape[0] + 1,
-                dtype=fp8_dtype,
+                cache.swa_token_ids.shape[0], dtype=fp8_dtype
             )
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
@@ -2048,8 +2070,7 @@ class DeepseekV4AttnBackend(
 
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0] + 1,
-                dtype=fp8_dtype,
+                n_compressed + cache.swa_token_ids.shape[0], dtype=fp8_dtype
             )
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
@@ -2066,30 +2087,71 @@ class DeepseekV4AttnBackend(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
-            extra_rows=1,
             out=swa_slice,
         )
 
-        sentinel_row = workspace.shape[0] - 1
-        q8_indices = torch.where(
-            combined_indices < 0,
-            torch.full_like(combined_indices, sentinel_row),
-            combined_indices,
-        )
+        output_buffers = getattr(self, "_q8kv8_output_buffers", None)
+        required_out_shape = (q_kernel.shape[0], active_heads, self.head_dim_v)
+        required_meta_shape = (q_kernel.shape[0], kernel_heads)
+        if (
+            output_buffers is None
+            or output_buffers[0].shape[0] < required_out_shape[0]
+            or output_buffers[0].shape[1:] != required_out_shape[1:]
+            or output_buffers[1].shape[0] < required_meta_shape[0]
+            or output_buffers[1].shape[1:] != required_meta_shape[1:]
+            or output_buffers[0].device != q_kernel.device
+        ):
+            output_buffers = (
+                torch.empty(
+                    required_out_shape, dtype=torch.bfloat16, device=q_kernel.device
+                ),
+                torch.empty(
+                    required_meta_shape, dtype=torch.float32, device=q_kernel.device
+                ),
+                torch.empty(
+                    required_meta_shape, dtype=torch.float32, device=q_kernel.device
+                ),
+            )
+            self._q8kv8_output_buffers = output_buffers
+        out_buf = output_buffers[0][: required_out_shape[0]]
+        max_logits_buf = output_buffers[1][: required_meta_shape[0]]
+        lse_buf = output_buffers[2][: required_meta_shape[0]]
 
-        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
-            q=q_fp8,
+        kernel_args = dict(
+            q=q_kernel,
             kv=workspace,
-            indices=q8_indices.unsqueeze(1),
+            # Both architecture kernels mask negative/past-length indices
+            # internally. Keeping the cache's native indices removes an
+            # elementwise torch.where launch and the workspace sentinel row.
+            indices=combined_indices.unsqueeze(1),
             sm_scale=self.softmax_scale,
             q_scale=identity_scale,
             kv_scale=identity_scale,
-            d_v=self.head_dim_v,
             attn_sink=attn_sink_pad,
             topk_length=combined_lens,
+            out=out_buf,
+            max_logits=max_logits_buf,
+            lse=lse_buf,
         )
+        if is_sm100_supported():
+            from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+                _sparse_mla_q8kv8_prefill_fwd_sm100_trusted,
+            )
 
-        return o[:, :active_heads]
+            o, _, _ = _sparse_mla_q8kv8_prefill_fwd_sm100_trusted(
+                **kernel_args, active_heads=active_heads
+            )
+        else:
+            from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+                sparse_mla_q8kv8_prefill_fwd,
+            )
+
+            o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+                **kernel_args,
+                d_v=self.head_dim_v,
+            )
+
+        return o
 
     def expand_prefill_casually(
         self,

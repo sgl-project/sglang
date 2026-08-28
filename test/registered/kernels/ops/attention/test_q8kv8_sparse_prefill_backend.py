@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_sm90_supported
+from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -91,8 +91,8 @@ class _TokenToKVPool:
         return self._extra_key_buffer
 
 
-def _sm90_available() -> bool:
-    return torch.cuda.is_available() and is_sm90_supported()
+def _q8kv8_available() -> bool:
+    return torch.cuda.is_available() and (is_sm90_supported() or is_sm100_supported())
 
 
 def _make_v4_paged_kv_cache(
@@ -372,6 +372,9 @@ def _patched_sparse_kernels(
         d_v,
         attn_sink,
         topk_length,
+        out=None,
+        max_logits=None,
+        lse=None,
     ):
         q8_capture.record(
             q=q,
@@ -384,13 +387,25 @@ def _patched_sparse_kernels(
             attn_sink=attn_sink,
             topk_length=topk_length,
         )
-        out = torch.zeros(
-            (q.shape[0], q.shape[1], d_v), dtype=torch.bfloat16, device=q.device
-        )
-        meta = torch.zeros(
-            (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
-        )
-        return out, meta, meta
+        if out is None:
+            out = torch.zeros(
+                (q.shape[0], q.shape[1], d_v),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+        else:
+            out.zero_()
+        if max_logits is None:
+            max_logits = torch.zeros(
+                (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
+            )
+        else:
+            max_logits.zero_()
+        if lse is None:
+            lse = torch.zeros_like(max_logits)
+        else:
+            lse.zero_()
+        return out, max_logits, lse
 
     sgl_kernel_pkg = types.ModuleType("sgl_kernel")
     flash_mla_mod = types.ModuleType("sgl_kernel.flash_mla")
@@ -400,6 +415,12 @@ def _patched_sparse_kernels(
     q8_module_name = "sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90"
     q8_mod = types.ModuleType(q8_module_name)
     q8_mod.sparse_mla_q8kv8_prefill_fwd = fake_sparse_mla_q8kv8_prefill_fwd
+    q8_mod._sparse_mla_q8kv8_prefill_fwd_sm100_trusted = (
+        lambda **kwargs: fake_sparse_mla_q8kv8_prefill_fwd(
+            **{key: value for key, value in kwargs.items() if key != "active_heads"},
+            d_v=kwargs["out"].shape[-1],
+        )
+    )
 
     old_modules = {
         name: sys.modules.get(name)
@@ -441,9 +462,10 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
 
     bf16_capture = _Capture()
     q8_capture = _Capture()
-    with _patched_sparse_kernels(
-        bf16_capture, q8_capture
-    ), _patched_compressed_sparse_cache_paths(compress_ratio):
+    with (
+        _patched_sparse_kernels(bf16_capture, q8_capture),
+        _patched_compressed_sparse_cache_paths(compress_ratio),
+    ):
         bf16_out = backend._forward_prefill_sparse(
             q=q,
             layer_id=0,
@@ -485,30 +507,23 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
     assert bf16_kv.dtype == torch.bfloat16
     assert q8_kv.dtype == fp8_dtype
     assert q8_call["q"].dtype == fp8_dtype
-    assert q8_call["q"].shape[1] == 64
-    assert torch.count_nonzero(q8_call["q"][:, 16:]).item() == 0
-    assert q8_call["attn_sink"].shape == (64,)
-    assert q8_kv.shape[0] == bf16_kv.shape[0] + 1
+    expected_q_heads = 16 if is_sm100_supported() else 64
+    expected_kernel_heads = 32 if is_sm100_supported() else 64
+    assert q8_call["q"].shape[1] == expected_q_heads
+    if expected_q_heads > 16:
+        assert torch.count_nonzero(q8_call["q"][:, 16:]).item() == 0
+    assert q8_call["attn_sink"].shape == (expected_kernel_heads,)
+    assert q8_kv.shape[0] == bf16_kv.shape[0]
     torch.testing.assert_close(
-        q8_kv[:-1].to(torch.bfloat16).float(),
+        q8_kv.to(torch.bfloat16).float(),
         bf16_kv.float(),
         atol=3e-2,
         rtol=2e-1,
     )
-    assert torch.equal(
-        q8_kv[-1].to(torch.bfloat16),
-        torch.zeros_like(q8_kv[-1].to(torch.bfloat16)),
-    )
 
     bf16_indices = bf16_call["indices"]
     q8_indices = q8_call["indices"]
-    sentinel_row = q8_kv.shape[0] - 1
-    valid_mask = bf16_indices >= 0
-    assert torch.equal(q8_indices[valid_mask], bf16_indices[valid_mask])
-    assert torch.equal(
-        q8_indices[~valid_mask],
-        torch.full_like(q8_indices[~valid_mask], sentinel_row),
-    )
+    assert torch.equal(q8_indices, bf16_indices)
     assert torch.equal(q8_call["topk_length"], bf16_call["topk_length"])
     assert q8_call["q_scale"].item() == pytest.approx(1.0)
     assert q8_call["kv_scale"].item() == pytest.approx(1.0)
@@ -575,7 +590,9 @@ def test_q8kv8_sparse_prefill_rejects_invalid_tensor_contracts(
 @pytest.mark.parametrize("bad_length", [-1, 129])
 def test_q8kv8_sparse_prefill_rejects_invalid_topk_length_bounds(
     bad_length: int,
+    monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setenv("SGLANG_Q8KV8_VALIDATE_TOPK_LENGTH", "1")
     args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=128)
     args["topk_length"][0] = bad_length
 
@@ -584,33 +601,43 @@ def test_q8kv8_sparse_prefill_rejects_invalid_topk_length_bounds(
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(),
+    reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA",
 )
-def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path(
+    compress_ratio: int,
+):
     device = torch.device("cuda")
     backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
         _make_sparse_prefill_case(device, local_heads=64)
     )
+    _populate_compress_metadata(
+        core_attn_metadata,
+        compress_ratio=compress_ratio,
+        device=device,
+    )
 
-    bf16_out = backend._forward_prefill_sparse(
-        q=q,
-        layer_id=0,
-        compress_ratio=0,
-        forward_batch=forward_batch,
-        token_to_kv_pool=token_to_kv_pool,
-        core_attn_metadata=core_attn_metadata,
-        attn_sink=attn_sink,
-    )
-    sparse_cache = backend.forward_metadata.sparse_prefill_cache
-    q8_out = backend._forward_prefill_sparse_q8kv8(
-        q=q,
-        layer_id=0,
-        compress_ratio=0,
-        forward_batch=forward_batch,
-        token_to_kv_pool=token_to_kv_pool,
-        core_attn_metadata=core_attn_metadata,
-        attn_sink=attn_sink,
-    )
+    with _patched_compressed_sparse_cache_paths(compress_ratio):
+        bf16_out = backend._forward_prefill_sparse(
+            q=q,
+            layer_id=0,
+            compress_ratio=compress_ratio,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            core_attn_metadata=core_attn_metadata,
+            attn_sink=attn_sink,
+        )
+        sparse_cache = backend.forward_metadata.sparse_prefill_cache
+        q8_out = backend._forward_prefill_sparse_q8kv8(
+            q=q,
+            layer_id=0,
+            compress_ratio=compress_ratio,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            core_attn_metadata=core_attn_metadata,
+            attn_sink=attn_sink,
+        )
     torch.cuda.synchronize()
 
     assert backend.forward_metadata.sparse_prefill_cache is sparse_cache
@@ -640,7 +667,98 @@ def test_q8kv8_sparse_prefill_real_kernel_matches_bf16_sparse_path():
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(),
+    reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA",
+)
+def test_q8kv8_deepseek_v4_flash_shape_matches_bf16_sparse_kernel():
+    """Exercise DeepSeek-V4-Flash's 64-head, D=512, index_topk=512 shape."""
+    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+    args = _make_q8kv8_kernel_args(
+        device=torch.device("cuda"),
+        s_q=5,
+        h_q=64,
+        d_qk=512,
+        s_kv=1024,
+        h_kv=1,
+        topk=512,
+    )
+    q_bf16 = args["q"].to(torch.bfloat16)
+    kv_bf16 = args["kv"].to(torch.bfloat16)
+
+    golden, _, _ = flash_mla_sparse_fwd(
+        q=q_bf16,
+        kv=kv_bf16,
+        indices=args["indices"],
+        sm_scale=args["sm_scale"],
+        d_v=args["d_v"],
+        attn_sink=args["attn_sink"],
+        topk_length=args["topk_length"],
+    )
+    actual, _, _ = sparse_mla_q8kv8_prefill_fwd(**args)
+    torch.cuda.synchronize()
+
+    abs_diff = (actual.float() - golden.float()).abs()
+    assert abs_diff.mean().item() < 0.02
+    assert torch.quantile(abs_diff.flatten(), 0.99).item() < 0.1
+    torch.testing.assert_close(
+        actual.float(),
+        golden.float(),
+        atol=1.5e-1,
+        rtol=2.0e-1,
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_sm100_supported()),
+    reason="Unpadded TP8 Q heads require SM100 CUDA",
+)
+def test_q8kv8_deepseek_v4_flash_tp8_heads_match_bf16_sparse_kernel():
+    """Exercise the production TP8 shape without SM90's 64-head padding."""
+    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+    args = _make_q8kv8_kernel_args(
+        device=torch.device("cuda"),
+        s_q=32,
+        h_q=8,
+        d_qk=512,
+        s_kv=1024,
+        h_kv=1,
+        topk=512,
+    )
+    q_bf16_padded = torch.zeros(
+        (args["q"].shape[0], 64, args["q"].shape[2]),
+        dtype=torch.bfloat16,
+        device=args["q"].device,
+    )
+    q_bf16_padded[:, :8].copy_(args["q"])
+    sink_padded = torch.zeros(64, dtype=torch.float32, device=args["q"].device)
+    sink_padded[:8].copy_(args["attn_sink"])
+    golden, _, _ = flash_mla_sparse_fwd(
+        q=q_bf16_padded,
+        kv=args["kv"].to(torch.bfloat16),
+        indices=args["indices"],
+        sm_scale=args["sm_scale"],
+        d_v=args["d_v"],
+        attn_sink=sink_padded,
+        topk_length=args["topk_length"],
+    )
+    actual, _, _ = sparse_mla_q8kv8_prefill_fwd(**args)
+    torch.cuda.synchronize()
+
+    assert actual.shape == (32, 8, 512)
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), golden[:, :8].float().flatten(), dim=0
+    )
+    assert cosine.item() > 0.995
+    torch.testing.assert_close(
+        actual.float(), golden[:, :8].float(), atol=1.5e-1, rtol=2.0e-1
+    )
+
+
+@pytest.mark.skipif(
+    not _q8kv8_available(),
+    reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA",
 )
 def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
     args = _make_q8kv8_kernel_args(

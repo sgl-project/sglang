@@ -1,11 +1,13 @@
-"""JIT-compiled Q8KV8 sparse prefill attention kernel for SM90 (Hopper/H200).
+"""Q8KV8 sparse prefill attention with SM90 and SM100 dispatch.
 
 Uses native FP8 GMMA instructions via CUTLASS/CUTE for MLA attention
-with FP8 quantized Q and KV tensors.
+with FP8 quantized Q and KV tensors on SM90.  The public entry point dispatches
+to the native FP8 Triton implementation on SM100.
 """
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -118,6 +120,43 @@ def _check_out_buffer(
         raise ValueError(f"{name} must be on device {device}, got {t.device}")
     if not t.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def _sparse_mla_q8kv8_prefill_fwd_sm100_trusted(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_length: torch.Tensor,
+    out: torch.Tensor,
+    max_logits: torch.Tensor,
+    lse: torch.Tensor,
+    active_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Launch SM100 CUDA for backend-owned, already-validated tensors."""
+    from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm100_cuda import (
+        sparse_mla_q8kv8_prefill_fwd_sm100_cuda,
+    )
+
+    sparse_mla_q8kv8_prefill_fwd_sm100_cuda(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        out=out,
+        max_logits=max_logits,
+        lse=lse,
+        active_heads=active_heads,
+    )
+    return out, max_logits, lse
 
 
 # Internal custom-op wrappers so the JIT kernel calls participate in
@@ -281,7 +320,7 @@ def sparse_mla_q8kv8_prefill_fwd(
     max_logits: Optional[torch.Tensor] = None,  # [s_q, h_q], float32
     lse: Optional[torch.Tensor] = None,  # [s_q, h_q], float32
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run Q8KV8 (FP8) sparse prefill attention on SM90.
+    """Run Q8KV8 (FP8) sparse prefill attention on SM90 or SM100.
 
     The kernel writes into three output tensors. By default fresh tensors
     are allocated and returned; callers that want to reuse buffers may pass
@@ -303,7 +342,7 @@ def sparse_mla_q8kv8_prefill_fwd(
         )
     if indices.ndim != 3:
         raise ValueError(
-            "indices must have shape (s_q, h_kv, topk), " f"got {tuple(indices.shape)}"
+            f"indices must have shape (s_q, h_kv, topk), got {tuple(indices.shape)}"
         )
 
     s_q, h_q, d_qk = q.shape
@@ -327,6 +366,13 @@ def sparse_mla_q8kv8_prefill_fwd(
             f"indices must be on q's device {device}, got {indices.device}"
         )
 
+    device_major = torch.cuda.get_device_capability(device)[0]
+    if device_major not in (9, 10):
+        raise ValueError(
+            "sparse_mla_q8kv8_prefill_fwd requires an SM90 or SM100 CUDA GPU, "
+            f"got compute capability {torch.cuda.get_device_capability(device)}"
+        )
+
     if q.dtype != torch.float8_e4m3fn:
         raise ValueError(f"q must be torch.float8_e4m3fn, got {q.dtype}")
     if kv.dtype != torch.float8_e4m3fn:
@@ -342,14 +388,13 @@ def sparse_mla_q8kv8_prefill_fwd(
     if kv_d_qk != d_qk:
         raise ValueError(f"kv d_qk must match q d_qk={d_qk}, got {kv_d_qk}")
 
-    # The CUDA implementation uses B_H=64 and launches h_q / B_H CTAs.
-    # Reject unpadded TP-local head counts instead of launching zero CTAs and
-    # returning uninitialized outputs, which can appear to callers as a hang or
-    # a later collective failure.
-    if h_q == 0 or h_q % 64 != 0:
+    # The SM90 CUDA implementation uses B_H=64 and launches h_q / B_H CTAs.
+    # SM100 specializes its Triton tile to the active TP-local head count and
+    # therefore deliberately accepts unpadded head counts (notably TP8's 8).
+    if h_q == 0 or (device_major == 9 and h_q % 64 != 0):
         raise ValueError(
-            "sparse_mla_q8kv8_prefill_fwd requires h_q padded to a positive "
-            f"multiple of 64, got {h_q}"
+            "SM90 sparse_mla_q8kv8_prefill_fwd requires h_q padded to a "
+            f"positive multiple of 64, got {h_q}"
         )
 
     if h_kv != 1:
@@ -362,8 +407,7 @@ def sparse_mla_q8kv8_prefill_fwd(
 
     if indices.shape[:2] != (s_q, h_kv):
         raise ValueError(
-            "indices must have shape "
-            f"({s_q}, {h_kv}, topk), got {tuple(indices.shape)}"
+            f"indices must have shape ({s_q}, {h_kv}, topk), got {tuple(indices.shape)}"
         )
 
     if indices.dtype != torch.int32:
@@ -385,14 +429,18 @@ def sparse_mla_q8kv8_prefill_fwd(
             raise ValueError("topk_length must be a CUDA tensor")
         if topk_length.device != device:
             raise ValueError(
-                "topk_length must be on q's device "
-                f"{device}, got {topk_length.device}"
+                f"topk_length must be on q's device {device}, got {topk_length.device}"
             )
         if not topk_length.is_contiguous():
             raise ValueError("topk_length must be contiguous")
-        if torch.any(topk_length < 0).item() or torch.any(topk_length > topk).item():
+        # Value validation synchronizes the CUDA stream twice through .item().
+        # Production metadata is generated by trusted in-tree kernels, so keep
+        # the synchronization-heavy check behind an explicit diagnostic flag.
+        if os.environ.get("SGLANG_Q8KV8_VALIDATE_TOPK_LENGTH", "0") == "1" and (
+            torch.any(topk_length < 0).item() or torch.any(topk_length > topk).item()
+        ):
             raise ValueError(
-                "topk_length values must satisfy " f"0 <= topk_length <= topk ({topk})"
+                f"topk_length values must satisfy 0 <= topk_length <= topk ({topk})"
             )
 
     if d_v != 512:
@@ -459,6 +507,25 @@ def sparse_mla_q8kv8_prefill_fwd(
     if out_ptr == ml_ptr or out_ptr == lse_ptr or ml_ptr == lse_ptr:
         raise ValueError("out, max_logits and lse must not alias each other")
 
+    if device_major == 10:
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm100 import (
+            sparse_mla_q8kv8_prefill_fwd_sm100,
+        )
+
+        sparse_mla_q8kv8_prefill_fwd_sm100(
+            q=q,
+            kv=kv,
+            indices=indices,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            out=out,
+            max_logits=max_logits,
+            lse=lse,
+        )
+        return out, max_logits, lse
     cuda_stream = _get_current_stream_raw(q.device.index)
 
     if attn_sink is not None and topk_length is not None:

@@ -6,7 +6,7 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.utils import is_sm90_supported
+from sglang.srt.utils import is_sm90_supported, is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=240, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -24,8 +24,8 @@ S_KV = 256
 # optional kernel full path and partial topk_length handling.
 
 
-def _sm90_available() -> bool:
-    return is_sm90_supported()
+def _q8kv8_available() -> bool:
+    return is_sm90_supported() or is_sm100_supported()
 
 
 def _make_fp8_tensor(shape: tuple[int, ...], seed: int) -> torch.Tensor:
@@ -162,7 +162,7 @@ def _run_and_check(d_qk, with_sink, s_q=2, topk=TOPK, s_kv=S_KV):
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize("d_qk,with_sink", [(512, False), (576, False)])
 def test_sparse_mla_q8kv8_prefill_matches_reference(d_qk: int, with_sink: bool):
@@ -173,7 +173,7 @@ def test_sparse_mla_q8kv8_prefill_matches_reference(d_qk: int, with_sink: bool):
 # configurations, and optional sink+topk_length feature coverage. The kernel
 # requires topk to be a multiple of 128, so 128 is the minimum supported.
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize(
     "d_qk,with_sink,s_q,topk,s_kv",
@@ -197,7 +197,7 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
 # be BITWISE identical to the full-topk dispatch that masks those pads, and
 # must match the fp32 reference on the truncated index range.
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize(
     "d_qk,s_q,topk,s_kv",
@@ -276,7 +276,7 @@ def test_sparse_mla_q8kv8_prefill_topk_length_only(
 # above as kernel feature coverage, but sink-enabled precision numbers should
 # not be used as E2E proxy results until the E2E pipeline wires attn_sink.
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize(
     "d_qk,s_q,topk,s_kv",
@@ -359,7 +359,7 @@ def test_sparse_mla_q8kv8_prefill_precision(d_qk: int, s_q: int, topk: int, s_kv
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
     """Two default-allocation calls with the same shape must return independent
@@ -406,7 +406,7 @@ def test_sparse_mla_q8kv8_prefill_no_alias_between_calls():
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
     """Caller-provided ``out`` / ``max_logits`` / ``lse`` tensors must be
@@ -448,7 +448,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     """Validation: wrong shape/dtype and aliasing must raise ValueError."""
@@ -542,7 +542,7 @@ def _ref_masked_blocked(q, kv, indices, sm_scale, d_v, row_start, row_end):
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize("s_q", [2048, 4096])
 def test_sparse_mla_q8kv8_prefill_masked_sentinels(s_q: int):
@@ -604,7 +604,7 @@ def test_sparse_mla_q8kv8_prefill_masked_sentinels(s_q: int):
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize("s_q", [2048, 4096, 6144])
 def test_sparse_mla_q8kv8_prefill_sq_envelope(s_q: int):
@@ -648,7 +648,7 @@ def test_sparse_mla_q8kv8_prefill_sq_envelope(s_q: int):
 
 
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 def test_sparse_mla_q8kv8_prefill_large_skv():
     """NEW gate (bug class 3): large gathered buffers / large index values
@@ -687,7 +687,7 @@ def test_sparse_mla_q8kv8_prefill_large_skv():
 # (interleaved -1s, all-pad, full rows) where the trailing-run semantics still
 # define the correct consumed range.
 @pytest.mark.skipif(
-    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+    not _q8kv8_available(), reason="Q8KV8 sparse prefill requires SM90 or SM100 CUDA"
 )
 @pytest.mark.parametrize("s_q,topk", [(437, 2048), (7, 128), (65, 256), (4096, 2048)])
 def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
