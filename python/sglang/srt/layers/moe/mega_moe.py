@@ -47,19 +47,13 @@ _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
-    """Upper bound on the SM count a Blackwell MegaMoE launch may use.
-
-    None on other architectures: the SM90 MegaMoE implementation does not use
-    the whole-grid clustered launch that needs a residency margin.
-
-    Anchored to the physical SM count so the margin stays absolute. Two-batch
-    overlap and the DSA indexer reconfigure DeepGEMM process-wide, and
-    subtracting the reserve from whatever they left behind would compound the
-    two reservations.
-    """
     if _device_sm < 100:
+        # The SM90 MegaMoE implementation does not use the whole-grid clustered
+        # launch that needs a residency margin.
         return None
 
+    # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
+    # indexer reconfigure that process-wide, so reserving on top would compound.
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
     return max(2, num_sms - reserved_num_sms)
@@ -72,10 +66,10 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         yield
         return
 
-    # Stay under an outer context's budget rather than claiming SMs back from
-    # it, and round down to keep the launch compatible with the 2-CTA cluster.
     current_num_sms = deep_gemm.get_num_sms()
+    # Stay under an outer context's budget instead of claiming SMs back from it.
     target_num_sms = min(max_num_sms, current_num_sms)
+    # Round down: the clustered launch needs an even CTA count.
     target_num_sms -= target_num_sms % 2
     if target_num_sms == current_num_sms:
         yield
