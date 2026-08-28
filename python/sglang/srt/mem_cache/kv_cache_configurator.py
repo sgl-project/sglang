@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from dataclasses import dataclass, field
@@ -238,26 +239,21 @@ class KVCacheConfigurator:
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
-    is_inkling_mtp_draft: bool = field(init=False)
+    is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
-        # Each multi-layer EAGLE MTP head owns one transformer block at
-        # layer_id=draft_model_idx; heads at a banded 's' depth route that layer
-        # into the SWA ring sub-pool (draft_swa_full_capacity) so the SWA
-        # store/read path activates for this depth, exactly like a trunk local
-        # layer.
-        self.is_inkling_mtp_draft = (
+        self.is_hybrid_swa_mtp_draft = (
             self.is_draft_worker
             and self.draft_model_idx is not None
-            and self.model_config.hf_config.architectures[0]
-            == "InklingForConditionalGenerationMTP"
+            and self.is_hybrid_swa
+            and getattr(self.model_config.hf_text_config, "mtp_local_layer_ids", None)
+            is not None
         )
-        self.draft_swa_full_capacity = self.is_inkling_mtp_draft and (
-            self.draft_model_idx
-            in set(self.model_config.hf_text_config.mtp_local_layer_ids)
+        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
+            self.draft_model_idx in self.model_config.swa_attention_layer_ids
         )
 
     def _build_fp4_quant_method(self, *, num_layers: int):
@@ -478,7 +474,7 @@ class KVCacheConfigurator:
             # Each multi-layer EAGLE MTP head owns one transformer block at
             # layer_id=draft_model_idx and needs its own sconv/mamba cache while
             # sharing the target's request-to-token mapping.
-            if self.is_inkling_mtp_draft and isinstance(
+            if self.is_hybrid_swa_mtp_draft and isinstance(
                 req_to_token_pool, HybridReqToTokenPool
             ):
                 # speculative_num_draft_tokens=None: draft heads never run
@@ -1474,23 +1470,15 @@ class KVCacheConfigurator:
         )
         swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
         full_attention_layer_ids = self.model_config.full_attention_layer_ids
-        if self.is_inkling_mtp_draft:
+        if self.is_hybrid_swa_mtp_draft:
             if self.draft_swa_full_capacity:
-                # Banded 's' depth: route the draft's single layer into the SWA
-                # ring sub-pool so use_sliding_window_kv_pool activates the SWA
-                # store/read path for this depth, exactly like a trunk local
-                # layer.
+                # Route local MTP depths through the SWA ring pool.
                 swa_attention_layer_ids = [self.draft_model_idx]
                 full_attention_layer_ids = []
             else:
                 swa_attention_layer_ids = []
                 full_attention_layer_ids = [self.draft_model_idx]
-        # Size the banded draft's SWA ring to FULL draft capacity (not the
-        # trunk-window-derived swa_max): with the identity full->swa mapping
-        # registered in _build_token_to_kv_pool_allocator, every logical slot
-        # the shared target allocator hands out (up to full_max) must be
-        # addressable in the ring, whatever the head-vs-trunk window
-        # relationship.
+        # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
             if self.draft_swa_full_capacity
@@ -1825,6 +1813,12 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # Weight-loading temporaries can still be referenced at this point, and
+        # empty_cache() (which get_available_gpu_memory already calls) cannot
+        # reclaim referenced blocks. Without collecting first, the KV budget is
+        # measured against an understated free-memory figure and the pool can be
+        # sized orders of magnitude too small while GPU memory sits idle.
+        gc.collect()
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -1919,7 +1913,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if get_parallel().config.pp_size > 1:
+        if get_parallel().pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

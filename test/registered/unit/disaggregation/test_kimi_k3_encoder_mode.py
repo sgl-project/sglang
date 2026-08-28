@@ -104,8 +104,8 @@ def test_epd_rejection_reads_the_resolved_transfer_backend():
 
     The record is produced by actual resolution -- a language-only Kimi-K3
     launch at TP2, whose `encoder_transfer_backend` starts at the argument
-    default `"auto"` (`ENCODER_TRANSFER_BACKEND_CHOICES[0]`) and is filled in
-    by `resolve_encoder_transfer_backend` to `"zmq_to_tokenizer"`. The guard
+    default `"auto"` and is filled in by `resolve_encoder_transfer_backend` to
+    `"zmq_to_tokenizer"`. The guard
     reads that resolved value out of the published bags, so the rejection
     survives the record going raw: what a reader must never do is go back to
     the record for this field.
