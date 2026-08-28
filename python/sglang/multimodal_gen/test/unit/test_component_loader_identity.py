@@ -95,6 +95,7 @@ class TestComponentLoaderIdentity(unittest.TestCase):
             "_class_name": "TestPipeline",
             "_diffusers_version": "0",
             "duration_head_2": ["ltx2", "LTX2DurationHeadModel"],
+            "unused_component": ["diffusers", "UnusedModel"],
         }
         server_args = SimpleNamespace(
             component_paths={},
