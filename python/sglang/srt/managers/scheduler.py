@@ -2845,6 +2845,8 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
 
     def _retry_missed_storage_prefetches(self):
