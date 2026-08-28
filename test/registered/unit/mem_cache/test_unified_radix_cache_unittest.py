@@ -2708,6 +2708,8 @@ class UnifiedRadixCacheSuite:
             prefix_len = f.matched_len
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
@@ -3342,6 +3344,8 @@ class UnifiedRadixCacheSuite:
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         req.last_node = cons.root_node_handle()
         req.prefix_indices = torch.zeros(
             held.matched_len,
@@ -3561,6 +3565,8 @@ class UnifiedRadixCacheSuite:
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         req.last_node = cons.root_node_handle()
         req.prefix_indices = torch.zeros(
             held.matched_len,
@@ -3763,6 +3769,8 @@ class UnifiedRadixCacheSuite:
         f = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         req.prefix_indices = torch.zeros(
             0,
             dtype=torch.int64,
@@ -7626,7 +7634,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.can_terminate_prefetch.return_value = True
+        cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
         order = mock.MagicMock()
@@ -7799,7 +7807,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         operation.hash_value = hashes
 
         with (
-            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
             # Isolate the drop-release branch under test from the hybrid-sync
             # step: treat the whole fetched prefix as usable so the insert runs.
             mock.patch.object(
