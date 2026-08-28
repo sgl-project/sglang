@@ -133,6 +133,11 @@ _EMBEDDING_ARCHITECTURES = {
         EmbeddingExecution.DECODER_POOLING,
         PoolingStrategy.LAST,
     ),
+    "Qwen3BidirectionalModel": (
+        "qwen3_bidirectional",
+        EmbeddingExecution.ENCODER_ONLY,
+        PoolingStrategy.MEAN,
+    ),
     "XLMRobertaModel": (
         "xlm_roberta",
         EmbeddingExecution.ENCODER_ONLY,

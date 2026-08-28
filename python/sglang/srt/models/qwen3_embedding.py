@@ -121,4 +121,24 @@ class Qwen3Model(nn.Module):
                     logger.warning(f"Parameter {name} not found in params_dict")
 
 
-EntryClass = Qwen3Model
+class Qwen3BidirectionalModel(Qwen3Model):
+    """Bidirectional Qwen3 encoder for dense embedding models.
+
+    Checkpoints exported as architectures=["Qwen3BidirectionalModel"], e.g.
+    ai-sage/Giga-Embeddings-instruct-3B-0826, run the Qwen3 backbone with
+    encoder-style (bidirectional) attention -- enabled by is_causal=False on
+    the HF config, threaded into the attention layers -- and produce a sentence
+    embedding via mean pooling over non-padding tokens + L2 normalization.
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
+
+
+EntryClass = [Qwen3Model, Qwen3BidirectionalModel]
