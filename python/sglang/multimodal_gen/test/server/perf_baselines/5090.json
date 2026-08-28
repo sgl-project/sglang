@@ -60,7 +60,7 @@
             "expected_e2e_ms": 18255.39,
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
-            "load_peak_vram_mb": 1126.0,
+            "load_peak_vram_mb": 8522.0,
             "runtime_peak_vram_mb": 20064.0,
             "estimated_full_test_time_s": 94.0
         },
