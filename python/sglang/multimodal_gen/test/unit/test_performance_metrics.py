@@ -332,7 +332,6 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
     worker = GPUWorker.__new__(GPUWorker)
     worker.rank = 0
     worker.is_output_rank = True
-    worker._auto_residency_budget_correction_bytes = 2 * GIB_BYTES
     worker._auto_residency_reference_request_duration_ns = None
     worker._auto_residency_reference_stage_duration_ns = {}
     worker._auto_residency_reference_component_stages = {}
@@ -386,6 +385,7 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
                     num_frames=1,
                     baseline_allocated_bytes=1,
                     peak_allocated_bytes=2,
+                    peak_reserved_bytes=2 * GIB_BYTES + 2,
                     succeeded=True,
                 )
             ],

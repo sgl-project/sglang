@@ -864,13 +864,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 step_duration_ms_by_stage=(
                     {
                         stage_name: tuple(durations)
-                        for stage_name, durations in metrics.steps_by_stage.items()
+                        for stage_name, durations in getattr(
+                            metrics, "steps_by_stage", {}
+                        ).items()
                     }
                     if metrics is not None
                     else {}
                 ),
                 stage_iterations=(
-                    dict(metrics.stage_iterations) if metrics is not None else {}
+                    dict(getattr(metrics, "stage_iterations", {}))
+                    if metrics is not None
+                    else {}
                 ),
             )
         )

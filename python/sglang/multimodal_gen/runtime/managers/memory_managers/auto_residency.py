@@ -553,6 +553,13 @@ def _repeated_stages(
         if is_dit_component_name(component_name)
         for stage_name in stage_names
     }
+    stages.update(
+        stage_name
+        for stage_names in component_stages.values()
+        for stage_name in stage_names
+        if stage_name.endswith("DenoisingStage")
+        and not stage_name.endswith("BeforeDenoisingStage")
+    )
     stages.update(record.stage_iterations)
     stages.update(
         stage_name
@@ -628,17 +635,28 @@ def estimate_default_workload_timing(
             repeated_stages=repeated_stages,
             target_num_inference_steps=target_num_inference_steps,
         )
-        step_durations = representative.step_duration_ms_by_stage.get(stage_name, ())
+        stage_step_durations = representative.step_duration_ms_by_stage.get(
+            stage_name, ()
+        )
+        step_durations = stage_step_durations
         if not step_durations and len(repeated_stages) == 1:
             step_durations = representative.step_duration_ms
         if stage_name in repeated_stages and step_durations:
-            steady_steps = (
-                step_durations[1:] if len(step_durations) > 1 else step_durations
-            )
             non_step_ms = max(0.0, duration_ms - sum(step_durations))
-            target_duration_ms = non_step_ms + (
-                statistics.median(steady_steps) * target_iterations
-            )
+            if stage_step_durations and len(step_durations) > 1:
+                target_duration_ms = (
+                    non_step_ms
+                    + step_durations[0]
+                    + statistics.median(step_durations[1:])
+                    * max(0, target_iterations - 1)
+                )
+            else:
+                steady_steps = (
+                    step_durations[1:] if len(step_durations) > 1 else step_durations
+                )
+                target_duration_ms = non_step_ms + (
+                    statistics.median(steady_steps) * target_iterations
+                )
         else:
             target_duration_ms = duration_ms * target_iterations / measured_iterations
         stage_duration_ns[stage_name] = max(0, int(target_duration_ms * 1_000_000))
@@ -2176,7 +2194,7 @@ def collect_residency_targets(
             uses_per_streamed_layer=uses_per_request,
             layer_uses=layer_uses,
         )
-        full_weight_bytes = _module_weight_bytes(module)
+        full_weight_bytes = max(_module_weight_bytes(module), managed_weight_bytes)
         unmanaged_weight_bytes = max(0, full_weight_bytes - managed_weight_bytes)
         component_transfer_work = (
             PAGEABLE_H2D_COST_MULTIPLIER * full_weight_bytes if component_used else 0
