@@ -9,6 +9,7 @@
 // is unspecified (atomic collection order), matching the AOT kernel.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -33,8 +34,7 @@ struct FastTopKParams {
 SGL_DEVICE auto convert_to_uint8(float x) -> uint8_t {
   const __half h = __float2half_rn(x);
   const uint16_t bits = __half_as_ushort(h);
-  const uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
-                                       : static_cast<uint16_t>(bits | 0x8000);
+  const uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
   return static_cast<uint8_t>(key >> 8);
 }
 
@@ -45,8 +45,7 @@ SGL_DEVICE auto convert_to_uint32(float x) -> uint32_t {
 
 // When length <= kTopK, write the indices directly.
 template <int kTopK>
-SGL_DEVICE void naive_topk(
-    const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
+SGL_DEVICE void naive_topk(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
   const auto tid = threadIdx.x;
   for (int i = tid; i < kTopK; i += kThreadsPerBlock) {
     indice[i] = (i < length) ? i : -1;
@@ -55,8 +54,7 @@ SGL_DEVICE void naive_topk(
 
 // Radix-select top-k. Assumes length > kTopK (checked by the caller).
 template <int kTopK>
-SGL_DEVICE void radix_select_topk(
-    const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
+SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   int topk = kTopK;
   constexpr auto BLOCK_SIZE = kThreadsPerBlock;
   constexpr auto RADIX = 256;
@@ -156,9 +154,7 @@ SGL_DEVICE void radix_select_topk(
 
     // clip here to prevent overflow
     const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE))
-                               ? _raw_num_input
-                               : int(SMEM_INPUT_SIZE);
+    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
 
     run_cumsum();
     if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
@@ -293,11 +289,7 @@ struct FastTopKKernel {
     };
 
     const auto num_rows = static_cast<uint32_t>(B.unwrap());
-    LaunchKernel(
-        num_rows,
-        fast_topk_detail::kThreadsPerBlock,
-        device.unwrap(),
-        fast_topk_detail::kSmemBytes)
+    LaunchKernel(num_rows, fast_topk_detail::kThreadsPerBlock, device.unwrap(), fast_topk_detail::kSmemBytes)
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };

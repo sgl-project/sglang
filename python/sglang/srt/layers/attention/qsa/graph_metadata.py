@@ -164,7 +164,9 @@ def _qsa_graph_row_metadata_kernel(
     for p0 in range(0, max_pages, PAGE_BLOCK):
         idx = p0 + offs
         valid = idx < tl.minimum(max_pages, row_width_pages)
-        loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0)
+        loc = tl.load(
+            req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
+        )
         tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
 
 
@@ -173,9 +175,7 @@ def supports_graph_metadata_kernels(pool, device) -> bool:
 
     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
-    return torch.device(device).type == "cuda" and isinstance(
-        pool, QSATokenToKVPool
-    )
+    return torch.device(device).type == "cuda" and isinstance(pool, QSATokenToKVPool)
 
 
 def launch_graph_metadata(

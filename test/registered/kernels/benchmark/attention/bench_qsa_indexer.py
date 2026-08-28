@@ -9,6 +9,7 @@ the per-step total across Qwen4-Exp's 12 QSA layers.
 from types import SimpleNamespace
 
 import torch
+
 from sglang.kernels.jit.benchmark import marker
 from sglang.test.ci.ci_register import register_cuda_ci
 

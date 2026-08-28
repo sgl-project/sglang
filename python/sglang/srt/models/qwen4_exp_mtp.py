@@ -79,10 +79,14 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             if self.hc_count > 1
             else config.hidden_size
         )
-        self.pre_fc_norm_hidden = GemmaRMSNorm(hidden_norm_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = GemmaRMSNorm(
+            hidden_norm_size, eps=config.rms_norm_eps
+        )
 
     def _init_linear_projections(self, config: PretrainedConfig) -> None:
-        self.fc_embedding = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.fc_embedding = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False
+        )
         self.fc_hidden = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def _init_standard_fusion(self, config: PretrainedConfig):
@@ -213,7 +217,9 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
-        self._set_hc_logits_hidden_states(logits_output, hc_hidden_states, forward_batch)
+        self._set_hc_logits_hidden_states(
+            logits_output, hc_hidden_states, forward_batch
+        )
         return logits_output
 
 

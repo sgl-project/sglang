@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -22,9 +22,7 @@ def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Mo
     # `cache_once` keys on (group_size, dtype), so this runs once per
     # specialisation instead of once per call.
     if dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(
-            f"Unsupported dtype {dtype}. Supported: bfloat16, float16"
-        )
+        raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if group_size <= 0 or group_size % 512 != 0:
         raise RuntimeError(
             f"Unsupported group_size {group_size}. Must be a multiple of 512."

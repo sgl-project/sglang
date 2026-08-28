@@ -7,7 +7,9 @@ from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 
 def torch_impl_grouped_gemma_rmsnorm(

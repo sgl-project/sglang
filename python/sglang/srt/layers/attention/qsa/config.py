@@ -169,10 +169,9 @@ def parse_qsa_profile(config) -> Optional[QSAProfile]:
     if text_config is None:
         return None
     has_compressed = getattr(text_config, "indexer_n_heads", None) is not None
-    has_tokenwise = (
-        getattr(text_config, "index_topk", None) is not None
-        and _is_qwen_family(text_config)
-    )
+    has_tokenwise = getattr(
+        text_config, "index_topk", None
+    ) is not None and _is_qwen_family(text_config)
     if has_compressed and has_tokenwise:
         raise ValueError(
             "Ambiguous QSA config: both compressed (indexer_*) and tokenwise "

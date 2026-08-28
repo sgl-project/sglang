@@ -33,9 +33,7 @@ class GroupedGemmaRMSNorm(nn.Module):
         self.weight.weight_loader = self._weight_loader
         # The JIT kernel requires group_size to be a multiple of 512; this is
         # init-static, so resolve it once here (device/dtype stay per-call).
-        effective_group_size = (
-            group_size if group_size is not None else hidden_size
-        )
+        effective_group_size = group_size if group_size is not None else hidden_size
         self._jit_group_size = (
             effective_group_size if effective_group_size % 512 == 0 else None
         )

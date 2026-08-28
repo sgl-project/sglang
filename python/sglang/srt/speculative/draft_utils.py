@@ -121,9 +121,7 @@ class DraftBackendFactory:
                 parse_qsa_profile,
             )
 
-            profile = parse_qsa_profile(
-                self.draft_model_runner.model_config.hf_config
-            )
+            profile = parse_qsa_profile(self.draft_model_runner.model_config.hf_config)
             if profile is not None and profile.variant != QSA_VARIANT_COMPRESSED:
                 # Tokenwise QSA has no graph-stable indexer metadata; keep
                 # the intentional eager draft-extend path and never fall

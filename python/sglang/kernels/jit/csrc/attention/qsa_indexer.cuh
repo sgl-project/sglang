@@ -155,10 +155,7 @@ SGL_DEVICE void qsa_mrope_apply(
  */
 template <typename T, int kHeadDim>
 SGL_DEVICE void qsa_gemma_norm_row(
-    const T* __restrict__ x_row,
-    const T* __restrict__ weight,
-    const float eps,
-    T* __restrict__ smem_row) {
+    const T* __restrict__ x_row, const T* __restrict__ weight, const float eps, T* __restrict__ smem_row) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
   using vec_t = AlignedVector<T, kPerLane>;
@@ -204,15 +201,15 @@ SGL_DEVICE void qsa_gemma_norm_row(
 }
 
 struct QsaIndexQPrepParams {
-  const void* qk;                  // [tokens, (num_q_heads + 1) * kHeadDim]
-  void* q_out;                     // [tokens, q_heads_padded, kHeadDim]
-  const void* weight;              // [kHeadDim]
-  const float* cos_sin_cache;      // [positions_capacity, rotary_dim]
-  const int32_t* axis_map;         // [rotary_dim / 2]
-  const int64_t* positions;        // [num_axes, tokens] (row stride may exceed tokens)
-  const int64_t* cache_loc;        // [tokens]
-  void* key_state_buffer;          // [slots, kHeadDim]
-  int64_t* rope_position_buffer;   // [slots, 3]
+  const void* qk;                 // [tokens, (num_q_heads + 1) * kHeadDim]
+  void* q_out;                    // [tokens, q_heads_padded, kHeadDim]
+  const void* weight;             // [kHeadDim]
+  const float* cos_sin_cache;     // [positions_capacity, rotary_dim]
+  const int32_t* axis_map;        // [rotary_dim / 2]
+  const int64_t* positions;       // [num_axes, tokens] (row stride may exceed tokens)
+  const int64_t* cache_loc;       // [tokens]
+  void* key_state_buffer;         // [slots, kHeadDim]
+  int64_t* rope_position_buffer;  // [slots, 3]
   int64_t positions_stride;
   int32_t num_axes;
   int32_t num_q_heads;
@@ -227,8 +224,7 @@ struct QsaIndexQPrepParams {
  * One CTA (4 warps) per token; one warp per query head.
  */
 template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
-__global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(
-    const QsaIndexQPrepParams __grid_constant__ params) {
+__global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPrepParams __grid_constant__ params) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
   using vec_t = AlignedVector<T, kPerLane>;
@@ -239,8 +235,7 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  const int64_t qk_row =
-      static_cast<int64_t>(token) * (params.num_q_heads + 1) * kHeadDim;
+  const int64_t qk_row = static_cast<int64_t>(token) * (params.num_q_heads + 1) * kHeadDim;
   const int64_t loc = params.cache_loc[token];
   int64_t pos[3];
 #pragma unroll
@@ -249,19 +244,13 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(
     pos[a] = params.positions[ax * params.positions_stride + token];
   }
 
-  for (int32_t h = static_cast<int32_t>(warp); h < params.q_heads_padded;
-       h += 4) {
-    T* out_row =
-        static_cast<T*>(params.q_out) +
-        (static_cast<int64_t>(token) * params.q_heads_padded + h) * kHeadDim;
+  for (int32_t h = static_cast<int32_t>(warp); h < params.q_heads_padded; h += 4) {
+    T* out_row = static_cast<T*>(params.q_out) + (static_cast<int64_t>(token) * params.q_heads_padded + h) * kHeadDim;
     if (h < params.num_q_heads) {
       const T* x_row = static_cast<const T*>(params.qk) + qk_row + h * kHeadDim;
-      qsa_gemma_norm_row<T, kHeadDim>(
-          x_row, static_cast<const T*>(params.weight), params.eps,
-          smem_rows[warp]);
+      qsa_gemma_norm_row<T, kHeadDim>(x_row, static_cast<const T*>(params.weight), params.eps, smem_rows[warp]);
       qsa_mrope_apply<T, kHeadDim, kIsNeox>(
-          smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos,
-          params.rotary_dim);
+          smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
     } else {
       vec_t zv;
       zv.fill(DTypeTrait<T>::from(0.0f));
@@ -276,8 +265,7 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(
     kv.load(
         static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim,
         lane);  // offset is in vector units
-    kv.store(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim,
-             lane);
+    kv.store(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim, lane);
   }
   if (warp == 1 && lane < 3) {
     params.rope_position_buffer[loc * 3 + lane] = pos[lane];
@@ -287,14 +275,14 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(
 }
 
 struct QsaIndexKCompressParams {
-  const void* key_state_buffer;      // [slots, kHeadDim]
-  const int32_t* group_locs;         // [groups, compress_ratio]
+  const void* key_state_buffer;         // [slots, kHeadDim]
+  const int32_t* group_locs;            // [groups, compress_ratio]
   const int64_t* rope_position_buffer;  // [slots, 3]
-  const float* cos_sin_cache;        // [positions_capacity, rotary_dim]
-  const int32_t* axis_map;           // [rotary_dim / 2]
-  const void* weight;                // [kHeadDim]
-  const int32_t* write_locs;         // [groups]
-  void* compressed_k_buffer;         // [compressed_slots, kHeadDim]
+  const float* cos_sin_cache;           // [positions_capacity, rotary_dim]
+  const int32_t* axis_map;              // [rotary_dim / 2]
+  const void* weight;                   // [kHeadDim]
+  const int32_t* write_locs;            // [groups]
+  void* compressed_k_buffer;            // [compressed_slots, kHeadDim]
   int32_t compress_ratio;
   int32_t rotary_dim;
   int32_t num_groups;
@@ -307,8 +295,8 @@ struct QsaIndexKCompressParams {
  * One warp per group.
  */
 template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
-__global__ __launch_bounds__(128) void qsa_index_k_compress_kernel(
-    const QsaIndexKCompressParams __grid_constant__ params) {
+__global__
+__launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressParams __grid_constant__ params) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
   using vec_t = AlignedVector<T, kPerLane>;
@@ -333,8 +321,7 @@ __global__ __launch_bounds__(128) void qsa_index_k_compress_kernel(
     for (int32_t r = 0; r < params.compress_ratio; ++r) {
       vec_t v;
       v.load(
-          static_cast<const T*>(params.key_state_buffer) +
-              static_cast<int64_t>(locs[r]) * kHeadDim,
+          static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim,
           lane);  // offset is in vector units
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i) {
@@ -366,10 +353,8 @@ __global__ __launch_bounds__(128) void qsa_index_k_compress_kernel(
     const float nf = math::rsqrt(ss / kHeadDim + params.eps);
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
-      const float wf = static_cast<float>(
-          static_cast<const T*>(params.weight)[lane * kPerLane + i]);
-      smem_rows[warp][lane * kPerLane + i] =
-          DTypeTrait<T>::from(mf[i] * nf * (1.0f + wf));
+      const float wf = static_cast<float>(static_cast<const T*>(params.weight)[lane * kPerLane + i]);
+      smem_rows[warp][lane * kPerLane + i] = DTypeTrait<T>::from(mf[i] * nf * (1.0f + wf));
     }
     __syncwarp();
   }
@@ -380,11 +365,9 @@ __global__ __launch_bounds__(128) void qsa_index_k_compress_kernel(
     pos[a] = params.rope_position_buffer[static_cast<int64_t>(loc0) * 3 + a];
   }
 
-  T* out_row = static_cast<T*>(params.compressed_k_buffer) +
-               static_cast<int64_t>(params.write_locs[group]) * kHeadDim;
+  T* out_row = static_cast<T*>(params.compressed_k_buffer) + static_cast<int64_t>(params.write_locs[group]) * kHeadDim;
   qsa_mrope_apply<T, kHeadDim, kIsNeox>(
-      smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos,
-      params.rotary_dim);
+      smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
 
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -418,48 +401,25 @@ void qsa_index_q_prep(
   device.set_options<kDLCUDA>();
   constexpr int64_t D = kHeadDim;
 
-  TensorMatcher({tokens, (num_q_heads + 1) * D})
-      .with_dtype<T>()
-      .with_device(device)
-      .verify(qk);
+  TensorMatcher({tokens, (num_q_heads + 1) * D}).with_dtype<T>().with_device(device).verify(qk);
   auto heads_padded = SymbolicSize{"heads_padded"};
-  TensorMatcher({tokens, heads_padded, D})
-      .with_dtype<T>()
-      .with_device(device)
-      .verify(q_out);
+  TensorMatcher({tokens, heads_padded, D}).with_dtype<T>().with_device(device).verify(q_out);
   TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
   auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
-  TensorMatcher({cache_rows, rotary_dim})
-      .with_dtype<fp32_t>()
-      .with_device(device)
-      .verify(cos_sin_cache);
-  TensorMatcher({rotary_dim / 2})
-      .with_dtype<int32_t>()
-      .with_device(device)
-      .verify(axis_map);
-  TensorMatcher({num_axes, tokens})
-      .with_dtype<int64_t>()
-      .with_device(device)
-      .with_strides({-1, 1})
-      .verify(positions);
-  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(
-      cache_loc);
+  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
+  TensorMatcher({num_axes, tokens}).with_dtype<int64_t>().with_device(device).with_strides({-1, 1}).verify(positions);
+  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(cache_loc);
   auto slots = SymbolicSize{"state_slots"};
-  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(
-      key_state_buffer);
-  TensorMatcher({slots, 3})
-      .with_dtype<int64_t>()
-      .with_device(device)
-      .verify(rope_position_buffer);
+  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
+  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
 
   const int64_t num_tokens = tokens.unwrap();
   const int64_t q_heads_padded = heads_padded.unwrap();
   CHECK_HOST(num_tokens > 0) << "qsa_index_q_prep: no tokens";
-  CHECK_HOST(num_axes == 1 || num_axes == 3)
-      << "qsa_index_q_prep: positions must have 1 or 3 axes, got " << num_axes;
+  CHECK_HOST(num_axes == 1 || num_axes == 3) << "qsa_index_q_prep: positions must have 1 or 3 axes, got " << num_axes;
   CHECK_HOST(q_heads_padded >= num_q_heads)
-      << "qsa_index_q_prep: padded heads " << q_heads_padded
-      << " < num_q_heads " << num_q_heads;
+      << "qsa_index_q_prep: padded heads " << q_heads_padded << " < num_q_heads " << num_q_heads;
   CHECK_HOST(rotary_dim > 0 && rotary_dim % 2 == 0 && rotary_dim <= D)
       << "qsa_index_q_prep: invalid rotary_dim " << rotary_dim;
 
@@ -472,8 +432,7 @@ void qsa_index_q_prep(
       .positions = static_cast<const int64_t*>(positions.data_ptr()),
       .cache_loc = static_cast<const int64_t*>(cache_loc.data_ptr()),
       .key_state_buffer = key_state_buffer.data_ptr(),
-      .rope_position_buffer =
-          static_cast<int64_t*>(rope_position_buffer.data_ptr()),
+      .rope_position_buffer = static_cast<int64_t*>(rope_position_buffer.data_ptr()),
       .positions_stride = positions.stride(0),
       .num_axes = static_cast<int32_t>(num_axes),
       .num_q_heads = static_cast<int32_t>(num_q_heads),
@@ -482,8 +441,7 @@ void qsa_index_q_prep(
       .eps = eps,
   };
   LaunchKernel(static_cast<uint32_t>(num_tokens), 128, device.unwrap())
-      .enable_pdl(kUsePDL)(
-          qsa_index_q_prep_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
+      .enable_pdl(kUsePDL)(qsa_index_q_prep_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
 }
 
 /**
@@ -508,34 +466,17 @@ void qsa_index_k_compress(
   constexpr int64_t D = kHeadDim;
 
   auto slots = SymbolicSize{"state_slots"};
-  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(
-      key_state_buffer);
+  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
   auto groups = SymbolicSize{"groups"};
-  TensorMatcher({groups, compress_ratio})
-      .with_dtype<int32_t>()
-      .with_device(device)
-      .verify(group_locs);
-  TensorMatcher({slots, 3})
-      .with_dtype<int64_t>()
-      .with_device(device)
-      .verify(rope_position_buffer);
+  TensorMatcher({groups, compress_ratio}).with_dtype<int32_t>().with_device(device).verify(group_locs);
+  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
   auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
-  TensorMatcher({cache_rows, rotary_dim})
-      .with_dtype<fp32_t>()
-      .with_device(device)
-      .verify(cos_sin_cache);
-  TensorMatcher({rotary_dim / 2})
-      .with_dtype<int32_t>()
-      .with_device(device)
-      .verify(axis_map);
+  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
   TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
-  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(
-      write_locs);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(write_locs);
   auto compressed_slots = SymbolicSize{"compressed_slots"};
-  TensorMatcher({compressed_slots, D})
-      .with_dtype<T>()
-      .with_device(device)
-      .verify(compressed_k_buffer);
+  TensorMatcher({compressed_slots, D}).with_dtype<T>().with_device(device).verify(compressed_k_buffer);
 
   const int64_t num_groups = groups.unwrap();
   CHECK_HOST(num_groups > 0) << "qsa_index_k_compress: no groups";
@@ -547,8 +488,7 @@ void qsa_index_k_compress(
   const auto params = QsaIndexKCompressParams{
       .key_state_buffer = key_state_buffer.data_ptr(),
       .group_locs = static_cast<const int32_t*>(group_locs.data_ptr()),
-      .rope_position_buffer =
-          static_cast<const int64_t*>(rope_position_buffer.data_ptr()),
+      .rope_position_buffer = static_cast<const int64_t*>(rope_position_buffer.data_ptr()),
       .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
       .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
       .weight = weight.data_ptr(),
@@ -559,10 +499,8 @@ void qsa_index_k_compress(
       .num_groups = static_cast<int32_t>(num_groups),
       .eps = eps,
   };
-  LaunchKernel(
-      static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())
-      .enable_pdl(kUsePDL)(
-          qsa_index_k_compress_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
+  LaunchKernel(static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())
+      .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
 }
 
 }  // namespace sglang

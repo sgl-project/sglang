@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -16,15 +16,15 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_hc_combine_module(hc_count: int, hidden_size: int, dtype: torch.dtype) -> Module:
+def _jit_hc_combine_module(
+    hc_count: int, hidden_size: int, dtype: torch.dtype
+) -> Module:
     """Compile and cache the JIT HC combine module for a given shape/dtype."""
     # Checks on the compile key live here, not in `hc_combine`: `cache_once`
     # keys on (hc_count, hidden_size, dtype), so this runs once per
     # specialisation instead of once per call.
     if dtype not in (torch.bfloat16, torch.float16):
-        raise RuntimeError(
-            f"Unsupported dtype {dtype}. Supported: bfloat16, float16"
-        )
+        raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if hidden_size <= 0 or hidden_size % 8 != 0:
         raise RuntimeError(
             f"Unsupported hidden_size {hidden_size}. Must be a multiple of 8."

@@ -216,9 +216,7 @@ def fused_hc_mix(
     device = hyper_input_normed.device
     num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
-    out = torch.empty(
-        (rows, hs), dtype=hyper_input_normed.dtype, device=device
-    )
+    out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
         return out
     _hc_mix_persistent_kernel[(num_ctas,)](

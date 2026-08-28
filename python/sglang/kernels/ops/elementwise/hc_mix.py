@@ -92,9 +92,7 @@ def hc_mix(
     if rows == 0:
         return out
     inv_hc = 1.0 / hc_count
-    t_pad = _get_scratch(
-        lowrank, hyper_input_normed.dtype, hyper_input_normed.device
-    )
+    t_pad = _get_scratch(lowrank, hyper_input_normed.dtype, hyper_input_normed.device)
     for row_start in range(0, rows, _MAX_ROWS):
         row_end = min(row_start + _MAX_ROWS, rows)
         m = row_end - row_start

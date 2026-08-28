@@ -5,12 +5,12 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.srt.models.qwen4_exp import Qwen4ExpPLEGroupedNorm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 
-def torch_impl_ple_norm(
-    norm: Qwen4ExpPLEGroupedNorm, x: torch.Tensor
-) -> torch.Tensor:
+def torch_impl_ple_norm(norm: Qwen4ExpPLEGroupedNorm, x: torch.Tensor) -> torch.Tensor:
     """Eager baseline (the production unfused fp32 chain)."""
     x_float = x.float()
     group_shape = x_float.shape[:-1] + (-1, norm.group_size)

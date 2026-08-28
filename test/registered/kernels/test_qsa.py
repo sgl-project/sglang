@@ -5,34 +5,32 @@ import pytest
 import torch
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
-from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
+from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
-    torch_expand_qsa_block_indices,
-    triton_expand_qsa_block_indices,
     qsa_fast_topk,
     qsa_sparse_attention,
+    torch_expand_qsa_block_indices,
+    triton_expand_qsa_block_indices,
+)
+from sglang.srt.layers.attention.qsa.metadata import (
+    QSAIndexerMetadata,
+    build_qsa_row_ranges,
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_decode,
     qsa_mqa_prefill,
 )
-from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -210,7 +208,9 @@ def test_qsa_glue_builds_indexer_per_variant(monkeypatch):
     recorded = {}
 
     class _FakeIndexer:
-        def __init__(self, config, layer_id, quant_config=None, prefix="", rotary_emb=None):
+        def __init__(
+            self, config, layer_id, quant_config=None, prefix="", rotary_emb=None
+        ):
             recorded.update(
                 config=config,
                 layer_id=layer_id,
@@ -240,9 +240,7 @@ def test_qsa_glue_builds_indexer_per_variant(monkeypatch):
                 dsa_prefix=prefix,
             )
 
-    monkeypatch.setattr(
-        dsa_indexer_module, "QwenDSAIndexer", _FakeDSAIndexer
-    )
+    monkeypatch.setattr(dsa_indexer_module, "QwenDSAIndexer", _FakeDSAIndexer)
     dsa_indexer = build_qsa_indexer(
         _tokenwise_config_namespace(), layer_id=2, prefix="q"
     )
@@ -555,9 +553,7 @@ def test_qwen_dsa_select_prefill_respects_causal_windows():
     metadata = SimpleNamespace(
         sequence_lengths=torch.tensor([4, 5], dtype=torch.int32),
         token_slot_table=token_slot_table,
-        token_to_batch_idx=torch.tensor(
-            [0, 0, 0, 1, 1, 1, 1], dtype=torch.int32
-        ),
+        token_to_batch_idx=torch.tensor([0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
         token_to_kv_pool=pool,
     )
     indexer = _make_dsa_indexer_stub(topk=4)
@@ -565,12 +561,8 @@ def test_qwen_dsa_select_prefill_respects_causal_windows():
     q[..., 1:] = 0
     w = torch.ones(7, 2, dtype=torch.bfloat16)
     # seq 0 extends positions 1..3, seq 1 extends positions 1..4.
-    logical_positions = torch.tensor(
-        [1, 2, 3, 1, 2, 3, 4], dtype=torch.int64
-    )
-    out = QwenDSAIndexer._select_prefill(
-        indexer, q, w, logical_positions, metadata
-    )
+    logical_positions = torch.tensor([1, 2, 3, 1, 2, 3, 4], dtype=torch.int64)
+    out = QwenDSAIndexer._select_prefill(indexer, q, w, logical_positions, metadata)
     assert out.shape == (7, 4)
     # A row may never select a column beyond its causal end — in particular
     # seq 1 rows before position 4 must not see the hot col 4.
@@ -661,9 +653,7 @@ def test_qsa_idle_skips_metadata_construction():
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     backend.forward_metadata = object()
 
-    backend.init_forward_metadata(
-        SimpleNamespace(forward_mode=ForwardMode.IDLE)
-    )
+    backend.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.IDLE))
 
     assert backend.forward_metadata is None
 
@@ -761,9 +751,7 @@ def test_qsa_target_verify_rejects_branching_speculation():
 
 
 def test_qsa_mtp_cuda_graph_padding_stays_below_compression_boundary():
-    backend, forward_batch, _ = _make_mtp_draft_batch(
-        steps=4, seq_lens=(3, 1)
-    )
+    backend, forward_batch, _ = _make_mtp_draft_batch(steps=4, seq_lens=(3, 1))
 
     class Recorder:
         def __init__(self):
@@ -1119,9 +1107,7 @@ def test_qsa_idle_metadata_builds_empty_rows():
     assert step_metadata.row_req_pool_indices.numel() == 0
     # Per-step out_cache_loc slicing must stay empty without allocating rows.
     for attn_backend in draft.attn_backends:
-        assert (
-            attn_backend.forward_metadata.indexer_metadata.out_cache_loc.numel() == 0
-        )
+        assert attn_backend.forward_metadata.indexer_metadata.out_cache_loc.numel() == 0
 
 
 def test_qsa_decode_requires_one_query_row_per_request():
@@ -1242,9 +1228,7 @@ def test_qsa_speculative_pseudo_extend_is_rejected():
         except ValueError as exc:
             assert "pseudo-extend" in str(exc)
         else:
-            raise AssertionError(
-                f"QSA must reject pseudo-extend of {original_mode}"
-            )
+            raise AssertionError(f"QSA must reject pseudo-extend of {original_mode}")
 
 
 def test_qsa_indexer_requires_compress_ratio_above_one():
@@ -1567,9 +1551,7 @@ def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
     starts = torch.zeros(rows, dtype=torch.int32)
     ends = torch.full((rows,), keys, dtype=torch.int32)
     positions = torch.full((rows,), keys * compress_ratio - 1, dtype=torch.long)
-    sequence_lengths = torch.full(
-        (rows,), keys * compress_ratio, dtype=torch.int32
-    )
+    sequence_lengths = torch.full((rows,), keys * compress_ratio, dtype=torch.int32)
 
     monkeypatch.setattr(
         qsa_indexer_module,
@@ -1647,9 +1629,7 @@ def test_qsa_reranks_wider_candidate_set():
         _rerank_qsa_topk_candidates,
     )
 
-    logits = torch.tensor(
-        [[0.0, 9.0, 8.0, 7.0, 6.0, 10.0]], dtype=torch.float32
-    )
+    logits = torch.tensor([[0.0, 9.0, 8.0, 7.0, 6.0, 10.0]], dtype=torch.float32)
     starts = torch.tensor([1], dtype=torch.int32)
     candidates = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.int32)
 
@@ -1770,9 +1750,7 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     backend.topk, backend.speculative_num_steps = 1, 3
     bs, topk, steps = 4, 1, 3
     flat = torch.arange(bs * topk * steps, dtype=torch.int64)
-    fb = SimpleNamespace(
-        out_cache_loc=flat, batch_size=bs, seq_lens=torch.ones(bs)
-    )
+    fb = SimpleNamespace(out_cache_loc=flat, batch_size=bs, seq_lens=torch.ones(bs))
     # Reference: the exact draft_forward expression chain.
     reference = flat.reshape(bs, topk, steps).permute(2, 0, 1).reshape(steps, -1)
     for step in range(steps):
@@ -1894,9 +1872,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
         # Path 2: legacy host refresh over the layout the kernels produced.
         host_metadata = make_metadata()
         host_metadata.sequence_lengths.copy_(kernel_metadata.sequence_lengths)
-        host_metadata.row_req_pool_indices.copy_(
-            kernel_metadata.row_req_pool_indices
-        )
+        host_metadata.row_req_pool_indices.copy_(kernel_metadata.row_req_pool_indices)
         backend._update_qsa_cuda_graph_metadata(
             host_metadata.indexer_metadata, host_metadata.row_req_pool_indices
         )
@@ -1942,8 +1918,10 @@ def _qsa_expected_graph_layout(
             row_prefix.append(max(base - 1, 0))
             row_reqs.append(req_pool[pid])
             continue
-        eff = (extend_len if pid < real_reqs else 0) if mode == 1 else (
-            extend_lens[pid] if pid < real_reqs else 0
+        eff = (
+            (extend_len if pid < real_reqs else 0)
+            if mode == 1
+            else (extend_lens[pid] if pid < real_reqs else 0)
         )
         prefix, limit = (base, base + eff) if mode == 1 else (max(base - eff, 0), base)
         for j in range(eff):
@@ -1990,7 +1968,9 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
         indexer = QSAIndexerMetadata(
             sequence_lengths=torch.zeros(num_rows, dtype=torch.int32, device=device),
             token_to_batch_idx=torch.arange(num_rows, dtype=torch.int32, device=device),
-            token_slot_table=torch.zeros((num_rows, 1), dtype=torch.int32, device=device),
+            token_slot_table=torch.zeros(
+                (num_rows, 1), dtype=torch.int32, device=device
+            ),
             out_cache_loc=torch.zeros(num_rows, dtype=torch.int64, device=device),
             token_to_kv_pool=pool,
             compress_ratio=ratio,
@@ -2004,7 +1984,9 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
             graph_compressed_lengths=torch.zeros(
                 num_rows, dtype=torch.int32, device=device
             ),
-            graph_prefix_lengths=torch.zeros(num_rows, dtype=torch.int32, device=device),
+            graph_prefix_lengths=torch.zeros(
+                num_rows, dtype=torch.int32, device=device
+            ),
             decode_logical_positions=torch.zeros(
                 num_rows, dtype=torch.int32, device=device
             ),
@@ -2018,7 +2000,9 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
             token_to_batch_idx=indexer.token_to_batch_idx,
             token_slot_table=indexer.token_slot_table,
             indexer_metadata=indexer,
-            row_req_pool_indices=torch.zeros(num_rows, dtype=torch.int32, device=device),
+            row_req_pool_indices=torch.zeros(
+                num_rows, dtype=torch.int32, device=device
+            ),
             is_cuda_graph=True,
         )
         launch_graph_metadata(
@@ -2065,18 +2049,33 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
 
     # Target verify: uniform 4-token window, 2 padded request slots.
     run_case(
-        mode=1, bs=6, num_rows=32, seq_lens=[254, 255, 256, 300, 7, 7],
-        extend_lens=None, extend_len=4, num_padding=2,
+        mode=1,
+        bs=6,
+        num_rows=32,
+        seq_lens=[254, 255, 256, 300, 7, 7],
+        extend_lens=None,
+        extend_len=4,
+        num_padding=2,
     )
     # Draft extend: per-request extend lengths (accept-count dependent), padded.
     run_case(
-        mode=2, bs=5, num_rows=24, seq_lens=[260, 512, 257, 9, 9],
-        extend_lens=[3, 1, 4, 0, 0], extend_len=0, num_padding=2,
+        mode=2,
+        bs=5,
+        num_rows=24,
+        seq_lens=[260, 512, 257, 9, 9],
+        extend_lens=[3, 1, 4, 0, 0],
+        extend_len=0,
+        num_padding=2,
     )
     # Decode with a padded tail (dummy rows alias request slot 0).
     run_case(
-        mode=0, bs=4, num_rows=4, seq_lens=[256, 1024, 1025, 4096],
-        extend_lens=None, extend_len=0, num_padding=0,
+        mode=0,
+        bs=4,
+        num_rows=4,
+        seq_lens=[256, 1024, 1025, 4096],
+        extend_lens=None,
+        extend_len=0,
+        num_padding=0,
     )
 
 

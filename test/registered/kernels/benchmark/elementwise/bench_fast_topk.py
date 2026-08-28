@@ -5,7 +5,9 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.ops.elementwise.fast_topk import fast_topk as jit_fast_topk
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=30, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+)
 
 
 def torch_topk(score, lengths, topk):

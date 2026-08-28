@@ -63,12 +63,9 @@ __global__ __launch_bounds__(kGroupSize / 16) void grouped_gemma_rmsnorm_kernel(
 
   PDLWaitPrimary<kUsePDL>();
 
-  const auto input_ptr =
-      pointer::offset<Float>(params.input, static_cast<int64_t>(bid) * kGroupSize);
-  const auto output_ptr =
-      pointer::offset<Float>(params.output, static_cast<int64_t>(bid) * kGroupSize);
-  const auto weight_ptr =
-      pointer::offset<Float>(params.weight, static_cast<int64_t>(group) * kGroupSize);
+  const auto input_ptr = pointer::offset<Float>(params.input, static_cast<int64_t>(bid) * kGroupSize);
+  const auto output_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(bid) * kGroupSize);
+  const auto weight_ptr = pointer::offset<Float>(params.weight, static_cast<int64_t>(group) * kGroupSize);
 
   Storage input_vec[kNumLoads];
   Storage weight_vec[kNumLoads];
@@ -113,8 +110,7 @@ __global__ __launch_bounds__(kGroupSize / 16) void grouped_gemma_rmsnorm_kernel(
     for (uint32_t i = 0; i < kVecLen; ++i) {
       const auto [ix, iy] = cast<fp32x2_t>(input_vec[j][i]);
       const auto [wx, wy] = cast<fp32x2_t>(weight_vec[j][i]);
-      output_vec[i] = cast<Float2>(
-          fp32x2_t{ix * norm_factor * (1.0f + wx), iy * norm_factor * (1.0f + wy)});
+      output_vec[i] = cast<Float2>(fp32x2_t{ix * norm_factor * (1.0f + wx), iy * norm_factor * (1.0f + wy)});
     }
     gmem.store(output_ptr, output_vec, j);
   }
@@ -161,9 +157,8 @@ struct GroupedGemmaRMSNormKernel {
         .verify(output);
 
     const int64_t hidden_size = H.unwrap();
-    CHECK_HOST(hidden_size % kGroupSize == 0)
-        << "grouped_gemma_rmsnorm: hidden_size (" << hidden_size
-        << ") must be divisible by group_size (" << kGroupSize << ")";
+    CHECK_HOST(hidden_size % kGroupSize == 0) << "grouped_gemma_rmsnorm: hidden_size (" << hidden_size
+                                              << ") must be divisible by group_size (" << kGroupSize << ")";
 
     const auto params = GroupedGemmaRMSNormParams{
         .input = input.data_ptr(),
