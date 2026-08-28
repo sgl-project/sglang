@@ -162,6 +162,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             target_resident_weight_bytes=1,
             h2d_bytes_per_request=1,
         )
+        worker._auto_residency_last_applied_plan = AutoResidencyPlan(
+            changes=[candidate]
+        )
 
         with (
             mock.patch.object(
@@ -177,13 +180,19 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             mock.patch.object(
                 gpu_worker_module,
                 "plan_auto_residency",
-                return_value=AutoResidencyPlan(changes=[candidate]),
-            ),
+            ) as plan,
             mock.patch.object(gpu_worker_module, "apply_residency_changes") as apply,
         ):
             response = worker.apply_auto_residency(validate_only=True)
 
         self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
+        self.assertIsNone(worker._auto_residency_last_applied_plan)
+        worker._build_auto_residency_report.assert_called_once_with(
+            workload=mock.ANY,
+            records=[mock.ANY],
+            include_candidates=False,
+        )
+        plan.assert_not_called()
         apply.assert_not_called()
 
     def test_aux_resident_promotion_uses_short_validation_but_dit_does_not(self):

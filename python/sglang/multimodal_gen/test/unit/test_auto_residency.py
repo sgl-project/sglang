@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     commit_residency_changes,
     component_resident_size_bytes,
     component_runtime_weight_bytes,
+    current_placement_reserve_shortfall_bytes,
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
@@ -1161,6 +1162,16 @@ class TestPlanAutoResidency:
         )
 
         assert plan.current_placement_reserve_shortfall_bytes == 2 * GIB_BYTES
+
+    def test_validation_checks_measured_placement_without_candidate_frontier(self):
+        report = _report(
+            budget_gib=30,
+            estimated_gib=20,
+            target_workload_measured=True,
+            phase_peaks_gib={"decode": 28},
+        )
+
+        assert current_placement_reserve_shortfall_bytes([report]) == 2 * GIB_BYTES
 
     def test_unobserved_later_component_gets_a_conservative_phase(self):
         first_transformer = _candidate("first_transformer", weight_gib=26, h2d_gib=100)
