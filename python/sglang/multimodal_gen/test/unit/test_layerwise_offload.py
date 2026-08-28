@@ -90,6 +90,37 @@ class _FakeDeviceModule:
         return nullcontext()
 
 
+def test_dtensor_layer_store_remains_rank_local(monkeypatch):
+    local_weight = torch.arange(4)
+    replacement = torch.arange(4) + 10
+    wraps = []
+
+    class FakeDTensor:
+        def __init__(self, local_tensor):
+            self.local_tensor = local_tensor
+            self.device_mesh = "mesh"
+            self.placements = ("shard",)
+
+        def to_local(self):
+            return self.local_tensor
+
+        @classmethod
+        def from_local(cls, local_tensor, device_mesh, placements, **kwargs):
+            wraps.append((local_tensor, device_mesh, placements, kwargs))
+            return cls(local_tensor)
+
+    monkeypatch.setattr(layerwise_offload_mod, "DTensor", FakeDTensor)
+    target = FakeDTensor(local_weight)
+
+    assert LayerwiseOffloadManager._to_local_tensor(target) is local_weight
+    wrapped = LayerwiseOffloadManager._wrap_for_target(
+        object.__new__(LayerwiseOffloadManager), target, replacement
+    )
+
+    assert wrapped.local_tensor is replacement
+    assert wraps == [(replacement, "mesh", ("shard",), {"run_check": False})]
+
+
 class _DummyBlock(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()

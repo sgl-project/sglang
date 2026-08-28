@@ -579,7 +579,10 @@ class LayerwiseOffloadManager:
     ) -> torch.Tensor:
         if isinstance(target, DTensor):
             return DTensor.from_local(
-                local_tensor, target.device_mesh, target.placements
+                local_tensor,
+                target.device_mesh,
+                target.placements,
+                run_check=False,
             )
         return local_tensor
 
