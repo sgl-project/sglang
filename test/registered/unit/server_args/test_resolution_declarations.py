@@ -433,19 +433,11 @@ class TestResolutionDeclarations(CustomTestCase):
         mapping = namespace_of(ServerArgs)
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
-        # The five sizes keep a live property shadowing the bare name; the
-        # comparison below reaches them anyway, through `get_parallel().config`.
-        self.assertGreaterEqual(
-            _live_topology_leaves()
-            & {
-                "tp_size",
-                "pp_size",
-                "moe_dp_size",
-                "attn_cp_size",
-                "dcp_size",
-            },
-            {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
-            "a parallel size stopped being served from the live topology",
+        self.assertEqual(
+            set(),
+            _live_topology_leaves() & set(mapping),
+            "a parallel leaf gained a live member of the same name, so the "
+            "comparison below reads the group rather than the published leaf",
         )
 
         compared = 0
@@ -461,10 +453,6 @@ class TestResolutionDeclarations(CustomTestCase):
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
-                if groups[0] == "parallel":
-                    # Bare names there are the live topology; the published
-                    # leaves are one hop down, so the reader takes that hop.
-                    node = node.config
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)
@@ -918,6 +906,104 @@ class TestResolutionDeclarations(CustomTestCase):
             "result, so the projection publishes what the operator passed "
             "instead of what the platform decided",
         )
+
+
+class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
+    """A declaration records a value, not a handle on one.
+
+    The stash keeps whatever object the declaring handler passed, so a handler
+    that declares a mutable and then edits it in place rewrites an entry that
+    already went into the log. The projection still answers with the end state,
+    which is why nothing else notices: what is lost is *which* handler decided
+    what, and `validate_declarations` never sees the later change at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        environment = dict(os.environ)
+
+        def restore():
+            os.environ.clear()
+            os.environ.update(environment)
+
+        self.addCleanup(restore)
+
+    def _resolve_recording_each_entry(self, **supplied):
+        """Resolve, deep-copying every stash entry the moment it is appended."""
+        from sglang.srt.arg_groups import overrides
+
+        recorded = []
+
+        def watch(name):
+            original = getattr(overrides, name)
+
+            def wrapper(server_args, *args, **kwargs):
+                result = original(server_args, *args, **kwargs)
+                stash = getattr(server_args, "_resolved_overrides", None) or []
+                while len(recorded) < len(stash):
+                    index = len(recorded)
+                    recorded.append((index, copy.deepcopy(stash[index])))
+                return result
+
+            return original, wrapper
+
+        # Every path that appends to the stash.
+        patched = {}
+        for name in (
+            "declare_resolution",
+            "declare_late_resolution",
+            "declare_direct_writes",
+            "run_post_process_pass",
+        ):
+            original, wrapper = watch(name)
+            patched[name] = original
+            setattr(overrides, name, wrapper)
+        try:
+            path = tempfile.mkdtemp(prefix="declared_values_")
+            self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+            with open(os.path.join(path, "config.json"), "w") as handle:
+                json.dump(_MINI_CONFIG, handle)
+            server_args = ServerArgs(
+                model_path=path, device="cuda", random_seed=42, **supplied
+            )
+            server_args.resolve_once()
+        finally:
+            for name, original in patched.items():
+                setattr(overrides, name, original)
+        return server_args, recorded
+
+    def test_no_entry_changes_after_it_is_recorded(self):
+        # One shape per family of handlers that decides a graph setting.
+        for label, supplied in (
+            ("plain", {}),
+            ("cuda_graph_knobs", {"cuda_graph_max_bs_decode": 16}),
+            ("chunked_prefill", {"chunked_prefill_size": 1024}),
+            ("explicit_json", {"cuda_graph_config": {"decode": {"max_bs": 12}}}),
+            ("disaggregation", {"disaggregation_mode": "prefill"}),
+            ("deterministic", {"enable_deterministic_inference": True}),
+            ("speculative", {"speculative_algorithm": "EAGLE"}),
+            ("dp_attention", {"tp_size": 2, "dp_size": 2, "enable_dp_attention": True}),
+        ):
+            with self.subTest(shape=label):
+                server_args, recorded = self._resolve_recording_each_entry(**supplied)
+                stash = server_args._resolved_overrides
+                self.assertGreater(
+                    len(recorded),
+                    0,
+                    "nothing was recorded, so this case is not watching the "
+                    "declaration paths it thinks it is",
+                )
+                drifted = [
+                    (index, was, stash[index])
+                    for index, was in recorded
+                    if stash[index] != was
+                ]
+                self.assertEqual(
+                    [],
+                    drifted,
+                    "these entries changed after they were declared, so the log "
+                    f"credits the wrong handler for the end state: {drifted}",
+                )
 
 
 if __name__ == "__main__":

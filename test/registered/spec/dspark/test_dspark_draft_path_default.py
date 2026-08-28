@@ -40,7 +40,7 @@ def _make_dspark_server_args(
     server_args.speculative_algorithm = "DSPARK"
     server_args.speculative_draft_model_path = None
     server_args.speculative_dspark_block_size = 5
-    server_args.model_config = SimpleNamespace(hf_config=hf_config)
+    server_args._model_config = SimpleNamespace(hf_config=hf_config)
     return server_args
 
 
