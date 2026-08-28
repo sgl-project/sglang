@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
 
 use crate::engine::HttpGenerateClient;
-use crate::openai::{OpenAIHttpFrontend, hosted_routes, standalone_routes};
+use crate::openai::{OpenAIHttpFrontend, hosted_routes, render_only_routes, standalone_routes};
 
 #[derive(Clone, Debug)]
 pub struct RendererRuntimeConfig {
@@ -17,17 +17,19 @@ pub struct RendererRuntimeConfig {
     pub http_workers: usize,
     pub tokenizer_workers: usize,
     pub queue_capacity: usize,
-    pub engine_url: String,
+    /// Optional SGLang engine origin. When absent, inference routes are not mounted.
+    pub engine_url: Option<String>,
     /// Optional Rust-server origin for every route not owned by the renderer.
     pub fallback_url: Option<String>,
     pub renderer: RendererConfig,
 }
 
 pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
-    let mode = if config.fallback_url.is_some() {
-        "hosted"
-    } else {
-        "standalone"
+    let mode = match (&config.engine_url, &config.fallback_url) {
+        (None, None) => "render-only",
+        (Some(_), None) => "serving",
+        (Some(_), Some(_)) => "hosted",
+        (None, Some(_)) => return Err("fallback_url requires engine_url".to_string()),
     };
     let tokenizer_without_specials = load_tokenizer(
         (!config.renderer.tokenizer_path.is_empty())
@@ -51,16 +53,25 @@ pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
         config.tokenizer_workers,
         config.queue_capacity,
     ));
-    let generate_client = HttpGenerateClient::new(config.engine_url, tokenizer_without_specials)?;
+    let app = match (config.engine_url, config.fallback_url) {
+        (None, None) => render_only_routes(renderer),
+        (Some(engine_url), None) => {
+            let generate_client = HttpGenerateClient::new(engine_url, tokenizer_without_specials)?;
+            standalone_routes(OpenAIHttpFrontend::new(renderer, generate_client))
+        }
+        (Some(engine_url), Some(fallback_url)) => {
+            let generate_client = HttpGenerateClient::new(engine_url, tokenizer_without_specials)?;
+            hosted_routes(
+                OpenAIHttpFrontend::new(renderer, generate_client),
+                fallback_url,
+            )?
+        }
+        (None, Some(_)) => unreachable!("runtime topology was validated above"),
+    };
     let listener = tokio::net::TcpListener::bind(config.http_addr)
         .await
         .map_err(|error| format!("binding renderer on {} failed: {error}", config.http_addr))?;
     tracing::info!(address = %config.http_addr, mode, "renderer listening");
-    let frontend = OpenAIHttpFrontend::new(renderer, generate_client);
-    let app = match config.fallback_url {
-        Some(fallback_url) => hosted_routes(frontend, fallback_url)?,
-        None => standalone_routes(frontend),
-    };
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(async {
             if let Err(error) = tokio::signal::ctrl_c().await {

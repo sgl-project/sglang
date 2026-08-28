@@ -17,19 +17,21 @@ const DEFAULT_CONTEXT_LEN: u64 = 2048;
 #[derive(Debug, Parser)]
 #[command(
     name = "sglang-renderer",
-    about = "Run the SGLang Rust renderer against an SGLang engine"
+    about = "Run the SGLang Rust renderer with an optional SGLang engine"
 )]
 struct Cli {
     /// Model directory, config file, or Hugging Face repository id.
     #[arg(value_name = "MODEL")]
     model: String,
 
-    /// SGLang engine origin exposing /generate.
+    /// Optional SGLang engine origin exposing /generate.
+    ///
+    /// When omitted, only rendering and tokenization routes are served.
     #[arg(long, value_name = "URL")]
-    engine_url: String,
+    engine_url: Option<String>,
 
     /// Optional origin for routes not owned by the renderer.
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", requires = "engine_url")]
     fallback_url: Option<String>,
 
     #[arg(long)]
@@ -86,7 +88,7 @@ enum SamplingDefaultsSource {
 #[derive(Debug)]
 struct DirectArgs {
     model: String,
-    engine_url: String,
+    engine_url: Option<String>,
     fallback_url: Option<String>,
     tokenizer_path: String,
     revision: Option<String>,
@@ -542,13 +544,7 @@ mod tests {
     use super::*;
 
     fn direct_cli(model: &Path) -> Cli {
-        Cli::try_parse_from([
-            "sglang-renderer",
-            model.to_str().unwrap(),
-            "--engine-url",
-            "http://127.0.0.1:30001",
-        ])
-        .unwrap()
+        Cli::try_parse_from(["sglang-renderer", model.to_str().unwrap()]).unwrap()
     }
 
     fn fixture_model(config: Value, generation_config: Option<Value>) -> PathBuf {
@@ -581,9 +577,26 @@ mod tests {
         assert_eq!(args.http_workers, 2);
         assert_eq!(args.tokenizer_workers, 1);
         assert_eq!(args.queue_capacity, 128);
+        assert_eq!(args.engine_url, None);
         assert_eq!(args.sampling_defaults, SamplingDefaultsSource::Model);
         assert_eq!(args.resolved_sampling_params, None);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn fallback_url_requires_an_engine_url() {
+        let error = Cli::try_parse_from([
+            "sglang-renderer",
+            "model",
+            "--fallback-url",
+            "http://127.0.0.1:30001",
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[tokio::test]
@@ -634,6 +647,7 @@ mod tests {
             config.fallback_url.as_deref(),
             Some("http://127.0.0.1:30001")
         );
+        assert_eq!(config.engine_url.as_deref(), Some("http://127.0.0.1:30001"));
         assert_eq!(config.renderer.served_model_name, "fixture");
         assert_eq!(config.renderer.limits.context_len, 2048);
         assert_eq!(config.renderer.limits.vocab_size, 256);

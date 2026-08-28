@@ -42,12 +42,22 @@ impl OpenAIHttpFrontend {
 }
 
 pub(crate) fn inference_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
-    let renderer = frontend.renderer.clone();
     Router::new()
         .merge(chat::routes())
         .merge(completions::routes())
         .with_state(Arc::new(frontend))
-        .merge(tokenize::routes(renderer))
+}
+
+fn renderer_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
+    render::routes(renderer.clone()).merge(tokenize::routes(renderer))
+}
+
+fn direct_routes(routes: Router<()>) -> Router<()> {
+    routes
+        .merge(render::health_route())
+        .layer(axum::extract::DefaultBodyLimit::max(
+            DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+        ))
 }
 
 pub(super) fn unix_seconds_u32() -> u32 {
@@ -68,12 +78,11 @@ pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> Co
 
 pub(crate) fn standalone_routes(frontend: OpenAIHttpFrontend) -> Router<()> {
     let renderer = frontend.renderer.clone();
-    inference_routes(frontend)
-        .merge(render::routes(renderer))
-        .merge(render::health_route())
-        .layer(axum::extract::DefaultBodyLimit::max(
-            DEFAULT_REQUEST_BODY_LIMIT_BYTES,
-        ))
+    direct_routes(inference_routes(frontend).merge(renderer_routes(renderer)))
+}
+
+pub(crate) fn render_only_routes(renderer: Arc<crate::RendererService>) -> Router<()> {
+    direct_routes(renderer_routes(renderer))
 }
 
 pub(crate) fn hosted_routes(
@@ -83,7 +92,7 @@ pub(crate) fn hosted_routes(
     let renderer = frontend.renderer.clone();
     let proxy = crate::runtime::RustServerProxy::new(fallback_url)?;
     Ok(inference_routes(frontend)
-        .merge(render::routes(renderer))
+        .merge(renderer_routes(renderer))
         .merge(render::readiness_route())
         .fallback(move |request| {
             let proxy = proxy.clone();

@@ -22,7 +22,8 @@ mod suite {
 
     use super::super::{
         ChatCompletionRequest, CompletionRequest, DEFAULT_REQUEST_BODY_LIMIT_BYTES,
-        HttpGenerateClient, OpenAIHttpFrontend, hosted_routes, standalone_routes,
+        HttpGenerateClient, OpenAIHttpFrontend, hosted_routes, render_only_routes,
+        standalone_routes,
     };
     use crate::openai::protocol::{
         lower_chat_request, lower_text_completion_request, lower_token_ids_completion_request,
@@ -455,19 +456,46 @@ mod suite {
         .unwrap()
     }
 
-    fn standalone_test_app() -> Router<()> {
+    fn render_only_test_app() -> Router<()> {
         let renderer = Arc::new(RendererService::with_tokenizer(
             renderer_config(),
             Arc::new(WordTokenizer),
             2,
             2,
         ));
-        let client = HttpGenerateClient::new("http://127.0.0.1:1", tiny_tokenizer()).unwrap();
-        standalone_routes(OpenAIHttpFrontend::new(renderer, client))
+        render_only_routes(renderer)
     }
 
     #[tokio::test]
-    async fn standalone_routes_accept_bodies_above_axum_default() {
+    async fn render_only_routes_exclude_inference_without_losing_preprocessing() {
+        let chat = serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let rendered =
+            post_request(render_only_test_app(), "/v1/chat/completions/render", &chat).await;
+        assert_eq!(rendered.status(), StatusCode::OK);
+
+        let tokenized = post_request(
+            render_only_test_app(),
+            "/v1/tokenize",
+            &serde_json::json!({"prompt": "hello world"}),
+        )
+        .await;
+        assert_eq!(tokenized.status(), StatusCode::OK);
+
+        let inference = post_request(render_only_test_app(), "/v1/chat/completions", &chat).await;
+        assert_eq!(inference.status(), StatusCode::NOT_FOUND);
+
+        let health = render_only_test_app()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn render_only_routes_accept_bodies_above_axum_default() {
         let body = serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
@@ -477,13 +505,13 @@ mod suite {
         assert!(body.len() > 2 * 1024 * 1024);
         assert!(body.len() < DEFAULT_REQUEST_BODY_LIMIT_BYTES);
 
-        let response = post_json(standalone_test_app(), "/v1/chat/completions/render", body).await;
+        let response = post_json(render_only_test_app(), "/v1/chat/completions/render", body).await;
 
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn standalone_routes_reject_bodies_above_configured_limit() {
+    async fn render_only_routes_reject_bodies_above_configured_limit() {
         let body = serde_json::json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
@@ -492,7 +520,7 @@ mod suite {
         .to_string();
         assert!(body.len() > DEFAULT_REQUEST_BODY_LIMIT_BYTES);
 
-        let response = post_json(standalone_test_app(), "/v1/chat/completions/render", body).await;
+        let response = post_json(render_only_test_app(), "/v1/chat/completions/render", body).await;
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
