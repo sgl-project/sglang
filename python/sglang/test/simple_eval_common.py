@@ -47,6 +47,7 @@ class EvalResult:
     metrics: Optional[Dict[str, float]]  # other metrics
     htmls: List[str]  # strings of valid HTML
     convos: List[MessageList]  # sampled conversations
+    examples: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +60,7 @@ class SingleEvalResult:
     metrics: Dict[str, float] = field(default_factory=dict)
     html: Optional[str] = None
     convo: Optional[MessageList] = None  # sampled conversation
+    example: Optional[Dict[str, Any]] = None
 
 
 class Eval:
@@ -473,6 +475,7 @@ def aggregate_results(
     name2values = defaultdict(list)
     htmls = []
     convos = []
+    examples = []
     for single_eval_result in single_eval_results:
         # Skip None results
         if single_eval_result is None:
@@ -483,6 +486,8 @@ def aggregate_results(
             name2values["score"].append(single_eval_result.score)
         htmls.append(single_eval_result.html)
         convos.append(single_eval_result.convo)
+        if single_eval_result.example is not None:
+            examples.append(single_eval_result.example)
     final_metrics = {}
     for name, values in name2values.items():
         stats = name2stats.get(name, default_stats)
@@ -494,6 +499,7 @@ def aggregate_results(
         metrics=final_metrics,
         htmls=htmls,
         convos=convos,
+        examples=examples,
     )
 
 
