@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx1201_supported,
     is_hip,
     is_mps,
     is_musa,
@@ -33,18 +34,6 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_gfx1201 = (
-    _is_hip
-    and torch.cuda.is_available()
-    and getattr(
-        torch.cuda.get_device_properties(torch.cuda.current_device()),
-        "gcnArchName",
-        "",
-    )
-    .split(":", 1)[0]
-    .lower()
-    == "gfx1201"
-)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -88,7 +77,11 @@ if _is_xpu:
 
 
 def _should_force_native_rope() -> bool:
-    return _is_gfx1201 or (
+    # gfx1201: released ROCm sgl-kernel wheels are not built for that arch, so
+    # the fused RoPE entry point is unavailable there. Queried lazily -- reading
+    # device properties at import time would initialise a HIP context in every
+    # process that merely imports this module.
+    return is_gfx1201_supported() or (
         publish_role() is not None
         and get_exec().deterministic.rl_on_policy_target is not None
     )

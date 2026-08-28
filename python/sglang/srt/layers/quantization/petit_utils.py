@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.gemm.rdna4_nvfp4 import (
     is_rdna4_nvfp4_device,
     rdna4_nvfp4_linear,
+    try_warmup_rdna4_nvfp4,
 )
 
 PETIT_NVFP4_BACKEND = "petit"
@@ -96,6 +97,14 @@ def prepare_nvfp4_layer_for_petit(layer: torch.nn.Module) -> None:
     )
     layer.weight_scale = torch.nn.Parameter(
         layer.weight_scale.data.contiguous(), requires_grad=False
+    )
+    # Force the HIP and Triton compiles now: loading a layer is the last point
+    # before CUDA graph capture where a plain launch is still safe.
+    try_warmup_rdna4_nvfp4(
+        getattr(layer, "params_dtype", None) or torch.get_default_dtype(),
+        layer.weight.device,
+        layer.output_size_per_partition,
+        layer.input_size_per_partition,
     )
 
 

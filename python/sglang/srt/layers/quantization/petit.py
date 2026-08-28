@@ -72,6 +72,11 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "PetitNvFp4Config":
+        # Two checkpoint shapes reach here: hf_quant_config.json nests the
+        # metadata under "quantization", while a config.json
+        # "quantization_config" block is already flat. The alternative key
+        # spellings below mirror the ModelOpt parsing in
+        # ModelConfig._parse_modelopt_quant_config.
         quant_config = config.get("quantization", config)
         quant_method = quant_config["quant_algo"]
         group_size = quant_config.get("group_size", None)
@@ -124,8 +129,18 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def is_petit_nvfp4_compatible(cls, quant_config: Dict[str, Any]) -> bool:
+        if not _is_hip:
+            return False
         quant_method = quant_config.get("quant_method", "").lower()
-        return _is_hip and quant_method == "modelopt"
+        if quant_method == "modelopt":
+            return True
+        # Newer ModelOpt exports name the method after the format instead of the
+        # producer. Those reach ROCm as "modelopt_fp4"; the dense NVFP4 ones are
+        # served here because modelopt_fp4 has no ROCm kernels.
+        return (
+            quant_method == "modelopt_fp4"
+            and (quant_config.get("quant_algo", "") or "").upper() == "NVFP4"
+        )
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
         for pattern in exclude_modules:
@@ -137,12 +152,27 @@ class PetitNvFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
                 prefix, self.exclude_modules
             ):
                 return UnquantizedLinearMethod()
             return PetitNvFp4LinearMethod(self)
+        if isinstance(layer, FusedMoE) and not (
+            is_layer_skipped(prefix, self.exclude_modules)
+            or self.is_layer_excluded(prefix, self.exclude_modules)
+        ):
+            # Returning None here would hand the packed FP4 experts to the
+            # unquantized MoE method, which fails much later with an opaque
+            # shape mismatch. This path only covers dense linear layers.
+            raise NotImplementedError(
+                "The ROCm NVFP4 (petit_nvfp4) backend does not support quantized "
+                f"MoE layers, but '{prefix}' is one. Only dense linear layers are "
+                "supported; exclude the experts from the checkpoint or use a "
+                "different quantization method."
+            )
         return None
 
     def get_scaled_act_names(self) -> List[str]:
