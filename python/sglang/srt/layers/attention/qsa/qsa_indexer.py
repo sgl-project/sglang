@@ -321,6 +321,9 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
+            # `_qsa_write_plan`'s capacity is a worst-case bound and can
+            # reserve more groups than this chunk has members for; clamp so
+            # the padding groups don't gather past `token_k` (#38346).
             group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
@@ -626,6 +629,20 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+        )
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        # forward_cuda's fast paths are gated on `tensor.is_cuda`, which is
+        # False for XPU tensors, so it already falls back to the portable
+        # implementation. Reuse it instead of duplicating the orchestration.
+        return self.forward_cuda(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 
