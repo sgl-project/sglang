@@ -106,6 +106,29 @@ class NgramCorpus:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
+    def batch_get_with_lens(
+        self,
+        req_ids: List[str],
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """batch_get plus ``valid_lens[bs]``: how many entries of each request's
+        ``[draft_token_num]`` block are REAL nodes (anchor included).
+
+        Needed because the padding is not self-identifying. ``fillResult``
+        zero-pads the tail and gives each pad ``prev = 0``, so a pad's mask row
+        is exactly ``{0, i}`` -- byte-identical to a real depth-1 child whose
+        token happens to be 0. Token 0 is legal (DSV4's
+        ``<|begin_of_sentence|>``, and it is in the trie whenever the prompt is
+        indexed), so counting non-zeros or walking leaf paths reports a no-match
+        result as a length-1 continuation of token 0.
+
+        Kept separate from ``batch_get`` so the NGRAM worker's call site is
+        untouched.
+        """
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.match_stateful_lens(state_ids, batch_tokens, total_lens)
+
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
         for rid in req_ids:

@@ -85,6 +85,23 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.hybrid_chain import (
+    HybridChainState,
+    build_hybrid_verify_input,
+    parse_position_thresholds,
+)
+from sglang.srt.speculative.hybrid_ragged import (
+    HYBRID_RAGGED_TIER_VETO,
+    agree_hybrid_ragged_dp_tier,
+    build_hybrid_ragged_idle_layout,
+    build_hybrid_ragged_layout,
+    hybrid_ragged_capture_max_bs,
+    hybrid_ragged_capture_tiers,
+    hybrid_ragged_dp_tier_enabled,
+    plan_hybrid_ragged_tier,
+    resolve_hybrid_ragged_tier,
+)
+from sglang.srt.speculative.hybrid_retrieval import HybridRetriever
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -156,6 +173,55 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             get_spec().speculative_algorithm
         )
 
+        # Hybrid MTP + retrieval (hybrid retrieval). Init-static: the flags are fixed
+        # for the process lifetime. When enabled, the draft chain is MTP-headed,
+        # truncated per request at the first chain position whose draft prob
+        # falls below that position's tau, and refilled by NGRAM retrieval up to
+        # L = speculative_num_draft_tokens (> num_steps + 1). See hybrid_chain.
+        self.hybrid_enabled = server_args.speculative_hybrid_retrieval
+        # When on, the draft-loop step logprobs are written to a graph-safe
+        # STATIC buffer instead of a Python list, so the draft-loop and
+        # draft-extend cuda graphs can be captured and replayed. Off (default)
+        # keeps the draft loop eager (list-based) and captures only the
+        # target-verify graph.
+        self.hybrid_full_cuda_graph = server_args.speculative_hybrid_full_cuda_graph
+        self.hybrid_state: Optional[HybridChainState] = None
+        self.hybrid_retriever: Optional[HybridRetriever] = None
+        if self.hybrid_enabled:
+            self.hybrid_state = HybridChainState(
+                thresholds=parse_position_thresholds(
+                    server_args.speculative_hybrid_tau_per_pos,
+                    server_args.speculative_hybrid_tau,
+                    self.speculative_num_steps,
+                ),
+                tau_min=server_args.speculative_hybrid_tau_min,
+                dynamic_tau=server_args.speculative_hybrid_dynamic_tau,
+                device=self.device,
+            )
+            self.hybrid_retriever = HybridRetriever(server_args, self.device)
+        # This step's [bs, num_steps-1] draft-loop logprobs, stashed by
+        # draft_forward for the verify-input build (eager path); None on the
+        # full-cuda-graph path, where they live in the static buffer below.
+        self._hybrid_step_logprobs: Optional[torch.Tensor] = None
+        self._hybrid_step_logprobs_buf: Optional[torch.Tensor] = None
+        # One-shot warning latch for the non-greedy ragged fallback.
+        self._hybrid_ragged_nongreedy_warned = False
+        # Whether the graph tier has to be agreed across DP ranks each step.
+        # Resolved once: every input is a frozen server arg or a parallel-state
+        # constant, and re-deriving it per step would risk the ranks disagreeing
+        # about whether the collective happens at all.
+        self.hybrid_ragged_dp_tier = hybrid_ragged_dp_tier_enabled(
+            server_args=server_args
+        )
+        # Advances once per step on EVERY rank (the all-gather is
+        # unconditional), so it is the only key that lines dump rows up across
+        # ranks for the tier-equality check.
+        self._hybrid_ragged_dp_step = 0
+        self._hybrid_ragged_dp_tier_num_tokens: Optional[int] = None
+
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
@@ -265,6 +331,64 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
 
+    def _rebuild_topk1_chain_buffers(self) -> None:
+        # For topk=1 the draft tree degenerates to a chain, so parent_list and
+        # top_scores_index are runtime-invariant. Must be rebuilt after any
+        # change to speculative_num_steps / speculative_num_draft_tokens.
+        if self.topk != 1:
+            return
+        # _override_worker_state can set both directly, bypassing the hook that
+        # pins this relation; the fast path is only valid when it holds.
+        # Hybrid MTP+retrieval intentionally runs with L = num_draft_tokens >
+        # num_steps + 1 (retrieval fills the extra slots). The preallocs below
+        # stay width num_steps -- the MTP draft chain is still num_steps deep --
+        # and the wider verify chain is synthesized in hybrid_chain.
+        if self.hybrid_enabled:
+            assert (
+                self.speculative_num_draft_tokens >= self.speculative_num_steps + 1
+            ), (
+                "hybrid topk=1 requires speculative_num_draft_tokens (L) >= "
+                f"speculative_num_steps + 1, got L={self.speculative_num_draft_tokens} "
+                f"and num_steps={self.speculative_num_steps}"
+            )
+        else:
+            assert (
+                self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+            ), (
+                "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
+                f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+            )
+        num_steps = self.speculative_num_steps
+        decode_max_bs = (
+            get_exec().graph.cuda_graph_config.decode.max_bs
+            if get_exec().graph.cuda_graph_config is not None
+            else None
+        )
+        max_bs = max(
+            decode_max_bs or 0,
+            get_schedule().max_running_requests or 0,
+            1,
+        )
+        # A single-step chain has no parent entries (slow path drops the last
+        # step). repeat (not expand): the kernel reads these as contiguous.
+        parent_width = num_steps if num_steps > 1 else 0
+        self._topk1_parents_prealloc = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+        self._topk1_score_indices_prealloc = torch.arange(
+            num_steps, dtype=torch.long, device=self.device
+        ).repeat(max_bs, 1)
+        # Graph-safe per-step draft-logprob buffer (chain positions 1..num_steps-1).
+        # A fixed address so draft_forward's in-place writes are captured by the
+        # draft cuda graph and re-executed on replay. Sized to the same max_bs as
+        # the chain preallocs (covers eager max_running and captured graph bs).
+        if self.hybrid_enabled and self.hybrid_full_cuda_graph and num_steps > 1:
+            self._hybrid_step_logprobs_buf = torch.zeros(
+                (max_bs, num_steps - 1), dtype=torch.float32, device=self.device
+            )
+        else:
+            self._hybrid_step_logprobs_buf = None
+
     def init_token_map(self):
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -357,6 +481,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return
 
         if get_model().model_impl == "mindspore":
+            return
+
+        # Hybrid MTP+retrieval keeps the DRAFT loop and the draft-extend reseed
+        # EAGER so draft_forward can assemble the real per-step draft logprobs
+        # the tau truncation reads (a draft-graph replay would skip the Python
+        # list that carries them). The expensive TARGET-verify forward is
+        # captured independently by the target worker at the fixed width L, so
+        # verify still runs as a graph. --speculative-hybrid-full-cuda-graph
+        # routes the logprobs through a static buffer instead, which IS
+        # capturable, and re-enables both draft graphs.
+        if self.hybrid_enabled and not self.hybrid_full_cuda_graph:
+            log_info_on_rank0(
+                logger,
+                "hybrid MTP+retrieval: skipping draft / draft-extend cuda graphs "
+                "(eager draft for real per-step logprobs); the target-verify graph "
+                "is still captured. Pass --speculative-hybrid-full-cuda-graph to "
+                "capture them too.",
+            )
             return
 
         Device2DraftCudaGraphRunner = {
@@ -505,6 +647,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
     def draft(self, batch: ScheduleBatch):
+        # Drop any stash left by a previous iteration (an idle batch never
+        # reaches the hybrid build, so its [0, ...] tensor would otherwise be
+        # consumed by the next real one). draft_forward re-populates it.
+        self._hybrid_step_logprobs = None
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
@@ -552,20 +698,336 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
-        return build_eagle_verify_input(
-            batch,
-            draft_input,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            draft_probs,
-            target_worker=self.target_worker,
-            topk=self.topk,
-            num_steps=self.speculative_num_steps,
-            num_draft_tokens=self.speculative_num_draft_tokens,
-            tree_mask_mode=self.tree_mask_mode,
-            device=self.device,
+        if self.hybrid_enabled and not batch.forward_mode.is_idle():
+            verify_input = self._build_hybrid_verify_input(
+                batch, draft_input, draft_tokens
+            )
+        else:
+            verify_input = build_eagle_verify_input(
+                batch,
+                draft_input,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                draft_probs,
+                target_worker=self.target_worker,
+                topk=self.topk,
+                num_steps=self.speculative_num_steps,
+                num_draft_tokens=self.speculative_num_draft_tokens,
+                tree_mask_mode=self.tree_mask_mode,
+                device=self.device,
+            )
+
+        # BOTH branches, including the idle one: under DP attention the graph
+        # tier is a collective, and an idle rank has to join it.
+        return self._finalize_hybrid_ragged_layout(batch, verify_input)
+
+    def _build_hybrid_verify_input(
+        self,
+        batch: ScheduleBatch,
+        draft_input: EagleDraftInput,
+        mtp_draft_tokens: torch.Tensor,
+    ) -> EagleVerifyInput:
+        """Truncate the MTP chain by per-position tau and refill it to width L
+        with an agreement-gated retrieval continuation."""
+        bs = mtp_draft_tokens.shape[0]
+        if self.hybrid_full_cuda_graph:
+            # Written by draft_forward (captured + replayed under the graph).
+            step_logprobs = (
+                self._hybrid_step_logprobs_buf[:bs]
+                if self._hybrid_step_logprobs_buf is not None
+                else None
+            )
+        else:
+            step_logprobs, self._hybrid_step_logprobs = self._hybrid_step_logprobs, None
+            assert step_logprobs is not None or self.speculative_num_steps == 1, (
+                "hybrid MTP+retrieval needs the eager topk=1 chain with real draft "
+                "logprobs, but draft_forward produced none (cuda-graph replay or "
+                "oversized-batch slow path). Use --speculative-hybrid-full-cuda-graph "
+                "for the graph path."
+            )
+        assert step_logprobs is None or step_logprobs.shape[0] == bs, (
+            "hybrid MTP+retrieval: draft logprob rows "
+            f"({step_logprobs.shape[0]}) do not match the batch ({bs}); the "
+            "draft-loop stash is stale."
         )
+
+        # The trie walk was launched on a worker thread before draft_forward so
+        # the CPU match overlaps the GPU draft; join it here. The retriever
+        # reports its own continuation lengths -- they cannot be recovered from
+        # the chain, because the padding value 0 is a legal token id.
+        retrieval_chains, retrieval_lens = self.hybrid_retriever.collect()
+        if retrieval_chains is not None:
+            retrieval_chains = retrieval_chains.to(mtp_draft_tokens.dtype)
+
+        return build_hybrid_verify_input(
+            batch=batch,
+            draft_input=draft_input,
+            mtp_draft_tokens=mtp_draft_tokens,
+            step_logprobs=step_logprobs,
+            retrieval_chains=retrieval_chains,
+            retrieval_lens=retrieval_lens,
+            state=self.hybrid_state,
+            topk=self.topk,
+            verify_width=self.speculative_num_draft_tokens,
+            tree_mask_mode=self.tree_mask_mode,
+            target_worker=self.target_worker,
+            ragged=self._hybrid_ragged_enabled_for(batch),
+        )
+
+    def _hybrid_ragged_enabled_for(self, batch: ScheduleBatch) -> bool:
+        """Whether THIS step runs the ragged (variable-length) verify forward.
+
+        The accept cutoff is a port of DSPARK's ``CapCorrectLen``, which caps a
+        GREEDY ``correct_len``. The sampling paths
+        (``tree_speculative_sampling_target_only`` / rejection sampling) walk the
+        tree themselves and would need a per-position draft distribution to cap
+        equivalently -- which the topk=1 chain does not have (``topk_p`` is
+        fused to a constant 1.0). Rather than fail the request, fall back to the
+        fixed-width forward for that step: correctness is identical, only the
+        token saving is lost. Startup already rejects the CONFIGURATIONS that can
+        never be greedy (see ``_check_hybrid_ragged_server_args``); this handles a
+        single non-greedy request landing in an otherwise greedy deployment.
+        """
+        if not self.server_args.speculative_hybrid_ragged:
+            return False
+        if batch.forward_mode.is_idle():
+            return False
+        sampling_info = batch.sampling_info
+        if sampling_info is None or not sampling_info.is_all_greedy:
+            if not self._hybrid_ragged_nongreedy_warned:
+                self._hybrid_ragged_nongreedy_warned = True
+                logger.warning(
+                    "speculative_hybrid_ragged: batch is not all-greedy; this "
+                    "verify step falls back to the fixed-width forward. Output "
+                    "is unaffected; the ragged token saving is not taken."
+                )
+            return False
+        return True
+
+    def _finalize_hybrid_ragged_layout(
+        self, batch: ScheduleBatch, verify_input: EagleVerifyInput
+    ) -> EagleVerifyInput:
+        """Attach the ``RaggedVerifyLayout`` once the graph tier is settled.
+
+        Split out of ``build_hybrid_verify_input`` for one reason: the tier is a
+        CROSS-RANK agreement under DP attention, and an idle rank -- which never
+        builds a hybrid chain -- has to take part in it and then replay the same
+        captured graph. So both of ``draft()``'s branches land here, and this is
+        the single place that writes ``ragged_verify_layout``.
+
+        Three outcomes:
+          * layout with a tier      -- replayable on the token-keyed verify graph
+          * layout without a tier   -- exact ``graph_num_tokens == Σ w_r``; the
+                                      verify runs eager (eager mode's path, and what a
+                                      ``--disable-cuda-graph`` run gets)
+          * no layout               -- plain fixed-width verify
+        """
+        if not self.server_args.speculative_hybrid_ragged:
+            return verify_input
+
+        tier_grid = hybrid_ragged_capture_tiers(target_worker=self.target_worker)
+        accept_lens_cpu = verify_input.ragged_accept_verify_lens_cpu
+
+        if self.hybrid_ragged_dp_tier:
+            tier = self._agree_hybrid_ragged_dp_tier(
+                batch=batch,
+                accept_lens_cpu=accept_lens_cpu,
+                tier_grid=tier_grid,
+            )
+            if tier is None:
+                # Some rank vetoed (or nobody had work). Every rank reaches this
+                # from the same gathered vector, so the whole group drops to
+                # fixed width together -- which is mandatory, not conservative:
+                # a compact batch that does NOT replay a graph goes through
+                # `prepare_mlp_sync_batch`, whose DP padding stretches input_ids
+                # to `bs * num_tokens_per_req` and would not match the compact
+                # attention metadata.
+                return self._clear_hybrid_ragged(verify_input)
+            if accept_lens_cpu is None:
+                # Idle rank: no requests, but it still has to enter the graph.
+                # This branch can ONLY be the idle case: a non-idle rank with no
+                # accept widths (a non-greedy batch) votes VETO, which forces the
+                # agreed tier to None and returns above.
+                assert batch.forward_mode.is_idle(), (
+                    "ragged DP tier agreed but this rank has no accept widths and "
+                    "is not idle; its veto should have taken the whole group to "
+                    "fixed width"
+                )
+                verify_input.ragged_verify_layout = build_hybrid_ragged_idle_layout(
+                    tier_num_tokens=tier, target_worker=self.target_worker
+                )
+                return verify_input
+        elif accept_lens_cpu is None:
+            return self._clear_hybrid_ragged(verify_input)
+        else:
+            # Non-DP. Two differences from the DP branch, both because nothing
+            # here GUARANTEES the graph will be admitted:
+            #
+            #  * the tier is capped at `bs * L`. Above that, plan_hybrid_ragged_tier
+            #    cannot spend all the slack, and if the verify then falls back to
+            #    eager the substrate folds the remainder into the LAST REAL
+            #    request -- widening it past L and past its reserved KV window.
+            #    (On the graph path that same tier is fine: captured slots exceed
+            #    bs, so the remainder lands on pad requests.) When no grid member
+            #    fits under the cap, tier is None and the step runs exact+eager,
+            #    which costs a graph but is always safe.
+            #  * if the runner would not admit this batch at all, do not build a
+            #    tier -- same predicate the DP vote uses, so the two cannot drift.
+            admits = self._hybrid_ragged_graph_admits(
+                batch=batch, accept_lens_cpu=accept_lens_cpu, tier_grid=tier_grid
+            )
+            tier = (
+                resolve_hybrid_ragged_tier(
+                    total_verify_tokens=sum(accept_lens_cpu),
+                    tier_grid=tier_grid,
+                    max_tier=len(accept_lens_cpu) * self.speculative_num_draft_tokens,
+                )
+                if admits
+                else None
+            )
+
+        plan = (
+            plan_hybrid_ragged_tier(
+                accept_verify_lens=accept_lens_cpu,
+                verify_width=self.speculative_num_draft_tokens,
+                tier_num_tokens=tier,
+            )
+            if tier is not None
+            else None
+        )
+        forward_lens = plan.forward_verify_lens if plan else accept_lens_cpu
+        layout = build_hybrid_ragged_layout(
+            verify_lens_cpu=forward_lens,
+            device=self.device,
+            tier_num_tokens=tier,
+        )
+        verify_input.ragged_verify_layout = layout
+        return verify_input
+
+    def _clear_hybrid_ragged(self, verify_input: EagleVerifyInput) -> EagleVerifyInput:
+        """Drop every ragged field so this step is byte-for-byte fixed width.
+
+        The accept widths have to go too, not just the layout: `eagle_sample`
+        keys the cutoff off the layout, so a leftover width vector would be dead
+        weight that a later reader could mistake for "ragged ran".
+        """
+        verify_input.ragged_verify_layout = None
+        verify_input.ragged_accept_verify_lens = None
+        verify_input.ragged_accept_verify_lens_cpu = None
+        return verify_input
+
+    def _agree_hybrid_ragged_dp_tier(
+        self,
+        *,
+        batch: ScheduleBatch,
+        accept_lens_cpu: Optional[List[int]],
+        tier_grid: Optional[List[int]],
+    ) -> Optional[int]:
+        """This rank's vote, then the group's tier. Runs on EVERY rank, every step.
+
+        Unconditional participation is the whole point: the all-gather is the
+        only thing keeping the ranks on one graph shape, so a rank that skipped
+        it (or voted on a locally-derived predicate) would leave the others
+        blocked in the collective. `is_extend_in_batch` and
+        `can_run_dp_cuda_graph` are already dp-global (max- and min-reduced by
+        the MLP sync), so voting them is redundant for agreement -- but it is
+        free, and it keeps the "graph will run" precondition in one place instead
+        of implicitly spread across the runner's admission checks.
+        """
+        self._hybrid_ragged_dp_step += 1
+        local = self._hybrid_ragged_dp_vote(
+            batch=batch, accept_lens_cpu=accept_lens_cpu, tier_grid=tier_grid
+        )
+        tier = agree_hybrid_ragged_dp_tier(
+            local_total_verify_tokens=local,
+            tier_grid=tier_grid,
+            # NOT get_tp_group(): draft() runs inside draft_tp_context under DP,
+            # which patches the global tp group to the draft runner's (world_size
+            # 1 at attn_tp_size == 1). See agree_hybrid_ragged_dp_tier's docstring.
+            cpu_group=self.target_worker.model_runner.tp_group.cpu_group,
+        )
+        self._hybrid_ragged_dp_tier_num_tokens = tier
+        return tier
+
+    def _hybrid_ragged_graph_admits(
+        self,
+        *,
+        batch: ScheduleBatch,
+        accept_lens_cpu: Optional[List[int]],
+        tier_grid: Optional[List[int]],
+    ) -> bool:
+        """Will the decode runner admit this step's ragged verify to a graph?
+
+        The PER-RANK, per-step subset of `can_run_graph` /
+        `_can_run_ragged_verify_graph` that is knowable here. It has two callers
+        that must never disagree:
+
+          * the DP vote -- a rank that would not be admitted has to veto, or it
+            runs its compact batch eager (through prepare_mlp_sync_batch's DP
+            padding) while its peers replay the graph, and the group hangs;
+          * the non-DP tier choice -- a tier above `bs * verify_width` is only
+            safe when the graph runs, because only then do captured PAD requests
+            exist to absorb the slack. On the eager path the substrate folds it
+            into the last real request instead.
+
+        Conditions deliberately NOT here because they are process-static or
+        dp-global rather than per-rank: `supports_ragged_verify_graph`, the
+        capture_hidden_mode match, `can_run_dp_cuda_graph` and
+        `is_extend_in_batch` (the last two are voted separately, since they are
+        dp-global by construction and belong to the DP decision).
+        """
+        if accept_lens_cpu is None or not tier_grid:
+            return False
+        if batch.replace_embeds is not None:
+            # can_run_graph's FIRST test, before it ever reaches the ragged
+            # branch, so the vote has to cover it or the two drift apart. It is a
+            # PER-RANK property: only ranks holding a request with a
+            # token-embedding override carry it, so one rank refusing the graph
+            # must take the whole group to fixed width.
+            #
+            # `prepare_for_decode` now clears the overrides (they address prefill
+            # rows), so on a decode-family batch this is normally already None.
+            # Keep the test anyway: it is the union with can_run_graph, and if a
+            # future field ever survives into decode again, the group still falls
+            # back together instead of splitting.
+            return False
+        if sum(accept_lens_cpu) > tier_grid[-1]:
+            return False
+        if len(accept_lens_cpu) > hybrid_ragged_capture_max_bs(
+            target_worker=self.target_worker
+        ):
+            # The runner's `batch_size <= _ragged_capture_slots(tier)` =
+            # `min(tier, max_bs)`. Every w_r >= 1 makes the tier >= bs, so it
+            # reduces exactly to `bs <= max_bs` -- and max_bs = max(capture_bs)
+            # comes from --cuda-graph-max-bs, which is INDEPENDENT of
+            # --max-running-requests.
+            return False
+        return True
+
+    def _hybrid_ragged_dp_vote(
+        self,
+        *,
+        batch: ScheduleBatch,
+        accept_lens_cpu: Optional[List[int]],
+        tier_grid: Optional[List[int]],
+    ) -> int:
+        if batch.forward_mode.is_idle():
+            # Nothing to verify, no objection: an idle rank rides whatever tier
+            # the busy ranks agree on.
+            return 0
+        if accept_lens_cpu is None:
+            # Ragged is off for this step on this rank (non-greedy batch). A 0
+            # here would read as "no objection" and let the peers go ragged while
+            # this rank runs fixed width -- different graph, hung group.
+            return HYBRID_RAGGED_TIER_VETO
+        if batch.is_extend_in_batch or not batch.can_run_dp_cuda_graph:
+            return HYBRID_RAGGED_TIER_VETO
+        if not self._hybrid_ragged_graph_admits(
+            batch=batch, accept_lens_cpu=accept_lens_cpu, tier_grid=tier_grid
+        ):
+            return HYBRID_RAGGED_TIER_VETO
+        return sum(accept_lens_cpu)
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -619,6 +1081,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+
+        # Real per-step draft logprobs on the topk=1 chain fast path (production
+        # fakes topk_p to 1.0 inside the fused kernel). The hybrid chain uses
+        # them for confidence-based truncation.
+        hybrid_on = self.hybrid_enabled and draft_tokens_topk1 is not None
+        step_logprobs_buf = self._hybrid_step_logprobs_buf if hybrid_on else None
+        step_lp_list: List[torch.Tensor] = []
 
         # Forward multiple steps
         scores = None
@@ -703,6 +1172,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                if hybrid_on:
+                    # log p_draft(argmax token) = gather - logsumexp; avoids
+                    # materializing the full [bs, vocab] log_softmax. This
+                    # forward produces chain position i + 1.
+                    step_logits = logits_output.next_token_logits
+                    step_lp = torch.gather(
+                        step_logits, -1, topk_index
+                    ) - torch.logsumexp(step_logits, dim=-1, keepdim=True)
+                    if step_logprobs_buf is not None:
+                        # In-place write into the graph-safe static buffer
+                        # (column i = chain position i + 1), so the draft cuda
+                        # graph captures it and replays it.
+                        step_logprobs_buf[: step_lp.shape[0], i] = step_lp.squeeze(-1)
+                    else:
+                        step_lp_list.append(step_lp)
                 maybe_detect_oob(
                     topk_index,
                     0,
@@ -718,6 +1202,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if get_spec().speculative_use_rejection_sampling
             else None
         )
+
+        step_logprobs = torch.cat(step_lp_list, dim=1) if step_lp_list else None
+        if hybrid_on and step_logprobs_buf is None:
+            # Stash for the hybrid verify-input build (draft -> build is
+            # sequential within this forward step).
+            self._hybrid_step_logprobs = step_logprobs
 
         # Organize the results
         if draft_tokens_topk1 is not None:
@@ -1102,6 +1592,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    def clear_cache_pool(self):
+        """Clear hybrid retrieval's process-local online retrieval state."""
+        dw = self._draft_worker
+        if dw.hybrid_retriever is not None:
+            dw.hybrid_retriever.reset()
+
+        state = dw.hybrid_state
+        if state is not None:
+            state.extension_ema = 0.0
+            state.last_num_keep_drafts = None
+            state.last_graft_ok = None
+
+        # The static graph buffer is deliberately retained: it has a
+        # capture-stable address and every active slice is overwritten before use.
+        dw._hybrid_step_logprobs = None
+        logger.info("Hybrid NGRAM corpus and retrieval state reset")
+
     @property
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
@@ -1188,6 +1695,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+                # Index the full prompt into the trie so hybrid retrieval can
+                # copy from the prompt (RAG / long-context / code-with-context).
+                # The decode-time insert only adds sliding windows of generated
+                # text, so without this the prompt body is never matchable.
+                if (
+                    self.draft_worker.hybrid_retriever is not None
+                    and self.server_args.speculative_hybrid_index_prompt
+                    and not batch.forward_mode.is_idle()
+                ):
+                    self.draft_worker.hybrid_retriever.insert_prompt(batch.reqs)
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
@@ -1214,6 +1731,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # runs, keeping draft KV warm for when the batch shrinks.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
+                # Kick off the NGRAM trie walk on a worker thread BEFORE the GPU
+                # draft_forward so the CPU match overlaps it; the hybrid
+                # verify-input build joins it.
+                if (
+                    self.draft_worker.hybrid_retriever is not None
+                    and not batch.forward_mode.is_idle()
+                ):
+                    self.draft_worker.hybrid_retriever.launch_query(batch.reqs)
                 with (
                     self.draft_worker.draft_tp_context(
                         self.draft_worker.draft_runner.tp_group
@@ -1229,6 +1754,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+            # Must run after on_publish (seq_lens published first) and before
+            # the next launch_query drains the relay.
+            if not batch.forward_mode.is_idle():
+                self._hybrid_after_verify(batch, batch_output)
             if (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
@@ -1245,7 +1774,44 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            # Fold the verified context into the trie AFTER querying it
+            # (query-first / insert-after mirrors NGRAMWorker, so a query
+            # matches earlier occurrences of the suffix, not the just-written
+            # leaf), then drop match state for finished/retracted requests.
+            if (
+                self.draft_worker.hybrid_retriever is not None
+                and not batch.forward_mode.is_idle()
+            ):
+                self.draft_worker.hybrid_retriever.insert(batch.reqs)
+                self.draft_worker.hybrid_retriever.erase(batch.reqs)
+
             return batch_output
+
+    def _hybrid_after_verify(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> None:
+        """Post-verify hybrid bookkeeping: the overlap accepted-token relay and
+        the retrieval-extension EMA that drives dynamic tau."""
+        retriever = self.draft_worker.hybrid_retriever
+        if retriever is None:
+            return
+        if retriever.overlap:
+            # Relay this step's accepted tokens into the retriever's shadow
+            # context via an async D2H, off the forward hot path.
+            # next_token_ids / accept_lens are the same tensors the scheduler
+            # commits from; the stride is speculative_num_draft_tokens (= L).
+            retriever.publish_accepted(
+                batch.reqs,
+                batch_output.next_token_ids,
+                batch_output.accept_lens,
+                batch_output.speculative_num_draft_tokens,
+            )
+        state = self.draft_worker.hybrid_state
+        if state is not None and state.dynamic_tau:
+            state.update_extension_ema(
+                num_correct_drafts=batch_output.accept_lens - 1,
+                keep_on_device=retriever.overlap,
+            )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

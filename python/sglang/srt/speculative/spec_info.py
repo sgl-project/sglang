@@ -131,8 +131,23 @@ class SpeculativeAlgorithm(Enum):
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
-        graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        graphs in the decode cuda graph runner.
+
+        EAGLE qualifies only when hybrid retrieval's ragged verify is switched ON for
+        this process. The extra condition is not belt-and-braces: on plain
+        ``is_eagle()`` every EAGLE deployment would swap its fixed-width verify
+        graphs for token-keyed ones and inherit the compact path's restrictions
+        (no TBO, no LoRA, no ``--disable-cuda-graph-padding``) without asking for
+        any of it. The flag is a resolved server arg, so it is the same on every
+        rank and for the whole process lifetime.
+        """
+        if self.is_dspark():
+            return True
+        if not self.is_eagle():
+            return False
+        from sglang.srt.runtime_context import get_server_args
+
+        return bool(get_server_args().speculative_hybrid_ragged)
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the

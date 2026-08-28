@@ -434,6 +434,51 @@ print(response.json())
 
 ---
 
+## Hybrid MTP and Ngram Retrieval
+
+Hybrid retrieval extends a top-k=1 EAGLE/NEXTN draft chain with a continuation
+from SGLang's ngram corpus. The MTP prefix is truncated only at configured
+low-confidence positions, and the retrieval tail is appended only when it agrees
+with the retained MTP prefix. Target-model verification remains authoritative, so
+enabling hybrid retrieval does not change speculative decoding correctness.
+
+Add the following options to an EAGLE/NEXTN launch:
+
+```bash Command
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 9 \
+--speculative-hybrid-retrieval \
+--speculative-hybrid-tau-per-pos off,off,0.40,0.55 \
+--speculative-hybrid-full-cuda-graph
+```
+
+`--speculative-num-draft-tokens` is the maximum verify width, including the
+target-produced bonus token. `--speculative-hybrid-tau-per-pos` is indexed by
+verify-chain column: column 0 is the bonus token and column 1 is the first MTP
+draft, so both must be disabled. An empty per-position value uses
+`--speculative-hybrid-tau` for columns 2 and later.
+
+The following options tune retrieval behavior:
+
+- `--speculative-hybrid-index-prompt` also indexes prompt tokens in the corpus.
+- `--speculative-hybrid-dynamic-tau` adjusts enabled thresholds using the
+  retrieval-extension exponential moving average.
+- `--speculative-hybrid-overlap` overlaps the CPU corpus query with MTP drafting.
+  Without this option, hybrid retrieval disables the overlap scheduler.
+
+On the DeepSeek V4 attention backend, `--speculative-hybrid-ragged` can compact
+the variable-length verify rows and round their total to a captured CUDA graph
+tier. This mode is greedy-only and has stricter startup checks for attention,
+parallelism, CUDA graph preparation, LoRA, and overlap compatibility. The tier
+grid can be controlled with `--speculative-hybrid-ragged-floor`,
+`--speculative-hybrid-ragged-tier-step`,
+`--speculative-hybrid-ragged-max-tiers`, and
+`--speculative-hybrid-ragged-tiers`. In DP-attention deployments, also enable
+`--speculative-hybrid-ragged-dp-tier` so all ranks choose the same graph tier.
+
+---
+
 ## DFlash Decoding
 
 SGLang also supports **DFLASH** speculative decoding using a dedicated draft model checkpoint. Compared with EAGLE-style tree verification, DFLASH verifies a linear draft block and is configured around a block size / draft window. This path is useful when the target model has a matching DFlash draft checkpoint, such as `meta-llama/Llama-3.1-8B-Instruct` with `z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat`.

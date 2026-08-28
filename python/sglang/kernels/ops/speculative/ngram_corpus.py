@@ -97,6 +97,48 @@ def get_ngram_corpus_cls():
                 np.int64
             )
 
+        def match_stateful_lens(
+            self,
+            state_ids: List[int],
+            batch_tokens: List[List[int]],
+            total_lens: List[int],
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            """match_stateful plus the per-request count of REAL result nodes.
+
+            The third array is the ONLY way to tell a no-match result (anchor
+            plus zero padding) from a genuine one-token continuation of token 0:
+            both give ``token[1] == 0`` and the same mask row. See
+            ``Result::num_valid`` in ``csrc/ngram_corpus/result.h``.
+
+            A separate entry point rather than an extra return value on
+            ``match_stateful``, so the NGRAM algorithm's hot path is unchanged.
+            """
+            tokens_flat, offsets = _to_csr(batch_tokens)
+            batch_size = len(batch_tokens)
+            d = self._draft_token_num
+
+            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+            total_lens_t = torch.tensor(total_lens, dtype=torch.int64)
+            out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
+            out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
+            out_valid_lens = torch.zeros(batch_size, dtype=torch.int32)
+
+            self.batch_match_stateful_lens(  # type: ignore
+                state_ids_t,
+                tokens_flat,
+                offsets,
+                total_lens_t,
+                out_tokens,
+                out_mask,
+                out_valid_lens,
+            )
+
+            return (
+                out_tokens.numpy().astype(np.int64),
+                out_mask.numpy().astype(np.int64),
+                out_valid_lens.numpy().astype(np.int64),
+            )
+
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             self.erase_match_state(state_ids_t)  # type: ignore

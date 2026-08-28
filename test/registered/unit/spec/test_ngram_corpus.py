@@ -220,6 +220,22 @@ class TestNgramCorpusNoMatch(CustomTestCase):
         self.assertEqual(ids_list[0], 3)
         self.assertTrue(all(t == 0 for t in ids_list[1:]))
 
+    def test_valid_lengths_distinguish_padding_from_token_zero(self):
+        corpus = _make_corpus("BFS")
+        corpus.batch_put([[55, 0, 66]])
+        corpus.synchronize()
+
+        ids, _, valid_lens = corpus.batch_get_with_lens(
+            req_ids=["no-match", "real-zero"],
+            batch_tokens=[[333], [55]],
+            total_lens=[1, 1],
+        )
+        ids = ids.reshape(2, -1)
+
+        self.assertEqual(ids[0, 1], 0)
+        self.assertEqual(ids[1, 1], 0)
+        self.assertEqual(valid_lens.tolist(), [1, 3])
+
 
 class TestNgramCorpusMultipleInserts(CustomTestCase):
     """Verify that multiple inserts accumulate correctly."""

@@ -214,6 +214,27 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # --- capture contract for the subclasses that skip this __init__ -------
+    # EAGLEDraftCudaGraphRunner, EAGLEDraftExtendCudaGraphRunner,
+    # FrozenKVMTPCudaGraphRunner and MultiLayerEagleDraftExtendCudaGraphRunner
+    # deliberately do NOT call this __init__ (it builds decode-only SWA /
+    # encoder-decoder / MLA-aware state they have no use for); each one
+    # hand-initializes the fields the INHERITED capture loop reads. So a field
+    # that `_capture_one_stream` / `_capture_ragged_tiers` touches must have a
+    # value even when this __init__ never ran, and that default belongs here --
+    # declared once, identical for every subclass, and still overwritten below
+    # for the runner that does construct normally -- rather than as a
+    # `getattr(self, ..., False)` at the read site, which would also swallow a
+    # genuinely missing field.
+    #
+    # False/None are not merely inert placeholders: ragged verify is a
+    # TARGET-worker mode (see __init__), so no draft-side runner can ever be in
+    # it. test/registered/unit/model_executor/runner/test_decode_capture_contract.py
+    # pins the closure -- a new field read from the capture path has to be
+    # declared here or set by all four subclasses.
+    ragged_verify_mode: bool = False
+    capture_num_tokens: Optional[list[int]] = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -351,10 +372,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.ragged_verify_mode
             else None
         )
+        # Membership, not range: `_can_run_ragged_verify_graph` has to reject a
+        # layout whose token count sits BETWEEN two captured tiers, and the grid
+        # is deliberately not dense (see _validate_hybrid_ragged_tier_grid). Frozen
+        # for the runner's lifetime, so hoist the set out of the per-step path.
+        self._ragged_capture_token_set: frozenset[int] = frozenset(
+            self.capture_num_tokens or ()
+        )
         self._ragged_graph_size = 0
         # Per-tier capture layouts; their verify_lens / qo_indptr tensors are
         # baked into the captured graphs and refreshed in place each replay.
         self._captured_ragged_layouts: dict[int, object] = {}
+        # How many verify steps ran EAGER because no captured tier could hold
+        # them. In ragged mode that is not a cheap fallback -- there is no
+        # fixed-width verify graph left -- so it needs to be countable rather
+        # than invisible.
+        self._ragged_verify_eager_steps = 0
+        self._ragged_verify_eager_next_log = 1
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap
             or model_runner.lora_manager is not None
@@ -537,6 +571,70 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.shared_read_done_event = read_done
 
     def _build_ragged_verify_token_buckets(self) -> list[int]:
+        server_args = self.model_runner.server_args
+        if server_args.speculative_hybrid_ragged:
+            # hybrid retrieval brings its own grid: the default {bs * width} below has
+            # spacing `width`, while the hybrid chain's totals move in quanta of
+            # `width - floor`, so the round-up eats almost all of the saving.
+            # See build_hybrid_ragged_tier_grid.
+            from sglang.srt.speculative.hybrid_ragged import (
+                build_hybrid_ragged_tier_plan,
+                resolve_hybrid_ragged_tier_params,
+            )
+
+            params = resolve_hybrid_ragged_tier_params(
+                server_args=server_args,
+                verify_width=self.captured_req_width,
+                capture_bs=self.capture_bs,
+            )
+            plan = build_hybrid_ragged_tier_plan(
+                capture_bs=self.capture_bs,
+                verify_width=self.captured_req_width,
+                floor=params.floor,
+                tier_step=params.tier_step,
+                max_tiers=params.max_tiers,
+                explicit_tiers=params.explicit_tiers,
+            )
+            buckets = plan.tiers
+            if get_parallel().tp_rank == 0:
+                # The EFFECTIVE step and the anchor count are what say whether
+                # this is the quantum-aligned grid used by the measurements
+                # on or a coarsened fallback -- printing only the requested step
+                # would show `step=5` on a grid that actually ran at 2080.
+                logger.info(
+                    "hybrid retrieval ragged verify tier grid: %s (floor=%d, "
+                    "requested_step=%d, width=%d, max_tiers=%d). Tiers: %s. "
+                    "%d verify graphs will be captured; the fixed-width path "
+                    "would capture %d.",
+                    plan.describe(),
+                    params.floor,
+                    params.tier_step,
+                    self.captured_req_width,
+                    params.max_tiers,
+                    buckets,
+                    len(buckets),
+                    len(self.capture_bs),
+                )
+                if plan.coarsened(params.tier_step):
+                    logger.warning(
+                        "hybrid retrieval ragged verify: the grid was COARSENED to fit "
+                        "--speculative-hybrid-ragged-max-tiers=%d (%s). The "
+                        "The reported saving numbers used an uncoarsened "
+                        "quantum grid, so expect less. Raise max-tiers (and pay "
+                        "startup capture time) or lower --cuda-graph-max-bs.",
+                        params.max_tiers,
+                        plan.describe_coarsening(params.tier_step),
+                    )
+                if params.max_tiers > 0 and len(buckets) > params.max_tiers:
+                    logger.warning(
+                        "hybrid retrieval ragged verify: %d tiers still exceeds "
+                        "--speculative-hybrid-ragged-max-tiers=%d at the "
+                        "coarsest reachable grid; capturing all of them.",
+                        len(buckets),
+                        params.max_tiers,
+                    )
+            return buckets
+
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
         return buckets
@@ -624,7 +722,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
-            return num_tokens // self.captured_req_width
+            # This test knob assumes every tier is a whole number of full-width
+            # requests, which holds for the substrate's {bs * width} grid but not
+            # for hybrid retrieval's quantum grid (4, 8, 13, 17, ... at width 9). Floor
+            # at 1 slot: 0 would make build_capture_verify_lens raise at capture.
+            return max(num_tokens // self.captured_req_width, 1)
         return min(num_tokens, self.max_bs)
 
     def _capture_ragged_verify_layout(self, num_tokens: int):
@@ -678,15 +780,40 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
-        ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
-            if self.ragged_verify_mode
-            else None
-        )
-        if ragged_layout is not None:
-            return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
-        if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
+        ragged_layout = resolve_ragged_verify_layout(forward_batch)
+        if ragged_layout is not None and not self.ragged_verify_mode:
+            # A layout means the forward's inputs are COMPACT (sum(w_r) rows,
+            # not bs * width). This runner captured fixed-width graphs, so
+            # replaying one here would feed a short input_ids/out_cache_loc into
+            # a graph whose static buffers assume the full rectangle. Fall back
+            # to eager -- correct, just slower. Reachable when the token-keyed
+            # captures were never built (SGLANG_RAGGED_VERIFY_MODE not compact,
+            # or this is the draft runner, which stays fixed width by design).
             return False
+        if self.ragged_verify_mode:
+            # In ragged mode the layout is the ONLY thing that can name a captured
+            # graph: `_capture_ragged_tiers` REPLACES the batch-size capture loop,
+            # so `self._graphs` is keyed purely by token tier. Two consequences,
+            # and both of them are decided here rather than per forward mode:
+            #
+            #  * no layout  -> no graph, whatever the mode. That has to include an
+            #    IDLE batch. Under DP attention a single rank's veto drops the
+            #    layout on EVERY rank (the tier is agreed from one gathered
+            #    vector), and an idle rank that kept replaying here would enter a
+            #    captured graph while its busy peers ran eager -- the two halves of
+            #    the group would then disagree on the shape of every in-graph
+            #    collective, which hangs with no assertion firing first. Falling
+            #    through to the fixed-width admission below is not a lesser
+            #    version of that bug: it derives its key from `bs * width`, which
+            #    the ragged grid does not have to contain at all.
+            #  * a layout the captures cannot hold -> also eager, counted the same
+            #    way (see _can_run_ragged_verify_graph).
+            if ragged_layout is None or not self._can_run_ragged_verify_graph(
+                forward_batch, ragged_layout
+            ):
+                self._note_ragged_verify_ran_eager(forward_batch, ragged_layout)
+                return False
+            return True
 
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
@@ -750,14 +877,56 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and is_ngram_supported
         )
 
+    def _note_ragged_verify_ran_eager(
+        self, forward_batch: ForwardBatch, layout
+    ) -> None:
+        """Count (and occasionally log) a verify step that could not be replayed.
+
+        In ragged mode this is not the cheap fallback it is on the fixed-width
+        path -- there is no fixed-width verify graph left to take -- so it shows
+        up as "throughput mysteriously collapsed" rather than as an error. Logged
+        on the first occurrence and then on a geometric schedule, so a persistent
+        fallback keeps saying so without one log line per decode step.
+        """
+        self._ragged_verify_eager_steps += 1
+        count = self._ragged_verify_eager_steps
+        if count < self._ragged_verify_eager_next_log:
+            return
+        self._ragged_verify_eager_next_log = max(count * 10, 1)
+        logger.warning(
+            "Ragged verify is on but %d batch(es) ran EAGER: every captured verify "
+            "graph is token-keyed, so there is no fixed-width graph to fall back "
+            "to. This step was mode=%s, batch_size=%d, tier=%s. Expected for a "
+            "non-greedy batch, a DP tier veto (which takes the WHOLE group -- busy "
+            "and idle -- to eager together), speculative_num_steps == 0, a step "
+            "total above the grid's last tier (%d), or an intended-eager exact "
+            "layout whose token count is not a captured tier.",
+            count,
+            forward_batch.forward_mode.name,
+            forward_batch.batch_size,
+            None if layout is None else layout.graph_num_tokens,
+            self.capture_num_tokens[-1],
+        )
+
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:
             return False
 
         admission_tokens = ragged_layout.graph_num_tokens
-        is_tokens_supported = admission_tokens <= self.capture_num_tokens[
-            -1
-        ] and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        # MEMBERSHIP, not `<= capture_num_tokens[-1]`. `load_batch` keys the replay
+        # off `round_up_grid(graph_num_tokens)`, so a token count that merely sits
+        # inside the grid's range selects a DIFFERENT graph than the layout
+        # describes -- caught by load_batch's tier assert, i.e. a dead request
+        # rather than an eager step. Non-members are a NORMAL occurrence, not a
+        # corrupt layout: the planner builds an EXACT layout
+        # (graph_num_tokens == Σ w_r) precisely when it wants the step to run
+        # eager -- when cuda graphs are off, and when the next captured tier is
+        # above `bs * verify_width` so its slack could not be spent inside the
+        # per-request cap (resolve_hybrid_ragged_tier's `max_tier`).
+        is_tokens_supported = (
+            admission_tokens in self._ragged_capture_token_set
+            and forward_batch.batch_size <= self._ragged_capture_slots(admission_tokens)
+        )
 
         is_dp_supported = (
             forward_batch.can_run_decode_cuda_graph if self.require_mlp_sync else True
@@ -1097,16 +1266,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
+        lora_variants = (
+            [("lora", True), ("nolora", False)]
+            if getattr(self, "record_nolora_graph", False)
+            else [(None, None)]
+        )
+        if self.ragged_verify_mode:
+            self._capture_ragged_tiers(stream_idx, lora_variants)
+            return
+
         # Reverse so cuda graphs share memory better.
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
             if get_parallel().tp_rank == 0
             else reversed(self.capture_bs)
-        )
-        lora_variants = (
-            [("lora", True), ("nolora", False)]
-            if getattr(self, "record_nolora_graph", False)
-            else [(None, None)]
         )
         # DSA: capture a dense (k-only) and a sparse (full indexer) graph
         # per bs bucket. Order: dense first so its (smaller) capture-time peak
@@ -1150,6 +1323,62 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                             )
         _set_capture_dsa_variant(None)
 
+    def _capture_ragged_tiers(self, stream_idx, lora_variants) -> None:
+        """Capture one graph per TOKEN TIER (ragged verify only).
+
+        Kept as a separate loop rather than folded into the batch-size one on
+        purpose. Every speculative subclass of this runner
+        (EAGLEDraftCudaGraphRunner, EAGLEDraftExtendCudaGraphRunner,
+        MultiLayerEagleDraftExtendCudaGraphRunner, FrozenKVMTPCudaGraphRunner)
+        overrides ``capture_one_shape`` WITHOUT the ``num_tokens`` parameter and
+        inherits ``_capture_one_stream`` unchanged -- so a unified loop that
+        always passed ``num_tokens=`` would raise TypeError at startup for every
+        one of them. None of them can reach this method: ``ragged_verify_mode``
+        requires the TARGET worker and a TARGET_VERIFY capture mode.
+        """
+        capture_range = (
+            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+            if get_parallel().tp_rank == 0
+            else reversed(self.capture_num_tokens)
+        )
+        for num_tokens in capture_range:
+            slots = self._ragged_capture_slots(num_tokens)
+            if get_parallel().tp_rank == 0:
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                capture_range.set_description(
+                    f"Capturing tiers (tokens={num_tokens} slots={slots} "
+                    f"{avail_mem=:.2f} GB)"
+                )
+
+            # torch.compile is keyed by REQUEST count and `compile_bs` is a
+            # subset of `capture_bs`, so a tier that is not a whole number of
+            # full-width requests has no request count and no pre-graph-tier mode
+            # counterpart; it stays uncompiled rather than being opted in by a
+            # rounding choice.
+            compile_this_shape = (
+                num_tokens % self.captured_req_width == 0
+                and (num_tokens // self.captured_req_width) in self.compile_bs
+            )
+            for variant_label, _variant_has_lora in lora_variants:
+                _set_capture_lora_variant(variant_label)
+                with torch_compile_decoration.patch_model(
+                    self.model_runner.model,
+                    compile_this_shape,
+                    num_tokens=num_tokens,
+                    tp_group=self.model_runner.tp_group,
+                ) as forward:
+                    self.capture_one_shape(
+                        slots,
+                        forward,
+                        stream_idx,
+                        variant_label,
+                        num_tokens=num_tokens,
+                    )
+
     def capture_one_shape(
         self,
         size: int,
@@ -1157,8 +1386,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         dsa_variant: Optional[str] = None,
+        num_tokens: Optional[int] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        if num_tokens is None:
+            num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -1298,8 +1529,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             )
             if is_ragged:
-                assert self.raw_num_token == ragged_layout.graph_num_tokens, (
-                    f"stale ragged raw_num_token {self.raw_num_token} != "
+                assert self.raw_num_token <= ragged_layout.graph_num_tokens, (
+                    f"stale ragged raw_num_token {self.raw_num_token} > tier "
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
@@ -1328,11 +1559,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         raw_bs = forward_batch.batch_size
 
         if is_ragged:
-            raw_num_token = ragged_layout.graph_num_tokens
-            graph_size_key = self._ragged_graph_num_tokens(raw_num_token)
+            # The graph is keyed by the layout's tier, but only the rows the
+            # batch actually carries get copied in. Those are the same number
+            # for a busy rank (the planner pads its compact window to the tier),
+            # and ZERO for an idle DP rank, which has no requests yet still has
+            # to enter the same captured graph as its peers or the in-graph DP
+            # collectives mismatch. The registry resets the [raw, padded) tail,
+            # which is exactly what the fixed-width idle path already relies on.
+            graph_size_key = self._ragged_graph_num_tokens(
+                ragged_layout.graph_num_tokens
+            )
             assert graph_size_key == ragged_layout.graph_num_tokens, (
                 f"ragged verify tier mismatch: runner tier {graph_size_key} != "
                 f"layout graph_num_tokens {ragged_layout.graph_num_tokens}"
+            )
+            raw_num_token = forward_batch.input_ids.numel()
+            assert raw_num_token <= graph_size_key, (
+                f"ragged verify batch carries {raw_num_token} rows but its tier "
+                f"is {graph_size_key}; the planner must pad the compact window "
+                "to the tier"
             )
             bs = self._ragged_capture_slots(graph_size_key)
             assert bs >= raw_bs, (
@@ -1342,6 +1587,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = graph_size_key
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
+            # The fixed-width key is `bs * captured_req_width`, which the ragged
+            # grid need not contain -- and even where it does, that tier was
+            # captured with `min(tokens, max_bs)` request slots rather than `bs`.
+            # can_run_graph rejects every layout-less batch in ragged mode, so
+            # arriving here means that gate regressed; say so instead of replaying
+            # a graph whose geometry does not describe this batch.
+            assert not self.ragged_verify_mode, (
+                f"ragged verify mode reached the fixed-width replay path "
+                f"(mode={forward_batch.forward_mode.name}, raw_bs={raw_bs}): every "
+                "captured graph is token-keyed, so can_run_graph must have sent "
+                "this batch to eager"
+            )
             raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
@@ -1545,6 +1802,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_hidden_mode=capture_mode,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
+                    # hybrid retrieval ragged verify: without a layout here the capture
+                    # would plan FIXED-WIDTH attention metadata (uniform
+                    # extend_seq_lens = width, qo_indptr with stride width) and
+                    # then be replayed against a ragged batch. The DSV4 backend
+                    # rebuilds its metadata inside the graph from the layout's
+                    # device tensors, so what capture fixes is the SHAPE -- and a
+                    # fixed-width shape at a tier that is not a multiple of the
+                    # width does not even exist. None when ragged is off, which
+                    # keeps every non-hybrid retrieval EAGLE capture byte-identical.
+                    ragged_verify_layout=self._capture_ragged_verify_layout(num_tokens),
                 )
                 # MTP models (e.g. deepseek_nextn) read spec_info.hidden_states
                 spec_info.hidden_states = torch.zeros(

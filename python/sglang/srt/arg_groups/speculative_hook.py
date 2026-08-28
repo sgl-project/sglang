@@ -814,6 +814,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     if (
         cfg.speculative_eagle_topk == 1
+        and not cfg.speculative_hybrid_retrieval
         and cfg.speculative_num_draft_tokens != cfg.speculative_num_steps + 1
     ):
         logger.warning(
@@ -824,6 +825,19 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "_handle_eagle_family",
             speculative_num_draft_tokens=cfg.speculative_num_steps + 1,
         )
+    elif cfg.speculative_eagle_topk == 1 and cfg.speculative_hybrid_retrieval:
+        # Hybrid MTP+retrieval intentionally uses L = num_draft_tokens >
+        # num_steps + 1 (retrieval fills the extra slots). Collapsing it here
+        # would silently remove the retrieval extension room.
+        logger.warning(
+            "speculative_hybrid_retrieval: keeping speculative_num_draft_tokens=%d "
+            "(L) > speculative_num_steps + 1 = %d for the retrieval extension.",
+            cfg.speculative_num_draft_tokens,
+            cfg.speculative_num_steps + 1,
+        )
+
+    if cfg.speculative_hybrid_retrieval:
+        _handle_hybrid_retrieval(server_args)
 
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
@@ -840,6 +854,84 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
+
+
+def _handle_hybrid_retrieval(server_args: ServerArgs) -> None:
+    """Pin the co-requisites of hybrid MTP + retrieval (hybrid retrieval).
+
+    Mutations live here, next to ``_disable_overlap_schedule_for_cpu``, so they
+    land while the configuration is still resolving; ``ServerArgs.
+    check_hybrid_retrieval_server_args`` only validates afterwards (a bare field
+    write after resolution trips the strict-config-mutation guard).
+    """
+    cfg = resolving_view(server_args)
+
+    # Chain-only retrieval: the splice and the agreement gate both assume a
+    # single linear continuation, so pin the ngram BFS breadth to 1.
+    declare_resolution(
+        server_args,
+        "_handle_hybrid_retrieval",
+        speculative_ngram_min_bfs_breadth=1,
+        speculative_ngram_max_bfs_breadth=1,
+    )
+
+    # The retrieval query conditions on the verified context. By default that is
+    # req.output_ids, which under the overlap scheduler LAGS the real chain
+    # position (just-accepted tokens are committed only after the forward), so
+    # the retrieved continuation is offset from the MTP chain and the agreement
+    # gate never matches. Force --disable-overlap-schedule, exactly as the NGRAM
+    # worker does. --speculative-hybrid-overlap instead flips the retriever to a
+    # self-maintained shadow context fed by an async accepted-token relay, which
+    # is fresh at query time, so overlap can stay on.
+    if cfg.speculative_hybrid_overlap:
+        logger.warning(
+            "speculative_hybrid_retrieval + --speculative-hybrid-overlap: keeping "
+            "the overlap scheduler ON; retrieval uses the shadow verified context "
+            "(async accepted-token relay)."
+        )
+    elif not cfg.disable_overlap_schedule:
+        logger.warning(
+            "speculative_hybrid_retrieval: forcing --disable-overlap-schedule so "
+            "the retrieval query sees the current verified context. (Pass "
+            "--speculative-hybrid-overlap to run under overlap.)"
+        )
+        declare_resolution(
+            server_args,
+            "_handle_hybrid_retrieval",
+            disable_overlap_schedule=True,
+        )
+
+    if cfg.speculative_hybrid_ragged:
+        _arm_hybrid_ragged_env()
+
+
+def _arm_hybrid_ragged_env() -> None:
+    """Map ``--speculative-hybrid-ragged`` onto the substrate's env knob.
+
+    The ragged substrate is driven by ``SGLANG_RAGGED_VERIFY_MODE``, a GLOBAL
+    env read by the DSV4 attention backend, the decode cuda-graph runner and the
+    overlap relay. Hybrid retrieval deliberately exposes its own server arg instead of
+    asking users to set that env: the env would then mean two things at once
+    ("which ragged flavour" and "is hybrid retrieval ragged on"), and it is validated at
+    startup for every algorithm. Set it here, while config is still resolving, so
+    the value is inherited by the TP worker processes.
+
+    Turning it to COMPACT does not affect other EAGLE launches: the token-tier
+    verify graphs are additionally gated by ``SpeculativeAlgorithm.
+    supports_ragged_verify()``, which checks the resolved hybrid-ragged flag.
+    """
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+    key = "SGLANG_RAGGED_VERIFY_MODE"
+    wanted = RaggedVerifyMode.COMPACT.value
+    current = os.environ.get(key)
+    if current is not None and current != wanted:
+        raise ValueError(
+            f"--speculative-hybrid-ragged needs {key}={wanted!r}, but the "
+            f"environment already sets {key}={current!r}. Unset it, or drop "
+            "--speculative-hybrid-ragged."
+        )
+    os.environ[key] = wanted
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:

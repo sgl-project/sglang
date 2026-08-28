@@ -78,6 +78,45 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     write_result_(result, out_tokens, out_mask);
   }
 
+  // Same as batch_match_stateful, plus the per-request count of REAL nodes.
+  // Deliberately a SEPARATE entry point rather than an extra argument on the
+  // existing one: batch_match_stateful is on the NGRAM speculative algorithm's
+  // hot path, and this keeps that path byte-identical.
+  void batch_match_stateful_lens(
+      const tvm::ffi::TensorView state_ids_tv,
+      const tvm::ffi::TensorView tokens_flat,
+      const tvm::ffi::TensorView offsets,
+      const tvm::ffi::TensorView total_lens_tv,
+      const tvm::ffi::TensorView out_tokens,
+      const tvm::ffi::TensorView out_mask,
+      const tvm::ffi::TensorView out_valid_lens) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
+    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
+    auto* tlens = static_cast<const int64_t*>(total_lens_tv.data_ptr());
+    int64_t batch_size = offsets.size(0) - 1;
+
+    std::vector<int64_t> state_ids(sid, sid + batch_size);
+    std::vector<std::vector<int32_t>> tokens(batch_size);
+    std::vector<size_t> total_lens(batch_size);
+    for (int64_t i = 0; i < batch_size; ++i) {
+      tokens[i].assign(data + offs[i], data + offs[i + 1]);
+      total_lens[i] = static_cast<size_t>(tlens[i]);
+    }
+
+    std::vector<int32_t> valid_lens;
+    auto result = ngram_->batchMatch(state_ids, tokens, total_lens, &valid_lens);
+    write_result_(result, out_tokens, out_mask);
+
+    if (static_cast<int64_t>(valid_lens.size()) != out_valid_lens.size(0)) {
+      throw std::runtime_error(
+          "out_valid_lens size mismatch: expected " + std::to_string(valid_lens.size()) + ", got " +
+          std::to_string(out_valid_lens.size(0)));
+    }
+    std::memcpy(
+        static_cast<int32_t*>(out_valid_lens.data_ptr()), valid_lens.data(), valid_lens.size() * sizeof(int32_t));
+  }
+
   void erase_match_state(const tvm::ffi::TensorView state_ids_tv) {
     auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
     int64_t n = state_ids_tv.size(0);
@@ -158,6 +197,7 @@ void register_ngram_corpus() {
       .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
+      .def("batch_match_stateful_lens", &NgramCorpusObj::batch_match_stateful_lens)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
