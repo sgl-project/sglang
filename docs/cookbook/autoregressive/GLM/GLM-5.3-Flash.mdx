@@ -41,7 +41,7 @@ Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which
 
 ## Playground
 
-Use the Playground for lower-level tuning such as attention parallelism, MoE communication, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -95,6 +95,16 @@ The deployment recipes use the checkpoint's generation configuration. Override s
 Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE` (upstream folds the older NEXTN spelling into EAGLE), so generated commands use that flag value.
 
 Strategy labels describe the workload goal. Both strategies stay available on NVIDIA GPUs; the AMD ROCm recipes expose only High Throughput until MTP speculative decoding is validated there.
+
+### Change the speculative algorithm
+
+The **Speculative** card in the Playground changes the algorithm without leaving the selected strategy:
+
+- **EAGLE / Adaptive MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
+- **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
+- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
+
+Neither algorithm runs with DP-Attention, and neither is available on the AMD ROCm recipes; the card disables the affected chips and names the reason.
 
 ### Size both memory pools
 
