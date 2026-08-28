@@ -4,7 +4,6 @@ import json
 import os
 import random
 import re
-import socket
 import threading
 import time
 import traceback
@@ -24,6 +23,7 @@ import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils.network import get_local_ip_by_remote
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -1439,7 +1439,7 @@ def _create_zmq_rpc_broadcast(
     sock = ctx.socket(zmq.REP)
     sock.bind("tcp://*:0")
     bound_port = int(sock.getsockopt_string(zmq.LAST_ENDPOINT).rsplit(":", 1)[1])
-    local_addr = f"tcp://{_get_local_ip_by_remote()}:{bound_port}"
+    local_addr = f"tcp://{get_local_ip_by_remote()}:{bound_port}"
 
     def serve_loop():
         while True:
@@ -1537,35 +1537,6 @@ class _ZmqRpcBroadcast(_RpcBroadcastBase):
 
 
 # --------------------------------- copied code (avoid dependency) --------------------------------------
-
-
-def _get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        _log("Can not get local ip by remote")
-    return None
 
 
 def _load_function(path: str) -> Callable:
