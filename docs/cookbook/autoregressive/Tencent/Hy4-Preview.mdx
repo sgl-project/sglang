@@ -163,7 +163,7 @@ On H200 (BF16, TP16 → ~95GB of weights per rank) the per-rank pool holds rough
 
 ### 3.1 Reasoning (`reasoning_effort`)
 
-Hy4-Preview is a hybrid-thinking model driven by the `reasoning_effort` field: it defaults to `high` (deep chain-of-thought — suits math, coding, and agentic tasks), and `no_think` yields direct responses. The Deploy recipes enable the reasoning parser (`--reasoning-parser auto`) so thinking is separated into `reasoning_content` and the final answer into `content`:
+Hy4-Preview is a hybrid-thinking model: reasoning defaults to `high` (deep chain-of-thought — suits math, coding, and agentic tasks). The top-level OpenAI `reasoning_effort` field accepts the standard tiers (e.g. `high`); for direct responses, pass the model-specific `no_think` through `extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}}`. The Deploy recipes enable the reasoning parser (`--reasoning-parser auto`) so thinking is separated into `reasoning_content` and the final answer into `content`:
 
 <Accordion title="Example: thinking (reasoning_effort=high) (Python)">
 
@@ -206,7 +206,7 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="tencent/Hy4-preview-FP8",
     messages=[{"role": "user", "content": "Give me a one-line summary of relativity."}],
-    reasoning_effort="no_think",
+    extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}},
     max_tokens=256,
 )
 
