@@ -22,7 +22,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.placement_budget imp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     auto_residency_static_skip_reason,
-    resolve_keep_resident_min_available_gb,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -60,8 +59,8 @@ def choose_initial_resident_components(
     """Choose resident startup components without removing runtime options.
 
     This is a load-feasibility seed, not a second serving-placement planner.
-    Native DiTs can still be demoted by warmup calibration. Auxiliary modules,
-    unknown weights, pipeline exclusions, and explicit choices retain their
+    Native weighted components can still be demoted by warmup calibration.
+    Unknown weights, pipeline exclusions, and explicit choices retain their
     configured loading semantics. A model-default layerwise placement remains
     eligible because avoiding that initialization is the point of this seed.
     """
@@ -92,17 +91,19 @@ def choose_initial_resident_components(
             weight_bytes is None
             or weight_bytes <= 0
             or item.component_name in excluded_components
-            or not is_dit_component_name(item.component_name)
             or server_args.residency_mode(item.component_name) == RESIDENT
             or server_args.explicit_residency_mode(item.component_name) is not None
         ):
             continue
+        uses_per_request = (
+            denoising_steps if is_dit_component_name(item.component_name) else 1
+        )
         options.append(
             PlacementOption(
                 group_key=item.component_name,
                 option_key=f"{item.component_name}:resident",
                 resource_delta_bytes={"gpu:load": weight_bytes},
-                estimated_latency_savings=weight_bytes * denoising_steps,
+                estimated_latency_savings=weight_bytes * uses_per_request,
                 preference_cost=(weight_bytes,),
             )
         )
@@ -139,15 +140,6 @@ def maybe_seed_initial_residency(
             available_gib,
             envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB,
         )
-    admission_gib = resolve_keep_resident_min_available_gb(server_args)
-    if available_gib < admission_gib:
-        logger.debug(
-            "Keeping configured load placement: %.1f GiB is below the %.1f GiB "
-            "initial-residency admission threshold.",
-            available_gib,
-            admission_gib,
-        )
-        return
     selected = choose_initial_resident_components(
         server_args,
         inventory,

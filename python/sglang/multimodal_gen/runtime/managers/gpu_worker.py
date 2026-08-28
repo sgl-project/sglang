@@ -91,6 +91,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     get_global_component_residency_manager,
     peek_global_component_residency_manager,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    RESIDENT,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
     host_memory_available_bytes,
@@ -117,9 +120,6 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.server_args.auto_tune import (
-    resolve_keep_resident_min_available_gb,
-)
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
@@ -1345,6 +1345,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             not pre_warmup
             and self._auto_residency_round_sizes
             and not recovering_from_oom
+            and not self._latest_auto_residency_round_is_resident_only()
         ):
             regressions = []
             for report in reports:
@@ -1617,20 +1618,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         budget_bytes = self._auto_residency_budget_bytes()
-        admission_gib = resolve_keep_resident_min_available_gb(self.server_args)
-        budget_gib = budget_bytes / GIB_BYTES
-        if budget_gib < admission_gib:
-            return RankResidencyReport(
-                rank=self.rank,
-                budget_bytes=budget_bytes,
-                estimated_peak_bytes=None,
-                candidates=[],
-                skip_reason=(
-                    f"{budget_gib:.1f} GiB VRAM budget is below the "
-                    f"{admission_gib:.1f} GiB uncalibrated residency threshold"
-                ),
-            )
-
         all_candidates = self._collect_auto_residency_targets(workload)
         candidates = pre_warmup_residency_targets(
             all_candidates,
@@ -1914,6 +1901,25 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if manager is None:
             return dict(self.pipeline.modules)
         return manager.placement_modules()
+
+    def _latest_auto_residency_round_is_resident_only(self) -> bool:
+        """Whether validation follows only execution-monotonic promotions.
+
+        Moving an offloaded component to resident removes transfer/hooks from
+        its existing compute path. Its post-adjustment warmup must still prove
+        VRAM safety, but one noisy duration sample must not undo that promotion.
+        Layerwise layout and lower-memory transitions retain latency rollback.
+        """
+        if not self._auto_residency_round_sizes:
+            return False
+        round_size = self._auto_residency_round_sizes[-1]
+        if round_size <= 0 or round_size > len(self._auto_residency_applied):
+            return False
+        return all(
+            adjustment.residency_mode != RESIDENT
+            and self.server_args.residency_mode(adjustment.component_name) == RESIDENT
+            for adjustment in self._auto_residency_applied[-round_size:]
+        )
 
     def _rollback_applied_residency_changes(
         self, *, latest_round_only: bool = False

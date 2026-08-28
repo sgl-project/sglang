@@ -474,17 +474,30 @@ class ComposedPipelineBase(ABC):
         """Resolve selected checkpoint weights before component loading."""
         self.component_weight_inventory = estimate_component_weight_inventory(sources)
         known = {
-            item.component_name: round(item.checkpoint_bytes / 1024**3, 2)
+            item.component_name: (
+                (
+                    round(item.checkpoint_bytes / 1024**3, 2)
+                    if item.checkpoint_bytes is not None
+                    else None
+                ),
+                (
+                    round(materialized_bytes / 1024**3, 2)
+                    if (materialized_bytes := item.materialized_bytes()) is not None
+                    else None
+                ),
+            )
             for item in self.component_weight_inventory
-            if item.checkpoint_bytes is not None and item.checkpoint_bytes > 0
+            if item.checkpoint_bytes is not None
+            or item.materialized_bytes() is not None
         }
         unknown = [
             item.component_name
             for item in self.component_weight_inventory
-            if item.checkpoint_bytes is None
+            if item.checkpoint_bytes is None and item.materialized_bytes() is None
         ]
         logger.debug(
-            "Pre-load component weights (GiB): known=%s unknown=%s",
+            "Pre-load component weights (checkpoint/materialized GiB): "
+            "known=%s unknown=%s",
             known,
             unknown,
         )

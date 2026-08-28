@@ -1175,22 +1175,57 @@ class TestPlanAutoResidency:
 
         assert pre_warmup_residency_targets([current, resident]) == [current]
 
-    def test_pre_warmup_report_skips_uncalibrated_promotion_below_threshold(
+    def test_pre_warmup_report_uses_weight_model_below_legacy_threshold(
         self, monkeypatch
     ):
         from sglang.multimodal_gen.runtime.managers import gpu_worker
 
+        current = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=8 * GIB_BYTES,
+            target_device_weight_bytes=0,
+            current_placement=True,
+        )
+        modules = {"transformer": object()}
         worker = SimpleNamespace(
             rank=0,
-            pipeline=object(),
-            server_args=object(),
-            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
-            _collect_auto_residency_targets=lambda _workload: pytest.fail(
-                "candidate collection should be skipped"
+            pipeline=SimpleNamespace(preload_residency_excluded_components=frozenset()),
+            server_args=SimpleNamespace(
+                num_gpus=1,
+                nnodes=1,
+                node_rank=0,
+                host_pin_budget=lambda: None,
             ),
+            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
+            _collect_auto_residency_targets=lambda _workload: [current],
+            _auto_residency_modules=lambda: modules,
         )
         monkeypatch.setattr(
-            gpu_worker, "resolve_keep_resident_min_available_gb", lambda _args: 60.0
+            gpu_worker,
+            "component_runtime_weight_bytes",
+            lambda _modules: {"transformer": 8 * GIB_BYTES},
+        )
+        monkeypatch.setattr(
+            gpu_worker,
+            "component_current_device_weight_bytes",
+            lambda _modules: {"transformer": 0},
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_pinned_host_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "layerwise_host_pin_capacity_bytes", lambda *a, **k: 0
+        )
+        monkeypatch.setattr(
+            gpu_worker, "host_memory_available_bytes", lambda: 100 * GIB_BYTES
+        )
+        monkeypatch.setattr(
+            gpu_worker.torch,
+            "get_device_module",
+            lambda: SimpleNamespace(memory_allocated=lambda: 2 * GIB_BYTES),
         )
 
         report = gpu_worker.GPUWorker._build_pre_warmup_auto_residency_report(
@@ -1204,12 +1239,9 @@ class TestPlanAutoResidency:
         )
 
         assert report.budget_bytes == 30 * GIB_BYTES
-        assert report.estimated_peak_bytes is None
-        assert report.candidates == []
-        assert report.skip_reason == (
-            "30.0 GiB VRAM budget is below the 60.0 GiB uncalibrated residency "
-            "threshold"
-        )
+        assert report.estimated_peak_bytes == 10 * GIB_BYTES
+        assert report.candidates == [current]
+        assert report.skip_reason is None
 
     def test_pre_warmup_report_keeps_excluded_components_fixed(self, monkeypatch):
         from sglang.multimodal_gen.runtime.managers import gpu_worker
@@ -1247,9 +1279,6 @@ class TestPlanAutoResidency:
             _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
             _collect_auto_residency_targets=lambda _workload: [transformer, vae],
             _auto_residency_modules=lambda: modules,
-        )
-        monkeypatch.setattr(
-            gpu_worker, "resolve_keep_resident_min_available_gb", lambda _args: 0
         )
         monkeypatch.setattr(
             gpu_worker,

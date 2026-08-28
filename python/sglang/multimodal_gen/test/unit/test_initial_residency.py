@@ -99,7 +99,7 @@ def test_initial_seed_stays_conservative_for_unknown_fixed_resident_weights():
     assert selected == set()
 
 
-def test_initial_seed_does_not_override_explicit_or_auxiliary_components():
+def test_initial_seed_keeps_explicit_placement_and_can_select_auxiliary_components():
     args = _Args(
         modes={"transformer": LAYERWISE_OFFLOAD},
         explicit={"transformer"},
@@ -111,7 +111,24 @@ def test_initial_seed_does_not_override_explicit_or_auxiliary_components():
         denoising_steps=8,
     )
 
-    assert selected == set()
+    assert selected == {"vae"}
+
+
+def test_initial_seed_selects_all_known_components_when_they_fit():
+    args = _Args(modes={"transformer": LAYERWISE_OFFLOAD})
+
+    selected = choose_initial_resident_components(
+        args,
+        [
+            _weight("transformer", 8),
+            _weight("text_encoder", 4),
+            _weight("vae", 2),
+        ],
+        available_bytes=40 * GIB_BYTES,
+        denoising_steps=8,
+    )
+
+    assert selected == {"transformer", "text_encoder", "vae"}
 
 
 def test_initial_seed_can_bypass_model_default_layerwise_initialization():
@@ -152,11 +169,6 @@ def test_initial_seed_applies_one_reversible_override():
         ),
         patch(
             "sglang.multimodal_gen.runtime.managers.memory_managers."
-            "initial_residency.resolve_keep_resident_min_available_gb",
-            return_value=30,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.managers.memory_managers."
             "initial_residency.current_platform"
         ) as platform,
     ):
@@ -179,11 +191,6 @@ def test_initial_seed_honors_the_test_allocator_cap():
             "sglang.multimodal_gen.runtime.managers.memory_managers."
             "initial_residency.auto_residency_static_skip_reason",
             return_value=None,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.managers.memory_managers."
-            "initial_residency.resolve_keep_resident_min_available_gb",
-            return_value=30,
         ),
         patch(
             "sglang.multimodal_gen.runtime.managers.memory_managers."
@@ -222,18 +229,13 @@ def test_initial_seed_skips_structural_fsdp_path():
     assert args.selected == {}
 
 
-def test_initial_seed_keeps_configured_load_path_below_admission_threshold():
+def test_initial_seed_uses_inventory_budget_below_legacy_threshold():
     args = _Args()
     with (
         patch(
             "sglang.multimodal_gen.runtime.managers.memory_managers."
             "initial_residency.auto_residency_static_skip_reason",
             return_value=None,
-        ),
-        patch(
-            "sglang.multimodal_gen.runtime.managers.memory_managers."
-            "initial_residency.resolve_keep_resident_min_available_gb",
-            return_value=30,
         ),
         patch(
             "sglang.multimodal_gen.runtime.managers.memory_managers."
@@ -244,4 +246,4 @@ def test_initial_seed_keeps_configured_load_path_below_admission_threshold():
         platform.get_available_gpu_memory.return_value = 29.8
         maybe_seed_initial_residency(args, [_weight("transformer", 8)])
 
-    assert args.selected == {}
+    assert args.selected == {"transformer": RESIDENT}

@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
+    RESIDENT,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -183,8 +184,13 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
         worker.is_output_rank = False
-        worker.server_args = SimpleNamespace()
+        worker.server_args = SimpleNamespace(
+            residency_mode=lambda _name: COMPONENT_OFFLOAD
+        )
         worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_applied = [
+            AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
+        ]
         worker._auto_residency_round_sizes = [1]
         report = RankResidencyReport(
             rank=0,
@@ -221,6 +227,50 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         self.assertIn("10.00s to 20.00s", kwargs["cause"])
         self.assertFalse(kwargs["already_failed"])
         self.assertTrue(kwargs["latest_round_only"])
+
+    def test_worker_keeps_resident_only_round_despite_noisy_duration(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.rank = 0
+        worker.is_output_rank = False
+        worker.server_args = SimpleNamespace(residency_mode=lambda _name: RESIDENT)
+        worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_applied = [
+            AppliedResidencyChange("text_encoder", COMPONENT_OFFLOAD),
+            AppliedResidencyChange("vae", COMPONENT_OFFLOAD),
+        ]
+        worker._auto_residency_round_sizes = [2]
+        report = RankResidencyReport(
+            rank=0,
+            budget_bytes=1,
+            estimated_peak_bytes=1,
+            estimated_request_duration_ns=10_000_000_000,
+            measured_request_duration_ns=20_000_000_000,
+        )
+        worker._build_auto_residency_report = mock.Mock(return_value=report)
+        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        worker._rollback_everywhere = mock.Mock()
+
+        with (
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "resolve_measured_default_workload",
+                return_value=SimpleNamespace(),
+            ),
+            mock.patch.object(
+                gpu_worker_module,
+                "plan_auto_residency",
+                return_value=AutoResidencyPlan(),
+            ),
+        ):
+            response = worker.apply_auto_residency(validate_only=True)
+
+        self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
+        worker._rollback_everywhere.assert_not_called()
 
     def test_worker_validation_does_not_apply_a_second_candidate_plan(self):
         worker = GPUWorker.__new__(GPUWorker)
