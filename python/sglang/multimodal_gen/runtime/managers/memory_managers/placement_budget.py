@@ -98,6 +98,20 @@ def _pareto_prune(states: Iterable[_State]) -> list[_State]:
             _selection_key(state),
         ),
     )
+    if ordered and not ordered[0][0]:
+        # lexicographic preference is a total order, so without hard resources
+        # the exact skyline is the strictly increasing utility envelope
+        frontier = []
+        best_utility: int | None = None
+        for state in sorted(
+            ordered, key=lambda item: (item[2], -item[1], _selection_key(item))
+        ):
+            if best_utility is not None and best_utility >= state[1]:
+                continue
+            frontier.append(state)
+            best_utility = state[1]
+        return frontier
+
     frontier: list[_State] = []
     for state in ordered:
         if any(_dominates(existing, state) for existing in frontier):

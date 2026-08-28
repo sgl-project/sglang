@@ -43,7 +43,14 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             component_residency_strategies={
                 "fixed": ComponentResidencyStrategy(),
                 "dynamic": AutoCompatibleStrategy(),
-            }
+            },
+            modules={},
+        )
+        worker.server_args = SimpleNamespace(
+            component_quantizations=(),
+            quantization=None,
+            direct_gpu_weight_loading=False,
+            nunchaku_config=None,
         )
 
         self.assertEqual(worker._fixed_custom_residency_strategy_names(), {"fixed"})
@@ -341,7 +348,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._auto_residency_last_applied_plan = AutoResidencyPlan()
         report = RankResidencyReport(
             rank=0,
-            budget_bytes=1,
+            budget_bytes=10 * GIB_BYTES,
             estimated_peak_bytes=1,
             estimated_request_duration_ns=10_000_000_000,
             measured_request_duration_ns=20_000_000_000,
@@ -445,7 +452,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._auto_residency_round_sizes = [1]
         report = RankResidencyReport(
             rank=0,
-            budget_bytes=1,
+            budget_bytes=10 * GIB_BYTES,
             estimated_peak_bytes=1,
             estimated_request_duration_ns=10_000_000_000,
             measured_request_duration_ns=10_000_000_000,

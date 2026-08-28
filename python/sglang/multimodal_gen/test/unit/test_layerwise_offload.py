@@ -84,6 +84,23 @@ def test_layerwise_usage_tracker_observes_only_executed_groups():
     assert all(not layer._forward_pre_hooks for layer in module.decoder)
 
 
+def test_layerwise_usage_tracker_attributes_calls_to_stages():
+    module = _UsageTrackedVAE()
+    stage = "encode"
+    tracker = LayerwiseUsageTracker({"vae": module}, stage_name_provider=lambda: stage)
+
+    module(torch.zeros(1))
+    stage = "decode"
+    module(torch.zeros(1))
+    uses, uses_by_stage = tracker.finish_with_stages()
+
+    assert uses["vae"]["decoder"] == (2, 2, 2)
+    assert uses_by_stage == {
+        "encode": {"vae": {"decoder": (1, 1, 1)}},
+        "decode": {"vae": {"decoder": (1, 1, 1)}},
+    }
+
+
 class _FakeStream:
     def wait_stream(self, _stream) -> None:
         return None

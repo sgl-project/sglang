@@ -394,6 +394,10 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         batch.scheduler = scheduler
         batch.timesteps = scheduler.timesteps
         batch.num_inference_steps = num_steps
+        previous_stage_target_steps = batch.extra.get(
+            "stage_target_num_inference_steps"
+        )
+        batch.extra["stage_target_num_inference_steps"] = num_steps
         original_do_cfg = batch.do_classifier_free_guidance
         batch.do_classifier_free_guidance = False
 
@@ -403,6 +407,12 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             batch.scheduler = original_batch_scheduler
             batch.timesteps = original_batch_timesteps
             batch.num_inference_steps = original_batch_num_inference_steps
+            if previous_stage_target_steps is None:
+                batch.extra.pop("stage_target_num_inference_steps", None)
+            else:
+                batch.extra["stage_target_num_inference_steps"] = (
+                    previous_stage_target_steps
+                )
             batch.do_classifier_free_guidance = original_do_cfg
             batch.ltx2_ti2v_clean_latent_background = original_clean_latent_background
 

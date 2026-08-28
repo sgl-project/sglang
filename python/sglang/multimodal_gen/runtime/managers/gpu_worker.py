@@ -611,6 +611,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         warmup_baseline_allocated_bytes = 0
         warmup_baseline_reserved_bytes = 0
         layerwise_usage_tracker: LayerwiseUsageTracker | None = None
+        layerwise_layer_uses_by_stage: dict[
+            str, dict[str, dict[str, tuple[int, ...]]]
+        ] = {}
         try:
             if measure_server_warmup:
                 # Drop the previous request's allocator pool so each probe
@@ -631,7 +634,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     and self.pipeline is not None
                 ):
                     layerwise_usage_tracker = LayerwiseUsageTracker(
-                        self.pipeline.modules
+                        self.pipeline.modules,
+                        stage_name_provider=(
+                            lambda: (
+                                req.metrics.active_stage_name
+                                if req.metrics is not None
+                                else None
+                            )
+                        ),
                     )
 
             start_time = (
@@ -750,11 +760,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # or the estimator would plan from the remaining partial data
             if measure_server_warmup:
                 assert warmup_workload is not None
-                layerwise_layer_uses = (
-                    layerwise_usage_tracker.finish()
-                    if layerwise_usage_tracker is not None
-                    else {}
-                )
+                if layerwise_usage_tracker is not None:
+                    (
+                        layerwise_layer_uses,
+                        layerwise_layer_uses_by_stage,
+                    ) = layerwise_usage_tracker.finish_with_stages()
+                else:
+                    layerwise_layer_uses = {}
                 self._record_server_warmup_memory(
                     req=req,
                     workload=warmup_workload,
@@ -762,6 +774,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     baseline_reserved_bytes=warmup_baseline_reserved_bytes,
                     succeeded=output_batch is not None and output_batch.error is None,
                     layerwise_layer_uses=layerwise_layer_uses,
+                    layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
         return output_batch
 
@@ -774,6 +787,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         baseline_reserved_bytes: int,
         succeeded: bool,
         layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
+        layerwise_layer_uses_by_stage: (
+            dict[str, dict[str, dict[str, tuple[int, ...]]]] | None
+        ) = None,
     ) -> None:
         phase_allocated_peaks: dict[str, int] = {}
         phase_components: dict[str, tuple[str, ...]] = {}
@@ -837,13 +853,25 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 phase_full_weight_transition_components=(
                     phase_full_weight_transition_components
                 ),
+                layerwise_layer_uses=layerwise_layer_uses or {},
+                layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
                 num_inference_steps=num_inference_steps,
                 total_duration_ms=(
                     float(metrics.total_duration_ms) if metrics is not None else 0.0
                 ),
                 stage_duration_ms=stage_duration_ms,
                 step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
-                layerwise_layer_uses=layerwise_layer_uses or {},
+                step_duration_ms_by_stage=(
+                    {
+                        stage_name: tuple(durations)
+                        for stage_name, durations in metrics.steps_by_stage.items()
+                    }
+                    if metrics is not None
+                    else {}
+                ),
+                stage_iterations=(
+                    dict(metrics.stage_iterations) if metrics is not None else {}
+                ),
             )
         )
 
@@ -1650,6 +1678,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> list[ResidencyTarget]:
         assert self.pipeline is not None
         modules = self._auto_residency_modules()
+        local_worker_count = max(
+            1, self.server_args.num_gpus // self.server_args.nnodes
+        )
         return collect_residency_targets(
             modules=modules,
             residency_mode_of=self.server_args.residency_mode,
@@ -1675,6 +1706,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             pin_cpu_memory=self.server_args.pin_cpu_memory,
             used_components=used_components,
             layerwise_layer_uses=layerwise_layer_uses,
+            host_transition_headroom_bytes=(
+                max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
+                // local_worker_count
+            ),
         )
 
     def _build_pre_warmup_auto_residency_report(
@@ -1915,12 +1950,21 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
         )
+        explicitly_repeated_stages = {
+            stage_name
+            for record in records
+            if record.succeeded
+            for stage_name in record.stage_iterations
+        }
         repeated_components.update(
             component_name
             for component_name, stage_names in measured_component_stages.items()
             if any(
-                stage_name.endswith("DenoisingStage")
-                and not stage_name.endswith("BeforeDenoisingStage")
+                stage_name in explicitly_repeated_stages
+                or (
+                    stage_name.endswith("DenoisingStage")
+                    and not stage_name.endswith("BeforeDenoisingStage")
+                )
                 for stage_name in stage_names
             )
         )
@@ -1966,6 +2010,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             1, self.server_args.num_gpus // self.server_args.nnodes
         )
         pin_budget = self.server_args.host_pin_budget()
+        host_transition_headroom_bytes = (
+            max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
+            // local_worker_count
+        )
         return RankResidencyReport(
             rank=self.rank,
             budget_bytes=budget_bytes,
@@ -2000,10 +2048,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 else 0
             ),
             host_transition_headroom_bytes=(
-                max(0, host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES)
-                // local_worker_count
-                if include_candidates
-                else 0
+                host_transition_headroom_bytes if include_candidates else 0
             ),
             device_transition_allocated_bytes=(
                 int(torch.get_device_module().memory_allocated())

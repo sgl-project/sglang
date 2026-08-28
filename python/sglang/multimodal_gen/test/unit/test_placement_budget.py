@@ -704,3 +704,45 @@ def test_identical_resource_columns_keep_only_the_strictest_budget():
 
     assert [option.option_key for option in plan.selections] == ["dit:small"]
     assert plan.resource_delta_bytes == {"phase-a": 4, "phase-b": 4}
+
+
+def test_nonbinding_preference_sweep_matches_exhaustive_search():
+    rng = random.Random(20260828)
+
+    for _ in range(100):
+        options = []
+        for group_index in range(rng.randint(1, 5)):
+            for option_index in range(rng.randint(1, 6)):
+                options.append(
+                    PlacementOption(
+                        group_key=f"group-{group_index}",
+                        option_key=f"group-{group_index}:option-{option_index}",
+                        resource_delta_bytes={},
+                        estimated_latency_savings=rng.randint(0, 50),
+                        preference_cost=(
+                            rng.randint(0, 20),
+                            rng.randint(0, 20),
+                            rng.randint(0, 20),
+                        ),
+                    )
+                )
+        tolerance = rng.randint(0, 10)
+        require_every_group = rng.choice((False, True))
+        expected = _exhaustive_plan_key(
+            options,
+            resource_budget_bytes={},
+            estimated_latency_tolerance=tolerance,
+            require_selection_from_every_group=require_every_group,
+        )
+
+        plan = optimize_placement(
+            options,
+            resource_budget_bytes={},
+            estimated_latency_tolerance=tolerance,
+            require_selection_from_every_group=require_every_group,
+        )
+        assert expected is not None
+        expected_keys, _, expected_utility, expected_cost = expected
+        assert tuple(option.option_key for option in plan.selections) == expected_keys
+        assert plan.estimated_latency_savings == expected_utility
+        assert plan.preference_cost == expected_cost
