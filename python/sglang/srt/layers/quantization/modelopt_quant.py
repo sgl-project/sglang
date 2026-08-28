@@ -352,7 +352,9 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):  # noqa: B027
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: WeightsMapper
+    ):  # noqa: B027
         # Map excluded module patterns from HF layout to sglang layout.
         # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
         # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
@@ -383,6 +385,27 @@ class ModelOptQuantConfig(QuantizationConfig):
         prefixes_to_check = [prefix]
         if prefix.startswith("language_model."):
             prefixes_to_check.append(prefix.removeprefix("language_model."))
+
+        # Expand fused module names to their checkpoint shard names. The exclude
+        # list may reference per-projection names (e.g. "q_proj") while the model
+        # builds a fused module (e.g. "qkv_proj"), so matching must consider the
+        # unfused constituents.
+        if self.packed_modules_mapping:
+            expanded = []
+            for p in prefixes_to_check:
+                head, _, tail = p.rpartition(".")
+                for shard_name in self.packed_modules_mapping.get(tail, []):
+                    expanded_prefix = f"{head}.{shard_name}" if head else shard_name
+                    expanded.append(expanded_prefix)
+                    if expanded_prefix.startswith("language_model."):
+                        expanded.append(expanded_prefix.removeprefix("language_model."))
+            prefixes_to_check.extend(expanded)
+
+        # Vision-language checkpoints sometimes rename "model.visual.*" to
+        # "visual.*" during load; also test the "model."-prefixed variant.
+        prefixes_to_check.extend(
+            "model." + p for p in prefixes_to_check if not p.startswith("model.")
+        )
 
         # Fused module patterns: the exclude list may reference a sub-component
         # (e.g., "q_a_proj") that is fused into a combined parameter name
@@ -2683,9 +2706,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 assert w.shape == (layer.num_experts,)
                 assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
                 return w[
-                    layer.moe_ep_rank * layer.num_local_experts : (
-                        layer.moe_ep_rank + 1
-                    )
+                    layer.moe_ep_rank
+                    * layer.num_local_experts : (layer.moe_ep_rank + 1)
                     * layer.num_local_experts
                 ]
 
@@ -2801,9 +2823,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
                 }
-                assert weight_scale.shape[-1] == expected_blocks[name], (
-                    f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
-                )
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
             else:
                 if weight_scale.shape[assert_dim] % 4 != 0:
                     logger.warning(
@@ -2812,9 +2834,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         tuple(weight_scale.shape),
                         getattr(self.quant_config, "group_size", None),
                     )
-            assert weight_scale.dtype == torch.float8_e4m3fn, (
-                f"{name} Weight Blockscale must be represented as FP8-E4M3"
-            )
+            assert (
+                weight_scale.dtype == torch.float8_e4m3fn
+            ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
