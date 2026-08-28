@@ -52,9 +52,7 @@ class TestParallelSampleNumBound(unittest.TestCase):
             req.normalize_batch_and_arguments()
 
     def test_legitimate_n_still_works(self):
-        req = GenerateReqInput(
-            text="hi", sampling_params={"n": 4, "max_new_tokens": 1}
-        )
+        req = GenerateReqInput(text="hi", sampling_params={"n": 4, "max_new_tokens": 1})
         req.normalize_batch_and_arguments()
         self.assertEqual(req.parallel_sample_num, 4)
 
@@ -64,30 +62,32 @@ class TestTopLogprobsNumValidation(unittest.TestCase):
         self.tm = _make_tokenizer_manager(vocab_size=100)
 
     def test_over_vocab_top_logprobs_num_rejected(self):
-        req = GenerateReqInput(
-            text="hi", return_logprob=True, top_logprobs_num=10**9
-        )
-        with self.assertRaisesRegex(ValueError, r"top_logprobs_num must be in \[0, 100\]"):
+        req = GenerateReqInput(text="hi", return_logprob=True, top_logprobs_num=10**9)
+        with self.assertRaisesRegex(
+            ValueError, r"top_logprobs_num must be in \[0, 100\]"
+        ):
             self.tm._validate_top_logprobs_num(req)
 
     def test_negative_top_logprobs_num_rejected(self):
         req = GenerateReqInput(text="hi", return_logprob=True, top_logprobs_num=-1)
-        with self.assertRaisesRegex(ValueError, r"top_logprobs_num must be in \[0, 100\]"):
+        with self.assertRaisesRegex(
+            ValueError, r"top_logprobs_num must be in \[0, 100\]"
+        ):
             self.tm._validate_top_logprobs_num(req)
 
     def test_top_logprobs_num_list_validated_elementwise(self):
         req = GenerateReqInput(
             text="hi", return_logprob=True, top_logprobs_num=[1, 2, 10**9]
         )
-        with self.assertRaisesRegex(ValueError, r"top_logprobs_num must be in \[0, 100\]"):
+        with self.assertRaisesRegex(
+            ValueError, r"top_logprobs_num must be in \[0, 100\]"
+        ):
             self.tm._validate_top_logprobs_num(req)
 
     def test_boolean_top_logprobs_num_rejected(self):
         # bool is an int subclass; JSON true/false must not pass as 1/0.
         for bad in (True, False, [1, True]):
-            req = GenerateReqInput(
-                text="hi", return_logprob=True, top_logprobs_num=bad
-            )
+            req = GenerateReqInput(text="hi", return_logprob=True, top_logprobs_num=bad)
             with self.assertRaisesRegex(ValueError, "must be an integer"):
                 self.tm._validate_top_logprobs_num(req)
 
