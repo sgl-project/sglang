@@ -67,10 +67,13 @@ def _record(
     total_duration_ms=0.0,
     stage_duration_ms=None,
     step_duration_ms=(),
+    step_duration_ms_by_stage=None,
+    stage_iterations=None,
     phase_active_components=None,
     phase_used_components=None,
     phase_full_weight_transition_components=None,
     layerwise_layer_uses=None,
+    layerwise_layer_uses_by_stage=None,
 ) -> WarmupMemoryRecord:
     return WarmupMemoryRecord(
         width=width,
@@ -83,12 +86,15 @@ def _record(
         total_duration_ms=total_duration_ms,
         stage_duration_ms=stage_duration_ms or {},
         step_duration_ms=step_duration_ms,
+        step_duration_ms_by_stage=step_duration_ms_by_stage or {},
+        stage_iterations=stage_iterations or {},
         phase_active_components=phase_active_components or {},
         phase_used_components=phase_used_components or {},
         phase_full_weight_transition_components=(
             phase_full_weight_transition_components or {}
         ),
         layerwise_layer_uses=layerwise_layer_uses or {},
+        layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
     )
 
 
@@ -175,6 +181,39 @@ class TestEstimateDefaultWorkloadTiming:
             "CustomDenoisingStage": 3_000_000_000,
         }
         assert request_ns == 5_600_000_000
+
+    def test_uses_each_stage_iteration_target(self):
+        record = _record(
+            num_inference_steps=4,
+            total_duration_ms=1_100,
+            stage_duration_ms={
+                "ShapeDenoisingStage": 500,
+                "PaintStage": 600,
+            },
+            step_duration_ms_by_stage={
+                "ShapeDenoisingStage": (200, 100, 100, 100),
+            },
+            stage_iterations={
+                "ShapeDenoisingStage": (4, 50),
+                "PaintStage": (4, 30),
+            },
+            phase_active_components={
+                "0:ShapeDenoisingStage:use:hy3dshape_model": ("hy3dshape_model",),
+                "1:PaintStage:use:paint_transformer": ("paint_transformer",),
+            },
+        )
+
+        request_ns, stage_ns, _ = estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=50,
+        )
+
+        assert stage_ns == {
+            "ShapeDenoisingStage": 5_100_000_000,
+            "PaintStage": 4_500_000_000,
+        }
+        assert request_ns == 9_600_000_000
 
     def test_transfer_savings_is_capped_by_request_not_component_stage(self):
         candidates = [
@@ -281,6 +320,36 @@ class TestEstimateLayerwiseLayerUses:
 
         assert uses["custom_encoder"]["layers"] == (2, 2)
         assert uses["custom_refiner"]["blocks"] == (10, 10)
+
+    def test_scales_each_stage_calls_with_its_own_iteration_target(self):
+        record = _record(
+            num_inference_steps=4,
+            phase_used_components={
+                "0:ShapeStage:use:transformer": ("transformer",),
+                "1:PaintStage:use:transformer": ("transformer",),
+            },
+            stage_iterations={
+                "ShapeStage": (4, 50),
+                "PaintStage": (4, 30),
+            },
+            layerwise_layer_uses={
+                "transformer": {"blocks": (9, 9), "one_shot": (2, 2)}
+            },
+            layerwise_layer_uses_by_stage={
+                "ShapeStage": {"transformer": {"blocks": (4, 4), "one_shot": (1, 1)}},
+                "PaintStage": {"transformer": {"blocks": (4, 4), "one_shot": (1, 1)}},
+            },
+        )
+
+        uses = estimate_layerwise_layer_uses(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=50,
+        )
+
+        # one untracked one-shot call + 50 shape calls + 30 paint calls
+        assert uses["transformer"]["blocks"] == (81, 81)
+        assert uses["transformer"]["one_shot"] == (2, 2)
 
 
 class TestEstimateDefaultWorkloadPeak:
@@ -2001,6 +2070,36 @@ class TestCollectResidencyTargets:
 
         assert len(targets) == 41
 
+    def test_host_pin_frontier_drops_scratch_only_tradeoffs_when_nonbinding(self):
+        manager = SimpleNamespace(
+            num_layers=3,
+            residency_policy="leading",
+            pin_cpu_memory=True,
+            layer_weight_bytes=lambda: {0: 6, 1: 4, 2: 4},
+            layer_host_store_bytes=lambda: {0: 6, 1: 4, 2: 4},
+            pinnable_layer_indices=lambda: (0, 1, 2),
+        )
+
+        constrained = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(0,),
+            current_pinned_layers=((0, 1, 2),),
+            uses_per_streamed_layer=1,
+            layer_uses=((2, 1, 1),),
+        )
+        unconstrained = _layerwise_pin_targets(
+            managers=[manager],
+            resident_layers=(0,),
+            current_pinned_layers=((0, 1, 2),),
+            uses_per_streamed_layer=1,
+            layer_uses=((2, 1, 1),),
+            constrain_host_transitions=False,
+        )
+
+        assert ((1, 2),) in constrained
+        assert ((1, 2),) not in unconstrained
+        assert ((0,),) in unconstrained
+
     def test_filters_and_sizes(self):
         te = nn.Linear(8, 8)
         vae = nn.Linear(4, 4)
@@ -2269,6 +2368,26 @@ class TestCollectResidencyTargets:
             for candidate in candidates
         )
         assert any(candidate.target_mode() == RESIDENT for candidate in candidates)
+
+    def test_virtual_layerwise_prefetch_is_runtime_not_transition_memory(self):
+        module = _FakeLazyLayerwiseDit(num_layers=3)
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=4,
+            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+        )
+
+        streamed = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (0,)
+        )
+        assert streamed.device_transition_delta_bytes == 0
+        assert streamed.active_device_delta_bytes < 0
 
     def test_lazy_layerwise_frontier_keeps_buffers_out_of_managed_weights(self):
         module = _FakeLazyLayerwiseDit(num_layers=2)

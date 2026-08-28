@@ -246,7 +246,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         return torch.cat([positive, negative, negative])
 
     @torch.no_grad()
-    def _run_delight(self, image: Image.Image) -> Image.Image:
+    def _run_delight(self, image: Image.Image, batch: Req) -> Image.Image:
         assert self.delight_transformer is not None
         assert self.delight_vae is not None
         assert self.delight_scheduler is not None
@@ -278,7 +278,14 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             )
 
         scheduler = self.delight_scheduler
-        scheduler.set_timesteps(self.config.delight_num_inference_steps, device=device)
+        target_steps = self.config.delight_num_inference_steps
+        measured_steps = (
+            min(target_steps, max(1, int(batch.num_inference_steps)))
+            if batch.is_warmup
+            else target_steps
+        )
+        batch.record_stage_iterations(measured_steps, target_steps)
+        scheduler.set_timesteps(measured_steps, device=device)
         generator = torch.Generator(device="cpu").manual_seed(42)
         latent_channels = self.delight_transformer.config.out_channels
         latents = randn_tensor(
@@ -350,11 +357,11 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             (composited.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         )
 
-    def _prepare_reference_image(self, image_path: str) -> Image.Image:
+    def _prepare_reference_image(self, image_path: str, batch: Req) -> Image.Image:
         image = self._load_input_image(image_path)
         if not self.config.delight_enable:
             return image
-        return self._run_delight(image)
+        return self._run_delight(image, batch)
 
     def _render_multiview(
         self, mesh: Any
@@ -404,7 +411,9 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             mesh_future = executor.submit(self._unwrap_mesh, mesh)
-            image_future = executor.submit(self._prepare_reference_image, image_path)
+            image_future = executor.submit(
+                self._prepare_reference_image, image_path, batch
+            )
             paint_mesh = mesh_future.result()
             delighted_image = image_future.result()
 
@@ -542,15 +551,27 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             base, divisor = 12, 1
         return base + base_index // divisor
 
-    def _timesteps(self, device: torch.device) -> torch.Tensor:
+    def _timesteps(
+        self, device: torch.device, batch: Req | None = None
+    ) -> torch.Tensor:
+        target_steps = (
+            10
+            if self.config.paint_turbo_mode
+            else (self.config.paint_num_inference_steps)
+        )
+        measured_steps = (
+            min(target_steps, max(1, int(batch.num_inference_steps)))
+            if batch is not None and batch.is_warmup
+            else target_steps
+        )
+        if batch is not None:
+            batch.record_stage_iterations(measured_steps, target_steps)
         if not self.config.paint_turbo_mode:
-            self.scheduler.set_timesteps(
-                self.config.paint_num_inference_steps, device=device
-            )
+            self.scheduler.set_timesteps(measured_steps, device=device)
             return self.scheduler.timesteps
 
         self.scheduler.set_timesteps(
-            num_inference_steps=10,
+            num_inference_steps=measured_steps,
             original_inference_steps=30,
             device=device,
         )
@@ -639,7 +660,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         if position_attention_mask is not None:
             model_kwargs["position_attn_mask"] = position_attention_mask
 
-        timesteps = self._timesteps(device)
+        timesteps = self._timesteps(device, batch)
         latent_channels = self.transformer.config.in_channels
         latent_size = render_size // self.vae_scale_factor
         latents = randn_tensor(

@@ -93,6 +93,49 @@ def _pareto_prune(states: Iterable[_State]) -> list[_State]:
             _selection_key(state),
         ),
     )
+    if ordered and not ordered[0][0] and len(ordered[0][2]) == 2:
+        # with no hard resource dimension, local dominance is a 2D soft-cost
+        # skyline; a Fenwick sweep avoids the quadratic layer frontier scan
+        second_costs = sorted({state[2][1] for state in ordered})
+        second_cost_indices = {
+            cost: index + 1 for index, cost in enumerate(second_costs)
+        }
+        best_utility: list[int | None] = [None] * (len(second_costs) + 1)
+
+        def prefix_max(index: int) -> int | None:
+            result = None
+            while index > 0:
+                value = best_utility[index]
+                if value is not None and (result is None or value > result):
+                    result = value
+                index -= index & -index
+            return result
+
+        def update(index: int, utility: int) -> None:
+            while index < len(best_utility):
+                value = best_utility[index]
+                if value is None or utility > value:
+                    best_utility[index] = utility
+                index += index & -index
+
+        frontier = []
+        for state in sorted(
+            ordered,
+            key=lambda item: (
+                item[2][0],
+                item[2][1],
+                -item[1],
+                _selection_key(item),
+            ),
+        ):
+            index = second_cost_indices[state[2][1]]
+            dominating_utility = prefix_max(index)
+            if dominating_utility is not None and dominating_utility >= state[1]:
+                continue
+            frontier.append(state)
+            update(index, state[1])
+        return frontier
+
     frontier: list[_State] = []
     for state in ordered:
         if any(_dominates(existing, state) for existing in frontier):

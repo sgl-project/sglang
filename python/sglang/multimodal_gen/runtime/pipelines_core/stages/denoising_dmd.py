@@ -80,6 +80,7 @@ class DmdDenoisingStage(DenoisingStage):
             dtype=torch.long,
             device=get_local_torch_device(),
         )
+        batch.record_stage_iterations(len(timesteps), len(timesteps))
 
         # prepare image_kwargs
         image_embeds = batch.image_embeds

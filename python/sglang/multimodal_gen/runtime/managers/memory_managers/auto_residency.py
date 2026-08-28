@@ -135,10 +135,13 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     phase_used_components: dict[str, tuple[str, ...]] = {}
     phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
     layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] = {}
+    layerwise_layer_uses_by_stage: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {}
     num_inference_steps: int = 1
     total_duration_ms: float = 0.0
     stage_duration_ms: dict[str, float] = {}
     step_duration_ms: tuple[float, ...] = ()
+    step_duration_ms_by_stage: dict[str, tuple[float, ...]] = {}
+    stage_iterations: dict[str, tuple[int, int]] = {}
 
     def workload_units(self) -> int:
         return max(1, self.width) * max(1, self.height) * max(1, self.num_frames)
@@ -340,10 +343,11 @@ def estimate_layerwise_layer_uses(
 ) -> dict[str, dict[str, tuple[int, ...]]]:
     """Estimate per-request layer calls from the same calibration forward.
 
-    A full-shape memory probe deliberately runs only a few denoise steps. A
-    layer observed at least twice is treated as step-scoped and scaled to the
-    target step count; a layer observed once remains a one-shot encoder,
-    refiner, or decoder layer even when it belongs to a DiT component.
+    A full-shape memory probe deliberately runs only a few denoise steps.
+    Stage-attributed calls use that stage's measured and target iteration
+    counts, so independent shape, paint, refiner, and chunk loops are not all
+    multiplied by one request-wide ratio. Legacy records retain the repeated
+    DiT-layer heuristic.
     """
     successful = [record for record in records if record.succeeded]
     if target_units is not None:
@@ -356,38 +360,65 @@ def estimate_layerwise_layer_uses(
     estimated: dict[str, dict[str, list[int]]] = {}
     for record in successful:
         source_steps = max(1, record.num_inference_steps)
-        denoising_components: set[str] = set()
-        phase_components = (
-            record.phase_used_components or record.phase_active_components
-        )
-        for phase_name, component_names in phase_components.items():
-            fields = phase_name.split(":", 2)
-            if len(fields) < 2 or not fields[0].isdigit():
-                continue
-            stage_name = fields[1]
-            if stage_name.endswith("DenoisingStage") and not stage_name.endswith(
-                "BeforeDenoisingStage"
-            ):
-                denoising_components.update(component_names)
+        component_stages = _component_stages(record)
+        repeated_stages = _repeated_stages(record, component_stages)
         for component_name, groups in record.layerwise_layer_uses.items():
             component = estimated.setdefault(component_name, {})
             for layer_name, counts in groups.items():
                 target = component.setdefault(layer_name, [0] * len(counts))
                 if len(target) != len(counts):
                     continue
+                stage_counts = [
+                    (
+                        stage_name,
+                        stage_components[component_name][layer_name],
+                    )
+                    for stage_name, stage_components in (
+                        record.layerwise_layer_uses_by_stage.items()
+                    )
+                    if component_name in stage_components
+                    and layer_name in stage_components[component_name]
+                    and len(stage_components[component_name][layer_name]) == len(counts)
+                ]
                 for layer_index, count in enumerate(counts):
-                    scaled = count
-                    if (
-                        (
-                            is_dit_component_name(component_name)
-                            or component_name in denoising_components
+                    if stage_counts:
+                        measured_by_stage = sum(
+                            per_layer_counts[layer_index]
+                            for _, per_layer_counts in stage_counts
                         )
-                        and count > 1
-                        and target_num_inference_steps > source_steps
-                    ):
-                        scaled = (
-                            count * target_num_inference_steps + source_steps - 1
-                        ) // source_steps
+                        scaled = max(0, count - measured_by_stage)
+                        for stage_name, per_layer_counts in stage_counts:
+                            measured_iterations, target_iterations = _stage_iterations(
+                                record,
+                                stage_name,
+                                repeated_stages=repeated_stages,
+                                target_num_inference_steps=(target_num_inference_steps),
+                            )
+                            stage_count = per_layer_counts[layer_index]
+                            if stage_count <= 1:
+                                scaled += stage_count
+                            else:
+                                scaled += (
+                                    stage_count * target_iterations
+                                    + measured_iterations
+                                    - 1
+                                ) // measured_iterations
+                    else:
+                        scaled = count
+                        component_is_repeated = is_dit_component_name(
+                            component_name
+                        ) or any(
+                            stage_name in repeated_stages
+                            for stage_name in component_stages.get(component_name, ())
+                        )
+                        if (
+                            component_is_repeated
+                            and count > 1
+                            and target_num_inference_steps > source_steps
+                        ):
+                            scaled = (
+                                count * target_num_inference_steps + source_steps - 1
+                            ) // source_steps
                     target[layer_index] = max(target[layer_index], scaled)
     return {
         component_name: {
@@ -395,6 +426,64 @@ def estimate_layerwise_layer_uses(
         }
         for component_name, groups in estimated.items()
     }
+
+
+def _component_stages(
+    record: WarmupMemoryRecord,
+    *,
+    timed_stage_names: set[str] | None = None,
+) -> dict[str, set[str]]:
+    component_stages: dict[str, set[str]] = {}
+    phase_components = record.phase_used_components or record.phase_active_components
+    for phase_name, components in phase_components.items():
+        fields = phase_name.split(":", 2)
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        stage_name = fields[1]
+        if timed_stage_names is not None and stage_name not in timed_stage_names:
+            continue
+        for component_name in components:
+            component_stages.setdefault(component_name, set()).add(stage_name)
+    return component_stages
+
+
+def _repeated_stages(
+    record: WarmupMemoryRecord,
+    component_stages: Mapping[str, set[str]],
+) -> set[str]:
+    stages = {
+        stage_name
+        for component_name, stage_names in component_stages.items()
+        if is_dit_component_name(component_name)
+        for stage_name in stage_names
+    }
+    stages.update(record.stage_iterations)
+    stages.update(
+        stage_name
+        for stage_name in record.stage_duration_ms
+        if stage_name.endswith("DenoisingStage")
+        and not stage_name.endswith("BeforeDenoisingStage")
+    )
+    return stages
+
+
+def _stage_iterations(
+    record: WarmupMemoryRecord,
+    stage_name: str,
+    *,
+    repeated_stages: set[str],
+    target_num_inference_steps: int,
+) -> tuple[int, int]:
+    explicit = record.stage_iterations.get(stage_name)
+    if explicit is not None:
+        return max(1, explicit[0]), max(1, explicit[1])
+    measured = max(1, record.num_inference_steps)
+    target = (
+        max(1, target_num_inference_steps)
+        if stage_name in repeated_stages
+        else measured
+    )
+    return measured, target
 
 
 def estimate_default_workload_timing(
@@ -405,10 +494,10 @@ def estimate_default_workload_timing(
 ) -> tuple[int, dict[str, int], dict[str, tuple[str, ...]]]:
     """Estimate full-request and stage durations from the warmup workload.
 
-    Non-denoise stages run once. Denoising time scales with the requested step
-    count; the full-shape probe intentionally executes only a few steps, so
-    using its raw total would make every one-shot encoder transfer look
-    important relative to a long video request.
+    Repeated stages scale by their own measured/default iteration counts. The
+    full-shape probe intentionally executes only a few steps, so using its raw
+    total would make every one-shot encoder transfer look important relative
+    to a long video request.
     """
     successful = [record for record in records if record.succeeded]
     if not successful:
@@ -429,57 +518,34 @@ def estimate_default_workload_timing(
     if representative.total_duration_ms <= 0 or not representative.stage_duration_ms:
         return 0, {}, {}
 
-    component_stages: dict[str, set[str]] = {}
-    phase_components = (
-        representative.phase_used_components or representative.phase_active_components
+    component_stages = _component_stages(
+        representative,
+        timed_stage_names=set(representative.stage_duration_ms),
     )
-    for phase_name, components in phase_components.items():
-        fields = phase_name.split(":", 2)
-        if len(fields) < 2 or not fields[0].isdigit():
-            continue
-        stage_name = fields[1]
-        if stage_name not in representative.stage_duration_ms:
-            continue
-        for component_name in components:
-            component_stages.setdefault(component_name, set()).add(stage_name)
-
-    denoising_stages = {
-        stage_name
-        for component_name, stage_names in component_stages.items()
-        if is_dit_component_name(component_name)
-        for stage_name in stage_names
-    }
-    denoising_stages.update(
-        stage_name
-        for stage_name in representative.stage_duration_ms
-        if stage_name.endswith("DenoisingStage")
-        and not stage_name.endswith("BeforeDenoisingStage")
-    )
-
-    measured_steps = max(1, representative.num_inference_steps)
-    target_steps = max(1, target_num_inference_steps)
-    denoising_scale = target_steps / measured_steps
-    measured_denoising_ms = sum(
-        representative.stage_duration_ms[stage_name] for stage_name in denoising_stages
-    )
-    if measured_denoising_ms > 0 and representative.step_duration_ms:
-        steady_steps = (
-            representative.step_duration_ms[1:]
-            if len(representative.step_duration_ms) > 1
-            else representative.step_duration_ms
-        )
-        steady_step_ms = statistics.median(steady_steps)
-        non_step_denoising_ms = max(
-            0.0,
-            measured_denoising_ms - sum(representative.step_duration_ms),
-        )
-        target_denoising_ms = non_step_denoising_ms + steady_step_ms * target_steps
-        denoising_scale = target_denoising_ms / measured_denoising_ms
+    repeated_stages = _repeated_stages(representative, component_stages)
 
     stage_duration_ns: dict[str, int] = {}
     for stage_name, duration_ms in representative.stage_duration_ms.items():
-        scale = denoising_scale if stage_name in denoising_stages else 1.0
-        stage_duration_ns[stage_name] = max(0, int(duration_ms * scale * 1_000_000))
+        measured_iterations, target_iterations = _stage_iterations(
+            representative,
+            stage_name,
+            repeated_stages=repeated_stages,
+            target_num_inference_steps=target_num_inference_steps,
+        )
+        step_durations = representative.step_duration_ms_by_stage.get(stage_name, ())
+        if not step_durations and len(repeated_stages) == 1:
+            step_durations = representative.step_duration_ms
+        if stage_name in repeated_stages and step_durations:
+            steady_steps = (
+                step_durations[1:] if len(step_durations) > 1 else step_durations
+            )
+            non_step_ms = max(0.0, duration_ms - sum(step_durations))
+            target_duration_ms = non_step_ms + (
+                statistics.median(steady_steps) * target_iterations
+            )
+        else:
+            target_duration_ms = duration_ms * target_iterations / measured_iterations
+        stage_duration_ns[stage_name] = max(0, int(target_duration_ms * 1_000_000))
 
     measured_stage_ms = sum(representative.stage_duration_ms.values())
     untracked_ms = max(0.0, representative.total_duration_ms - measured_stage_ms)
@@ -950,6 +1016,7 @@ def _layerwise_pin_targets(
     current_pinned_layers: tuple[tuple[int, ...], ...],
     uses_per_streamed_layer: int,
     layer_uses: tuple[tuple[int, ...], ...] | None = None,
+    constrain_host_transitions: bool = True,
 ) -> list[tuple[tuple[int, ...], ...]]:
     """Pareto-optimal HostPin targets for one resident-layer placement.
 
@@ -1010,6 +1077,38 @@ def _layerwise_pin_targets(
         )
 
     def prune(candidates):
+        if not constrain_host_transitions:
+            # host transition scratch cannot constrain this solve, so the local
+            # frontier is exactly pinned bytes versus avoided pageable transfer
+            best_by_pinned_bytes = {}
+            for state in candidates:
+                incumbent = best_by_pinned_bytes.get(state[0])
+                if incumbent is None or (
+                    -state[1],
+                    state[2] + state[3],
+                    state[2],
+                    state[3],
+                    state[4],
+                ) < (
+                    -incumbent[1],
+                    incumbent[2] + incumbent[3],
+                    incumbent[2],
+                    incumbent[3],
+                    incumbent[4],
+                ):
+                    best_by_pinned_bytes[state[0]] = state
+            frontier = []
+            best_utility = -1
+            for state in sorted(
+                best_by_pinned_bytes.values(),
+                key=lambda item: (item[0], -item[1], item[4]),
+            ):
+                if state[1] <= best_utility:
+                    continue
+                frontier.append(state)
+                best_utility = state[1]
+            return frontier
+
         best_by_cost = {}
         for state in candidates:
             key = state[:4]
@@ -1295,11 +1394,6 @@ def _unconfigured_layerwise_targets(
     coarse_savings = max(0, maximum_transfer_work - coarse_transfer_work)
     current_resident = current_mode == RESIDENT
     current_inactive_bytes = full_weight_bytes if current_resident else 0
-    initial_managed_bytes = _layerwise_active_peak_device_bytes(
-        managers=managers,
-        resident_layers=tuple(0 for _ in managers),
-        layer_uses=layer_uses,
-    )
     host_materialize_scratch = max(
         (
             weight_bytes
@@ -1344,9 +1438,7 @@ def _unconfigured_layerwise_targets(
                 target_layerwise_pinned_layers=empty_pins,
                 host_materialize_scratch_bytes=host_materialize_scratch,
                 device_transition_delta_bytes=(
-                    unmanaged_weight_bytes
-                    + initial_managed_bytes
-                    - current_inactive_bytes
+                    unmanaged_weight_bytes - current_inactive_bytes
                 ),
                 active_device_delta_bytes=(
                     unmanaged_weight_bytes + active_managed_bytes - full_weight_bytes
@@ -1398,6 +1490,7 @@ def collect_residency_targets(
     pin_cpu_memory: bool = True,
     used_components: Iterable[str] | None = None,
     layerwise_layer_uses: Mapping[str, Mapping[str, tuple[int, ...]]] | None = None,
+    host_transition_headroom_bytes: int | None = None,
 ) -> list[ResidencyTarget]:
     """Build complete target-state frontiers for auto-managed components.
 
@@ -1412,6 +1505,32 @@ def collect_residency_targets(
     measured_used_names = set(used_components) if used_components is not None else None
     if baseline_residency_mode_of is None:
         baseline_residency_mode_of = residency_mode_of
+    constrain_host_transitions = True
+    if host_transition_headroom_bytes is not None:
+        seen_managers: set[int] = set()
+        maximum_unpin_bytes = 0
+        maximum_pin_bytes = 0
+        for module in modules.values():
+            if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                continue
+            for manager in module.layerwise_offload_managers:
+                manager_id = id(manager)
+                if manager_id in seen_managers:
+                    continue
+                seen_managers.add(manager_id)
+                pinned = set(manager.pinned_layer_indices())
+                host_bytes = manager.layer_host_store_bytes()
+                maximum_unpin_bytes += sum(
+                    host_bytes.get(layer_idx, 0) for layer_idx in pinned
+                )
+                maximum_pin_bytes += sum(
+                    host_bytes.get(layer_idx, 0)
+                    for layer_idx in manager.pinnable_layer_indices()
+                    if layer_idx not in pinned
+                )
+        constrain_host_transitions = max(maximum_unpin_bytes, maximum_pin_bytes) > max(
+            0, host_transition_headroom_bytes
+        )
     candidates = []
     for name in sorted(modules):
         module = modules[name]
@@ -1662,6 +1781,7 @@ def collect_residency_targets(
                     current_pinned_layers=current_pinned_layers,
                     uses_per_streamed_layer=uses_per_request,
                     layer_uses=layer_uses,
+                    constrain_host_transitions=constrain_host_transitions,
                 )
                 if allow_host_pin_reallocation
                 else [current_pinned_layers]

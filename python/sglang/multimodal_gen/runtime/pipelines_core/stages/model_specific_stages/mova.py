@@ -474,6 +474,7 @@ class MOVADenoisingStage(PipelineStage):
 
         boundary_ratio = server_args.pipeline_config.boundary_ratio
         total_steps = paired_timesteps.shape[0]
+        batch.record_stage_iterations(total_steps)
         cfg_rank = get_classifier_free_guidance_rank()
         enable_cfg_parallel = server_args.enable_cfg_parallel
 

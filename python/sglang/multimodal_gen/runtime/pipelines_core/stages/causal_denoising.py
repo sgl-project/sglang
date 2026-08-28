@@ -1253,6 +1253,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
             start_index = 0
 
+        total_iterations = len(block_sizes) * len(timesteps)
+        batch.record_stage_iterations(total_iterations, total_iterations)
+
         def prepare_context_input(current_latents):
             return current_latents
 

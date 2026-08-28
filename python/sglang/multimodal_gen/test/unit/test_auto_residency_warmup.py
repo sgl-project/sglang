@@ -40,7 +40,14 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             component_residency_strategies={
                 "fixed": ComponentResidencyStrategy(),
                 "dynamic": AutoCompatibleStrategy(),
-            }
+            },
+            modules={},
+        )
+        worker.server_args = SimpleNamespace(
+            component_quantizations=(),
+            quantization=None,
+            direct_gpu_weight_loading=False,
+            nunchaku_config=None,
         )
 
         self.assertEqual(worker._fixed_custom_residency_strategy_names(), {"fixed"})

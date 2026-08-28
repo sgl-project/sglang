@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 from diffusers import AutoencoderKL as DiffusersAutoencoderKL
@@ -221,6 +222,24 @@ class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):
             [989, 890, 791, 692, 593, 494, 395, 296, 197, 98],
         )
         self.assertFalse(stage.scheduler.custom_timesteps)
+
+    def test_warmup_caps_paint_steps_and_records_full_target(self):
+        stage = Hunyuan3DPaintTexGenStage.__new__(Hunyuan3DPaintTexGenStage)
+        stage.config = Hunyuan3D2PipelineConfig(paint_turbo_mode=True)
+        stage.scheduler = LCMScheduler(
+            num_train_timesteps=1000,
+            original_inference_steps=50,
+        )
+        batch = SimpleNamespace(
+            is_warmup=True,
+            num_inference_steps=4,
+            record_stage_iterations=Mock(),
+        )
+
+        timesteps = stage._timesteps(torch.device("cpu"), batch)
+
+        self.assertEqual(len(timesteps), 4)
+        batch.record_stage_iterations.assert_called_once_with(4, 10)
 
 
 if __name__ == "__main__":

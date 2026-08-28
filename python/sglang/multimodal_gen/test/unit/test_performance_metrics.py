@@ -44,6 +44,27 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     )
 
 
+def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
+    metrics = RequestMetrics("request")
+    metrics.active_stage_name = "ShapeStage"
+
+    metrics.record_step(0.1)
+    metrics.record_stage_iterations(4, 50)
+    metrics.active_stage_name = "PaintStage"
+    metrics.record_step(0.2)
+    metrics.record_stage_iterations(4, 30)
+
+    assert metrics.steps == [100.0, 200.0]
+    assert metrics.steps_by_stage == {
+        "ShapeStage": [100.0],
+        "PaintStage": [200.0],
+    }
+    assert metrics.stage_iterations == {
+        "ShapeStage": (4, 50),
+        "PaintStage": (4, 30),
+    }
+
+
 def test_performance_summary_separates_load_and_runtime_peaks():
     summary = PerformanceSummary.from_req_perf_record(
         _perf_record(
@@ -201,6 +222,10 @@ def test_loaded_prequantized_checkpoint_can_use_auto_residency():
         auto_residency_mode=lambda _name: None,
         layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
         pin_cpu_memory=True,
+        component_quantizations=(),
+        quantization=None,
+        direct_gpu_weight_loading=False,
+        nunchaku_config=None,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100, 100)
@@ -248,6 +273,10 @@ def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
         auto_residency_mode=lambda _name: None,
         layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
         pin_cpu_memory=True,
+        component_quantizations=(),
+        quantization=None,
+        direct_gpu_weight_loading=False,
+        nunchaku_config=None,
     )
     device_module = Mock()
     device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)
