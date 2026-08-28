@@ -559,6 +559,7 @@ impl MatchResultBinding {
 pub struct InsertResultBinding {
     prefix_len: usize,
     total_len: usize,
+    last_device_node: Option<NodeId>,
     inserted_host_node: Option<NodeId>,
     host_insert_dropped: bool,
     mamba_exist: bool,
@@ -596,6 +597,7 @@ impl InsertResultBinding {
         Ok(InsertResultBinding {
             prefix_len: result.prefix_len,
             total_len: result.total_len,
+            last_device_node: result.last_device_node_id,
             inserted_host_node: result.inserted_host_node,
             host_insert_dropped: result.host_insert_dropped,
             mamba_exist: result.mamba_exist,

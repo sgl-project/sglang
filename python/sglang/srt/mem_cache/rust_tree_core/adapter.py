@@ -203,6 +203,7 @@ def _insert_step_from_binding(step) -> InsertStepResult:
         assert not step.result.cache_actions
         result = InsertResult(
             prefix_len=step.result.prefix_len,
+            last_device_node=step.result.last_device_node,
             mamba_exist=step.result.mamba_exist,
             host_insert_dropped=step.result.host_insert_dropped,
         )
@@ -710,6 +711,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return InsertResult(
             prefix_len=result.prefix_len,
             total_len=result.total_len,
+            last_device_node=result.last_device_node,
             inserted_host_node=result.inserted_host_node,
             host_insert_dropped=result.host_insert_dropped,
             mamba_exist=result.mamba_exist,

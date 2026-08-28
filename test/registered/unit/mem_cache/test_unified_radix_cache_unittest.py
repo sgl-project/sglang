@@ -1184,6 +1184,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.prefix_len, len(seq_a))
 
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_b))))
+        self.assertEqual(result.last_device_node, m.last_device_node)
         self.assertEqual(len(m.device_indices), len(seq_b))
 
         m = cache.match_prefix(

@@ -1822,6 +1822,7 @@ fn insert_creates_a_leaf_and_matches_back() {
     assert!(result.cache_actions.is_empty());
     assert_eq!(tc.evictable_size_(FULL), 3);
     let matched = tc.match_prefix(&match_params(&vec![1, 2, 3]));
+    assert_eq!(result.last_device_node_id, Some(matched.best_match_node_id));
     assert!(
         matched
             .device_indices

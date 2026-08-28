@@ -94,6 +94,7 @@ def _pump_insert(core: RustUnifiedTreeCore, params: InsertParams) -> InsertResul
     core.end_insert()
     return InsertResult(
         prefix_len=step.result.prefix_len,
+        last_device_node=step.result.last_device_node,
         mamba_exist=step.result.mamba_exist,
         cache_actions=actions,
     )
@@ -124,6 +125,7 @@ def test_insert_then_match_back_returns_the_exact_indices():
     assert result.prefix_len == 0
     assert result.cache_actions == []
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
+    assert result.last_device_node == matched.last_device_node
     assert matched.device_indices.tolist() == [10, 11, 12]
 
 

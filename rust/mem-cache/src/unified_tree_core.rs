@@ -121,6 +121,8 @@ pub struct InsertResult {
     pub prefix_len: usize,
     /// The inserted key's full (page-aligned) length.
     pub total_len: usize,
+    /// The device-resident node at the end of the inserted path.
+    pub last_device_node_id: Option<NodeId>,
     /// Whether the cache holds Mamba state covering the inserted sequence;
     /// vacuously true for an empty insert.
     pub mamba_exist: bool,
@@ -1251,6 +1253,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 result: Some(InsertResult {
                     prefix_len: 0,
                     total_len: 0,
+                    last_device_node_id: Some(self.arena.node(root_id).id),
                     inserted_host_node: None,
                     host_insert_dropped: false,
                     mamba_exist: true,
@@ -1495,6 +1498,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut result = InsertResult {
             prefix_len: state.total_prefix_length,
             total_len: 0,
+            last_device_node_id: Some(self.arena.node(target_node_id).id),
             inserted_host_node: None,
             host_insert_dropped: false,
             mamba_exist: false,
@@ -2658,6 +2662,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return InsertResult {
                 prefix_len: 0,
                 total_len: 0,
+                last_device_node_id: None,
                 inserted_host_node: None,
                 host_insert_dropped: false,
                 mamba_exist: true,
@@ -2695,6 +2700,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut result = InsertResult {
             prefix_len: matched_length,
             total_len,
+            last_device_node_id: None,
             inserted_host_node: None,
             host_insert_dropped: false,
             mamba_exist: false,
