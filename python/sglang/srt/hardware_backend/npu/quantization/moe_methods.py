@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 _E8M0_DTYPE = None
+_DEFAULT_DYNAMIC_QUANT = object()
 
 
 def _require_e8m0_dtype():
@@ -278,8 +279,9 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     """ModelSlim W4A8 MoE with packed MXFP4 weights and MXFP8 activations."""
 
-    def __init__(self):
+    def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
         super().__init__(quant_config=None)
+        self.dynamic_quant_kwargs = dynamic_quant_kwargs
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -316,6 +318,10 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
                 hidden_states.shape[0], hidden_states.shape[1] // 64, 2
             )
 
+        dynamic_quant_kwargs = self.dynamic_quant_kwargs
+        if dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT:
+            dynamic_quant_kwargs = {"dst_type": torch.float8_e4m3fn}
+
         return w4a8_mxfp_gmm(
             input=hidden_states,
             input_scale=pertoken_scale,
@@ -324,7 +330,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             group_list_type=group_list_type,
             group_list=expert_tokens,
             output_dtype=output_dtype,
-            dynamic_quant_kwargs={"dst_type": torch.float8_e4m3fn},
+            dynamic_quant_kwargs=dynamic_quant_kwargs,
         )
 
 
