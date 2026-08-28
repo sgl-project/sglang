@@ -1440,6 +1440,12 @@ class TestOffloadDefaults(unittest.TestCase):
         cosmos3_deployment = Cosmos3Config(
             model_path="nvidia/Cosmos3-Nano"
         ).get_model_deployment_config()
+        cosmos3_super_deployment = Cosmos3Config(
+            model_path="nvidia/Cosmos3-Super"
+        ).get_model_deployment_config()
+        local_cosmos3_nano_deployment = Cosmos3Config(
+            model_path="/models/custom-checkpoint", is_nano=True
+        ).get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
         zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
@@ -1452,8 +1458,12 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertIsNone(qwen_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(qwen_deployment.dit_layerwise_offload_modes, ())
 
-        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(cosmos3_deployment.keep_resident_min_available_gb, 90)
         self.assertEqual(cosmos3_deployment.keep_resident_components, ("dit", "vae"))
+        self.assertEqual(cosmos3_super_deployment.keep_resident_min_available_gb, 120)
+        self.assertEqual(
+            local_cosmos3_nano_deployment.keep_resident_min_available_gb, 90
+        )
 
         self.assertIsNone(wan_deployment.fsdp_auto_min_available_memory_gb)
         self.assertEqual(wan_deployment.dit_layerwise_offload_modes, ("memory",))
@@ -1930,7 +1940,7 @@ class TestOffloadDefaults(unittest.TestCase):
     def test_auto_cosmos3_keeps_dit_resident_on_high_memory_gpu(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
-            available_memory_gb=139,
+            available_memory_gb=95,
             kwargs={
                 "model_path": "nvidia/Cosmos3-Nano",
                 "performance_mode": "auto",
@@ -1947,7 +1957,7 @@ class TestOffloadDefaults(unittest.TestCase):
     def test_auto_cosmos3_offloads_dit_below_resident_threshold(self):
         args = self._from_dict_with_pipeline_config(
             Cosmos3Config(model_path="nvidia/Cosmos3-Nano"),
-            available_memory_gb=100,
+            available_memory_gb=85,
             kwargs={
                 "model_path": "nvidia/Cosmos3-Nano",
                 "performance_mode": "auto",
