@@ -9,6 +9,7 @@ For ``num_frames == 1`` the output ``data_type`` flips to ``IMAGE``
 so the file extension and decode path agree.
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -44,6 +45,24 @@ COSMOS3_EDGE_SUPPORTED_RESOLUTIONS = [
 ]
 
 
+def _parse_request_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return value
+
+
+def _optional_int_list(value: Any) -> list[int] | None:
+    value = _parse_request_value(value)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
 @dataclass
 class Cosmos3SamplingParams(SamplingParams):
     """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I).
@@ -62,6 +81,12 @@ class Cosmos3SamplingParams(SamplingParams):
     num_inference_steps: int = 35
 
     negative_prompt: str = ""
+
+    use_duration_template: bool | None = None
+    use_resolution_template: bool | None = None
+    use_system_prompt: bool | None = None
+    use_guardrails: bool | None = None
+    sound_duration: float = 0.0
 
     # Optional CFG window — T2I requests typically pass e.g. ``(400, 1000)`` to
     # skip guidance at low noise levels. T2V / I2V / V2V leave it unset.
@@ -159,33 +184,54 @@ class Cosmos3SamplingParams(SamplingParams):
     action_normalization: str = "quantile"
 
     @classmethod
-    def video_request_extra_fields(cls) -> frozenset[str]:
+    def image_request_extra_fields(cls) -> frozenset[str]:
         return frozenset(
             {
-                "generate_sound",
-                "sound_duration",
+                "guidance_interval",
+                "use_duration_template",
+                "use_guardrails",
+                "use_resolution_template",
+                "use_system_prompt",
+            }
+        )
+
+    @classmethod
+    def default_image_output_format(cls) -> str:
+        return "png"
+
+    @classmethod
+    def default_image_response_format(cls) -> str:
+        return "b64_json"
+
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        return cls.image_request_extra_fields() | frozenset(
+            {
+                "action",
+                "action_fps",
+                "action_mode",
+                "action_normalization",
+                "action_view_point",
                 "condition_frame_indexes",
                 "condition_frame_indexes_vision",
                 "condition_video_keep",
-                "control_path",
-                "control_hint",
                 "control_guidance",
                 "control_guidance_interval",
-                "num_video_frames_per_chunk",
-                "num_conditional_frames",
-                "num_first_chunk_conditional_frames",
-                "max_frames",
-                "show_control_condition",
-                "show_input",
-                "share_vision_temporal_positions",
-                "action_mode",
+                "control_hint",
+                "control_path",
                 "domain_id",
                 "domain_name",
+                "generate_sound",
+                "guardrails",
+                "max_frames",
+                "num_conditional_frames",
+                "num_first_chunk_conditional_frames",
+                "num_video_frames_per_chunk",
                 "raw_action_dim",
-                "action_fps",
-                "action",
-                "action_view_point",
-                "action_normalization",
+                "share_vision_temporal_positions",
+                "show_control_condition",
+                "show_input",
+                "sound_duration",
             }
         )
 
@@ -247,16 +293,114 @@ class Cosmos3SamplingParams(SamplingParams):
     def lower_video_request_kwargs(
         cls, request: Any, kwargs: dict[str, Any]
     ) -> dict[str, Any]:
-        """Apply defaults that the generic video endpoint pre-resolves."""
+        kwargs = super().lower_video_request_kwargs(request, dict(kwargs))
+        extras = getattr(request, "model_extra", None) or {}
+
+        if "use_guardrails" not in kwargs and extras.get("guardrails") is not None:
+            kwargs["use_guardrails"] = _parse_request_value(extras["guardrails"])
+
+        condition_indexes = kwargs.get("condition_frame_indexes")
+        if condition_indexes is None:
+            condition_indexes = extras.get("condition_frame_indexes_vision")
+        condition_indexes = _optional_int_list(condition_indexes)
+        if condition_indexes is not None:
+            kwargs["condition_frame_indexes"] = condition_indexes
+
+        if "sound_duration" in kwargs:
+            kwargs["sound_duration"] = float(
+                _parse_request_value(kwargs["sound_duration"])
+            )
+        generate_sound = _parse_request_value(extras.get("generate_sound"))
+        if generate_sound is False:
+            kwargs["sound_duration"] = 0.0
+        elif generate_sound is True and "sound_duration" not in kwargs:
+            kwargs["sound_duration"] = float(kwargs["num_frames"]) / float(
+                kwargs["fps"]
+            )
+
+        for name in ("control_path", "control_hint"):
+            value = _parse_request_value(kwargs.get(name))
+            if isinstance(value, (list, tuple)):
+                value = [str(item) for item in value if str(item).strip()]
+            elif value is not None and not isinstance(value, str):
+                value = str(value)
+            if isinstance(value, str):
+                value = value if value.strip() else None
+            if value:
+                kwargs[name] = value
+            else:
+                kwargs.pop(name, None)
+
+        if "control_guidance" in kwargs:
+            kwargs["control_guidance"] = float(
+                _parse_request_value(kwargs["control_guidance"])
+            )
+        if "control_guidance_interval" in kwargs:
+            interval = _parse_request_value(kwargs["control_guidance_interval"])
+            if interval is None or (isinstance(interval, str) and not interval.strip()):
+                kwargs.pop("control_guidance_interval")
+            else:
+                if not isinstance(interval, (list, tuple)):
+                    interval = [interval]
+                kwargs["control_guidance_interval"] = tuple(
+                    float(item) for item in interval
+                )
+
+        for name in (
+            "num_video_frames_per_chunk",
+            "num_conditional_frames",
+            "num_first_chunk_conditional_frames",
+            "max_frames",
+        ):
+            value = _parse_request_value(kwargs.get(name))
+            if value is not None and value != "":
+                kwargs[name] = int(value)
+
+        for name in (
+            "show_control_condition",
+            "show_input",
+            "share_vision_temporal_positions",
+        ):
+            value = _parse_request_value(kwargs.get(name))
+            if value is None or (isinstance(value, str) and not value.strip()):
+                kwargs.pop(name, None)
+            elif isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "on"}:
+                    kwargs[name] = True
+                elif normalized in {"0", "false", "no", "off"}:
+                    kwargs[name] = False
+                else:
+                    raise ValueError(f"Invalid boolean value: {value!r}")
+            else:
+                kwargs[name] = bool(value)
+
+        for name in (
+            "condition_video_keep",
+            "action_mode",
+            "domain_id",
+            "domain_name",
+            "raw_action_dim",
+            "action_fps",
+            "action",
+            "action_view_point",
+            "action_normalization",
+        ):
+            value = _parse_request_value(kwargs.get(name))
+            if isinstance(value, str) and not value.strip():
+                kwargs.pop(name, None)
+            elif value is not None:
+                kwargs[name] = value
+
         hint = kwargs.get("control_hint")
         paths = kwargs.get("control_path")
         hints = [hint] if isinstance(hint, str) else list(hint or [])
         control_paths = [paths] if isinstance(paths, str) else list(paths or [])
         if len(control_paths) == 1 and hints == ["wsm"]:
             defaults = cls._TRANSFER_DEFAULTS["wsm"]
-            if getattr(request, "num_frames", None) is None:
+            if request.num_frames is None:
                 kwargs["num_frames"] = defaults["num_frames"]
-            if getattr(request, "fps", None) is None:
+            if request.fps is None:
                 kwargs["fps"] = defaults["fps"]
         return kwargs
 
@@ -264,6 +408,8 @@ class Cosmos3SamplingParams(SamplingParams):
         # adjust distil and edge args — read from the pre-computed config fields
         # so no checkpoint download happens at request time.
         pipeline_config = server_args.pipeline_config
+        if self.action_stats_path is None:
+            self.action_stats_path = getattr(pipeline_config, "action_stats_path", None)
         distilled_sigmas = pipeline_config.distilled_sigmas
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
