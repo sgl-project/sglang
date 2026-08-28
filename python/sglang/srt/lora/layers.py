@@ -461,6 +461,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             device="cpu",
             pin_memory=True,
         )
+        self._grouped_output_dim = None
+        self._grouped_output_offset = None
+        self._grouped_output_offset_cpu = None
 
     def set_lora_info(
         self,
@@ -481,6 +484,31 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             base_output=base_output,
         )
         return lora_output
+
+    def _get_grouped_output_offsets(
+        self, group_output_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if getattr(self, "_grouped_output_dim", None) != group_output_dim:
+            is_capturing = (
+                self.output_offset.is_cuda
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if is_capturing:
+                raise RuntimeError(
+                    "grouped LoRA output offsets must be initialized during "
+                    "CUDA-graph warmup"
+                )
+            self._grouped_output_dim = group_output_dim
+            self._grouped_output_offset = self.output_offset.new_tensor(
+                [0, group_output_dim]
+            )
+            self._grouped_output_offset_cpu = torch.tensor(
+                [0, group_output_dim],
+                dtype=self.output_offset_cpu.dtype,
+                device="cpu",
+                pin_memory=self.output_offset_cpu.is_pinned(),
+            )
+        return self._grouped_output_offset, self._grouped_output_offset_cpu
 
     def apply_grouped_lora(
         self, base_output: torch.Tensor, x: torch.Tensor
@@ -541,9 +569,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             group_output_dim,
             lora_rank,
         ).reshape(num_adapters * num_groups, group_output_dim, lora_rank)
-        group_output_offset = self.output_offset.new_tensor([0, group_output_dim])
-        group_output_offset_cpu = self.output_offset_cpu.new_tensor(
-            [0, group_output_dim]
+        group_output_offset, group_output_offset_cpu = (
+            self._get_grouped_output_offsets(group_output_dim)
         )
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
