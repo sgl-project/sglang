@@ -1003,7 +1003,8 @@ class HybridCacheController(BaseHiCacheController):
         for pool in derived_transfers:
             if pool.indices_from_pool == PoolName.KV:
                 pool.host_indices = kv_host_indices
-                pool.device_indices = kv_device_indices
+                if pool.device_indices is None:
+                    pool.device_indices = kv_device_indices
                 continue
 
             source = next(
@@ -1019,7 +1020,8 @@ class HybridCacheController(BaseHiCacheController):
                 rollback_allocated()
                 return None
             pool.host_indices = source.host_indices
-            pool.device_indices = source.device_indices
+            if pool.device_indices is None:
+                pool.device_indices = source.device_indices
         return extra_pools
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:

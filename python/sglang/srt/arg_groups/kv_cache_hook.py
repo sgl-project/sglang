@@ -163,6 +163,16 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "--disaggregation-decode-retraction-backup=host_pool requires "
             "--disable-priority-preemption when priority scheduling is enabled."
         )
+    if (
+        cfg.disaggregation_decode_retraction_backup == "host_pool"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.hicache_write_policy in ("write_through", "write_through_selective")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-retraction-backup=host_pool does not "
+            "support decode radix cache with a write-through HiCache policy. "
+            "Use --hicache-write-policy=write_back or disable decode radix cache."
+        )
 
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
@@ -228,19 +238,15 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-        uses_host_pool = (
-            cfg.disaggregation_decode_retraction_backup == "host_pool"
-            or cfg.disaggregation_decode_enable_offload_kvcache
-        )
         if cfg.disaggregation_decode_enable_offload_kvcache:
             assert cfg.hicache_storage_backend == "file", (
                 "--enable-unified-memory with decode KV offload currently "
                 "supports --hicache-storage-backend=file only."
             )
-        assert not uses_host_pool or cfg.speculative_algorithm is None, (
-            "--enable-unified-memory decode host pools do not support "
-            "packed-draft speculative decoding."
-        )
+            assert not resolved_view(server_args).uses_mamba_radix_cache, (
+                "--enable-unified-memory decode KV offload does not support "
+                "hybrid-Mamba models."
+            )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
         "DSPARK (chain draft); other speculative algorithms are not yet "

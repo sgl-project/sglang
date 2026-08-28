@@ -1219,13 +1219,15 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfers in component_transfers.values()
             for transfer in transfers
         ]
-        extra_transfers.extend(
-            self._build_sidecar_transfers(
-                CacheTransferPhase.BACKUP_HOST,
-                kv_transfer,
-                component_transfers,
-            )
+        sidecar_transfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST,
+            kv_transfer,
+            component_transfers,
         )
+        for transfer in sidecar_transfers:
+            if transfer.name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER):
+                transfer.device_indices = full_virtual_indices
+        extra_transfers.extend(sidecar_transfers)
         return full_device_indices, extra_transfers
 
     def _reclaim_retraction_host(self, num_tokens: int) -> int:

@@ -151,7 +151,8 @@ class HostPoolGroup:
         for transfer in derived_transfers:
             if transfer.indices_from_pool == self.anchor_entry.name:
                 transfer.host_indices = primary_host_indices
-                transfer.device_indices = primary_device_indices
+                if transfer.device_indices is None:
+                    transfer.device_indices = primary_device_indices
                 continue
 
             source = next(
@@ -167,7 +168,8 @@ class HostPoolGroup:
                 rollback()
                 return None
             transfer.host_indices = source.host_indices
-            transfer.device_indices = source.device_indices
+            if transfer.device_indices is None:
+                transfer.device_indices = source.device_indices
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:
