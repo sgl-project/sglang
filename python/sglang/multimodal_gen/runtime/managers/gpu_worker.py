@@ -1682,6 +1682,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         candidates = []
         if include_candidates:
+            candidate_started = time.perf_counter()
             candidates = collect_residency_targets(
                 modules=self.pipeline.modules,
                 residency_mode_of=self.server_args.residency_mode,
@@ -1705,6 +1706,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 ),
                 layerwise_layer_uses=layerwise_layer_uses,
                 host_transition_headroom_bytes=host_transition_headroom_bytes,
+            )
+            candidates_by_component: dict[str, int] = {}
+            for candidate in candidates:
+                candidates_by_component[candidate.component_name] = (
+                    candidates_by_component.get(candidate.component_name, 0) + 1
+                )
+            logger.debug(
+                "Auto residency candidate frontier built in %.3fs: %s",
+                time.perf_counter() - candidate_started,
+                candidates_by_component,
             )
         measured_request_duration_ns, _, _ = estimate_default_workload_timing(
             records=records,

@@ -25,6 +25,7 @@ single placement to serve two different lifecycle objectives.
 from __future__ import annotations
 
 import statistics
+import time
 from itertools import chain, product
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Sequence
 
@@ -2370,6 +2371,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         if use_latency_utility
         else 0
     )
+    option_build_started = time.perf_counter()
     options = []
     for candidate in candidates:
         resource_deltas: dict[str, int] = {}
@@ -2490,6 +2492,13 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
         any(candidate.current_placement for candidate in component_candidates)
         for component_candidates in candidates_by_component.values()
     )
+    logger.debug(
+        "Auto residency option vectors built in %.3fs: options=%d, resources=%d",
+        time.perf_counter() - option_build_started,
+        len(options),
+        len(resource_budgets),
+    )
+    solve_started = time.perf_counter()
     try:
         placement = optimize_placement(
             options,
@@ -2506,6 +2515,10 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
                 current_placement_reserve_shortfall
             ),
         )
+    logger.debug(
+        "Auto residency joint solve completed in %.3fs",
+        time.perf_counter() - solve_started,
+    )
     changed_candidates = []
     for selection in placement.selections:
         candidate = candidate_by_key[selection.option_key]
