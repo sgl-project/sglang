@@ -718,6 +718,26 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_max += self.speculative_step_id + 1
         else:
             seq_lens_max = forward_batch.seq_lens_cpu.max()
+            # Context-parallel in-seq-split mode inflates the last sequence's
+            # extend length by the batch-level CP alignment padding:
+            # prepare_context_parallel_metadata adds the gap between the padded
+            # input_ids length and sum(extend_seq_lens) to the last seq's
+            # extend_seqs_len.  The block_table must cover those padding tokens
+            # so the NPU indexer / sparse-attention kernels don't read past the
+            # last page when actual_seq_lengths_kv includes them.
+            if (
+                forward_batch.extend_seq_lens_cpu is not None
+                and forward_batch.input_ids is not None
+            ):
+                batch_pad = (
+                    forward_batch.input_ids.shape[0]
+                    - sum(forward_batch.extend_seq_lens_cpu)
+                )
+                if batch_pad > 0:
+                    seq_lens_max = max(
+                        seq_lens_max,
+                        forward_batch.seq_lens_cpu[-1] + batch_pad,
+                    )
 
         self.forward_metadata.block_tables = (
             self.req_to_token_pool.req_to_token[
@@ -1197,9 +1217,13 @@ class AscendAttnBackend(AttentionBackend):
         layer,
         actual_seq_qlen,
         actual_seq_lengths_kv,
+        forward_batch,
     ):
-        seq_len = q_nope.shape[0]
-        split_len = (seq_len + 1) // 2
+        # CP zigzag layout for bs>1 is [all_prev_tokens, all_next_tokens];
+        # split at total_q_prev_tokens (sum of per-seq prev blocks), NOT the
+        # midpoint. Using (seq_len+1)//2 is only correct when bs==1 and
+        # prev/next happen to be equal.
+        split_len = forward_batch.attn_cp_metadata.total_q_prev_tokens
         q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
         q_rope_prev, q_rope_next = torch.split(q_pe, split_len, dim=0)
         q_nope_prev = q_nope_prev.contiguous()
@@ -1213,6 +1237,12 @@ class AscendAttnBackend(AttentionBackend):
 
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        # NPU attention kernels with TND layout expect cumulative
+        # actual_seq_lengths_query (last element = total query tokens).
+        # CP metadata stores per-sequence lengths, so convert to cumsum.
+        actual_seq_qlen_prev = torch.cumsum(actual_seq_qlen_prev, dim=0)
+        actual_seq_qlen_next = torch.cumsum(actual_seq_qlen_next, dim=0)
 
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
             if q_nope.dtype != torch.bfloat16 or q_pe.dtype != torch.bfloat16:
@@ -1548,6 +1578,7 @@ class AscendAttnBackend(AttentionBackend):
                 layer,
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
+                forward_batch,
             )
         else:
             if topk_indices is not None:
