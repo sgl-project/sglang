@@ -331,6 +331,21 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Default to string (safest fallback)
         return "string"
 
+    def _needs_closing_brace(self, streamed_args: str) -> bool:
+        """Whether the streamed argument object is still missing its final "}".
+
+        This cannot be decided from the last character: when the final argument
+        value is itself an object, ``streamed_args`` already ends with "}" (the
+        value's own brace) while the outer object is still open, e.g.
+        ``{"o": {"k": 1}``. Parse instead and only treat it as complete when it
+        is valid JSON on its own.
+        """
+        try:
+            json.loads(streamed_args)
+            return False
+        except (json.JSONDecodeError, ValueError):
+            return True
+
     def _format_value_complete(self, value: str, value_type: str) -> str:
         """Format complete value based on type.
 
@@ -345,15 +360,14 @@ class Glm47MoeDetector(BaseFormatDetector):
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
-            try:
-                num = _convert_to_number(value.strip() if value else "")
+            num = _convert_to_number(value.strip() if value else "")
+            # _convert_to_number returns the input unchanged when it is not
+            # numeric, so an isinstance check is required: returning str(num)
+            # blindly would emit a bare, invalid JSON token (123abc).
+            if isinstance(num, (int, float)) and not isinstance(num, bool):
                 return str(num)
-            except (ValueError, AttributeError):
-                # Fallback to string if not a valid number
-                logger.warning(
-                    f"Failed to parse '{value}' as number, treating as string"
-                )
-                return json.dumps(str(value) if value else "", ensure_ascii=False)
+            logger.warning(f"Failed to parse '{value}' as number, treating as string")
+            return json.dumps(str(value) if value else "", ensure_ascii=False)
         else:
             # For object/array types, return as-is (should already be valid JSON)
             return value
@@ -403,8 +417,11 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._xml_tag_buffer = ""
                     self._value_started = False
-                    # Determine and cache the value type at the start
-                    self._cached_value_type = self._get_value_type(
+                    # Only the schema-declared type is known this early. Value
+                    # based auto-detection is deferred to </arg_value>, because
+                    # _current_value is still empty here and inferring now would
+                    # always fall back to "string".
+                    self._cached_value_type = get_argument_type(
                         func_name, self._current_key, tools
                     )
 
@@ -412,6 +429,13 @@ class Glm47MoeDetector(BaseFormatDetector):
                 if self._xml_tag_buffer.endswith("</arg_value>"):
                     final_value = self._xml_tag_buffer[:-12]
                     self._current_value += final_value
+
+                    # The schema declared no type, so infer it now that the
+                    # complete value is known.
+                    if self._cached_value_type is None:
+                        self._cached_value_type = self._get_value_type(
+                            func_name, self._current_key, tools
+                        )
 
                     # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
@@ -448,9 +472,18 @@ class Glm47MoeDetector(BaseFormatDetector):
                     if not is_potential_closing:
                         content = self._xml_tag_buffer
                         # Use cached value type for consistency
-                        value_type = self._cached_value_type or "string"
+                        value_type = self._cached_value_type
 
-                        if value_type == "string":
+                        if value_type is None:
+                            # No schema type for this argument. Buffer the value
+                            # instead of emitting it: the type can only be
+                            # decided once the whole value is known. Guessing
+                            # from the leading characters would quote a number
+                            # (123 -> "123") or emit malformed JSON.
+                            if content:
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+                        elif value_type == "string":
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -613,7 +646,10 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
+        elif (
+            self._needs_closing_brace(self._last_arguments)
+            and not self._sent_empty_object
+        ):
             # Need to close brace
             calls.append(
                 ToolCallItem(
