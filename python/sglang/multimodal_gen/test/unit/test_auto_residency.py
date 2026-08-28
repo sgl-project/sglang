@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     collect_residency_targets,
     component_resident_size_bytes,
     component_runtime_weight_bytes,
+    estimate_allocator_headroom_bytes,
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
@@ -68,6 +69,7 @@ def _record(
     num_frames=17,
     baseline_gib=10,
     peak_gib=12,
+    peak_reserved_gib=None,
     succeeded=True,
     num_inference_steps=1,
     total_duration_ms=0.0,
@@ -83,6 +85,7 @@ def _record(
         baseline_allocated_bytes=baseline_gib * GIB_BYTES,
         peak_allocated_bytes=peak_gib * GIB_BYTES,
         succeeded=succeeded,
+        peak_reserved_bytes=int((peak_reserved_gib or peak_gib) * GIB_BYTES),
         num_inference_steps=num_inference_steps,
         total_duration_ms=total_duration_ms,
         stage_duration_ms=stage_duration_ms or {},
@@ -92,6 +95,38 @@ def _record(
             phase_full_weight_transition_components or {}
         ),
     )
+
+
+class TestEstimateAllocatorHeadroom:
+    def test_uses_covering_workload_allocator_gap(self):
+        small = _record(
+            num_frames=9,
+            peak_gib=10,
+            peak_reserved_gib=11,
+        )
+        target = _record(
+            num_frames=17,
+            peak_gib=20,
+            peak_reserved_gib=26,
+        )
+
+        assert (
+            estimate_allocator_headroom_bytes(
+                records=[small, target], target_units=target.workload_units()
+            )
+            == 6 * GIB_BYTES
+        )
+
+    def test_keeps_largest_observed_gap_without_covering_workload(self):
+        first = _record(peak_gib=10, peak_reserved_gib=12)
+        second = _record(peak_gib=15, peak_reserved_gib=19)
+
+        assert (
+            estimate_allocator_headroom_bytes(
+                records=[first, second], target_units=second.workload_units() * 2
+            )
+            == 4 * GIB_BYTES
+        )
 
 
 class TestEstimateDefaultWorkloadTiming:

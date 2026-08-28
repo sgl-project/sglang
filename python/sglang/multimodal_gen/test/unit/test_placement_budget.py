@@ -653,3 +653,28 @@ def test_branch_and_bound_matches_exhaustive_multiresource_search():
         )
         assert plan.estimated_latency_savings == expected_utility
         assert plan.preference_cost == expected_cost
+
+
+def test_identical_resource_columns_keep_only_the_strictest_budget():
+    options = [
+        PlacementOption(
+            group_key="dit",
+            option_key="dit:small",
+            resource_delta_bytes={"phase-a": 4, "phase-b": 4},
+            estimated_latency_savings=4,
+        ),
+        PlacementOption(
+            group_key="dit",
+            option_key="dit:large",
+            resource_delta_bytes={"phase-a": 8, "phase-b": 8},
+            estimated_latency_savings=8,
+        ),
+    ]
+
+    plan = optimize_placement(
+        options,
+        resource_budget_bytes={"phase-a": 10, "phase-b": 6},
+    )
+
+    assert [option.option_key for option in plan.selections] == ["dit:small"]
+    assert plan.resource_delta_bytes == {"phase-a": 4, "phase-b": 4}

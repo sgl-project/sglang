@@ -139,6 +139,8 @@ class WarmupMemoryRecord(msgspec.Struct, frozen=True):
     baseline_allocated_bytes: int
     peak_allocated_bytes: int
     succeeded: bool
+    baseline_reserved_bytes: int = 0
+    peak_reserved_bytes: int = 0
     phase_peak_allocated_bytes: dict[str, int] = {}
     phase_active_components: dict[str, tuple[str, ...]] = {}
     phase_used_components: dict[str, tuple[str, ...]] = {}
@@ -731,6 +733,33 @@ def estimate_default_workload_peak_bytes(
             baseline + int(activation * ratio * ACTIVATION_EXTRAPOLATION_MARGIN)
         )
     return max(estimates)
+
+
+def estimate_allocator_headroom_bytes(
+    *, records: Iterable[WarmupMemoryRecord], target_units: int | None
+) -> int:
+    """Return observed allocator capacity above live tensor allocations.
+
+    Placement deltas are expressed in live weight bytes, but CUDA must fit the
+    allocator pool that served the measured workload too. Prefer covering
+    target-shape records; otherwise retain the largest observed gap without
+    pretending it scales linearly with pixels or frames.
+    """
+    records = list(records)
+    if target_units is not None:
+        covering = [
+            record for record in records if record.workload_units() >= target_units
+        ]
+        if covering:
+            records = covering
+    return max(
+        (
+            max(record.peak_reserved_bytes, record.peak_allocated_bytes)
+            - record.peak_allocated_bytes
+            for record in records
+        ),
+        default=0,
+    )
 
 
 def estimate_workload_phase_peaks(

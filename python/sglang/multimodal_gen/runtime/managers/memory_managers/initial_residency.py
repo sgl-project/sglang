@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 GIB_BYTES = 1024**3
 MIN_INITIAL_RESIDENCY_RESERVE_BYTES = 4 * GIB_BYTES
 INITIAL_RESIDENCY_RESERVE_FRACTION = 0.20
+MULTI_DIT_INITIAL_RESIDENCY_RESERVE_FRACTION = 0.30
 
 
 def _default_denoising_steps(server_args: ServerArgs) -> int:
@@ -64,9 +65,26 @@ def choose_initial_resident_components(
     configured loading semantics. A model-default layerwise placement remains
     eligible because avoiding that initialization is the point of this seed.
     """
+    dit_count = sum(
+        is_dit_component_name(item.component_name)
+        and (
+            server_args.explicit_residency_mode(item.component_name) is None
+            or server_args.residency_mode(item.component_name) == RESIDENT
+        )
+        for item in inventory
+    )
+    # Before the first target-shape probe there is no activation/workspace
+    # measurement. Multiple denoisers can otherwise consume nearly the whole
+    # device with static weights even though only one is active at a time. Keep
+    # a larger temporary probe allowance; measured planning can spend it again.
+    reserve_fraction = (
+        MULTI_DIT_INITIAL_RESIDENCY_RESERVE_FRACTION
+        if dit_count > 1
+        else INITIAL_RESIDENCY_RESERVE_FRACTION
+    )
     reserve_bytes = max(
         MIN_INITIAL_RESIDENCY_RESERVE_BYTES,
-        int(available_bytes * INITIAL_RESIDENCY_RESERVE_FRACTION),
+        int(available_bytes * reserve_fraction),
     )
     fixed_resident = [
         item

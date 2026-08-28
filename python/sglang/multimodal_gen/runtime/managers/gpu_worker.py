@@ -70,6 +70,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     component_current_device_weight_bytes,
     component_runtime_weight_bytes,
     describe_error,
+    estimate_allocator_headroom_bytes,
     estimate_candidate_latency_savings_ns,
     estimate_default_workload_peak_bytes,
     estimate_default_workload_timing,
@@ -601,6 +602,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             else None
         )
         warmup_baseline_allocated_bytes = 0
+        warmup_baseline_reserved_bytes = 0
         try:
             if measure_server_warmup:
                 # Drop the previous request's allocator pool so each probe
@@ -612,6 +614,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if measure_server_warmup:
                 warmup_baseline_allocated_bytes = (
                     torch.get_device_module().memory_allocated()
+                )
+                warmup_baseline_reserved_bytes = (
+                    torch.get_device_module().memory_reserved()
                 )
 
             start_time = (
@@ -734,6 +739,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     req=req,
                     workload=warmup_workload,
                     baseline_allocated_bytes=warmup_baseline_allocated_bytes,
+                    baseline_reserved_bytes=warmup_baseline_reserved_bytes,
                     succeeded=output_batch is not None and output_batch.error is None,
                 )
         return output_batch
@@ -744,6 +750,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req: Req,
         workload: tuple[int, int, int, int],
         baseline_allocated_bytes: int,
+        baseline_reserved_bytes: int,
         succeeded: bool,
     ) -> None:
         phase_allocated_peaks: dict[str, int] = {}
@@ -797,6 +804,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 baseline_allocated_bytes=int(baseline_allocated_bytes),
                 peak_allocated_bytes=request_allocated_peak,
                 succeeded=succeeded,
+                baseline_reserved_bytes=int(baseline_reserved_bytes),
+                peak_reserved_bytes=int(
+                    torch.get_device_module().max_memory_reserved()
+                ),
                 phase_peak_allocated_bytes=phase_allocated_peaks,
                 phase_active_components=phase_components,
                 phase_used_components=phase_used_components,
@@ -1711,6 +1722,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             for record in records
         )
         runtime_weights_by_component = component_runtime_weight_bytes(modules)
+        allocator_headroom_bytes = estimate_allocator_headroom_bytes(
+            records=records,
+            target_units=target_units,
+        )
         if warmup_oom:
             (
                 estimated_peak_bytes,
@@ -1836,7 +1851,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             budget_bytes=budget_bytes,
             estimated_peak_bytes=estimated_peak_bytes,
             planning_headroom_correction_bytes=(
-                self._auto_residency_budget_correction_bytes
+                self._auto_residency_budget_correction_bytes + allocator_headroom_bytes
             ),
             target_workload_measured=any(
                 record.succeeded and record.workload_units() >= target_units

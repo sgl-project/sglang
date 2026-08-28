@@ -131,6 +131,25 @@ def test_initial_seed_selects_all_known_components_when_they_fit():
     assert selected == {"transformer", "text_encoder", "vae"}
 
 
+def test_initial_seed_keeps_probe_headroom_for_multiple_dits():
+    args = _Args()
+
+    selected = choose_initial_resident_components(
+        args,
+        [
+            _weight("transformer", 27),
+            _weight("transformer_2", 27),
+            _weight("text_encoder", 10),
+            _weight("vae", 1),
+        ],
+        available_bytes=75 * GIB_BYTES,
+        denoising_steps=40,
+    )
+
+    assert len(selected & {"transformer", "transformer_2"}) == 1
+    assert {"text_encoder", "vae"} <= selected
+
+
 def test_initial_seed_can_bypass_model_default_layerwise_initialization():
     args = _Args(modes={"transformer": LAYERWISE_OFFLOAD})
 

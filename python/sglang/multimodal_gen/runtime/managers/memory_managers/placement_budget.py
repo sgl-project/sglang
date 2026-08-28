@@ -197,7 +197,7 @@ def optimize_placement(
     # for the common case where a large-host server can pin every candidate:
     # all pin-prefix alternatives then collapse to the highest-utility one for
     # each GPU placement instead of multiplying the global frontier.
-    resource_names = tuple(
+    binding_resource_names = tuple(
         resource_name
         for resource_name in all_resource_names
         if sum(
@@ -212,6 +212,25 @@ def optimize_placement(
         )
         > resource_budget_bytes[resource_name]
     )
+
+    # Phase-level VRAM accounting commonly produces many constraints with the
+    # exact same cost for every option. Such columns describe the same left-hand
+    # side, so only the smallest budget can bind. Collapsing them before local
+    # Pareto construction is exact and avoids quadratic skyline work over dozens
+    # of duplicate stage dimensions.
+    ordered_options = sorted(options, key=lambda option: option.option_key)
+    resource_by_cost_vector: dict[tuple[int, ...], str] = {}
+    for resource_name in binding_resource_names:
+        cost_vector = tuple(
+            option.resource_delta_bytes.get(resource_name, 0)
+            for option in ordered_options
+        )
+        incumbent = resource_by_cost_vector.get(cost_vector)
+        if incumbent is None or (
+            resource_budget_bytes[resource_name] < resource_budget_bytes[incumbent]
+        ):
+            resource_by_cost_vector[cost_vector] = resource_name
+    resource_names = tuple(sorted(resource_by_cost_vector.values()))
     resource_budgets = tuple(
         int(resource_budget_bytes[name]) for name in resource_names
     )
