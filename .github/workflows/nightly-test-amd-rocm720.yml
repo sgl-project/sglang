@@ -11,12 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm image version ("all" runs every flavor, as the nightly schedule does)'
+        description: 'ROCm image version ("all" runs the scheduled ROCm 7.2 matrix; select rocm10 explicitly)'
         required: false
         type: choice
         default: 'all'
         options:
           - 'all'
+          - rocm10
           - rocm724
           - rocm720
       aiter_ref:
@@ -110,7 +111,7 @@ on:
   workflow_call:
     inputs:
       rocm_version:
-        description: 'ROCm image version ("all" runs every flavor)'
+        description: 'ROCm image version ("all" runs the scheduled ROCm 7.2 matrix; pass rocm10 explicitly)'
         required: false
         type: string
         # A single flavor, unlike the schedule and the dispatch form: a caller
