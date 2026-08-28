@@ -992,6 +992,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
+        # The fused_qk_gemma_rmsnorm_rope_gate CUDA kernel applies a plain NeoX
+        # RoPE over the flat `positions`. It cannot express M-RoPE (the
+        # mrope_section 3D position split, optionally interleaved), so for
+        # M-RoPE models such as Qwen3.5-VL it silently corrupts the rotary
+        # encoding of the vision tokens (grounding/bbox is offset). Only take
+        # the fused CUDA path when the rotary embedding is a plain, non-M-RoPE
+        # RoPE; M-RoPE models fall back to forward_prepare_fused_gate, which
+        # runs the correct Python MRotaryEmbedding.
+        self._can_fuse_qk_rope = not getattr(self.rotary_emb, "mrope_section", None)
+
         # Q stays sharded across attention TP ranks; K/V are replicated within
         # each DCP group.
         self.qkv_proj = QKVParallelLinear(
@@ -1239,12 +1249,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _is_cuda and self.attn_output_gate and self._can_fuse_qk_rope:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+        elif (_is_hip or _is_xpu or _is_cpu or _is_cuda) and self.attn_output_gate:
+            # Non-CUDA gated path, and CUDA M-RoPE models that must skip the
+            # fused NeoX RoPE kernel above.
             q, k, v, gate = self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
