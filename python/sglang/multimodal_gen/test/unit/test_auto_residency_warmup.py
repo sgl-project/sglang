@@ -46,10 +46,12 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
         worker.is_output_rank = False
+        worker.pipeline = SimpleNamespace(modules={})
         worker.server_args = SimpleNamespace(
             residency_mode=lambda _name: COMPONENT_OFFLOAD
         )
         worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_applied = []
         worker._auto_residency_round_sizes = [1]
         report = RankResidencyReport(
             rank=0,
@@ -59,7 +61,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             measured_request_duration_ns=20_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
-        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
         rolled_back = OutputBatch(
             error="request duration regressed",
             output={"status": PLACEMENT_STATUS_ROLLED_BACK},
@@ -138,10 +140,12 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker = GPUWorker.__new__(GPUWorker)
         worker.rank = 0
         worker.is_output_rank = False
+        worker.pipeline = SimpleNamespace(modules={})
         worker.server_args = SimpleNamespace(
             residency_mode=lambda _name: COMPONENT_OFFLOAD
         )
         worker._auto_residency_warmup_records = [object()]
+        worker._auto_residency_applied = []
         worker._auto_residency_round_sizes = [1]
         report = RankResidencyReport(
             rank=0,
@@ -151,7 +155,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             measured_request_duration_ns=10_000_000_000,
         )
         worker._build_auto_residency_report = mock.Mock(return_value=report)
-        worker._auto_residency_all_gather = mock.Mock(return_value=[report])
+        worker._auto_residency_all_gather = mock.Mock(side_effect=lambda value: [value])
         candidate = ResidencyTarget(
             component_name="vae",
             residency_mode=COMPONENT_OFFLOAD,

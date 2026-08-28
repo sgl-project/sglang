@@ -65,6 +65,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     WarmupMemoryRecord,
     apply_residency_changes,
     collect_residency_targets,
+    commit_residency_changes,
     component_current_device_weight_bytes,
     component_runtime_weight_bytes,
     describe_error,
@@ -1345,10 +1346,30 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 latest_round_only=True,
             )
         if validate_only:
+            short_validation = (
+                self._latest_auto_residency_round_supports_short_validation()
+            )
+            commit_error = None
+            try:
+                commit_residency_changes(
+                    applied=self._latest_auto_residency_round(),
+                    modules=self.pipeline.modules,
+                    server_args=self.server_args,
+                )
+            except Exception as e:
+                commit_error = describe_error(e)
+            commit_errors = self._auto_residency_all_gather(commit_error)
+            if any(error is not None for error in commit_errors):
+                raise RuntimeError(
+                    "post-validation residency commit failed: "
+                    + next(error for error in commit_errors if error is not None)
+                )
+            self._auto_residency_applied = []
+            self._auto_residency_round_sizes = []
             if self.is_output_rank:
                 reference_ns = local_report.estimated_request_duration_ns
                 measured_ns = local_report.measured_request_duration_ns
-                if self._latest_auto_residency_round_supports_short_validation():
+                if short_validation:
                     result = "full-shape one-step memory check passed"
                 elif reference_ns > 0 and measured_ns > 0:
                     change = (measured_ns - reference_ns) / reference_ns

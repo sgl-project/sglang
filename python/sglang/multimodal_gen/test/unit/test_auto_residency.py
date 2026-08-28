@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     _layerwise_resident_targets,
     apply_residency_changes,
     collect_residency_targets,
+    commit_residency_changes,
     component_resident_size_bytes,
     component_runtime_weight_bytes,
     estimate_candidate_latency_savings_ns,
@@ -1624,6 +1625,7 @@ class _FakeLayerwiseManager:
         self.register_hooks_calls = 0
         self.sync_to_cpu_calls = 0
         self.release_all_calls = 0
+        self.release_host_stores_calls = 0
 
     def iter_cpu_weights(self):
         yield from self._tensors.items()
@@ -1704,6 +1706,12 @@ class _FakeLayerwiseManager:
 
     def release_all(self):
         self.release_all_calls += 1
+
+    def release_host_stores(self):
+        if self.enabled:
+            raise RuntimeError("offload is still enabled")
+        self.release_host_stores_calls += 1
+        self._pinned_layers = ()
 
 
 class _FakeLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
@@ -2301,6 +2309,30 @@ class TestApplyAndRollback:
         assert manager.register_hooks_calls == 1
         assert args.auto_modes == {}
 
+    def test_resident_only_promotion_keeps_pins_until_validation_commit(self):
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        manager._pinned_layers = (0,)
+        module = _FakeLayerwiseDit([manager])
+        args = _StubResidencyArgs()
+        candidate = _candidate("text_encoder", mode=LAYERWISE_OFFLOAD, weight_gib=1)
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert manager.enabled is False
+        assert manager.pinned_layer_indices() == (0,)
+
+        commit_residency_changes(
+            applied=applied,
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+
+        assert manager.release_host_stores_calls == 1
+        assert module.layerwise_offload_managers == []
+
     def test_partial_layerwise_promotion_restores_exact_group_counts(self):
         managers = [
             _FakeLayerwiseManager(
@@ -2616,6 +2648,22 @@ class TestApplyAndRollback:
         assert manager.enabled is True
         assert manager.register_hooks_calls == 1
         assert manager.release_all_calls == 1
+
+    def test_disable_offload_failure_rearms_earlier_layer_groups(self):
+        first = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        failing = _FakeLayerwiseManager({"layers.1.w": torch.zeros(16)})
+        failing.fail_load = True
+        module = _FakeLayerwiseDit([first, failing])
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            module.disable_offload()
+
+        assert first.enabled is True
+        assert first.register_hooks_calls == 1
+        assert first.release_all_calls == 1
+        assert failing.enabled is True
+        assert failing.register_hooks_calls == 1
+        assert failing.release_all_calls == 1
 
     def test_failed_rollback_raises_rollback_error_with_visible_cause(self):
         class _BrokenArgs(_StubResidencyArgs):
