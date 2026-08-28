@@ -141,6 +141,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             "_class_name": "LatentUpsampler",
             "quantization_config": {"quant_method": "bitsandbytes"},
         }
+        server_args = SimpleNamespace(component_weights_paths={})
 
         with (
             patch(
@@ -160,7 +161,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
             UpsamplerLoader().load_customized(
-                "/model/spatial_upsampler", None, "spatial_upsampler"
+                "/model/spatial_upsampler", server_args, "spatial_upsampler"
             )
 
         load_weights.assert_not_called()
