@@ -254,13 +254,6 @@ def npu_fused_experts_w4a4_mxfp(
         expanded_expert_idx, num_experts
     ).to(torch.int64)
 
-    # npu_moe_init_routing pads its output to the worst case; rows past the last
-    # expert boundary hold garbage and must not reach finalize_routing.
-    row_ids = torch.arange(
-        hidden_states.shape[0], device=hidden_states.device, dtype=torch.int64
-    )
-    valid_mask_2d = (row_ids < expert_tokens[-1]).unsqueeze(1)
-
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
         input_scale=None,
@@ -281,8 +274,6 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    hidden_states = hidden_states * valid_mask_2d.to(hidden_states.dtype)
-
     final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
         hidden_states,
         skip1=None,
