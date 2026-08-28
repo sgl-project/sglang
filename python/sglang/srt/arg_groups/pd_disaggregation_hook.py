@@ -68,6 +68,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     if server_args.disaggregation_mode == "decode":
+        if server_args.disaggregation_decode_ready_reserve < 0:
+            raise ValueError("--disaggregation-decode-ready-reserve must be >= 0")
+
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:
                 raise ValueError(

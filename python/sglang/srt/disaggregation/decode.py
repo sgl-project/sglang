@@ -2602,6 +2602,20 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        ready_reserve = get_disagg().disaggregation_decode_ready_reserve
+        if ready_reserve > 0 and curr_batch_size > 0:
+            # Spend the reserve on replacements first; grow the running batch
+            # only from ready work beyond it. This absorbs short transfer gaps.
+            active_batch_size = sum(not req.finished() for req in running_batch.reqs)
+            replacement_slots = min(
+                len(self.waiting_queue), curr_batch_size - active_batch_size
+            )
+            ready_after_replacements = len(self.waiting_queue) - replacement_slots
+            growth_slots = min(
+                max(0, batch_size - curr_batch_size),
+                max(0, ready_after_replacements - ready_reserve),
+            )
+            num_not_used_batch = replacement_slots + growth_slots
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

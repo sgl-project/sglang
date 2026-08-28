@@ -503,6 +503,29 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
 
+    def test_ready_reserve_replaces_finished_before_growing_batch(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.max_running_requests = scheduler.req_to_token_pool.size = 4
+        scheduler.running_batch.reqs = [MagicMock(), MagicMock()]
+        scheduler.running_batch.reqs[0].finished.return_value = False
+        scheduler.running_batch.reqs[1].finished.return_value = True
+        scheduler.running_batch.batch_size.return_value = 2
+        scheduler.waiting_queue = [MagicMock(rid=str(i)) for i in range(3)]
+
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=MagicMock(),
+        ) as init_new, get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=False,
+            disaggregation_decode_ready_reserve=2,
+        ):
+            SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        self.assertEqual([req.rid for req in init_new.call_args.args[0]], ["0"])
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["1", "2"])
+
 
 if __name__ == "__main__":
     unittest.main()

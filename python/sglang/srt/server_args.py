@@ -3272,6 +3272,11 @@ class ServerArgs:
         "Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",
         NS("disagg"),
     ] = None
+    disaggregation_decode_ready_reserve: A[
+        int,
+        "Number of KV-ready requests to retain per decode DP rank as replacement headroom for transfer-arrival jitter (PD mode).",
+        NS("disagg"),
+    ] = 0
     disaggregation_decode_polling_interval: A[
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
