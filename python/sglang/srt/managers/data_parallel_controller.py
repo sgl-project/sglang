@@ -161,8 +161,10 @@ class DPBudget:
                 else load.num_running_reqs
             )
             self.total_tokens[rank] = load.num_total_tokens + pending_tokens
+            # Balance decode compute by KV-ready work; only assignments not yet
+            # visible to the scheduler need the local ledger projection.
             self.active_tokens[rank] = (
-                load.num_assigned_input_tokens + pending_tokens
+                load.num_active_tokens + pending_tokens
                 if project_pending
                 else load.num_running_input_tokens
             )

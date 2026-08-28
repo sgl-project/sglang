@@ -109,7 +109,7 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.active_requests, [3, 5])
         self.assertEqual(budget.active_tokens, [120, 80])
 
-    def test_maps_pending_assignments_to_active_projection(self):
+    def test_maps_ready_tokens_to_active_projection(self):
         budget = DPBudget(dp_size=1)
         budget.update_budget(
             [
@@ -117,13 +117,14 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
                     timestamp=1.0,
                     num_running_reqs=3,
                     num_waiting_reqs=2,
+                    num_active_tokens=150,
                     num_assigned_input_tokens=240,
                 )
             ],
             project_pending=True,
         )
         self.assertEqual(budget.active_requests, [5])
-        self.assertEqual(budget.active_tokens, [240])
+        self.assertEqual(budget.active_tokens, [150])
 
     def test_partial_update_only_affects_reported_rank(self):
         budget = DPBudget(dp_size=3)
@@ -192,6 +193,7 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
                     dp_rank=0,
                     timestamp=2.0,
                     num_running_reqs=4,
+                    num_active_tokens=50,
                     num_assigned_input_tokens=80,
                     last_dp_dispatch_seq=1,
                 ),
@@ -201,7 +203,7 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
             project_pending=True,
         )
         self.assertEqual(budget.active_requests, [4, 0])
-        self.assertEqual(budget.active_tokens, [80, 0])
+        self.assertEqual(budget.active_tokens, [50, 0])
 
 
 class TestDPBudgetDispatch(CustomTestCase):
