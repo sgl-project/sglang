@@ -308,6 +308,24 @@ def test_binding_stays_usable_after_a_failed_insert():
     assert matched.device_indices.tolist() == [10, 11, 12]
 
 
+def test_poisoned_binding_refuses_to_reuse_the_core():
+    binding = _binding()
+    root = binding.root_node_handle()
+
+    # Reading a backup spec from the value-less root deliberately trips a native
+    # invariant while the binding owns the mutex.
+    with pytest.raises(BaseException) as initial_panic:
+        binding.build_backup_spec(root)
+    assert initial_panic.type.__name__ == "PanicException"
+
+    # The guard must fail closed instead of handing potentially partial state to
+    # the next operation through PoisonError::into_inner().
+    with pytest.raises(BaseException) as poisoned:
+        binding.root_node_handle()
+    assert poisoned.type.__name__ == "PanicException"
+    assert "Rust TreeCore mutex poisoned" in str(poisoned.value)
+
+
 def test_extra_key_isolates_namespaces():
     core = _tree_core()
     result = _pump_insert(

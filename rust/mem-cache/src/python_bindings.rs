@@ -804,10 +804,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
     }
 
-    /// Lock the core for one adapter call; recovers a poisoned lock (sanity_check
-    /// guards the invariants, not poisoning).
+    /// Lock the core for one adapter call. A panic can leave a mutation half-applied,
+    /// so a poisoned core is never reused.
     fn core(&self) -> std::sync::MutexGuard<'_, UnifiedTreeCore<K>> {
-        self.core.lock().unwrap_or_else(|e| e.into_inner())
+        self.core.lock().unwrap_or_else(|_| {
+            panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
+        })
     }
 
     /// Reject an insert value whose dtype, device, or length cannot cover the key.
