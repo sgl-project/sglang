@@ -47,6 +47,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             component_quantizations=(),
             quantization=None,
             direct_gpu_weight_loading=False,
+            ltx2_two_stage_device_mode=None,
             nunchaku_config=None,
         )
 
