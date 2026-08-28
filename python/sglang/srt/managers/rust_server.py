@@ -46,10 +46,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.rust_renderer import RustRendererSidecar
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import (
-        MmSpec,
-        Server,
-    )
+    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
