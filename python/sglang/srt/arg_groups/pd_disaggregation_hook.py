@@ -146,7 +146,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
         # Reject features whose role-specific state is not rebuilt on a flip.
-        if server_args.enable_pd_role_switch:
+        if cfg.enable_pd_role_switch:
             from sglang.srt.arg_groups.overrides import resolved_view
 
             view = resolved_view(server_args)
