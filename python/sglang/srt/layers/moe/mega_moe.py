@@ -46,30 +46,37 @@ _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 
 @functools.lru_cache(maxsize=1)
-def _mega_moe_num_sms() -> int:
-    """The SM count the MegaMoE launch runs with.
+def _mega_moe_max_num_sms() -> Optional[int]:
+    """Upper bound on the SM count a Blackwell MegaMoE launch may use.
 
-    Derived from the physical SM count, not from DeepGEMM's current setting:
-    two-batch overlap and the DSA indexer temporarily reconfigure DeepGEMM
-    process-wide, and reading their value here would both compound the reserve
-    and make the residency margin relative to a moving baseline.
+    None on other architectures: the SM90 MegaMoE implementation does not use
+    the whole-grid clustered launch that needs a residency margin.
+
+    Anchored to the physical SM count so the margin stays absolute. Two-batch
+    overlap and the DSA indexer reconfigure DeepGEMM process-wide, and
+    subtracting the reserve from whatever they left behind would compound the
+    two reservations.
     """
-    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     if _device_sm < 100:
-        # The SM90 MegaMoE implementation does not use the Blackwell whole-grid
-        # clustered launch that needs a residency margin.
-        return num_sms
+        return None
 
+    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
-    num_sms = max(2, num_sms - reserved_num_sms)
-    # Round down so the launch stays compatible with the two-CTA cluster.
-    return num_sms - num_sms % 2
+    return max(2, num_sms - reserved_num_sms)
 
 
 @contextmanager
 def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-    target_num_sms = _mega_moe_num_sms()
+    max_num_sms = _mega_moe_max_num_sms()
+    if max_num_sms is None:
+        yield
+        return
+
+    # Stay under an outer context's budget rather than claiming SMs back from
+    # it, and round down to keep the launch compatible with the 2-CTA cluster.
     current_num_sms = deep_gemm.get_num_sms()
+    target_num_sms = min(max_num_sms, current_num_sms)
+    target_num_sms -= target_num_sms % 2
     if target_num_sms == current_num_sms:
         yield
         return
