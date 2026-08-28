@@ -15,9 +15,10 @@ use crate::node::ChildKeyType;
 use crate::node::{NodeId, TreeCoreRuntimeError};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
-    CacheAction, CacheInitParams, CacheTransferPhase, DecLockRefParams, EvictLayer,
-    EvictionStepResult, InsertParams, InsertResult, InsertStepResult, MatchPrefixParams,
-    MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
+    BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
+    DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
+    MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
+    UnifiedTreeCore,
 };
 
 /// Parse a torch-style device string (e.g. "cpu", "cuda", "cuda:1"); a bare
@@ -663,6 +664,21 @@ pub struct IncLockRefResultBinding {
     skip_lock_node_ids: HashMap<u8, HashSet<NodeId>>,
 }
 
+impl IncLockRefResultBinding {
+    fn from_result(result: crate::unified_tree_core::IncLockRefResult) -> Self {
+        Self {
+            delta: result.delta,
+            swa_uuid_for_lock: result.swa_uuid_for_lock,
+            swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
+            skip_lock_node_ids: result
+                .skip_lock_node_ids
+                .into_iter()
+                .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
+                .collect(),
+        }
+    }
+}
+
 /// Convert a Python component-keyed tracker into the core's counts.
 fn tracker_from_py(tracker: HashMap<u8, usize>) -> PyResult<HashMap<ComponentType, usize>> {
     tracker
@@ -730,6 +746,56 @@ pub struct StorageBackupSpecBinding {
     hash_value: Option<Vec<String>>,
     prefix_keys: Option<Vec<String>>,
     comp_xfers: Py<PyDict>,
+}
+
+#[pyclass(get_all)]
+pub struct BufferBackupSnapshotBinding {
+    node_id: NodeId,
+    parent_node_id: NodeId,
+    parent_is_root: bool,
+    parent_last_hash: Option<String>,
+    key_token_ids: Py<PyBytes>,
+    extra_key: Option<String>,
+    is_bigram: bool,
+    hash_values: Vec<String>,
+    prefix_keys: Option<Vec<String>>,
+}
+
+impl BufferBackupSnapshotBinding {
+    fn from_snapshot(py: Python<'_>, snapshot: BufferBackupSnapshot) -> Self {
+        let mut token_bytes = Vec::with_capacity(snapshot.token_ids.len() * 8);
+        for token in snapshot.token_ids {
+            token_bytes.extend_from_slice(&token.to_ne_bytes());
+        }
+        Self {
+            node_id: snapshot.node_id,
+            parent_node_id: snapshot.parent_node_id,
+            parent_is_root: snapshot.parent_is_root,
+            parent_last_hash: snapshot.parent_last_hash,
+            key_token_ids: PyBytes::new_bound(py, &token_bytes).unbind(),
+            extra_key: snapshot.extra_key,
+            is_bigram: snapshot.is_bigram,
+            hash_values: snapshot.hash_values,
+            prefix_keys: snapshot.prefix_keys,
+        }
+    }
+}
+
+#[pyclass(get_all)]
+pub struct BufferBackupStateBinding {
+    parent_node_id: NodeId,
+    parent_is_root: bool,
+    parent_last_hash: Option<String>,
+}
+
+impl From<BufferBackupState> for BufferBackupStateBinding {
+    fn from(state: BufferBackupState) -> Self {
+        Self {
+            parent_node_id: state.parent_node_id,
+            parent_is_root: state.parent_is_root,
+            parent_last_hash: state.parent_last_hash,
+        }
+    }
 }
 
 /// Python-visible KV-canary walk rows: parallel int64 tensors of slots,
@@ -978,16 +1044,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             self.core()
                 .inc_lock_ref_with_skip(node_id, &skip_lock_components)
         });
-        Ok(IncLockRefResultBinding {
-            delta: result.delta,
-            swa_uuid_for_lock: result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            skip_lock_node_ids: result
-                .skip_lock_node_ids
-                .into_iter()
-                .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
-                .collect(),
-        })
+        Ok(IncLockRefResultBinding::from_result(result))
     }
 
     /// Decrease the reference count on a node's component locks.
@@ -1400,6 +1457,32 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 
     fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
         py.allow_threads(|| self.core().get_hash_values(node_id))
+    }
+
+    fn snapshot_buffer_backup(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        pass_prefix_keys: bool,
+    ) -> Option<BufferBackupSnapshotBinding> {
+        py.allow_threads(|| {
+            self.core()
+                .snapshot_buffer_backup(node_id, pass_prefix_keys)
+        })
+        .map(|snapshot| BufferBackupSnapshotBinding::from_snapshot(py, snapshot))
+    }
+
+    fn validate_buffer_backup(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+        expected_key_length: usize,
+    ) -> Option<BufferBackupStateBinding> {
+        py.allow_threads(|| {
+            self.core()
+                .validate_buffer_backup(node_id, expected_key_length)
+        })
+        .map(BufferBackupStateBinding::from)
     }
 
     /// Hash every node built while storage was disabled.
@@ -2467,6 +2550,26 @@ macro_rules! tree_core_binding {
                 self.inner.get_hash_values(py, node_id)
             }
 
+            fn snapshot_buffer_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                pass_prefix_keys: bool,
+            ) -> Option<BufferBackupSnapshotBinding> {
+                self.inner
+                    .snapshot_buffer_backup(py, node_id, pass_prefix_keys)
+            }
+
+            fn validate_buffer_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                expected_key_length: usize,
+            ) -> Option<BufferBackupStateBinding> {
+                self.inner
+                    .validate_buffer_backup(py, node_id, expected_key_length)
+            }
+
             /// Hash every node built while storage was disabled.
             fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
                 self.inner.backfill_missing_hash_values(py)
@@ -3069,6 +3172,8 @@ fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DemoteResultBinding>()?;
     m.add_class::<KvCanaryWalkResultBinding>()?;
     m.add_class::<StorageBackupSpecBinding>()?;
+    m.add_class::<BufferBackupSnapshotBinding>()?;
+    m.add_class::<BufferBackupStateBinding>()?;
     m.add_class::<HostEvictionResultBinding>()?;
     m.add_class::<RustUnifiedTreeCoreBinding>()?;
     m.add_class::<RustBigramUnifiedTreeCoreBinding>()?;

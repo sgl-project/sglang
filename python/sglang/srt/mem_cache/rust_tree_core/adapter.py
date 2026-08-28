@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -40,6 +41,8 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BufferBackupSnapshot,
+    BufferBackupState,
     DecSwaLockOnlyResult,
     DemoteResult,
     DriveHostEvictionResult,
@@ -57,7 +60,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hicache_storage import PoolTransferResult
-    from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -140,6 +142,15 @@ def _cache_action_from_tagged(action: tuple) -> CacheAction:
 def _cache_actions_from_tagged(actions: Sequence[tuple]) -> list[CacheAction]:
     """Build the Python CacheActions for the binding's tagged tuples, in order."""
     return [_cache_action_from_tagged(action) for action in actions]
+
+
+def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
+    return IncLockRefResult(
+        delta=result.delta,
+        swa_uuid_for_lock=result.swa_uuid_for_lock,
+        swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
+        skip_lock_node_ids=_skip_lock_node_ids_from_binding(result.skip_lock_node_ids),
+    )
 
 
 def _transfer_to_binding(transfer: PoolTransfer) -> tuple:
@@ -388,14 +399,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = self._binding.inc_lock_ref(
             node_id, [int(component) for component in skip_lock_components]
         )
-        return IncLockRefResult(
-            delta=result.delta,
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
-            skip_lock_node_ids=_skip_lock_node_ids_from_binding(
-                result.skip_lock_node_ids
-            ),
-        )
+        return _inc_lock_ref_result_from_binding(result)
 
     def dec_lock_ref(
         self,
@@ -780,6 +784,40 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         return self._binding.get_hash_values(node_id)
+
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        snapshot = self._binding.snapshot_buffer_backup(node_id, pass_prefix_keys)
+        if snapshot is None:
+            return None
+        token_ids = array("q")
+        token_ids.frombytes(snapshot.key_token_ids)
+        return BufferBackupSnapshot(
+            node_id=snapshot.node_id,
+            parent_node_id=snapshot.parent_node_id,
+            parent_is_root=snapshot.parent_is_root,
+            parent_last_hash=snapshot.parent_last_hash,
+            hash_values=snapshot.hash_values,
+            key=RadixKey(
+                token_ids,
+                extra_key=snapshot.extra_key,
+                is_bigram=snapshot.is_bigram,
+            ),
+            prefix_keys=snapshot.prefix_keys,
+        )
+
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        state = self._binding.validate_buffer_backup(node_id, expected_key_length)
+        if state is None:
+            return None
+        return BufferBackupState(
+            parent_node_id=state.parent_node_id,
+            parent_is_root=state.parent_is_root,
+            parent_last_hash=state.parent_last_hash,
+        )
 
     def backfill_missing_hash_values(self) -> int:
         return self._binding.backfill_missing_hash_values()

@@ -378,6 +378,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     "by the Rust TreeCore"
                 )
 
+            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
+            # follow-up to #34798 and #35769.
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
             # the admission-time load-back read path and is not layer-gated.
             # Lifting the fence also needs the admission charge: a staged
@@ -1319,9 +1321,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # FIFO ordering instead (BackupKV chains are parent-before-child
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
-                self.buffer_pipeline.enqueue_backup_intent(
-                    self.tree_core.node_by_id(node_id)
-                )
+                self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0
         written = 0
         for node_id in action.node_ids:

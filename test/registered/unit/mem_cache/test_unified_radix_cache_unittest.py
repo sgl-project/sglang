@@ -3267,6 +3267,25 @@ class UnifiedRadixCacheSuite:
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
+    def test_buffer_only_rejects_mamba(self):
+        if self.cfg.components != (
+            ComponentType.FULL,
+            ComponentType.MAMBA,
+        ) or self.cfg.page_size != 1:
+            self.skipTest("one FULL+MAMBA page_size=1 fixture covers this guard")
+
+        cache, _, _ = build_fixture(self.cfg)
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        with self.assertRaisesRegex(ValueError, "supports only FULL/SWA"):
+            self._init_hicache(
+                cache,
+                storage_backend="file",
+                storage_dir=storage_dir,
+                prefetch_threshold=1,
+                host_memory_mode="buffer_only",
+            )
+
     def _init_buffer_hicache(
         self,
         cache,
@@ -3556,7 +3575,7 @@ class UnifiedRadixCacheSuite:
         # Query BEFORE any producer wrote the span: full miss -> revoked.
         req_id = "early-query-miss"
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -3572,7 +3591,7 @@ class UnifiedRadixCacheSuite:
         # and stages what the first, too-early query could not see.
         self._produce_buffer_l3(storage_dir, seq)
         cons.prefetch_from_storage(
-            req_id, cons.root_node.id, array("q", seq), None, None
+            req_id, cons.root_node_handle(), array("q", seq), None, None
         )
         self._pump_hicache_until(
             cons,
@@ -3587,7 +3606,7 @@ class UnifiedRadixCacheSuite:
         aborted_rid = "aborted-miss"
         cons.prefetch_from_storage(
             aborted_rid,
-            cons.root_node.id,
+            cons.root_node_handle(),
             array("q", self._make_seq(700, 4)),
             None,
             None,
@@ -3603,7 +3622,7 @@ class UnifiedRadixCacheSuite:
         # A fully-device-matched (empty-suffix) decline also arms the retry:
         # the device match can evict while the request waits in the queue.
         cons.prefetch_from_storage(
-            "fully-matched", cons.root_node.id, array("q", []), None, None
+            "fully-matched", cons.root_node_handle(), array("q", []), None, None
         )
         self.assertTrue(cons.pop_storage_prefetch_miss("fully-matched"))
         cons.sanity_check()
@@ -8245,6 +8264,26 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
         before = self._hashes_by_token_ids(cache)
         self.assertEqual(cache.tree_core.backfill_missing_hash_values(), 0)
         self.assertEqual(self._hashes_by_token_ids(cache), before)
+
+    def test_buffer_backup_snapshot_is_detached_and_revalidates_parent(self):
+        cache = self._build_two_level_tree(storage_on_from_the_start=True)
+        child = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(self.prefix_tokens + self.suffix_tokens))
+        ).last_device_node
+        parent = cache.tree_core.get_parent_node_id(child)
+        snapshot = cache.tree_core.snapshot_buffer_backup(child, pass_prefix_keys=True)
+
+        self.assertEqual(snapshot.key.token_ids, self.suffix_tokens)
+        snapshot.key.token_ids[0] = -1
+        self.assertEqual(_node_token_ids(cache, child), list(self.suffix_tokens))
+
+        parent_hashes = cache.tree_core.get_hash_values(parent)
+        replacement_hashes = ["a" * 64] * len(parent_hashes)
+        cache.tree_core.set_node_hash_values(parent, replacement_hashes)
+        state = cache.tree_core.validate_buffer_backup(child, len(snapshot.key))
+        self.assertEqual(state.parent_node_id, parent)
+        self.assertEqual(state.parent_last_hash, replacement_hashes[-1])
+        cache.tree_core.set_node_hash_values(parent, parent_hashes)
 
     def test_enabling_storage_backfills_the_tree(self):
         """The tree is hashed by the time `enable_storage` flips on."""

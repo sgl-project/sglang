@@ -1080,6 +1080,36 @@ def test_buffer_only_hicache_is_rejected_by_the_rust_cache():
         cache.init_hicache(server_args, params)
 
 
+def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
+    core = _tree_core()
+    core.enable_storage = True
+    inserted = _insert(core, [1, 2], [10, 11])
+    leaf = inserted.last_device_node
+
+    snapshot = core.snapshot_buffer_backup(leaf, pass_prefix_keys=True)
+    assert snapshot.node_id == leaf
+    assert snapshot.parent_is_root
+    assert snapshot.key.token_ids == array("q", [1, 2])
+    assert not snapshot.key.is_bigram
+    assert snapshot.prefix_keys == []
+    assert core.validate_buffer_backup(leaf, len(snapshot.key)) is not None
+
+    _insert(core, [1, 9], [12, 13])
+    assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
+
+
+def test_buffer_backup_snapshot_preserves_bigram_keys():
+    core = _tree_core(is_eagle=True)
+    core.enable_storage = True
+    inserted = _insert(core, [1, 2, 3], [10, 11])
+
+    snapshot = core.snapshot_buffer_backup(
+        inserted.last_device_node, pass_prefix_keys=False
+    )
+    assert snapshot.key.token_ids == array("q", [1, 2, 3])
+    assert snapshot.key.is_bigram
+
+
 def test_swa_core_builds_with_a_window():
     core = _swa_tree_core(window=8)
     result = _insert(core, [1, 2, 3], [10, 11, 12])

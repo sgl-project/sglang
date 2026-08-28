@@ -323,6 +323,25 @@ pub struct StorageBackupSpec {
     pub comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
 }
 
+/// Immutable metadata for a queued buffer-only backup.
+pub struct BufferBackupSnapshot {
+    pub node_id: NodeId,
+    pub parent_node_id: NodeId,
+    pub parent_is_root: bool,
+    pub parent_last_hash: Option<String>,
+    pub token_ids: Vec<i64>,
+    pub extra_key: Option<String>,
+    pub is_bigram: bool,
+    pub hash_values: Vec<String>,
+    pub prefix_keys: Option<Vec<String>>,
+}
+
+pub struct BufferBackupState {
+    pub parent_node_id: NodeId,
+    pub parent_is_root: bool,
+    pub parent_last_hash: Option<String>,
+}
+
 /// Which storage layer(s) an eviction targets.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum EvictLayer {
@@ -3073,6 +3092,54 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .hash_value
             .clone()
             .unwrap_or_default()
+    }
+
+    pub fn snapshot_buffer_backup(
+        &self,
+        node_id: NodeId,
+        pass_prefix_keys: bool,
+    ) -> Option<BufferBackupSnapshot> {
+        let node_id = self.arena.try_resolve(node_id)?;
+        let node = self.arena.node(node_id);
+        if node.is_root() || !node.has_device_value(FULL) {
+            return None;
+        }
+        let hash_values = node.hash_value.as_ref()?.clone();
+        if hash_values.is_empty() {
+            return None;
+        }
+        let parent_node_id = node.try_parent()?;
+        let parent = self.arena.node(parent_node_id);
+        Some(BufferBackupSnapshot {
+            node_id: node.id,
+            parent_node_id: parent.id,
+            parent_is_root: parent.is_root(),
+            parent_last_hash: parent.get_last_hash_value().map(str::to_string),
+            token_ids: K::raw_token_ids(node.key.as_ref()).into_owned(),
+            extra_key: node.extra_key.as_deref().map(str::to_string),
+            is_bigram: K::IS_BIGRAM,
+            hash_values,
+            prefix_keys: pass_prefix_keys.then(|| self.arena.prefix_hash_values(node.parent)),
+        })
+    }
+
+    pub fn validate_buffer_backup(
+        &self,
+        node_id: NodeId,
+        expected_key_length: usize,
+    ) -> Option<BufferBackupState> {
+        let node_id = self.arena.try_resolve(node_id)?;
+        let node = self.arena.node(node_id);
+        if !node.has_device_value(FULL) || node.key.atom_len() != expected_key_length {
+            return None;
+        }
+        let parent_node_id = node.try_parent()?;
+        let parent = self.arena.node(parent_node_id);
+        Some(BufferBackupState {
+            parent_node_id: parent.id,
+            parent_is_root: parent.is_root(),
+            parent_last_hash: parent.get_last_hash_value().map(str::to_string),
+        })
     }
 
     /// Hash every node built while storage was disabled.
