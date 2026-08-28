@@ -1822,9 +1822,7 @@ def process_model_config():
 def reports_expert_balancedness() -> bool:
     """Whether the expert-balancedness report is on at all.
 
-    The three readers of `expert_balancedness_report_mode` all run after
-    publish, so they ask the bag; `overrides.should_report_expert_balancedness`
-    is the pre-publish equivalent the resolution pipeline uses.
+    `overrides.should_report_expert_balancedness` is the pre-publish equivalent.
     """
     return get_exec().moe.expert_balancedness_report_mode != "off"
 

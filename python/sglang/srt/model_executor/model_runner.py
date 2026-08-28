@@ -748,7 +748,6 @@ class ModelRunner:
     def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_size=self.ps.moe_ep_size,
                 moe_ep_rank=self.ps.moe_ep_rank,
