@@ -430,7 +430,6 @@ class CompressorAscendBackendMixin:
             # compressor derives the in-bank offset from start_pos; passing
             # the A3 explicit [B, width] table here would be an ABI violation.
             state_block_table = fm.dsv4_cycle_state_block_table
-            cache_mode = 2
         else:
             table_cache = fm.dsv4_explicit_state_block_tables
             if ratio not in table_cache:
@@ -447,7 +446,6 @@ class CompressorAscendBackendMixin:
                     max_input_capacity=fm.dsv4_max_input_capacity,
                 )
             state_block_table = table_cache[ratio]
-            cache_mode = 2
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -476,7 +474,7 @@ class CompressorAscendBackendMixin:
             coff=coff,
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
-            cache_mode=cache_mode,
+            cache_mode=2,
         )
 
         # prefill output may be padded; trim to loc length
