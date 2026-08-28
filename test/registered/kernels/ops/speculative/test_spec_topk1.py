@@ -114,9 +114,7 @@ class TestSpecTopk1Triton(CustomTestCase):
                     )
                     expected_index = torch.argmax(expected_logits, dim=-1, keepdim=True)
 
-                    topk_p, topk_index = draft_topk1_postprocess(
-                        logits, positions=None
-                    )
+                    topk_p, topk_index = draft_topk1_postprocess(logits, positions=None)
 
                     torch.testing.assert_close(
                         topk_index, expected_index, rtol=0, atol=0
