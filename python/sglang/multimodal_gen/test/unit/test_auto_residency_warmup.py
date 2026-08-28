@@ -336,6 +336,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             AppliedResidencyChange("text_encoder", COMPONENT_OFFLOAD),
             AppliedResidencyChange("vae", COMPONENT_OFFLOAD),
         ]
+        worker._auto_residency_repeated_components = set()
         worker._auto_residency_round_sizes = [2]
         worker._auto_residency_last_applied_plan = AutoResidencyPlan()
         report = RankResidencyReport(
@@ -375,6 +376,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
         ]
         worker._auto_residency_round_sizes = [1]
+        worker._auto_residency_repeated_components = set()
 
         self.assertTrue(worker._latest_auto_residency_round_is_resident_only())
         self.assertFalse(
@@ -493,6 +495,7 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker = GPUWorker.__new__(GPUWorker)
         worker.server_args = SimpleNamespace(residency_mode=lambda _name: RESIDENT)
         worker._auto_residency_round_sizes = [1]
+        worker._auto_residency_repeated_components = set()
 
         worker._auto_residency_applied = [
             AppliedResidencyChange("text_encoder", COMPONENT_OFFLOAD)
@@ -502,6 +505,14 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         worker._auto_residency_applied = [
             AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
         ]
+        self.assertFalse(
+            worker._latest_auto_residency_round_supports_short_validation()
+        )
+
+        worker._auto_residency_applied = [
+            AppliedResidencyChange("custom_refiner", COMPONENT_OFFLOAD)
+        ]
+        worker._auto_residency_repeated_components = {"custom_refiner"}
         self.assertFalse(
             worker._latest_auto_residency_round_supports_short_validation()
         )

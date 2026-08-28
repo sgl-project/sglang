@@ -288,6 +288,35 @@ class TestEstimateDefaultWorkloadTiming:
         assert savings[partial.option_key()] > 100_000_000
         assert savings[resident.option_key()] > savings[partial.option_key()]
 
+    def test_repeated_nonstandard_component_uses_request_latency_cap(self):
+        partial = ResidencyTarget(
+            component_name="custom_refiner",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=10 * GIB_BYTES,
+            h2d_bytes_per_request=5 * GIB_BYTES,
+            target_layerwise_resident_layers=(5,),
+            target_layerwise_pinned_layers=((),),
+        )
+        resident = ResidencyTarget(
+            component_name="custom_refiner",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=20 * GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(10,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        savings = estimate_candidate_latency_savings_ns(
+            candidates=[partial, resident],
+            request_duration_ns=10_000_000_000,
+            stage_duration_ns={"denoise": 100_000_000},
+            component_stages={"custom_refiner": ("denoise",)},
+            repeated_components={"custom_refiner"},
+        )
+
+        assert savings[partial.option_key()] > 100_000_000
+        assert savings[resident.option_key()] > savings[partial.option_key()]
+
     def test_dit_request_cap_does_not_compress_marginal_transfer_savings(self):
         partial = ResidencyTarget(
             component_name="transformer",

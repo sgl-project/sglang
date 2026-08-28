@@ -231,6 +231,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self._auto_residency_reference_request_duration_ns: int | None = None
         self._auto_residency_reference_stage_duration_ns: dict[str, int] = {}
         self._auto_residency_reference_component_stages: dict[str, tuple[str, ...]] = {}
+        self._auto_residency_repeated_components: set[str] = set()
         # default workload resolved once for the per-request residency hint
         self._cached_default_workload: DefaultWorkload | None = None
         self._cached_default_workload_failed = False
@@ -1845,6 +1846,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
         )
+        repeated_components = {
+            component_name
+            for component_name in layerwise_layer_uses
+            if is_dit_component_name(component_name)
+        }
         budget_bytes = self._auto_residency_budget_bytes()
         candidates = (
             self._collect_auto_residency_targets(
@@ -1909,6 +1915,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             target_units=target_units,
             target_num_inference_steps=workload.num_inference_steps,
         )
+        repeated_components.update(
+            component_name
+            for component_name, stage_names in measured_component_stages.items()
+            if any(
+                stage_name.endswith("DenoisingStage")
+                and not stage_name.endswith("BeforeDenoisingStage")
+                for stage_name in stage_names
+            )
+        )
+        if include_candidates:
+            self._auto_residency_repeated_components = repeated_components
         reference_request_duration_ns = (
             self._auto_residency_reference_request_duration_ns
         )
@@ -1940,6 +1957,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     self._auto_residency_reference_component_stages
                     or measured_component_stages
                 ),
+                repeated_components=repeated_components,
             )
             if include_candidates
             else {}
@@ -2067,7 +2085,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """Whether one full-shape step covers the changed execution paths."""
         changes = self._latest_auto_residency_round()
         return self._latest_auto_residency_round_is_resident_only() and all(
-            not is_dit_component_name(change.component_name) for change in changes
+            not is_dit_component_name(change.component_name)
+            and change.component_name not in self._auto_residency_repeated_components
+            for change in changes
         )
 
     def _rollback_applied_residency_changes(

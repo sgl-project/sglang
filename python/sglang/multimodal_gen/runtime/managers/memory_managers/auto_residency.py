@@ -599,6 +599,7 @@ def estimate_candidate_latency_savings_ns(
     request_duration_ns: int,
     stage_duration_ns: Mapping[str, int] | None = None,
     component_stages: Mapping[str, tuple[str, ...]] | None = None,
+    repeated_components: Iterable[str] = (),
 ) -> dict[str, int]:
     """Estimate each complete placement relative to the measured one.
 
@@ -612,6 +613,7 @@ def estimate_candidate_latency_savings_ns(
     candidates = list(candidates)
     stage_duration_ns = stage_duration_ns or {}
     component_stages = component_stages or {}
+    repeated_component_names = set(repeated_components)
     candidates_by_component: dict[str, list[ResidencyTarget]] = {}
     maximum_h2d_bytes: dict[str, int] = {}
     for candidate in candidates:
@@ -640,9 +642,13 @@ def estimate_candidate_latency_savings_ns(
             stage_duration_ns.get(stage_name, 0)
             for stage_name in component_stages.get(component_name, ())
         )
+        repeatedly_streamed = (
+            is_dit_component_name(component_name)
+            or component_name in repeated_component_names
+        )
         latency_upper_bound_ns = (
             request_duration_ns
-            if is_dit_component_name(component_name)
+            if repeatedly_streamed
             else component_stage_duration_ns or request_duration_ns
         )
         for candidate in component_candidates:
@@ -687,16 +693,20 @@ def estimate_candidate_latency_savings_ns(
         # and can understate layerwise H2D stalls by orders of magnitude. The
         # transfer model is already an upper bound, so constrain DiT savings by
         # the synchronized request wall time instead.
+        repeatedly_streamed = (
+            is_dit_component_name(candidate.component_name)
+            or candidate.component_name in repeated_component_names
+        )
         latency_upper_bound_ns = (
             request_duration_ns
-            if is_dit_component_name(candidate.component_name)
+            if repeatedly_streamed
             else component_stage_duration_ns or request_duration_ns
         )
         if latency_upper_bound_ns > 0:
             transfer_upper_bound_ns = min(
                 transfer_upper_bound_ns, latency_upper_bound_ns
             )
-        if is_dit_component_name(candidate.component_name):
+        if repeatedly_streamed:
             # Model the remaining layer traffic, not a linearly scaled share
             # of the worst placement. When an all-pageable frontier exceeds
             # the request wall time, linear scaling compresses every marginal
