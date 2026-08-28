@@ -3366,6 +3366,7 @@ class TestAutoResidencySkipReason:
             transformer_weights_path=None,
             nunchaku_config=None,
             direct_gpu_weight_loading=False,
+            ltx2_two_stage_device_mode=None,
             pipeline_config=SimpleNamespace(
                 task_type=ModelTaskType.T2V,
                 supports_auto_residency=True,
@@ -3455,6 +3456,17 @@ class TestAutoResidencySkipReason:
         assert (
             fixed_loading_residency_components(
                 self._base_args(transformer_weights_path="/x.safetensors"),
+                component_names,
+            )
+            == set()
+        )
+        assert fixed_loading_residency_components(
+            self._base_args(ltx2_two_stage_device_mode="original"),
+            component_names,
+        ) == {"transformer", "transformer_2"}
+        assert (
+            fixed_loading_residency_components(
+                self._base_args(ltx2_two_stage_device_mode="resident"),
                 component_names,
             )
             == set()
