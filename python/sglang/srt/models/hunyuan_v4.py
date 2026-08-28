@@ -35,6 +35,14 @@ from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import BumpAllocator, get_device_capability, is_cuda
 
 
+def _hpc_ihc_available(op_name: str, hc_mult: int, hidden_size: int) -> bool:
+    try:
+        from sglang.kernels.ops.layernorm.hy4_ihc import _hpc_ihc_op
+    except ImportError:
+        return False
+    return _hpc_ihc_op(op_name, hc_mult, hidden_size) is not None
+
+
 def permute_hyv4_indexer_weight(name, loaded_weight, config):
     if ".self_attn.indexer.wq_b." in name:
         group_count = config.index_n_heads
@@ -85,7 +93,12 @@ class HYV4HCPreLayer(nn.Module):
             torch.empty(2 * config.hc_mult, dtype=torch.float32)
         )
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rms_weight: torch.Tensor | None = None,
+        rms_eps: float = 0.0,
+    ):
         if hidden_states.is_cuda:
             try:
                 from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_pre
@@ -101,6 +114,8 @@ class HYV4HCPreLayer(nn.Module):
                         self.magnitude,
                         self.rms_norm_eps,
                         self.hc_eps,
+                        rms_weight,
+                        rms_eps,
                     )
                 except Exception:
                     logger.warning("fused_hy4_ihc_pre failed, using eager path")
@@ -124,7 +139,17 @@ class HYV4HCPreLayer(nn.Module):
             + self.hc_eps
         )
         reduced = torch.sum(pre.unsqueeze(-1) * hidden_states.reshape(shape), dim=1)
-        return reduced.to(hidden_states.dtype), post
+        reduced = reduced.to(hidden_states.dtype)
+        if rms_weight is not None:
+            reduced_float = reduced.float()
+            reduced = (
+                reduced_float
+                * torch.rsqrt(
+                    reduced_float.square().mean(dim=-1, keepdim=True) + rms_eps
+                )
+                * rms_weight.float()
+            ).to(hidden_states.dtype)
+        return reduced, post
 
 
 class HYV4HCLayer(nn.Module):
@@ -149,8 +174,19 @@ class HYV4HCLayer(nn.Module):
             "iHC input width must equal hidden_size or hc_mult * hidden_size"
         )
 
-    def pre(self, hidden_states: torch.Tensor):
-        reduced, post = self.hc_pre(hidden_states)
+    def pre(self, hidden_states: torch.Tensor, norm: RMSNorm | None = None):
+        fuse_norm = (
+            norm is not None
+            and hidden_states.is_cuda
+            and _hpc_ihc_available("fuse_ihc_pre", self.hc_mult, self.hidden_size)
+        )
+        reduced, post = self.hc_pre(
+            hidden_states,
+            norm.weight if fuse_norm else None,
+            norm.variance_epsilon if fuse_norm else 0.0,
+        )
+        if norm is not None and not fuse_norm:
+            reduced = norm(reduced)
         return reduced, post, hidden_states
 
     def post(self, output, residual, post):
@@ -166,6 +202,38 @@ class HYV4HCLayer(nn.Module):
                     logger.warning("fused_hy4_ihc_post failed, using eager path")
         result = post.float().unsqueeze(-1) * output.float().unsqueeze(1)
         return (result + residual.float()).to(output.dtype)
+
+    def post_pre(self, output, residual, post, next_layer, norm):
+        if output.is_cuda and _hpc_ihc_available(
+            "fuse_ihc_post_pre", self.hc_mult, self.hidden_size
+        ):
+            try:
+                from sglang.kernels.ops.layernorm.hy4_ihc import (
+                    fused_hy4_ihc_post_pre,
+                )
+            except ImportError:
+                pass
+            else:
+                try:
+                    next_residual, reduced, next_post = fused_hy4_ihc_post_pre(
+                        output,
+                        residual,
+                        post,
+                        next_layer.hc_pre.hc_fn.weight,
+                        next_layer.hc_pre.hc_scale,
+                        next_layer.hc_pre.hc_base,
+                        next_layer.hc_pre.magnitude,
+                        next_layer.hc_pre.rms_norm_eps,
+                        next_layer.hc_pre.hc_eps,
+                        norm.weight,
+                        norm.variance_epsilon,
+                    )
+                    return reduced, next_post, next_residual
+                except Exception:
+                    logger.warning("fused_hy4_ihc_post_pre failed, using fallback")
+        next_residual = self.post(output, residual, post)
+        next_residual = next_layer.prepare_input(next_residual)
+        return next_layer.pre(next_residual, norm)
 
 
 class HYV4HCHeadLayer(nn.Module):
@@ -184,7 +252,28 @@ class HYV4HCHeadLayer(nn.Module):
             torch.empty(config.hc_mult, dtype=torch.float32)
         )
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, norm: RMSNorm | None = None):
+        if hidden_states.is_cuda and _hpc_ihc_available(
+            "fuse_ihc_head", self.config.hc_mult, self.config.hidden_size
+        ):
+            try:
+                from sglang.kernels.ops.layernorm.hy4_ihc import fused_hy4_ihc_head
+            except ImportError:
+                pass
+            else:
+                try:
+                    return fused_hy4_ihc_head(
+                        hidden_states,
+                        self.hc_head_fn.weight,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                        self.config.rms_norm_eps,
+                        self.config.hc_eps,
+                        None if norm is None else norm.weight,
+                        0.0 if norm is None else norm.variance_epsilon,
+                    )
+                except Exception:
+                    logger.warning("fused_hy4_ihc_head failed, using eager path")
         shape = hidden_states.shape
         flat = hidden_states.flatten(1).float()
         scale = torch.rsqrt(
@@ -196,7 +285,8 @@ class HYV4HCHeadLayer(nn.Module):
             + self.config.hc_eps
         )
         output = torch.sum(gates.unsqueeze(-1) * flat.reshape(shape), dim=1)
-        return output.to(hidden_states.dtype)
+        output = output.to(hidden_states.dtype)
+        return output if norm is None else norm(output)
 
 
 class HYV4Attention(DeepseekV2AttentionMLA):
@@ -403,8 +493,9 @@ class HYV4DecoderLayer(nn.Module):
         prev_topk_indices=None,
     ):
         hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
-        hidden_states, post, residual = self.hc_attn_layer.pre(hidden_states)
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, post, residual = self.hc_attn_layer.pre(
+            hidden_states, self.input_layernorm
+        )
         get_attn_tp_context().set_attn_inputs(
             AttentionInputs(
                 hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
@@ -424,11 +515,13 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
-        hidden_states = self.hc_attn_layer.post(hidden_states, residual, post)
-
-        hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
-        hidden_states, post, residual = self.hc_mlp_layer.pre(hidden_states)
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, post, residual = self.hc_attn_layer.post_pre(
+            hidden_states,
+            residual,
+            post,
+            self.hc_mlp_layer,
+            self.post_attention_layernorm,
+        )
         if isinstance(self.mlp, DeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, forward_batch)
         else:
@@ -487,7 +580,7 @@ class HYV4Model(nn.Module):
             )
             topk_share.update(topk_indices)
         topk_share.publish()
-        return self.norm(self.hc_head(hidden_states))
+        return self.hc_head(hidden_states, self.norm)
 
 
 class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):

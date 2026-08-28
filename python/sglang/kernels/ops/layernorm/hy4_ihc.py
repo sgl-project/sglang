@@ -1,4 +1,4 @@
-"""Fused Triton kernels for the HYV4 iHC pre/post layers.
+"""Fused kernels for the HYV4 iHC layers.
 
 The pre path splits the flat reduction into BLOCK_K tiles, then replays the
 partials in ascending order before reducing the hc channels. This exposes
@@ -18,7 +18,7 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 
-_HPC_IHC_CAPABILITIES = ((10, 0), (10, 3))
+_HPC_IHC_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 _HPC_IHC_HC_MULTS = (4,)
 _HPC_IHC_HIDDEN_SIZES = (4096, 6144)
 
@@ -46,7 +46,7 @@ def _hpc_ihc_op(op_name: str, hc_mult: int, hidden_size: int):
     cap = get_device_capability()
     if cap not in _HPC_IHC_CAPABILITIES:
         logger.warning(
-            "HY4 iHC: hpc.%s is built for sm100/sm103, got sm%s%s.",
+            "HY4 iHC: hpc.%s is unavailable on sm%s%s.",
             op_name,
             *cap,
         )
@@ -218,6 +218,8 @@ def fused_hy4_ihc_pre(
     magnitude: float,
     norm_eps: float,
     hc_eps: float,
+    rms_weight: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused HYV4HCPreLayer: returns (y (T, hidden) x.dtype, post (T, hc) fp32)."""
     assert x.dim() == 3, f"x must be 3D (T, hc_mult, hidden_size), got {x.shape}"
@@ -241,7 +243,16 @@ def fused_hy4_ihc_pre(
     hpc_op = _hpc_ihc_op("fuse_ihc_pre", hc_mult, hidden_size)
     if hpc_op is not None:
         return hpc_op(
-            x, hc_fn, hc_scale, hc_base, norm_eps, hc_eps, magnitude, None, 0.0
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_eps,
+            hc_eps,
+            magnitude,
+            rms_weight,
+            rms_eps,
+            True,
         )
 
     y = torch.empty((T, hidden_size), dtype=x.dtype, device=x.device)
@@ -289,6 +300,13 @@ def fused_hy4_ihc_pre(
         num_warps=4,
         enable_fp_fusion=False,
     )
+    if rms_weight is not None:
+        y_float = y.float()
+        y = (
+            y_float
+            * torch.rsqrt(y_float.square().mean(dim=-1, keepdim=True) + rms_eps)
+            * rms_weight.float()
+        ).to(y.dtype)
     return y, post
 
 
@@ -333,3 +351,104 @@ def fused_hy4_ihc_post(
         enable_fp_fusion=False,
     )
     return y
+
+
+def fused_hy4_ihc_post_pre(
+    output: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    magnitude: float,
+    norm_eps: float,
+    hc_eps: float,
+    rms_weight: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, hidden_size = output.shape
+    hc_mult = residual.shape[1]
+    if num_tokens == 0:
+        return (
+            torch.empty_like(residual),
+            torch.empty_like(output),
+            torch.empty((0, hc_mult), dtype=torch.float32, device=output.device),
+        )
+
+    hpc_op = _hpc_ihc_op("fuse_ihc_post_pre", hc_mult, hidden_size)
+    if hpc_op is not None:
+        return hpc_op(
+            output.contiguous(),
+            residual.contiguous(),
+            post.contiguous(),
+            hc_fn.contiguous(),
+            hc_scale.contiguous(),
+            hc_base.contiguous(),
+            norm_eps,
+            hc_eps,
+            magnitude,
+            rms_weight,
+            rms_eps,
+            True,
+        )
+
+    next_residual = fused_hy4_ihc_post(output, residual, post)
+    reduced, next_post = fused_hy4_ihc_pre(
+        next_residual,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        magnitude,
+        norm_eps,
+        hc_eps,
+        rms_weight,
+        rms_eps,
+    )
+    return next_residual, reduced, next_post
+
+
+def fused_hy4_ihc_head(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_eps: float,
+    hc_eps: float,
+    rms_weight: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
+) -> torch.Tensor:
+    num_tokens, hc_mult, hidden_size = hidden_states.shape
+    if num_tokens == 0:
+        return torch.empty(
+            (0, hidden_size), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+    hpc_op = _hpc_ihc_op("fuse_ihc_head", hc_mult, hidden_size)
+    if hpc_op is not None:
+        return hpc_op(
+            hidden_states.contiguous(),
+            hc_fn.contiguous(),
+            hc_scale.contiguous(),
+            hc_base.contiguous(),
+            norm_eps,
+            hc_eps,
+            rms_weight,
+            rms_eps,
+            True,
+        )
+
+    flat = hidden_states.flatten(1).float()
+    scale = torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
+    gates = torch.nn.functional.linear(flat, hc_fn) * scale
+    gates = torch.sigmoid(gates * hc_scale + hc_base) + hc_eps
+    output = torch.sum(gates.unsqueeze(-1) * hidden_states.float(), dim=1).to(
+        hidden_states.dtype
+    )
+    if rms_weight is not None:
+        output_float = output.float()
+        output = (
+            output_float
+            * torch.rsqrt(output_float.square().mean(dim=-1, keepdim=True) + rms_eps)
+            * rms_weight.float()
+        ).to(output.dtype)
+    return output
