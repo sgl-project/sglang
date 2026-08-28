@@ -16,8 +16,7 @@ class TestQwen330Bw8a8FuseEPMode1(GSM8KAscendMixin, CustomTestCase):
     [Test Target] Qwen/Qwen3-30B-A3B-w8a8
     """
 
-    #model = QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
-    model = "/data/weights/Qwen3-30B-A3B-w8a8"
+    model = QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
     accuracy = 0.90
     other_args = [
         "--trust-remote-code",
@@ -45,7 +44,7 @@ class TestQwen330Bw8a8FuseEPMode1(GSM8KAscendMixin, CustomTestCase):
         **os.environ,
         "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
-        "HCCL_BUFFSIZE": "1024"
+        "HCCL_BUFFSIZE": "1024",
     }
 
 
