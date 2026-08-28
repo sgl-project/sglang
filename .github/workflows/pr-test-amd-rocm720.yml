@@ -89,6 +89,16 @@ on:
         required: false
         type: boolean
         default: false
+      stage_b_small_parts:
+        description: 'Optional JSON array of stage-b 1-GPU small shard IDs'
+        required: false
+        type: string
+        default: ''
+      stage_b_large_parts:
+        description: 'Optional JSON array of stage-b 1-GPU large shard IDs'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       rocm_version:
@@ -126,6 +136,16 @@ on:
         required: false
         type: boolean
         default: false
+      stage_b_small_parts:
+        description: 'Optional JSON array of stage-b 1-GPU small shard IDs'
+        required: false
+        type: string
+        default: ''
+      stage_b_large_parts:
+        description: 'Optional JSON array of stage-b 1-GPU large shard IDs'
+        required: false
+        type: string
+        default: ''
 
 # Mirror pr-test.yml: the chained extra suite (call-pr-test-amd-extra-rocm720 ->
 # pr-test-amd-extra.yml) declares actions: write / issues: read /
@@ -515,7 +535,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        part: ${{ fromJSON(inputs.stage_b_small_parts || '[0,1,2,3,4,5,6,7,8,9,10,11,12,13]') }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -632,7 +652,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        part: [0, 1, 2]
+        part: ${{ fromJSON(inputs.stage_b_large_parts || '[0,1,2]') }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
