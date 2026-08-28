@@ -95,6 +95,15 @@ def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
         )
 
 
+def _fragmented_host_indices(page_count: int) -> torch.Tensor:
+    indices = torch.arange(page_count * PAGE_SIZE, dtype=torch.int64).reshape(
+        page_count, PAGE_SIZE
+    )
+    if PAGE_SIZE > 1:
+        indices[:, [0, 1]] = indices[:, [1, 0]]
+    return indices.flatten()
+
+
 def _run_mha(element_dim: int, page_count: int) -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MHATokenToKVPool(
@@ -243,6 +252,46 @@ def _run_mla(element_dim: int, page_count: int) -> None:
         )
 
 
+def _run_mla_fragmented_destination_indices() -> None:
+    page_count = 3
+    pool_size = PAGE_SIZE * (page_count + 8)
+    device_pool = MLATokenToKVPool(
+        size=pool_size,
+        page_size=PAGE_SIZE,
+        kv_lora_rank=MLA_ELEMENT_DIMS[0] - 64,
+        qk_rope_head_dim=64,
+        dtype=torch.bfloat16,
+        layer_num=NUM_LAYERS,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+    host_pool = _pinned_host_pool(
+        MLATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
+    )
+    assert host_pool.can_use_write_back_jit
+
+    for layer_id in range(NUM_LAYERS):
+        _fill_with_offset(device_pool.kv_buffer[layer_id], layer_id)
+
+    device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
+    device_indices = _token_indices_for_pages(device_pages)
+    host_indices = _fragmented_host_indices(page_count)
+    expected = [
+        device_pool.kv_buffer[layer_id][device_indices].cpu()
+        for layer_id in range(NUM_LAYERS)
+    ]
+
+    host_pool.backup_from_device_all_layer(
+        device_pool, host_indices, device_indices, "kernel"
+    )
+    torch.cuda.synchronize()
+
+    for layer_id in range(NUM_LAYERS):
+        assert torch.equal(
+            host_pool.data_refs[layer_id][host_indices].cpu(), expected[layer_id]
+        )
+
+
 @pytest.mark.parametrize("element_dim", MHA_ELEMENT_DIMS)
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> None:
@@ -253,6 +302,10 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+def test_page_first_staged_write_back_mla_fragmented_destination_indices() -> None:
+    _run_mla_fragmented_destination_indices()
 
 
 if __name__ == "__main__":
