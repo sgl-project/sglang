@@ -2796,7 +2796,7 @@
             "expected_avg_denoise_ms": 802.06,
             "expected_median_denoise_ms": 747.62,
             "load_peak_vram_mb": 56048.0,
-            "runtime_peak_vram_mb": 66586.0,
+            "runtime_peak_vram_mb": 68712.0,
             "estimated_full_test_time_s": 363.2
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
