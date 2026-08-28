@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
@@ -45,7 +46,7 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)
-    resolved = server_args._resolved()
+    resolved = resolved_view(server_args)
     prefill_attention_backend, _ = server_args._resolved_attention_backends()
     return (
         cfg.enable_prefill_cp
@@ -64,7 +65,7 @@ def filter_prefill_cp_bcg_capture_num_tokens(
     capture_num_tokens: list[int], server_args: ServerArgs
 ) -> list[int]:
     """Keep only token buckets where the zigzag CP strategy can run."""
-    min_num_tokens = server_args._resolved().attn_cp_size * 2
+    min_num_tokens = resolved_view(server_args).attn_cp_size * 2
     filtered = [size for size in capture_num_tokens if size >= min_num_tokens]
     if not filtered:
         raise ValueError(

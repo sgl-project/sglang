@@ -519,7 +519,7 @@ class TestProgramsResolveBeforeReadingResolution(CustomTestCase):
         from sglang.srt.server_args import ServerArgs as _ServerArgs
 
         srt = pathlib.Path(next(iter(sglang.__path__))).resolve() / "srt"
-        declarers = {"_declare", "declare_resolution", "declare_late_resolution"}
+        declarers = {"declare_resolution", "declare_late_resolution"}
         fields = set()
         field_names = {field.name for field in _dataclasses.fields(_ServerArgs)}
         # The record plus every module under `arg_groups/`: a handler declares

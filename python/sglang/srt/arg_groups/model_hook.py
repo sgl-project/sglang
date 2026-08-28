@@ -308,7 +308,7 @@ def handle_model_specific_adjustments(server_args: Any):
                 # here for the rest of the DSA family (DeepSeek-V3.2 /
                 # GLM-5.x) that shares the same decode top-k path.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            if not server_args._resolved().enable_dp_attention and cfg.nnodes == 1:
+            if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
                 logger.info("Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM")
@@ -391,7 +391,7 @@ def handle_model_specific_adjustments(server_args: Any):
         quant_method = get_quantization_config(hf_config)
         is_mxfp4_quant_format = quant_method == "mxfp4"
         if (
-            not server_args._resolved().enable_dp_attention
+            not resolved_view(server_args).enable_dp_attention
             and cfg.nnodes == 1
             and is_hip()
         ):
@@ -411,13 +411,13 @@ def handle_model_specific_adjustments(server_args: Any):
 
         if resolved_view(server_args).moe_runner_backend == "triton_kernel":
             assert (
-                server_args._resolved().ep_size == 1
+                resolved_view(server_args).ep_size == 1
             ), "Triton kernel MoE is only supported when ep_size == 1"
 
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
-            view = server_args._resolved()
+            view = resolved_view(server_args)
             attn_dp_size = cfg.dp_size if view.enable_dp_attention else 1
             effective_attn_tp_size = cfg.tp_size // attn_dp_size // view.attn_cp_size
             if (

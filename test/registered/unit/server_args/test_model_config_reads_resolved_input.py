@@ -196,7 +196,8 @@ def _server_args_names(tree, path):
             member = (
                 isinstance(value, ast.Call)
                 and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "_resolved"
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "resolved_view"
                 and isinstance(value.func.value, ast.Name)
                 and value.func.value.id in names
             )
@@ -267,7 +268,7 @@ def _late_resolution_fields():
                 if isinstance(node.func, ast.Attribute)
                 else getattr(node.func, "id", "")
             )
-            if called in ("_late_resolution", "declare_late_resolution"):
+            if called == "declare_late_resolution":
                 fields |= {kw.arg for kw in node.keywords if kw.arg}
     return fields
 
@@ -532,8 +533,8 @@ def _declaration_positions():
                 same_body = index == build_index and method == build_method
                 rank = 0 if same_body and node.lineno < build_line_in_body else 1
                 if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_declare"
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "declare_resolution"
                 ):
                     fields = {kw.arg for kw in node.keywords if kw.arg}
                 # A handler that calls an imported hook (the Kimi and DeepSeek
