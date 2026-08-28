@@ -795,6 +795,19 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 "the Mamba component requires mamba_cache_chunk_size",
             ));
         }
+        if init_params.page_size == 0 {
+            return Err(PyValueError::new_err("page_size must be at least 1"));
+        }
+        let eviction_policy = init_params.eviction_policy.to_lowercase();
+        if !matches!(
+            eviction_policy.as_str(),
+            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru"
+        ) {
+            return Err(PyValueError::new_err(format!(
+                "Unknown eviction policy: {eviction_policy}. Supported policies: \
+                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+            )));
+        }
         let params = init_params.to_cache_init_params()?;
         let device = params.device;
         let page_size = params.page_size;
@@ -2981,6 +2994,24 @@ fn get_hash_str(
     is_bigram: bool,
 ) -> PyResult<Vec<String>> {
     let raw = py_array_to_vec_i64(py, token_ids)?;
+    if page_size == 0 {
+        return Err(PyValueError::new_err("page_size must be positive"));
+    }
+    if let Some(prior_hash) = prior_hash.as_deref().filter(|hash| !hash.is_empty())
+        && (prior_hash.len() != 64 || !prior_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(PyValueError::new_err(
+            "prior_hash must be a 64-character hexadecimal digest",
+        ));
+    }
+    if let Some(token_id) = raw
+        .iter()
+        .find(|token_id| u32::try_from(**token_id).is_err())
+    {
+        return Err(PyValueError::new_err(format!(
+            "token id {token_id} does not fit in uint32"
+        )));
+    }
     Ok(py.allow_threads(move || {
         if is_bigram {
             let key = <Vec<(i64, i64)> as ChildKeyType>::key_from(Cow::Owned(raw)).into_owned();

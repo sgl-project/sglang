@@ -324,6 +324,33 @@ def test_binding_stays_usable_after_a_failed_insert():
     assert matched.device_indices.tolist() == [10, 11, 12]
 
 
+@pytest.mark.parametrize("prior_hash", ["abcd", "z" * 64])
+def test_hash_boundary_rejects_malformed_prior_hash(prior_hash):
+    with pytest.raises(ValueError, match="64-character hexadecimal digest"):
+        mem_cache.get_hash_str(array("q", [1, 2]), prior_hash, 2)
+
+
+@pytest.mark.parametrize("token_id", [-1, 1 << 32])
+def test_hash_boundary_rejects_token_ids_outside_uint32(token_id):
+    with pytest.raises(ValueError, match="does not fit in uint32"):
+        mem_cache.get_hash_str(array("q", [token_id]), None, 1)
+
+
+def test_hash_boundary_rejects_zero_page_size():
+    with pytest.raises(ValueError, match="page_size must be positive"):
+        mem_cache.get_hash_str(array("q", [1, 2]), None, 0)
+
+
+def test_binding_rejects_zero_page_size_before_core_construction():
+    with pytest.raises(ValueError, match="page_size must be at least 1"):
+        _binding(page_size=0)
+
+
+def test_binding_rejects_unknown_eviction_policy_before_core_construction():
+    with pytest.raises(ValueError, match="Unknown eviction policy: clock"):
+        _binding(eviction_policy="clock")
+
+
 def test_poisoned_binding_refuses_to_reuse_the_core():
     binding = _binding()
     root = binding.root_node_handle()
