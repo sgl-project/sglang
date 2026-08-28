@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Role definitions for diffusion pipeline disaggregation."""
 
+from collections.abc import Mapping
 from enum import Enum
 
 _ROLE_ALIASES = {"denoising": "denoiser"}
@@ -86,21 +87,24 @@ def filter_modules_for_role(
     role: "RoleType",
     *,
     extra_allowed_modules: set[str] | None = None,
+    structural_component_names: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Filter module names to only those needed by the given role."""
     if role in (RoleType.MONOLITHIC, RoleType.SERVER):
         return module_names
 
     extra_allowed_modules = extra_allowed_modules or set()
+    structural_component_names = structural_component_names or {}
     filtered = []
     for name in module_names:
-        module_role = get_module_role(name)
+        structural_name = structural_component_names.get(name, name)
+        module_role = get_module_role(structural_name)
 
         if module_role is None:
             filtered.append(name)
         elif module_role == role:
             filtered.append(name)
-        elif name in extra_allowed_modules:
+        elif name in extra_allowed_modules or structural_name in extra_allowed_modules:
             filtered.append(name)
 
     return filtered

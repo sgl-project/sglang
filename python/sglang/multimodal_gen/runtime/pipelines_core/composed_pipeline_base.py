@@ -131,6 +131,7 @@ class ComposedPipelineBase(ABC):
                 extra_allowed_modules=self._get_extra_allowed_modules_for_role(
                     self._disagg_role, task_name
                 ),
+                structural_component_names=self._extra_config_module_map,
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:
@@ -443,9 +444,11 @@ class ComposedPipelineBase(ABC):
         if self._disagg_role != RoleType.MONOLITHIC:
             self._init_skipped_component_configs(model_index, server_args)
 
+        declared_modules = model_index
         model_index = {
             required_module: model_index[required_module]
             for required_module in self.required_config_modules
+            if required_module in model_index
         }
 
         for module_name in self.required_config_modules:
@@ -460,15 +463,17 @@ class ComposedPipelineBase(ABC):
                     module_name,
                     extra_module_value,
                 )
-                if extra_module_value in model_index:
+                if extra_module_value in declared_modules:
                     logger.info(
                         "Using module %s for %s", extra_module_value, module_name
                     )
-                    model_index[module_name] = model_index[extra_module_value]
+                    model_index[module_name] = declared_modules[extra_module_value]
                     continue
                 else:
                     raise ValueError(
-                        f"Required module key: {module_name} value: {model_index.get(module_name)} was not found in loaded modules {model_index.keys()}"
+                        f"Required module key: {module_name} value: "
+                        f"{declared_modules.get(module_name)} was not found in "
+                        f"declared modules {declared_modules.keys()}"
                     )
 
         # all the component models used by the pipeline
@@ -564,7 +569,8 @@ class ComposedPipelineBase(ABC):
                     matched_backend_key,
                 )
             module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=load_module_name,
+                component_name=module_name,
+                component_type=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
@@ -573,7 +579,7 @@ class ComposedPipelineBase(ABC):
                 component_attn_name=matched_backend_key or module_name,
             )
 
-            self.memory_usages[load_module_name] = memory_usage
+            self.memory_usages[module_name] = memory_usage
 
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)

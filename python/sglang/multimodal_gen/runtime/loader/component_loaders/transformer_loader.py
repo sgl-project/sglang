@@ -96,7 +96,9 @@ def _warn_if_expected_param_dtype_missing(
 
 
 def _server_args_for_transformer_component(
-    server_args: ServerArgs, component_name: str
+    server_args: ServerArgs,
+    component_name: str,
+    component_type: str | None = None,
 ) -> ServerArgs:
     """Mask global quantized override flags for secondary transformer components."""
     component_weights_path = server_args.component_weights_paths.get(component_name)
@@ -129,7 +131,9 @@ def _server_args_for_transformer_component(
             component_server_args.quantization_ignored_layers = component_ignored_layers
         return component_server_args
 
-    if component_name not in ("transformer_2", "unconditional_transformer"):
+    component_type = component_type or _normalize_component_type(component_name)
+    is_secondary = component_name != component_type
+    if not is_secondary and component_name != "unconditional_transformer":
         return server_args
 
     if (
@@ -182,7 +186,9 @@ class TransformerLoader(ComponentLoader):
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
         component_server_args = _server_args_for_transformer_component(
-            server_args, component_name
+            server_args,
+            component_name,
+            self.structural_component_type(component_name),
         )
         # Don't let a quantized load quietly fall back to the unquantized native
         # model. That would drop the requested precision and bury the real error.
@@ -201,7 +207,9 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         component_server_args = _server_args_for_transformer_component(
-            server_args, component_name
+            server_args,
+            component_name,
+            self.structural_component_type(component_name),
         )
 
         # 1. hf config
@@ -221,7 +229,7 @@ class TransformerLoader(ComponentLoader):
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_type = _normalize_component_type(component_name)
+        component_type = self.structural_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
         if component_type in (
             "transformer",
