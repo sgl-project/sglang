@@ -136,26 +136,33 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         *args,
         **kwargs,
     ):
-        # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
-        if seq_lens_cpu is None:
-            num_padding = 0
-        else:
-            num_padding = torch.count_nonzero(
-                seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-            )
-        # Write the gather directly into the graph-stable buffer. The old
-        # advanced-index + copy_ sequence launched two tiny kernels per replay.
-        if num_padding:
+        if num_padding is None:
+            if seq_lens_cpu is None:
+                num_padding = 0
+            else:
+                num_padding = int(
+                    torch.count_nonzero(
+                        seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
+                    )
+                )
+        # Capture initializes the graph-stable buffers for the dummy forward.
+        # Replay refreshes them inside the graph (see
+        # init_forward_metadata_in_graph), removing the state gather and query
+        # indptr launches from the target/draft submission seam. Keep the
+        # req-pool padding side effect here for padded ranks because the full
+        # attention child may read it before the linear child's captured op.
+        if not in_capture and num_padding:
             req_pool_indices[bs - num_padding :] = 0
         state_indices = self.state_indices_list[bs - 1]
-        torch.index_select(
-            self.req_to_token_pool.req_index_to_mamba_index_mapping,
-            0,
-            req_pool_indices,
-            out=state_indices,
-        )
-        if num_padding:
-            state_indices[bs - num_padding :] = 0
+        if in_capture:
+            torch.index_select(
+                self.req_to_token_pool.req_index_to_mamba_index_mapping,
+                0,
+                req_pool_indices,
+                out=state_indices,
+            )
+            if num_padding:
+                state_indices[bs - num_padding :] = 0
         track_buf = None
         if mamba_track_indices is not None:
             track_buf = mamba_track_indices
@@ -163,13 +170,6 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             if in_capture:
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
-                )
-            elif num_padding:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
-                )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    bs - num_padding
                 )
         elif forward_mode.is_target_verify():
             # These tensors depend only on the captured shape. Initialize them
@@ -183,13 +183,6 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 )
                 self.query_start_loc_list[bs - 1].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
-            elif num_padding:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
-                )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
-                    (bs - num_padding) * spec_info.draft_token_num
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -218,6 +211,28 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
                 mamba_track_indices=track_buf,
             )
+
+    def init_forward_metadata_in_graph(self, forward_batch):
+        """Capture the replay metadata refresh at the graph head."""
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_decode_or_idle():
+            query_step = 1
+        elif forward_mode.is_target_verify():
+            query_step = forward_batch.spec_info.draft_token_num
+        else:
+            return
+
+        from sgl_kernel_npu.mamba.replay_metadata import update_replay_metadata
+
+        bs = forward_batch.batch_size
+        update_replay_metadata(
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            self.req_to_token_pool.req_index_to_mamba_index_mapping,
+            self.state_indices_list[bs - 1],
+            self.query_start_loc_list[bs - 1],
+            query_step=query_step,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0  # Mamba attn does not use seq lens to index kv cache
