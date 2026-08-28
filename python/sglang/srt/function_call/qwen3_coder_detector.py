@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    get_schema_properties,
     infer_type_from_json_schema,
     safe_literal_eval,
 )
@@ -80,9 +81,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 except AttributeError:
                     return {}
 
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
+                if isinstance(params, dict):
+                    properties = get_schema_properties(params)
+                    if properties or "properties" in params:
+                        return properties
                     return params
                 else:
                     return {}

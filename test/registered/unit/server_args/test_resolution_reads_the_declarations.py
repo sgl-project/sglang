@@ -420,7 +420,7 @@ def reads_a_leaf_through_the_alias(runner):
 
 
 def hands_the_accessor_to_a_helper():
-    return compute_world_size(get_server_args())
+    return attention_backends_of(get_server_args())
 
 
 def reads_the_view(runner):
@@ -580,7 +580,7 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         """
         helpers = _config_reading_helpers()
         decided = _declared_fields()
-        for name in ("m3_fp8_attn_gemm_enabled", "compute_world_size"):
+        for name in ("m3_fp8_attn_gemm_enabled", "attention_backends_of"):
             self.assertIn(name, helpers, f"the helper derivation lost {name}")
         for field in ("speculative_num_draft_tokens", "attention_backend"):
             self.assertIn(field, decided, f"the declared set lost {field}")
@@ -598,8 +598,8 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
                 "sa_local.attention_backend",
                 "self._server_args.attention_backend",
                 "engine_args.attention_backend",
-                "compute_world_size(get_server_args())"
-                " reads " + ", ".join(helpers["compute_world_size"]),
+                "attention_backends_of(get_server_args())"
+                " reads " + ", ".join(helpers["attention_backends_of"]),
             },
             "the scan lost a spelling, or started flagging a legal one:\n  "
             + "\n  ".join(sorted(flagged)),

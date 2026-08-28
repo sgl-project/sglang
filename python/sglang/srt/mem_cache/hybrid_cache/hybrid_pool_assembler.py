@@ -97,7 +97,6 @@ def build_kv_host_pool(
     *,
     kv_pool: Any,
     page_size: int,
-    server_args: ServerArgs,
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
@@ -179,7 +178,6 @@ def build_pool_entry(
 def build_kv_only_group(
     *,
     page_size: int,
-    server_args: ServerArgs,
     kv_pool: Any,
     full_layer_mapping: dict[int, int],
     use_mla: bool,
@@ -192,7 +190,6 @@ def build_kv_only_group(
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
@@ -223,7 +220,6 @@ def build_kv_only_group(
 def build_hybrid_swa_group(
     *,
     page_size: int,
-    server_args: ServerArgs,
     full_kv_pool: Any,
     swa_kv_pool: Any,
     full_layer_mapping: dict[int, int],
@@ -241,7 +237,6 @@ def build_hybrid_swa_group(
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
         pool_label="full",
@@ -249,7 +244,6 @@ def build_hybrid_swa_group(
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=use_mla,
         host_size=swa_host_size,
         mtp_draft_device_pools=mtp_swa_device_pools,
@@ -310,7 +304,6 @@ def build_kv_only_stack(
     transfer_layer_num = len(full_layer_mapping)
     host_pool_group = build_kv_only_group(
         page_size=params.page_size,
-        server_args=server_args,
         kv_pool=kv_pool,
         full_layer_mapping=full_layer_mapping,
         use_mla=use_mla,
@@ -371,7 +364,6 @@ def build_hybrid_swa_stack(
 
     host_pool_group = build_hybrid_swa_group(
         page_size=params.page_size,
-        server_args=server_args,
         full_kv_pool=full_kv_pool,
         swa_kv_pool=swa_kv_pool,
         full_layer_mapping=full_layer_mapping,
@@ -723,7 +715,6 @@ def build_hybrid_mamba_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
-        server_args=server_args,
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -826,7 +817,6 @@ def build_hybrid_mamba_swa_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=full_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=False,
         host_size=kv_host_size,
         pool_label="full",
@@ -834,7 +824,6 @@ def build_hybrid_mamba_swa_stack(
     swa_host_pool = build_kv_host_pool(
         kv_pool=swa_kv_pool,
         page_size=page_size,
-        server_args=server_args,
         use_mla=False,
         host_size=swa_host_size,
         pool_label="swa",
@@ -925,7 +914,6 @@ def build_anchor_sidecar_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
-        server_args=server_args,
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -1013,7 +1001,6 @@ def build_full_draft_pools(
     *,
     draft_kv_pool: Any,
     tree_cache: Any,
-    server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV/DSA sidecars whose indices follow target full KV."""
     from sglang.srt.mem_cache.memory_pool import (
@@ -1089,7 +1076,6 @@ def build_swa_draft_pools(
     *,
     draft_kv_pool: Any,
     tree_cache: Any,
-    server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build a draft SWA sidecar whose indices follow target SWA."""
     draft_swa_pool = draft_kv_pool.swa_kv_pool
@@ -1143,7 +1129,6 @@ def build_hicache_draft_sidecars(
     *,
     draft_device_pools: tuple[Any, ...],
     tree_cache: Any,
-    server_args: ServerArgs,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -1158,7 +1143,6 @@ def build_hicache_draft_sidecars(
     return builder(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
 
 
@@ -1561,7 +1545,6 @@ class _MiniMaxSparseStrategy(StackStrategy):
     ):
         host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
             params=params,
-            server_args=server_args,
             sparse_pool=kvcache,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
@@ -1754,7 +1737,6 @@ def attach_hybrid_pool_to_unified_cache(
 def build_minimax_sparse_hicache_stack(
     *,
     params: CacheInitParams,
-    server_args: ServerArgs,
     sparse_pool: Any,
     load_cache_event,
     storage_backend: Optional[str],
@@ -1787,7 +1769,6 @@ def build_minimax_sparse_hicache_stack(
     kv_host_pool = build_kv_host_pool(
         kv_pool=main_pool,
         page_size=params.page_size,
-        server_args=server_args,
         use_mla=False,
     )
     entries = [
@@ -1892,7 +1873,6 @@ def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
         else:
             host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
                 params=params,
-                server_args=server_args,
                 sparse_pool=sparse_pool,
                 load_cache_event=load_cache_event,
                 storage_backend=get_memory().hicache_storage_backend,
