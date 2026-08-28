@@ -333,12 +333,20 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             tp_size=parallel.attn_tp_size,
             prefix=f"{prefix}.linear_gate",
         )
+        self.local_gate_width = self.num_local_heads * config.v_head_dim
+        if self.linear_gate.output_size_per_partition != self.local_gate_width:
+            raise ValueError(
+                "HYV4 attention gate shard width must match the local attention "
+                f"output width: {self.linear_gate.output_size_per_partition} != "
+                f"{self.local_gate_width}"
+            )
         self.learnable_sink_param = nn.Parameter(
             torch.empty(self.num_local_heads, dtype=torch.float32)
         )
         self.learnable_sink_param.weight_loader = self._sink_weight_loader
+        self._gate_fallback_backend = self._resolve_gate_fallback_backend()
         self._gate_backend = self._resolve_gate_backend(
-            getattr(config, "gating_type", None)
+            getattr(config, "gating_type", None), self._gate_fallback_backend
         )
         if prefix.endswith(".0.self_attn"):
             logger.info("HYV4 MLA output gate backend: %s", self._gate_backend)
@@ -350,15 +358,8 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         start = parallel.attn_tp_rank * heads
         param.data.copy_(loaded_weight[start : start + heads].float())
 
-    def _resolve_gate_backend(self, gating_type: str | None) -> str:
-        """Select hpc, Triton, or eager for the MLA output gate."""
-        weight = getattr(self.linear_gate, "weight", None)
-        if self._hpc_gated_mla_supported(
-            gating_type,
-            None if weight is None else weight.dtype,
-            None if weight is None else weight.shape[0],
-        ):
-            return "hpc"
+    @staticmethod
+    def _resolve_gate_fallback_backend() -> str:
         try:
             from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (  # noqa: F401
                 sigmoid_gate_mul,
@@ -367,12 +368,29 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             return "eager"
         return "triton"
 
+    def _resolve_gate_backend(
+        self, gating_type: str | None, fallback_backend: str
+    ) -> str:
+        """Select hpc, Triton, or eager for the MLA output gate."""
+        weight = getattr(self.linear_gate, "weight", None)
+        if self._hpc_gated_mla_supported(
+            gating_type,
+            None if weight is None else weight.dtype,
+            None if weight is None else tuple(weight.shape),
+            self.local_gate_width,
+            self.hidden_size,
+        ):
+            return "hpc"
+        return fallback_backend
+
     @staticmethod
     @functools.lru_cache(maxsize=None)
     def _hpc_gated_mla_supported(
         gating_type: str | None,
         weight_dtype: torch.dtype | None,
-        weight_width: int | None,
+        weight_shape: tuple[int, ...] | None,
+        local_gate_width: int,
+        hidden_size: int,
     ) -> bool:
         """Check whether ``hpc.gated_mla_gemm`` supports this model shard."""
         try:
@@ -410,13 +428,52 @@ class HYV4Attention(DeepseekV2AttentionMLA):
                 weight_dtype,
             )
             return False
-        if weight_width is None or weight_width % 256 != 0:
+        expected_shape = (local_gate_width, hidden_size)
+        if weight_shape != expected_shape:
+            logger.warning(
+                "HYV4 gated MLA: local gate weight shape is %s, expected %s.",
+                weight_shape,
+                expected_shape,
+            )
+            return False
+        if local_gate_width % 256 != 0:
             logger.warning(
                 "HY4 gated MLA: local gate width %s is not a multiple of 256.",
-                weight_width,
+                local_gate_width,
             )
             return False
         return True
+
+    def _hpc_gated_mla_inputs_supported(self, hidden_states, attn_out) -> bool:
+        weight = self.linear_gate.weight
+        return (
+            hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and attn_out.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and weight.ndim == 2
+            and attn_out.ndim == 2
+            and hidden_states.shape[0] == attn_out.shape[0]
+            and hidden_states.shape[1] == weight.shape[1]
+            and weight.shape[0] == self.local_gate_width
+            and attn_out.shape[1] == self.local_gate_width
+            and hidden_states.device == weight.device == attn_out.device
+        )
+
+    @staticmethod
+    def _apply_attention_output_gate_fallback(attn_out, gate, backend):
+        if gate.shape != attn_out.shape:
+            raise ValueError(
+                "HYV4 projected attention gate shape must match the local attention "
+                f"output shape: {tuple(gate.shape)} != {tuple(attn_out.shape)}"
+            )
+        if backend == "triton" and attn_out.is_cuda:
+            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                sigmoid_gate_mul,
+            )
+
+            return sigmoid_gate_mul(attn_out, gate)
+        return attn_out * torch.sigmoid(gate)
 
     def prepare_attention_output_gate(self, hidden_states):
         # The hpc kernel fuses the projection in, so hand it the activations and
@@ -428,7 +485,9 @@ class HYV4Attention(DeepseekV2AttentionMLA):
 
     def apply_attention_output_gate(self, attn_out, gate):
         """Apply the MLA output gate. ``gate`` is whatever prepare returned."""
-        if self._gate_backend == "hpc":
+        if self._gate_backend == "hpc" and self._hpc_gated_mla_inputs_supported(
+            gate, attn_out
+        ):
             from hpc.gemm import gated_mla_gemm
 
             # linear_gate is column-parallel and unbiased, so the local weight
@@ -436,13 +495,12 @@ class HYV4Attention(DeepseekV2AttentionMLA):
             return gated_mla_gemm(
                 gate.contiguous(), self.linear_gate.weight, attn_out.contiguous()
             )
-        if self._gate_backend == "triton":
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
-                sigmoid_gate_mul,
-            )
-
-            return sigmoid_gate_mul(attn_out, gate)
-        return attn_out * torch.sigmoid(gate)
+        if self._gate_backend == "hpc":
+            gate = self.linear_gate(gate)[0]
+            backend = self._gate_fallback_backend
+        else:
+            backend = self._gate_backend
+        return self._apply_attention_output_gate_fallback(attn_out, gate, backend)
 
     def dispatch_attn_forward_method(self, forward_batch):
         backend = get_attn_backend()
