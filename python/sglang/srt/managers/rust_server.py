@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.rust_renderer import RustRendererSidecar
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
+    from sglang.srt.rust_extensions._server import MmSpec, Server
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -459,12 +459,11 @@ class RustServer:
                 )
             server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
 
-        rust_server = cls(server, mm_spec=mm_spec, renderer_sidecar=renderer_sidecar)
         if renderer_sidecar is not None:
             try:
                 renderer_sidecar.start(server_cores)
             except BaseException:
-                rust_server.close()
+                server.shutdown()
                 raise
 
         # Narrow the scheduler thread only after the server threads are launched.
@@ -486,7 +485,7 @@ class RustServer:
             dp_note,
         )
 
-        return rust_server
+        return cls(server, mm_spec=mm_spec, renderer_sidecar=renderer_sidecar)
 
     @staticmethod
     def initialize_renderer(
@@ -782,7 +781,7 @@ class RustServer:
         )
 
     @staticmethod
-    def _build_server_args(scheduler: Scheduler):
+    def _build_server_args(scheduler: Scheduler) -> ServerArgs:
         """The typed launch handoff for the scheduler's embedded Rust server:
         the ``server_args`` fields it reads, the already-resolved
         ``model_config``, and launch-time facts — as the Rust extension's own
