@@ -332,6 +332,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"false"`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run the Qwen shared expert on an alternate CUDA stream while DeepEP executes the routed experts.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"true"`</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISABLED_MODEL_ARCHS</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated list of model architectures to disable from auto-registration.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
@@ -518,12 +523,12 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use deterministic FlashInfer topk kernels when <code>--dsa-topk-backend=flashinfer</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use deterministic FlashInfer topk kernels when either <code>--dsa-topk-backend=flashinfer</code> or <code>--speculative-dsa-topk-backend=flashinfer</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tie-break mode for FlashInfer DSA topk when <code>--dsa-topk-backend=flashinfer</code>: unset disables explicit tie-breaking, <code>small</code> prefers the smaller candidate index for equal scores, and <code>large</code> prefers the larger candidate index for equal scores. Setting this variable makes FlashInfer use deterministic topk.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tie-break mode for FlashInfer DSA topk when either <code>--dsa-topk-backend=flashinfer</code> or <code>--speculative-dsa-topk-backend=flashinfer</code>: unset disables explicit tie-breaking, <code>small</code> prefers the smaller candidate index for equal scores, and <code>large</code> prefers the larger candidate index for equal scores. Setting this variable makes FlashInfer use deterministic topk.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
     </tr>
     <tr>
@@ -1067,6 +1072,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DETECT_SLOW_RANK</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Detect and report ranks that fall behind during collective ops.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_RANK_CONSENSUS_CHECKER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Check for PP/TP-rank divergence.  Kill the server when divergence occurs.  Helpful for trouble-shooting server hangs issues.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FORCE_SHUTDOWN</code></td>
@@ -1880,6 +1890,9 @@ SGLang supports various environment variables that can be used to configure its 
 </table>
 
 ## Apple Silicon (MLX / MPS)
+
+These variables configure the SRT MLX backend. SGLang Diffusion uses PyTorch
+MPS and does not read them.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

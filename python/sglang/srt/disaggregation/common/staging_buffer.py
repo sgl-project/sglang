@@ -257,10 +257,6 @@ class StagingAllocator:
         offset, _, _ = self.allocations[alloc_id]
         return offset
 
-    def get_round(self, alloc_id: int) -> int:
-        _, _, rnd = self.allocations[alloc_id]
-        return rnd
-
     def get_base_ptr(self) -> int:
         return self.base_ptr
 

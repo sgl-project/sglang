@@ -55,6 +55,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -63,6 +64,22 @@ logger = init_logger(__name__)
 
 def is_cosmos_layer(name: str, _module: object) -> bool:
     return is_module_list_entry_in(name, ("layers", "gen_layers"))
+
+
+def _can_enable_t1_fused_qk_norm_rope(
+    *,
+    is_blackwell: bool,
+    is_hopper: bool,
+    hidden_act: str,
+    tp_size: int,
+    sp_size: int,
+    is_compiled: bool,
+) -> bool:
+    if is_compiled:
+        return False
+    if is_blackwell:
+        return True
+    return is_hopper and hidden_act != "relu2" and tp_size == 1 and sp_size == 1
 
 
 # -----------------------------------------------------------------------------
@@ -742,6 +759,7 @@ class Cosmos3CrossAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn", prefix),
+            is_cross_attention=True,
         )
 
     def forward(
@@ -1600,6 +1618,19 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self._ensure_cache_dicts()
 
+        # The T=1 fused path is faster on Blackwell. It also benefits the
+        # single-GPU Hopper Nano (SwiGLU) workload, while the Hopper
+        # Cosmos3-Super (dense MLP) multi-GPU workload remains on the split
+        # path because that shape regresses with the fusion.
+        enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
+            is_blackwell=current_platform.is_blackwell(),
+            is_hopper=current_platform.is_hopper(),
+            hidden_act=self.hidden_act,
+            tp_size=get_tp_world_size(),
+            sp_size=get_sp_world_size(),
+            is_compiled=self._gen_layers_torch_compiled,
+        )
+
         # Compute UND K/V cache for this cache_key if not already cached
         # This allows reusing the cache across denoising steps for the same text
         if (
@@ -1636,7 +1667,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
                 )
             )
-            if T == 1 and not self._gen_layers_torch_compiled:
+            if enable_t1_fused_qk_norm_rope:
                 # build_rope_cache_inputs already rounds through cache_dtype
                 # before returning FP32 storage. Keep that rounded cache in the
                 # activation dtype so the exact fused QKNorm+RoPE kernel can
@@ -1654,11 +1685,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # fused add+rmsnorm path instead of separate add + norm kernels.
         cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
-        round_norm_before_rope = T == 1
+        round_norm_before_rope = enable_t1_fused_qk_norm_rope
         use_fused_qk_norm_rope = T > 1 or (
-            hidden_gen.device.type == "cuda"
+            enable_t1_fused_qk_norm_rope
+            and hidden_gen.device.type == "cuda"
             and not torch.compiler.is_compiling()
-            and not self._gen_layers_torch_compiled
             and get_sp_world_size() == 1
             and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,

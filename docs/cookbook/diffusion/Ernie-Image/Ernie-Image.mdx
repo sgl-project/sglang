@@ -6,11 +6,13 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "turbo"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "standard + Turbo", "single GPU"]} />
 
-## 1. Model introduction
+## 1. Model Introduction
 
-[ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) is Baidu's text-to-image diffusion model family. SGLang Diffusion supports both the regular and Turbo checkpoints with the native `ErnieImagePipeline`.
+[ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) is Baidu's text-to-image family with separate standard and Turbo checkpoints. The standard model is the quality-oriented path; Turbo is the lower-latency choice, and both load through SGLang's native `ErnieImagePipeline`.
+
+This integration currently targets text-only image generation rather than image editing or reference conditioning. Choose it for a straightforward single-GPU T2I deployment; use a dedicated editing model when preserving source-image structure is part of the task.
 
 | Model | Hugging Face model ID | Notes |
 | --- | --- | --- |
