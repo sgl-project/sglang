@@ -73,7 +73,8 @@ export const config = {
     return (
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
-      s.hicache === "off"
+      s.hicache === "off" &&
+      s.dcp === "off"
     );
   },
 
@@ -133,8 +134,8 @@ export const config = {
           label: "L1 + L2",
           subtitle: "Host memory",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32"],
-          disabled: (s) => s.strategy === "low-latency" || s.quant === "mxfp4",
-          disableReason: "HiCache is unavailable with adaptive MTP and with the MXFP4 recipes, which use --disable-radix-cache.",
+          disabled: (s) => s.quant === "mxfp4",
+          disableReason: "The validated MXFP4 recipes disable radix caching, so HiCache is unavailable.",
           hints: ["32 GB host tier; the default ratio can demand more host RAM than the node has free."],
         },
         {
@@ -143,9 +144,25 @@ export const config = {
           subtitle: "Mooncake",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
-          disabled: (s) => s.strategy === "low-latency" || s.quant === "mxfp4",
-          disableReason: "HiCache is unavailable with adaptive MTP and with the MXFP4 recipes, which use --disable-radix-cache.",
+          disabled: (s) => s.quant === "mxfp4",
+          disableReason: "The validated MXFP4 recipes disable radix caching, so HiCache is unavailable.",
           hints: ["Start Mooncake and place the configuration file on every serving node."],
+        },
+      ],
+    },
+    {
+      id: "dcp",
+      title: "Context Parallelism",
+      default: "off",
+      options: [
+        { id: "off", label: "Off" },
+        {
+          id: "4",
+          label: "DCP 4",
+          disabled: (s) => s.hw !== "gb300",
+          disableReason: "DCP is validated only on 4x GB300 TP4/EP4 for now.",
+          flags: ["--dcp-size 4", "--dcp-comm-backend a2a", "--dcp-replicate-q-proj"],
+          hints: ["Measured on 4x GB300 with both KV/DSA pairings, adaptive MTP 5/1/6, full decode graph."],
         },
       ],
     },
@@ -218,10 +235,13 @@ sgl-eval run gsm8k \\
     mi355x: "lmsysorg/sglang:v0.5.18-rocm720-mi35x",
   },
 
-  // No published ROCm image contains the mixed MXFP4/block-FP8 loader fix yet.
-  // Keep that checkpoint on the source-installed Python path until #36607 lands.
+  // GLM-5.3-Flash AMD support currently lives on the open #36507 support
+  // branch, including the merged #36607 ROCm work. Do not emit a standalone
+  // Docker command until a published ROCm image contains that source stack.
   runModes: (s) =>
-    s.quant === "mxfp4" ? ["python"] : ["python", "docker"],
+    ["mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw)
+      ? ["python"]
+      : ["python", "docker"],
 
   github: {
     cookbookModel: "zai-org/glm-5.3-flash",
@@ -279,7 +299,7 @@ sgl-eval run gsm8k \\
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
             disabled: (s) => ["mi300x", "mi325x", "mi350x", "mi355x"].includes(s.hw),
-            disableReason: "DeepGemm is not part of the validated AMD ROCm recipes; FP8 uses Triton and MXFP4 uses AITER.",
+            disableReason: "DeepGemm is not part of the AMD ROCm recipes; gfx942 FP8 uses Triton, while gfx950 FP8 and MXFP4 use AITER.",
           },
         ],
       },
@@ -304,6 +324,72 @@ sgl-eval run gsm8k \\
       ],
     },
 
+    // ----- Card: "Speculative" -----
+    // The Deploy panel only picks speculation through the Strategy dim (Low
+    // Latency = the checkpoint's adaptive MTP head, High Throughput = off).
+    // This card is the finer control, and it adds the one algorithm no cell
+    // ships: DFlash2, whose draft is a separate checkpoint.
+    //
+    // The EAGLE preset is byte-identical to what the Low Latency cells carry,
+    // so a Low Latency base derives onto that chip instead of showing
+    // "Inherited from base", and re-picking it is a no-op.
+    speculative: {
+      options: [
+        { id: "current", label: "Inherited from base" },
+        { id: "off", label: "Off (greedy)" },
+        {
+          id: "eagle",
+          label: "EAGLE / Adaptive MTP 5-1-6",
+          flags: [
+            "--speculative-algorithm EAGLE",
+            "--speculative-num-steps 5",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 6",
+            "--speculative-adaptive",
+          ],
+          disable: [
+            {
+              when: { dpAttnOn: [true] },
+              reason: "Adaptive MTP does not support DP-Attention — the server falls back to a static draft depth and warns. Turn DP-Attention off in the Attention card above.",
+            },
+            {
+              when: { hw: ["mi300x", "mi325x", "mi350x", "mi355x"] },
+              reason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; the Strategy row disables Low Latency there for the same reason.",
+            },
+          ],
+        },
+        {
+          id: "dflash",
+          label: "DFlash2",
+          // Block-wise draft: the block size comes from the draft checkpoint,
+          // so no --speculative-num-draft-tokens here. The draft is a dense
+          // model and does not run on the target's DSA backends, hence the
+          // explicit draft attention backend.
+          flags: [
+            "--speculative-algorithm DFLASH",
+            "--speculative-draft-model-path incoai/GLM-5.3-Flash-DFlash2",
+            "--speculative-draft-attention-backend fa4",
+          ],
+          // DFLASH needs this model's hidden-state capture, which landed on the
+          // GLM-5.3-Flash support branch (PR #36708 into #36507's
+          // xinyuan/glm-5.3-flash-support), not on main — so it postdates the
+          // image the Install accordion pins. Drop this note once #36507 merges
+          // and a published image carries it.
+          note: "⚠️ Needs the GLM-5.3-Flash hidden-state capture from PR #36708. It is merged into the PR #36507 support branch (xinyuan/glm-5.3-flash-support), not into main, so pull that branch at its current head — or add #36708's commit on top of an older checkout — before serving. The lmsysorg/sglang:glm-5.3-flash image alone is not enough.",
+          disable: [
+            {
+              when: { dpAttnOn: [true] },
+              reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
+            },
+            {
+              when: { hw: ["mi300x", "mi325x", "mi350x", "mi355x"] },
+              reason: "DFLASH speculative decoding only supports CUDA and NPU devices; the server rejects it on ROCm at startup.",
+            },
+          ],
+        },
+      ],
+    },
+
   },
 
   cells: [
@@ -314,7 +400,8 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off"
+        s.hicache === "off" &&
+        ["off", "4"].includes(s.dcp)
           ? "verified"
           : "unverified",
       env: [],
@@ -326,7 +413,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -345,7 +431,8 @@ sgl-eval run gsm8k \\
       verificationStatus: (s) =>
         ["bf16-tilelang", "fp8-trtllm"].includes(s.kvDsaPair) &&
         s.mmTransport === "auto" &&
-        s.hicache === "off"
+        s.hicache === "off" &&
+        s.dcp === "off"
           ? "verified"
           : "unverified",
       env: [],
@@ -357,7 +444,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -382,7 +468,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -410,7 +495,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -435,7 +519,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -462,7 +545,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -483,7 +565,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -510,7 +591,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -531,7 +611,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -558,7 +637,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -578,7 +656,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
@@ -603,32 +680,44 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--disable-shared-experts-fusion",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
-    // AMD ROCm — one non-speculative TP8 operating point. The explicit BF16
-    // KV and TileLang DSA flags match the resolved defaults observed in the
-    // validation server logs. AITER remains enabled for the ROCm kernel paths,
-    // while Triton owns the MoE runner. CUDA graphs stay disabled because that
-    // is the architecture-gated configuration used for correctness validation.
+    // AMD FP8 — use expert parallelism on all eight GPUs instead of replicating
+    // every routed expert on every TP rank. The gfx942 cells use Triton MoE;
+    // the gfx950 cells use AITER MoE. Both paths use full decode graphs for
+    // batch sizes 1 and 32. The MI300X cell completed full GSM8K with this exact
+    // TP8+EP8 command. MI325X carries that verification because it uses the same
+    // gfx942 path with more HBM; the gfx950 FP8 cells still require full runs.
     {
       match: { hw: "mi300x", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
       verified: true,
+      verificationStatus: (s) =>
+        s.kvDsaPair === "bf16-tilelang" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off" &&
+        s.dcp === "off"
+          ? "verified"
+          : "unverified",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend dsa",
         "--trust-remote-code",
-        "--disable-cuda-graph",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend triton",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 32",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -638,18 +727,56 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "mi325x", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
-      verified: false,
-      warn: "This MI325X recipe is inferred from the validated MI300X gfx942 path. It has not been measured directly on MI325X.",
+      verified: true,
+      verificationStatus: (s) =>
+        s.kvDsaPair === "bf16-tilelang" &&
+        s.mmTransport === "auto" &&
+        s.hicache === "off" &&
+        s.dcp === "off"
+          ? "verified"
+          : "unverified",
+      warn: "Architecture-equivalent verification: the exact TP8+EP8 graph command completed full GSM8K on MI300X. MI325X uses the same gfx942 path with greater HBM capacity; it was not measured in a separate run.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend dsa",
         "--trust-remote-code",
-        "--disable-cuda-graph",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend triton",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 32",
+        "--reasoning-parser glm45",
+        "--tool-call-parser glm47",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi350x", quant: "fp8", strategy: "high-throughput" },
+      nnodes: 1,
+      verified: false,
+      warn: "The gfx950 TP8+EP8 graph path passed an MI355X runtime pilot, but this exact MI350X command still needs a full accuracy run.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend dsa",
+        "--trust-remote-code",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
+        "--kv-cache-dtype bfloat16",
+        "--moe-runner-backend aiter",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 32",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
@@ -659,33 +786,39 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "mi355x", quant: "fp8", strategy: "high-throughput" },
       nnodes: 1,
-      verified: true,
+      verified: false,
+      warn: "The TP8+EP8 topology, AITER MoE path, and decode graphs passed an MI355X runtime pilot. Full GSM8K on this exact command is still pending.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend dsa",
         "--trust-remote-code",
-        "--disable-cuda-graph",
         "--dsa-prefill-backend tilelang",
         "--dsa-decode-backend tilelang",
+        "--linear-attn-backend triton",
         "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend triton",
+        "--moe-runner-backend aiter",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-bs-decode 1 32",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
-    // AMD Quark MXFP4 — MI350X and MI355X share the same CDNA4 gfx950 target,
+    // AMD Quark MXFP4 — MI350X and MI355X share the CDNA4 gfx950 target,
     // 288 GB per GPU, and mi35x ROCm image path, so they use identical cells.
-    // Direct validation ran on MI350X. Unlike the FP8 ROCm recipe above, mixed
-    // Quark MXFP4 + block-FP8 uses the AITER MoE runner and full decode graphs.
-    // PR #36607 commit 654df43cbee1 supplies the required loader compatibility.
+    // Direct validation ran on MI350X. Mixed Quark MXFP4 + block-FP8 uses the
+    // AITER MoE runner and full decode graphs. PR #36607 commit 654df43cbee1
+    // supplies the required loader compatibility and is merged into #36507.
     {
       match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp1" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -716,7 +849,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp2" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -747,7 +880,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp4" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -778,7 +911,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi350x", quant: "mxfp4", strategy: "mxfp4-tp8-ep8" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -810,7 +943,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp1" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -841,7 +974,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp2" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -872,7 +1005,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp4" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -903,7 +1036,7 @@ sgl-eval run gsm8k \\
       match: { hw: "mi355x", quant: "mxfp4", strategy: "mxfp4-tp8-ep8" },
       nnodes: 1,
       verified: true,
-      warn: "Use SGLang PR #36607 commit 654df43cbee108a81fa1736c34ba8c701f199285 until the loader fix is merged.",
+      warn: "Use the open PR #36507 support branch; it contains the merged AMD changes from PR #36607, including the MXFP4 loader fix.",
       env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
