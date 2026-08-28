@@ -1,4 +1,4 @@
-"""Equivalence tests for the EagleDraftWorker topk=1 chain fast path.
+"""Equivalence and ownership tests for EAGLE topk=1 fast paths.
 
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
 cat/topk/sort/gather of the slow path and returns pre-allocated constants. These
@@ -13,14 +13,32 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_target_verify import (
+    maybe_eagle_sample_target_verify_topk1,
+)
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
+from sglang.srt.speculative.eagle_worker_common import EagleVerifyStepResult
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+)
+from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    MultiLayerEagleWorkerV2,
+)
+from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.utils import is_cuda
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -89,6 +107,41 @@ def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=
             return draft_extend_backend
 
     return FakeDraftBackendFactory
+
+
+def _make_target_verify_selection_case(device: torch.device):
+    batch_size, num_tokens, vocab_size = 1, 2, 16
+    logits = torch.zeros(
+        (batch_size * num_tokens, vocab_size), device=device, dtype=torch.float32
+    )
+    additive_penalty = torch.zeros((batch_size, vocab_size), device=device)
+    additive_penalty[:, 3] = 10.0
+    sampling_info = SimpleNamespace(
+        is_all_greedy=True,
+        acc_additive_penalties=additive_penalty,
+        acc_scaling_penalties=None,
+        logit_bias=None,
+    )
+    retrieve_index = torch.arange(
+        batch_size * num_tokens, dtype=torch.long, device=device
+    ).view(batch_size, num_tokens)
+    retrieve_next_token = torch.tensor([[1, -1]], dtype=torch.long, device=device)
+    verify_input = SimpleNamespace(
+        spec_input_type=SpecInputType.EAGLE_VERIFY,
+        tree_topk=1,
+        draft_token_num=num_tokens,
+        max_tree_depth=num_tokens,
+        draft_token=torch.tensor([0, 3], dtype=torch.long, device=device),
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        sampling_info=sampling_info,
+        seq_lens=torch.tensor([32], dtype=torch.int32, device=device),
+    )
+    logits_output = SimpleNamespace(next_token_logits=logits)
+    return verify_input, batch, logits_output
 
 
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
@@ -161,6 +214,236 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
 
+class TestTargetVerifyFusionOwnership(CustomTestCase):
+    @staticmethod
+    def _make_verify_worker(worker_cls):
+        worker = object.__new__(worker_cls)
+        worker._target_worker = object()
+        worker.req_to_token_pool = object()
+        worker.token_to_kv_pool_allocator = object()
+        worker.plan_stream = object()
+        worker.plan_stream_ctx = object()
+        worker.topk = 1
+        worker.speculative_num_steps = 5
+        worker.speculative_num_draft_tokens = 6
+        worker.device = "cpu"
+        return worker
+
+    def test_target_verify_topk1_is_enabled_only_for_internal_single_layer(self):
+        batch = object()
+        batch_result = GenerationBatchResult()
+        verify_step = EagleVerifyStepResult(batch_result, None)
+        worker = self._make_verify_worker(EAGLEWorkerV2)
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_verify:
+            worker.verify(batch)
+            worker._verify_for_draft_extend(batch)
+
+        generic_call, fused_call = run_verify.call_args_list
+        self.assertFalse(generic_call.kwargs["enable_target_verify_topk1"])
+        self.assertTrue(fused_call.kwargs["enable_target_verify_topk1"])
+
+        multi_layer = self._make_verify_worker(MultiLayerEagleWorkerV2)
+        with patch(
+            "sglang.srt.speculative.multi_layer_eagle_worker_v2.run_eagle_verify",
+            return_value=verify_step,
+        ) as run_multi_layer_verify:
+            multi_layer.verify(batch)
+        self.assertFalse(
+            run_multi_layer_verify.call_args.kwargs["enable_target_verify_topk1"]
+        )
+
+
+@unittest.skipUnless(
+    is_cuda() and torch.cuda.is_available(), "NVIDIA CUDA is required for this test."
+)
+class TestTargetVerifyTopk1Selection(CustomTestCase):
+    def setUp(self):
+        self.device = torch.device("cuda")
+
+    def test_applies_logits_transform_once(self):
+        verify_input, batch, logits_output = _make_target_verify_selection_case(
+            self.device
+        )
+
+        result = maybe_eagle_sample_target_verify_topk1(
+            verify_input, batch, logits_output
+        )
+
+        self.assertIsNotNone(result)
+        torch.testing.assert_close(
+            result.predict,
+            torch.tensor([3, 3], dtype=torch.int32, device=self.device),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            logits_output.next_token_logits[:, 3],
+            torch.full((2,), 10.0, device=self.device),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_fast_path_ignores_tp_broadcast(self):
+        verify_input, batch, logits_output = _make_target_verify_selection_case(
+            self.device
+        )
+        tp_group = SimpleNamespace(world_size=2, broadcast=MagicMock())
+
+        with (
+            patch(
+                "sglang.srt.distributed.get_tp_group", return_value=tp_group
+            ) as get_tp_group,
+            patch(
+                "sglang.srt.speculative.eagle_utils.get_parallel",
+                return_value=SimpleNamespace(attn_tp_group=tp_group),
+            ) as get_parallel,
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=True,
+            ) as is_dp_attention_enabled,
+        ):
+            result = maybe_eagle_sample_target_verify_topk1(
+                verify_input, batch, logits_output
+            )
+
+        self.assertIsNotNone(result)
+        get_tp_group.assert_not_called()
+        get_parallel.assert_not_called()
+        is_dp_attention_enabled.assert_not_called()
+        tp_group.broadcast.assert_not_called()
+
+    def test_simulated_acceptance_uses_fast_path(self):
+        for token_mode in ("fixed", "real-draft-token"):
+            with self.subTest(token_mode=token_mode):
+                verify_input, batch, logits_output = _make_target_verify_selection_case(
+                    self.device
+                )
+                tp_group = SimpleNamespace(world_size=2, broadcast=MagicMock())
+                with (
+                    patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 1.5),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.SIMULATE_ACC_METHOD",
+                        "match-expected",
+                    ),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.SIMULATE_ACC_TOKEN_MODE",
+                        token_mode,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.sample_simulated_acc_len",
+                        return_value=1,
+                    ) as sample_simulated_acc_len,
+                    patch(
+                        "sglang.srt.distributed.get_tp_group", return_value=tp_group
+                    ) as get_tp_group,
+                    patch(
+                        "sglang.srt.speculative.eagle_utils.get_parallel",
+                        return_value=SimpleNamespace(attn_tp_group=tp_group),
+                    ) as get_parallel,
+                    patch(
+                        "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                        return_value=True,
+                    ) as is_dp_attention_enabled,
+                ):
+                    result = maybe_eagle_sample_target_verify_topk1(
+                        verify_input,
+                        batch,
+                        logits_output,
+                    )
+
+                self.assertIsNotNone(result)
+                sample_simulated_acc_len.assert_called_once_with(
+                    1.5, "match-expected", 2
+                )
+                get_tp_group.assert_not_called()
+                get_parallel.assert_not_called()
+                is_dp_attention_enabled.assert_not_called()
+                tp_group.broadcast.assert_not_called()
+                simulated_token = 100 if token_mode == "fixed" else 3
+                torch.testing.assert_close(
+                    result.accept_lens,
+                    torch.tensor([1], dtype=torch.int32, device=self.device),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    result.bonus_tokens,
+                    torch.tensor(
+                        [simulated_token], dtype=torch.int32, device=self.device
+                    ),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_simulated_acceptance_rejects_unknown_token_mode(self):
+        verify_input, batch, logits_output = _make_target_verify_selection_case(
+            self.device
+        )
+        with (
+            patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 1),
+            patch(
+                "sglang.srt.speculative.spec_utils.SIMULATE_ACC_TOKEN_MODE",
+                "unknown",
+            ),
+            self.assertRaisesRegex(
+                ValueError, "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE"
+            ),
+        ):
+            maybe_eagle_sample_target_verify_topk1(
+                verify_input,
+                batch,
+                logits_output,
+            )
+
+    def test_fallbacks(self):
+        cases = (
+            "non_greedy",
+            "input_type",
+            "topk",
+            "idle",
+            "logits_stride",
+            "draft_layout",
+            "metadata_contract",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                verify_input, batch, logits_output = _make_target_verify_selection_case(
+                    self.device
+                )
+                if case == "non_greedy":
+                    batch.sampling_info.is_all_greedy = False
+                elif case == "input_type":
+                    verify_input.spec_input_type = SpecInputType.FROZEN_KV_MTP_VERIFY
+                elif case == "topk":
+                    verify_input.tree_topk = 2
+                elif case == "idle":
+                    batch.forward_mode = ForwardMode.IDLE
+                elif case == "logits_stride":
+                    logits_output.next_token_logits = torch.empty(
+                        (16, 2), device=self.device
+                    ).t()
+                elif case == "draft_layout":
+                    verify_input.draft_token = torch.tensor(
+                        [[0, -1], [3, -1]], dtype=torch.long, device=self.device
+                    )[:, 0]
+                elif case == "metadata_contract":
+                    verify_input.retrieve_index = verify_input.retrieve_index.to(
+                        torch.int32
+                    )
+
+                with patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 0):
+                    result = maybe_eagle_sample_target_verify_topk1(
+                        verify_input,
+                        batch,
+                        logits_output,
+                    )
+                self.assertIsNone(result)
+
+
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):
         # The adaptive state-machine paths write live spec switches through
@@ -231,12 +514,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 
