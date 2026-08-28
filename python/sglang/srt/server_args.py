@@ -11,7 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The arguments of the server."""
+"""Server argument declarations, resolution, and CLI registration.
+
+Keep this file in the following top-level order:
+
+1. Imports and the module logger.
+2. Public extension-point choice lists, with each legacy ``add_*`` alias
+   immediately below the choice list it extends.
+3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
+   aliases. A choice list used by only one field belongs inline in that field.
+4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
+   registration and small query helpers. New resolution steps are appended at
+   the end of ``_run_resolution_pipeline``, immediately before resolution is
+   marked complete, unless an earlier dependency is documented explicitly.
+5. Module-level ``ServerArgs`` construction/runtime shims.
+6. Networking constants and ``PortArgs``.
+
+Model- or vendor-specific utilities belong in ``sglang.srt.arg_groups`` (or
+their owning subsystem), not before ``ServerArgs`` in this module.
+"""
 
 from __future__ import annotations
 
@@ -67,6 +85,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     default_cuda_graph_config,
     parse_cuda_graph_config_arg,
+    with_phase,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
@@ -110,10 +129,14 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-# Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+# --------------------------------------------------------------------------
+# Extension points: out-of-tree platforms and plugins extend these lists
+# before ServerArgs is constructed. Each list owns its adder on the line
+# below it. A list with no adder is not an extension point -- inline it into
+# the field's Arg(choices=...) instead of hoisting it here.
+# --------------------------------------------------------------------------
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+# --- Model loading and quantization ---
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -186,6 +209,8 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 add_quantization_method_choices = QUANTIZATION_CHOICES.extend
+
+# --- Attention backends ---
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -267,6 +292,8 @@ add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )
 
+# --- Transport ---
+
 DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
@@ -277,15 +304,14 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 ]
 add_disagg_transfer_backend_choices = DISAGG_TRANSFER_BACKEND_CHOICES.extend
 
+# --- Sampling and grammar ---
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 add_grammar_backend_choices = GRAMMAR_BACKEND_CHOICES.extend
 
-# Placeholder token inserted between items in Multi-Item Scoring sequences:
-# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
-# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
-# attention mask compat and logprob column indexing. Will be removed once the
-# attention backend supports position-only MIS.
-MIS_DELIMITER_TOKEN_ID = 9999
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+
+# --- MoE and GEMM runners ---
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -308,15 +334,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.extend
-
-# These architectures take the A2A MoE path and skip post-expert all-reduce.
-_DEEPEP_V2_VALIDATED_ARCHITECTURES = frozenset(
-    {
-        "DeepseekV3ForCausalLM",
-        "DeepseekV4ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    }
-)
 
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
@@ -349,17 +366,17 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
 ]
 add_fp4_gemm_runner_backend_choices = FP4_GEMM_RUNNER_BACKEND_CHOICES.extend
 
+# --- Cache and scheduling policy ---
+
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 add_radix_eviction_policy_choices = RADIX_EVICTION_POLICY_CHOICES.extend
+
+# --- Reinforcement learning ---
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.extend
 
-# Speculative algorithms whose verify forward presents a uniform per-request
-# token width, which is what the LoRA segment layout assumes.
-_LORA_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
-
-DEFAULT_LORA_EVICTION_POLICY = "lru"
+# --- Linear attention ---
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
@@ -372,6 +389,12 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend
+
+# --------------------------------------------------------------------------
+# Add new extension points at the end of the matching group above. A new
+# choice list is inlined into its field by default; hoisting one here makes
+# it public API for out-of-tree code and is a deliberate decision.
+# --------------------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -1256,6 +1279,8 @@ class ServerArgs:
         "defaults to --port + 10000.",
         NS("serving"),
     ] = None
+    # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
+    grpc_worker_threads: A[Optional[int], Arg(no_cli=True), NS("serving")] = None
     sidecar: A[
         Optional[str],
         "Start a locally managed sidecar against the native gRPC server. "
@@ -1491,9 +1516,7 @@ class ServerArgs:
             nargs="*",
         ),
         NS("observability"),
-    ] = dataclasses.field(
-        default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
-    )
+    ] = dataclasses.field(default_factory=list)
     crash_dump_folder: A[
         Optional[str],
         "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
@@ -2797,6 +2820,23 @@ class ServerArgs:
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         NS("memory"),
     ] = None
+    hicache_storage_prefetch_retry_poll_interval: A[
+        int,
+        Arg(
+            help=(
+                "Scheduling passes a queued request waits after a storage "
+                "prefetch miss before the availability check is retried "
+                "(under load the first check can run before the needed "
+                "backup commits). 0 disables retries."
+            ),
+        ),
+        NS("memory"),
+    ] = 0
+    hicache_storage_prefetch_retry_max_attempts: A[
+        int,
+        "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
+        NS("memory"),
+    ] = 4
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
@@ -3675,7 +3715,7 @@ class ServerArgs:
         except BaseException:
             # The handlers that ran already declared, and they are not
             # idempotent over their own output.
-            object.__setattr__(self, "_resolution_failed", True)
+            self._resolution_failed = True
             raise
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
@@ -3726,8 +3766,8 @@ class ServerArgs:
 
         # Everything outside the fields, enumerated from the instance: the raw
         # snapshot, the stash, and what resolution memoized -- including the
-        # `get_model_config()` cache, which a resolved copy can no longer fill
-        # (the read-only guard refuses the write).
+        # `get_model_config()` memo, which the copy carries over rather than
+        # rebuild.
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
             if name in field_names or name == "_resolution_finished":
@@ -4035,8 +4075,18 @@ class ServerArgs:
             )
             # cuda_graph_config was already parsed from the legacy boolean, so
             # flipping the boolean alone would not stop graph capture.
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 "HRM-Text (prefix_lm) detected: forcing --attention-backend "
                 "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
@@ -4119,9 +4169,19 @@ class ServerArgs:
                     prefill_only_disable_kv_cache=True,
                 )
                 self._validate_prefill_only_disable_kv_cache_args()
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+            self._declare(
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
             if is_cuda() and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                cfg.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.BREAKABLE
+                    ),
+                )
                 # CUDA-graph sizing has already run by this point and derives
                 # its generic maximum from the 8K chunked-prefill default.
                 # On the Hopper/Blackwell FA raw-K/V path, raise the unlocked
@@ -4137,21 +4197,32 @@ class ServerArgs:
                     self, "_cuda_graph_config_locked", set()
                 )
                 if (Phase.PREFILL, "max_bs") not in cuda_graph_config_locked:
-                    prefill_config.max_bs = max(
-                        prefill_config.max_bs or 0,
-                        model_config.context_len,
-                        16384,
-                    )
-                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
-                        prefill_config.bs = (
-                            self._generate_prefill_cuda_graph_batch_sizes(
-                                prefill_config.max_bs
-                            )
+                    sizing = {
+                        "max_bs": max(
+                            prefill_config.max_bs or 0,
+                            model_config.context_len,
+                            16384,
                         )
+                    }
+                    if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
+                        sizing["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
+                            sizing["max_bs"]
+                        )
+                    self._declare(
+                        "_handle_model_capability_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config, Phase.PREFILL, **sizing
+                        ),
+                    )
             elif not is_cuda():
                 # BCG is CUDA-only. Other graph backends do not support this
                 # encoder-style prefill, so retain the eager Triton path.
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
             logger.info(
                 "EmbeddingGemma detected: disabling radix cache and chunked "
                 "prefill; using breakable CUDA graph for CUDA prefill."
@@ -4420,7 +4491,10 @@ class ServerArgs:
 
         # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
         # native server, falling back to SGLANG_GRPC_PORT.
-        self.grpc_worker_threads = envs.SGLANG_GRPC_WORKER_THREADS.get()
+        self._declare(
+            "_handle_deprecated_args",
+            grpc_worker_threads=envs.SGLANG_GRPC_WORKER_THREADS.get(),
+        )
 
         grpc_port_env = envs.SGLANG_GRPC_PORT.get()
         if cfg.grpc_port is None and grpc_port_env is not None:
@@ -4444,10 +4518,10 @@ class ServerArgs:
                     "--grpc-port / SGLANG_GRPC_PORT "
                     f"({cfg.grpc_port}) must be between 1 and 65535"
                 )
-            if self.grpc_worker_threads < 1:
+            if cfg.grpc_worker_threads is not None and cfg.grpc_worker_threads < 1:
                 raise ValueError(
                     "SGLANG_GRPC_WORKER_THREADS "
-                    f"({self.grpc_worker_threads}) must be >= 1"
+                    f"({cfg.grpc_worker_threads}) must be >= 1"
                 )
 
         # Native gRPC is incompatible with launch paths it doesn't wire into.
@@ -4696,7 +4770,12 @@ class ServerArgs:
                     "At this moment Ascend platform only support prefill graph compilation with "
                     "cuda_graph_config[prefill].tc_compiler='eager'."
                 )
-                cfg.cuda_graph_config.prefill.tc_compiler = "eager"
+                self._declare(
+                    "_handle_npu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, tc_compiler="eager"
+                    ),
+                )
 
     def _handle_mps_backends(self):
         cfg = resolving_view(self)
@@ -4714,7 +4793,12 @@ class ServerArgs:
             # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
             # disabled so the default startup doesn't require graph capture.
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_xpu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
             elif cfg.cuda_graph_config.decode.backend not in (
                 Backend.DISABLED,
                 Backend.FULL,
@@ -4724,7 +4808,12 @@ class ServerArgs:
                     "disabling unsupported decode backend '%s'.",
                     cfg.cuda_graph_config.decode.backend,
                 )
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_xpu_backends",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -4768,12 +4857,8 @@ class ServerArgs:
 
     def _handle_cuda_graph_config(self):
         cfg = resolving_view(self)
-        from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
         self._parse_cuda_graph_config()
-        # Reads the resolved per-phase backends; must precede the compat rules
-        # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
-        disable_kimi_k3_symm_mem(self)
         self._apply_cuda_graph_compatibility()
         self._apply_deepep_adjustments()
         self._apply_cuda_graph_disaggregation_roles()
@@ -4809,8 +4894,15 @@ class ServerArgs:
                     sorted(bs),
                     aligned,
                 )
-                cfg.cuda_graph_config.prefill.bs = aligned
-                cfg.cuda_graph_config.prefill.max_bs = aligned[-1]
+                self._declare(
+                    "_apply_deepep_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        bs=aligned,
+                        max_bs=aligned[-1],
+                    ),
+                )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4906,7 +4998,12 @@ class ServerArgs:
                 "Using tc_piecewise CUDA graph for validated multimodal "
                 "decoder prefill."
             )
-            cfg.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+            self._declare(
+                "_apply_cuda_graph_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.TC_PIECEWISE
+                ),
+            )
 
         if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
@@ -4919,10 +5016,20 @@ class ServerArgs:
         cfg = resolving_view(self)
         if cfg.disaggregation_mode == "prefill":
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                self._declare(
+                    "_apply_cuda_graph_disaggregation_roles",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
         elif cfg.disaggregation_mode == "decode":
             if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_apply_cuda_graph_disaggregation_roles",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         """TcPiecewise (torch.compile + piecewise) is incompatible with
@@ -4998,7 +5105,15 @@ class ServerArgs:
         ]
         for _name, predicate in rules:
             if predicate():
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_tc_piecewise_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
+                # One decision, one declaration: every rule declares the same
+                # value, so a later match would only append a duplicate entry.
+                break
 
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
@@ -5051,7 +5166,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_breakable_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
                 return
 
     def _disable_full_prefill_cudagraph_if_incompatible(self):
@@ -5065,7 +5185,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_disable_full_prefill_cudagraph_if_incompatible",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
                 return
 
     def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
@@ -5095,7 +5220,12 @@ class ServerArgs:
             "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
             cfg.cuda_graph_config.prefill.backend,
         )
-        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self._declare(
+            "_disable_prefill_cuda_graph_for_deepseek_trtllm_mla",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
     def _validate_cuda_graph_config(self):
         cfg = resolving_view(self)
@@ -5123,8 +5253,18 @@ class ServerArgs:
 
         if cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
             logger.warning("CUDA graph is disabled because --enable-mis is set.")
-        cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+        self._declare(
+            "_handle_multi_item_scoring",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        self._declare(
+            "_handle_multi_item_scoring",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
 
         if not cfg.disable_radix_cache:
             logger.warning("Radix cache is disabled because --enable-mis is set.")
@@ -5172,8 +5312,10 @@ class ServerArgs:
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
         cfg = resolving_view(self)
-        decode_cuda_graph_config = cfg.cuda_graph_config.decode
-        prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
+        # A copy, so an earlier declaration keeps the value it recorded.
+        cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
+        decode_cuda_graph_config = cuda_graph_config.decode
+        prefill_cuda_graph_config = cuda_graph_config.prefill
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -5318,6 +5460,11 @@ class ServerArgs:
                 self._generate_prefill_cuda_graph_batch_sizes(
                     prefill_cuda_graph_config.max_bs
                 )
+            )
+
+        if cuda_graph_config != cfg.cuda_graph_config:
+            self._declare(
+                "_handle_gpu_memory_settings", cuda_graph_config=cuda_graph_config
             )
 
         if cfg.mem_fraction_static is None:
@@ -5759,7 +5906,14 @@ class ServerArgs:
                         # The DSA CP field declarations moved to the override
                         # registry (arg_groups/overrides.py:
                         # _deepseek_family_overrides).
-                        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                        self._declare(
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                         if cfg.dp_size < cfg.tp_size:
@@ -5842,7 +5996,14 @@ class ServerArgs:
                 # the override registry (arg_groups/overrides.py:
                 # _deepseek_family_overrides).
                 if cfg.enable_prefill_cp and self.use_mla_backend():
-                    cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                    self._declare(
+                        "_handle_model_specific_adjustments",
+                        cuda_graph_config=with_phase(
+                            cfg.cuda_graph_config,
+                            Phase.PREFILL,
+                            backend=Backend.DISABLED,
+                        ),
+                    )
 
             # Set moe backend for DeepSeek: the sm100 quant/moe resolution
             # moved to the resolution pipeline (arg_groups/overrides.py:
@@ -5911,7 +6072,7 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
@@ -6338,15 +6499,35 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph is disabled because of using torch native attention backend"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
 
         if attention_backend == "flex_attention":
             logger.warning(
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             assert (
                 cfg.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
@@ -7108,7 +7289,6 @@ class ServerArgs:
             "_handle_dwdp",
             ep_size=cfg.dwdp_size,
         )
-        self.moe_ep_size = cfg.dwdp_size
         self._declare(
             "_handle_dwdp",
             moe_dp_size=1,
@@ -7127,7 +7307,7 @@ class ServerArgs:
 
         logger.info(
             f"DWDP enabled: dwdp_size={cfg.dwdp_size}, "
-            f"auto-forced dp_size={cfg.dp_size}, moe_ep_size={self.moe_ep_size}, "
+            f"auto-forced dp_size={cfg.dp_size}, ep_size={cfg.dwdp_size}, "
             f"moe_dense_tp_size=1, moe_a2a_backend=none, "
             f"dp_attention_local_control_broadcast=True, "
             f"enable_dp_lm_head=True, SCHEDULER_SKIP_ALL_GATHER=True, "
@@ -7192,11 +7372,17 @@ class ServerArgs:
                 and prefill_cfg.max_bs > cfg.chunked_prefill_size
                 and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
             ):
-                prefill_cfg.max_bs = cfg.chunked_prefill_size
+                clamped = {"max_bs": cfg.chunked_prefill_size}
                 if (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked:
-                    prefill_cfg.bs = self._generate_prefill_cuda_graph_batch_sizes(
-                        prefill_cfg.max_bs
+                    clamped["bs"] = self._generate_prefill_cuda_graph_batch_sizes(
+                        clamped["max_bs"]
                     )
+                self._declare(
+                    "_handle_data_parallelism",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, **clamped
+                    ),
+                )
 
         # Resolve the phase-aware TP LM-head default before validating the
         # resulting DP/TP LM-head configuration.
@@ -7434,10 +7620,17 @@ class ServerArgs:
         )
 
         architecture = architectures[0] if architectures else None
-        if architecture not in _DEEPEP_V2_VALIDATED_ARCHITECTURES:
+        # These architectures take the A2A MoE path and skip post-expert
+        # all-reduce.
+        validated_architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV4ForCausalLM",
+            "Qwen3MoeForCausalLM",
+        )
+        if architecture not in validated_architectures:
             raise ValueError(
                 f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-                f"architectures are {sorted(_DEEPEP_V2_VALIDATED_ARCHITECTURES)}. "
+                f"architectures are {sorted(validated_architectures)}. "
                 "Other model workflows may require an all-reduce after A2A "
                 "combine. Use --moe-a2a-backend deepep."
             )
@@ -7506,8 +7699,18 @@ class ServerArgs:
                     )
             if cfg.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_a2a_moe",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
+                self._declare(
+                    "_handle_a2a_moe",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
         if a2a_backend == "deepep_v2":
             self._validate_deepep_v2_model_architecture()
@@ -7547,7 +7750,12 @@ class ServerArgs:
                     "--moe-a2a-backend deepep_v2."
                 )
             # Prefill reads host counts and is not graph-capturable.
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_a2a_moe",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{cfg.tp_size}]."
             )
@@ -9272,8 +9480,18 @@ class ServerArgs:
                 logger.warning(
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
-                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._declare(
+                    "_handle_dllm_inference",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                    ),
+                )
+                self._declare(
+                    "_handle_dllm_inference",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                    ),
+                )
 
         from sglang.srt.arg_groups.overrides import (
             _dllm_attention_backend,
@@ -9409,8 +9627,18 @@ class ServerArgs:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             self._declare("_handle_other_validations", skip_server_warmup=True)
 
         if cfg.msprobe_dump_config is not None:
@@ -9419,8 +9647,18 @@ class ServerArgs:
                 "cuda graph is disabled because msProbe only supports dump in eager mode, "
                 "warmup is disabled(skip_server_warmup=True) because there is no need to dump data for this stage."
             )
-            cfg.cuda_graph_config.decode.backend = Backend.DISABLED
-            cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+            self._declare(
+                "_handle_other_validations",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
             self._declare("_handle_other_validations", skip_server_warmup=True)
 
         # Validate limit_mm_per_prompt modalities
@@ -9877,7 +10115,7 @@ class ServerArgs:
         cfg = resolving_view(self)
         from sglang.srt.configs.model_config import ModelConfig
 
-        memo = getattr(self, "model_config", None)
+        memo = getattr(self, "_model_config", None)
         if memo is not None:
             # The key is the path this record carried when the cache was
             # filled. The GGUF and ModelScope handlers declare a different
@@ -9891,7 +10129,7 @@ class ServerArgs:
                 return memo
 
         model_config = ModelConfig.from_server_args(self)
-        self.model_config = model_config
+        self._model_config = model_config
         self._model_config_built_from = cfg.model_path
         if model_config.is_hybrid_swa:
             logger.info(
@@ -9926,7 +10164,6 @@ class ServerArgs:
         if (
             getattr(self, "_resolution_finished", False)
             and not getattr(self, "_internal_write", False)
-            and name not in _CACHE_SLOTS
             and (not name.startswith("_") or name in _underscore_field_names())
         ):
             raise AttributeError(
@@ -10006,7 +10243,7 @@ class ServerArgs:
             # is supported.
             result = max(candidate_steps) + 1
         if getattr(self, "_resolution_finished", False):
-            object.__setattr__(self, "_max_speculative_num_draft_tokens", result)
+            self._max_speculative_num_draft_tokens = result
         return result
 
     @property
@@ -10459,7 +10696,10 @@ class ServerArgs:
         if cfg.speculative_algorithm in ["NGRAM", None]:
             return
 
-        if cfg.speculative_algorithm not in _LORA_SPEC_ALGORITHMS:
+        # These algorithms present a uniform per-request token width during
+        # verify, which is what the LoRA segment layout assumes.
+        lora_spec_algorithms = ("EAGLE", "EAGLE3", "DFLASH", "DSPARK")
+        if cfg.speculative_algorithm not in lora_spec_algorithms:
             promoted = (
                 " (NEXTN/EAGLE with a Gemma4 assistant draft is automatically "
                 "promoted to FROZEN_KV_MTP, which does not support LoRA)"
@@ -10627,7 +10867,7 @@ class ServerArgs:
             result = json.loads(self.modelexpress_config)
         else:
             result = self.modelexpress_config
-        object.__setattr__(self, "_mx_config_cache", result)
+        self._mx_config_cache = result
         return result
 
     @property
@@ -10785,6 +11025,11 @@ class ServerArgs:
         return cfg.expert_balancedness_report_mode in ("prometheus", "both")
 
 
+# --------------------------------------------------------------------------
+# Module-level ServerArgs helpers and runtime shims.
+# --------------------------------------------------------------------------
+
+
 def resolve_encoder_transfer_backend(
     backend: str, model_arch: str, tp_size: int
 ) -> str:
@@ -10795,20 +11040,16 @@ def resolve_encoder_transfer_backend(
     return "zmq_to_scheduler"
 
 
-def compute_world_size(config) -> int:
-    """Return the total GPU count across all data-parallel replicas.
+def compute_world_size(
+    *, enable_dp_attention: bool, dp_size: int, tp_size: int, pp_size: int
+) -> int:
+    """Total GPU count across all data-parallel replicas.
 
-    Takes the resolved topology -- the published `parallel` bag, or a view over
-    the declarations. `enable_dp_attention` and `dp_size` are both resolution's
-    answers (`_handle_dwdp` fills the pair, DeepSeek MLA context parallelism
-    turns DP attention on), so a raw-record read would size the world from what
-    the operator typed.
+    Takes the values rather than a config object: the two sizes are the widths
+    the launch asked for, which the Ray driver needs before any process group
+    exists, and passing a context would hand it the live groups instead.
     """
-    return (
-        (1 if config.enable_dp_attention else config.dp_size)
-        * config.tp_size
-        * config.pp_size
-    )
+    return (1 if enable_dp_attention else dp_size) * tp_size * pp_size
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
@@ -10831,14 +11072,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
         and is_sm100_supported()
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
-
-
-# Caches, which the read-only guard lets through: a value the record derived
-# from itself is not resolved configuration, and a key that can invalidate on a
-# resolved record needs the refill to be storable there. Only the public-named
-# ones are listed -- a cache key spelled with a leading underscore is already
-# exempt.
-_CACHE_SLOTS = frozenset({"model_config"})
 
 
 # NOTE: The process-wide ServerArgs is owned by the runtime context
@@ -10923,6 +11156,11 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     )
 
     return ServerArgs.from_cli_args(raw_args)
+
+
+# --------------------------------------------------------------------------
+# Networking constants and PortArgs.
+# --------------------------------------------------------------------------
 
 
 ZMQ_TCP_PORT_DELTA = 233

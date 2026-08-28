@@ -10,13 +10,16 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import get_cp_strategy
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -25,8 +28,14 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -127,6 +136,16 @@ class MLPSyncBatchInfo:
             dtype=dtype,
         )
 
+    def finalize_local(self):
+        """Populate gather-derived metadata from the sole attention-DP rank."""
+        self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
+        self.global_num_tokens = [self.num_tokens]
+        self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        if _ENABLE_METRICS_DP_ATTENTION:
+            self.dp_cooperation_info = DPCooperationInfo.create(
+                self.tp0_info_cpu[:, 5].tolist()
+            )
+
     def all_gather(
         self,
         device,
@@ -203,7 +222,7 @@ def _update_gather_batch(
     batch: ScheduleBatch,
     mlp_sync_info: MLPSyncBatchInfo,
     require_mlp_tp_gather: bool,
-    skip_all_gather=False,
+    skip_global_metadata=False,
 ):
     # TODO: handle the case when moe_dense_tp_size != 1
     if not require_mlp_tp_gather:
@@ -214,7 +233,7 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
-    if not skip_all_gather:
+    if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
@@ -222,6 +241,105 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+
+
+def should_skip_scheduler_all_gather(dp_size: int) -> bool:
+    """Return whether scheduler metadata is already local and rank-invariant.
+
+    With one attention-DP rank there is no cross-DP state to reconcile.  The
+    TP schedulers consume the same broadcast request stream, so gathering the
+    identical batch mode, graph eligibility, and token counts only adds a
+    device collective plus host synchronization.  Preserve the environment
+    override for deployments that explicitly guarantee this invariant beyond
+    DP1.
+    """
+
+    return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+
+
+def _local_decode_cuda_graph_vote(
+    *,
+    local_batch: Optional[ScheduleBatch],
+    disable_cuda_graph: bool,
+) -> bool:
+    """This rank's vote for the decode graph (min-reduced across dp ranks)."""
+    if disable_cuda_graph:
+        return False
+    return (
+        local_batch is None
+        or local_batch.forward_mode.is_decode_or_idle()
+        or local_batch.forward_mode.is_prebuilt()
+    )
+
+
+def _local_prefill_cuda_graph_vote(
+    *,
+    local_batch: Optional[ScheduleBatch],
+    prefill_graph_runner,
+    coordinated_prefill: bool,
+    breakable_prefill: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    model_config,
+) -> bool:
+    """This rank's vote for the prefill graph (min-reduced across dp
+    ranks). Extend/mixed batches vote their own replayability; a decode
+    batch eligible for the decode->extend conversion votes as its 1-token-
+    extend view, so the vote and the post-sync conversion always agree."""
+    if local_batch is None or local_batch.forward_mode.is_idle():
+        return True
+    if not coordinated_prefill:
+        return False
+
+    mode = local_batch.forward_mode
+    if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+        num_tokens = local_batch.extend_num_tokens
+        input_embeds = local_batch.input_embeds
+        replace_embeds = local_batch.replace_embeds
+        prefix_lens = local_batch.prefix_lens
+        return_logprob = local_batch.return_logprob
+    elif (
+        mode.is_decode()
+        # Conversion replays the breakable graphs only; full's fixed
+        # request-slot geometry does not cover converted decode tails.
+        and breakable_prefill
+        # decode->extend conversion eligibility; needs the captured-graph
+        # prefill runner, not the eager fallback.
+        and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
+        and spec_algorithm.is_none()
+        and not local_batch.return_logprob
+        # Grammar FSMs advance through the decode result path only.
+        and not local_batch.has_grammar
+        # Small-bucket BCG replays amplify the a2a EP logits drift (#30898)
+        # into an accuracy loss.
+        and get_moe_a2a_backend().is_none()
+        # The converted view lacks prepare_for_extend's mamba-track fills.
+        and not uses_ssm_state(model_config)
+        # HiSparse decode has its own batch lifecycle and host-offloaded KV.
+        and not get_memory().enable_hisparse
+        and not get_exec().overlap.enable_two_batch_overlap
+        and get_cp_strategy() is None
+    ):
+        num_tokens = local_batch.batch_size()
+        input_embeds = None
+        replace_embeds = None
+        prefix_lens = None
+        return_logprob = False
+    else:
+        return False
+
+    if prefill_graph_runner is None:
+        return True
+    return prefill_graph_runner.can_replay_locally(
+        batch_size=local_batch.batch_size(),
+        num_tokens=num_tokens,
+        input_embeds=input_embeds,
+        replace_embeds=replace_embeds,
+        prefix_lens=prefix_lens,
+        is_target_verify=mode.is_target_verify(),
+        capture_hidden_mode=None,
+        return_logprob=return_logprob,
+        lora_ineligible=prefill_graph_runner.enable_lora,
+    )
 
 
 def prepare_mlp_sync_batch_raw(
@@ -264,39 +382,23 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
-    skip_all_gather = envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
-    can_run_decode_cuda_graph = (
-        local_batch is None
-        or local_batch.forward_mode.is_decode_or_idle()
-        or local_batch.forward_mode.is_prebuilt()
-    ) and not disable_cuda_graph
-    coordinated_prefill = check_cuda_graph_backend(
-        Phase.PREFILL, Backend.BREAKABLE
-    ) or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
+    can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
+        local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
+    )
+    breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+    coordinated_prefill = breakable_prefill or check_cuda_graph_backend(
+        Phase.PREFILL, Backend.FULL
+    )
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
     )
-    can_run_prefill_cuda_graph = (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
-        or (
-            local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
-            and (
-                prefill_graph_runner is None
-                or prefill_graph_runner.can_replay_locally(
-                    batch_size=local_batch.batch_size(),
-                    num_tokens=local_batch.extend_num_tokens,
-                    input_embeds=local_batch.input_embeds,
-                    replace_embeds=local_batch.replace_embeds,
-                    prefix_lens=local_batch.prefix_lens,
-                    is_target_verify=local_batch.forward_mode.is_target_verify(),
-                    capture_hidden_mode=None,
-                    return_logprob=local_batch.return_logprob,
-                    lora_ineligible=prefill_graph_runner.enable_lora,
-                )
-            )
-            and coordinated_prefill
-        )
+    can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
+        local_batch=local_batch,
+        prefill_graph_runner=prefill_graph_runner,
+        coordinated_prefill=coordinated_prefill,
+        breakable_prefill=breakable_prefill,
+        spec_algorithm=model_runner.spec_algorithm,
+        model_config=model_runner.model_config,
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
@@ -329,6 +431,7 @@ def prepare_mlp_sync_batch_raw(
             local_num_tokens=num_tokens,
             local_forward_mode=local_forward_mode,
         )
+    skip_all_gather = should_skip_scheduler_all_gather(dp_size)
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -343,13 +446,17 @@ def prepare_mlp_sync_batch_raw(
         local_forward_mode=local_forward_mode,
     )
 
-    if not skip_all_gather:
+    if dp_size == 1:
+        mlp_sync_info.finalize_local()
+    elif not skip_all_gather:
         mlp_sync_info.all_gather(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
         )
 
+    metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
@@ -373,12 +480,15 @@ def prepare_mlp_sync_batch_raw(
 
     if batch_to_gather is not None:
         _update_gather_batch(
-            batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
+            batch_to_gather,
+            mlp_sync_info,
+            require_mlp_tp_gather,
+            skip_global_metadata=not metadata_ready,
         )
 
     # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
     # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
-    if local_batch is not None and not skip_all_gather:
+    if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(
                 mlp_sync_info.tp0_info_cpu[:, 5].tolist()
@@ -409,7 +519,7 @@ class SchedulerDPAttnAdapter:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
-            dp_size=get_parallel().config.dp_size,
+            dp_size=get_parallel().dp_size,
             attn_tp_size=self.ps.attn_tp_size,
             attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
@@ -418,7 +528,7 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
-            dwdp=get_parallel().config.dwdp_size > 1,
+            dwdp=get_parallel().dwdp_size > 1,
         )
 
     def maybe_prepare_mlp_sync_batch(
@@ -436,6 +546,36 @@ class SchedulerDPAttnAdapter:
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
             batch = self.prepare_mlp_sync_batch(batch)
+        return batch
+
+    def maybe_convert_decode_to_extend(
+        self, batch: Optional[ScheduleBatch]
+    ) -> Optional[ScheduleBatch]:
+        """After the mlp-sync gather: convert an eligible decode batch to the
+        extend view when a peer rank runs extend this step, so the step stays
+        mode-homogeneous and every rank replays the extend graphs instead of
+        all falling to eager."""
+        if batch is None or not batch.forward_mode.is_decode():
+            return batch
+        # Global triggers from the gather. This rank's own eligibility (spec/
+        # TBO/CP/logprob/replayability) is folded into the min-reduced vote:
+        # if it failed, can_run_dp_prefill_cuda_graph is already False.
+        if not batch.is_extend_in_batch:
+            return batch
+        if not batch.can_run_dp_prefill_cuda_graph:
+            # The step is eager everywhere; eager decode beats eager mixed.
+            return batch
+        global_tokens = batch.global_num_tokens
+        if (
+            global_tokens is not None
+            and len(global_tokens) > 1
+            and min(global_tokens) == 0
+        ):
+            # An idle rank makes the prefill runner reject replay for every
+            # rank (_has_inactive_dp_rank); converting would only trade eager
+            # decode for eager mixed.
+            return batch
+        batch.convert_decode_to_extend()
         return batch
 
     def get_idle_batch(self) -> ScheduleBatch:

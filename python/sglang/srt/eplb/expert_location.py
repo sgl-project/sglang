@@ -195,7 +195,7 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = 1 if use_flat_topology else get_parallel().config.nnodes
+        num_nodes = 1 if use_flat_topology else get_parallel().nnodes
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -238,15 +238,14 @@ class ExpertLocationMetadata:
             + get_exec().moe.ep_num_redundant_experts
         )
         # elastic-EP scale-up rewrites ep_size on the published config
-        ep_size = get_parallel().config.ep_size
+        ep_size = get_parallel().ep_size
         num_physical_experts = base_num_physical_experts
-        initial_ep_size = get_parallel().config.elastic_ep_initial_size
+        initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
             if get_exec().moe.ep_join_mode == "scale":
                 ep_size = max(
                     ep_size,
-                    get_parallel().config.ep_join_rank_offset
-                    + get_parallel().config.tp_size,
+                    get_parallel().ep_join_rank_offset + get_parallel().tp_size,
                 )
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
@@ -570,7 +569,7 @@ def _compute_logical_to_all_physical_map(
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         prefer_same_node = _prefer_same_node_experts()
         num_gpus_per_node = (
-            get_parallel().config.ep_size // get_parallel().config.nnodes
+            get_parallel().ep_size // get_parallel().nnodes
             if prefer_same_node
             else None
         )
@@ -634,9 +633,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_local_gpu_physical_experts = num_physical_experts // ep_size
     prefer_same_node = _prefer_same_node_experts()
     num_gpus_per_node = (
-        get_parallel().config.ep_size // get_parallel().config.nnodes
-        if prefer_same_node
-        else None
+        get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
     num_local_node_physical_experts = (
         num_local_gpu_physical_experts * num_gpus_per_node

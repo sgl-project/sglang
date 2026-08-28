@@ -18,7 +18,6 @@ from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +28,6 @@ def prepare_moe_topk(
     *,
     model,
     model_config: ModelConfig,
-    server_args: ServerArgs,
     moe_ep_size: int,
     moe_ep_rank: int,
 ) -> None:
