@@ -3202,6 +3202,16 @@ class TestSchedulerEndpointBinding(unittest.TestCase):
         )
         self.assertEqual(args.scheduler_endpoint_for(0), "tcp://10.1.2.3:5555")
 
+    def test_explicit_ipv6_host_is_bracketed(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/fake/model",
+                "host": "::1",
+                "scheduler_port": 5555,
+            }
+        )
+        self.assertEqual(args.scheduler_endpoint_for(0), "tcp://[::1]:5555")
+
     def test_replica_ports_increment_on_loopback(self):
         args = self._from_dict_without_model_resolution(
             {"model_path": "/fake/model", "host": "0.0.0.0", "scheduler_port": 5555}

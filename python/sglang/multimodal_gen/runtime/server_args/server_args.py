@@ -2809,10 +2809,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "::",
         ):
             scheduler_host = "127.0.0.1"
+            host_is_ipv6 = False
+        else:
+            host_is_ipv6 = is_valid_ipv6_address(scheduler_host)
         if self.scheduler_ports is not None:
             port = self.scheduler_ports[replica]
         else:
             port = self.scheduler_port + replica
+        # IPv6 literals must be bracketed in an endpoint string.
+        if host_is_ipv6:
+            return f"tcp://[{scheduler_host}]:{port}"
         return f"tcp://{scheduler_host}:{port}"
 
     @property
