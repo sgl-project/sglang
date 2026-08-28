@@ -6,13 +6,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.kv_cache_hook import (
-    validate_prefill_only_disable_kv_cache_args,
-)
-from sglang.srt.arg_groups.mamba_hook import (
-    validate_mamba_extra_buffer,
-    validate_mamba_no_buffer,
-)
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolved_view,
@@ -592,6 +585,10 @@ def handle_model_specific_adjustments(server_args: Any):
 
 
 def handle_model_capability_adjustments(server_args: Any):
+    from sglang.srt.arg_groups.kv_cache_hook import (
+        validate_prefill_only_disable_kv_cache_args,
+    )
+
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
@@ -815,6 +812,10 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
     # Resolution moved to the resolution pipeline (arg_groups/overrides.py:
     # _mamba_radix_cache_resolution), invoked here at each legacy call
     # slot; this handler keeps the validation.
+    from sglang.srt.arg_groups.mamba_hook import (
+        validate_mamba_extra_buffer,
+        validate_mamba_no_buffer,
+    )
     from sglang.srt.arg_groups.overrides import (
         _mamba_radix_cache_resolution,
         mamba_extra_buffer_of,

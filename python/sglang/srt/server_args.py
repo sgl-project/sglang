@@ -3784,97 +3784,6 @@ class ServerArgs:
            may mutate, and whether it validates only. Long ordering comments
            belong in the helper or signal that the helper should be split.
         """
-        from sglang.srt.arg_groups.attention_hook import (
-            handle_attention_backend_compatibility,
-            handle_deterministic_inference,
-            handle_linear_attn_backend,
-            handle_multi_item_scoring,
-        )
-        from sglang.srt.arg_groups.cuda_graph_hook import (
-            apply_inkling_prefill_cuda_graph_default,
-            apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
-            disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
-            handle_cuda_graph_config,
-        )
-        from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
-        from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
-        from sglang.srt.arg_groups.hicache_hook import (
-            handle_hicache,
-            handle_hicache_ratio_default,
-        )
-        from sglang.srt.arg_groups.kv_cache_hook import (
-            handle_cache_compatibility,
-            handle_kv4_compatibility,
-            handle_mxfp8_kv_cache_compatibility,
-            handle_page_major_kv_layout,
-            handle_prefill_only_disable_kv_cache,
-            handle_unified_memory_pool,
-            validate_prefill_only_disable_kv_cache_args,
-        )
-        from sglang.srt.arg_groups.mamba_hook import (
-            handle_int8_mamba_checkpoint,
-            handle_mamba_backend,
-        )
-        from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
-        from sglang.srt.arg_groups.model_hook import (
-            handle_model_capability_adjustments,
-            handle_model_specific_adjustments,
-        )
-        from sglang.srt.arg_groups.model_path_hook import (
-            handle_load_format,
-            handle_model_source_paths,
-        )
-        from sglang.srt.arg_groups.moe_hook import (
-            handle_a2a_moe,
-            handle_moe_kernel_config,
-            validate_cutedsl_a2a_token_budget,
-            validate_deepep_v2_dispatch_token_budget,
-            validate_deepep_v2_speculative_draft,
-        )
-        from sglang.srt.arg_groups.parallel_hook import (
-            handle_context_parallelism,
-            handle_data_parallelism,
-            handle_dcp_validation,
-            handle_dwdp,
-            handle_elastic_ep,
-            handle_eplb_and_dispatch,
-            handle_expert_distribution_metrics,
-            handle_legacy_cp_arguments,
-        )
-        from sglang.srt.arg_groups.pd_disaggregation_hook import (
-            handle_encoder_disaggregation,
-            handle_pd_disaggregation,
-        )
-        from sglang.srt.arg_groups.platform_hook import (
-            handle_amd_specifics,
-            handle_cpu_backends,
-            handle_hpu_backends,
-            handle_mps_backends,
-            handle_nccl_pre_warm,
-            handle_npu_backends,
-            handle_xpu_backends,
-        )
-        from sglang.srt.arg_groups.serving_hook import (
-            handle_asr_validation,
-            handle_crash_dump_env,
-            handle_debug_utils,
-            handle_deprecated_args,
-            handle_environment_variables,
-            handle_grammar_backend,
-            handle_load_balance_method,
-            handle_media_url_security,
-            handle_missing_default_values,
-            handle_multimodal,
-            handle_other_validations,
-            handle_prefill_delayer_env_compat,
-            handle_return_hidden_states_mode,
-            handle_ssl_validation,
-            handle_tokenizer_batching,
-        )
-        from sglang.srt.arg_groups.validation_hook import (
-            validate_experimental_sgl_marlin,
-            validate_prefill_decode_interval,
-        )
 
         # What the caller asked for, before any handler runs; this plus the
         # stash is the resolution result the projection reads.
@@ -3893,9 +3802,37 @@ class ServerArgs:
         from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
         handle_mega_moe(self)
+        from sglang.srt.arg_groups.serving_hook import (
+            handle_asr_validation,
+            handle_crash_dump_env,
+            handle_debug_utils,
+            handle_deprecated_args,
+            handle_environment_variables,
+            handle_grammar_backend,
+            handle_load_balance_method,
+            handle_media_url_security,
+            handle_missing_default_values,
+            handle_multimodal,
+            handle_other_validations,
+            handle_prefill_delayer_env_compat,
+            handle_return_hidden_states_mode,
+            handle_ssl_validation,
+            handle_tokenizer_batching,
+        )
+
         handle_return_hidden_states_mode(self)
         handle_media_url_security(self)
+        from sglang.srt.arg_groups.hicache_hook import (
+            handle_hicache,
+            handle_hicache_ratio_default,
+        )
+
         handle_hicache_ratio_default(self)
+        from sglang.srt.arg_groups.validation_hook import (
+            validate_experimental_sgl_marlin,
+            validate_prefill_decode_interval,
+        )
+
         validate_prefill_decode_interval(self)
 
         # Reject an explicitly enabled but incompatible hardware runtime before
@@ -3903,6 +3840,11 @@ class ServerArgs:
         self._handle_hardware_runtime_validation()
         if cfg.model_path.lower() in ["none", "dummy"]:
             return
+
+        from sglang.srt.arg_groups.model_path_hook import (
+            handle_load_format,
+            handle_model_source_paths,
+        )
 
         handle_model_source_paths(self)
 
@@ -3925,20 +3867,55 @@ class ServerArgs:
         # expert_pack may replace a raw GGUF input with its generated local
         # model metadata before any model-specific handler calls get_model_config.
         # It also establishes eager-only invariants before CUDA graph parsing.
+        from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
+
         handle_expert_pack(self)
 
         # Validate PD disaggregation flags before CUDA graph config.
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_encoder_disaggregation,
+            handle_pd_disaggregation,
+        )
+
         handle_pd_disaggregation(self)
 
         # Normalize deprecated CP aliases before validations or model-specific
         # defaults inspect enable_prefill_cp/cp_strategy.
+        from sglang.srt.arg_groups.parallel_hook import (
+            handle_context_parallelism,
+            handle_data_parallelism,
+            handle_dcp_validation,
+            handle_dwdp,
+            handle_elastic_ep,
+            handle_eplb_and_dispatch,
+            handle_expert_distribution_metrics,
+            handle_legacy_cp_arguments,
+        )
+
         handle_legacy_cp_arguments(self)
+        from sglang.srt.arg_groups.kv_cache_hook import (
+            handle_cache_compatibility,
+            handle_kv4_compatibility,
+            handle_mxfp8_kv_cache_compatibility,
+            handle_page_major_kv_layout,
+            handle_prefill_only_disable_kv_cache,
+            handle_unified_memory_pool,
+            validate_prefill_only_disable_kv_cache_args,
+        )
+
         validate_prefill_only_disable_kv_cache_args(self)
         handle_dcp_validation(self)
 
         # Model-arch prefill CUDA-graph default must land before cuda-graph
         # resolution (the declarative registry materializes too late to affect
         # it). Inkling opts into full-graph prefill capture here.
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            apply_inkling_prefill_cuda_graph_default,
+            apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
+            disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
+            handle_cuda_graph_config,
+        )
+
         apply_inkling_prefill_cuda_graph_default(self)
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self)
 
@@ -3948,6 +3925,16 @@ class ServerArgs:
         handle_cuda_graph_config(self)
 
         # Handle device-specific backends.
+        from sglang.srt.arg_groups.platform_hook import (
+            handle_amd_specifics,
+            handle_cpu_backends,
+            handle_hpu_backends,
+            handle_mps_backends,
+            handle_nccl_pre_warm,
+            handle_npu_backends,
+            handle_xpu_backends,
+        )
+
         handle_hpu_backends(self)
         handle_cpu_backends(self)
         handle_npu_backends(self)
@@ -3965,20 +3952,39 @@ class ServerArgs:
         gpu_mem = get_device_memory_capacity(cfg.device)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
+        from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+
         handle_gpu_memory_settings(self, gpu_mem)
 
         # Apply model-specific adjustments.
+        from sglang.srt.arg_groups.model_hook import (
+            handle_model_capability_adjustments,
+            handle_model_specific_adjustments,
+        )
+
         handle_model_specific_adjustments(self)
 
         # Set kernel backends.
         self._handle_sampling_backend()
         # Must run before _handle_attention_backend_compatibility so the
         # deterministic backend is set before auto-detection fills it in.
+        from sglang.srt.arg_groups.attention_hook import (
+            handle_attention_backend_compatibility,
+            handle_deterministic_inference,
+            handle_linear_attn_backend,
+            handle_multi_item_scoring,
+        )
+
         handle_deterministic_inference(self)
         handle_attention_backend_compatibility(self)
         # Must run after the attention backend is resolved so the trtllm_mla
         # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self)
+        from sglang.srt.arg_groups.mamba_hook import (
+            handle_int8_mamba_checkpoint,
+            handle_mamba_backend,
+        )
+
         handle_mamba_backend(self)
         handle_int8_mamba_checkpoint(self)
         handle_linear_attn_backend(self)
@@ -4017,6 +4023,14 @@ class ServerArgs:
         handle_context_parallelism(self)
 
         # Handle MoE configurations.
+        from sglang.srt.arg_groups.moe_hook import (
+            handle_a2a_moe,
+            handle_moe_kernel_config,
+            validate_cutedsl_a2a_token_budget,
+            validate_deepep_v2_dispatch_token_budget,
+            validate_deepep_v2_speculative_draft,
+        )
+
         handle_moe_kernel_config(self)
         handle_a2a_moe(self)
         handle_eplb_and_dispatch(self)
@@ -4028,6 +4042,7 @@ class ServerArgs:
         self._handle_pipeline_parallelism()
 
         # Handle speculative decoding logic.
+
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
@@ -4055,6 +4070,8 @@ class ServerArgs:
         handle_unified_memory_pool(self)
 
         # Handle diffusion LLM inference.
+        from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
+
         handle_dllm_inference(self)
 
         # Handle crash dump environment variables (must run before CUDA init).

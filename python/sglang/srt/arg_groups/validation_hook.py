@@ -8,7 +8,6 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
@@ -22,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def check_server_args(server_args: Any):
+    from sglang.srt.arg_groups.lora_hook import check_lora_server_args
+
     cfg = resolving_view(server_args)
 
     # Check parallel size constraints

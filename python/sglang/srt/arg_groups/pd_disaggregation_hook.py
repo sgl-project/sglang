@@ -5,12 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
-from sglang.srt.arg_groups.model_hook import handle_language_model_only
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
 )
-from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -187,6 +185,8 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
 
 
 def handle_encoder_disaggregation(server_args: Any):
+    from sglang.srt.arg_groups.model_hook import handle_language_model_only
+    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
     from sglang.srt.server_args import resolve_encoder_transfer_backend
 
     cfg = resolving_view(server_args)
