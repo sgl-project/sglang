@@ -284,6 +284,13 @@ def handle_page_major_kv_layout(server_args: Any):
         )
     if not cfg.enable_page_major_kv_layout:
         return
+    assert cfg.enable_unified_memory, (
+        "--enable-page-major-kv-layout without --enable-unified-memory is "
+        "temporarily unsupported: the strided MHA K/V views were removed "
+        "and the static-pool page-major layout awaits its dense-view "
+        "reimplementation. Run with --enable-unified-memory, or drop "
+        "--enable-page-major-kv-layout."
+    )
     if cfg.enable_unified_memory:
         from sglang.srt.mem_cache.unified_memory_pool import (
             unified_memory_supported_for_model,

@@ -128,6 +128,17 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} must stay rejected without --enable-unified-memory",
             )
 
+    def test_plain_page_major_arm_is_gated_at_boot(self):
+        """The strided views were removed: --enable-page-major-kv-layout
+        without --enable-unified-memory must be rejected up front for EVERY
+        backend, Triton included, until the dense-view reimplementation."""
+        for backend in ("triton",) + self.DENSE_MLA_BACKENDS:
+            for use_mla in (True, False):
+                self.assertFalse(
+                    _accepts(backend, use_mla=use_mla, unified=False),
+                    f"{backend} must be rejected on the static page-major arm",
+                )
+
     def test_asymmetric_kv_mha_model_cannot_use_unified_memory(self):
         """head_dim != v_head_dim (MiMoV2): no uniform rows, so no dense views
         and no unified pool. The rejection is the POOL's, not a backend's, so
@@ -160,15 +171,10 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 )
 
     def test_helion_linear_attention_is_kda_only(self):
-        for unified in (True, False):
-            for phase in ("decode", "prefill"):
-                kwargs = {f"linear_{phase}": "helion"}
-                self.assertTrue(
-                    _accepts("triton", use_mla=True, unified=unified, **kwargs)
-                )
-                self.assertFalse(
-                    _accepts("triton", use_mla=False, unified=unified, **kwargs)
-                )
+        for phase in ("decode", "prefill"):
+            kwargs = {f"linear_{phase}": "helion"}
+            self.assertTrue(_accepts("triton", use_mla=True, **kwargs))
+            self.assertFalse(_accepts("triton", use_mla=False, **kwargs))
 
 
 if __name__ == "__main__":
