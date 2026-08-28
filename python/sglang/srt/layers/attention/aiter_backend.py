@@ -1513,13 +1513,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                 # Once per batch, not per layer: forward_extend only consumes it.
-                # The arch test is not redundant with the flag: the asm guard is
-                # gfx95-only, and elsewhere there is no kernel for this shape at
-                # all, so building a view we must not pass is wasted work.
+                # The asm guard is gfx95-only, and elsewhere there is no kernel
+                # for this shape at all, so building a view we must not pass is
+                # wasted work.
                 paged_kv_view = None
                 if (
-                    envs.SGLANG_AITER_PAGED_PREFILL_ASM.get()
-                    and is_gfx95_supported()
+                    is_gfx95_supported()
                     and self.page_size == 64
                     and not self.kv_cache_is_vectorized_5d
                     and not self.use_sliding_window_kv_pool
