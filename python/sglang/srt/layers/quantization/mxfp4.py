@@ -469,6 +469,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             delattr(layer, checkpoint_name)
             layer.register_parameter(runtime_name, checkpoint_param)
 
+    def prepare_weights_for_post_load(self, layer: torch.nn.Module) -> None:
+        self._bind_runtime_weight_names(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -641,7 +644,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        self._bind_runtime_weight_names(layer)
+        self.prepare_weights_for_post_load(layer)
 
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (

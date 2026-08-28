@@ -87,7 +87,7 @@ class TestMxfp4CheckpointWeightNames(CustomTestCase):
         layer.register_parameter("w13_weight_packed", w13)
         layer.register_parameter("w2_weight_packed", w2)
 
-        method._bind_runtime_weight_names(layer)
+        method.prepare_weights_for_post_load(layer)
 
         self.assertIs(layer.w13_weight, w13)
         self.assertIs(layer.w2_weight, w2)
@@ -96,7 +96,7 @@ class TestMxfp4CheckpointWeightNames(CustomTestCase):
         self.assertFalse(hasattr(layer, "w2_weight_packed"))
 
         # Finalization can be called again without changing the parameters.
-        method._bind_runtime_weight_names(layer)
+        method.prepare_weights_for_post_load(layer)
         self.assertIs(layer.w13_weight, w13)
         self.assertIs(layer.w2_weight, w2)
 
@@ -130,7 +130,7 @@ class TestMxfp4CheckpointWeightNames(CustomTestCase):
         layer.register_parameter("w13_weight", w13)
         layer.register_parameter("w2_weight", w2)
 
-        method._bind_runtime_weight_names(layer)
+        method.prepare_weights_for_post_load(layer)
 
         self.assertIs(layer.w13_weight, w13)
         self.assertIs(layer.w2_weight, w2)
