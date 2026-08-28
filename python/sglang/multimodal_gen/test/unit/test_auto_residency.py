@@ -147,6 +147,35 @@ class TestEstimateDefaultWorkloadTiming:
         assert stage_ns["DenoisingStage"] == 1_020_000_000
         assert request_ns == 1_120_000_000
 
+    def test_scales_standard_and_nonstandard_denoising_stages_together(self):
+        record = _record(
+            num_inference_steps=2,
+            total_duration_ms=1_200,
+            stage_duration_ms={
+                "TextEncodingStage": 100,
+                "DenoisingStage": 500,
+                "CustomDenoisingStage": 600,
+            },
+            phase_active_components={
+                "0:TextEncodingStage:use:text_encoder": ("text_encoder",),
+                "1:DenoisingStage:use:transformer": ("transformer",),
+                "2:CustomDenoisingStage:use:custom_refiner": ("custom_refiner",),
+            },
+        )
+
+        request_ns, stage_ns, _ = estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=10,
+        )
+
+        assert stage_ns == {
+            "TextEncodingStage": 100_000_000,
+            "DenoisingStage": 2_500_000_000,
+            "CustomDenoisingStage": 3_000_000_000,
+        }
+        assert request_ns == 5_600_000_000
+
     def test_transfer_savings_is_capped_by_request_not_component_stage(self):
         candidates = [
             _candidate("text_encoder", weight_gib=10, h2d_gib=10),

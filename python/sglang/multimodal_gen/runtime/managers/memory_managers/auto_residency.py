@@ -449,13 +449,12 @@ def estimate_default_workload_timing(
         if is_dit_component_name(component_name)
         for stage_name in stage_names
     }
-    if not denoising_stages:
-        denoising_stages = {
-            stage_name
-            for stage_name in representative.stage_duration_ms
-            if stage_name.endswith("DenoisingStage")
-            and not stage_name.endswith("BeforeDenoisingStage")
-        }
+    denoising_stages.update(
+        stage_name
+        for stage_name in representative.stage_duration_ms
+        if stage_name.endswith("DenoisingStage")
+        and not stage_name.endswith("BeforeDenoisingStage")
+    )
 
     measured_steps = max(1, representative.num_inference_steps)
     target_steps = max(1, target_num_inference_steps)
