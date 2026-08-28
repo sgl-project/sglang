@@ -10,7 +10,7 @@ so the file extension and decode path agree.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -74,6 +74,61 @@ class Cosmos3SamplingParams(SamplingParams):
     condition_frame_indexes: list[int] | None = None
     condition_video_keep: str = "first"
 
+    # Transfer (control-video) conditioning. ``control_path`` points to one or
+    # more pre-computed control videos (e.g. edge / blur / depth / seg / wsm
+    # maps). When set, each control clip is VAE-encoded and packed as clean
+    # vision tokens that prefix the target clip in the GEN sequence; multiple
+    # paths drive multi-hint transfer (e.g. edge + depth). Control clips reuse
+    # ``proj_in``, so every Cosmos3 checkpoint supports transfer.
+    control_path: str | list[str] | None = None
+
+    # Optional hint type(s) parallel to ``control_path`` (one of
+    # ``edge`` / ``blur`` / ``depth`` / ``seg`` / ``wsm``). Used only to apply
+    # tuned per-hint defaults (``guidance`` / ``control_guidance`` / ``shift``)
+    # when exactly one control input is given and the user left those unset.
+    control_hint: str | list[str] | None = None
+
+    # Control-CFG scale for transfer. ``1.0`` (default) disables the extra
+    # control-dropped forward; values > 1.0 amplify the control map's influence
+    # by blending the with-control and without-control predictions on the
+    # generated span: ``cond_nc + control_guidance * (cond_full - cond_nc)``.
+    control_guidance: float = 1.0
+
+    # Optional timestep window ``(lo, hi)`` restricting where control-CFG is
+    # applied (analogous to ``guidance_interval`` for text CFG). ``None`` applies
+    # it at every step.
+    control_guidance_interval: tuple[float, float] | None = None
+
+    # Long-video transfer controls. Chunks overlap by
+    # ``num_conditional_frames`` pixel frames; overlap frames from the previous
+    # decoded chunk are kept clean in the next chunk.
+    num_video_frames_per_chunk: int = 93
+    num_conditional_frames: int = 1
+    num_first_chunk_conditional_frames: int = 0
+    max_frames: int = 5000
+    show_control_condition: bool = False
+    show_input: bool = False
+    share_vision_temporal_positions: bool = True
+
+    # Tuned per-hint defaults applied when exactly one control input is given
+    # and the corresponding field was not set explicitly (mirrors the
+    # cosmos-framework ``_TRANSFER_DEFAULTS`` table). ``shift`` maps to
+    # ``flow_shift``. Multi-hint transfer keeps the request's own values.
+    _TRANSFER_DEFAULTS: ClassVar[dict[str, dict[str, float | int]]] = {
+        "edge": {"guidance": 3.0, "control_guidance": 1.5, "shift": 10.0},
+        "blur": {"guidance": 3.0, "control_guidance": 1.5, "shift": 10.0},
+        "depth": {"guidance": 3.0, "control_guidance": 1.5, "shift": 10.0},
+        "seg": {"guidance": 3.0, "control_guidance": 2.0, "shift": 10.0},
+        "wsm": {
+            "guidance": 1.0,
+            "control_guidance": 3.0,
+            "shift": 10.0,
+            "num_frames": 101,
+            "fps": 10,
+            "num_video_frames_per_chunk": 101,
+        },
+    }
+
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: [
             (1280, 720),
@@ -103,6 +158,108 @@ class Cosmos3SamplingParams(SamplingParams):
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "generate_sound",
+                "sound_duration",
+                "condition_frame_indexes",
+                "condition_frame_indexes_vision",
+                "condition_video_keep",
+                "control_path",
+                "control_hint",
+                "control_guidance",
+                "control_guidance_interval",
+                "num_video_frames_per_chunk",
+                "num_conditional_frames",
+                "num_first_chunk_conditional_frames",
+                "max_frames",
+                "show_control_condition",
+                "show_input",
+                "share_vision_temporal_positions",
+                "action_mode",
+                "domain_id",
+                "domain_name",
+                "raw_action_dim",
+                "action_fps",
+                "action",
+                "action_view_point",
+                "action_normalization",
+            }
+        )
+
+    def _resolve_control_paths(self) -> list[str]:
+        cp = self.control_path
+        if cp is None:
+            return []
+        if isinstance(cp, str):
+            return [cp] if cp else []
+        return [p for p in cp if isinstance(p, str) and p]
+
+    def _resolve_control_hints(self) -> list[str]:
+        hint = self.control_hint
+        if hint is None:
+            return []
+        hints = [hint] if isinstance(hint, str) else list(hint)
+        hints = [h for h in hints if h]
+        for h in hints:
+            if h not in self._TRANSFER_DEFAULTS:
+                raise ValueError(
+                    f"Unknown control_hint {h!r}; expected one of "
+                    f"{sorted(self._TRANSFER_DEFAULTS)}"
+                )
+        return hints
+
+    def _apply_transfer_hint_defaults(self) -> None:
+        """Fill tuned per-hint defaults for a single, typed control input.
+
+        Mirrors cosmos-framework: defaults apply only when there is exactly one
+        control input with a known hint type, and only to fields the user did
+        not pass explicitly (tracked via ``_explicit_fields``). Multi-hint
+        transfer keeps the request's own ``guidance`` / ``control_guidance`` /
+        ``flow_shift``.
+        """
+        if len(self._resolve_control_paths()) != 1:
+            return
+        hints = self._resolve_control_hints()
+        if len(hints) != 1:
+            return
+        defaults = self._TRANSFER_DEFAULTS.get(hints[0])
+        if defaults is None:
+            return
+        explicit = getattr(self, "_explicit_fields", None) or set()
+        if "control_guidance" not in explicit:
+            self.control_guidance = defaults["control_guidance"]
+        if "guidance_scale" not in explicit:
+            self.guidance_scale = defaults["guidance"]
+        if "flow_shift" not in explicit and self.flow_shift is None:
+            self.flow_shift = defaults["shift"]
+        for field_name in (
+            "num_frames",
+            "fps",
+            "num_video_frames_per_chunk",
+        ):
+            if field_name in defaults and field_name not in explicit:
+                setattr(self, field_name, defaults[field_name])
+
+    @classmethod
+    def lower_video_request_kwargs(
+        cls, request: Any, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply defaults that the generic video endpoint pre-resolves."""
+        hint = kwargs.get("control_hint")
+        paths = kwargs.get("control_path")
+        hints = [hint] if isinstance(hint, str) else list(hint or [])
+        control_paths = [paths] if isinstance(paths, str) else list(paths or [])
+        if len(control_paths) == 1 and hints == ["wsm"]:
+            defaults = cls._TRANSFER_DEFAULTS["wsm"]
+            if getattr(request, "num_frames", None) is None:
+                kwargs["num_frames"] = defaults["num_frames"]
+            if getattr(request, "fps", None) is None:
+                kwargs["fps"] = defaults["fps"]
+        return kwargs
+
     def _adjust(self, server_args) -> None:
         # adjust distil and edge args — read from the pre-computed config fields
         # so no checkpoint download happens at request time.
@@ -130,6 +287,37 @@ class Cosmos3SamplingParams(SamplingParams):
                 )
             action_output = self.action_mode != "forward_dynamics"
 
+        # Apply transfer per-hint defaults before the base resolves remaining
+        # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up
+        # the hint's tuned shift.
+        self._apply_transfer_hint_defaults()
+        control_paths = self._resolve_control_paths()
+        if control_paths:
+            if pipeline_config.distilled_sigmas is not None:
+                raise ValueError(
+                    "Cosmos3 distilled checkpoints do not support transfer inference"
+                )
+            if pipeline_config.is_edge:
+                raise ValueError(
+                    "Cosmos3 Edge checkpoints do not support transfer inference"
+                )
+            if self.num_frames == 1:
+                raise ValueError(
+                    "Cosmos3 transfer inference is supported only for video outputs"
+                )
+            if self.image_path is not None:
+                raise ValueError(
+                    "Cosmos3 transfer accepts control videos and an optional source "
+                    "video, not an image input"
+                )
+            if self.action_mode is not None:
+                raise ValueError(
+                    "Cosmos3 transfer cannot be combined with action generation"
+                )
+            if float(self.sound_duration or 0.0) > 0.0:
+                raise ValueError(
+                    "Cosmos3 transfer cannot be combined with sound generation"
+                )
         super()._adjust(server_args)
 
         # Policy and inverse dynamics produce actions. Forward dynamics consumes
@@ -141,6 +329,39 @@ class Cosmos3SamplingParams(SamplingParams):
             self.return_frames = False
             self.output_file_name = None
             self.output_compression = 0
+
+    def _validate(self) -> None:
+        super()._validate()
+        paths = self._resolve_control_paths()
+        hints = self._resolve_control_hints()
+        if hints and len(hints) != len(paths):
+            raise ValueError(
+                "control_hint must contain exactly one entry per control_path "
+                f"(got {len(hints)} hint(s) for {len(paths)} path(s))"
+            )
+        if self.control_guidance_interval is not None:
+            if len(self.control_guidance_interval) != 2:
+                raise ValueError(
+                    "control_guidance_interval must contain exactly two values"
+                )
+            lo, hi = self.control_guidance_interval
+            if float(lo) > float(hi):
+                raise ValueError(
+                    "control_guidance_interval must be ordered as (low, high)"
+                )
+        if self.num_video_frames_per_chunk <= 0:
+            raise ValueError("num_video_frames_per_chunk must be positive")
+        if self.num_conditional_frames < 0:
+            raise ValueError("num_conditional_frames must be non-negative")
+        if self.num_conditional_frames >= self.num_video_frames_per_chunk:
+            raise ValueError(
+                "num_conditional_frames must be smaller than "
+                "num_video_frames_per_chunk"
+            )
+        if self.num_first_chunk_conditional_frames < 0:
+            raise ValueError("num_first_chunk_conditional_frames must be non-negative")
+        if self.max_frames <= 0:
+            raise ValueError("max_frames must be positive")
 
     def _guidance_is_explicit(self) -> bool:
         explicit = getattr(self, "_explicit_fields", None)
