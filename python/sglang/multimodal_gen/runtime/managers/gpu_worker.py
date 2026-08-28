@@ -576,10 +576,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         output_batch = None
         forward_failed = False
         # Prewarm reqs (is_warmup=False) run a different offload layout and
-        # must not contaminate the calibration records.
+        # must not contaminate the calibration records. Pipelines that cannot
+        # apply a residency plan also skip the temporary per-layer hooks.
         measure_server_warmup = (
             req.is_warmup
             and bool(req.extra.get("server_based_warmup"))
+            and self.server_args.pipeline_config.supports_auto_residency
             and current_platform.is_cuda()
         )
         warmup_workload = (
