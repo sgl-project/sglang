@@ -15,7 +15,11 @@ class DFlashConfidenceObserver:
 
     _HIST_BINS = 1_000
 
-    def __init__(self) -> None:
+    def __init__(self, *, collect_device_metrics: bool = True) -> None:
+        # Detailed metrics require CUDA-to-host reductions/copies. They are useful
+        # while tuning a scheduler, but must never be enabled implicitly on the
+        # serving decode path.
+        self.collect_device_metrics = bool(collect_device_metrics)
         self._confidence_hist = torch.zeros(self._HIST_BINS, dtype=torch.int64)
         self._confidence_sum = 0.0
         self._confidence_count = 0
@@ -29,10 +33,24 @@ class DFlashConfidenceObserver:
         self._step_started_at: float | None = None
         self._forward_ct = 0
         self._verify_num_draft_tokens: int | None = None
+        self._forced_budget_frac: float | None = None
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
 
     def configure_sps(self, *, verify_num_draft_tokens: int) -> None:
         self._verify_num_draft_tokens = int(verify_num_draft_tokens)
+
+    def set_forced_budget_frac(self, frac: float | None) -> None:
+        self._forced_budget_frac = frac
+
+    @property
+    def sps_recording_enabled(self) -> bool:
+        """Whether ``finish_step`` will consume per-step SPS records.
+
+        Hot-path callers gate device-to-host reductions (for example
+        ``verify_lens.sum().item()``) on this flag so a decode step stays
+        synchronization-free unless SPS profiling was explicitly requested.
+        """
+        return self._sps_enabled
 
     def begin_step(self) -> None:
         """Start wall-clock timing for one uniform DFLASH2 decode step."""
@@ -42,6 +60,12 @@ class DFlashConfidenceObserver:
     def finish_step(self, *, batch_size: int, verify_tokens: int) -> None:
         if not self._sps_enabled or self._step_started_at is None:
             return
+        # Decode launches are asynchronous.  SPS tables price completed GPU
+        # work, so synchronize only in the explicit offline profiler; without
+        # this, the host merely measures kernel-enqueue latency and makes every
+        # compact graph tier look spuriously identical.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         elapsed_ms = (time.monotonic() - self._step_started_at) * 1_000.0
         self._sps_records.append(
             {
@@ -63,7 +87,11 @@ class DFlashConfidenceObserver:
         deferred_tokens: int = 0,
         low_confidence_tokens: int = 0,
     ) -> None:
+        # Reason counting is host-only. Do it unconditionally so operators can
+        # still tell whether compact verify was admitted without perturbing it.
         self._verify_reasons[reason] += 1
+        if not self.collect_device_metrics:
+            return
         if verify_lens is not None:
             self._verify_batch_sizes[int(verify_lens.sum().item())] += 1
             self.deferred_requests += int(
@@ -82,7 +110,7 @@ class DFlashConfidenceObserver:
         self.low_confidence_tokens += int(low_confidence_tokens)
 
     def clear(self) -> None:
-        self.__init__()
+        self.__init__(collect_device_metrics=self.collect_device_metrics)
 
     def _quantile(self, q: float) -> float:
         if self._confidence_count == 0:
@@ -113,7 +141,11 @@ class DFlashConfidenceObserver:
             "deferred_tokens": self.deferred_tokens,
             "low_confidence_tokens": self.low_confidence_tokens,
             "deferred_wait_ms": {"mean": 0.0, "max": 0.0},
-            "mode": "static" if self._sps_enabled else "confidence",
+            "mode": (
+                "compact"
+                if self._sps_enabled and self._forced_budget_frac is not None
+                else "static" if self._sps_enabled else "confidence"
+            ),
             "verify_num_draft_tokens": self._verify_num_draft_tokens,
             "components": ["core", "step_cpu_time"] if self._sps_enabled else [],
             "simulate_acc_len": (

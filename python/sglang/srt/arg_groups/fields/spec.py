@@ -77,21 +77,13 @@ class Spec:
         float,
         "DFLASH_CONFIDENCE only. Selected-path confidence threshold used for diagnostics and verify-prefix planning.",
     ] = 0.5
-    speculative_dflash_confidence_min_verify_len: A[
-        int,
-        "DFLASH_CONFIDENCE only. Per-request target-verify floor including the anchor token; 1 means anchor-only verification and a bonus-only commit step.",
-    ] = 1
     speculative_dflash_confidence_target_verify_tokens: A[
         int,
-        "DFLASH_CONFIDENCE only. Fixed total target-verify token target; zero preserves full verification without an SPS table.",
+        "DFLASH_CONFIDENCE only. Fixed per-request target-verify width including the anchor; zero preserves full verification without an SPS table.",
     ] = 0
     speculative_dflash_confidence_sps_table_path: A[
         Optional[str],
         "DFLASH_CONFIDENCE only. Path to a DSpark-format pre-profiled SPS cost table JSON.",
-    ] = None
-    speculative_dflash_confidence_sts_path: A[
-        Optional[str],
-        "DFLASH_CONFIDENCE only. Path to a per-position sequential temperature scaling calibration JSON for the trained confidence head.",
     ] = None
     speculative_dflash_confidence_align_verify_tokens_to_graph_tier: A[
         bool,

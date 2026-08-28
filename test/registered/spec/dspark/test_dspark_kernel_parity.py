@@ -257,6 +257,26 @@ def _case_commit_kv_proj(tc):
 
 def _case_compact_layout(tc):
     torch.manual_seed(10)
+    # DFLASH supplies the anchor as [:, :-1] and proposals as [:, 1:] from
+    # one [bs, verify_width] block. Both views must have the proposal width
+    # after CompactVerifyIds normalizes them for the Triton row-stride contract.
+    dflash_block = torch.arange(4 * 6, device=DEVICE, dtype=torch.int64).view(4, 6)
+    dflash_lens = torch.tensor([6, 4, 2, 5], dtype=torch.int32, device=DEVICE)
+    dflash_layout = _layout(dflash_lens, int(dflash_lens.sum().item()))
+    dflash_ids = dspark_verify_window.CompactVerifyIds.triton(
+        draft_block_ids=dflash_block[:, :-1],
+        draft_tokens=dflash_block[:, 1:],
+        layout=dflash_layout,
+        device=DEVICE,
+    )
+    expected_dflash_ids = torch.cat(
+        [
+            dflash_block[row, : int(length)]
+            for row, length in enumerate(dflash_lens.cpu().tolist())
+        ]
+    )
+    tc._eq(dflash_ids, expected_dflash_ids)
+
     gamma, t, bs = 5, 6, 64
     verify_lens = _ri(1, t + 1, (bs,), torch.int32)
     total = int(verify_lens.sum().item())
