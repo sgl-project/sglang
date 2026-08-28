@@ -80,6 +80,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_lora,
     get_parallel,
     get_spec,
@@ -858,7 +859,7 @@ class TokenizerControlMixin:
             return PdRoleSwitchReqOutput(
                 success=False,
                 message="--enable-pd-role-switch is not set on this server",
-                old_role=self.server_args.disaggregation_mode,
+                old_role=get_disagg().disaggregation_mode,
                 new_role=obj.new_role,
                 safe_to_restore=True,
             )

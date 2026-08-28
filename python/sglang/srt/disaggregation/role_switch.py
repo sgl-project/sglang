@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
@@ -193,7 +193,7 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
         (
             km is not None and not km.supports_role_switch,
             True,
-            lambda: f"transfer backend {sa.disaggregation_transfer_backend!r} "
+            lambda: f"transfer backend {get_disagg().disaggregation_transfer_backend!r} "
             "does not support runtime role switch",
         ),
         (
