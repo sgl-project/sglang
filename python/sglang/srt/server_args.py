@@ -6940,6 +6940,25 @@ class ServerArgs:
                 "dynamic" if needs_rank_invariant_dispatch else "static"
             )
 
+        # LPLB divides one logical expert's traffic among its physical
+        # replicas. With no redundant experts there are no replicas, so every
+        # logical expert has exactly one destination and the LP decides
+        # nothing -- it would still build and solve a degenerate program on
+        # every MoE layer of every forward. Catch it here, while the config is
+        # being read, rather than letting it run: a silently-inert LPLB looks
+        # identical to a working one from the outside.
+        if (
+            self.ep_dispatch_algorithm == "lp"
+            and self._resolved().ep_num_redundant_experts == 0
+        ):
+            raise ValueError(
+                "--ep-dispatch-algorithm lp splits a logical expert's traffic "
+                "across its physical replicas, but this deployment has no "
+                "redundant experts, so no expert has a second replica to split "
+                "across. Set --ep-num-redundant-experts to a positive multiple "
+                "of --ep-size, or drop --ep-dispatch-algorithm lp."
+            )
+
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
         # per-rank table and `lp` samples inside its kernel.
         if needs_rank_invariant_dispatch and self.ep_dispatch_algorithm in (

@@ -77,6 +77,25 @@ def _make_metadata(rebalanced: bool = False):
     return phy2log, log2phy, num_valid
 
 
+def test_lp_is_rejected_without_redundant_experts():
+    """LPLB must be refused at config time when no expert has a replica.
+
+    With ep_num_redundant_experts == 0 every logical expert has exactly one
+    physical destination, so the LP has nothing to divide -- but it would
+    still build and solve a degenerate program on every MoE layer of every
+    forward. A silently-inert LPLB is indistinguishable from a working one
+    from the outside, so this has to fail loudly while the config is read.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="no redundant experts"):
+        ServerArgs(
+            model_path="deepseek-ai/DeepSeek-V2-Lite",
+            ep_dispatch_algorithm="lp",
+            ep_num_redundant_experts=0,
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="This test requires CUDA",
