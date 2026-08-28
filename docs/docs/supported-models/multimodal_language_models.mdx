@@ -390,7 +390,7 @@ curl http://localhost:30000/v1/chat/completions \
   }'
 ```
 
-To serve only the text model (skipping the vision tower entirely), add `--language-model-only`. In this mode `/model_info` reports no image or video understanding and media requests are rejected:
+To serve only the text model (skipping the vision tower entirely), add `--language-model-only`. In this mode `/model_info` reports `has_image_understanding: false`, and requests containing image or video inputs are rejected:
 
 ```bash Text-Only Launch
 sglang serve \
