@@ -332,7 +332,13 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
-        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
+        # Text-only serving comes from either the checkpoint's own declaration
+        # or the --language-model-only flag; every capability flag below
+        # (is_multimodal, is_*_understandable_model) must see both sources,
+        # since /model_info advertises them and drives media warmup requests.
+        self.is_lm_only = language_model_only or getattr(
+            self.hf_config, "language_model_only", False
+        )
         self.model_is_mrope = (
             not self.is_lm_only
             and rope_scaling is not None
@@ -557,7 +563,7 @@ class ModelConfig:
         # Checkpoints declare this one themselves (hf_transformers/processor.py),
         # so the flag may only turn it on: writing the default back would build a
         # vision tower with no weights to fill.
-        self.hf_config.language_model_only = language_model_only or self.is_lm_only
+        self.hf_config.language_model_only = self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
