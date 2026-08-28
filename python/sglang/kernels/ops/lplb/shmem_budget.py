@@ -1,15 +1,22 @@
 """Shared-memory budget accounting for the fused IPM kernel.
 
-Fused layout (fp32), one block per LP, all state in shared memory::
+Fused layout (fp32), one block per LP, all state in shared memory. This
+mirrors ``ipm_smem`` in ``csrc/lplb/ipm.cuh`` member for member -- keep the
+two in sync, because ``LaunchKernel`` is given ``sizeof(ipm_smem<NC,NV>)``
+and a budget that under-reports lets a shape pass :func:`assert_fits` and
+then fail to launch::
 
-    A        NC * NV       constraint matrix     (resident)
-    c        NV            cost vector           (resident)
-    x        NV            IPM state             (resident)
+    b        NC            RHS vector
+    a        NC * NV       constraint matrix
+    c        NV            cost vector
+    xx       NV            x^2, the syrk weights
     ata      NC * NC       KKT matrix / Cholesky factor
-    rhs      NC            ax2c, then delta
-    d        NV            aliased with r = A.T @ delta
+    x        NV            IPM state
+    ax2c     NC            A X^2 c, then delta
+    r        NV            delta^T A
+    d        NV            step direction
 
-    S_elems = NC*NV + NC*NC + 3*NV + NC
+    S_elems = NC*NV + NC*NC + 5*NV + 2*NC
 
 Dynamic shared-memory cap per block (with opt-in via
 ``cudaFuncAttributeMaxDynamicSharedMemorySize``):
@@ -71,7 +78,7 @@ class ShmemBreakdown:
 
 def shmem_bytes(nc: int, nv: int, bytes_per_elem: int = _BYTES_PER_ELEM) -> int:
     """Exact byte count for the fused layout with the given (NC, NV)."""
-    return bytes_per_elem * (nc * nv + nc * nc + 3 * nv + nc) + _RUNTIME_PAD_BYTES
+    return bytes_per_elem * (nc * nv + nc * nc + 5 * nv + 2 * nc) + _RUNTIME_PAD_BYTES
 
 
 def breakdown(
@@ -86,8 +93,8 @@ def breakdown(
         c_bytes=b * nv,
         x_bytes=b * nv,
         ata_bytes=b * nc * nc,
-        rhs_bytes=b * nc,
-        d_bytes=b * nv,
+        rhs_bytes=b * 2 * nc,
+        d_bytes=b * 3 * nv,
         pad_bytes=_RUNTIME_PAD_BYTES,
     )
 
@@ -119,20 +126,20 @@ def assert_fits(nc: int, nv: int, gpu: str = "h100") -> None:
 
 def max_nc_for_nv(nv: int, gpu: str = "h100") -> int:
     """Largest NC that fits for a given NV. Solves
-        4 * (NC^2 + (NV+1)*NC + 3*NV) + pad <= cap
+        4 * (NC^2 + (NV+2)*NC + 5*NV) + pad <= cap
     via the quadratic formula (monotone in NC). Returns 0 if even NC=1 overflows.
     """
     cap = gpu_budget_bytes(gpu)
     b = _BYTES_PER_ELEM
-    # cap - pad >= b * (NC^2 + (NV+1)*NC + 3*NV)
-    rhs = (cap - _RUNTIME_PAD_BYTES) / b - 3 * nv
+    # cap - pad >= b * (NC^2 + (NV+2)*NC + 5*NV)
+    rhs = (cap - _RUNTIME_PAD_BYTES) / b - 5 * nv
     if rhs <= 0:
         return 0
-    # NC^2 + (NV+1)*NC - rhs <= 0
+    # NC^2 + (NV+2)*NC - rhs <= 0
     import math
 
-    disc = (nv + 1) ** 2 + 4 * rhs
-    nc_max = int((-(nv + 1) + math.sqrt(disc)) / 2.0)
+    disc = (nv + 2) ** 2 + 4 * rhs
+    nc_max = int((-(nv + 2) + math.sqrt(disc)) / 2.0)
     while nc_max > 0 and shmem_bytes(nc_max, nv) > cap:
         nc_max -= 1
     return max(nc_max, 0)

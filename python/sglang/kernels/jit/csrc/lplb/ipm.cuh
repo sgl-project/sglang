@@ -2,10 +2,9 @@
 //
 // Solves min c^T x subject to A x = b, x >= 0 with a barrier method:
 //   for step in 0..NUM_ITERS:
-//     ax2  = A * x^2
-//     ax2a = ax2 @ A^T          (cuBLASDx GEMM)
-//     ax2c = ax2 @ c            (cuBLASDx GEMM)
-//     d    = solve(ax2a, ax2c)  (cuSolverDx Cholesky/POSV)
+//     ax2a = A X^2 A^T          (fused weighted syrk, lower triangle)
+//     ax2c = A X^2 c            (same pass)
+//     d    = solve(ax2a, ax2c)  (block Cholesky)
 //     r    = d^T @ A
 //     d    = x * (c - r)
 //     x   *= 1 - 0.999 * d / max(d)
@@ -35,7 +34,7 @@ struct ipm_smem {
   float b[NC];
   float a[NC][NV];
   float c[NV];
-  float ax2[NC][NV];
+  float xx[NV];
   float ax2a[NC][NC];
   float x[NV];
   float ax2c[NC];
@@ -157,7 +156,7 @@ __global__ void ipm_solve_kernel(
   }
   __syncthreads();
 
-  auto& ax2 = smem->ax2;
+  auto& xx = smem->xx;
   auto& ax2a = smem->ax2a;
   auto& x = smem->x;
   auto& ax2c = smem->ax2c;
@@ -174,14 +173,38 @@ __global__ void ipm_solve_kernel(
   __syncthreads();
 
   for (int step = 0; step < NUM_ITERS; step++) {
-    for (int ij = tid; ij < NC * NV; ij += dim) {
-      int i = ij / NV, j = ij % NV;
-      ax2[i][j] = a[i][j] * x[j] * x[j];
+    // ax2a = A X^2 A^T and ax2c = A X^2 c, accumulated in one pass over `a`.
+    //
+    // Previously this staged ax2 = A X^2 into an NC x NV shared-memory array
+    // just to hand it to two cuBLASDx GEMMs. X is diagonal, so both products
+    // can be formed directly and ax2 never has to exist -- which removes the
+    // larger of the two NC x NV shared arrays and is what lets the worst-case
+    // (NC, NV) for EP=64 fit in shared memory at all.
+    //
+    // Only the LOWER triangle of ax2a is written: it is symmetric, and
+    // cholesky_factor / cholesky_apply read nothing above the diagonal.
+    for (int v = tid; v < NV; v += dim) {
+      xx[v] = x[v] * x[v];
     }
     __syncthreads();
 
-    matmul_NT<NC, NC, NV, SM_VER, BLOCK_DIM>(ax2[0], a[0], ax2a[0]);
-    matmul_NT<NC, 1, NV, SM_VER, BLOCK_DIM>(ax2[0], c, ax2c);
+    for (int idx = tid; idx < NC * NC; idx += dim) {
+      const int i = idx / NC, j = idx % NC;
+      if (j > i) continue;  // upper triangle is never read
+      float s = 0.f;
+      for (int v = 0; v < NV; v++) {
+        s += a[i][v] * a[j][v] * xx[v];
+      }
+      ax2a[i][j] = s;
+    }
+    for (int i = tid; i < NC; i += dim) {
+      float s = 0.f;
+      for (int v = 0; v < NV; v++) {
+        s += a[i][v] * xx[v] * c[v];
+      }
+      ax2c[i] = s;
+    }
+    __syncthreads();
     cholesky_solve<NC, SM_VER, BLOCK_DIM>(ax2a, ax2c);
     matmul_NN<1, NV, NC, SM_VER, BLOCK_DIM>(ax2c, a[0], r);
 

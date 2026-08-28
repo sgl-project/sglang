@@ -119,6 +119,36 @@ def test_dispatch_probability_matches_torch_reference():
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="LPLB's fused IPM requires Hopper or newer",
+)
+def test_shmem_budget_admits_only_launchable_shapes():
+    """Any shape ``assert_fits`` accepts must actually launch.
+
+    ``shmem_budget`` is a hand-maintained model of the ``ipm_smem`` struct in
+    ``csrc/lplb/ipm.cuh``. If the two drift, the model under-reports, a shape
+    sails through ``assert_fits``, and the launch then fails with
+    ``cudaErrorInvalidValue`` -- at whatever expert placement first happens to
+    need it, i.e. potentially mid-run after an EPLB rebalance rather than at
+    startup.
+
+    Checked at the largest shape LPLB is expected to build: EP=64 with 64
+    redundant experts, where NC = R + G and NV = 2R + G + 2. That is close
+    enough to the per-block cap that a mis-modelled array shows up.
+    """
+    from sglang.kernels.ops.lplb.cuda_solver import warmup
+    from sglang.kernels.ops.lplb.shmem_budget import assert_fits, shmem_bytes
+
+    nc, nv = 128, 194
+    assert_fits(nc, nv)
+    # Raises if cudaFuncSetAttribute or the launch rejects the shape.
+    warmup(nc, nv)
+    print(
+        f"\n[shmem] NC={nc} NV={nv} -> {shmem_bytes(nc, nv) / 1024:.1f} KiB, launched"
+    )
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="This test requires CUDA",
 )
