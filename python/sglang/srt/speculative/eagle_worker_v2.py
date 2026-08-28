@@ -344,7 +344,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
-        if self.draft_extend_attn_backend is not None:
+        if (
+            self.draft_extend_attn_backend is not None
+            and self.draft_runner.prefill_attention_backend_str
+            == self.draft_runner.decode_attention_backend_str
+        ):
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = default_tree_mask_mode()
 

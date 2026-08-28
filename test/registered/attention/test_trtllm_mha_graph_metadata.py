@@ -122,6 +122,159 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert calls[0]["q_stride"] == 4
 
 
+@pytest.mark.parametrize(
+    ("forward_mode", "seq_lens", "q_len", "expected_prefix", "expected_total"),
+    [
+        (ForwardMode.TARGET_VERIFY, [9, 17], 4, [9, 17], [13, 21]),
+        (ForwardMode.DRAFT_EXTEND_V2, [13, 21], 4, [9, 17], [13, 21]),
+    ],
+)
+def test_dcp_spec_metadata_keeps_global_prefix_and_local_total(
+    forward_mode, seq_lens, q_len, expected_prefix, expected_total
+):
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.dcp_size = 4
+    backend.dcp_rank = 2
+    backend.speculative_step_id = 0
+    backend.page_size = PAGE_SIZE
+    backend.max_num_pages = 2
+    backend._swa_kv_pool = None
+    backend.expand_encoder_only_verify = False
+    backend.use_sliding_window_kv_pool = False
+    backend._fill_page_table_device = lambda *_args, **_kwargs: None
+    backend._maybe_build_cp_zigzag_page_tables = lambda *_args, **_kwargs: None
+
+    batch_size = len(seq_lens)
+    spec_info = SimpleNamespace(
+        num_tokens_per_req=q_len,
+        ragged_verify_layout=None,
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=batch_size,
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+        forward_mode=forward_mode,
+        spec_info=spec_info,
+        input_ids=torch.zeros(batch_size * q_len, dtype=torch.int64),
+        req_pool_indices=torch.arange(batch_size, dtype=torch.int64),
+        out_cache_loc=None,
+    )
+
+    backend.init_forward_metadata(forward_batch)
+    metadata = backend.forward_metadata
+    expected_total = torch.tensor(expected_total, dtype=torch.int32)
+    expected_local = expected_total // backend.dcp_size + (
+        backend.dcp_rank < expected_total % backend.dcp_size
+    )
+    torch.testing.assert_close(
+        metadata.causal_seqlens_kv_global,
+        torch.tensor(expected_prefix, dtype=torch.int32),
+    )
+    torch.testing.assert_close(metadata.cache_seqlens_int32, expected_local)
+    assert metadata.max_seq_len_q == q_len
+    torch.testing.assert_close(
+        metadata.cu_seqlens_q,
+        torch.arange(0, batch_size * q_len + 1, q_len, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize("q_len", [1, 4])
+def test_dcp_spec_decode_forwards_cake_contract_and_base2_lse(monkeypatch, q_len):
+    kernel_calls = []
+    merge_calls = []
+
+    def fake_decode(**kwargs):
+        kernel_calls.append(kwargs)
+        query = kwargs["query"]
+        return (
+            torch.zeros_like(query),
+            torch.zeros(query.shape[:2], dtype=torch.float32),
+        )
+
+    def fake_merge(out, lse, group, **kwargs):
+        merge_calls.append((lse, group, kwargs))
+        return out[:, : out.shape[1] // group.world_size]
+
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "flashinfer",
+        SimpleNamespace(
+            decode=SimpleNamespace(trtllm_batch_decode_with_kv_cache=fake_decode)
+        ),
+    )
+    monkeypatch.setattr(trtllm_mha_backend, "cp_lse_ag_out_rs_mha", fake_merge)
+
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.dcp_size = 4
+    backend.dcp_rank = 1
+    backend.dcp_group = SimpleNamespace(world_size=4)
+    backend.dcp_max_context_len = 32768
+    backend.max_context_len = 131072
+    backend.workspace_buffer = torch.empty(1, dtype=torch.uint8)
+    backend.q_data_type = torch.bfloat16
+    backend._multi_ctas_kv_counter_buffer = torch.zeros(1, dtype=torch.int32)
+    backend.decode_seq_len_splits = 8
+    backend.dcp_cuda_graph_out_buffer = None
+    backend.dcp_cuda_graph_lse_buffer = None
+
+    batch_size, num_heads, head_dim = 2, 16, 256
+    query = torch.zeros(batch_size * q_len, num_heads, head_dim, dtype=torch.bfloat16)
+    causal_prefix = torch.tensor([1024, 2048], dtype=torch.int32)
+    output = backend._run_fixed_q_len_decode(
+        query,
+        (torch.empty(0), torch.empty(0)),
+        torch.zeros(batch_size, 1, dtype=torch.int32),
+        torch.tensor([257, 513], dtype=torch.int32),
+        bmm1_scale=0.125,
+        bmm2_scale=1.0,
+        window_left=-1,
+        sinks=None,
+        q_len_per_req=q_len,
+        causal_seqlens_kv_global=causal_prefix,
+    )
+
+    assert output.shape == (batch_size * q_len, num_heads // 4, head_dim)
+    assert len(kernel_calls) == 1
+    call = kernel_calls[0]
+    assert call["cp_world"] == 4
+    assert call["cp_rank"] == 1
+    assert call["causal_seqlens_kv_global"] is causal_prefix
+    assert call["q_len_per_req"] == q_len
+    assert call["max_seq_len"] == backend.dcp_max_context_len
+    assert call["return_lse"] is True
+    assert call["skip_softmax_threshold_scale_factor"] is None
+    assert len(merge_calls) == 1
+    assert merge_calls[0][2] == {"is_lse_base_on_e": False}
+
+
+def test_dcp_spec_q_gather_reuses_graph_stable_buffer():
+    class FakeGroup:
+        def all_gather_into_tensor(self, output, query):
+            rows = query.shape[0]
+            for rank in range(4):
+                output[rank * rows : (rank + 1) * rows].copy_(query + rank * 100)
+
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.dcp_size = 4
+    backend.dcp_group = FakeGroup()
+    backend.num_q_heads = 2
+    backend.head_dim = 3
+    backend.dcp_cuda_graph_q_gather_buffer = torch.empty(6 * 4, 2, 3)
+    backend.dcp_cuda_graph_q_buffer = torch.empty(6, 8, 3)
+
+    query = torch.arange(2 * 2 * 3, dtype=torch.float32).view(2, 2, 3)
+    stable_query = backend._all_gather_dcp_spec_q(query)
+    expected = torch.cat([query + rank * 100 for rank in range(4)], dim=1)
+    torch.testing.assert_close(stable_query, expected)
+
+    stable_ptr = stable_query.data_ptr()
+    stable_query = backend._all_gather_dcp_spec_q(query + 1)
+    assert stable_query.data_ptr() == stable_ptr
+    torch.testing.assert_close(
+        stable_query,
+        torch.cat([query + 1 + rank * 100 for rank in range(4)], dim=1),
+    )
+
+
 def test_hybrid_wrappers_forward_in_graph_hook():
     # The hybrid backend reads the mode from the published configuration.
     from sglang.srt.runtime_context import get_context
@@ -581,6 +734,7 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
     )
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=DEVICE)
     cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    causal_seqlens_kv_global = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
     cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
     page_table = torch.full((bs, max_seq_pages), -1, dtype=torch.int32, device=DEVICE)
 
@@ -595,6 +749,8 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
         seqlen_offset=0,
         max_seq_pages=max_seq_pages,
         page_size=PAGE_SIZE,
+        causal_seqlens_kv_global=causal_seqlens_kv_global,
+        causal_seqlen_offset=-1,
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
     )
@@ -604,6 +760,9 @@ def test_dcp_metadata_uses_local_lens_and_page_table():
         torch.int32
     )
     torch.testing.assert_close(cache_seqlens, local_lens, rtol=0, atol=0)
+    torch.testing.assert_close(
+        causal_seqlens_kv_global, global_lens - 1, rtol=0, atol=0
+    )
     torch.testing.assert_close(
         cu_seqlens_k[1:],
         torch.cumsum(local_lens, dim=0, dtype=torch.int32),

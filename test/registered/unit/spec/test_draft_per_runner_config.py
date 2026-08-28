@@ -156,6 +156,23 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         )
         self.assertEqual((draft.prefill, draft.decode), ("triton", "triton"))
 
+    def test_dcp_trtllm_draft_preserves_the_prompt_prefill_backend(self):
+        self._seed(
+            attention_backend="trtllm_mha",
+            prefill_attention_backend="triton",
+            decode_attention_backend="trtllm_mha",
+            dcp_size=4,
+        )
+
+        draft = resolve_attention_backend_strs(
+            model_runner=self._runner(
+                is_draft_worker=True, draft_attention_backend="trtllm_mha"
+            )
+        )
+
+        self.assertEqual((draft.prefill, draft.decode), ("triton", "trtllm_mha"))
+        self.assertTrue(draft.is_draft_override)
+
     def test_the_target_keeps_its_split_pair(self):
         self._seed(
             attention_backend="fa3",
