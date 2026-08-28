@@ -246,6 +246,19 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             resolve_component_precision(self._server_args(), "text_encoder_0"),
             torch.float16,
         )
+        self.assertEqual(
+            resolve_component_precision(self._server_args(), "delight_text_encoder"),
+            torch.float16,
+        )
+        self.assertEqual(
+            resolve_component_precision(
+                self._server_args(
+                    component_precisions={"delight_text_encoder": "bf16"}
+                ),
+                "delight_text_encoder",
+            ),
+            torch.bfloat16,
+        )
 
     def test_paired_dit_rejects_mixed_component_precision(self):
         server_args = self._server_args(component_precisions={"transformer_2": "bf16"})
@@ -276,6 +289,7 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
             "image_encoder": torch.float16,
             "text_encoder": torch.float16,
             "text_encoder_2": torch.bfloat16,
+            "delight_text_encoder": torch.float16,
         }
 
         for module_name, expected_dtype in expected.items():

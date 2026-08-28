@@ -105,7 +105,7 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
             return None
         index = max(int(suffix) - 1, 0)
     elif is_text_encoder_component_name(module_name):
-        return None
+        index = 0
     else:
         return None
 
