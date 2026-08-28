@@ -9,7 +9,9 @@
 //   attention   — TP/CP/DP-Attention knobs
 //   moe         — backend (+ MegaMoE quantization sub-select) + EP
 //   parsers     — per-item toggle flags
-//   speculative — single-select preset
+//   speculative — single-select preset; an option may carry `note` (a
+//                 prerequisite line rendered under the chips while that option
+//                 is the one in effect)
 //
 // Axis-level `showWhen(base)` (any axis): the card is not rendered when the Deploy
 // panel has not switched that feature on. `base` carries the cell match dims plus
@@ -842,6 +844,11 @@ export const Playground = ({ config }) => {
               || head === "--speculative-num-steps"
               || head === "--speculative-eagle-topk"
               || head === "--speculative-num-draft-tokens"
+              // Adaptive draft depth is part of an EAGLE preset, not a
+              // separate knob: a base that carries it must strip it when
+              // another algorithm is picked, or the flag survives and the
+              // server warns it away (only EAGLE/EAGLE3 honor it).
+              || head === "--speculative-adaptive"
               || head === "--speculative-dspark-block-size"
               || head === "--enable-linear-replayssm-spec"
               || head === "--linear-replayssm-cache-len"
@@ -870,6 +877,7 @@ export const Playground = ({ config }) => {
         flags = h.stripFlagsByFirstToken(flags, [
           "--speculative-algorithm", "--speculative-num-steps",
           "--speculative-eagle-topk", "--speculative-num-draft-tokens",
+          "--speculative-adaptive",
           "--speculative-dspark-block-size", "--enable-linear-replayssm-spec",
           "--linear-replayssm-cache-len",
           "--speculative-ngram-max-bfs-breadth",
@@ -891,6 +899,12 @@ export const Playground = ({ config }) => {
           .map((opt) => h.evaluateChip(opt, base))
           .filter((c) => !c.hidden && !(hideCurrent && c.value === "current"));
         if (visible.length === 0) return null;
+        // An option may carry a `note`: a prerequisite the reader must act on
+        // before the composed command runs at all (an algorithm whose support
+        // is not in the page's pinned image yet, a draft checkpoint to fetch).
+        // Shown only for the option in effect, so the card stays a chip row
+        // until the pick actually needs something.
+        const note = (visible.find((c) => c.value === display) || {}).note;
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
@@ -903,6 +917,7 @@ export const Playground = ({ config }) => {
                 </span>
               ))}
             </div>
+            {note && <div style={s.axisNote}>{note}</div>}
           </div>
         );
       },
@@ -1772,6 +1787,16 @@ export const Playground = ({ config }) => {
       fontSize: "12px", lineHeight: "1.5",
       color: isDark ? "#e5e7eb" : "#374151",
       whiteSpace: "pre-wrap", overflowX: "auto", margin: 0,
+    },
+    // Amber callout for a prerequisite an axis option carries — rendered
+    // inside the axis card, so it reads as a condition on the pick rather
+    // than on the composed command.
+    axisNote: {
+      margin: "6px 0 0", padding: "6px 10px", borderRadius: "6px",
+      fontSize: "11px", lineHeight: "1.45",
+      background: isDark ? "#78350f" : "#fef3c7",
+      color: isDark ? "#fde68a" : "#92400e",
+      border: `1px solid ${isDark ? "#92400e" : "#fcd34d"}`,
     },
     // Amber callout under the playground command when the effective (post-
     // override) command turns speculative decoding on without setting

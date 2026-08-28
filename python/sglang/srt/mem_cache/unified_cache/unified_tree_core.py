@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -939,7 +940,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _is_deferrable_action(action: CacheAction | ComponentAction) -> bool:
         """Fire-and-forget actions safe to batch until the next barrier."""
-        return isinstance(action, (FreeDeviceKV, ReplaceWriteThroughOnNodeSplit))
+        return isinstance(
+            action,
+            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+        )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
