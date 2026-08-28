@@ -568,22 +568,19 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_tp1 = (
             self._ep_a2a and not get_parallel().enable_shared_experts_attn_tp
         )
-        # NPU compatibility mode keeps DeepEP's DP-local token dispatch but
-        # uses the original TP-sharded shared MLP. Gather only that branch's
-        # inputs, then reduce-scatter its output back to the DP-local rows.
+        # NPU compatibility mode keeps DeepEP's token dispatch but uses the
+        # original TP-sharded shared MLP. Gather only that branch's inputs,
+        # then reduce-scatter its output back to the rank-local rows. This
+        # covers both DP-local batches and no-DP SP-MoE token shards.
         self._shared_experts_attn_tp_comm = (
             get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
-            and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
-        elif (
-            get_parallel().enable_shared_experts_attn_tp
-            and get_parallel().attn_tp_size > 1
-        ):
+        elif self._shared_experts_attn_tp_comm:
             shared_experts_tp_kwargs = dict(
                 tp_rank=get_parallel().attn_tp_rank,
                 tp_size=get_parallel().attn_tp_size,
