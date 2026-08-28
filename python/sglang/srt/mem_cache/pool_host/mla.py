@@ -534,6 +534,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         for comp in comps:
             vals.extend(comp)
         
+
+        def _rewrite_host_base_to_dva(vals):
+            _KV_EXCHANGE_META_HEADER = 6
+            _KV_EXCHANGE_META_STRIDE = 9
+            _KV_EXCHANGE_MAX_COMPONENTS = 4
+            _KV_EXCHANGE_HOST_BASE_OFFSET = 1
+
+            # D2H: copy meta to CPU so we can read/modify the int64 fields.
+            num_components = int(vals[0])
+            if num_components < 0 or num_components > _KV_EXCHANGE_MAX_COMPONENTS:
+                raise ValueError(f"kv_exchange: invalid num_components {num_components} in meta")
+            for c in range(num_components):
+                idx = _KV_EXCHANGE_META_HEADER + _KV_EXCHANGE_META_STRIDE * c + _KV_EXCHANGE_HOST_BASE_OFFSET
+                host_base = int(vals[idx])
+                if host_base == 0:
+                    continue
+                # get_dva_impl = offload.get_dva
+                dva = offload.get_dva(host_base)
+                if dva == 0:
+                    raise ValueError(f"kv_exchange: get_dva failed for host_base 0x{host_base:x}")
+                if dva != host_base:
+                    vals[idx] = dva
+
+            return vals
+
+        vals = _rewrite_host_base_to_dva(vals)
+
         pinned_meta = torch.tensor(vals, dtype=torch.int64, pin_memory=True)
         meta = torch.empty(pinned_meta.shape, dtype=torch.int64, device=device)
         meta.copy_(pinned_meta, non_blocking=True)
