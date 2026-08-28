@@ -2851,6 +2851,8 @@ def _dllm_page_size(view: Any) -> dict:
     from sglang.srt.dllm.config import DllmConfig
 
     config = DllmConfig.from_server_args(view)
+    if config.needs_full_prefill:
+        return {}
     if not view.disable_radix_cache and view.page_size % config.block_size != 0:
         logger.warning(
             f"Setting page size to {config.block_size} for diffusion LLM inference"

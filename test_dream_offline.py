@@ -27,6 +27,11 @@ def parse_args():
         type=float,
         default=float(os.getenv("MEM_FRACTION_STATIC", "0.80")),
     )
+    parser.add_argument(
+        "--attention-backend",
+        default=os.getenv("ATTENTION_BACKEND"),
+        help="Attention backend, for example fa3, flashinfer, or triton.",
+    )
     return parser.parse_args()
 
 
@@ -46,11 +51,13 @@ def main():
             disable_radix_cache=True,
             disable_cuda_graph=True,
             mem_fraction_static=args.mem_fraction_static,
+            attention_backend=args.attention_backend,
         )
 
         assert engine.server_args.tp_size == 1
         assert engine.server_args.disable_radix_cache
         assert engine.server_args.disable_cuda_graph
+        print(f"Resolved attention backend: {engine.server_args.attention_backend}")
 
         outputs = engine.generate(
             [args.prompt],

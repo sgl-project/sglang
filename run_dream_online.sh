@@ -3,14 +3,15 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-MODEL_PATH="${MODEL_PATH:-Dream-org/Dream-v0-Base-7B}"
+# MODEL_PATH="${MODEL_PATH:-Dream-org/Dream-v0-Base-7B}"
+MODEL_PATH="${MODEL_PATH:-/root/.cache/modelscope/models/Dream-org--Dream-v0-Base-7B/snapshots/master}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-600}"
 SERVER_LOG="${SERVER_LOG:-dream_server.log}"
-
+export HF_ENDPOINT=https://hf-mirror.com
 export PYTHONPATH="python${PYTHONPATH:+:${PYTHONPATH}}"
 
 server_pid=""
@@ -32,6 +33,7 @@ trap cleanup EXIT INT TERM
   --disable-radix-cache \
   --disable-prefill-cuda-graph \
   --disable-decode-cuda-graph \
+  --attention-backend flashinfer \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
   --host "${HOST}" \
   --port "${PORT}" \
