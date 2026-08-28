@@ -647,6 +647,38 @@ class TestHunyuanDetectorStructureInfo(CustomTestCase):
         self.assertFalse(self.detector.supports_structural_tag())
 
 
+class TestHunyuanDetectorHy4StructureInfo(CustomTestCase):
+    class _Hy4Tokenizer:
+        def get_vocab(self):
+            return {
+                "<think:opensource>": 1,
+                "</think:opensource>": 2,
+                "<tool_calls:opensource>": 3,
+                "</tool_calls:opensource>": 4,
+                "<tool_call:opensource>": 5,
+                "</tool_call:opensource>": 6,
+                "<arg_key:opensource>": 7,
+                "</arg_key:opensource>": 8,
+                "<arg_value:opensource>": 9,
+                "</arg_value:opensource>": 10,
+            }
+
+    def test_hy4_structure_info_has_no_tool_sep(self):
+        detector = HunyuanDetector(self._Hy4Tokenizer())
+        info = detector.structure_info()("get_weather")
+        self.assertNotIn("<tool_sep>", info.begin)
+        self.assertNotIn("\n", info.begin)
+        self.assertIn("<tool_call:opensource>get_weather", info.begin)
+        self.assertTrue(
+            info.end.startswith("</tool_call:opensource>")
+            and info.end.endswith("</tool_calls:opensource>")
+        )
+
+    def test_hy4_parses_required_natively(self):
+        detector = HunyuanDetector(self._Hy4Tokenizer())
+        self.assertTrue(detector.parses_required_natively())
+
+
 class TestHunyuanDetectorFunctionCallParser(CustomTestCase):
     """Test through the FunctionCallParser interface."""
 
