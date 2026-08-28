@@ -6,7 +6,12 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#ifdef __HIP_PLATFORM_AMD__
+#include <hipcub/hipcub.hpp>
+namespace cub = hipcub;
+#else
 #include <cub/cub.cuh>
+#endif
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
@@ -497,7 +502,12 @@ struct MoeLoraAlignBlockSizeKernel {
     int device_max_shared_mem;
     auto device = topk_ids.device();
     int dev_id = device.device_id;
+#ifdef __HIP_PLATFORM_AMD__
+    RuntimeDeviceCheck(
+        hipDeviceGetAttribute(&device_max_shared_mem, hipDeviceAttributeMaxSharedMemoryPerBlock, dev_id));
+#else
     RuntimeDeviceCheck(cudaDeviceGetAttribute(&device_max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+#endif
     const cudaStream_t stream = LaunchKernel::resolve_device(device);
 
     int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -529,7 +539,12 @@ struct MoeLoraAlignBlockSizeKernel {
 
       dim3 blockDim(num_thread + fill_threads);
       auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
+#ifdef __HIP_PLATFORM_AMD__
+      RuntimeDeviceCheck(hipFuncSetAttribute(
+          reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+#else
       RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+#endif
 
       LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
           kernel,
