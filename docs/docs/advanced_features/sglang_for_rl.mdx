@@ -252,7 +252,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
   </tbody>
 </table>
 
-**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None)`
+**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None, weight_name_prefixes=None)`
 
 **Diffusion engine (SGLang-Diffusion):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint with the following behavior:
 

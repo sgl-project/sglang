@@ -2,8 +2,8 @@
 
 `POST /set_internal_state` fans out to every scheduler, which validates the
 request here and applies it through `get_context().override`, the sanctioned
-post-publish mutation entry. `GET /get_internal_state` reads the resolved
-config back.
+post-publish mutation entry. `GET /server_info` reads the resolved config
+back.
 
 A field is admitted to `HOT_UPDATABLE_SERVER_ARGS` only when its readers see
 the new value: either every reader reads the config-bag leaf live (e.g.
