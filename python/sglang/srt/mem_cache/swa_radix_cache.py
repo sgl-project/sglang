@@ -638,14 +638,32 @@ class SWARadixCache(BasePrefixCache):
                 x = x_next
 
         if swa_num_evicted < swa_num_tokens:
+            # Evict the last sliding window of a branch only as a last resort:
+            # tombstoning it makes the whole branch unmatchable, because
+            # `_match_prefix_helper` needs `sliding_window_size` consecutive
+            # non-tombstone tokens after a tombstone, while evicting a node
+            # closer to the root only costs that prefix. This is a preference,
+            # not a reservation, so the eviction target is still met.
+            skip_branch_tail = True
             # get the least recently used node that is not locked, doesn't have to be a leaf
             x = self.swa_lru_list.get_lru_no_lock()
 
-            # evict lru leaf nodes until swa_num_tokens is reached
-            while swa_num_evicted < swa_num_tokens and (self.swa_lru_list.in_list(x)):
+            while swa_num_evicted < swa_num_tokens:
+                if not self.swa_lru_list.in_list(x):
+                    if not skip_branch_tail:
+                        break
+                    # Every non-tail candidate is gone, retry the branch tails.
+                    skip_branch_tail = False
+                    x = self.swa_lru_list.get_lru_no_lock()
+                    continue
+
                 assert not x.swa_tombstone, f"duplicate swa tombstone node, {x.id=}"
                 assert x != self.root_node, f"root node is not evictable, {x.id=}"
                 assert x.swa_lock_ref == 0, f"node is in use by swa kv indices, {x.id=}"
+
+                if skip_branch_tail and self._is_swa_branch_tail(x):
+                    x = self.swa_lru_list.get_prev_no_lock(x)
+                    continue
 
                 if len(x.children) > 0:
                     # 1. an internal node, free swa tokens.
@@ -1071,11 +1089,7 @@ class SWARadixCache(BasePrefixCache):
             return leaf
 
         # Smallest page-aligned size that still covers the sliding window.
-        tail_size = (
-            (self.sliding_window_size + self.page_size - 1)
-            // self.page_size
-            * self.page_size
-        )
+        tail_size = self._swa_tail_size()
         if len(leaf.value) <= tail_size:
             return leaf
 
@@ -1090,6 +1104,41 @@ class SWARadixCache(BasePrefixCache):
 
         self._split_node(leaf.key, leaf, split_at)
         return leaf
+
+    def _swa_tail_size(self) -> int:
+        """Smallest page-aligned size that still covers the sliding window."""
+        return (
+            (self.sliding_window_size + self.page_size - 1)
+            // self.page_size
+            * self.page_size
+        )
+
+    def _is_swa_branch_tail(self, node: TreeNode) -> bool:
+        """Whether ``node`` holds part of the last window of some branch.
+
+        A branch end is a leaf or the node right before a tombstone: both are
+        stop points ``_match_prefix_helper`` can return. If the nearest branch
+        end below ``node`` is less than one (page-aligned) window away, freeing
+        ``node`` breaks the only reusable window of that branch. The walk is
+        pruned by the window size, so it visits at most the tail of the branch
+        rather than the whole subtree.
+        """
+        cap = self._swa_tail_size()
+        best = cap
+        stack = [(node, 0)]
+        while stack:
+            cur, distance = stack.pop()
+            if distance >= best:
+                continue
+            if len(cur.children) == 0:
+                best = distance
+                continue
+            for child in cur.children.values():
+                if child.swa_tombstone:
+                    best = min(best, distance)
+                else:
+                    stack.append((child, distance + len(child.value)))
+        return best < cap
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
