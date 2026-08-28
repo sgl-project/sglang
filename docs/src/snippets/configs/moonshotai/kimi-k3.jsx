@@ -2297,6 +2297,7 @@ export const config = {
         "--dcp-size 8",
         "--dp-size 2",
         "--enable-dp-attention",
+        "--enable-dp-lm-head",
         "--ep-size 16",
         "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
