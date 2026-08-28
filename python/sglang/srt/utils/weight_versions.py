@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+import sys
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List
 
 import msgspec
 
@@ -103,14 +104,10 @@ def add_weight_versions_to_meta_info(
 
 
 def weight_version_spans_to_json(
-    spans: WeightVersionSpans, end_limit: Optional[int] = None
+    spans: WeightVersionSpans, end_limit: int = sys.maxsize
 ) -> List[Dict[str, Any]]:
     return [
-        {
-            "version": span.version,
-            "start": span.start,
-            "end": span.end if end_limit is None else min(span.end, end_limit),
-        }
+        {"version": span.version, "start": span.start, "end": min(span.end, end_limit)}
         for span in spans
     ]
 
