@@ -733,12 +733,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if get_observability().gc_warning_threshold_secs > 0.0:
             configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        soft_watchdog_timeout = get_device().soft_watchdog_timeout
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
-            watchdog_timeout=get_device().soft_watchdog_timeout,
+            watchdog_timeout=soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
+        self.event_loop_watchdog = Watchdog.create(
+            debug_name="TokenizerManager event loop",
+            watchdog_timeout=soft_watchdog_timeout,
+            soft=True,
+        )
+        self.event_loop_watchdog_enabled = soft_watchdog_timeout is not None
 
     def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
         self.startup_time = startup_time
@@ -2145,6 +2152,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
+        if self.event_loop_watchdog_enabled:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self.event_loop_watchdog_loop))
+            )
         self.event_loop = loop
 
         # We only add signal handler when the tokenizer manager is in the main thread
@@ -2160,6 +2171,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+
+    async def event_loop_watchdog_loop(self):
+        while True:
+            self.event_loop_watchdog.feed()
+            await asyncio.sleep(1)
 
     async def handle_loop(self):
         """The event loop that handles requests"""

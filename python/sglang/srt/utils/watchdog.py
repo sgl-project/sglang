@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import signal
@@ -149,6 +150,7 @@ class WatchdogRaw:
         if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")
 
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
         pyspy_dump_schedulers()
         logger.error(
             f"{self.debug_name} watchdog timeout "
