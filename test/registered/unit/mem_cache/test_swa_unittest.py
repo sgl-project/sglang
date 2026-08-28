@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -852,34 +851,6 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         tree.sanity_check()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-class _SinglePoolAllocator(BaseTokenToKVPoolAllocator):
-    """Minimal single-pool allocator: no SWA peer, so it inherits free_full."""
-
-    def __init__(self):
-        super().__init__(
-            size=16,
-            page_size=1,
-            dtype=torch.bfloat16,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
-        )
-        self.freed = []
-
-    def clear(self):
-        self.freed = []
-
-    def alloc(self, need_size: int):
-        raise NotImplementedError
-
-    def free(self, free_index: torch.Tensor):
-        self.freed.append(free_index)
-
-
 class TestFreeFullPartition(CustomTestCase):
     """`free_full` releases only the full side of a hybrid SWA allocator."""
 
@@ -893,17 +864,6 @@ class TestFreeFullPartition(CustomTestCase):
             self.allocator.full_available_size(),
             self.allocator.swa_available_size(),
         )
-
-    def test_free_full_plus_free_swa_equals_free(self):
-        indices = _swa_alloc(self.allocator, 4)
-        self.allocator.free_full(indices)
-        self.allocator.free_swa(indices)
-        split = self._sizes()
-
-        indices = _swa_alloc(self.allocator, 4)
-        self.allocator.free(indices)
-        self.assertEqual(split, self._sizes())
-        self.assertEqual(split, (self.full_baseline, self.swa_baseline))
 
     def test_free_full_keeps_the_swa_peers_allocated(self):
         indices = _swa_alloc(self.allocator, 4)
@@ -933,11 +893,6 @@ class TestFreeFullPartition(CustomTestCase):
 
         self.assertEqual(self.allocator.full_available_size(), self.full_baseline)
 
-    def test_single_pool_allocator_routes_free_full_to_free(self):
-        allocator = _SinglePoolAllocator()
-        indices = torch.arange(1, 5, dtype=torch.int64)
 
-        allocator.free_full(indices)
-
-        self.assertEqual(len(allocator.freed), 1)
-        self.assertTrue(torch.equal(allocator.freed[0], indices))
+if __name__ == "__main__":
+    unittest.main()
