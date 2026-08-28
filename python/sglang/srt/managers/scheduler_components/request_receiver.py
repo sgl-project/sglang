@@ -75,6 +75,8 @@ class SchedulerRequestReceiver:
     @scheduler_nvtx_method("scheduler.recv_requests")
     def recv_requests(
         self,
+        *,
+        collective_executor: Optional[Callable[[Callable[[], Any]], Any]] = None,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
@@ -90,7 +92,12 @@ class SchedulerRequestReceiver:
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+        if collective_executor is None:
+            recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
+        else:
+            recv_reqs = collective_executor(
+                lambda: self._broadcast_reqs_across_ranks(recv_reqs)
+            )
 
         if self.ps.pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)

@@ -72,6 +72,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
+    DecodePollCoordinator,
     DecodePreallocQueue,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
@@ -1393,6 +1394,22 @@ class Scheduler(
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            self.disagg_decode_poll_pending = False
+            self.disagg_decode_poll_result = None
+            # Reuse the request-ingress Gloo group for decode polling. The
+            # event-loop gate waits for each poll before the next request
+            # broadcast, so all ranks issue both operations in one order. A
+            # separate group is unsafe here: a fast rank can submit its poll
+            # while a slow rank is still returning from the prior broadcast,
+            # creating a cross-group Gloo progress deadlock.
+            decode_coordination_group = (
+                self.attn_tp_cpu_group
+                if self.enable_dp_attention
+                else self.tp_cpu_group
+            )
+            self.disagg_decode_poll_coordinator = DecodePollCoordinator(
+                decode_coordination_group
+            )
             buffer_multiplier = (
                 8 if is_minimax_sparse(self.model_config.hf_config) else 2
             )
@@ -1410,7 +1427,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=decode_coordination_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 tp_rank=self.ps.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
@@ -1428,7 +1445,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=decode_coordination_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
                 dp_size=get_parallel().dp_size,

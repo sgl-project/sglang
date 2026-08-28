@@ -21,12 +21,14 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -59,6 +61,8 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    prepare_poll_tensor,
+    prepare_poll_tensor_with_staging,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -105,6 +109,138 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class DecodePollCoordinator:
+    """Run ordered decode collectives outside the scheduler thread.
+
+    Gloo's ``async_op=True`` only makes completion asynchronous; submitting the
+    collective can still wait for peer ranks. The decode schedulers may be on
+    different local iterations when attention TP gather is disabled, so even
+    submission must not run on their main threads. Request broadcasts use the
+    same worker as status polls: handing one process group between threads after
+    local completion can let a fast rank enter the next broadcast while a slow
+    rank is still returning from the preceding all-reduce.
+    """
+
+    def __init__(self, group: ProcessGroup):
+        self._group = group
+        self._inputs = queue.Queue(maxsize=1)
+        self._next_sequence = 0
+        self._pending_poll = None
+        self._current_task = None
+        self._last_stall_log_at = 0.0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="disagg-decode-poll",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, state: Dict[str, Any]) -> None:
+        if self._pending_poll is not None:
+            raise RuntimeError("A disaggregated decode poll is already pending")
+        task = self._make_task("poll", state)
+        self._pending_poll = task
+        self._inputs.put_nowait(task)
+
+    def execute(self, fn: Callable[[], Any]) -> Any:
+        """Run the next blocking collective on the poll worker."""
+        if self._pending_poll is not None:
+            raise RuntimeError(
+                "Cannot run a decode collective call before the pending poll "
+                "result is consumed"
+            )
+        task = self._make_task("call", fn)
+        self._inputs.put_nowait(task)
+        task["done"].wait()
+        return self._unwrap_result(task["result"])
+
+    def poll(self) -> Optional[Dict[str, Any]]:
+        task = self._pending_poll
+        if task is None:
+            raise RuntimeError("No disaggregated decode poll is pending")
+        if not task["done"].is_set():
+            return None
+        self._pending_poll = None
+        return self._unwrap_result(task["result"])
+
+    def _make_task(self, kind: str, payload: Any) -> Dict[str, Any]:
+        sequence = self._next_sequence
+        self._next_sequence += 1
+        return {
+            "sequence": sequence,
+            "kind": kind,
+            "payload": payload,
+            "result": None,
+            "done": threading.Event(),
+            "submitted_at": time.monotonic(),
+        }
+
+    def maybe_log_stall(self, scheduler: Scheduler) -> None:
+        task = self._pending_poll
+        if task is None:
+            return
+        now = time.monotonic()
+        age = now - task["submitted_at"]
+        if age < 10 or now - self._last_stall_log_at < 10:
+            return
+        self._last_stall_log_at = now
+        current = self._current_task
+        logger.warning(
+            "Disaggregated decode poll pending for %.1fs: tp_rank=%s "
+            "poll_seq=%s poll_done=%s worker_task=%s input_qsize=%s "
+            "scheduler_pending=%s staged_result=%s engine_paused=%s "
+            "polling_count=%s prealloc=%s transfer=%s retracted=%s",
+            age,
+            get_parallel().tp_rank,
+            task["sequence"],
+            task["done"].is_set(),
+            None
+            if current is None
+            else (current["sequence"], current["kind"]),
+            self._inputs.qsize(),
+            scheduler.disagg_decode_poll_pending,
+            scheduler.disagg_decode_poll_result is not None,
+            scheduler._engine_paused,
+            getattr(scheduler, "polling_count", None),
+            len(scheduler.disagg_decode_prealloc_queue.queue),
+            len(scheduler.disagg_decode_transfer_queue.queue),
+            len(scheduler.disagg_decode_prealloc_queue.retracted_queue),
+        )
+
+    @staticmethod
+    def _unwrap_result(result: Any) -> Any:
+        if isinstance(result, BaseException):
+            raise RuntimeError("Disaggregated decode collective failed") from result
+        return result
+
+    def _run(self) -> None:
+        while True:
+            task = self._inputs.get()
+            self._current_task = task
+            kind = task["kind"]
+            payload = task["payload"]
+            try:
+                if kind == "poll":
+                    torch.distributed.all_reduce(
+                        payload["tensor"],
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self._group,
+                    )
+                    result = payload
+                elif kind == "call":
+                    result = payload()
+                else:
+                    raise RuntimeError(f"Unknown decode collective task {kind!r}")
+            except BaseException as exc:
+                task["result"] = exc
+                task["done"].set()
+                return
+            task["result"] = result
+            task["done"].set()
+            self._current_task = None
+
 
 _is_npu = is_npu()
 
@@ -855,19 +991,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        precomputed_polls: Optional[Tuple[List[DecodeRequest], List[int]]] = None,
     ) -> None:
-        if not self.queue:
-            return
-
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if (
-            self.pp_size <= 1
-            and all(decode_req.waiting_for_input for decode_req in self.queue)
-            and not any(
-                decode_req.kv_receiver.conclude_state == KVPoll.Failed
-                for decode_req in self.queue
+        if precomputed_polls is not None:
+            poll_window, polls = precomputed_polls
+        elif self.pp_size <= 1:
+            collective_size = self.req_to_metadata_buffer_idx_allocator.size
+            poll_window = self.queue[:collective_size]
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in poll_window],
+                self.gloo_group,
+                collective_size=collective_size,
             )
-        ):
+        elif not self.queue:
             return
 
         if self.pp_size > 1:
@@ -877,12 +1013,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 pp_good_rids,
                 pp_bad_rids,
             )
-        else:
-            polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-            )
-
-        for decode_req, poll in zip(self.queue, polls):
+        decode_reqs_polled = poll_window if self.pp_size <= 1 else self.queue
+        for decode_req, poll in zip(decode_reqs_polled, polls):
             if poll is None:
                 continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -915,6 +1047,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+
+    def prepare_poll_tensor(self):
+        """Build this phase's local poll tensor for the combined TP collective."""
+        assert self.pp_size <= 1
+        self._resolve_pending_reqs()
+        collective_size = self.req_to_metadata_buffer_idx_allocator.size
+        poll_window = self.queue[:collective_size]
+        _, tensor = prepare_poll_tensor(
+            [decode_req.kv_receiver for decode_req in poll_window],
+            collective_size=collective_size,
+        )
+        return poll_window, tensor
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -1073,6 +1217,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        precomputed_polls: Optional[Tuple[List[DecodeRequest], List[int]]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         is_pp_mode = self.pp_size > 1
@@ -1081,8 +1226,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
-        self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
+        if precomputed_polls is None:
+            self._resolve_pending_reqs()
+        self._update_handshake_waiters(
+            rids_to_check,
+            pp_good_rids,
+            pp_bad_rids,
+            precomputed_polls=precomputed_polls,
+        )
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
@@ -2218,6 +2369,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
+            collective_size=self.req_to_metadata_buffer_idx_allocator.size,
         )
 
     def _poll_with_staging(self) -> list:
@@ -2226,7 +2378,35 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
+            collective_size=self.req_to_metadata_buffer_idx_allocator.size,
         )
+
+    def prepare_poll_tensor(self):
+        """Build this phase's local poll tensor for the combined TP collective."""
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(self.queue)
+
+        collective_size = self.req_to_metadata_buffer_idx_allocator.size
+        if self.enable_staging:
+            polls, tensor = prepare_poll_tensor_with_staging(
+                self.queue,
+                self.staging_handler,
+                metadata_buffers=self.metadata_buffers,
+                collective_size=collective_size,
+            )
+        else:
+            pollers = (
+                [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
+                if self.scheduler.enable_decode_hicache
+                else [dr.kv_receiver for dr in self.queue]
+            )
+            polls, tensor = prepare_poll_tensor(
+                pollers,
+                decode_reqs=self.queue,
+                metadata_buffers=self.metadata_buffers,
+                collective_size=collective_size,
+            )
+        return len(polls), tensor
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
@@ -2239,11 +2419,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        if not self.queue:
+    def pop_transferred(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        precomputed_polls: Optional[List[int]] = None,
+    ) -> List[Req]:
+        if precomputed_polls is None and not self.queue:
             return []
 
-        if self.scheduler.enable_decode_hicache:
+        if precomputed_polls is None and self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(
                 [
                     decode_req
@@ -2252,7 +2436,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if precomputed_polls is not None:
+            polls = precomputed_polls
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
@@ -2448,12 +2634,25 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            # Do not enter the next request broadcast until this rank's
+            # background decode-poll epoch has completed. Otherwise a fast
+            # scheduler rank can block in request ingress while a peer's poll
+            # thread still needs that rank to join the collective.
+            if not self._stage_completed_decode_poll():
+                continue
+
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests(
+                collective_executor=(
+                    self.disagg_decode_poll_coordinator.execute
+                    if self.disagg_decode_prealloc_queue.pp_size == 1
+                    else None
+                )
+            )
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -2491,12 +2690,24 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # Keep request ingress and decode-poll epochs in the same order on
+            # every rank even when attention TP gather is disabled and the
+            # scheduler loops advance at different rates.
+            if not self._stage_completed_decode_poll():
+                continue
+
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests(
+                collective_executor=(
+                    self.disagg_decode_poll_coordinator.execute
+                    if self.disagg_decode_prealloc_queue.pp_size == 1
+                    else None
+                )
+            )
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -2659,6 +2870,56 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    def _stage_completed_decode_poll(self: Scheduler) -> bool:
+        """Stage the pending poll result before the next request broadcast.
+
+        Collective submission runs on ``DecodePollCoordinator`` so the
+        scheduler thread never blocks in Gloo. This gate keeps the scheduler
+        out of request ingress until that already-submitted epoch is complete,
+        preventing rank-skewed loops from splitting across the two operations.
+        """
+        if self.disagg_decode_prealloc_queue.pp_size > 1:
+            return True
+        if getattr(self, "disagg_decode_poll_result", None) is not None:
+            return True
+        if not self.disagg_decode_poll_pending:
+            return True
+
+        poll_state = self.disagg_decode_poll_coordinator.poll()
+        if poll_state is None:
+            self.disagg_decode_poll_coordinator.maybe_log_stall(self)
+            return False
+
+        self.disagg_decode_poll_result = poll_state
+        self.disagg_decode_poll_pending = False
+        return True
+
+    def _submit_decode_poll(self: Scheduler, has_retracted_reqs: bool) -> None:
+        prealloc_window, prealloc_tensor = (
+            self.disagg_decode_prealloc_queue.prepare_poll_tensor()
+        )
+        transfer_count, transfer_tensor = (
+            self.disagg_decode_transfer_queue.prepare_poll_tensor()
+        )
+        can_process_tensor = torch.tensor(
+            [not has_retracted_reqs], dtype=torch.uint8, device="cpu"
+        )
+        combined_tensor = torch.cat(
+            (
+                prealloc_tensor,
+                transfer_tensor,
+                can_process_tensor,
+            )
+        )
+        self.disagg_decode_poll_coordinator.submit(
+            {
+                "tensor": combined_tensor,
+                "prealloc_window": prealloc_window,
+                "transfer_count": transfer_count,
+            }
+        )
+        self.disagg_decode_poll_pending = True
+
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
@@ -2673,7 +2934,8 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+        has_retracted_reqs = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
+        if self.disagg_decode_prealloc_queue.pp_size > 1 and has_retracted_reqs:
             # if there are still retracted requests, we do not allocate new requests
             return
 
@@ -2684,11 +2946,67 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
+            if self.disagg_decode_prealloc_queue.pp_size > 1:
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+                self.disagg_decode_transfer_queue.extend(req_conns)
+                transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
+            else:
+                completed_poll = False
+                poll_state = getattr(self, "disagg_decode_poll_result", None)
+                if poll_state is not None:
+                    self.disagg_decode_poll_result = None
+                    completed_poll = True
+                elif self.disagg_decode_poll_pending:
+                    poll_state = self.disagg_decode_poll_coordinator.poll()
+                    if poll_state is None:
+                        return
+                    self.disagg_decode_poll_pending = False
+                    completed_poll = True
+
+                if completed_poll:
+                    combined_tensor = poll_state["tensor"]
+                    prealloc_window = poll_state["prealloc_window"]
+                    transfer_count = poll_state["transfer_count"]
+
+                    collective_size = self.req_to_metadata_buffer_idx_allocator.size
+                    can_process_reqs = bool(combined_tensor[-1].item())
+                    if can_process_reqs:
+                        prealloc_polls = combined_tensor[
+                            : len(prealloc_window)
+                        ].tolist()
+                        transfer_polls = combined_tensor[
+                            collective_size : collective_size + transfer_count
+                        ].tolist()
+
+                        # Consume the transfer snapshot before adding requests
+                        # that completed preallocation in this epoch. New
+                        # transfers are included in the next poll.
+                        transferred_reqs = (
+                            self.disagg_decode_transfer_queue.pop_transferred(
+                                precomputed_polls=transfer_polls
+                            )
+                        )
+                        req_conns, _ = (
+                            self.disagg_decode_prealloc_queue.pop_preallocated(
+                                precomputed_polls=(
+                                    prealloc_window,
+                                    prealloc_polls,
+                                )
+                            )
+                        )
+                        self.disagg_decode_transfer_queue.extend(req_conns)
+                    else:
+                        # Preserve the existing retraction gate on every rank.
+                        transferred_reqs = []
+
+                # disable-attn-tp-gather permits scheduler ranks to consume a
+                # completed epoch on different local ticks. Refill the
+                # coordinator in the same invocation that drains its result;
+                # otherwise a rank can enter the next request broadcast while
+                # its peers already wait for that rank in the next poll.
+                self._submit_decode_poll(has_retracted_reqs)
+                if not completed_poll:
+                    return
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
