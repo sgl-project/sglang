@@ -408,6 +408,8 @@ class RustServer:
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
             http_addr = f"{get_serving().host}:{server_args.port + dp_rank}"
+        # When enabled, the renderer handles OpenAI routes at the serving address
+        # and uses a new address for the rust frontend server's remaining routes.
         renderer_sidecar, http_addr = cls.initialize_renderer(scheduler, http_addr)
 
         launch_cores, server_cores = cls._partition_cores(
