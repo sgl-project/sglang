@@ -414,9 +414,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        self._use_strided_target_verify_qkv = False
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        super().init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+        self._init_target_verify_qkv_routing(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._init_target_verify_qkv_routing(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -434,6 +446,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
+
+    def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
+        # CUDA-graph metadata leaves mode and draft count at their defaults.
+        if not forward_batch.forward_mode.is_target_verify():
+            self._use_strided_target_verify_qkv = False
+            return
+
+        metadata = self.forward_metadata
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        mamba_cache = mamba_pool.mamba_cache
+        is_gdn_replayssm = not getattr(mamba_pool, "replayssm_is_kda", False)
+        use_replayssm_fold = (
+            mamba_cache.replayssm_rawv is not None
+            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and is_gdn_replayssm
+        )
+        use_replayssm_spec = (
+            mamba_cache.replayssm_d is not None
+            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and is_gdn_replayssm
+        )
+        self._use_strided_target_verify_qkv = (
+            self._target_verify_supports_strided_qkv(
+                retrieve_parent_token=metadata.retrieve_parent_token,
+                use_replayssm_fold=use_replayssm_fold,
+                use_replayssm_spec=use_replayssm_spec,
+                ssm_dtype=mamba_cache.temporal.dtype,
+                draft_token_num=forward_batch.spec_info.draft_token_num,
+            )
+        )
 
     def _replayssm_fold_uses_cutedsl(
         self, ssm_dtype: torch.dtype, draft_token_num: int
@@ -677,21 +719,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        # Prefill requires contiguous QKV; compatible verify kernels accept strides.
-        use_strided_target_verify_qkv = (
-            is_target_verify
-            and self._target_verify_supports_strided_qkv(
-                retrieve_parent_token=retrieve_parent_token,
-                use_replayssm_fold=use_replayssm_fold,
-                use_replayssm_spec=use_replayssm_spec,
-                ssm_dtype=ssm_states.dtype,
-                draft_token_num=draft_token_num,
-            )
-        )
         if (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and not use_strided_target_verify_qkv
+            and not self._use_strided_target_verify_qkv
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
