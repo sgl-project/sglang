@@ -237,8 +237,17 @@ class StagingAllocator:
                 self.alloc_order.pop(0)
 
             if not self.allocations:
+                # Once the ring is empty, every byte is safe to reuse. Keeping
+                # ``head`` at the end of the last allocation leaves the unused
+                # tail represented as unsafe after the next wrap: an allocation
+                # in the new round whose end extends past the old head can then
+                # wait forever for a watermark that can no longer advance.
+                # Start a fresh round at offset zero so the empty-ring
+                # watermark covers the whole previous round.
+                self.round += 1
+                self.head = 0
                 self.watermark_round = self.round
-                self.watermark_tail = self.head
+                self.watermark_tail = 0
             elif self.alloc_order:
                 off, _, rnd = self.allocations[self.alloc_order[0]]
                 self.watermark_round = rnd

@@ -10,7 +10,12 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
     handle_staging_req,
+    is_watermark_ready,
+)
+from sglang.srt.disaggregation.common.staging_buffer import (
+    StagingAllocator,
 )
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
@@ -221,6 +226,65 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
 
 
 class TestMooncakePPStaging(unittest.TestCase):
+    def test_new_watermark_subscriber_receives_current_allocator_state(self):
+        sock = Mock()
+        bootstrap_info = {"host": "prefill", "port": 7200}
+        receiver = SimpleNamespace(
+            bootstrap_infos=[bootstrap_info],
+            _connect_to_bootstrap_server=Mock(
+                return_value=(sock, threading.Lock())
+            ),
+        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler.staging_allocator = SimpleNamespace(
+            get_watermark=Mock(return_value=(3, 0))
+        )
+        handler._wm_subscribers = {}
+
+        handler.register_wm_subscriber(receiver, "session-new")
+
+        receiver._connect_to_bootstrap_server.assert_called_once_with(bootstrap_info)
+        sock.send_multipart.assert_called_once_with(
+            [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
+
+        # Re-registering the same bootstrap does not duplicate subscriptions
+        # or send an older snapshot over a live stream.
+        handler.register_wm_subscriber(receiver, "session-new")
+        self.assertEqual(sock.send_multipart.call_count, 1)
+
+    def test_empty_ring_reset_makes_wrap_gap_reusable(self):
+        allocator = object.__new__(StagingAllocator)
+        allocator.total_size = 100
+        allocator.head = 0
+        allocator.round = 0
+        allocator.allocations = {}
+        allocator.alloc_order = []
+        allocator.next_alloc_id = 0
+        allocator.watermark_round = 0
+        allocator.watermark_tail = 0
+        allocator.lock = threading.Lock()
+
+        alloc_id, offset, alloc_round = allocator.assign(60)
+        self.assertEqual((offset, alloc_round), (0, 0))
+        allocator.free(alloc_id)
+
+        # The old implementation left watermark=(0, 60). A 70-byte
+        # allocation then wrapped to round 1 and waited forever because its
+        # end (70) lay beyond that stale head, even though the ring was empty.
+        _, offset, alloc_round = allocator.assign(70)
+        self.assertEqual((offset, alloc_round), (0, 1))
+        watermark = allocator.get_watermark()
+        self.assertEqual(watermark, (1, 0))
+        self.assertTrue(
+            is_watermark_ready(
+                SimpleNamespace(remote_watermarks={"session": watermark}),
+                "session",
+                alloc_round,
+                offset + 70,
+            )
+        )
+
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()
         receiver = SimpleNamespace(
