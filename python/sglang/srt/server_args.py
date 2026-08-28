@@ -2854,6 +2854,23 @@ class ServerArgs:
     ] = None
 
     # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
+
+    # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------
     enable_broadcast_mm_inputs_process: A[
@@ -8286,6 +8303,18 @@ class ServerArgs:
         2) Storage <-> layout compatibility (may rewrite layout).
         """
         cfg = resolving_view(self)
+        if cfg.enable_unified_cache_external_linker:
+            if cfg.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-unified-cache-external-linker and "
+                    "--enable-hierarchical-cache are mutually exclusive."
+                )
+            if cfg.hicache_storage_backend is not None:
+                raise ValueError(
+                    "--enable-unified-cache-external-linker does not use "
+                    "--hicache-storage-backend."
+                )
+            return
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             cfg.enable_hierarchical_cache
