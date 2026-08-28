@@ -1,3 +1,5 @@
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -126,11 +128,16 @@ def optimized_scale(positive_flat, negative_flat):
 
 def _randn_with_seed(shape, *, device, dtype, seed: int) -> torch.Tensor:
     try:
-        generator = torch.Generator(device).manual_seed(seed)
-        return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+        generator = torch.Generator(device)
     except (RuntimeError, TypeError):
-        torch.manual_seed(seed)
-        return torch.randn(shape, device=device, dtype=dtype)
+        rng_state = torch.get_rng_state()
+        try:
+            torch.manual_seed(seed)
+            return torch.randn(shape, device=device, dtype=dtype)
+        finally:
+            torch.set_rng_state(rng_state)
+    generator.manual_seed(seed)
+    return torch.randn(shape, device=device, dtype=dtype, generator=generator)
 
 
 def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):

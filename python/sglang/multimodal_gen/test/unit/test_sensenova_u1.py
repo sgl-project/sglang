@@ -19,6 +19,9 @@ from sglang.multimodal_gen.registry import (
     get_non_diffusers_pipeline_name,
     is_registered_diffusion_model_path,
 )
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
+    NEOVisionConfig,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1GenerationStage,
 )
@@ -59,6 +62,14 @@ def test_sensenova_u1_registry_resolves_local_and_hf_paths(monkeypatch):
     get_model_info.cache_clear()
 
 
+def test_sensenova_u1_registry_does_not_route_lora_only_repositories():
+    lora_repo = "sensenova/SenseNova-U1.5-8B-MoT-LoRA"
+    lora_path = "/models/SenseNova-U1.5-8B-MoT-LoRA"
+
+    assert get_non_diffusers_pipeline_name(lora_repo) is None
+    assert get_non_diffusers_pipeline_name(lora_path) is None
+
+
 def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
     params = SenseNovaU1SamplingParams(prompt="hello", width=2304, height=4096)
 
@@ -94,6 +105,71 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
 
     assert params.num_frames == 1
     assert params.data_type == DataType.IMAGE
+
+
+def test_sensenova_u1_scheduler_capabilities():
+    config = SenseNovaU1PipelineConfig()
+
+    assert not config.supports_dynamic_batching()
+    assert config.supports_sequential_multi_output_inference()
+
+
+def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
+    config = SenseNovaU1PipelineConfig()
+
+    with pytest.raises(ValueError, match="num_gpus=1"):
+        config.validate_server_args(
+            SimpleNamespace(
+                num_gpus=2,
+                enable_torch_compile=False,
+                attention_backend=None,
+                component_attention_backends={},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        ({"enable_torch_compile": True}, "torch.compile"),
+        ({"attention_backend": "fa"}, "custom attention backends"),
+        (
+            {"component_attention_backends": {"text_encoder": "torch_sdpa"}},
+            "component attention backends",
+        ),
+        ({"attention_backend_config": {"foo": "bar"}}, "attention backend config"),
+    ],
+)
+def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
+    config = SenseNovaU1PipelineConfig()
+    args = {
+        "num_gpus": 1,
+        "enable_torch_compile": False,
+        "attention_backend": None,
+        "component_attention_backends": {},
+        "attention_backend_config": {},
+    }
+    args.update(override)
+
+    with pytest.raises(ValueError, match=expected):
+        config.validate_server_args(SimpleNamespace(**args))
+
+
+def test_sensenova_u1_vision_config_round_trips_sequence_fields(tmp_path):
+    config = NEOVisionConfig(llm_hidden_size=2048, downsample_ratio=0.5)
+    config.save_pretrained(tmp_path)
+
+    loaded = NEOVisionConfig.from_pretrained(tmp_path)
+
+    assert loaded.llm_hidden_size == (2048,)
+    assert loaded.downsample_ratio == (0.5,)
+
+
+def test_sensenova_u1_vision_config_normalizes_nested_singletons():
+    config = NEOVisionConfig(llm_hidden_size=[[2048]], downsample_ratio=[[0.5]])
+
+    assert config.llm_hidden_size == (2048,)
+    assert config.downsample_ratio == (0.5,)
 
 
 def test_sensenova_u1_rejects_video_frame_count():

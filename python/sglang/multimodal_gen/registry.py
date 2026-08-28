@@ -349,7 +349,6 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
     "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
-    "sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
 }
 
 
@@ -988,10 +987,8 @@ def _register_configs():
         ],
         model_detectors=[
             # codespell:ignore mot
-            lambda model_id: "sensenova-u1.5-8b-mot" in model_id.lower(),
-            lambda model_id: "sensenova" in model_id.lower()
-            and "u1" in model_id.lower()
-            and (chr(109) + chr(111) + chr(116)) in model_id.lower(),
+            lambda model_id: get_model_short_name(model_id.lower())
+            == "sensenova-u1.5-8b-mot",
         ],
     )
     # FLUX

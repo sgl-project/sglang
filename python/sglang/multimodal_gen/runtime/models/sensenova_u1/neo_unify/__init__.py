@@ -1,3 +1,5 @@
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 from __future__ import annotations
 
 from .configuration_neo_chat import NEOChatConfig, NEOLLMConfig, NEOMoELLMConfig

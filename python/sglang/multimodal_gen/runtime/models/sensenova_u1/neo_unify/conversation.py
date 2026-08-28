@@ -7,6 +7,8 @@ If you have changes in mind, please contribute back so the community can benefit
 Modified from https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 """
 
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 import dataclasses
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple, Union

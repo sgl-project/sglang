@@ -1,5 +1,7 @@
 """Small compatibility seams for the supported Transformers 4/5 window."""
 
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 from __future__ import annotations
 
 import inspect

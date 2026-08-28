@@ -1,3 +1,5 @@
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 import copy
 
 from transformers import Qwen3Config, Qwen3MoeConfig

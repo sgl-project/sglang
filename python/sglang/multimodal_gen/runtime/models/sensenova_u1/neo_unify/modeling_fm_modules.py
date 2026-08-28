@@ -1,3 +1,5 @@
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 import logging
 import math
 from functools import lru_cache

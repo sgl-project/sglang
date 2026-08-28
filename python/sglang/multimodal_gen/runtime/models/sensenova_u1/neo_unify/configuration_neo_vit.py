@@ -1,10 +1,21 @@
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 import os
-from typing import Union
+from collections.abc import Sequence
+from typing import Any, Union
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+
+
+def _as_singleton_tuple(value: Any) -> tuple[Any, ...]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) == 1:
+            return _as_singleton_tuple(value[0])
+        return tuple(value)
+    return (value,)
 
 
 class NEOVisionConfig(PretrainedConfig):
@@ -27,8 +38,8 @@ class NEOVisionConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
-        self.llm_hidden_size = (llm_hidden_size,)
-        self.downsample_ratio = (downsample_ratio,)
+        self.llm_hidden_size = _as_singleton_tuple(llm_hidden_size)
+        self.downsample_ratio = _as_singleton_tuple(downsample_ratio)
         self.rope_theta_vision = rope_theta_vision
         self.max_position_embeddings_vision = max_position_embeddings_vision
         self.num_channels = num_channels

@@ -1,3 +1,5 @@
+# Modified for SGLang; see this directory's README.md for upstream source.
+
 import copy
 from typing import Callable, Optional, Union
 
