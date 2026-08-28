@@ -7,9 +7,11 @@ from torch.nn.parameter import Parameter
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 import logging
@@ -99,8 +101,13 @@ def prepare_w4a8_mxfp_weight(
     )
 
 
-def _pair_pack_mxfp_act_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Pack MXFP activation scales from ``[M, K/32]`` to A5 GMM layout."""
+def reshape_mxfp_activation_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
+    """Pack MXFP activation scales from ``[M, K/32]`` to ``[M, K/64, 2]``.
+
+    DeepEP can dispatch a flat scale while the Ascend TP routing path already
+    provides the pair-packed layout. Keeping this conversion shared makes both
+    W4A8 MXFP4 and MXFP8 MoE kernels consume the same GMM layout.
+    """
     if scale.ndim != 2:
         return scale
     if scale.shape[-1] % 2 != 0:
@@ -141,7 +148,7 @@ def w4a8_mxfp_gmm(
         scale=None,
         antiquant_scale=[weight_scale],
         scale_dtype=None,
-        per_token_scale=[_pair_pack_mxfp_act_scale(x_scale)],
+        per_token_scale=[reshape_mxfp_activation_scale_for_npu(x_scale)],
         split_item=2,
         group_type=0,
         group_list=group_list,
@@ -314,9 +321,7 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         group_list_type: int,
     ) -> torch.Tensor:
         if pertoken_scale is not None:
-            pertoken_scale = pertoken_scale.reshape(
-                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
-            )
+            pertoken_scale = reshape_mxfp_activation_scale_for_npu(pertoken_scale)
 
         dynamic_quant_kwargs = self.dynamic_quant_kwargs
         if dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT:
@@ -331,6 +336,154 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             group_list=expert_tokens,
             output_dtype=output_dtype,
             dynamic_quant_kwargs=dynamic_quant_kwargs,
+        )
+
+
+def _wrap_mxfp4_scale_weight_loader(weight_loader):
+    def load_scale(param, loaded_weight, *args, **kwargs):
+        if param.dtype == torch.uint8 and loaded_weight.dtype == torch.float8_e8m0fnu:
+            loaded_weight = loaded_weight.view(torch.uint8)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return load_scale
+
+
+class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
+    """DeepSeek-V4 checkpoint adapter for the shared W4A8 MXFP4 MoE kernels."""
+
+    _MXFP4_BLOCK_SIZE = 32
+
+    def __init__(self, prefix: str = ""):
+        self.prefix = prefix
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.runner = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                (num_experts, 2 * intermediate_size_per_partition, hidden_size // 2),
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                (num_experts, hidden_size, intermediate_size_per_partition // 2),
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        if weight_loader := scale_attrs.get("weight_loader"):
+            scale_attrs["weight_loader"] = _wrap_mxfp4_scale_weight_loader(
+                weight_loader
+            )
+        w13_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // self._MXFP4_BLOCK_SIZE,
+                ),
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self._MXFP4_BLOCK_SIZE,
+                ),
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        w13_weight_scale.format_ue8m0 = False
+        w2_weight_scale.format_ue8m0 = False
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
+
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import (
+            MoeRunnerBackend,
+            get_moe_runner_backend,
+        )
+
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.ASCEND
+        if not backend.is_ascend():
+            raise ValueError(
+                "NPU W4A8 MXFP4 requires the Ascend MoE runner, " f"got {backend.value}"
+            )
+
+        layer.w13_kernel = self.w13_kernel
+        layer.w2_kernel = self.w2_kernel
+        moe_runner_config.layer = layer
+        self.runner = MoeRunner(backend, moe_runner_config)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
+        for weight_prefix in ("w13", "w2"):
+            weight_scale = getattr(layer, f"{weight_prefix}_weight_scale_inv")
+            if weight_scale.data.max() == 0:
+                raise RuntimeError(
+                    f"FP4 expert weight scales are all zero (never loaded) for "
+                    f"prefix={self.prefix!r}; the checkpoint scale names likely did "
+                    f"not match {weight_prefix}_weight_scale_inv."
+                )
+            weight, scale = prepare_w4a8_mxfp_weight(
+                getattr(layer, f"{weight_prefix}_weight").data.view(torch.uint8),
+                weight_scale.data,
+                npu_format=NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            )
+            getattr(layer, f"{weight_prefix}_weight").data = weight
+            setattr(
+                layer,
+                f"{weight_prefix}_weight_scale_inv",
+                torch.nn.Parameter(scale, requires_grad=False),
+            )
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+    def apply(self, layer: torch.nn.Module, dispatch_output: "DispatchOutput"):
+        from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+        if self.runner is None:
+            raise RuntimeError("The NPU FP4 MoE runner has not been initialized")
+
+        return self.runner.run(
+            dispatch_output,
+            AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale_inv,
+                w2_weight_scale=layer.w2_weight_scale_inv,
+            ),
         )
 
 
@@ -1132,7 +1285,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             group_list_type=group_list_type,
             transposed=True,
             weight_scale=[quant_info.w13_weight_scale],
-            x_scale=pertoken_scale,
+            x_scale=reshape_mxfp_activation_scale_for_npu(pertoken_scale),
             dequant_mode=2,
             quant_mode=2,
             dequant_dtype=torch.float32,
@@ -1164,7 +1317,7 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         e8m0_dtype = _require_e8m0_dtype()
         scale_args: Dict[str, Any] = {
             "scale": [getattr(quant_info, f"{weight_prefix}_weight_scale", None)],
-            "per_token_scale": [pertoken_scale],
+            "per_token_scale": [reshape_mxfp_activation_scale_for_npu(pertoken_scale)],
             "scale_dtype": e8m0_dtype,
             "per_token_scale_dtype": e8m0_dtype,
             "x_dtype": None,

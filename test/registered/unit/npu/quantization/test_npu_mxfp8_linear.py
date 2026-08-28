@@ -17,9 +17,8 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 # package first mirrors how the engine loads quantization at model-config time.
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPUMXFP8LinearMethod,
     npu_w8a8_mxfp8_linear,
-)
-from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
     process_npu_arch35_mxfp8_linear_weights,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -165,6 +164,33 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         quant_bias = npu_ops.npu_quant_matmul.call_args.kwargs["bias"]
         self.assertEqual(quant_bias.dtype, torch.float32)
         torch.testing.assert_close(quant_bias, bias.float())
+
+    def test_method_path_uses_the_shared_mxfp8_matmul(self):
+        input_tensor = torch.randn(2, 128, dtype=torch.bfloat16)
+        layer = SimpleNamespace(
+            weight=torch.empty(128, 64, dtype=torch.float8_e4m3fn),
+            weight_scale_inv=torch.empty(2, 64, 2, dtype=torch.uint8),
+            bias=None,
+            bias_fp32=None,
+        )
+        npu_ops = MagicMock()
+        npu_ops.npu_dynamic_mx_quant.return_value = (
+            torch.empty(2, 128, dtype=torch.float8_e4m3fn),
+            torch.empty(2, 2, 2, dtype=torch.uint8),
+        )
+        npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
+
+        with patch.object(torch.ops, "npu", npu_ops, create=True):
+            output = NPUMXFP8LinearMethod().apply(layer, input_tensor)
+
+        self.assertEqual(output.shape, (2, 64))
+        self.assertIs(
+            npu_ops.npu_quant_matmul.call_args.kwargs["scale"],
+            layer.weight_scale_inv,
+        )
+        self.assertEqual(
+            npu_ops.npu_quant_matmul.call_args.kwargs["group_sizes"], (1, 1, 32)
+        )
 
 
 if __name__ == "__main__":

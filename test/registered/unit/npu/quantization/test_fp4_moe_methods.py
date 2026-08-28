@@ -9,7 +9,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 
 # Load the quantization package first so `base_config`, `moe_methods`, and
-# `linear_method_npu` initialize in dependency order. Importing `fp4_moe_methods`
+# `linear_method_npu` initialize in dependency order. Importing `moe_methods`
 # (or `linear_method_npu`) directly from a cold process triggers a circular
 # import: linear_method_npu -> base_config -> quantization/__init__ ->
 # gguf/unquant/gptq_moe -> moe_methods -> linear_method_npu (partially
@@ -17,12 +17,10 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 # package first mirrors how the engine loads quantization at model-config time.
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluLimit
-from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
-    NPUW4A8MXFP4FusedMoEMethod,
-)
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    _pair_pack_mxfp_act_scale,
+    NPUW4A8MXFP4FusedMoEMethod,
     prepare_w4a8_mxfp_weight,
+    reshape_mxfp_activation_scale_for_npu,
     reshape_w4a8_mxfp_weight_scale_for_npu,
     w4a8_mxfp_gmm,
 )
@@ -143,18 +141,22 @@ class TestMxfp4ScaleWeightLoader(unittest.TestCase):
         self.assertTrue(torch.equal(loaded[0], checkpoint_scale.view(torch.uint8)))
 
 
-class TestPairPackMxfpActScale(unittest.TestCase):
+class TestReshapeMxfpActivationScaleForNpu(unittest.TestCase):
     def test_packs_as_view(self):
         # The GMM expects a pair-packed *view* of the per-token scale, not a copy;
         # materializing a copy here would break the kernel's aliasing contract.
         flat = torch.arange(8).view(2, 4)
-        packed = _pair_pack_mxfp_act_scale(flat)
+        packed = reshape_mxfp_activation_scale_for_npu(flat)
         self.assertEqual(tuple(packed.shape), (2, 2, 2))
         self.assertEqual(packed.data_ptr(), flat.data_ptr())
 
     def test_rejects_odd_scale_dim(self):
         with self.assertRaises(ValueError):
-            _pair_pack_mxfp_act_scale(torch.zeros(2, 3))
+            reshape_mxfp_activation_scale_for_npu(torch.zeros(2, 3))
+
+    def test_keeps_already_packed_scale(self):
+        packed = torch.ones(2, 1, 2)
+        self.assertIs(reshape_mxfp_activation_scale_for_npu(packed), packed)
 
 
 class TestW4A8MxfpGmmInputScale(unittest.TestCase):
