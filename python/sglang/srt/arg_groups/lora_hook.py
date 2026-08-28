@@ -50,7 +50,7 @@ def check_lora_server_args(server_args: Any):
             )
 
         # Validate compatibility with speculative decoding
-        server_args._check_lora_speculative_compatibility()
+        check_lora_speculative_compatibility(server_args)
 
         # Parse lora_paths
         if isinstance(cfg.lora_paths, list):

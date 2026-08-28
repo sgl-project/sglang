@@ -10,6 +10,7 @@ import random
 import socket
 from typing import Any
 
+from sglang.srt.arg_groups.model_path_hook import handle_modelscope_paths
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolved_view,
@@ -390,7 +391,7 @@ def handle_deprecated_args(server_args: Any):
 
 def handle_environment_variables(server_args: Any):
     cfg = resolving_view(server_args)
-    server_args._handle_multimodal_feature_transport()
+    handle_multimodal_feature_transport(server_args)
     envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if cfg.enable_torch_compile else "0")
     if cfg.mamba_ssm_dtype is not None:
         envs.SGLANG_MAMBA_SSM_DTYPE.set(cfg.mamba_ssm_dtype)
@@ -609,7 +610,7 @@ def handle_missing_default_values(server_args: Any):
 
     # Handle ModelScope model downloads
     if envs.SGLANG_USE_MODELSCOPE.get():
-        server_args._handle_modelscope_paths()
+        handle_modelscope_paths(server_args)
 
     # In speculative scenario:
     # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.

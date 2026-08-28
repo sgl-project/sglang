@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 def handle_model_source_paths(server_args: Any):
     """Prepare metadata for model paths backed by remote object stores."""
     cfg = resolving_view(server_args)
-    server_args._resolve_hf_gguf_model_path()
+    resolve_hf_gguf_model_path(server_args)
 
     seen_paths = set()
     for model_path in (
@@ -241,7 +241,7 @@ def handle_load_format(server_args: Any):
             )
         elif (
             cfg.remote_instance_weight_loader_backend == "transfer_engine"
-            and not server_args.validate_transfer_engine()
+            and not validate_transfer_engine(server_args)
         ):
             logger.warning(
                 "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
@@ -257,7 +257,9 @@ def handle_load_format(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_load_format",
-            remote_instance_weight_loader_start_seed_via_transfer_engine=server_args.validate_transfer_engine(),
+            remote_instance_weight_loader_start_seed_via_transfer_engine=validate_transfer_engine(
+                server_args
+            ),
         )
 
     # "ipc_cache" is an internal-only load format: ModelRunner sets it

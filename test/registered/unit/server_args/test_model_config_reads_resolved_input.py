@@ -337,38 +337,33 @@ def _pipeline():
     methods = {
         node.name: node for node in record.body if isinstance(node, ast.FunctionDef)
     }
+    # The dispatcher calls its hooks by bare name, so the walk resolves those
+    # against `arg_groups/` alongside the record's own methods.
     hooks = _hook_functions()
-    # Follow exactly one edge: the slot's own `from arg_groups.X import f` /
-    # `f(self)`. Merging every hook function by bare name would let the walk
-    # wander into families the slot never calls.
-    slot_target = {}
-    for name, node in methods.items():
-        imported = {
-            alias.asname or alias.name
-            for child in ast.walk(node)
-            if isinstance(child, ast.ImportFrom)
-            and child.module
-            and child.module.startswith("sglang.srt.arg_groups")
-            for alias in child.names
-        }
-        called = {
-            child.func.id
-            for child in ast.walk(node)
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
-        }
-        for target in sorted(imported & called & set(hooks)):
-            slot_target.setdefault(name, target)
-    methods.update({name: hooks[name] for name in slot_target.values()})
+    methods.update({name: node for name, node in hooks.items() if name not in methods})
     dispatch = methods["_run_resolution_pipeline"]
+    # A step is either a record method (`self._x()`) or a bare-name hook call.
     steps = [
         name
         for _line, name in sorted(
-            (node.lineno, node.func.attr)
+            (
+                node.lineno,
+                (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else node.func.id
+                ),
+            )
             for node in ast.walk(dispatch)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "self"
+            and (
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                )
+                or (isinstance(node.func, ast.Name) and node.func.id in hooks)
+            )
         )
     ]
 
@@ -387,20 +382,22 @@ def _pipeline():
                 and node.func.attr in methods
             ):
                 reaches(node.func.attr, seen)
-        target = slot_target.get(name)
-        if target is not None:
-            reaches(target, seen)
+            elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+                reaches(node.func.id, seen)
         return seen
 
     step_lines = {}
     for node in ast.walk(dispatch):
+        if not isinstance(node, ast.Call):
+            continue
         if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
+            isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "self"
         ):
             step_lines.setdefault(node.func.attr, node.lineno)
+        elif isinstance(node.func, ast.Name) and node.func.id in hooks:
+            step_lines.setdefault(node.func.id, node.lineno)
     return steps, methods, {name: reaches(name) for name in steps}, step_lines
 
 

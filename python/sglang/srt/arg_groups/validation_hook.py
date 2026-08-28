@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
@@ -74,7 +75,7 @@ def check_server_args(server_args: Any):
         )
 
     # Check LoRA
-    server_args.check_lora_server_args()
+    check_lora_server_args(server_args)
 
     # Check speculative decoding
     if cfg.speculative_algorithm is not None:
@@ -119,11 +120,11 @@ def check_server_args(server_args: Any):
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
     assert cfg.mm_processor_worker_num >= 0, "Multimodal processor worker num must >= 0"
     assert cfg.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
-    server_args.validate_buckets_rule(
-        "--prompt-tokens-buckets", cfg.prompt_tokens_buckets
+    validate_buckets_rule(
+        server_args, "--prompt-tokens-buckets", cfg.prompt_tokens_buckets
     )
-    server_args.validate_buckets_rule(
-        "--generation-tokens-buckets", cfg.generation_tokens_buckets
+    validate_buckets_rule(
+        server_args, "--generation-tokens-buckets", cfg.generation_tokens_buckets
     )
 
     # Check scheduling policy
@@ -185,7 +186,7 @@ def check_server_args(server_args: Any):
         )
 
     # Check two batch overlap backend requirement.
-    server_args._check_two_batch_overlap()
+    check_two_batch_overlap(server_args)
 
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:
@@ -216,7 +217,7 @@ def check_server_args(server_args: Any):
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
 
-    server_args.check_load_publish_args()
+    check_load_publish_args(server_args)
 
 
 def validate_buckets_rule(server_args: Any, arg_name: str, buckets_rule: List[str]):
