@@ -23,7 +23,11 @@ class _NamedModel:
 
 def _v4_config():
     return SimpleNamespace(
+        model_type="deepseek_v4",
         hidden_size=4096,
+        intermediate_size=18432,
+        moe_intermediate_size=2048,
+        n_shared_experts=1,
         num_attention_heads=64,
         head_dim=512,
         q_lora_rank=1024,
@@ -45,6 +49,14 @@ def test_deepseek_v4_attention_dimensions_and_parallelism():
     assert {"wq_a", "wkv"} <= set(REPLICATED_LINEAR_LORA_NAMES)
     assert "wo_b" in ROW_PARALLELISM_LINEAR_LORA_NAMES
     assert {"wq_b", "wo_a", "wo_b"} <= ATTN_TP_LORA_MODULE_NAMES
+
+
+def test_deepseek_v4_shared_expert_dimensions():
+    config = _v4_config()
+    base_model = object()
+
+    assert get_hidden_dim("gate_up_proj", config, base_model, 0) == (4096, 4096)
+    assert get_hidden_dim("down_proj", config, base_model, 0) == (2048, 4096)
 
 
 def test_wq_b_normalization_preserves_dsa_only_adapters():

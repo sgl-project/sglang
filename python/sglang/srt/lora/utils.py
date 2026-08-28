@@ -184,9 +184,12 @@ def get_default_hidden_dim(
         )
     elif module_name == "gate_up_proj":
         inter = config.intermediate_size
+        deepseek_v4_shared = getattr(config, "model_type", None) == "deepseek_v4"
         first_k = getattr(config, "first_k_dense_replace", None)
         moe_freq = getattr(config, "moe_layer_freq", 1)
-        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+        if deepseek_v4_shared or (
+            first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0
+        ):
             moe_inter = getattr(config, "moe_intermediate_size", None)
             n_shared = getattr(config, "n_shared_experts", None)
             if moe_inter is not None and n_shared is not None:
@@ -194,9 +197,12 @@ def get_default_hidden_dim(
         return config.hidden_size, inter * 2
     elif module_name == "down_proj":
         inter = config.intermediate_size
+        deepseek_v4_shared = getattr(config, "model_type", None) == "deepseek_v4"
         first_k = getattr(config, "first_k_dense_replace", None)
         moe_freq = getattr(config, "moe_layer_freq", 1)
-        if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
+        if deepseek_v4_shared or (
+            first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0
+        ):
             moe_inter = getattr(config, "moe_intermediate_size", None)
             n_shared = getattr(config, "n_shared_experts", None)
             if moe_inter is not None and n_shared is not None:
