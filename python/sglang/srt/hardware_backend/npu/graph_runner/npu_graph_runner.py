@@ -215,6 +215,22 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
+            if not hasattr(self, "raw_num_token"):
+                # NPU skips the DFLASH verify pre-planning
+                # (DFlashVerifyInput.prepare_for_verify returns early for NPU),
+                # so load_batch may never have recorded the padded batch
+                # shapes. Compute them the same way load_batch does for the
+                # non-ragged path.
+                raw_bs = forward_batch.batch_size
+                if self.require_mlp_tp_gather:
+                    bs = self._pad_to_bucket(
+                        self._max_dp_batch_size(forward_batch), self.capture_bs
+                    )
+                else:
+                    bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+                self.raw_bs = raw_bs
+                self.raw_num_token = raw_bs * self.captured_req_width
+                self.bs = bs
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
