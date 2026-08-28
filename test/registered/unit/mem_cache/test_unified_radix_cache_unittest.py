@@ -2956,7 +2956,16 @@ class UnifiedRadixCacheSuite:
         self.fail(f"prefetch {req_id} did not complete in time")
 
     def _consume_staged_prefetch(
-        self, cache, req_id, prefix_len=None, prefix_indices=None, timeout: float = 10.0
+        self,
+        cache,
+        req_id,
+        prefix_len=None,
+        prefix_indices=None,
+        timeout: float = 10.0,
+        *,
+        extra_key=None,
+        cache_salt=None,
+        last_node=None,
     ):
         """Simulate the PrefillAdder consuming a staged prefetch at admission:
         init_load_back (buffer dispatch: device alloc + queued H2D), the batch
@@ -2969,8 +2978,8 @@ class UnifiedRadixCacheSuite:
             prefix_len = f.matched_len
         req = mock.Mock()
         req.rid = req_id
-        req.extra_key = None
-        req.cache_salt = None
+        req.extra_key = extra_key
+        req.cache_salt = cache_salt
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
@@ -2983,7 +2992,7 @@ class UnifiedRadixCacheSuite:
                 dtype=torch.int64,
                 device=cache.tree_core.empty_match_result.device_indices.device,
             )
-        req.last_node = cache.root_node_handle()
+        req.last_node = cache.root_node_handle() if last_node is None else last_node
         new_indices, _last_node = cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=None, host_hit_length=f.num_tokens, req=req
@@ -3395,10 +3404,14 @@ class UnifiedRadixCacheSuite:
     # ================================================================
 
     def test_buffer_only_rejects_mamba(self):
-        if self.cfg.components != (
-            ComponentType.FULL,
-            ComponentType.MAMBA,
-        ) or self.cfg.page_size != 1:
+        if (
+            self.cfg.components
+            != (
+                ComponentType.FULL,
+                ComponentType.MAMBA,
+            )
+            or self.cfg.page_size != 1
+        ):
             self.skipTest("one FULL+MAMBA page_size=1 fixture covers this guard")
 
         cache, _, _ = build_fixture(self.cfg)
@@ -3478,17 +3491,25 @@ class UnifiedRadixCacheSuite:
             "buffer backup pipeline did not drain",
         )
 
-    def _produce_buffer_l3(self, storage_dir, seq, marker=None):
+    def _produce_buffer_l3(
+        self, storage_dir, seq, marker=None, *, extra_key=None, cache_salt=None
+    ):
         """Producer tree in buffer mode: insert seq and push it to L3."""
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(prod, storage_dir)
-        self._insert(prod, prod_alloc, prod_rtp, seq)
-        leaf = prod.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
+        self._insert(
+            prod,
+            prod_alloc,
+            prod_rtp,
+            seq,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+        )
+        key = RadixKey(array("q", seq), extra_key=extra_key, cache_salt=cache_salt)
+        leaf = prod.match_prefix(MatchPrefixParams(key=key)).last_device_node
         expected = None
         if marker is not None:
-            m = prod.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+            m = prod.match_prefix(MatchPrefixParams(key=key))
             self._fill_full_kv(prod_alloc, m.device_indices, marker=marker)
             expected = self._snapshot_full_kv(prod_alloc, m.device_indices)
         self._buffer_backup_and_wait(prod, leaf)
@@ -3676,6 +3697,131 @@ class UnifiedRadixCacheSuite:
 
         self.assertIn("occupancy_ratio", cons.prefetch_outcome_stats_snapshot())
         cons.sanity_check()
+
+    def test_buffer_only_cache_salt_uses_the_request_namespace(self):
+        self._skip_unsupported_hicache_test()
+        if self.cfg.components != (ComponentType.FULL,) or self.cfg.page_size != 4:
+            self.skipTest("one FULL page_size=4 fixture covers namespace routing")
+
+        anchor_lock = envs.SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK.override(True)
+        anchor_lock.__enter__()
+        self.addCleanup(anchor_lock.__exit__, None, None, None)
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        extra_key = "adapter-a"
+        cache_salt = "tenant-a"
+        seq = self._make_seq(1, 2)
+        self._produce_buffer_l3(
+            storage_dir, seq, extra_key=extra_key, cache_salt=cache_salt
+        )
+
+        # A root anchor has no namespace of its own. The fetched span must use
+        # the request namespace supplied to prefetch_from_storage.
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        root_req = "salted-root-prefetch"
+        cons.prefetch_from_storage(
+            root_req,
+            cons.root_node_handle(),
+            array("q", seq),
+            None,
+            None,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(root_req)
+            and cons.buffer_pipeline.has_staged(root_req),
+            "salted root prefetch did not stage",
+        )
+        held = cons.buffer_pipeline.staged_prefetches[root_req]
+        self.assertEqual((held.extra_key, held.cache_salt), (extra_key, cache_salt))
+        self.assertNotIn(root_req, cons.buffer_pipeline.anchor_locks)
+        loaded = self._consume_staged_prefetch(
+            cons,
+            root_req,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+        )
+        self.assertEqual(len(loaded), len(seq))
+        key = RadixKey(array("q", seq), extra_key=extra_key, cache_salt=cache_salt)
+        self.assertEqual(
+            len(cons.match_prefix(MatchPrefixParams(key=key)).device_indices), len(seq)
+        )
+        for miss in (
+            RadixKey(array("q", seq)),
+            RadixKey(array("q", seq), extra_key=extra_key, cache_salt="tenant-b"),
+            RadixKey(array("q", seq), extra_key="adapter-b", cache_salt=cache_salt),
+        ):
+            self.assertEqual(
+                len(cons.match_prefix(MatchPrefixParams(key=miss)).device_indices), 0
+            )
+        cons.sanity_check()
+
+        # A mid-tree anchor is pinned while its suffix is in flight and
+        # released as soon as the staged span is consumed.
+        cons2, cons2_alloc, cons2_rtp = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons2, storage_dir)
+        prefix = seq[: self.cfg.page_size]
+        suffix = seq[self.cfg.page_size :]
+        self._insert(
+            cons2,
+            cons2_alloc,
+            cons2_rtp,
+            prefix,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+        )
+        prefix_match = cons2.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    array("q", prefix),
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                )
+            )
+        )
+        anchor = prefix_match.last_device_node
+        lock_ref = _device_lock_ref(cons2, anchor, ComponentType.FULL)
+        anchored_req = "salted-mid-tree-prefetch"
+        cons2.prefetch_from_storage(
+            anchored_req,
+            anchor,
+            array("q", suffix),
+            cons2.tree_core.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=prefix,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+        )
+        self.assertIn(anchored_req, cons2.buffer_pipeline.anchor_locks)
+        self.assertEqual(
+            _device_lock_ref(cons2, anchor, ComponentType.FULL), lock_ref + 1
+        )
+        self._pump_hicache_until(
+            cons2,
+            lambda: cons2.check_prefetch_progress(anchored_req)
+            and cons2.buffer_pipeline.has_staged(anchored_req),
+            "salted mid-tree prefetch did not stage",
+        )
+        self._consume_staged_prefetch(
+            cons2,
+            anchored_req,
+            prefix_len=len(prefix),
+            prefix_indices=prefix_match.device_indices,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            last_node=anchor,
+        )
+        self.assertNotIn(anchored_req, cons2.buffer_pipeline.anchor_locks)
+        self.assertEqual(cons2.buffer_pipeline.anchor_locked_tokens_, 0)
+        self.assertEqual(_device_lock_ref(cons2, anchor, ComponentType.FULL), lock_ref)
+        self.assertEqual(
+            len(cons2.match_prefix(MatchPrefixParams(key=key)).device_indices), len(seq)
+        )
+        cons2.sanity_check()
 
     def test_buffer_only_storage_prefetch_miss_marker_and_retry(self):
         """A too-early storage query misses; the miss must arm the retry

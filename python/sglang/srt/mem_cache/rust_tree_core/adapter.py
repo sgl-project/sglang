@@ -819,6 +819,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 token_ids,
                 extra_key=snapshot.extra_key,
                 is_bigram=snapshot.is_bigram,
+                cache_salt=snapshot.cache_salt,
             ),
             prefix_keys=snapshot.prefix_keys,
         )

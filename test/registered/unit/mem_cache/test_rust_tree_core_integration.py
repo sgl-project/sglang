@@ -1061,6 +1061,7 @@ def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():
     assert result.device_indices.numel() == 0
     core.sanity_check([], [])
 
+
 # ==== SWA wiring ====
 
 
@@ -1198,18 +1199,32 @@ def _swa_cache(window: int = 8, page_size: int = 1):
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     core = _tree_core()
     core.enable_storage = True
-    inserted = _insert(core, [1, 2], [10, 11])
+    key = RadixKey(array("q", [1, 2]), extra_key="adapter-a", cache_salt="tenant-a")
+    inserted = _pump_insert(
+        core,
+        InsertParams(key=key, value=torch.tensor([10, 11], dtype=torch.int64)),
+    )
     leaf = inserted.last_device_node
 
     snapshot = core.snapshot_buffer_backup(leaf, pass_prefix_keys=True)
     assert snapshot.node_id == leaf
     assert snapshot.parent_is_root
     assert snapshot.key.token_ids == array("q", [1, 2])
+    assert snapshot.key.extra_key == "adapter-a"
+    assert snapshot.key.cache_salt == "tenant-a"
     assert not snapshot.key.is_bigram
     assert snapshot.prefix_keys == []
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is not None
 
-    _insert(core, [1, 9], [12, 13])
+    _pump_insert(
+        core,
+        InsertParams(
+            key=RadixKey(
+                array("q", [1, 9]), extra_key="adapter-a", cache_salt="tenant-a"
+            ),
+            value=torch.tensor([12, 13], dtype=torch.int64),
+        ),
+    )
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
 
 
