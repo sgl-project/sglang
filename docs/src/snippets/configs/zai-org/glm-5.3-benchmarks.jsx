@@ -147,7 +147,15 @@ export const benchmarks = [
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
+  {
+    match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    speed: [
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 281, tpot_ms: 1.48, tokens_per_sec_per_gpu: 640 },
+      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
+        ttft_ms: 1988, tpot_ms: 5.11, tokens_per_sec_per_gpu: 2306 },
+    ],
+  },
   { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
   { match: { hw: "b300",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
