@@ -227,7 +227,7 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 FROM $BASE_IMAGE_ROCM1000 AS rocm1000-base
 
 # Redeclare the global selector inside this stage so each matrix build installs
-# only the device payload for its target image (gfx942, gfx950 or gfx1250).
+# only the device payload for its target image (gfx942 or gfx950).
 ARG GPU_ARCH
 
 # ROCM_TRITON_VERSION rather than TRITON_VERSION: the final stage declares a
@@ -1021,13 +1021,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # mori_application links -ldrm/-ldrm_amdgpu. The SDK's own libraries find
   # these through an $ORIGIN/rocm_sysdeps/lib RPATH that MORI does not inherit,
   # hence the ldconfig entry; every soname in there is librocm_sysdeps_*-prefixed,
-  # so it shadows nothing system-wide. The apt ROCm images have no rocm_sysdeps
-  # tree, so the guard keeps them on their existing behaviour. This supersedes
-  # the gfx1250-only CMAKE_PREFIX_PATH branch: every pip-SDK flavor needs it.
+  # so it shadows nothing system-wide. Scope this explicitly to ROCm 10 so the
+  # ROCm 7.2 and 7.2.4 MORI build paths remain byte-for-byte equivalent here.
   ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
-  if [ -d "${ROCM_SYSDEPS}" ]; then \
-    export PATH="${ROCM_HOME}/bin:${PATH}"; \
-    export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}/lib/cmake:${ROCM_SYSDEPS}:${ROCM_HOME}/lib/cmake:${ROCM_HOME}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
+  if [ "${GPU_ARCH##*-}" = "rocm1000" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
+    export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
     export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
     export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
     echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
