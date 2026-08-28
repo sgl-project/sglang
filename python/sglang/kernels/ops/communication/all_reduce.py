@@ -184,7 +184,7 @@ class Communicator(tvm_ffi.Object):
 
     @property
     def gather(self) -> PushPlane | None:
-        """The 2shot_lamport gather plane, or None when that algo is off."""
+        """The shared push-plane handle used by 2shot_lamport, or None."""
         return self.get_gather()
 
 

@@ -3,15 +3,17 @@
 The CUDA side is split into independent pieces:
 
 - ``PushPlane``: the zero-filled symmetric push buffers plus a rank-local
-  phase counter.
+  phase counter. ``1shot_push`` and ``2shot_lamport`` share this plane: the
+  former treats it as one full-input slot per source, while the latter lays
+  the reduced shards contiguously across those same slots.
 - ``PullPlane``: the symmetric pull buffers plus the per-block semaphores
   guarding them. The buffers exist only because this class hands the
   all-reduce tensors that are not symmetric memory, so it stages them
   through; the K3 fused collectives bring their own symmetric input and
   borrow the semaphores alone.
-- the gather plane: a second ``PushPlane``, used by ``2shot_lamport`` for
-  the all-gather half of its reduce-scatter. It cannot share the push plane,
-  whose epoch ``1shot_push`` advances on its own schedule.
+- the gather handle: an alias of ``PushPlane``, used by ``2shot_lamport`` for
+  the all-gather half of its reduce-scatter. Sharing the handle also shares
+  the epoch counter, so both algorithms advance the double buffer together.
 - ``Communicator``: the planes above (any may be absent), the handle every
   kernel takes, plus the pull launch widths.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
@@ -135,9 +137,10 @@ class CustomAllReduceV2:
         :param max_push_size: explicit per-slot push workspace size;
                               overrides both the tuned size and ``max_size``.
         :param max_lamport_size: explicit ``2shot_lamport`` message ceiling,
-                                 which sizes the gather plane; overrides both
-                                 the tuned size and ``max_size``. ``0``
-                                 disables the algo and its plane.
+                                 which may enlarge the shared push slots;
+                                 overrides both the tuned size and
+                                 ``max_size``. ``0`` disables the algo and its
+                                 gather handle.
         :param max_pull_blocks: cap on the barrier plane's block count; ``0``
                                 builds a push-only instance.
 
@@ -206,6 +209,7 @@ class CustomAllReduceV2:
             if self.lamport_enabled
             else 0
         )
+        self.shared_slot_size = max(self.max_push_size, self.gather_slot_size)
         self.max_lamport_size = min(
             self.gather_slot_size * self.world_size, self.max_pull_size
         )
@@ -245,22 +249,25 @@ class CustomAllReduceV2:
     def _init_workspace(self) -> None:
         """Slice one symmetric-memory allocation into every shared buffer.
 
-        Layout per rank: ``[2 * world_size push slots | pull buffer | pull
-        semaphores | 2 * world_size gather slots]``. One allocation rather
-        than four keeps it to a single rendezvous and a single multicast base
-        to offset from. The push and gather counters are rank-local, so they
-        live in plain CUDA tensors.
+        Layout per rank: ``[2 * world_size shared push slots | pull buffer |
+        pull semaphores]``. The shared slots serve both ``1shot_push`` and
+        ``2shot_lamport``; their common counter is rank-local and therefore
+        lives in a plain CUDA tensor.
         """
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
-        push_bytes = push_num_slots * self.max_push_size
+        push_bytes = push_num_slots * self.shared_slot_size
         pull_bytes = self.max_pull_size  # 0 when the pull half is disabled
-        sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks if self.pull_enabled else 0
-        gather_bytes = push_num_slots * self.gather_slot_size  # 0 when disabled
-        total_bytes = push_bytes + pull_bytes + sem_bytes + gather_bytes
+        # Lamport now launches with the push grid (`num_sms`) but enters
+        # through the pull barrier. Allocate enough semaphore rows for that
+        # grid while keeping the tuned pull launch width in Communicator.
+        num_sem_blocks = cfg.num_pull_blocks if self.pull_enabled else 0
+        if self.lamport_enabled:
+            num_sem_blocks = max(num_sem_blocks, cfg.num_push_blocks)
+        sem_bytes = _SEMAPHORE_BYTES * num_sem_blocks
+        total_bytes = push_bytes + pull_bytes + sem_bytes
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
-        gather_offset = sem_offset + sem_bytes
 
         self._symm_tensor, symm_mem = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
@@ -269,9 +276,9 @@ class CustomAllReduceV2:
             symm_mem.get_buffer(i, [total_bytes], torch.uint8)
             for i in range(self.world_size)
         ]
-        # The push and gather slots (lamport pos-zero markers) and the
-        # semaphores must start zeroed; the pull buffer need not, but it rides
-        # along in the one-shot memset.
+        # The shared push slots (Lamport pos-zero markers) and semaphores must
+        # start zeroed; the pull buffer need not, but it rides along in the
+        # one-shot memset.
         slabs[self.rank].zero_()
         torch.cuda.synchronize()
         dist.barrier(group=self.group)
@@ -296,23 +303,11 @@ class CustomAllReduceV2:
         push_plane = PushPlane(
             self.rank,
             self.world_size,
-            workspaces=slice_all([push_num_slots, self.max_push_size], 0),
+            workspaces=slice_all([push_num_slots, self.shared_slot_size], 0),
             counter=self._push_counter.view(-1, 1).view(torch.uint8),
             mc_workspace=mc_at(0),
         )
-        gather_plane = None
-        if self.lamport_enabled:
-            self._gather_counter = torch.zeros(
-                (cfg.num_pull_blocks,), dtype=torch.uint32, device=self.device
-            )
-            gather_plane = PushPlane(
-                self.rank,
-                self.world_size,
-                workspaces=slice_all(
-                    [push_num_slots, self.gather_slot_size], gather_offset
-                ),
-                counter=self._gather_counter.view(-1, 1).view(torch.uint8),
-            )
+        gather_plane = push_plane if self.lamport_enabled else None
         pull_plane = None
         if self.pull_enabled:
             pull_plane = PullPlane(
@@ -320,7 +315,7 @@ class CustomAllReduceV2:
                 self.world_size,
                 workspaces=slice_all([pull_bytes], pull_offset),
                 semaphores=slice_all(
-                    [cfg.num_pull_blocks, _SEMAPHORE_BYTES], sem_offset
+                    [num_sem_blocks, _SEMAPHORE_BYTES], sem_offset
                 ),
                 mc_workspace=mc_at(pull_offset),
                 mc_semaphore=mc_at(sem_offset),
@@ -329,6 +324,8 @@ class CustomAllReduceV2:
             self.config = self.config._replace(num_mc_blocks=None)
 
         self.obj = Communicator(push=push_plane, pull=pull_plane, gather=gather_plane)
+        if self.pull_enabled:
+            self.obj.set_pull_blocks(self.config.num_pull_blocks)
         if self.config.num_mc_blocks is not None:
             self.obj.set_pull_multicast_blocks(self.config.num_mc_blocks)
         if self.rank == 0:

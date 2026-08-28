@@ -8,9 +8,9 @@
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
 //   - 2shot_lamport: the same reduce-scatter, but the all-gather pushes each
-//     reduced shard into a separate lamport plane instead of the peers' pull
-//     workspaces. Readiness then rides in the data, so the exit barrier goes
-//     away: a rank copies each peer's shard out the moment it lands.
+//     reduced shard into the shared Lamport push plane instead of the peers'
+//     pull workspaces. Readiness then rides in the data, so the exit barrier
+//     goes away: a rank copies each peer's shard out the moment it lands.
 //
 // Unlike the previous implementation, the kernels carry no storage or IPC
 // logic: all pointers arrive via the communication planes (owned by Python)
@@ -309,7 +309,14 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_lamport_kernel(
   }
 
   const auto num_threads = blockDim.x * gridDim.x;
-  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto num_remote_vecs = num_total_vecs - num_vecs;
+  const auto block_major_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto warp_in_block = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto global_warp_id = blockIdx.x + gridDim.x * warp_in_block;
+  const auto warp_striped_tid = global_warp_id * kWarpThreads + lane_id;
+  const auto global_tid =
+      num_remote_vecs < num_threads ? warp_striped_tid : block_major_tid;
 
   // shot 1: reduce our own shard from every peer, write it straight to our
   // output, and push it into every peer's gather plane.
@@ -330,7 +337,6 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_lamport_kernel(
   vec_t pos_zero_vec;
   Lamport::fill_pos_zero(pos_zero_vec.data());
   const auto local_gather = gather_ptrs[params.rank];
-  const auto num_remote_vecs = num_total_vecs - num_vecs;
   for (auto rid = global_tid; rid < num_remote_vecs; rid += num_threads) {
     // compact the two remote ranges around our own, already-written shard
     const auto vid = rid < vec_offset ? rid : rid + num_vecs;
@@ -427,8 +433,8 @@ struct AllReduceKernel {
     const auto& pull = comm.get_pull_obj();
     const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
     // only 2shot pull + graph mode forces inplace implementation
-    // (2shot_lamport gathers through its own plane, so it never writes over
-    // an input a peer may still be reducing)
+    // (2shot_lamport gathers through the shared push plane, so it never
+    // writes over an input a peer may still be reducing)
     const auto is_inplace = use_graph && algo == "2shot_pull";
     Tensor out = is_inplace ? in : ffi::empty_like(in);
     const auto params = PullParams{
@@ -467,7 +473,7 @@ struct AllReduceKernel {
     using LS_GRAPH = LoadStoreImpl<vec_t, kWorldSize, /*kUseGraph=*/true>;
     using MC = MultiCastImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
     if (algo == "2shot_lamport") {
-      CHECK_HOST(!use_multicast) << "2shot_lamport gathers through its own plane, not multimem";
+      CHECK_HOST(!use_multicast) << "2shot_lamport gathers through the shared push plane, not multimem";
       const auto& gather = comm.get_gather_obj();
       const uint32_t lamport_blocks = gather.num_blocks;
       CHECK_HOST(lamport_blocks <= pull.num_blocks)

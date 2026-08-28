@@ -251,7 +251,7 @@ def test_empty_input_dispatches_like_the_smallest_one() -> None:
 
 
 @torch.inference_mode()
-def test_2shot_lamport_gather() -> None:
+def test_2shot_lamport_shared_push_plane() -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     dtype = torch.bfloat16
@@ -268,13 +268,29 @@ def test_2shot_lamport_gather() -> None:
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)
-    # a whole message spans one slot per peer, in either plane
+    # A whole Lamport message spans one enlarged shared slot per peer. Keep
+    # the tuned 1shot limit smaller: physical capacity must not silently widen
+    # its dispatch range.
     assert comm.gather_slot_size * comm.world_size >= lamport_bytes
     assert comm.max_push_size * comm.world_size < lamport_bytes
+    assert comm.shared_slot_size == comm.gather_slot_size
+    assert comm.shared_slot_size > comm.max_push_size
 
     plan = [(AllReduceAlgo.TWO_SHOT_LAMPORT, lamport_size)] * TEST_LAYERS
     plan += [(AllReduceAlgo.ONE_SHOT_PUSH, push_size)] * TEST_LAYERS
     plan[::2], plan[1::2] = plan[:TEST_LAYERS], plan[TEST_LAYERS:]
+
+    # Exercise the shared epoch in eager mode before capturing the same
+    # alternating sequence. Separate push/gather counters would let the two
+    # protocols select the same half of the aliased storage here.
+    for _ in range(TEST_LOOP):
+        for algo, size in plan:
+            inp = torch.randint(0, 16, (size,), dtype=dtype, device=device)
+            ref = inp.clone()
+            dist.all_reduce(ref, group=nccl_group)
+            comm.override_algo = algo
+            out = comm.custom_all_reduce(inp)
+            torch.testing.assert_close(ref, out, atol=0, rtol=0)
 
     graph = torch.cuda.CUDAGraph()
     graph_inps = [torch.zeros((size,), dtype=dtype, device=device) for _, size in plan]

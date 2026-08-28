@@ -93,7 +93,8 @@ class AllReduceConfig(NamedTuple):
     The two ``Heuristic`` entries describe the size crossover for each
     dispatch context (CUDA-graph capture vs eager). Block-count knobs apply
     to the kernel grid:
-      - ``num_push_blocks``: 1shot_push grid (bound to the counter array)
+      - ``num_push_blocks``: shared 1shot_push / 2shot_lamport grid (bound to
+        the counter array)
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
     """
