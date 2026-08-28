@@ -1963,6 +1963,21 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
+            # Drop the KV beliefs from the first page any pool failed to serve;
+            # the next insert then re-writes that span through one FULL check,
+            # restoring the missing aux pages.
+            keep_pages = completed_tokens // self.page_size
+            for transfer, count in zip(pool_transfers, pool_hit_pages):
+                if transfer.keys is None:
+                    keep_pages = 0
+                elif count < len(transfer.keys):
+                    # Aux transfers key the chain's trailing pages.
+                    keep_pages = min(
+                        keep_pages, max(0, len(hash_value) - len(transfer.keys))
+                    )
+            self.storage_existence_cache.invalidate_beyond(
+                PoolName.KV, hash_value, keep_pages=keep_pages
+            )
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self.cache_controller.append_host_mem_release(
@@ -1980,10 +1995,12 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.prefetch_loaded_tokens_by_reqid[req_id] = 0
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
+                "kv_beliefs_kept_pages=%d",
                 req_id,
                 completed_tokens,
                 expected_tokens,
+                keep_pages,
             )
             return False
         return True
