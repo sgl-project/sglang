@@ -66,7 +66,6 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
-from sglang.srt.connector import ConnectorType
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -102,7 +101,6 @@ from sglang.srt.utils.common import (
     is_xpu,
     json_list_type,
     nullable_str,
-    parse_connector_type,
     torch_release,
 )
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
@@ -4691,136 +4689,26 @@ class ServerArgs:
         return tokens
 
     def _validate_cutedsl_a2a_token_budget(self):
-        """Fail fast if the FlashInfer A2A dispatcher workspace cannot cover the
-        largest CuteDSL MoE forward. Runs after speculative decoding is resolved
-        so cutedsl_moe_max_num_tokens() sees the final num_tokens_per_req."""
-        cfg = resolving_view(self)
+        from sglang.srt.arg_groups.moe_hook import validate_cutedsl_a2a_token_budget
 
-        view = resolved_view(self)
-        if not (
-            view.moe_a2a_backend == "flashinfer"
-            and view.moe_runner_backend == "flashinfer_cutedsl"
-            and cfg.max_prefill_tokens > 0
-            and cfg.disaggregation_mode != "decode"
-        ):
-            return
-        required_tokens = self.cutedsl_moe_max_num_tokens()
-        max_dispatch_tokens_per_rank = (
-            envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
-        )
-        max_cutedsl_tokens = max_dispatch_tokens_per_rank * view.ep_size
-        if max_cutedsl_tokens < required_tokens:
-            required_per_rank = (required_tokens + view.ep_size - 1) // view.ep_size
-            raise ValueError(
-                "FlashInfer MoE A2A with flashinfer_cutedsl requires "
-                "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK * "
-                "ep_size to cover the largest CuteDSL MoE forward "
-                f"({required_tokens} tokens). Otherwise the FlashInfer "
-                "dispatcher can crash at runtime with "
-                "`ValueError: num_tokens (...) exceeds max_num_tokens (...)`. "
-                "Current values: "
-                f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                f"{max_dispatch_tokens_per_rank}, ep_size={view.ep_size}, "
-                f"capacity={max_cutedsl_tokens}, required={required_tokens}. "
-                f"Set `export "
-                f"SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK="
-                f"{required_per_rank}` or lower the relevant limit "
-                f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
-            )
+        validate_cutedsl_a2a_token_budget(self)
 
     def _validate_deepep_v2_dispatch_token_budget(self) -> None:
-        """Check the configured prefill and decode-graph buffer bounds."""
-        view = resolved_view(self)
-        if view.moe_a2a_backend != "deepep_v2":
-            return
-
-        capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-        if view.disaggregation_mode != "decode":
-            prefill_tokens = self.max_prefill_buffer_tokens() or (
-                view.max_prefill_tokens or 0
-            )
-            if prefill_tokens > capacity:
-                raise ValueError(
-                    "DeepEP v2 per-rank prefill budget exceeds "
-                    "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
-                    f"required={prefill_tokens}, capacity={capacity}. Raise the "
-                    "environment value or lower --chunked-prefill-size/"
-                    "--max-prefill-tokens."
-                )
-
-        if view.disaggregation_mode == "prefill":
-            return
-        decode_config = getattr(view.cuda_graph_config, "decode", None)
-        if decode_config is None or decode_config.backend == Backend.DISABLED:
-            return
-
-        graph_bs = decode_config.max_bs or 0
-        if view.max_running_requests is not None:
-            attn_dp_size = view.dp_size if view.enable_dp_attention else 1
-            per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
-            graph_bs = min(graph_bs, per_rank_pool_bs)
-        tokens_per_req = (
-            self.max_speculative_num_draft_tokens or 1
-            if view.speculative_algorithm
-            else 1
+        from sglang.srt.arg_groups.moe_hook import (
+            validate_deepep_v2_dispatch_token_budget,
         )
-        graph_tokens = graph_bs * tokens_per_req
-        if graph_tokens > capacity:
-            raise ValueError(
-                "DeepEP v2 per-rank decode CUDA graph exceeds "
-                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "
-                f"required={graph_tokens}, capacity={capacity} "
-                f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
-                "the environment value or lower --cuda-graph-max-bs."
-            )
+
+        validate_deepep_v2_dispatch_token_budget(self)
 
     def _validate_deepep_v2_model_architecture(self) -> None:
-        """Allow DeepEP v2 only where its model workflow is validated."""
-        if (
-            parse_connector_type(resolved_view(self).model_path)
-            == ConnectorType.INSTANCE
-        ):
-            raise ValueError(
-                "DeepEP v2 MoE cannot validate a model loaded through an instance "
-                "connector. Load it from a model path or use "
-                "--moe-a2a-backend deepep."
-            )
+        from sglang.srt.arg_groups.moe_hook import validate_deepep_v2_model_architecture
 
-        architectures = (
-            getattr(self.get_model_config().hf_config, "architectures", None) or []
-        )
-
-        architecture = architectures[0] if architectures else None
-        # These architectures take the A2A MoE path and skip post-expert
-        # all-reduce.
-        validated_architectures = (
-            "DeepseekV3ForCausalLM",
-            "DeepseekV4ForCausalLM",
-            "Qwen3MoeForCausalLM",
-        )
-        if architecture not in validated_architectures:
-            raise ValueError(
-                f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-                f"architectures are {sorted(validated_architectures)}. "
-                "Other model workflows may require an all-reduce after A2A "
-                "combine. Use --moe-a2a-backend deepep."
-            )
+        validate_deepep_v2_model_architecture(self)
 
     def _validate_deepep_v2_speculative_draft(self) -> None:
-        """Reject an explicit or inherited DeepEP v2 draft backend."""
-        view = resolved_view(self)
-        draft_backend = view.speculative_moe_a2a_backend
-        if draft_backend is None and view.speculative_algorithm:
-            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.arg_groups.moe_hook import validate_deepep_v2_speculative_draft
 
-            algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
-            if not algorithm.is_ngram():
-                draft_backend = view.moe_a2a_backend
-        if draft_backend == "deepep_v2":
-            raise ValueError(
-                "DeepEP v2 MoE is not validated as a speculative draft backend. "
-                "Select another --speculative-moe-a2a-backend."
-            )
+        validate_deepep_v2_speculative_draft(self)
 
     def _handle_a2a_moe(self):
         from sglang.srt.arg_groups.moe_hook import handle_a2a_moe
