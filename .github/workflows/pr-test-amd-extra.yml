@@ -127,7 +127,10 @@ concurrency:
   # never cancel each other); PR runs share a per-branch group so pushes cancel
   # stale runs. (In a reusable workflow github.event_name is the originating
   # event, never workflow_call, so the guard keys off the real events.)
-  group: pr-test-amd-extra-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}
+  # Keyed on the flavor for the same reason as pr-test-amd-rocm720.yml: one run
+  # may drive this suite once per flavor, and those must not queue behind each
+  # other.
+  group: pr-test-amd-extra-${{ inputs.rocm_version || 'rocm724' }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || github.head_ref || github.ref_name || inputs.ref || 'default' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
