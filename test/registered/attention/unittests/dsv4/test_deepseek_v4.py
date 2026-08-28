@@ -648,6 +648,23 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
 
+    def test_trtllm_padded_output_reuses_storage_and_zeros_only_tail(self):
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            DeepseekV4TrtllmAttnBackend,
+        )
+
+        backend = object.__new__(DeepseekV4TrtllmAttnBackend)
+        backend.trtllm_graph_output_buffer = torch.full((8, 2, 512), 7.0)
+        backend.trtllm_eager_output_buffer = None
+
+        output = backend._padded_output_buffer(num_rows=8, num_real_rows=6, num_heads=2)
+
+        self.assertEqual(
+            output.data_ptr(), backend.trtllm_graph_output_buffer.data_ptr()
+        )
+        self.assertTrue(torch.all(output[:6] == 7))
+        self.assertTrue(torch.all(output[6:] == 0))
+
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)
         for max_seq_len in (3, 4, 255, 256, 259, 260):
