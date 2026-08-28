@@ -81,6 +81,24 @@ register_kernel(
         description="DeepSeek-V3 router GEMM (sglang.kernels.jit, JIT-only).",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.kda_nvfp4_gemm",
+        backend=KernelBackend.CUTE_DSL,
+        target=("sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120:" "kda_nvfp4_gemm"),
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("uint8", "float8_e4m3fn", "bfloat16"),
+            description="Qwen3.8 block-scaled NVFP4 GEMM for captured SM120 shapes",
+        ),
+        description=(
+            "Qwen3.8 NVFP4 GEMM automatically optimized with Humanize2 and "
+            "Kernel Design Agents."
+        ),
+    )
+)
 
 
 def fp8_scaled_mm(
@@ -133,7 +151,66 @@ def dsv3_router_gemm(
     return impl(hidden_states, router_weights, out_dtype, output)
 
 
-__all__ = ["fp8_scaled_mm", "bmm_fp8", "dsv3_fused_a_gemm", "dsv3_router_gemm"]
+def can_use_kda_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> bool:
+    """Check the exact SM120/Qwen3.8 shape and layout contract."""
+    from sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120 import (
+        can_use_kda_nvfp4_gemm as can_use,
+    )
+
+    return can_use(input, weight, input_sf, weight_sf, alpha, out_dtype, out_features)
+
+
+def can_dispatch_kda_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> bool:
+    """Check the E2E-validated SM120/Qwen3.8 serving fast path."""
+    from sglang.kernels.kda_kernels.qwen38_nvfp4_gemm_sm120 import (
+        can_dispatch_kda_nvfp4_gemm as can_dispatch,
+    )
+
+    return can_dispatch(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
+    )
+
+
+def kda_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    """Run the Humanize2/KDA SM120 NVFP4 GEMM."""
+    return get_kernel("gemm.kda_nvfp4_gemm", KernelBackend.CUTE_DSL)(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
+    )
+
+
+__all__ = [
+    "bmm_fp8",
+    "can_dispatch_kda_nvfp4_gemm",
+    "can_use_kda_nvfp4_gemm",
+    "dsv3_fused_a_gemm",
+    "dsv3_router_gemm",
+    "fp8_scaled_mm",
+    "kda_nvfp4_gemm",
+]
 
 
 # LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);

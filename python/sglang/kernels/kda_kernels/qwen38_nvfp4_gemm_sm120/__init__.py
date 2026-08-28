@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# KDA provenance: this kernel was automatically optimized by the Humanize2
+# workflow (https://github.com/PolyArch/humanize) and Kernel Design Agents
+# (https://github.com/mit-han-lab/kernel-design-agents).
+# Source: https://github.com/BBuf/KDA-Pilot/pull/195 @
+# 516c976cee824a236679adf6eb525275a0a9a120.
+
+from __future__ import annotations
+
+import logging
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+_SUPPORTED_KN = frozenset(
+    {
+        (5120, 34816),
+        (17408, 5120),
+        (5120, 248320),
+    }
+)
+_SUPPORTED_M = frozenset({1, 9, 4369})
+# This is the only role that improved the full Qwen3.8-27B DSpark serving
+# benchmark without changing acceptance. Other captured shapes remain callable
+# through the low-level API, but ModelOpt keeps using FlashInfer for them.
+_E2E_VALIDATED_MKN = frozenset({(9, 17408, 5120)})
+_logged_fast_path = False
+
+
+def can_use_kda_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> bool:
+    """Return whether this call matches the captured SM120 production contract."""
+    if not input.is_cuda or input.ndim != 2 or input.dtype != torch.uint8:
+        return False
+    if out_dtype != torch.bfloat16 or input.shape[0] not in _SUPPORTED_M:
+        return False
+
+    m, packed_k = input.shape
+    k = packed_k * 2
+    n = int(out_features)
+    if (k, n) not in _SUPPORTED_KN:
+        return False
+    if input.stride() != (packed_k, 1):
+        return False
+    if weight.dtype != torch.uint8 or weight.shape != (packed_k, n):
+        return False
+    if weight.stride() != (1, packed_k):
+        return False
+
+    scale_k = k // 16
+    padded_m = ((m + 127) // 128) * 128
+    # FlashInfer 0.6.17 exposes the same E4M3 scale bytes as uint8, while
+    # newer builds may preserve the float8_e4m3fn dtype on the view.
+    if input_sf.dtype not in (torch.uint8, torch.float8_e4m3fn):
+        return False
+    if input_sf.shape != (padded_m, scale_k) or input_sf.stride() != (scale_k, 1):
+        return False
+    if weight_sf.dtype != torch.float8_e4m3fn:
+        return False
+    if weight_sf.shape != (scale_k, n) or weight_sf.stride() != (1, scale_k):
+        return False
+    if alpha.dtype != torch.float32 or alpha.numel() != 1 or not alpha.is_contiguous():
+        return False
+
+    tensors = (weight, input_sf, weight_sf, alpha)
+    if any(t.device != input.device for t in tensors):
+        return False
+    props = torch.cuda.get_device_properties(input.device)
+    return (props.major, props.minor) == (12, 0)
+
+
+def can_dispatch_kda_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> bool:
+    """Return whether this call belongs to the E2E-validated serving fast path."""
+    if input.ndim != 2:
+        return False
+    m, packed_k = input.shape
+    if (m, packed_k * 2, int(out_features)) not in _E2E_VALIDATED_MKN:
+        return False
+    return can_use_kda_nvfp4_gemm(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
+    )
+
+
+def kda_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    """Run the KDA-generated Qwen3.8 NVFP4 GEMM."""
+    global _logged_fast_path
+    if not can_use_kda_nvfp4_gemm(
+        input, weight, input_sf, weight_sf, alpha, out_dtype, out_features
+    ):
+        raise ValueError("unsupported call for the KDA Qwen3.8 NVFP4 GEMM")
+
+    from .gemm import decode_fp4_gemm, large_fp4_gemm
+
+    if not _logged_fast_path:
+        logger.info(
+            "Using the Humanize2/KDA Qwen3.8 NVFP4 GEMM on SM120 "
+            "(BBuf/KDA-Pilot#195)"
+        )
+        _logged_fast_path = True
+    if input.shape[0] <= 9:
+        return decode_fp4_gemm(input, weight, input_sf, weight_sf, alpha)
+    return large_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+
+
+__all__ = [
+    "can_dispatch_kda_nvfp4_gemm",
+    "can_use_kda_nvfp4_gemm",
+    "kda_nvfp4_gemm",
+]
