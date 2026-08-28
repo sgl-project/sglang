@@ -108,10 +108,7 @@ class DpPaddingMode(IntEnum):
         if moe_a2a_backend.is_pplx():
             return DpPaddingMode.MAX_LEN
 
-        if (
-            moe_a2a_backend.is_deepep_v2()
-            and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get()
-        ):
+        if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
             return DpPaddingMode.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
