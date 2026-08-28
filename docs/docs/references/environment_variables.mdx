@@ -897,7 +897,7 @@ SGLang supports various environment variables that can be used to configure its 
   </tbody>
 </table>
 
-## PD Disaggregation — Staging Buffer (Heterogeneous TP)
+## PD Disaggregation — Staging Buffers
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -924,8 +924,18 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGG_DCP_STAGING_BUFFER</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable prefill-side GPU staging for Mooncake MLA or hybrid-MLA relayout from prefill DCP size 1 to decode DCP size greater than 1. Set this variable on prefill servers only.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Prefill-side DCP relayout staging size in MB per Mooncake transfer worker. Larger relayouts are split into page-aligned batches.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>64</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_STAGING_USE_TORCH</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force the heterogeneous-TP staging path to use the PyTorch gather/scatter fallback instead of Triton fused kernels. This variable does not affect MLA DCP relayout staging.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>

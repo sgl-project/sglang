@@ -7,7 +7,9 @@ buffer mechanism that gathers scattered head slices into contiguous GPU memory,
 enabling bulk RDMA transfers that reduce request count to O(layers) or O(1).
 
 Usage:
-    Activated by setting SGLANG_DISAGG_STAGING_BUFFER=1.
+    Heterogeneous TP staging is activated with SGLANG_DISAGG_STAGING_BUFFER=1.
+    MLA DCP relayout staging is activated with
+    SGLANG_DISAGG_DCP_STAGING_BUFFER=1.
 """
 
 from __future__ import annotations
@@ -27,6 +29,39 @@ logger = logging.getLogger(__name__)
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
 _USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
+
+
+@triton.jit
+def _fused_gather_dcp_to_staging_kernel(
+    layer_ptrs,
+    token_indices,
+    token_item_lens,
+    layer_offsets,
+    staging,
+    num_tokens,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Pack strided MLA token rows into a layer-major byte buffer."""
+    layer_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+
+    item_len = tl.load(token_item_lens + layer_id).to(tl.int64)
+    byte_offsets = block_id.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(
+        tl.int64
+    )
+    mask = byte_offsets < num_tokens * item_len
+
+    packed_token = byte_offsets // item_len
+    byte_in_token = byte_offsets % item_len
+    src_token = tl.load(token_indices + packed_token, mask=mask, other=0).to(tl.int64)
+    src_layer = tl.load(layer_ptrs + layer_id).to(staging.dtype)
+    values = tl.load(
+        src_layer + src_token * item_len + byte_in_token,
+        mask=mask,
+    )
+
+    dst_layer_offset = tl.load(layer_offsets + layer_id).to(tl.int64)
+    tl.store(staging + dst_layer_offset + byte_offsets, values, mask=mask)
 
 
 @triton.jit
@@ -157,6 +192,87 @@ class StagingBuffer:
 
     def fits(self, required_bytes: int) -> bool:
         return required_bytes <= self.size_bytes
+
+
+def gather_dcp_tokens_to_staging(
+    src_data_ptrs: List[int],
+    src_token_indices,
+    token_item_lens: List[int],
+    staging_buffer: StagingBuffer,
+    gpu_id: int,
+) -> int:
+    """Gather MLA token rows into contiguous, layer-major staging memory.
+
+    The copy is byte-preserving so FP8 and other packed KV dtypes are not
+    converted. Returns the number of bytes written.
+    """
+    import numpy as np
+
+    if len(src_data_ptrs) != len(token_item_lens):
+        raise ValueError(
+            "src_data_ptrs and token_item_lens must have equal lengths, "
+            f"got {len(src_data_ptrs)} and {len(token_item_lens)}"
+        )
+    if any(item_len <= 0 for item_len in token_item_lens):
+        raise ValueError(
+            f"token_item_lens must contain only positive values, got {token_item_lens}"
+        )
+
+    indices_np = np.asarray(src_token_indices, dtype=np.int64)
+    if indices_np.ndim != 1:
+        raise ValueError(
+            f"src_token_indices must be one-dimensional, got shape {indices_np.shape}"
+        )
+    num_tokens = int(indices_np.size)
+    if num_tokens == 0 or not src_data_ptrs:
+        return 0
+
+    layer_offsets = []
+    total_bytes = 0
+    for item_len in token_item_lens:
+        layer_offsets.append(total_bytes)
+        total_bytes += num_tokens * item_len
+    if not staging_buffer.fits(total_bytes):
+        raise ValueError(
+            f"DCP staging buffer is too small: need {total_bytes} bytes, "
+            f"have {staging_buffer.get_size()}"
+        )
+
+    device = f"cuda:{gpu_id}"
+    torch.cuda.set_device(gpu_id)
+    layer_ptrs_tensor = torch.tensor(src_data_ptrs, dtype=torch.int64, device=device)
+    token_indices_tensor = torch.from_numpy(indices_np).to(device)
+    token_item_lens_tensor = torch.tensor(
+        token_item_lens, dtype=torch.int64, device=device
+    )
+    layer_offsets_tensor = torch.tensor(layer_offsets, dtype=torch.int64, device=device)
+
+    if not hasattr(staging_buffer, "_dcp_gather_stream"):
+        staging_buffer._dcp_gather_stream = torch.cuda.Stream(device=device)
+    gather_stream = staging_buffer._dcp_gather_stream
+    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
+
+    block_size = 1024
+    max_item_len = max(token_item_lens)
+    grid = (
+        len(src_data_ptrs),
+        triton.cdiv(num_tokens * max_item_len, block_size),
+    )
+    with torch.cuda.stream(gather_stream):
+        _fused_gather_dcp_to_staging_kernel[grid](
+            layer_ptrs_tensor,
+            token_indices_tensor,
+            token_item_lens_tensor,
+            layer_offsets_tensor,
+            staging_buffer.buffer,
+            num_tokens,
+            block_size,
+        )
+
+    # Mooncake does not consume a CUDA stream/event, so host synchronization is
+    # required before the registered staging region is submitted to RDMA.
+    gather_stream.synchronize()
+    return total_bytes
 
 
 class StagingAllocator:

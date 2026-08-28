@@ -304,6 +304,34 @@ python -m sglang_router.launch_router \
   --host 0.0.0.0 --port 8000
 ```
 
+## MLA DCP relayout with a GPU staging buffer
+
+When prefill uses DCP size 1 and decode uses DCP size greater than 1, each decode rank owns a strided subset of the prefill tokens. For MLA and hybrid-MLA models, the default Mooncake relayout path transfers these noncontiguous token rows directly. This can produce one small RDMA write per token and layer.
+
+Enable the DCP staging buffer on the **prefill server** to gather each decode rank's token rows into contiguous GPU memory before transfer. Mooncake then writes contiguous destination runs, normally one block per KV layer and destination cache page. The decode server receives data directly in its final KV cache and does not need a staging buffer or scatter step.
+
+```bash Command
+# Set these variables on the prefill server only.
+export SGLANG_DISAGG_DCP_STAGING_BUFFER=1
+export SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB=64
+```
+
+This path currently requires:
+
+- The Mooncake transfer backend
+- An MLA or hybrid-MLA model
+- Prefill DCP size 1 and decode DCP size greater than 1
+
+The size is allocated per Mooncake transfer worker. Relayouts larger than the configured buffer are split into page-aligned batches.
+If the Triton gather cannot compile or execute, the prefill process disables this
+optimized path and falls back to direct DCP relayout. Mooncake transfer failures
+are still reported normally rather than being hidden by the fallback.
+
+Before production rollout, validate deterministic token and logprob parity against
+a monolithic baseline across page and chunk boundaries, long-context retrieval,
+and an accuracy sample such as GSM8K. The Kimi Linear PD+DCP nightly acceptance
+test exercises this staging path and includes these checks.
+
 ## NIXL
 ### Requirements
 
