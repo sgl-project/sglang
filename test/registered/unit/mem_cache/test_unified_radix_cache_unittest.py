@@ -5013,7 +5013,7 @@ class UnifiedRadixCacheSuite:
             ).last_device_node
         )
         parent = leaf.parent
-        self._backup_node(cache, leaf)
+        self._backup_node(cache, leaf.id)
         lock_result = cache.inc_lock_ref(parent.id)
         try:
             cache.evict(EvictParams(num_tokens=len(leaf.key)))
