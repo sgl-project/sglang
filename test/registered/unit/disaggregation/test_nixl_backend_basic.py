@@ -431,6 +431,118 @@ class TestNixlUpdateStatus(CustomTestCase):
         self.assertNotIn(18, mgr.request_status)
 
 
+class TestNixlFailureNotification(CustomTestCase):
+    def _make_decode_manager(self, request_status=None):
+        mgr = object.__new__(NixlKVManager)
+        mgr.request_status = dict(request_status or {})
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.prefill_response_tracker = defaultdict(set)
+        mgr.transfer_statuses = {}
+        return mgr
+
+    def test_given_active_room_when_prefill_failure_arrives_then_decode_fails(self):
+        room = 31
+        mgr = self._make_decode_manager({room: KVPoll.WaitingForInput})
+        mgr.prefill_response_tracker[room].add(0)
+        mgr.transfer_statuses[room] = TransferStatus()
+
+        handled = mgr._handle_failure_notification(
+            [b"NIXL_TRANSFER_FAILURE", b"31", b"2", b"transport disconnected"]
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertEqual(
+            mgr.failure_records[room],
+            "Prefill rank 2 reported NIXL transfer failure: transport disconnected",
+        )
+        self.assertNotIn(room, mgr.prefill_response_tracker)
+        self.assertNotIn(room, mgr.transfer_statuses)
+
+    def test_given_cleared_room_when_late_failure_arrives_then_room_stays_cleared(self):
+        mgr = self._make_decode_manager()
+
+        handled = mgr._handle_failure_notification(
+            [b"NIXL_TRANSFER_FAILURE", b"32", b"0", b"late failure"]
+        )
+
+        self.assertTrue(handled)
+        self.assertNotIn(32, mgr.request_status)
+        self.assertEqual(mgr.failure_records, {})
+
+    def test_given_malformed_failure_when_handled_then_active_room_is_unchanged(self):
+        mgr = self._make_decode_manager({33: KVPoll.WaitingForInput})
+
+        handled = mgr._handle_failure_notification(
+            [b"NIXL_TRANSFER_FAILURE", b"not-a-room"]
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(mgr.request_status[33], KVPoll.WaitingForInput)
+        self.assertEqual(mgr.failure_records, {})
+
+    def test_given_other_tag_when_handled_then_message_is_not_consumed(self):
+        mgr = self._make_decode_manager({34: KVPoll.WaitingForInput})
+
+        self.assertFalse(mgr._handle_failure_notification([b"STAGING_REQ", b"34"]))
+
+    def test_notify_failure_sends_tagged_payload_to_unique_decode_endpoints(self):
+        room = 35
+        mgr = object.__new__(NixlKVManager)
+        mgr.attn_tp_rank = 1
+        mgr.pp_size = 2
+        mgr.pp_rank = 1
+        mgr.attn_cp_size = 2
+        mgr.attn_cp_rank = 0
+        mgr.transfer_infos = {
+            room: {
+                "a": SimpleNamespace(endpoint="127.0.0.1", dst_port=5555),
+                "a-duplicate": SimpleNamespace(endpoint="127.0.0.1", dst_port=5555),
+                "b": SimpleNamespace(endpoint="127.0.0.2", dst_port=5556),
+            }
+        }
+        mgr._send_multipart_locked = MagicMock()
+
+        mgr._notify_decode_failure(room, "transfer failed")
+
+        self.assertEqual(mgr._send_multipart_locked.call_count, 2)
+        expected_payload = [
+            b"NIXL_TRANSFER_FAILURE",
+            b"35",
+            b"6",
+            b"transfer failed",
+        ]
+        mgr._send_multipart_locked.assert_any_call(
+            "tcp://127.0.0.1:5555", expected_payload, is_ipv6=False
+        )
+        mgr._send_multipart_locked.assert_any_call(
+            "tcp://127.0.0.2:5556", expected_payload, is_ipv6=False
+        )
+
+    def test_notify_failure_continues_after_one_decode_endpoint_send_fails(self):
+        room = 36
+        mgr = object.__new__(NixlKVManager)
+        mgr.attn_tp_rank = 0
+        mgr.pp_size = 1
+        mgr.pp_rank = 0
+        mgr.attn_cp_size = 1
+        mgr.attn_cp_rank = 0
+        mgr.transfer_infos = {
+            room: {
+                "a": SimpleNamespace(endpoint="127.0.0.1", dst_port=5555),
+                "b": SimpleNamespace(endpoint="127.0.0.2", dst_port=5556),
+            }
+        }
+        mgr._send_multipart_locked = MagicMock(
+            side_effect=[RuntimeError("endpoint down"), None]
+        )
+
+        mgr._notify_decode_failure(room, "transfer failed")
+
+        self.assertEqual(mgr._send_multipart_locked.call_count, 2)
+
+
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
@@ -534,6 +646,23 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.transfer_infos)
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
+
+    def test_given_transport_error_when_worker_fails_then_decode_is_notified(self):
+        room = 23
+        mgr = self._make_manager(room)
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        mgr.agent.check_xfer_state = MagicMock(return_value="ERR")
+        mgr._notify_decode_failure = MagicMock()
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        reason = f"NIXL transfer encountered ERR room={room}"
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+        self.assertEqual(mgr.failure_records[room], reason)
+        mgr._notify_decode_failure.assert_called_once_with(
+            room, reason, [mgr.transfer_infos[room]["agent"]]
+        )
 
 
 class TestNixlNotifications(CustomTestCase):
