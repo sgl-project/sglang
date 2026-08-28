@@ -605,7 +605,7 @@ def estimate_candidate_latency_savings_ns(
 
     Transfer work remains the ordering signal within a component frontier.
     Removable latency is capped by the measured component stage for one-shot
-    components and by request wall time for repeatedly streamed DiTs. Added
+    components and by request wall time for repeatedly streamed components. Added
     transfer time is not capped: an unmeasured mechanism may be slower than the
     whole request. Callers without a measured current option retain the
     historical absolute frontier estimate.
@@ -659,7 +659,7 @@ def estimate_candidate_latency_savings_ns(
             )
             # A measured stage bounds how much latency a placement can remove,
             # but not how much an unmeasured mechanism can add. Clipping both
-            # directions made a repeatedly streamed DiT appear merely neutral
+            # directions made a repeatedly streamed component appear merely neutral
             # once its transfer time exceeded the whole request; another small
             # component gain could then select a several-times-slower layout.
             if relative_savings_ns > 0 and latency_upper_bound_ns > 0:
@@ -689,10 +689,10 @@ def estimate_candidate_latency_savings_ns(
         )
         # Stage profiling is intentionally asynchronous by default. That is a
         # useful low-overhead measurement for one-shot encoder/decoder work,
-        # but it records mostly CPU launch time for a repeatedly streamed DiT
-        # and can understate layerwise H2D stalls by orders of magnitude. The
-        # transfer model is already an upper bound, so constrain DiT savings by
-        # the synchronized request wall time instead.
+        # but it records mostly CPU launch time for a repeatedly streamed
+        # component and can understate layerwise H2D stalls by orders of
+        # magnitude. The transfer model is already an upper bound, so constrain
+        # repeated-component savings by the synchronized request wall time.
         repeatedly_streamed = (
             is_dit_component_name(candidate.component_name)
             or candidate.component_name in repeated_component_names
