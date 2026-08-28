@@ -804,12 +804,13 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"and sharding. Got architecture={model_arch!r} and "
                 f"enable_prefill_cp={cfg.enable_prefill_cp!r}."
             )
-        if cfg.dcp_size > 1:
+        dcp_size = getattr(cfg, "dcp_size", 1)
+        if dcp_size > 1:
             raise ValueError(
                 "--dcp-size > 1 is not supported for HYV4 because decode context "
                 "parallelism gathers query heads across DCP ranks but does not "
                 "provide single-owner semantics for learnable attention sinks. "
-                f"Got architecture={model_arch!r} and dcp_size={cfg.dcp_size!r}."
+                f"Got architecture={model_arch!r} and dcp_size={dcp_size!r}."
             )
 
     overrides: Dict[str, Any] = {}
