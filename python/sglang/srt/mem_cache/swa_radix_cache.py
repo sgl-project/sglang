@@ -539,11 +539,15 @@ class SWARadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        # An unfinished request can already have an SWA-evicted prefix (PD decode
+        # preallocates SWA for the tail only); pass the boundary so the insert
+        # builds a tombstone there instead of claiming live SWA KV.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
