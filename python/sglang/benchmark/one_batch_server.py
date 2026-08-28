@@ -35,6 +35,7 @@ from sglang.benchmark.datasets import get_dataset
 from sglang.benchmark.endpoint import acquire_endpoint
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -1276,6 +1277,7 @@ def run_benchmark_internal(
 
 
 def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
+    cfg = resolving_view(server_args)
     results, server_info = run_benchmark_internal(server_args, bench_args)
 
     # Save results as pydantic models in the JSON format
@@ -1283,7 +1285,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         save_results_as_pydantic_models(
             results,
             pydantic_result_filename=bench_args.pydantic_result_filename,
-            model_path=server_args.model_path,
+            model_path=cfg.model_path,
             server_args=bench_args.server_args_for_metrics,
         )
 
