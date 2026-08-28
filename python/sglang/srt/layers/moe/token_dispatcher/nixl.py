@@ -32,6 +32,13 @@ try:
 except ImportError:
     use_nixl = False
 
+try:
+    from nixl_ep import topk_idx_t as NIXL_EP_TOPK_INDICES_DTYPE
+except ImportError:
+    NIXL_EP_TOPK_INDICES_DTYPE = torch.int64
+
+assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
+
 logger = logging.getLogger(__name__)
 
 NixlEPDispatchOutput = DeepEPLLDispatchOutput
@@ -288,7 +295,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(NIXL_EP_TOPK_INDICES_DTYPE)
         state = NixlEPBuffer._state()
         dispatch_ep_size = state.dispatch_ep_size
         num_local_experts = state.num_local_experts
