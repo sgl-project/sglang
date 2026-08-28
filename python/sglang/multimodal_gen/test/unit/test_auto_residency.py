@@ -3146,11 +3146,23 @@ class TestCollectResidencyTargets:
             "condition_image_encoder",
         ),
     )
-    @pytest.mark.parametrize("startup_mode", (COMPONENT_OFFLOAD, RESIDENT))
+    @pytest.mark.parametrize(
+        "startup_mode", (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD, RESIDENT)
+    )
     def test_every_serving_component_group_gets_a_complete_frontier(
         self, component_name, startup_mode
     ):
-        module = _FakeLazyLayerwiseDit(num_layers=4)
+        module = (
+            _FakeLayerwiseDit(
+                [
+                    _FakeLayerwiseManager(
+                        {f"layers.{index}.w": torch.zeros(16) for index in range(4)}
+                    )
+                ]
+            )
+            if startup_mode == LAYERWISE_OFFLOAD
+            else _FakeLazyLayerwiseDit(num_layers=4)
+        )
 
         candidates = collect_residency_targets(
             modules={component_name: module},

@@ -191,6 +191,8 @@ In this example, `auto` will not re-enable FSDP. The same applies to parallelism
 
 **FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce DiT CPU offload cost on multi-GPU deployments, especially for validated Wan I2V workloads.
 
+Checkpoint loading does not use that forward-time collective as a loading primitive. Each rank reads the checkpoint independently and constructs its final local DTensor storage directly; the fallback for a full checkpoint tensor slices locally instead of redistributing from another rank. Layerwise offload follows the same rule: its CPU layer stores contain that rank's local DTensor shards and wrap them back with `DTensor.from_local`, without a load-time all-gather. FSDP forward execution still performs the collectives required by its sharding policy.
+
 FSDP sharding granularity matters. SGLang Diffusion prefers sharding direct repeated transformer block entries such as `transformer_blocks.0` or `blocks.0`. Coarser sharding lowers wrapper count but can increase all-gather peak memory; finer sharding can reduce transient memory but adds communication and scheduling overhead. If a model does not define an explicit sharding rule, the loader falls back to repeated block class names and common direct numbered block paths.
 
 **CFG parallelism** splits positive and negative CFG branches across GPUs. For Qwen/Wan workloads with normal step counts, this is the most reliable multi-GPU speedup observed so far.

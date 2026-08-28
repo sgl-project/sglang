@@ -417,7 +417,7 @@ def test_lifecycle_plan_jointly_constrains_load_transition_runtime_and_hostpin()
             ),
             PlacementOption(
                 group_key="dit-lifecycle",
-                option_key="dit-sharded-load-to-layerwise",
+                option_key="dit-rank-local-load-to-layerwise",
                 resource_delta_bytes={
                     "gpu:rank0:load": 4,
                     "gpu:rank0:transition": 3,
@@ -460,7 +460,7 @@ def test_lifecycle_plan_jointly_constrains_load_transition_runtime_and_hostpin()
     # Independently optimizing load and runtime would pick both resident
     # choices, but their transition uses 12 bytes and is infeasible.
     assert [option.option_key for option in plan.selections] == [
-        "dit-sharded-load-to-layerwise",
+        "dit-rank-local-load-to-layerwise",
         "encoder-gpu-load-to-resident",
     ]
     assert plan.resource_delta_bytes == {
