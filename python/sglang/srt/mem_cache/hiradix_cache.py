@@ -344,10 +344,8 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )

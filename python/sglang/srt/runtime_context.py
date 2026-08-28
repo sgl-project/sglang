@@ -1819,6 +1819,26 @@ def process_model_config():
     return model_config_of(get_server_args())
 
 
+def reports_expert_balancedness() -> bool:
+    """Whether the expert-balancedness report is on at all.
+
+    The three readers of `expert_balancedness_report_mode` all run after
+    publish, so they ask the bag; `overrides.should_report_expert_balancedness`
+    is the pre-publish equivalent the resolution pipeline uses.
+    """
+    return get_exec().moe.expert_balancedness_report_mode != "off"
+
+
+def logs_expert_balancedness_to_server_log() -> bool:
+    """Whether the balancedness report goes to the server log."""
+    return get_exec().moe.expert_balancedness_report_mode in ("server_log", "both")
+
+
+def exports_expert_balancedness_to_prometheus() -> bool:
+    """Whether the balancedness report goes to Prometheus."""
+    return get_exec().moe.expert_balancedness_report_mode in ("prometheus", "both")
+
+
 def cutedsl_moe_max_num_tokens() -> int:
     """The CuteDSL A2A per-rank token budget.
 

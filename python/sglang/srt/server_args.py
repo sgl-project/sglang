@@ -4341,16 +4341,6 @@ class ServerArgs:
             descriptor["load_topic"] = LOAD_TOPIC
         return descriptor
 
-    def should_log_expert_balancedness_to_server_log(self) -> bool:
-        cfg = resolving_view(self)
-
-        return cfg.expert_balancedness_report_mode in ("server_log", "both")
-
-    def should_export_expert_balancedness_to_prometheus(self) -> bool:
-        cfg = resolving_view(self)
-
-        return cfg.expert_balancedness_report_mode in ("prometheus", "both")
-
 
 # --------------------------------------------------------------------------
 # Module-level ServerArgs helpers and runtime shims.
