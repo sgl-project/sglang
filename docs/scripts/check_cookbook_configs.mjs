@@ -73,6 +73,19 @@ const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8")
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
 }
+// Deployment and Playground render the same serve command. Both must honor a
+// selection-dependent runModes contract; otherwise a Docker-only platform can
+// still leak an unverified bare-Python command through the Playground.
+for (const token of [
+  'typeof config.runModes === "function"',
+  "config.runModes(base)",
+  "runModes.map((mode, index)",
+  "activeRunMode",
+]) {
+  if (!playgroundSource.includes(token)) {
+    fail("_playground.jsx", `does not honor selection-dependent runModes (${token})`);
+  }
+}
 
 const cookbookModelTemplate = readFileSync(COOKBOOK_MODEL_TEMPLATE, "utf8");
 for (const oldName of [
@@ -331,6 +344,30 @@ for (const path of walk(CONFIGS)) {
       }
     }
   };
+  if (typeof config.dockerMounts === "function") {
+    probe((sel) => {
+      const mounts = config.dockerMounts(sel);
+      if (!Array.isArray(mounts) || mounts.some((mount) => typeof mount !== "string")) {
+        throw new Error("must return an array of strings");
+      }
+    }, "dockerMounts");
+  }
+  if (typeof config.dockerRunCommand === "function") {
+    probe((sel) => {
+      if (typeof config.dockerRunCommand(sel) !== "string") {
+        throw new Error("must return a string");
+      }
+    }, "dockerRunCommand");
+  }
+  if (typeof config.runModes === "function") {
+    probe((sel) => {
+      const modes = config.runModes(sel);
+      if (!Array.isArray(modes) || modes.length === 0
+          || modes.some((mode) => !["python", "docker"].includes(mode))) {
+        throw new Error('must return a non-empty array containing only "python" and "docker"');
+      }
+    }, "runModes");
+  }
   // A cell may report its badge per selection (`verificationStatus` as a
   // function of sel), so it has to survive the same space the predicates do —
   // it renders on every pick, and an unrecognized return silently downgrades

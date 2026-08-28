@@ -65,8 +65,27 @@ export const benchmarks = [
   { match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" } },
   { match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
-  { match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" } },
-  { match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" } },
+  {
+    match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "PR #36601 @ 3003ddf15",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random-ids", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 10 },
+        ttft_ms: 160.29, tpot_ms: 12.97, tokens_per_sec_per_gpu: 19.06 },
+    ],
+    notes: "8x MI350X, TP8+EP8, AITER attention/MoE, radix cache disabled, full decode graphs, no MTP. Values are medians of two measured repeats after warmup; aggregate output throughput ranged from 75.36 to 77.14 tok/s. Every request returned exactly 1,024 input and 1,024 output tokens with no errors; the benchmark client ignored EOS by default.",
+  },
+  {
+    match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "PR #36601 @ 3003ddf15",
+    latencyPercentile: "Mean",
+    speed: [
+      { workload: { dataset: "random-ids", isl: 1024, osl: 1024, max_concurrency: 1, num_prompts: 10 },
+        ttft_ms: 184.37, tpot_ms: 9.58, tokens_per_sec_per_gpu: 26.99 },
+    ],
+    accuracy: { gsm8k_pct: 96.89 },
+    notes: "8x MI350X, TP8+EP8, AITER attention/MoE, radix cache disabled, full target/draft graphs, EAGLE MTP 3/1/4. Full 5-shot GSM8K scored 1,278/1,319 (96.89%) with zero request errors, invalid answers, or length truncations. Across two measured speed repeats, median aggregate output throughput was 107.96 tok/s (range 83.80–132.11), 41.59% above the non-MTP median; mean TPOT fell 26.15% while mean TTFT rose 15.02%. Per-run accepted length was 3.07 and 1.94; every speed request returned exactly 1,024 input and 1,024 output tokens with no errors, with EOS ignored by default.",
+  },
+  { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" } },
+  { match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" } },
 ];

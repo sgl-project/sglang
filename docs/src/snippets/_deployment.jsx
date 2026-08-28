@@ -83,7 +83,8 @@
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
-//   dockerMounts       optional — additional `-v` mount specs
+//   dockerMounts       optional — additional `-v` mount specs; literal array or
+//                      `(selection) => string[]`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
@@ -851,7 +852,9 @@ export const Deployment = ({ config, benchmarks }) => {
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
+        ...(typeof config.dockerMounts === "function"
+          ? config.dockerMounts(sel)
+          : (config.dockerMounts || [])).map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),

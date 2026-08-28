@@ -7,10 +7,9 @@
 // Attention (QSA) — over an ultra-sparse MoE, plus an in-checkpoint
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
-// Every recipe on this page is single-node: BF16 and FP8 run TP4 (so four GPUs
-// of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4 runs on
-// a single GPU, and the AMD cells run TP8. That fits because 6B active params
-// keeps compute small and the N-gram table is the only large weight block.
+// Every recipe on this page is single-node: BF16 and FP8 run TP4 on NVIDIA,
+// NVFP4 runs on one Blackwell GPU, and the AMD Quark MXFP4 path uses TP8+EP8.
+// Plain TP8 is not a valid substitute for that expert-parallel topology.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
 // cell, and the engine greys it out.
@@ -24,16 +23,15 @@ export const config = {
     { id: "default", label: "Default" },
   ],
   // Checkpoint precisions. NVFP4 is SGLang's own Blackwell-only quantization of
-  // the BF16 weights (RadixArk), so it has no H200 or AMD cell — SM90 and CDNA4
-  // have no NVFP4 path. AMD serves the upstream BF16 and FP8 repos.
+  // the BF16 weights (RadixArk). MXFP4 is AMD's Quark checkpoint for CDNA4.
   quantizations: [
     { id: "bf16",  label: "BF16"  },
     { id: "fp8",   label: "FP8"   },
     { id: "nvfp4", label: "NVFP4" },
+    { id: "mxfp4", label: "MXFP4" },
   ],
-  // BF16, FP8 and NVFP4 each ship two operating points, low latency adding the
-  // in-checkpoint MTP head (NEXTN 3/1/4) on top of the high-throughput shape.
-  // The two AMD platforms ship one recipe each, which parks under `balanced`.
+  // BF16, FP8, NVFP4, and MXFP4 expose low-latency and/or high-throughput
+  // operating points. Low latency adds the in-checkpoint MTP head where tested.
   strategies: [
     { id: "low-latency",     label: "Low Latency"     },
     { id: "balanced",        label: "Balanced"        },
@@ -72,6 +70,7 @@ export const config = {
     // Separate repos, not revisions of the BF16 one.
     "default|fp8":   "Qwen/Qwen3.8-Flash-Next-FP8",
     "default|nvfp4": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "default|mxfp4": "amd/Qwen3.8-Flash-Next-Quark-MXFP4",
   },
 
   placeholders: {
@@ -86,19 +85,23 @@ export const config = {
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
-  // The "⚡ Reproduce" modal's benchmark command. --random-range-ratio 1 pins ISL
-  // exactly rather than drawing a range, so runs stay comparable.
+  // The "⚡ Reproduce" modal's benchmark command matches the AMD measurements
+  // below. random-ids plus --tokenize-prompt fixes the submitted token count;
+  // --random-range-ratio 1 fixes both requested lengths. The client ignores EOS
+  // by default, and the explicit seed makes the generated token IDs repeatable.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
-  --backend sglang-oai \\
+`HF_TOKEN="{{HF_TOKEN}}" python3 -m sglang.benchmark.serving \\
+  --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
+  --tokenizer {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
+  --tokenize-prompt \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} --random-range-ratio 1 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --request-rate inf \\
-  --flush-cache`,
+  --request-rate inf --seed 42 \\
+  --flush-cache --output-details`,
     numPromptsByConc: { 1: 8, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
 
@@ -108,17 +111,25 @@ export const config = {
     ["mmmu_pro_pct", "MMMU-Pro", "%"],
   ],
 
-  // Launch images — this is a day-0 model with no release cut, so both tags are
-  // purpose-built rather than a version. The ROCm build targets CDNA4 (gfx950)
-  // and is not interchangeable with the CUDA one.
+  // Launch images. AMD uses a content-addressed ROCm environment and mounts the
+  // exact #36601 source checkout because the qwen38flashnext ROCm tag predates
+  // the loader fix validated by the recipe below.
   dockerImages: {
     h200:   "lmsysorg/sglang:qwen38flashnext",
     b200:   "lmsysorg/sglang:qwen38flashnext",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
-    mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
-    mi355x: "lmsysorg/sglang-rocm:qwen38flashnext",
+    mi350x: "lmsysorg/sglang@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72",
+    mi355x: "lmsysorg/sglang@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72",
   },
+
+  dockerMounts: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+    ? ["\"$(pwd):/workspace/sglang:ro\""] : [],
+  dockerRunCommand: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+    ? "env PYTHONPATH=/workspace/sglang/python:/sgl-workspace/sglang/python python3 -m sglang.launch_server"
+    : "sglang serve",
+  runModes: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+    ? ["docker"] : ["python", "docker"],
 
   github: {
     cookbookModel: "Qwen/Qwen3.8-Flash-Next",
@@ -128,7 +139,7 @@ export const config = {
 
     // ----- Card: "Attention Parallelism" -----
     // TP only. Every cell on the page is single-node TP (4 for BF16/FP8, 1 for
-    // NVFP4, 8 on AMD) with no DP-attention anywhere, and the values stop at 8
+    // NVFP4, 8 for AMD MXFP4) with no DP-attention anywhere, and the values stop at 8
     // because that is the widest single host here. CP and DP-Attention are left
     // out until there's a validated shape for them on this checkpoint.
     attention: {
@@ -138,12 +149,10 @@ export const config = {
     },
 
     // ----- Card: "MoE Parallelism" -----
-    // EP degree only: the ultra-sparse MoE spreads its expert pool across ranks,
-    // and the BF16/FP8 high-throughput cells already pair TP4 with EP4 (the TP1
-    // NVFP4 cells have only one rank, so EP stays 1 there). No a2a/runner
-    // backend row — the cells leave `--moe-a2a-backend` and
-    // `--moe-runner-backend` unset so the runner resolves from the checkpoint's
-    // own quant_method, and no alternative backend is validated here yet.
+    // EP degree only: the ultra-sparse MoE spreads its expert pool across ranks.
+    // NVIDIA BF16/FP8 high-throughput uses EP4, while AMD MXFP4 requires EP8 so
+    // each rank receives complete quantization groups. The AMD cells also pin
+    // AITER explicitly instead of relying on backend auto-selection.
     moe: {
       ep: { label: "EP", values: [null, 1, 2, 4, 8] },
     },
@@ -164,22 +173,26 @@ export const config = {
     },
 
     // ----- Card: "Speculative Decoding" -----
-    // The in-checkpoint MTP head, trained with multiple steps. Spelled NEXTN
-    // with the same 3/1/4 numbers the low-latency cells carry, so the chip
-    // derives as already-on there instead of showing a phantom diff.
+    // The in-checkpoint MTP head, trained with multiple steps. The tested AMD
+    // implementation selects EAGLE; the NVIDIA recipes use NEXTN.
     speculative: {
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
-        { id: "mtp",     label: "NEXTN / MTP",
-          flags: ["--speculative-algorithm NEXTN", "--speculative-num-steps 3",
-                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"] },
+        { id: "mtp",     label: "MTP 3/1/4",
+          flags: (sel) => [
+            `--speculative-algorithm ${["mi350x", "mi355x"].includes(sel.hw) ? "EAGLE" : "NEXTN"}`,
+            "--speculative-num-steps 3",
+            "--speculative-eagle-topk 1",
+            "--speculative-num-draft-tokens 4",
+          ] },
       ],
     },
   },
 
-  // Every cell below is a verified recipe. Ordering: the first cell seeds the
-  // Deploy panel's default selection.
+  // Ordering: the first cell seeds the Deploy panel's default selection.
+  // Each cell carries its own verification state; inferred hardware variants
+  // remain explicitly unverified.
   //
   // Within a quantization the NVIDIA cells are identical across
   // H200/B200/B300/GB300, and `--linear-attn-{prefill,decode}-backend flashinfer` is
@@ -639,83 +652,114 @@ export const config = {
     },
 
     // ==== AMD CDNA4 (MI350X / MI355X) ====
-    // One recipe, identical for BF16 and FP8 and for both cards (same gfx950,
-    // same 288GB, same ROCm image) — hence `balanced` on all four cells. This is
-    // its own shape rather than a port of the NVIDIA one: TP8, the aiter
-    // attention backend with `--page-size 32`, and a 16384-token prefill chunk.
-    // `--kv-cache-dtype auto` is stated rather than left off so the checkpoint's
-    // own declaration is visibly what decides KV precision.
+    // Quark MXFP4 was validated on eight MI350X GPUs with TP8+EP8, explicit
+    // AITER attention/MoE, page size 64, radix cache disabled, and full decode
+    // CUDA graphs. The two operating points differ only by EAGLE/MTP 3/1/4.
     {
-      match: { hw: "mi350x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
-        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
+      match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
-        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "mi355x", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: true,
-      env: [],
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "This command matches the validated MI350X gfx950 path but has not been rerun on MI355X.",
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
-        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
     },
     {
-      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
-      verified: true,
-      env: [],
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "This command matches the validated MI350X gfx950 path but has not been rerun on MI355X.",
+      env: ["SGLANG_USE_AITER=1"],
       flags: [
         "--model-path {{MODEL_NAME}}",
+        "--revision 1ad7d941b239f6dc83cba6e49234c0efe1ca5477",
         "--tp-size 8",
+        "--ep-size 8",
         "--attention-backend aiter",
-        "--page-size 32",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
-        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--trust-remote-code",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
