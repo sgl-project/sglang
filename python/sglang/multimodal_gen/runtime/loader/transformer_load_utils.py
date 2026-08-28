@@ -1033,7 +1033,7 @@ def _resolve_weight_override_quantization(
                     break
 
     if declaration is not None:
-        if "quant_method" not in declaration and header_quant_config is not None:
+        if "quant_method" not in declaration:
             return header_quant_config, True
         return (
             get_quant_config(

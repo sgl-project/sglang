@@ -259,6 +259,22 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsInstance(quant_config, Fp8Config)
         self.assertEqual(quant_config.activation_scheme, "dynamic")
 
+    def test_weight_override_defers_header_without_quant_method_to_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            weights = f"{directory}/model.safetensors"
+            save_file(
+                {"block.weight": torch.ones((2, 2))},
+                weights,
+                metadata={"quantization_config": json.dumps({"quant_algo": "NVFP4"})},
+            )
+
+            quant_config, declared = _resolve_weight_override_quantization(
+                [weights], {}, {}
+            )
+
+        self.assertIsNone(quant_config)
+        self.assertTrue(declared)
+
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
         return_value=None,
