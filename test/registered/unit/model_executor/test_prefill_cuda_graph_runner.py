@@ -152,21 +152,19 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
-        # The server-side hidden-state ceiling is a bag leaf.
+        # The server-side hidden-state ceiling and graph config are bag leaves.
         override = get_context().override_server_args(
             enable_return_hidden_states=True,
             return_hidden_states_mode="last",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.TC_PIECEWISE)
+            ),
         )
         override.install()
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
             is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
-            server_args=SimpleNamespace(
-                cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend=Backend.TC_PIECEWISE)
-                )
-            ),
         )
 
         capture = capture_prefill_graph(

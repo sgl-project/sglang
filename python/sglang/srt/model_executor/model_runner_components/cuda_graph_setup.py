@@ -329,8 +329,7 @@ def capture_prefill_graph(
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
         and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
-        and model_runner.server_args.cuda_graph_config.prefill.backend
-        == Backend.TC_PIECEWISE
+        and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
     ):
         logger.info(
             "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
