@@ -550,66 +550,6 @@ class TestWeightVersionSpans(CustomTestCase):
             self, metadata, prompt_tokens=data["usage"]["prompt_tokens"]
         )
 
-    def test_17_reused_prefix_keeps_the_version_that_computed_it(self):
-        """A radix hit on KV computed before a relabel shows up as a stale leading prefill span."""
-        self._flush_cache()
-        self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Name three colors.")
-        version_before = self._current_version()
-
-        self._set_weight_version("reuse-v4")
-        data = self._generate(
-            max_new_tokens=8,
-            prompt=_SHARED_PREFIX + "Name three colors. Then name three shapes.",
-        )
-
-        meta_info = data["meta_info"]
-        self.assertGreater(meta_info["cached_tokens"], 0)
-        prefill_spans = _assert_prefill_spans_contiguous(
-            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
-        )
-        self.assertEqual(
-            [span["version"] for span in prefill_spans], [version_before, "reuse-v4"]
-        )
-        self.assertEqual(prefill_spans[0]["end"], meta_info["cached_tokens"])
-        spans = _assert_spans_contiguous(self, meta_info)
-        self.assertEqual([span["version"] for span in spans], ["reuse-v4"])
-
-    def test_18_flushed_cache_recomputes_the_prefix(self):
-        """After a flush the whole prompt is recomputed under the current version."""
-        self._flush_cache()
-        data = self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Say hello.")
-
-        meta_info = data["meta_info"]
-        self.assertEqual(meta_info["cached_tokens"], 0)
-        prefill_spans = _assert_prefill_spans_contiguous(
-            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
-        )
-        self.assertEqual(len(prefill_spans), 1)
-        self.assertEqual(prefill_spans[0]["version"], self._current_version())
-
-    def test_19_aborted_after_prefill_reports_both_spans(self):
-        """A request aborted mid-decode keeps its prompt spans and reports output spans."""
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self._generate,
-                max_new_tokens=8192,
-                prompt=_SHARED_PREFIX + "Write an even longer story.",
-            )
-            time.sleep(1)
-            self._pause("in_place")
-            try:
-                self._abort_all()
-            finally:
-                self._continue()
-            data = future.result()
-
-        meta_info = data["meta_info"]
-        self.assertEqual(meta_info["finish_reason"]["type"], "abort")
-        self.assertGreater(meta_info["completion_tokens"], 0)
-        spans = _assert_spans_contiguous(self, meta_info)
-        self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
-        _assert_prefill_spans_contiguous(self, meta_info)
-
     def test_13_new_requests_after_the_endpoint_returns_see_the_new_version(self):
         """Once the endpoint returns, every concurrently admitted request stamps the new version."""
         self._set_weight_version("dp-v1")
@@ -706,6 +646,66 @@ class TestWeightVersionSpans(CustomTestCase):
             "No request spanned the update -- the retract boundary under "
             "speculative decoding was not recorded.",
         )
+
+    def test_17_reused_prefix_keeps_the_version_that_computed_it(self):
+        """A radix hit on KV computed before a relabel shows up as a stale leading prefill span."""
+        self._flush_cache()
+        self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Name three colors.")
+        version_before = self._current_version()
+
+        self._set_weight_version("reuse-v4")
+        data = self._generate(
+            max_new_tokens=8,
+            prompt=_SHARED_PREFIX + "Name three colors. Then name three shapes.",
+        )
+
+        meta_info = data["meta_info"]
+        self.assertGreater(meta_info["cached_tokens"], 0)
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(
+            [span["version"] for span in prefill_spans], [version_before, "reuse-v4"]
+        )
+        self.assertEqual(prefill_spans[0]["end"], meta_info["cached_tokens"])
+        spans = _assert_spans_contiguous(self, meta_info)
+        self.assertEqual([span["version"] for span in spans], ["reuse-v4"])
+
+    def test_18_flushed_cache_recomputes_the_prefix(self):
+        """After a flush the whole prompt is recomputed under the current version."""
+        self._flush_cache()
+        data = self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Say hello.")
+
+        meta_info = data["meta_info"]
+        self.assertEqual(meta_info["cached_tokens"], 0)
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(len(prefill_spans), 1)
+        self.assertEqual(prefill_spans[0]["version"], self._current_version())
+
+    def test_19_aborted_after_prefill_reports_both_spans(self):
+        """A request aborted mid-decode keeps its prompt spans and reports output spans."""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                self._generate,
+                max_new_tokens=8192,
+                prompt=_SHARED_PREFIX + "Write an even longer story.",
+            )
+            time.sleep(1)
+            self._pause("in_place")
+            try:
+                self._abort_all()
+            finally:
+                self._continue()
+            data = future.result()
+
+        meta_info = data["meta_info"]
+        self.assertEqual(meta_info["finish_reason"]["type"], "abort")
+        self.assertGreater(meta_info["completion_tokens"], 0)
+        spans = _assert_spans_contiguous(self, meta_info)
+        self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
+        _assert_prefill_spans_contiguous(self, meta_info)
 
 
 if __name__ == "__main__":
