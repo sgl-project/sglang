@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
@@ -44,24 +45,40 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 
+@functools.lru_cache(maxsize=1)
+def _mega_moe_num_sms() -> int:
+    """The SM count the MegaMoE launch runs with.
+
+    Derived from the physical SM count, not from DeepGEMM's current setting:
+    two-batch overlap and the DSA indexer temporarily reconfigure DeepGEMM
+    process-wide, and reading their value here would both compound the reserve
+    and make the residency margin relative to a moving baseline.
+    """
+    num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+    if _device_sm < 100:
+        # The SM90 MegaMoE implementation does not use the Blackwell whole-grid
+        # clustered launch that needs a residency margin.
+        return num_sms
+
+    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+    num_sms = max(2, num_sms - reserved_num_sms)
+    # Round down so the launch stays compatible with the two-CTA cluster.
+    return num_sms - num_sms % 2
+
+
 @contextmanager
 def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    target_num_sms = _mega_moe_num_sms()
     current_num_sms = deep_gemm.get_num_sms()
-    # The SM90 MegaMoE implementation does not use the Blackwell whole-grid
-    # clustered launch that needs a residency margin.
-    target_num_sms = current_num_sms
-    if _device_sm >= 100:
-        reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
-        target_num_sms = max(2, current_num_sms - reserved_num_sms)
-        target_num_sms -= target_num_sms % 2
+    if target_num_sms == current_num_sms:
+        yield
+        return
 
-    if target_num_sms != current_num_sms:
-        deep_gemm.set_num_sms(target_num_sms)
+    deep_gemm.set_num_sms(target_num_sms)
     try:
         yield
     finally:
-        if target_num_sms != current_num_sms:
-            deep_gemm.set_num_sms(current_num_sms)
+        deep_gemm.set_num_sms(current_num_sms)
 
 
 def _get_mega_moe_symm_buffer(
