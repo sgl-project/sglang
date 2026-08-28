@@ -166,6 +166,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
         load_weights.assert_not_called()
 
     def test_upsampler_uses_exact_component_weight_override(self):
+        self.assertTrue(UpsamplerLoader.supports_component_weight_override)
         server_args = SimpleNamespace(
             component_weights_paths={"spatial_upsampler": "owner/repo/upsampler"}
         )
