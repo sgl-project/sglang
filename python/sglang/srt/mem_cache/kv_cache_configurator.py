@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import math
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     kimi_linear_config,
@@ -65,11 +67,11 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_context,
     get_disagg,
     get_exec,
     get_memory,
+    get_mm,
     get_parallel,
     get_schedule,
     get_spec,
@@ -237,26 +239,21 @@ class KVCacheConfigurator:
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
-    is_inkling_mtp_draft: bool = field(init=False)
+    is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
-        # Each multi-layer EAGLE MTP head owns one transformer block at
-        # layer_id=draft_model_idx; heads at a banded 's' depth route that layer
-        # into the SWA ring sub-pool (draft_swa_full_capacity) so the SWA
-        # store/read path activates for this depth, exactly like a trunk local
-        # layer.
-        self.is_inkling_mtp_draft = (
+        self.is_hybrid_swa_mtp_draft = (
             self.is_draft_worker
             and self.draft_model_idx is not None
-            and self.model_config.hf_config.architectures[0]
-            == "InklingForConditionalGenerationMTP"
+            and self.is_hybrid_swa
+            and getattr(self.model_config.hf_text_config, "mtp_local_layer_ids", None)
+            is not None
         )
-        self.draft_swa_full_capacity = self.is_inkling_mtp_draft and (
-            self.draft_model_idx
-            in set(self.model_config.hf_text_config.mtp_local_layer_ids)
+        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
+            self.draft_model_idx in self.model_config.swa_attention_layer_ids
         )
 
     def _build_fp4_quant_method(self, *, num_layers: int):
@@ -477,7 +474,7 @@ class KVCacheConfigurator:
             # Each multi-layer EAGLE MTP head owns one transformer block at
             # layer_id=draft_model_idx and needs its own sconv/mamba cache while
             # sharing the target's request-to-token mapping.
-            if self.is_inkling_mtp_draft and isinstance(
+            if self.is_hybrid_swa_mtp_draft and isinstance(
                 req_to_token_pool, HybridReqToTokenPool
             ):
                 # speculative_num_draft_tokens=None: draft heads never run
@@ -738,6 +735,8 @@ class KVCacheConfigurator:
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
+        elif self.use_mla_backend and self.is_hybrid_swa:
+            unsupported_pool_family = "hybrid DSA/MLA-SWA KV pool"
         elif self.use_mla_backend and is_dsa_model:
             unsupported_pool_family = "DSA/MLA KV pool"
         elif self.use_mla_backend and not self.mambaish_config:
@@ -1013,6 +1012,12 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+        elif self.use_mla_backend and self.is_hybrid_swa:
+            token_to_kv_pool = self._build_hybrid_mla_swa_kv_pool(
+                full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                is_dsa_model=is_dsa_model,
+            )
         elif self.use_mla_backend and is_dsa_model:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1144,7 +1149,6 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
-                server_args=self.server_args,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -1245,7 +1249,7 @@ class KVCacheConfigurator:
 
         token_to_kv_pool = NPUMiniMaxSparseKVPool(
             size=max_total_num_tokens,
-            page_size=self.server_args.page_size,
+            page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
             index_dtype=self.model_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
@@ -1255,7 +1259,7 @@ class KVCacheConfigurator:
             sparse_layer_ids=sparse_layer_ids,
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
             device=self.device,
-            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
         )
@@ -1348,7 +1352,6 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
-                server_args=self.server_args,
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -1357,6 +1360,59 @@ class KVCacheConfigurator:
             **pool_kwargs,
         )
         return token_to_kv_pool
+
+    def _build_hybrid_mla_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: int,
+        swa_max_total_num_tokens: int,
+        is_dsa_model: bool,
+    ) -> KVCache:
+        """Build a hybrid MLA pool with independent full/SWA cache geometries.
+
+        Full-attention layers may use either MLA or DSA storage, while sliding
+        layers use MLA storage. The returned ``SWAKVPool`` exposes the common
+        MLA and optional DSA-index interfaces independent of model type.
+        """
+        full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
+        common = {
+            "page_size": get_schedule().page_size,
+            "device": self.device,
+            "enable_memory_saver": False,
+        }
+        full_pool_kwargs = {
+            **common,
+            "kv_lora_rank": self.model_config.kv_lora_rank,
+            "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+        }
+        if is_dsa_model:
+            full_pool_kwargs.update(
+                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                kv_cache_dim=calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ),
+            )
+
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=get_schedule().page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=0,
+            head_dim=0,
+            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            device=self.device,
+            full_kv_pool_class=full_pool_class,
+            swa_kv_pool_class=MLATokenToKVPool,
+            full_kv_pool_kwargs=full_pool_kwargs,
+            swa_kv_pool_kwargs={
+                **common,
+                "kv_lora_rank": self.model_config.swa_kv_lora_rank,
+                "qk_rope_head_dim": self.model_config.swa_qk_rope_head_dim,
+            },
+        )
 
     def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPoolFP4(
@@ -1414,23 +1470,15 @@ class KVCacheConfigurator:
         )
         swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
         full_attention_layer_ids = self.model_config.full_attention_layer_ids
-        if self.is_inkling_mtp_draft:
+        if self.is_hybrid_swa_mtp_draft:
             if self.draft_swa_full_capacity:
-                # Banded 's' depth: route the draft's single layer into the SWA
-                # ring sub-pool so use_sliding_window_kv_pool activates the SWA
-                # store/read path for this depth, exactly like a trunk local
-                # layer.
+                # Route local MTP depths through the SWA ring pool.
                 swa_attention_layer_ids = [self.draft_model_idx]
                 full_attention_layer_ids = []
             else:
                 swa_attention_layer_ids = []
                 full_attention_layer_ids = [self.draft_model_idx]
-        # Size the banded draft's SWA ring to FULL draft capacity (not the
-        # trunk-window-derived swa_max): with the identity full->swa mapping
-        # registered in _build_token_to_kv_pool_allocator, every logical slot
-        # the shared target allocator hands out (up to full_max) must be
-        # addressable in the ring, whatever the head-vs-trunk window
-        # relationship.
+        # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
             if self.draft_swa_full_capacity
@@ -1474,7 +1522,7 @@ class KVCacheConfigurator:
             # with the widening-dequant contract.
             index_dtype=(
                 self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(self.server_args)
+                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
                 else self.model_dtype
             ),
             head_num=self.model_config.get_num_kv_heads(
@@ -1765,6 +1813,12 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # Weight-loading temporaries can still be referenced at this point, and
+        # empty_cache() (which get_available_gpu_memory already calls) cannot
+        # reclaim referenced blocks. Without collecting first, the KV budget is
+        # measured against an understated free-memory figure and the pool can be
+        # sized orders of magnitude too small while GPU memory sits idle.
+        gc.collect()
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -1784,7 +1838,7 @@ class KVCacheConfigurator:
             )
         mm_reservation_gb = mm_runtime_reservation_gb(
             is_multimodal=self.model_config.is_multimodal,
-            mm_feature_transport=self.server_args.mm_feature_transport,
+            mm_feature_transport=get_mm().mm_feature_transport,
         )
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
@@ -1859,7 +1913,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if configured_pp_size() > 1:
+        if get_parallel().pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -2137,10 +2191,7 @@ class KVCacheConfigurator:
 
 
 def calculate_mla_kv_cache_dim(
-    *,
-    model_config: ModelConfig,
-    kv_cache_dtype: torch.dtype,
-    server_args: ServerArgs,
+    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_cache_dtype = kv_cache_dtype
@@ -2157,16 +2208,16 @@ def calculate_mla_kv_cache_dim(
     # since it is not compatible for trtllm and other mla attn backend due to the different
     # kv cache layout.
     if (
-        server_args.dsa_prefill_backend == "trtllm"
-        or server_args.dsa_decode_backend == "trtllm"
+        get_exec().kernel.dsa_prefill_backend == "trtllm"
+        or get_exec().kernel.dsa_decode_backend == "trtllm"
     ):
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
     if _is_hip and (
-        server_args.dsa_prefill_backend in ("tilelang", "aiter")
-        or server_args.dsa_decode_backend in ("tilelang", "aiter")
+        get_exec().kernel.dsa_prefill_backend in ("tilelang", "aiter")
+        or get_exec().kernel.dsa_decode_backend in ("tilelang", "aiter")
     ):
         return kv_cache_dim
 
