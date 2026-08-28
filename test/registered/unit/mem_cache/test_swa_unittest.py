@@ -905,8 +905,7 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
         )
         kv_indices = _swa_alloc(allocator, num_tokens)
         req_to_token_pool.write((0, slice(0, num_tokens)), kv_indices)
-        # PD decode preallocates SWA for the tail only, so the prefix never had a
-        # peer; window eviction leaves the same state behind.
+        # Drop the prefix's SWA peers, as window eviction would.
         allocator.free_swa(kv_indices[:evicted])
         swa_before = allocator.swa_available_size()
 
@@ -939,8 +938,8 @@ class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
             num_tokens - evicted,
         )
 
-        # Finishing re-walks the same nodes and drops the locks; the tombstone
-        # accounting must survive it and the tree must be consistent when idle.
+        # Finishing drops the locks, which sanity_check needs; the accounting
+        # must survive the re-walk.
         tree.cache_finished_req(req, kv_len_to_handle=num_tokens)
         self.assertEqual(allocator.swa_available_size(), swa_before)
         self.assertEqual(
