@@ -74,6 +74,14 @@ def _resolve_flash_attn_varlen_func():
     Classic flash_attn (FA2, Ampere/Hopper) is preferred when installed;
     flash-attn-4's cute interface serves the same call shape on Blackwell.
     """
+    from sglang.srt.utils import is_sm121
+
+    if is_sm121():
+        from sglang.srt.layers.attention.qsa.sm121_varlen import (
+            qsa_sm121_varlen_attention,
+        )
+
+        return qsa_sm121_varlen_attention
     try:
         from flash_attn import flash_attn_varlen_func
 
