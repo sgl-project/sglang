@@ -579,6 +579,9 @@ pub struct ValueState {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum TreeCoreRuntimeError {
+    /// A public NodeId no longer names a live arena node.
+    #[error("node {node_id} is not allocated")]
+    NodeNotAllocated { node_id: NodeId },
     /// `begin_insert`/`insert` called while a resumable insert is suspended.
     #[error("concurrent insert walks")]
     ConcurrentInsertWalk,

@@ -2989,38 +2989,80 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((kv_xfer, comp_xfers))
     }
 
+    fn try_resolve_node_handle_(&self, node_id: NodeId) -> Result<NodeIdx_, TreeCoreRuntimeError> {
+        self.arena
+            .try_resolve(node_id)
+            .ok_or(TreeCoreRuntimeError::NodeNotAllocated { node_id })
+    }
+
     /// The anchor node's namespace; None for the default namespace.
     pub fn prefetch_anchor_info(&self, node_id: NodeId) -> Option<String> {
-        let node_id = self.arena.resolve(node_id);
-        self.arena.node_extra_key(node_id).map(str::to_string)
+        self.try_prefetch_anchor_info(node_id)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_prefetch_anchor_info(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<String>, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        Ok(self.arena.node_extra_key(node_id).map(str::to_string))
     }
 
     /// Whether the node's Full KV is present on host.
     pub fn node_backuped(&self, node_id: NodeId) -> bool {
-        let node_id = self.arena.resolve(node_id);
-        self.arena.node(node_id).backuped()
+        self.try_node_backuped(node_id)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_node_backuped(&self, node_id: NodeId) -> Result<bool, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        Ok(self.arena.node(node_id).backuped())
     }
 
     /// Whether the node is a (default or named) root.
     pub fn is_root(&self, node_id: NodeId) -> bool {
-        let node_id = self.arena.resolve(node_id);
-        self.arena.node(node_id).is_root()
+        self.try_is_root(node_id)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_is_root(&self, node_id: NodeId) -> Result<bool, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        Ok(self.arena.node(node_id).is_root())
     }
 
     /// The node's last page hash, or None when it was never hashed.
     pub fn get_last_hash_value(&self, node_id: NodeId) -> Option<String> {
-        let node_id = self.arena.resolve(node_id);
-        self.arena
+        self.try_get_last_hash_value(node_id)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_get_last_hash_value(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<String>, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        Ok(self
+            .arena
             .node(node_id)
             .get_last_hash_value()
-            .map(str::to_string)
+            .map(str::to_string))
     }
 
     /// The hash chain of the node's ancestors, in root-to-parent order.
     pub fn get_prefix_hash_values(&self, node_id: NodeId) -> Vec<String> {
-        let node_id = self.arena.resolve(node_id);
-        self.arena
-            .prefix_hash_values(self.arena.node(node_id).parent)
+        self.try_get_prefix_hash_values(node_id)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_get_prefix_hash_values(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<String>, TreeCoreRuntimeError> {
+        let node_id = self.try_resolve_node_handle_(node_id)?;
+        Ok(self
+            .arena
+            .prefix_hash_values(self.arena.node(node_id).parent))
     }
 
     /// The hash values owned by this node, excluding its ancestors.

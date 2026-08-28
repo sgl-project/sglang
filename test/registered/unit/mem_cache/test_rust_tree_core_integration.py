@@ -149,6 +149,27 @@ def test_root_node_handle_is_namespace_independent():
     assert missed.best_match_node == root
 
 
+def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
+    core = _tree_core()
+    stale_root = core.root_node_handle()
+    core.reset()
+    live_root = core.root_node_handle()
+
+    accessors = (
+        core.is_backuped,
+        core.is_root,
+        core.get_last_hash_value,
+        core.get_prefix_hash_values,
+        core.prefetch_anchor_info,
+    )
+    for accessor in accessors:
+        with pytest.raises(Exception) as exc_info:
+            accessor(stale_root)
+        assert isinstance(exc_info.value, KeyError)
+        assert exc_info.value.args == (stale_root,)
+        assert core.is_root(live_root)
+
+
 def test_dfs_weight_order_groups_the_heaviest_subtree_first():
     core = _tree_core()
     _insert(core, [1, 10], [10, 11])

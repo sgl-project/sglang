@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyAssertionError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyAssertionError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
@@ -66,7 +66,10 @@ fn parse_evict_layer(target: u8) -> PyResult<EvictLayer> {
 
 /// Convert an expected tree-core contract failure without unwinding through PyO3.
 fn tree_core_runtime_error(error: TreeCoreRuntimeError) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+    match error {
+        TreeCoreRuntimeError::NodeNotAllocated { node_id } => PyKeyError::new_err(node_id),
+        error => PyRuntimeError::new_err(error.to_string()),
+    }
 }
 
 /// Map the Rust enum back onto the Python ComponentType value.
@@ -1362,28 +1365,37 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// The anchor node's namespace; None for root-like anchors.
-    fn prefetch_anchor_info(&self, py: Python<'_>, node_id: NodeId) -> Option<String> {
-        py.allow_threads(|| self.core().prefetch_anchor_info(node_id))
+    fn prefetch_anchor_info(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<Option<String>> {
+        py.allow_threads(|| self.core().try_prefetch_anchor_info(node_id))
+            .map_err(tree_core_runtime_error)
     }
 
     /// Whether the node's Full KV is present on host.
-    fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> bool {
-        py.allow_threads(|| self.core().node_backuped(node_id))
+    fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        py.allow_threads(|| self.core().try_node_backuped(node_id))
+            .map_err(tree_core_runtime_error)
     }
 
     /// Whether the node is a (default or named) root.
-    fn is_root(&self, py: Python<'_>, node_id: NodeId) -> bool {
-        py.allow_threads(|| self.core().is_root(node_id))
+    fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        py.allow_threads(|| self.core().try_is_root(node_id))
+            .map_err(tree_core_runtime_error)
     }
 
     /// The node's last page hash, or None when it was never hashed.
-    fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> Option<String> {
-        py.allow_threads(|| self.core().get_last_hash_value(node_id))
+    fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
+        py.allow_threads(|| self.core().try_get_last_hash_value(node_id))
+            .map_err(tree_core_runtime_error)
     }
 
     /// The hash chain of the node's ancestors, in root-to-parent order.
-    fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
-        py.allow_threads(|| self.core().get_prefix_hash_values(node_id))
+    fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
+        py.allow_threads(|| self.core().try_get_prefix_hash_values(node_id))
+            .map_err(tree_core_runtime_error)
     }
 
     fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
@@ -2415,27 +2427,39 @@ macro_rules! tree_core_binding {
             }
 
             /// The anchor node's namespace; None for root-like anchors.
-            fn prefetch_anchor_info(&self, py: Python<'_>, node_id: NodeId) -> Option<String> {
+            fn prefetch_anchor_info(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<String>> {
                 self.inner.prefetch_anchor_info(py, node_id)
             }
 
             /// Whether the node's Full KV is present on host.
-            fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> bool {
+            fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 self.inner.node_backuped(py, node_id)
             }
 
             /// Whether the node is a (default or named) root.
-            fn is_root(&self, py: Python<'_>, node_id: NodeId) -> bool {
+            fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 self.inner.is_root(py, node_id)
             }
 
             /// The node's last page hash, or None when it was never hashed.
-            fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> Option<String> {
+            fn get_last_hash_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<String>> {
                 self.inner.get_last_hash_value(py, node_id)
             }
 
             /// The hash chain of the node's ancestors, in root-to-parent order.
-            fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> Vec<String> {
+            fn get_prefix_hash_values(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Vec<String>> {
                 self.inner.get_prefix_hash_values(py, node_id)
             }
 

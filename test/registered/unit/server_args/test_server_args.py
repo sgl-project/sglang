@@ -789,7 +789,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "mooncake",
         )
 
-    def test_pd_decode_hicache_rejects_rust_tree_core(self):
+    def test_pd_decode_hicache_allows_rust_tree_core(self):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
@@ -798,8 +798,9 @@ class TestLoadBalanceMethod(unittest.TestCase):
             enable_hierarchical_cache=True,
         )
         with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "PD decode HiCache"):
-                handle_pd_disaggregation(server_args)
+            handle_pd_disaggregation(server_args)
+
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
 
 
 class TestSkipTokenizerInit(unittest.TestCase):
