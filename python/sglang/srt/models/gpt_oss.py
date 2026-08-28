@@ -258,7 +258,7 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if get_parallel().config.dwdp_size > 1:
+        if get_parallel().dwdp_size > 1:
             return self.forward_dwdp(hidden_states)
 
         if not get_moe_a2a_backend().is_deepep():
@@ -786,7 +786,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False

@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -27,31 +27,32 @@ logger = logging.getLogger(__name__)
 
 def handle_expert_pack(server_args: Any) -> None:
     """Normalize expert-pack settings and report all startup errors together."""
-    if server_args.load_format != "expert_pack":
+    cfg = resolving_view(server_args)
+    if cfg.load_format != "expert_pack":
         return
 
     errors = []
     parallelism = (
-        ("tensor", "--tp-size", server_args.tp_size),
-        ("data", "--dp-size", server_args.dp_size),
-        ("expert", "--ep-size", server_args.ep_size),
+        ("tensor", "--tp-size", cfg.tp_size),
+        ("data", "--dp-size", cfg.dp_size),
+        ("expert", "--ep-size", cfg.ep_size),
     )
     for label, option, size in parallelism:
         if size != 1:
             errors.append(f"{label} parallelism ({option}) must be 1, got {size}")
 
-    if server_args.enforce_shared_experts_fusion:
+    if cfg.enforce_shared_experts_fusion:
         errors.append(
             "--enforce-shared-experts-fusion is incompatible with expert_pack"
         )
-    if server_args.enable_waterfill:
+    if cfg.enable_waterfill:
         errors.append("--enable-waterfill is incompatible with expert_pack")
 
     explicit_cuda_graph_backends = {
-        Phase.DECODE: server_args.cuda_graph_backend_decode,
-        Phase.PREFILL: server_args.cuda_graph_backend_prefill,
+        Phase.DECODE: cfg.cuda_graph_backend_decode,
+        Phase.PREFILL: cfg.cuda_graph_backend_prefill,
     }
-    raw_cuda_graph_config = server_args.cuda_graph_config
+    raw_cuda_graph_config = cfg.cuda_graph_config
     if isinstance(raw_cuda_graph_config, CudaGraphConfig):
         raw_cuda_graph_config = raw_cuda_graph_config.to_dict()
     for phase in Phase.ALL:
@@ -69,7 +70,7 @@ def handle_expert_pack(server_args: Any) -> None:
                 f"disabled, got {explicit_backend!r}"
             )
 
-    loader_config = server_args.model_loader_extra_config or {}
+    loader_config = cfg.model_loader_extra_config or {}
     if isinstance(loader_config, str):
         try:
             loader_config = json.loads(loader_config)
@@ -82,7 +83,7 @@ def handle_expert_pack(server_args: Any) -> None:
 
     # A raw GGUF path is the public input form.  Preparation is performed once
     # here, before model-config parsing and before the loader is constructed.
-    raw_model_path = Path(server_args.model_path).expanduser()
+    raw_model_path = Path(cfg.model_path).expanduser()
     raw_preparation_failed = False
     if not errors and raw_model_path.is_file():
         try:
@@ -136,12 +137,12 @@ def handle_expert_pack(server_args: Any) -> None:
             errors.append(f"expert-pack file does not exist: {pack_path}")
 
     model_kind = None
-    model_path = parse_path("--model-path", server_args.model_path)
+    model_path = parse_path("--model-path", cfg.model_path)
     if not raw_preparation_failed:
         if model_path is None or not model_path.is_dir():
             errors.append(
                 "--model-path must be a local GGUF shard or tokenizer/config "
-                f"directory for expert_pack, got {server_args.model_path!r}"
+                f"directory for expert_pack, got {cfg.model_path!r}"
             )
         else:
             try:
