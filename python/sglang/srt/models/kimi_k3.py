@@ -456,7 +456,7 @@ class KimiK3MoE(nn.Module):
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
         # so FusedMoE's weight_loader uses the MXFP4 fast path
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
+        if quant_config is not None and getattr(quant_config, "quant_format", None) and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
             if "mxfp4" in quant_config.quant_format:
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
@@ -575,7 +575,6 @@ class KimiK3MoE(nn.Module):
         self._shared_experts_attn_tp_comm = (
             get_parallel().enable_shared_experts_attn_tp
             and self._ep_a2a
-            and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
         shared_experts_tp_kwargs = {}
@@ -3197,7 +3196,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            if "weight_packed" in name:
+            if "weight_packed" in name and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa

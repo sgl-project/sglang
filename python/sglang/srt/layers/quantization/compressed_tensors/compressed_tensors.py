@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import suppress
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -53,6 +54,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
     NPUCompressedTensorsW4A8Int8DynamicMoE,
+    NPUCompressedTensorsW4A8mxfp4MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
@@ -70,7 +72,8 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sm100_supported, is_xpu
+from sglang.srt.utils.common import get_bool_env_var
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -225,7 +228,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             # Detect MXFP4 before the scheme-based path: MXFP4 uses a
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
-            if self._is_mxfp4_moe(layer_name=prefix):
+            if self._is_mxfp4_moe(layer_name=prefix) and not get_bool_env_var("SGLANG_W4A8_MXFP4_MOE"):
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
@@ -825,9 +828,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     self._is_mxint4a16(weight_quant, input_quant)
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
-                    logger.info_once(
-                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
-                    )
+                    if self.quant_format == "mxfp4-pack-quantized":
+                        if os.getenv("SGLANG_W4A8_MXFP4_MOE"):
+                            return NPUCompressedTensorsW4A8mxfp4MoE()
+                        else:
+                            raise NotImplementedError(
+                                f"The {self.quant_format} only support W4A16_MXFP4 or W4A8_MXFP4 scheme now."
+                            )
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
