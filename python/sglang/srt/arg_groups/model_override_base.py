@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.aiter import is_aiter_supported_arch
 from sglang.srt.utils.common import is_mps, is_no_spec_infer_or_topk_one
 
 logger = logging.getLogger(__name__)
@@ -319,7 +320,7 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
                 return "fa4"
             return "trtllm_mha"
         elif get_platform().is_hip:
-            return "aiter"
+            return "aiter" if is_aiter_supported_arch() else "triton"
         elif is_mps():
             return "torch_native"
         else:
