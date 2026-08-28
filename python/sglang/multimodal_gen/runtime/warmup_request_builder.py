@@ -232,8 +232,20 @@ def _resolve_warmup_num_frames(
     *,
     server_based_warmup: bool,
 ) -> int:
-    num_frames = getattr(sampling_defaults, "num_frames", 1)
-    if not _is_video_warmup_task(server_args) or num_frames is None:
+    default_num_frames = getattr(sampling_defaults, "num_frames", 1)
+    if not _is_video_warmup_task(server_args):
+        return default_num_frames
+
+    # Most tests and a few lightweight integrations use MagicMock server args,
+    # whose missing attributes resolve to another mock. Only accept a concrete
+    # integer as an explicit override.
+    explicit_num_frames = getattr(server_args, "warmup_num_frames", None)
+    num_frames = (
+        explicit_num_frames
+        if isinstance(explicit_num_frames, int)
+        else default_num_frames
+    )
+    if num_frames is None:
         return num_frames
 
     # Breakable CUDA graph replays only exact latent shapes: the warmup

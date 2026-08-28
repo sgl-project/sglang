@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, and GB300, with MTP and multimodal serving."
+description: "Deploy GLM-5.3-Flash with SGLang using NVIDIA CUDA and AMD ROCm recipes, with MTP and multimodal serving where validated."
 tag: NEW
 ---
 
@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use an SGLang build that includes GLM-5.3-Flash support.
+Use an SGLang build that includes GLM-5.3-Flash support. The AMD ROCm recipes also require [the ROCm engine changes in PR #36607](https://github.com/sgl-project/sglang/pull/36607) until they are available in a published SGLang image.
 
 ```bash Command
 docker pull lmsysorg/sglang:glm-5.3-flash
@@ -25,7 +25,7 @@ Choose your hardware, then choose the operating point that matches your workload
 - **Low Latency** starts with adaptive MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+NVIDIA platforms expose both strategies. AMD ROCm currently exposes only the non-speculative High Throughput recipe because MTP has not been validated there. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, and HiCache tiers. Changing an option that was not part of the measured command changes the badge to **Not Verified** without hiding the option.
 
@@ -35,9 +35,13 @@ import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmar
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
+</Note>
+
 ## Playground
 
-Use the Playground for lower-level tuning such as attention parallelism, MoE communication, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
+Use the Playground for lower-level tuning such as attention parallelism, MoE communication, speculative decoding, and reasoning or tool parsers. It inherits every selection from the deployment panel and shows only the command-line diff.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -65,7 +69,7 @@ GLM-5.3-Flash is a natively multimodal Mixture-of-Experts model built around a h
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}>Precision</td>
-      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100 and H200</td>
+      <td style={{padding: "9px 12px"}}>FP8 weights; FP8 KV cache by default on Blackwell, BF16 KV cache on H100, H200, and the AMD ROCm recipes</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context</td>
@@ -88,9 +92,19 @@ The deployment recipes use the checkpoint's generation configuration. Override s
 
 ### Choose a strategy
 
-Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm NEXTN`, so generated commands use that flag value.
+Start with **Low Latency** for chat and agent workloads. Adaptive MTP changes the draft depth as acceptance changes, reducing unnecessary draft work when the server is busy. Measure **High Throughput** for heavily batched traffic where disabling speculative decoding can be more efficient. SGLang serves MTP through `--speculative-algorithm EAGLE` (upstream folds the older NEXTN spelling into EAGLE), so generated commands use that flag value.
 
-Strategy labels describe the workload goal, not a hardware restriction. Both strategies stay available when you switch hardware; only the verification badge changes.
+Strategy labels describe the workload goal. Both strategies stay available on NVIDIA GPUs; the AMD ROCm recipes expose only High Throughput until MTP speculative decoding is validated there.
+
+### Change the speculative algorithm
+
+The **Speculative** card in the Playground changes the algorithm without leaving the selected strategy:
+
+- **EAGLE / Adaptive MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
+- **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
+- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
+
+Neither algorithm runs with DP-Attention, and neither is available on the AMD ROCm recipes; the card disables the affected chips and names the reason.
 
 ### Size both memory pools
 
@@ -102,7 +116,13 @@ Keep the checkpoint's KDA lower-bound setting unchanged. In particular, do not o
 
 ### Keep the KV and DSA backends paired
 
-On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.3–5.5% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
+On Blackwell, the recipes default to an FP8 KV cache with TRT-LLM DSA: on GB300 this pairing measured 2.9–5.7% higher throughput and about 1.8x the KV token capacity at identical pool bytes, with GSM8K accuracy within noise of BF16. BF16 KV with TileLang DSA remains selectable in the deployment panel and is the default on H100 and H200, where FP8 KV with TRT-LLM DSA is disabled. Switch the dtype and both DSA backends together; TileLang DSA with FP8 KV is not a valid CUDA combination.
+
+On AMD ROCm, use BF16 KV cache with TileLang DSA, set `SGLANG_USE_AITER=1`, keep the MoE runner on Triton, and disable CUDA graphs. The ROCm recipe uses TP8 on a single eight-GPU node. MI300X and MI325X both use gfx942, but the MI325X entry remains explicitly unverified because it is inferred from MI300X rather than measured directly. AMD validation covers text generation and GSM8K only; multimodal serving remains unverified.
+
+### Decode context parallelism
+
+Decode context parallelism (DCP) shards the KV across GPUs during decode to cut long-context latency. The **Context Parallelism** row offers DCP4, validated on 4x GB300 (TP4/EP4) with both KV pairings and adaptive MTP 5/1/6; it requires the current release image, which carries the TileLang LSE fix. Other platforms and attention backends are unvalidated, and draft-extend v2 is unsupported under DCP.
 
 ### Extend the cache hierarchy
 
@@ -166,7 +186,7 @@ sglang serve \
   --max-prefill-tokens 8192 \
   --disable-shared-experts-fusion \
   --disable-prefill-cuda-graph \
-  --speculative-algorithm NEXTN \
+  --speculative-algorithm EAGLE \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \

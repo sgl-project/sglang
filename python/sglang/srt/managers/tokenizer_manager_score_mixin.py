@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 
 logger = logging.getLogger(__name__)
 
