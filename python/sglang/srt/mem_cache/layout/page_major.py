@@ -10,8 +10,8 @@ Across pages the layout is envelope-major (one ``page_bytes`` block per page).
 At ``page_size == 1`` a page is a single slot, so the within-page block is the
 per-slot ``[L0_K | L0_V | L1_K | L1_V | ...]`` envelope (token-granularity).
 
-These builders produce per-layer strided views into a raw ``uint8`` buffer; they
-hold no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
+These builders produce per-layer views into a raw ``uint8`` buffer; they hold
+no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
 pool's region inside the raw buffer (0 for a standalone pool).
 """
 
@@ -34,78 +34,6 @@ def mha_entry_bytes(
     k_row_bytes = head_num * head_dim * itemsize
     v_row_bytes = head_num * v_head_dim * itemsize
     return layer_num * (k_row_bytes + v_row_bytes)
-
-
-def build_page_major_mha_views(
-    raw: torch.Tensor,
-    *,
-    layer_num: int,
-    head_num: int,
-    head_dim: int,
-    v_head_dim: int,
-    store_dtype: torch.dtype,
-    page_size: int,
-    num_pages: int,
-    anchor_bytes: int = 0,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Per-layer K/V views over ``raw`` in the page-major layer-major layout.
-
-    Each returned view is 4-D ``(num_pages, page_size, head_num, head_dim*)``
-    with constant strides:
-
-        stride[0] = page_bytes / itemsize     # next page
-        stride[1] = k_row_bytes / itemsize    # next slot within layer L's K block
-        stride[2] = head_dim                  # next head
-        stride[3] = 1                         # next element
-
-    V is analogous with ``v_row_bytes`` / ``v_head_dim``. A token id ``t`` reads
-    page ``t // page_size``, slot ``t % page_size``.
-    """
-    itemsize = store_dtype.itemsize
-    k_row_bytes = head_num * head_dim * itemsize
-    v_row_bytes = head_num * v_head_dim * itemsize
-    entry_bytes = layer_num * (k_row_bytes + v_row_bytes)
-    page_bytes = page_size * entry_bytes
-    assert anchor_bytes % itemsize == 0
-    assert k_row_bytes % itemsize == 0
-    assert v_row_bytes % itemsize == 0
-    assert page_bytes % itemsize == 0
-
-    as_dtype_view = raw.view(store_dtype)
-    stride_page = page_bytes // itemsize
-    stride_tok_k = k_row_bytes // itemsize
-    stride_tok_v = v_row_bytes // itemsize
-
-    k_shape = (num_pages, page_size, head_num, head_dim)
-    v_shape = (num_pages, page_size, head_num, v_head_dim)
-    k_stride = (stride_page, stride_tok_k, head_dim, 1)
-    v_stride = (stride_page, stride_tok_v, v_head_dim, 1)
-
-    k_buffer: List[torch.Tensor] = []
-    v_buffer: List[torch.Tensor] = []
-    for layer in range(layer_num):
-        # Layer L's K block starts at L * page_size * (k_row + v_row); V follows.
-        k_base_bytes = anchor_bytes + layer * page_size * (k_row_bytes + v_row_bytes)
-        v_base_bytes = k_base_bytes + page_size * k_row_bytes
-        assert k_base_bytes % itemsize == 0
-        assert v_base_bytes % itemsize == 0
-        k_buffer.append(
-            torch.as_strided(
-                as_dtype_view,
-                size=k_shape,
-                stride=k_stride,
-                storage_offset=k_base_bytes // itemsize,
-            )
-        )
-        v_buffer.append(
-            torch.as_strided(
-                as_dtype_view,
-                size=v_shape,
-                stride=v_stride,
-                storage_offset=v_base_bytes // itemsize,
-            )
-        )
-    return k_buffer, v_buffer
 
 
 def build_dense_mha_views(

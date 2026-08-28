@@ -46,7 +46,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mha_views,
-    build_page_major_mha_views,
     mha_entry_bytes,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -113,6 +112,44 @@ def _build_dense(raw, ps, num_pages, head_dim=_D, v_head_dim=_D, layer_num=_L):
     )
 
 
+def _reference_strided_views(raw, *, page_size, num_pages, anchor_bytes=0):
+    """Independent 4-D strided description of the page-major envelope.
+
+    This is the retired production strided builder, kept here as the oracle:
+    per-layer ``(num_pages, page_size, head_num, head_dim)`` views addressed by
+    ``(page, slot)``, so the dense builder's addressing can be cross-checked
+    against a second, independently-derived description of the same bytes.
+    """
+    k_row_bytes = _ROW * _ITEM
+    v_row_bytes = _ROW * _ITEM
+    page_bytes = page_size * _L * (k_row_bytes + v_row_bytes)
+    as_dtype_view = raw.view(_DTYPE)
+    k_stride = (page_bytes // _ITEM, k_row_bytes // _ITEM, _D, 1)
+    v_stride = (page_bytes // _ITEM, v_row_bytes // _ITEM, _D, 1)
+    shape = (num_pages, page_size, _H, _D)
+    k_views, v_views = [], []
+    for layer in range(_L):
+        k_base = anchor_bytes + layer * page_size * (k_row_bytes + v_row_bytes)
+        v_base = k_base + page_size * k_row_bytes
+        k_views.append(
+            torch.as_strided(
+                as_dtype_view,
+                size=shape,
+                stride=k_stride,
+                storage_offset=k_base // _ITEM,
+            )
+        )
+        v_views.append(
+            torch.as_strided(
+                as_dtype_view,
+                size=shape,
+                stride=v_stride,
+                storage_offset=v_base // _ITEM,
+            )
+        )
+    return k_views, v_views
+
+
 class TestMHADenseSpecSurface(unittest.TestCase):
     def test_asymmetric_rows_refused_at_construction(self):
         """The unified pool has ONE layout and the dense block array exists
@@ -161,24 +198,16 @@ class TestDenseMHAViews(unittest.TestCase):
             self.assertEqual(tuple(v.shape), (n_dense, _H, _D))
             self.assertEqual(v.stride(), (_ROW, _D, 1))
 
-    def test_dense_addressing_matches_strided_builder(self):
-        """Cross-readback: bytes written through the STRIDED views at
+    def test_dense_addressing_matches_strided_reference(self):
+        """Cross-readback: bytes written through the reference STRIDED views at
         (page, slot) must be read back through the DENSE views at dense(t),
         for both K and V of every layer — and vice versa. This pins that the
-        two builders describe the same physical envelope."""
+        dense builder and the independent strided description agree on the
+        same physical envelope."""
         for ps in (1, 4):
             num_pages = 5
             raw = _make_raw(ps, num_pages)
-            sk, sv = build_page_major_mha_views(
-                raw,
-                layer_num=_L,
-                head_num=_H,
-                head_dim=_D,
-                v_head_dim=_D,
-                store_dtype=_DTYPE,
-                page_size=ps,
-                num_pages=num_pages,
-            )
+            sk, sv = _reference_strided_views(raw, page_size=ps, num_pages=num_pages)
             dk, dv = _build_dense(raw, ps, num_pages)
             probes = [(0, 0, 0), (1, 1, ps - 1), (4, 0, ps // 2), (3, 1, 0)]
             # strided-write -> dense-read
@@ -207,6 +236,37 @@ class TestDenseMHAViews(unittest.TestCase):
                 self.assertTrue(
                     torch.all(sv[l][p, s] == float(p * 100 + l * 10 + s + 4))
                 )
+
+    def test_byte_addresses_match_envelope_formula(self):
+        """The dense view's byte address for token ``t``, layer ``L`` must equal
+        the hand-computed envelope formula: page origin + layer-block origin +
+        slot offset. Independent of any view builder — this is the raw layout
+        contract every envelope consumer (moves, sizing, transfer math) relies
+        on."""
+        k_row = _ROW * _ITEM
+        v_row = _ROW * _ITEM
+        for ps in (1, 4):
+            num_pages = 5
+            page_bytes = ps * _L * (k_row + v_row)
+            dk, dv = _build_dense(_make_raw(ps, num_pages), ps, num_pages)
+            for t in (0, 1, ps, 3 * ps + (ps - 1), 4 * ps):
+                d = _dense(t, ps)
+                for L in range(_L):
+                    expected_k = (
+                        (t // ps) * page_bytes
+                        + L * ps * (k_row + v_row)
+                        + (t % ps) * k_row
+                    )
+                    expected_v = (
+                        (t // ps) * page_bytes
+                        + L * ps * (k_row + v_row)
+                        + ps * k_row
+                        + (t % ps) * v_row
+                    )
+                    got_k = (dk[L].storage_offset() + d * dk[L].stride(0)) * _ITEM
+                    got_v = (dv[L].storage_offset() + d * dv[L].stride(0)) * _ITEM
+                    self.assertEqual(got_k, expected_k, f"K t={t} L={L} ps={ps}")
+                    self.assertEqual(got_v, expected_v, f"V t={t} L={L} ps={ps}")
 
     def test_k_and_v_share_one_dense_id_without_aliasing(self):
         """One dense id, 2L distinct cells (K and V of every layer): writes
@@ -331,15 +391,9 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         raw bytes) end to end."""
         for ps in (1, 4):
             kv, pool = _make_pool_and_kv(ps, device=_STORE_DEV)
-            # An independent view of the SAME sub-pool region, in the layout the
-            # standalone page-major pool uses.
-            sk, sv = build_page_major_mha_views(
+            # An independent strided view of the SAME sub-pool region.
+            sk, sv = _reference_strided_views(
                 kv._raw,
-                layer_num=_L,
-                head_num=_H,
-                head_dim=_D,
-                v_head_dim=_D,
-                store_dtype=_DTYPE,
                 page_size=ps,
                 num_pages=kv.max_slots("full") // ps,
                 anchor_bytes=kv.anchor_bytes("full"),
