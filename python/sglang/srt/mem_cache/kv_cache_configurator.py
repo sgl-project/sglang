@@ -674,8 +674,8 @@ class KVCacheConfigurator:
             # Draft workers keep the token-count byte sum (spec is asserted
             # off under unified; belt only).
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
-            # DCP widens the allocator's virtual id space (dcp_size ids per stored
-            # row); the pool itself stays this rank's shard.
+            # Widens the allocator's virtual id space only; the pool below it
+            # still holds this rank's shard.
             dcp_size=get_parallel().attn_dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
         )

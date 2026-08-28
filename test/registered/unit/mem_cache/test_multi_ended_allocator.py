@@ -3413,6 +3413,63 @@ class TestDcpWidening(unittest.TestCase):
             )
         )
 
+    def _build_composite(self, *, page_size, dcp_size):
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        full_spec = _make_mha_spec("full", "up", layer_num=2)
+        mamba_spec = _make_mamba_spec("mamba", "down", layer_num=2)
+        pool = UnifiedKVPool(
+            total_bytes=16 * page_size * full_spec.entry_bytes()
+            + 8 * mamba_spec.entry_bytes(),
+            sub_pool_specs=[full_spec, mamba_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv._copy_from_physical = lambda src, dst: None
+
+        class _FakeHybridLinearKVPool:
+            full_kv_pool = full_kv
+            mamba_pool = mamba_kv
+
+        return UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeHybridLinearKVPool(),
+            device=_DEV,
+            page_size=page_size,
+            dcp_size=dcp_size,
+            need_sort=False,
+            forward_stream=None,
+        )
+
+    def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
+        """The planner charges `mamba_slot_full_token_cost()` against a budget
+        fed by `available_size()`. Both are bytes/entry_bytes conversions, so
+        both carry `dcp_size`; if only the budget widens, every Mamba state is
+        under-reserved by that factor and a batch is admitted whose later
+        allocations cross the shared byte frontier."""
+        for page_size in (1, 8):
+            base = self._build_composite(page_size=page_size, dcp_size=1)
+            base_cost = base.mamba_slot_full_token_cost()
+            self.assertGreater(base_cost, 0)
+            for dcp_size in (2, 4):
+                a = self._build_composite(page_size=page_size, dcp_size=dcp_size)
+                self.assertEqual(a.available_size(), base.available_size() * dcp_size)
+                mamba_bytes = a.mamba_allocator.entry_bytes_per_page
+                full_entry = a.full_attn_allocator.entry_bytes
+                cost = a.mamba_slot_full_token_cost()
+                # A widened token is `full_entry / dcp_size` bytes, so the
+                # reservation covers the slot...
+                self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
+                # ...and stays tight (rounds up by less than one token).
+                self.assertLess((cost - 1) * full_entry, mamba_bytes * dcp_size)
+                # The un-scaled cost -- the bug -- would not have covered it.
+                self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2873,9 +2873,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         stays inside the JOINT budget. = mamba bytes/slot ÷ full bytes/token, rounded
         UP (conservative). Only on the shared composite (non-shared pools are separate,
         so the planner sources this via `getattr(..., None)`).
+
+        The planner charges this against `rem_total_tokens`, which is fed by
+        `available_size()` -- widened under DCP. One widened token is
+        `entry_bytes / dcp_size` local bytes, so the conversion carries the same
+        `dcp_size`; leaving it out under-reserves the shared gap by that factor.
         """
         return -(
             -self.mamba_allocator.entry_bytes_per_page
+            * self.dcp_size
             // self.full_attn_allocator.entry_bytes
         )
 
@@ -2993,6 +2999,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
         `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`).
         """
+        # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
+        # argument validation, so reaching it means a config path got past that.
         assert self.dcp_size == 1, (
             "PD-disaggregation transfer with the unified memory pool does not "
             "support decode context parallelism: the transfer ships whole page "

@@ -296,6 +296,15 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
         "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
         "space, and the full->swa mapping is not DCP-sharded."
     )
+    cfg = resolving_view(server_args)
+    assert cfg.disaggregation_mode == "null", (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support PD disaggregation: the transfer "
+        "ships whole page envelopes, which under DCP hold only this rank's "
+        "shard of each widened page. Rejected here rather than at the first KV "
+        "transfer, where translate_kv_indices_for_transfer would abort a "
+        "server that had already booted."
+    )
     # trtllm_mla (and its cutedsl_mla / tokenspeed_mla subclasses) build the
     # MLA block table straight from req_to_token with
     # create_flashmla_kv_indices_triton, whose v2p gather assumes UNWIDENED
