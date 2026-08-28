@@ -1927,6 +1927,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             if t:
                 comp_xfers[comp.component_type] = t
+        # Reject transfers that would claim a node pinned by another load-back
+        # anchor; the empty spec makes the caller back off and recompute.
+        if any(
+            self.node_by_id(nid).load_back_pending_id not in (None, node_id)
+            for xfers in ([kv_xfer], *comp_xfers.values())
+            for xfer in xfers
+            for nid in xfer.nodes_to_load or ()
+        ):
+            empty_kv = PoolTransfer(
+                name=PoolName.KV,
+                host_indices=torch.empty((0,), dtype=torch.int64, device="cpu"),
+                nodes_to_load=[],
+            )
+            return empty_kv, {}
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
