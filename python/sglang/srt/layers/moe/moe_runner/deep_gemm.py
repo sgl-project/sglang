@@ -160,11 +160,49 @@ def _estimate_masked_standard_layout_peak_bytes(
     return runner_config.num_local_experts * padded_m * peak_row_bytes
 
 
+_masked_activation_fallback_logged = False
+
+
+# Masked clamped/swizzled activation only exists as the DSV4 JIT kernel, which
+# requires D // 8 >= E and group 128 (silu_and_mul_masked_post_quant.cuh:245).
+def _masked_activation_unsupported_reason(
+    runner_config: MoeRunnerConfig, quant_info: DeepGemmMoeQuantInfo
+) -> Optional[str]:
+    if runner_config.swiglu_limit is None and not get_moe_a2a_backend().is_megamoe():
+        return None
+    d = runner_config.intermediate_size_per_partition
+    e = runner_config.num_local_experts
+    if d is None or e is None:
+        return None
+    group_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+    if d // 8 < e:
+        return f"D // 8 ({d // 8}) < num_local_experts ({e})"
+    if group_size != 128:
+        return (
+            f"masked activation group_size {group_size}, DSV4 JIT kernel requires 128"
+        )
+    if d % (group_size * 4) != 0:
+        return f"D ({d}) not divisible by 4 * group_size"
+    return None
+
+
 def _should_use_masked_standard_layout(
     runner_config: MoeRunnerConfig,
     quant_info: DeepGemmMoeQuantInfo,
     hidden_states: torch.Tensor,
 ) -> bool:
+    reason = _masked_activation_unsupported_reason(runner_config, quant_info)
+    if reason is not None:
+        global _masked_activation_fallback_logged
+        if not _masked_activation_fallback_logged:
+            _masked_activation_fallback_logged = True
+            logger.info(
+                "DeepGEMM masked standard layout disabled: %s. "
+                "Clamped/swizzled activations on this config must use the "
+                "compact layout.",
+                reason,
+            )
+        return False
     mode = envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower()
     if mode not in ("auto", "masked", "compact"):
         raise ValueError(
