@@ -24,14 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
-from sglang.srt.mem_cache.rust_tree_core.extension import (
-    DecLockRefParamsBinding,
-    InsertParamsBinding,
-    MatchParamsBinding,
-    RustBigramUnifiedTreeCoreBinding,
-    RustUnifiedTreeCoreBinding,
-    TreeCoreInitParamsBinding,
-)
+from sglang.srt.mem_cache.rust_tree_core.extension import bindings
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     FreeComponentDeviceSlot,
@@ -282,6 +275,8 @@ class _RustKVCacheEventRecorder:
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     """A TreeCore backed by the Rust extension binding."""
 
+    _bindings = bindings
+
     def __init__(self, params: CacheInitParams):
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
@@ -332,7 +327,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self._binding = self._binding_class()(
-            TreeCoreInitParamsBinding(
+            self._bindings.TreeCoreInitParamsBinding(
                 eviction_policy=params.eviction_policy,
                 page_size=params.page_size,
                 is_write_back=False,
@@ -363,8 +358,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def _binding_class(self) -> type:
         """The extension binding class this core constructs."""
         if self.is_eagle:
-            return RustBigramUnifiedTreeCoreBinding
-        return RustUnifiedTreeCoreBinding
+            return self._bindings.RustBigramUnifiedTreeCoreBinding
+        return self._bindings.RustUnifiedTreeCoreBinding
 
     # ==== Tree API ====
 
@@ -410,7 +405,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         binding_params = (
-            DecLockRefParamsBinding(
+            self._bindings.DecLockRefParamsBinding(
                 swa_uuid_for_lock=params.swa_uuid_for_lock,
                 swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
                 skip_lock_node_ids=_skip_lock_node_ids_to_binding(
@@ -500,7 +495,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
         binding_params = (
-            DecLockRefParamsBinding(
+            self._bindings.DecLockRefParamsBinding(
                 swa_uuid_for_lock=params.swa_uuid_for_lock,
                 swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
                 skip_lock_node_ids=_skip_lock_node_ids_to_binding(
@@ -568,7 +563,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
         result = self._binding.match_prefix(
-            MatchParamsBinding(key=_radix_key_buffer(key), extra_key=key.extra_key)
+            self._bindings.MatchParamsBinding(
+                key=_radix_key_buffer(key), extra_key=key.extra_key
+            )
         )
         return _match_result_from_binding(result)
 
@@ -593,7 +590,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # token ids materialized on the core's device.
             value = torch.tensor(key_buffer, dtype=torch.int64, device=self.device)
         step = self._binding.begin_insert(
-            InsertParamsBinding(
+            self._bindings.InsertParamsBinding(
                 key=key_buffer,
                 value=value,
                 extra_key=key.extra_key,

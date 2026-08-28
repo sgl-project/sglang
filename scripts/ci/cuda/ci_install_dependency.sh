@@ -473,10 +473,19 @@ require_prebuilt_rust_exts() {
     for module in server grpc multimodal; do
         [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
+        || missing+=("mem_cache")
+    [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache_inspection${suffix}" ] \
+        || missing+=("mem_cache_inspection")
     if [ ${#missing[@]} -gt 0 ]; then
         echo "::warning::no prebuilt Rust extension ${suffix} for: ${missing[*]}; building from source"
         ls -l python/sglang/srt/rust_extensions/_*.so 2>/dev/null || echo "(no extension modules at all)"
+        ls -l python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so 2>/dev/null || true
         export SGLANG_BUILD_RUST_EXTS=
+        export SGLANG_RUST_BUILD_MODE=auto
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_RUST_BUILD_MODE=auto" >> "${GITHUB_ENV}"
+        fi
         mark_step_done "${FUNCNAME[0]}"
         return
     fi

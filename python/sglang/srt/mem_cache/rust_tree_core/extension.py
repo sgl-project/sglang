@@ -1,62 +1,40 @@
-"""Build-and-load shim for the ``mem_cache`` Rust extension.
+"""Load the bundled Rust TreeCore extension or a fingerprinted local build."""
 
-Importing this module loads the compiled extension, building it with cargo on
-first use (a Rust toolchain is required); libtorch comes from the installed
-torch package.
-"""
-
-import importlib.util
-import os
-import shlex
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
-# libtorch must be resident before the extension's cdylib loads.
+# Loading torch first makes its libtorch dependencies resident before dlopen.
 import torch
 
+from sglang.srt.rust_extensions import load_rust_extension
+from sglang.srt.rust_extensions.torch_build import torch_build_configuration
+
+_PYTHON_MODULE = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
+_INSPECTION_MODULE = "sglang.srt.mem_cache.rust_tree_core.mem_cache_inspection"
 _CRATE_DIR = Path(__file__).resolve().parents[5] / "rust" / "mem-cache"
 _TORCH_COMPAT_HEADER = _CRATE_DIR / "torch_2_13_compat.h"
-_BUILT_SO = _CRATE_DIR / "target" / "release" / "libmem_cache.so"
-_PACKAGED_SO = Path(__file__).parent / "mem_cache.so"
 
 
-def _build() -> None:
-    torch_dir = Path(torch.__file__).parent
-    env = dict(os.environ)
-    env["LIBTORCH"] = str(torch_dir)
-    env["LIBTORCH_BYPASS_VERSION_CHECK"] = "1"
-    env["PYO3_PYTHON"] = sys.executable
-    # torch-sys discovers python include dirs via `python3` on PATH.
-    env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
-    env["LD_LIBRARY_PATH"] = f"{torch_dir / 'lib'}:{env.get('LD_LIBRARY_PATH', '')}"
-    # The cdylib finds libtorch at runtime through this rpath.
-    env["RUSTFLAGS"] = (
-        f"{env.get('RUSTFLAGS', '')} -C link-arg=-Wl,-rpath,{torch_dir / 'lib'}"
-    ).strip()
-    env["CXXFLAGS"] = (
-        f"{env.get('CXXFLAGS', '')} -include {shlex.quote(str(_TORCH_COMPAT_HEADER))}"
-    ).strip()
-    subprocess.run(["cargo", "build", "--release"], cwd=_CRATE_DIR, env=env, check=True)
-    shutil.copy2(_BUILT_SO, _PACKAGED_SO)
+def load_tree_core_extension(*, inspection: bool = False):
+    """Load the production binding or the test-only inspection variant."""
+    build = torch_build_configuration(
+        compat_header=_TORCH_COMPAT_HEADER,
+        python_module=_PYTHON_MODULE,
+        torch_module=torch,
+    )
+    return load_rust_extension(
+        _PYTHON_MODULE,
+        additional_features=("inspection",) if inspection else (),
+        extension_module=_INSPECTION_MODULE if inspection else None,
+        build_environment=build.environment,
+        build_fingerprint=build.fingerprint,
+    )
 
 
-def _load():
-    if not _PACKAGED_SO.exists():
-        _build()
-    spec = importlib.util.spec_from_file_location("mem_cache", _PACKAGED_SO)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["mem_cache"] = module
-    spec.loader.exec_module(module)
-    return module
+bindings = load_tree_core_extension()
 
-
-_ext = _load()
-
-DecLockRefParamsBinding = _ext.DecLockRefParamsBinding
-InsertParamsBinding = _ext.InsertParamsBinding
-MatchParamsBinding = _ext.MatchParamsBinding
-RustBigramUnifiedTreeCoreBinding = _ext.RustBigramUnifiedTreeCoreBinding
-RustUnifiedTreeCoreBinding = _ext.RustUnifiedTreeCoreBinding
-TreeCoreInitParamsBinding = _ext.TreeCoreInitParamsBinding
+DecLockRefParamsBinding = bindings.DecLockRefParamsBinding
+InsertParamsBinding = bindings.InsertParamsBinding
+MatchParamsBinding = bindings.MatchParamsBinding
+RustBigramUnifiedTreeCoreBinding = bindings.RustBigramUnifiedTreeCoreBinding
+RustUnifiedTreeCoreBinding = bindings.RustUnifiedTreeCoreBinding
+TreeCoreInitParamsBinding = bindings.TreeCoreInitParamsBinding

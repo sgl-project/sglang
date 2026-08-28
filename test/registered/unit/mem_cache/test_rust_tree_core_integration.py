@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
-from sglang.srt.mem_cache.rust_tree_core.extension import _ext as mem_cache
+from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     FreeComponentHostSlot,

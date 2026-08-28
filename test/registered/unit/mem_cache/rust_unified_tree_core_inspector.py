@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.rust_tree_core.adapter import (
     _match_result_from_binding,
     _radix_key_buffer,
 )
+from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.unified_cache.components import ComponentType, EvictLayer
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
@@ -26,6 +27,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(
     est_time=0, suite="base-a-test-cpu", disabled="Rust TreeCore test inspector"
 )
+
+_inspection_bindings = load_tree_core_extension(inspection=True)
 
 
 class RustUnifiedTreeCoreInspector(
@@ -38,6 +41,8 @@ class RustUnifiedTreeCoreInspector(
     controls in test code while the binding returns snapshots rather than Rust
     iterators across the Python boundary.
     """
+
+    _bindings = _inspection_bindings
 
     def contains_node(self, node_id: NodeId) -> bool:
         return self._binding.inspect_contains_node(node_id)

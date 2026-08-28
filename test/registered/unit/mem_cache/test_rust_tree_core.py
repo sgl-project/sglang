@@ -54,6 +54,7 @@ def test_registry_resolves_the_rust_backend_lazily():
     core = _tree_core()
     assert type(core).__name__ == "RustUnifiedTreeCore"
     assert not isinstance(core, UnifiedTreeCoreInspectionInterface)
+    assert not any(name.startswith("inspect_") for name in dir(core._binding))
 
 
 def test_insert_then_match_round_trips():

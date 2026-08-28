@@ -3761,12 +3761,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
         nodes
     }
+}
 
-    // ==== Test-only inspection support ====
-    //
-    // These methods expose owned snapshots or deliberate white-box operations
-    // for the backend-neutral Python test suite. They add no persistent state
-    // and are not used by the production TreeCore interface.
+#[cfg(any(test, feature = "inspection"))]
+impl<K: ChildKeyType> UnifiedTreeCore<K> {
+    // Test-only inspection support for the backend-neutral Python suite.
 
     /// Whether the external node handle is currently live.
     pub fn inspect_contains_node(&self, node_id: NodeId) -> bool {
@@ -4129,7 +4128,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.build_backup_kv_action_(self.arena.node(node_id), write_back)
             .node_ids
     }
+}
 
+impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Print the tree structure for debugging.
     pub fn pretty_print(&self) {
         println!("{}", self.pretty_format_());

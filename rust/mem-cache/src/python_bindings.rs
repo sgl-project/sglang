@@ -268,6 +268,7 @@ type TransferArgs = (
 /// Strongly typed, attribute-based input view of a Python MatchResult.
 /// Cache actions are intentionally omitted: component finalizers only update
 /// match metadata, while the test adapter preserves the original actions.
+#[cfg(feature = "inspection")]
 #[derive(FromPyObject)]
 struct InspectionMatchResultInput {
     #[pyo3(attribute)]
@@ -1683,9 +1684,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let ct = parse_component_type(component_type)?;
         Ok(py.allow_threads(|| self.core().component_has_host_value_only(node_id, ct)))
     }
+}
 
-    // ==== Test-only inspection surface ====
-
+#[cfg(feature = "inspection")]
+impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
         py.allow_threads(|| self.core().inspect_contains_node(node_id))
     }
@@ -2045,7 +2047,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                 .inspect_build_backup_node_ids(node_id, write_back)
         })
     }
+}
 
+impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Print the tree structure for debugging.
     fn pretty_print(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().pretty_print());
@@ -2614,10 +2618,12 @@ macro_rules! tree_core_binding {
 
             // ==== Test-only inspection surface ====
 
+            #[cfg(feature = "inspection")]
             fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
                 self.inner.inspect_contains_node(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_parent_node_id(
                 &self,
                 py: Python<'_>,
@@ -2626,6 +2632,7 @@ macro_rules! tree_core_binding {
                 self.inner.inspect_get_parent_node_id(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_child_node_ids(
                 &self,
                 py: Python<'_>,
@@ -2634,18 +2641,22 @@ macro_rules! tree_core_binding {
                 self.inner.inspect_get_child_node_ids(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> usize {
                 self.inner.inspect_get_node_key_length(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> Vec<i64> {
                 self.inner.inspect_get_node_token_ids(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> bool {
                 self.inner.inspect_is_node_key_bigram(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_component_host_value(
                 &self,
                 py: Python<'_>,
@@ -2656,6 +2667,7 @@ macro_rules! tree_core_binding {
                     .inspect_get_component_host_value(py, node_id, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_component_device_lock_ref(
                 &self,
                 py: Python<'_>,
@@ -2666,10 +2678,12 @@ macro_rules! tree_core_binding {
                     .inspect_get_component_device_lock_ref(py, node_id, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> i64 {
                 self.inner.inspect_get_node_hit_count(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_write_through_pending_id(
                 &self,
                 py: Python<'_>,
@@ -2679,6 +2693,7 @@ macro_rules! tree_core_binding {
                     .inspect_get_write_through_pending_id(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_is_node_in_device_lru(
                 &self,
                 py: Python<'_>,
@@ -2689,6 +2704,7 @@ macro_rules! tree_core_binding {
                     .inspect_is_node_in_device_lru(py, node_id, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_is_node_in_host_lru(
                 &self,
                 py: Python<'_>,
@@ -2699,6 +2715,7 @@ macro_rules! tree_core_binding {
                     .inspect_is_node_in_host_lru(py, node_id, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_component_device_lru_node_ids(
                 &self,
                 py: Python<'_>,
@@ -2708,6 +2725,7 @@ macro_rules! tree_core_binding {
                     .inspect_get_component_device_lru_node_ids(py, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_is_device_evictable_leaf(
                 &self,
                 py: Python<'_>,
@@ -2716,6 +2734,7 @@ macro_rules! tree_core_binding {
                 self.inner.inspect_is_device_evictable_leaf(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_is_host_evictable_leaf(
                 &self,
                 py: Python<'_>,
@@ -2724,14 +2743,17 @@ macro_rules! tree_core_binding {
                 self.inner.inspect_is_host_evictable_leaf(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
                 self.inner.inspect_is_device_leaf(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
                 self.inner.inspect_get_all_node_ids(py)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_component_protected_size(
                 &self,
                 py: Python<'_>,
@@ -2741,6 +2763,7 @@ macro_rules! tree_core_binding {
                     .inspect_component_protected_size(py, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             #[pyo3(signature = (node_id, hash_values = None))]
             fn inspect_set_node_hash_values(
                 &self,
@@ -2752,6 +2775,7 @@ macro_rules! tree_core_binding {
                     .inspect_set_node_hash_values(py, node_id, hash_values)
             }
 
+            #[cfg(feature = "inspection")]
             #[pyo3(signature = (node_id, component_type, value = None))]
             fn inspect_set_component_device_value_raw(
                 &self,
@@ -2768,6 +2792,7 @@ macro_rules! tree_core_binding {
                 )
             }
 
+            #[cfg(feature = "inspection")]
             #[pyo3(signature = (node_id, component_type, value = None))]
             fn inspect_set_component_host_value_raw(
                 &self,
@@ -2784,6 +2809,7 @@ macro_rules! tree_core_binding {
                 )
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_set_component_device_lock_ref(
                 &self,
                 py: Python<'_>,
@@ -2799,6 +2825,7 @@ macro_rules! tree_core_binding {
                 )
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_remove_node_from_device_lru(
                 &self,
                 py: Python<'_>,
@@ -2809,6 +2836,7 @@ macro_rules! tree_core_binding {
                     .inspect_remove_node_from_device_lru(py, node_id, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_insert_node_into_host_lru(
                 &self,
                 py: Python<'_>,
@@ -2819,6 +2847,7 @@ macro_rules! tree_core_binding {
                     .inspect_insert_node_into_host_lru(py, node_id, component_type)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_set_component_evictable_size(
                 &self,
                 py: Python<'_>,
@@ -2829,6 +2858,7 @@ macro_rules! tree_core_binding {
                     .inspect_set_component_evictable_size(py, component_type, value)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_set_component_protected_size(
                 &self,
                 py: Python<'_>,
@@ -2839,14 +2869,17 @@ macro_rules! tree_core_binding {
                     .inspect_set_component_protected_size(py, component_type, value)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) {
                 self.inner.inspect_update_duplicate_tracking(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
                 self.inner.inspect_advance_insert_walk_once(py)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_evict_component(
                 &self,
                 py: Python<'_>,
@@ -2858,6 +2891,7 @@ macro_rules! tree_core_binding {
                     .inspect_evict_component(py, node_id, component_type, target)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_validate_cascade_evict(
                 &self,
                 py: Python<'_>,
@@ -2869,6 +2903,7 @@ macro_rules! tree_core_binding {
                     .inspect_validate_cascade_evict(py, node_id, component_type, target)
             }
 
+            #[cfg(feature = "inspection")]
             fn inspect_cleanup_tombstone_ancestors(
                 &self,
                 py: Python<'_>,
@@ -2878,6 +2913,7 @@ macro_rules! tree_core_binding {
                     .inspect_cleanup_tombstone_ancestors(py, node_id)
             }
 
+            #[cfg(feature = "inspection")]
             #[allow(clippy::too_many_arguments)]
             #[pyo3(signature = (component_type, result, key, extra_key, value_chunks, best_value_len))]
             fn inspect_finalize_component_match_result(
@@ -2901,6 +2937,7 @@ macro_rules! tree_core_binding {
                 )
             }
 
+            #[cfg(feature = "inspection")]
             #[pyo3(signature = (node_id, write_back = false))]
             fn inspect_build_backup_node_ids(
                 &self,
@@ -2954,9 +2991,7 @@ fn get_hash_str(
     }))
 }
 
-/// The `mem_cache` extension module (Python: `sglang.srt.mem_cache.mem_cache`).
-#[pymodule]
-fn mem_cache(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
     m.add_class::<MatchParamsBinding>()?;
@@ -2975,4 +3010,17 @@ fn mem_cache(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustUnifiedTreeCoreBinding>()?;
     m.add_class::<RustBigramUnifiedTreeCoreBinding>()?;
     Ok(())
+}
+
+/// The production TreeCore extension module.
+#[pymodule]
+fn mem_cache(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_mem_cache_module(m)
+}
+
+/// White-box variant used only by the shared test inspector.
+#[cfg(feature = "inspection")]
+#[pymodule]
+fn mem_cache_inspection(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register_mem_cache_module(m)
 }

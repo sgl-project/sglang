@@ -77,7 +77,15 @@ jobs:
           cd python
           pip install auditwheel patchelf
           mkdir -p dist-repaired
-          python3 -m auditwheel repair dist/*.whl -w dist-repaired/
+          # The TreeCore extension intentionally resolves libtorch from the
+          # wheel's torch dependency; do not duplicate PyTorch inside sglang.
+          python3 -m auditwheel repair dist/*.whl -w dist-repaired/ \
+            --exclude libc10.so \
+            --exclude libc10_cuda.so \
+            --exclude libtorch.so \
+            --exclude libtorch_cpu.so \
+            --exclude libtorch_cuda.so \
+            --exclude libtorch_python.so
           rm dist/*.whl
           mv dist-repaired/*.whl dist/
 
