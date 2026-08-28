@@ -26,7 +26,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -44,7 +43,6 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
-        server_args: ServerArgs,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -64,7 +62,6 @@ class DecodeKVCacheOffloadManager:
         self.decode_host_mem_pool = build_kv_host_pool(
             kv_pool=kv_cache,
             page_size=self.page_size,
-            server_args=server_args,
             use_mla=isinstance(kv_cache, MLATokenToKVPool),
         )
 
