@@ -429,6 +429,12 @@ def resolve_safetensors_weight_set(
     ):
         selected_name = Path(inventory.source.local_path).name
     if selected_name is not None:
+        if not selected_name.lower().endswith(
+            (".safetensors", _SAFETENSORS_INDEX_SUFFIX)
+        ):
+            raise NoSafetensorsWeightsError(
+                f"Selected file is not safetensors: {selected_name!r}"
+            )
         selected = _select_named_file(weights + indexes, selected_name)
         if selected in weights:
             return ResolvedWeightSet(inventory, (selected,))

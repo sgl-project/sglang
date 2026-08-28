@@ -171,6 +171,14 @@ def test_source_without_safetensors_has_distinct_error(tmp_path):
         resolve_safetensors_weight_set(str(tmp_path))
 
 
+def test_exact_non_safetensors_file_has_distinct_error(tmp_path):
+    weights = tmp_path / "pytorch_model.bin"
+    weights.write_bytes(b"bin")
+
+    with pytest.raises(NoSafetensorsWeightsError):
+        resolve_safetensors_weight_set(str(weights))
+
+
 def test_remote_safetensors_shards_use_one_pinned_revision(tmp_path):
     index_path = tmp_path / "model.safetensors.index.json"
     index_path.write_text(
