@@ -142,8 +142,8 @@ def connect_host(host: str) -> str:
     return host
 
 
-class RustRendererHost:
-    """Own the optional renderer in front of one embedded Rust server."""
+class RustRendererSidecar:
+    """Own renderer topology, configuration, and process lifecycle."""
 
     def __init__(
         self,
@@ -162,70 +162,48 @@ class RustRendererHost:
             internal_server_url=self.internal_server_addr.to_url(),
             num_reserved_tokens=num_reserved_tokens,
         )
-        self._sidecar: RustRendererSidecar | None = None
+        self.process = None
+        self._watchdog: SubprocessWatchdog | None = None
 
     def start(self, cores: Sequence[int] | None) -> None:
-        if self._sidecar is not None:
+        if self.process is not None:
             raise RuntimeError("Rust renderer is already running")
-        self._sidecar = RustRendererSidecar.launch(
-            args=self.args,
-            public_addr=self.public_addr,
-            internal_server_url=self.internal_server_addr.to_url(),
-            cores=cores,
-        )
-
-    def stop(self) -> None:
-        if self._sidecar is not None:
-            self._sidecar.stop()
-            self._sidecar = None
-
-
-class RustRendererSidecar:
-    def __init__(self, process, public_addr: NetworkAddress):
-        self.process = process
-        self.public_addr = public_addr
-        self._watchdog = SubprocessWatchdog(
-            processes=[process], process_names=["sglang-renderer"]
-        )
-
-    @classmethod
-    def launch(
-        cls,
-        args: Sequence[str],
-        public_addr: NetworkAddress,
-        internal_server_url: str,
-        cores: Sequence[int] | None = None,
-    ) -> RustRendererSidecar:
         binary = find_renderer_binary()
         process = mp.get_context("spawn").Process(
             name="sglang_renderer",
             target=renderer_process,
-            args=(binary, args, cores),
+            args=(binary, self.args, cores),
         )
-        sidecar = cls(process, public_addr)
+        watchdog = SubprocessWatchdog(
+            processes=[process], process_names=["sglang-renderer"]
+        )
+        self.process = process
+        self._watchdog = watchdog
         try:
             process.start()
-            sidecar._wait_until_listening()
-            sidecar._watchdog.start()
+            self._wait_until_listening()
+            watchdog.start()
         except BaseException:
-            sidecar.stop()
+            self.stop()
             raise
         logger.info(
             "Rust renderer listening on %s and forwarding Rust-server routes to %s",
-            public_addr.to_host_port_str(),
-            internal_server_url,
+            self.public_addr.to_host_port_str(),
+            self.internal_server_addr.to_url(),
         )
-        return sidecar
 
     def _wait_until_listening(self) -> None:
+        process = self.process
+        if process is None:
+            raise RuntimeError("Rust renderer has not been started")
         deadline = time.monotonic() + STARTUP_TIMEOUT
         address = (connect_host(self.public_addr.host), self.public_addr.port)
         while time.monotonic() < deadline:
-            if not self.process.is_alive():
-                self.process.join(timeout=0)
+            if not process.is_alive():
+                process.join(timeout=0)
                 raise RuntimeError(
                     "sglang-renderer exited during startup with code "
-                    f"{self.process.exitcode}"
+                    f"{process.exitcode}"
                 )
             try:
                 with socket.create_connection(address, timeout=0.2):
@@ -238,16 +216,22 @@ class RustRendererSidecar:
         )
 
     def stop(self) -> None:
-        self._watchdog.stop()
-        if self.process.pid is not None and self.process.is_alive():
-            os.kill(self.process.pid, signal.SIGINT)
-            self.process.join(timeout=SHUTDOWN_TIMEOUT)
-        elif self.process.pid is not None:
-            self.process.join(timeout=0)
-        if self.process.pid is not None and self.process.is_alive():
+        if self._watchdog is not None:
+            self._watchdog.stop()
+            self._watchdog = None
+        process = self.process
+        if process is None:
+            return
+        if process.pid is not None and process.is_alive():
+            os.kill(process.pid, signal.SIGINT)
+            process.join(timeout=SHUTDOWN_TIMEOUT)
+        elif process.pid is not None:
+            process.join(timeout=0)
+        if process.pid is not None and process.is_alive():
             logger.warning("Rust renderer did not stop after SIGINT; terminating it")
-            self.process.terminate()
-            self.process.join(timeout=SHUTDOWN_TIMEOUT)
-        if self.process.pid is not None and self.process.is_alive():
+            process.terminate()
+            process.join(timeout=SHUTDOWN_TIMEOUT)
+        if process.pid is not None and process.is_alive():
             logger.warning("Rust renderer did not terminate; killing its process tree")
-            kill_process_tree(self.process.pid, wait_timeout=SHUTDOWN_TIMEOUT)
+            kill_process_tree(process.pid, wait_timeout=SHUTDOWN_TIMEOUT)
+        self.process = None

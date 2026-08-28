@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.managers.rust_renderer import (
-    RustRendererHost,
+    RustRendererSidecar,
     build_renderer_args,
     connect_host,
     validate_embedded_renderer,
@@ -50,20 +50,33 @@ def flag_values(args):
     }
 
 
-class TestRustRendererHost(unittest.TestCase):
-    def test_host_owns_sidecar_lifecycle(self):
-        sidecar = mock.Mock()
+class TestRustRendererSidecar(unittest.TestCase):
+    def test_sidecar_owns_topology_and_process_lifecycle(self):
+        process = mock.Mock(pid=123, exitcode=0)
+        process.is_alive.return_value = False
+        context = mock.Mock()
+        context.Process.return_value = process
+        watchdog = mock.Mock()
         with (
             mock.patch(
                 "sglang.srt.managers.rust_renderer.get_free_port",
                 return_value=31000,
             ),
             mock.patch(
-                "sglang.srt.managers.rust_renderer.RustRendererSidecar.launch",
-                return_value=sidecar,
-            ) as launch,
+                "sglang.srt.managers.rust_renderer.find_renderer_binary",
+                return_value="/bin/sglang-renderer",
+            ),
+            mock.patch(
+                "sglang.srt.managers.rust_renderer.mp.get_context",
+                return_value=context,
+            ),
+            mock.patch(
+                "sglang.srt.managers.rust_renderer.SubprocessWatchdog",
+                return_value=watchdog,
+            ),
+            mock.patch.object(RustRendererSidecar, "_wait_until_listening"),
         ):
-            host = RustRendererHost(
+            sidecar = RustRendererSidecar(
                 server_args(),
                 SimpleNamespace(
                     vocab_size=128,
@@ -73,18 +86,22 @@ class TestRustRendererHost(unittest.TestCase):
                 "0.0.0.0:30000",
                 32,
             )
-            host.start([2, 3])
-            host.stop()
-            host.stop()
+            sidecar.start([2, 3])
+            sidecar.stop()
+            sidecar.stop()
 
-        self.assertEqual(host.internal_server_addr.to_host_port_str(), "127.0.0.1:31000")
-        launch.assert_called_once_with(
-            args=host.args,
-            public_addr=host.public_addr,
-            internal_server_url="http://127.0.0.1:31000",
-            cores=[2, 3],
+        self.assertEqual(
+            sidecar.internal_server_addr.to_host_port_str(), "127.0.0.1:31000"
         )
-        sidecar.stop.assert_called_once_with()
+        context.Process.assert_called_once_with(
+            name="sglang_renderer",
+            target=mock.ANY,
+            args=("/bin/sglang-renderer", sidecar.args, [2, 3]),
+        )
+        process.start.assert_called_once_with()
+        watchdog.start.assert_called_once_with()
+        watchdog.stop.assert_called_once_with()
+        self.assertIsNone(sidecar.process)
 
     def test_embedded_args_use_resolved_state_and_internal_server(self):
         args = build_renderer_args(

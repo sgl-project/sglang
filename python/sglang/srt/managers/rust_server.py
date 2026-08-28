@@ -44,9 +44,13 @@ from sglang.version import __version__
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
-    from sglang.srt.managers.rust_renderer import RustRendererHost
+    from sglang.srt.managers.rust_renderer import RustRendererSidecar
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
+    from sglang.srt.rust_extensions._server import (
+        MmSpec,
+        Server,
+        ServerArgs as RustServerArgs,
+    )
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -365,12 +369,12 @@ class RustServer:
         self,
         server: Server,
         mm_spec: Optional[NativeMmSpec] = None,
-        renderer_host: Optional[RustRendererHost] = None,
+        renderer_sidecar: Optional[RustRendererSidecar] = None,
         max_per_poll: int = 256,
     ):
         self.server = server
         self.mm_spec = mm_spec
-        self.renderer_host = renderer_host
+        self.renderer_sidecar = renderer_sidecar
         self._max_per_poll = max_per_poll
 
     @classmethod
@@ -408,17 +412,7 @@ class RustServer:
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         if dp_rank is not None:
             http_addr = f"{get_serving().host}:{server_args.port + dp_rank}"
-        renderer_host = None
-        if envs.SGLANG_RUST_RENDERER.get():
-            from sglang.srt.managers.rust_renderer import RustRendererHost
-
-            renderer_host = RustRendererHost(
-                resolving_view(server_args),
-                scheduler.model_config,
-                http_addr,
-                compute_num_reserved_tokens(),
-            )
-            http_addr = renderer_host.internal_server_addr.to_host_port_str()
+        renderer_sidecar, http_addr = cls._prepare_renderer(scheduler, http_addr)
 
         launch_cores, server_cores = cls._partition_cores(
             mm_workers=(
@@ -469,12 +463,7 @@ class RustServer:
                 )
             server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
 
-        if renderer_host is not None:
-            try:
-                renderer_host.start(server_cores)
-            except BaseException:
-                server.shutdown()
-                raise
+        cls._start_renderer(renderer_sidecar, server, server_cores)
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -495,7 +484,38 @@ class RustServer:
             dp_note,
         )
 
-        return cls(server, mm_spec=mm_spec, renderer_host=renderer_host)
+        return cls(server, mm_spec=mm_spec, renderer_sidecar=renderer_sidecar)
+
+    @staticmethod
+    def _prepare_renderer(
+        scheduler: Scheduler, public_addr: str
+    ) -> Tuple[Optional[RustRendererSidecar], str]:
+        if not envs.SGLANG_RUST_RENDERER.get():
+            return None, public_addr
+
+        from sglang.srt.managers.rust_renderer import RustRendererSidecar
+
+        renderer = RustRendererSidecar(
+            resolving_view(scheduler.server_args),
+            scheduler.model_config,
+            public_addr,
+            compute_num_reserved_tokens(),
+        )
+        return renderer, renderer.internal_server_addr.to_host_port_str()
+
+    @staticmethod
+    def _start_renderer(
+        renderer: Optional[RustRendererSidecar],
+        server: Server,
+        cores: Optional[List[int]],
+    ) -> None:
+        if renderer is None:
+            return
+        try:
+            renderer.start(cores)
+        except BaseException:
+            server.shutdown()
+            raise
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
@@ -559,9 +579,12 @@ class RustServer:
         return out
 
     def close(self) -> None:
-        """Release optional processes owned by this server wrapper."""
-        if self.renderer_host is not None:
-            self.renderer_host.stop()
+        """Stop the public renderer, then the internal Rust server."""
+        try:
+            if self.renderer_sidecar is not None:
+                self.renderer_sidecar.stop()
+        finally:
+            self.server.shutdown()
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting
@@ -771,7 +794,7 @@ class RustServer:
         )
 
     @staticmethod
-    def _build_server_args(scheduler: Scheduler) -> ServerArgs:
+    def _build_server_args(scheduler: Scheduler) -> RustServerArgs:
         """The typed launch handoff for the scheduler's embedded Rust server:
         the ``server_args`` fields it reads, the already-resolved
         ``model_config``, and launch-time facts — as the Rust extension's own

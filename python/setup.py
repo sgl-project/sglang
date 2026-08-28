@@ -11,6 +11,9 @@ crate whose Cargo.toml declares
 is built as a PyO3 extension module at that import path. Adding a new extension
 crate therefore needs no pyproject changes — declare the metadata in the crate.
 
+Crates may instead declare ``python-bin`` to install a Cargo executable in the
+wheel. The optional ``debug`` and ``features`` metadata has the same meaning.
+
 Two filters can narrow the discovered set:
 
 - [tool.sglang] rust-extensions in the active pyproject.toml: a list of
@@ -109,18 +112,6 @@ def _discovered_rust_extensions():
         _cargo_workspace_metadata()["packages"], key=lambda p: p["name"]
     ):
         sglang_meta = (package["metadata"] or {}).get("sglang", {})
-        if "python-module" in sglang_meta:
-            extensions.append(
-                RustExtension(
-                    target=sglang_meta["python-module"],
-                    path=package["manifest_path"],
-                    binding=Binding.PyO3,
-                    debug=sglang_meta.get("debug"),
-                    # Crates that gate their PyO3 bindings behind a non-default
-                    # feature (so the pure-Rust core stays pyo3-free) declare it here.
-                    features=sglang_meta.get("features"),
-                )
-            )
         if "python-bin" in sglang_meta:
             extensions.append(
                 RustBin(
@@ -130,6 +121,19 @@ def _discovered_rust_extensions():
                     features=sglang_meta.get("features"),
                 )
             )
+        if "python-module" not in sglang_meta:
+            continue
+        extensions.append(
+            RustExtension(
+                target=sglang_meta["python-module"],
+                path=package["manifest_path"],
+                binding=Binding.PyO3,
+                debug=sglang_meta.get("debug"),
+                # Crates that gate their PyO3 bindings behind a non-default
+                # feature (so the pure-Rust core stays pyo3-free) declare it here.
+                features=sglang_meta.get("features"),
+            )
+        )
     if not extensions:
         raise RuntimeError(
             f"no crate under {_RUST_WORKSPACE_DIR} declares "
