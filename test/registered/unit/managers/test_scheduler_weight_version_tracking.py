@@ -156,37 +156,80 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
-    def test_successful_distributed_update_records_the_version(self):
-        """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_distributed"
+    def _runner_updater(self, target_result, receive=lambda *args: {}):
+        self.recorded = []
+        runner = SimpleNamespace(
+            weight_updater=SimpleNamespace(
+                receive_weights_from_distributed=receive,
+                load_weights=lambda weights: None,
+                update_weights_from_tensor=lambda **kwargs: target_result,
+            )
+        )
+        updater = SchedulerWeightUpdaterManager(
+            tp_worker=SimpleNamespace(
+                model_runner=runner,
+                ps=SimpleNamespace(tp_rank=0),
+                iter_runners=lambda: [("", runner)],
+            ),
+            draft_worker=None,
+            tp_cpu_group=None,
+            memory_saver_adapter=None,
+            flush_cache=lambda **kwargs: True,
+            is_fully_idle=lambda **kwargs: True,
+            scheduler=SimpleNamespace(
+                record_weight_version_change=lambda new_version: self.recorded.append(
+                    new_version
+                )
+            ),
+        )
+        updater._weight_update_in_progress = True
+        return updater
+
+    def _distributed_request(self):
+        return self._request(
+            names=[],
+            dtypes=[],
+            shapes=[],
+            group_name="g",
+            load_format=None,
+            selector="target",
         )
 
-        output = updater.update_weights_from_distributed(self._request())
+    def test_successful_distributed_update_records_the_version(self):
+        """The distributed refit is the path an RL trainer actually drives, so it must record too."""
+        updater = self._runner_updater(target_result=(True, "ok"))
+
+        output = updater.update_weights_from_distributed(self._distributed_request())
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
         """A failed distributed refit leaves the version alone, exactly like the disk path."""
-        updater = self._updater(
-            target_result=(False, "boom"), method="update_weights_from_distributed"
-        )
 
-        output = updater.update_weights_from_distributed(self._request())
+        def boom(*args):
+            raise RuntimeError("boom")
+
+        updater = self._runner_updater(target_result=(False, "boom"), receive=boom)
+
+        output = updater.update_weights_from_distributed(self._distributed_request())
 
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
     def test_successful_tensor_update_records_the_version(self):
         """The tensor refit records the version once the load reports success."""
-        updater = self._updater(
-            target_result=(True, "ok"), method="update_weights_from_tensor"
-        )
+        updater = self._runner_updater(target_result=(True, "ok"))
 
-        with patch("torch.distributed.barrier"):
+        with patch("torch.distributed.barrier"), patch(
+            "sglang.srt.managers.scheduler_components.weight_updater."
+            "MultiprocessingSerializer.deserialize",
+            return_value=[],
+        ):
             output = updater.update_weights_from_tensor(
-                self._request(disable_draft_model=True)
+                self._request(
+                    serialized_named_tensors=[b""], selector="target", load_format=None
+                )
             )
 
         self.assertTrue(output.success)
