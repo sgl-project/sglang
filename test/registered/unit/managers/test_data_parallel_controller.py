@@ -138,6 +138,23 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
+    def test_full_refresh_does_not_mix_rank_updates(self):
+        budget = DPBudget(dp_size=2)
+        budget.update_budget(
+            [
+                _load(dp_rank=0, timestamp=1.0, num_running_reqs=3),
+                _load(dp_rank=1, timestamp=1.0, num_running_reqs=5),
+            ]
+        )
+        budget.update_budget(
+            [
+                _load(dp_rank=0, timestamp=2.0, num_running_reqs=1),
+                _load(dp_rank=1, timestamp=1.0, num_running_reqs=2),
+            ],
+            require_full_refresh=True,
+        )
+        self.assertEqual(budget.active_requests, [3, 5])
+
 
 class TestDPBudgetDispatch(CustomTestCase):
     """DPBudget.dispatch picks a rank from current state and updates counters."""
