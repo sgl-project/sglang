@@ -1478,7 +1478,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             logger.info("%s", summary)
             logger.info("%s", format_applied_changes(plan=plan))
         return OutputBatch(
-            output=plan_summary_payload(plan=plan, status=PLACEMENT_STATUS_ADJUSTED)
+            output=plan_summary_payload(
+                plan=plan,
+                status=PLACEMENT_STATUS_ADJUSTED,
+                short_validation=(
+                    self._latest_auto_residency_round_supports_short_validation()
+                ),
+            )
         )
 
     def rollback_auto_residency(self) -> OutputBatch:
@@ -1927,6 +1933,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             return dict(self.pipeline.modules)
         return manager.placement_modules()
 
+    def _latest_auto_residency_round(self) -> list[AppliedResidencyChange]:
+        if not self._auto_residency_round_sizes:
+            return []
+        round_size = self._auto_residency_round_sizes[-1]
+        if round_size <= 0 or round_size > len(self._auto_residency_applied):
+            return []
+        return self._auto_residency_applied[-round_size:]
+
     def _latest_auto_residency_round_is_resident_only(self) -> bool:
         """Whether validation follows only execution-monotonic promotions.
 
@@ -1935,15 +1949,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         VRAM safety, but one noisy duration sample must not undo that promotion.
         Layerwise layout and lower-memory transitions retain latency rollback.
         """
-        if not self._auto_residency_round_sizes:
-            return False
-        round_size = self._auto_residency_round_sizes[-1]
-        if round_size <= 0 or round_size > len(self._auto_residency_applied):
-            return False
+        changes = self._latest_auto_residency_round()
         return all(
             adjustment.residency_mode != RESIDENT
             and self.server_args.residency_mode(adjustment.component_name) == RESIDENT
-            for adjustment in self._auto_residency_applied[-round_size:]
+            for adjustment in changes
+        ) and bool(changes)
+
+    def _latest_auto_residency_round_supports_short_validation(self) -> bool:
+        """Whether one full-shape step covers the changed execution paths."""
+        changes = self._latest_auto_residency_round()
+        return self._latest_auto_residency_round_is_resident_only() and all(
+            not is_dit_component_name(change.component_name) for change in changes
         )
 
     def _rollback_applied_residency_changes(

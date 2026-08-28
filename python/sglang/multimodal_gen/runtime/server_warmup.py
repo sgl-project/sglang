@@ -276,12 +276,22 @@ async def maybe_apply_auto_residency(
 
         adjusted_any = True
         recovering_from_oom = response_recovering_from_oom
+        short_validation = bool(
+            isinstance(response.output, dict)
+            and response.output.get("short_validation")
+        )
         # This pass physically realizes the selected placement and measures
-        # phases that overlap under it. The next round can then use that new
-        # evidence instead of permanently charging components twice.
+        # phases that overlap under it. Resident-only changes need one
+        # full-shape step for memory safety; other changes retain the longer
+        # timing sample used by regression validation.
         try:
+            validation_options = {"step_limit": 1} if short_validation else {}
             await run_async_client_warmup(
-                server_args, forward, fail_open=False, rewarm=True
+                server_args,
+                forward,
+                fail_open=False,
+                rewarm=True,
+                **validation_options,
             )
         except Exception as e:
             if recovering_from_oom and _is_out_of_memory(e):
@@ -398,6 +408,7 @@ def build_client_warmup_reqs(
     *,
     warmup_input_path: str | None = None,
     rewarm: bool = False,
+    step_limit: int | None = None,
 ) -> list[Req]:
     warmup_reqs = build_warmup_reqs(
         server_args,
@@ -410,6 +421,8 @@ def build_client_warmup_reqs(
     for req in warmup_reqs:
         if req.is_warmup:
             req.extra["warmup_total"] = warmup_total
+            if step_limit is not None:
+                req.num_inference_steps = min(req.num_inference_steps, step_limit)
         if rewarm:
             # a repeat pass after an auto-residency change: keep it out of
             # the scheduler's warmup progress accounting (already at N/N)
@@ -423,6 +436,7 @@ async def run_async_client_warmup(
     *,
     fail_open: bool = False,
     rewarm: bool = False,
+    step_limit: int | None = None,
 ) -> None:
     try:
         auto_residency_handles_oom = auto_residency_skip_reason(server_args) is None
@@ -431,7 +445,10 @@ async def run_async_client_warmup(
             warmup_input_path = prepare_warmup_image_path(server_args)
 
         for req in build_client_warmup_reqs(
-            server_args, warmup_input_path=warmup_input_path, rewarm=rewarm
+            server_args,
+            warmup_input_path=warmup_input_path,
+            rewarm=rewarm,
+            step_limit=step_limit,
         ):
             response = await forward(req)
             for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):

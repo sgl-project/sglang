@@ -3254,14 +3254,20 @@ def _format_candidate_summary(candidate: ResidencyTarget) -> str:
     return f"{candidate.component_name}({target_mode}{details})"
 
 
-def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
+def plan_summary_payload(
+    *,
+    plan: AutoResidencyPlan,
+    status: str,
+    short_validation: bool = False,
+) -> dict:
     """Minimal decision payload for the warmup orchestrator.
 
-    The orchestrator only branches on ``status``; the human-readable detail
-    lives in the logged ``format_plan_summary`` line.
+    The orchestrator branches on ``status`` and whether validation only needs
+    a full-shape memory check; human-readable detail stays in the plan log.
     """
     return {
         "status": status,
         "changed": [candidate.component_name for candidate in plan.changes],
         "recovering_from_oom": plan.recovering_from_oom,
+        "short_validation": short_validation,
     }

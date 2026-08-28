@@ -30,6 +30,28 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 
 
 class TestAutoResidencyWarmup(unittest.TestCase):
+    def test_rewarm_step_limit_keeps_full_shape_but_shortens_denoising(self):
+        req = SimpleNamespace(
+            is_warmup=True,
+            extra={},
+            num_inference_steps=4,
+        )
+        with mock.patch.object(
+            server_warmup,
+            "build_warmup_reqs",
+            return_value=[req],
+        ):
+            result = server_warmup.build_client_warmup_reqs(
+                SimpleNamespace(warmup_resolutions=None),
+                rewarm=True,
+                step_limit=1,
+            )
+
+        self.assertEqual(result, [req])
+        self.assertEqual(req.num_inference_steps, 1)
+        self.assertEqual(req.extra["warmup_total"], 1)
+        self.assertTrue(req.extra["server_warmup_rewarm"])
+
     def test_residency_hint_uses_effective_device_budget(self):
         worker = GPUWorker.__new__(GPUWorker)
         worker._auto_residency_budget_bytes = mock.Mock(return_value=12 * GIB_BYTES)
@@ -271,6 +293,20 @@ class TestAutoResidencyWarmup(unittest.TestCase):
 
         self.assertEqual(response.output["status"], PLACEMENT_STATUS_VALIDATED)
         worker._rollback_everywhere.assert_not_called()
+        self.assertTrue(worker._latest_auto_residency_round_supports_short_validation())
+
+    def test_dit_residency_keeps_multi_step_validation(self):
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.server_args = SimpleNamespace(residency_mode=lambda _name: RESIDENT)
+        worker._auto_residency_applied = [
+            AppliedResidencyChange("transformer", COMPONENT_OFFLOAD)
+        ]
+        worker._auto_residency_round_sizes = [1]
+
+        self.assertTrue(worker._latest_auto_residency_round_is_resident_only())
+        self.assertFalse(
+            worker._latest_auto_residency_round_supports_short_validation()
+        )
 
     def test_worker_validation_does_not_apply_a_second_candidate_plan(self):
         worker = GPUWorker.__new__(GPUWorker)
@@ -523,7 +559,12 @@ class TestAutoResidencyWarmup(unittest.TestCase):
                 if req.action == "apply"
                 else PLACEMENT_STATUS_VALIDATED
             )
-            return OutputBatch(output={"status": status})
+            return OutputBatch(
+                output={
+                    "status": status,
+                    "short_validation": req.action == "apply",
+                }
+            )
 
         rewarm = mock.AsyncMock()
         server_args = SimpleNamespace(
@@ -539,7 +580,42 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
 
         self.assertEqual(actions, ["apply", "validate"])
-        rewarm.assert_awaited_once()
+        rewarm.assert_awaited_once_with(
+            server_args,
+            forward,
+            fail_open=False,
+            rewarm=True,
+            step_limit=1,
+        )
+
+    def test_non_resident_adjustment_keeps_timing_validation_steps(self):
+        async def forward(req):
+            status = (
+                PLACEMENT_STATUS_ADJUSTED
+                if req.action == "apply"
+                else PLACEMENT_STATUS_VALIDATED
+            )
+            return OutputBatch(output={"status": status})
+
+        rewarm = mock.AsyncMock()
+        server_args = SimpleNamespace(
+            performance_mode="auto",
+            warmup_resolutions=None,
+        )
+        with (
+            mock.patch.object(
+                server_warmup, "auto_residency_skip_reason", return_value=None
+            ),
+            mock.patch.object(server_warmup, "run_async_client_warmup", rewarm),
+        ):
+            asyncio.run(server_warmup.maybe_apply_auto_residency(server_args, forward))
+
+        rewarm.assert_awaited_once_with(
+            server_args,
+            forward,
+            fail_open=False,
+            rewarm=True,
+        )
 
     def test_regressed_validation_rolls_back_and_rewarms_original_placement(self):
         responses = iter(
