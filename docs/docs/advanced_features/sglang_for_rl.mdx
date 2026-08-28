@@ -594,7 +594,7 @@ A request can outlive a version change: the RL flow retracts it with `pause_gene
 
 ### Prefill KV Weight Version Attribution
 
-With prefix caching, a prompt can be served from KV that an earlier request computed under older weights. `--enable-prefill-weight-versions` reports which weights computed each prompt token's KV:
+`--enable-prefill-weight-versions` adds the same span list for the **prompt** tokens, so a prefix-cache hit on KV computed under older weights is visible:
 
 ```json Output
 "prefill_weight_versions": [
@@ -603,11 +603,8 @@ With prefix caching, a prompt can be served from KV that an earlier request comp
 ]
 ```
 
-- Half-open `[start, end)` over **prompt**-token indices; `weight_versions` above covers the output tokens instead.
-- A leading span older than the current version is a radix-cache hit on stale KV; its `end` equals `meta_info["cached_tokens"]`.
-- Every prompt slot must have been stamped by a forward pass under this flag; a slot the tracker never saw (hierarchical-cache reloads, PD transfers) is a bug and fails the request instead of reporting a made-up version.
-- Recorded when the prefill finishes, so a retracted request reports its re-prefill and a request aborted mid-prefill has no field. Also surfaced under OpenAI `metadata` and on the final streaming chunk.
-- Cost: 4 bytes per KV slot on the device and one device-to-host read per finished request; nothing changes while the flag is off.
+- A leading stale span is a radix-cache hit; its `end` equals `meta_info["cached_tokens"]`.
+- Present only once the prefill finished; KV the tracker never saw (HiCache reloads, PD transfers) fails the request.
 
 ## Easy To Postpone Generation
 
