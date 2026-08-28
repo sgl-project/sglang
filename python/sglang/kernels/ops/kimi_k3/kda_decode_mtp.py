@@ -899,13 +899,13 @@ _DSPARK_COMPILED = get_jit_cache(
 )
 
 
-def _tensor_layout_key(tensor):
+def _tensor_layout_key(tensor, fits_32bit_stride):
     return (
         tensor.device,
         tensor.dtype,
         tuple(tensor.shape),
         tuple(tensor.stride()),
-        _fits_32bit_stride(tensor),
+        fits_32bit_stride,
     )
 
 
@@ -921,15 +921,17 @@ def _fits_32bit_stride(tensor):
     return True
 
 
-def _cute_tensor(tensor, *, dynamic=True):
+def _cute_tensor(tensor, *, dynamic=True, fits_32bit_stride=None):
     from cutlass.cute.runtime import from_dlpack
 
     if tensor.requires_grad:
         tensor = tensor.detach()
+    if fits_32bit_stride is None:
+        fits_32bit_stride = _fits_32bit_stride(tensor)
     value = from_dlpack(
         tensor,
         assumed_align=16,
-        use_32bit_stride=_fits_32bit_stride(tensor),
+        use_32bit_stride=fits_32bit_stride,
     )
     leading_dim = next(
         (dim for dim, stride in enumerate(tensor.stride()) if stride == 1), None
@@ -1109,6 +1111,7 @@ def fused_kda_decode_mtp_dspark(
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
     )
+    fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
     key = (
         torch.cuda.get_device_capability(),
         H,
@@ -1120,12 +1123,15 @@ def fused_kda_decode_mtp_dspark(
         float(onorm_eps) if apply_onorm else 0.0,
         float(scale),
         float(lower_bound),
-        *(_tensor_layout_key(tensor) for tensor in args),
+        *(_tensor_layout_key(tensor, fits) for tensor, fits in zip(args, fits_32bit)),
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled = _DSPARK_COMPILED[key] if key in _DSPARK_COMPILED else None
     if compiled is None:
-        cute_args = tuple(_cute_tensor(tensor, dynamic=False) for tensor in args)
+        cute_args = tuple(
+            _cute_tensor(tensor, dynamic=False, fits_32bit_stride=fits)
+            for tensor, fits in zip(args, fits_32bit)
+        )
         compiled = cute.compile(
             _run_kda_decode_mtp_dspark,
             *cute_args,
@@ -1142,7 +1148,10 @@ def fused_kda_decode_mtp_dspark(
         )
         _DSPARK_COMPILED[key] = compiled
     compiled(
-        *(_cute_tensor(tensor) for tensor in args),
+        *(
+            _cute_tensor(tensor, fits_32bit_stride=fits)
+            for tensor, fits in zip(args, fits_32bit)
+        ),
         stream,
     )
     return out

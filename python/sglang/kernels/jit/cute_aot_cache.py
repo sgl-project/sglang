@@ -1,8 +1,10 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
 """In-memory and persistent caches for CuTe DSL JIT functions.
 
-Set ``SGLANG_CUTE_AOT_CACHE_DIR`` to a trusted persistent directory to share
-exported objects across process restarts.
+Compiled objects persist under ``SGLANG_CUTE_AOT_CACHE_DIR`` (default
+``{SGLANG_CACHE_DIR}/cute_aot``) and are shared across process restarts. Set
+the variable to an empty string to keep compilation process-local. The
+directory must be trusted: cached object files are loaded into the process.
 """
 
 import ctypes
@@ -11,9 +13,10 @@ import hashlib
 import logging
 import os
 import pickle
+import platform
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Hashable, TypeAlias
@@ -26,7 +29,7 @@ _loaded_modules: list[Any] = []
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = Any
 
-CUTE_AOT_CACHE_DIR = os.getenv("SGLANG_CUTE_AOT_CACHE_DIR") or None
+_UNSET_CACHE_DIR = object()
 
 
 def _normalize_disk_key(value: Any) -> Any:
@@ -55,6 +58,8 @@ def _compute_source_fingerprint(
     h = hashlib.sha256()
 
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
+    # Exported objects contain host machine code, not just GPU code.
+    h.update(f"host={sys.platform}-{platform.machine()}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"cuda={getattr(cutlass, 'CUDA_VERSION', 'unknown')}".encode())
     h.update(f"tvm_ffi={enable_tvm_ffi}".encode())
@@ -223,16 +228,34 @@ class JITCache:
 class JITPersistentCache(JITCache):
     """
     In-memory cache for compiled functions, which is also backed by persistent storage.
+
+    ``cache_path`` may be a path or a zero-argument callable returning one; a
+    callable is resolved on first storage access, so constructing a cache at
+    import time never probes the GPU or hashes sources.
     """
 
     EXPORT_FUNCTION_PREFIX = "func"
     LOCK_TIMEOUT_SECONDS = 15
 
-    def __init__(self, cache_path: Path, *, enable_tvm_ffi: bool = True):
+    def __init__(
+        self,
+        cache_path: Path | Callable[[], Path],
+        *,
+        enable_tvm_ffi: bool = True,
+    ):
         super().__init__()
-        cache_path.mkdir(parents=True, exist_ok=True)
-        self.cache_path: Path = cache_path
+        self._cache_path_source = cache_path
+        self._resolved_cache_path: Path | None = None
         self.enable_tvm_ffi = enable_tvm_ffi
+
+    @property
+    def cache_path(self) -> Path:
+        if self._resolved_cache_path is None:
+            source = self._cache_path_source
+            path = Path(source() if callable(source) else source)
+            path.mkdir(parents=True, exist_ok=True)
+            self._resolved_cache_path = path
+        return self._resolved_cache_path
 
     def __setitem__(self, key: CompileKeyType, fn: CallableFunction) -> None:
         JITCache.__setitem__(self, key, fn)
@@ -338,7 +361,7 @@ class JITPersistentCache(JITCache):
 def get_jit_cache(
     name: str | None = None,
     *,
-    cache_dir: str | os.PathLike[str] | None = CUTE_AOT_CACHE_DIR,
+    cache_dir: Any = _UNSET_CACHE_DIR,
     source_paths: Sequence[str | os.PathLike[str]] = (),
     enable_tvm_ffi: bool = True,
 ) -> JITCache:
@@ -346,11 +369,22 @@ def get_jit_cache(
     JIT cache factory.
     `name` is an optional identifier to create subdirectories to manage cache.
 
+    ``cache_dir`` defaults to ``SGLANG_CUTE_AOT_CACHE_DIR``; pass ``None`` (or
+    set the variable to an empty string) for a process-local cache.
+
     When persistent caching is enabled, artifacts are namespaced under a
     source fingerprint directory so that code or dependency changes
     automatically invalidate stale entries.
     """
-    if cache_dir is not None:
+    if cache_dir is _UNSET_CACHE_DIR:
+        from sglang.srt.environ import envs
+
+        cache_dir = envs.SGLANG_CUTE_AOT_CACHE_DIR.get() or None
+    if cache_dir is None:
+        logger.debug("Persistent cache disabled, using in-memory JIT cache")
+        return JITCache()
+
+    def resolve_cache_path() -> Path:
         paths = (str(Path(__file__).resolve()),) + tuple(
             str(Path(path).resolve()) for path in source_paths
         )
@@ -360,7 +394,6 @@ def get_jit_cache(
         if name:
             path = path / name
         logger.debug("Creating persistent JIT cache at %s", path)
-        return JITPersistentCache(path, enable_tvm_ffi=enable_tvm_ffi)
-    else:
-        logger.debug("Persistent cache disabled, using in-memory JIT cache")
-        return JITCache()
+        return path
+
+    return JITPersistentCache(resolve_cache_path, enable_tvm_ffi=enable_tvm_ffi)
