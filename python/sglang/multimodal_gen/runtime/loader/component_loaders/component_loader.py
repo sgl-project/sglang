@@ -367,11 +367,17 @@ class ComponentLoader(ABC):
         """
         precision = None
         if component_name is not None:
-            precision = resolve_component_precision(server_args, component_name)
-            if precision is None:
-                precision = resolve_component_precision(
-                    server_args, self.structural_component_name(component_name)
+            precision_names = dict.fromkeys(
+                (
+                    component_name,
+                    self.structural_component_name(component_name),
+                    self.structural_component_type(component_name),
                 )
+            )
+            for precision_name in precision_names:
+                precision = resolve_component_precision(server_args, precision_name)
+                if precision is not None:
+                    break
         load_kwargs = {}
         if precision is not None:
             load_kwargs["torch_dtype"] = precision

@@ -7,6 +7,13 @@ from enum import Enum
 _ROLE_ALIASES = {"denoising": "denoiser"}
 
 
+def _matches_component_type(component_name: str, component_type: str) -> bool:
+    prefix = f"{component_type}_"
+    return component_name == component_type or (
+        component_name.startswith(prefix) and component_name[len(prefix) :].isdigit()
+    )
+
+
 class RoleType(str, Enum):
     MONOLITHIC = "monolithic"
     ENCODER = "encoder"
@@ -104,7 +111,14 @@ def filter_modules_for_role(
             filtered.append(name)
         elif module_role == role:
             filtered.append(name)
-        elif name in extra_allowed_modules or structural_name in extra_allowed_modules:
+        elif (
+            name in extra_allowed_modules
+            or structural_name in extra_allowed_modules
+            or any(
+                _matches_component_type(structural_name, component_type)
+                for component_type in extra_allowed_modules
+            )
+        ):
             filtered.append(name)
 
     return filtered

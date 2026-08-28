@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
     order_component_load_specs,
@@ -73,6 +74,7 @@ class ComposedPipelineBase(ABC):
     is_video_pipeline: bool = False  # To be overridden by video pipelines
     # should contains only the modules to be loaded
     _required_config_modules: list[str] = []
+    _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
@@ -118,7 +120,8 @@ class ComposedPipelineBase(ABC):
         )
         if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        self._required_config_modules = list(base_required_config_modules)
+        self._unfiltered_required_config_modules = tuple(base_required_config_modules)
+        self._required_config_modules = list(self._unfiltered_required_config_modules)
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -309,11 +312,36 @@ class ComposedPipelineBase(ABC):
             get_diffusers_component_config,
         )
 
-        required = set(self.required_config_modules)
-        for module_name in full_model_index:
-            if module_name in required:
-                continue  # will be loaded normally
-            cfg_attr = self._CONFIG_ATTR_MAP.get(module_name)
+        loaded_components = set(self.required_config_modules)
+        loaded_structural_components = {
+            self._extra_config_module_map.get(name, name)
+            for name in self.required_config_modules
+        }
+        skipped_components: list[tuple[str, str]] = []
+        seen_component_keys = loaded_components | loaded_structural_components
+        for component_name in self._unfiltered_required_config_modules:
+            structural_name = self._extra_config_module_map.get(
+                component_name, component_name
+            )
+            if (
+                component_name in seen_component_keys
+                or structural_name in seen_component_keys
+                or (
+                    component_name not in full_model_index
+                    and structural_name not in full_model_index
+                )
+            ):
+                continue
+            skipped_components.append((component_name, structural_name))
+            seen_component_keys.update((component_name, structural_name))
+        for structural_name in full_model_index:
+            if structural_name not in seen_component_keys:
+                skipped_components.append((structural_name, structural_name))
+
+        for component_name, structural_name in skipped_components:
+            cfg_attr = self._CONFIG_ATTR_MAP.get(
+                _normalize_component_type(structural_name)
+            )
             if cfg_attr is None:
                 continue  # not a config we need to patch
 
@@ -323,7 +351,7 @@ class ComposedPipelineBase(ABC):
 
             try:
                 component_path = self._resolve_component_path(
-                    server_args, module_name, module_name
+                    server_args, component_name, structural_name
                 )
                 hf_config = get_diffusers_component_config(
                     component_path=component_path
@@ -337,7 +365,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: initialized %s config from HF JSON "
                     "(spatial_compression_ratio=%s)",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     getattr(
                         getattr(pipeline_cfg, "arch_config", None),
                         "spatial_compression_ratio",
@@ -349,7 +377,7 @@ class ComposedPipelineBase(ABC):
                     "Disagg role=%s: failed to read HF config for skipped "
                     "component %s: %s",
                     self._disagg_role.value,
-                    module_name,
+                    component_name,
                     e,
                 )
 

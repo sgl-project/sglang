@@ -283,6 +283,21 @@ class VAELoader(ComponentLoader):
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
+    def select_weight_files(
+        self,
+        safetensors_list: list[str],
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        vae_precision: str,
+    ) -> list[str]:
+        return server_args.pipeline_config.select_vae_weight_files(
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            component_name=self.structural_component_type(component_name),
+            vae_precision=vae_precision,
+        )
+
     @staticmethod
     def resolve_model_weights_path(
         component_model_path: str,
@@ -426,11 +441,12 @@ class VAELoader(ComponentLoader):
             safetensors_list = [component_weights_path]
         else:
             safetensors_list = _list_safetensors_files(component_weights_path)
-            safetensors_list = server_args.pipeline_config.select_vae_weight_files(
-                safetensors_list=safetensors_list,
-                component_model_path=component_weights_path,
-                component_name=component_name,
-                vae_precision=vae_precision,
+            safetensors_list = self.select_weight_files(
+                safetensors_list,
+                component_weights_path,
+                server_args,
+                component_name,
+                vae_precision,
             )
 
         assert (
