@@ -52,10 +52,12 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer_mhc,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -365,7 +367,19 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             get_local_dp_buffer_mhc(get_tp_group(), 1),
             hidden_states,
         )
-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        # Mirror CommunicateSummableTensorPairFn._scatter_hidden_states: when
+        # should_use_dp_reduce_scatterv() is true, the MoE skipped its
+        # post-experts all-reduce (should_skip_post_experts_all_reduce) on the
+        # promise that THIS scatter performs the combine. Without this branch,
+        # SUM_LEN rounds take the non-reducing dp_scatter and every DP rank's
+        # tokens keep only that rank's local-expert partial sums.
+        if should_use_dp_reduce_scatterv():
+            get_tp_group().reduce_scatterv(
+                global_hidden_states,
+                output=hidden_states,
+                sizes=get_dp_global_num_tokens(),
+            )
+        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
@@ -581,9 +595,15 @@ class MHCLayerCommunicator(LayerCommunicator):
         if (
             self._communicate_summable_tensor_pair_fn
             is MHCCommunicateSummableTensorPairFn._scatter_hidden_states
-            and forward_batch.dp_padding_mode.is_max_len()
         ):
-            return True
+            # Mirror LayerCommunicator.should_use_reduce_scatter (PR #24785):
+            # True on should_use_dp_reduce_scatterv() regardless of padding
+            # mode, else RowParallelLinear keeps all-reducing the dense MLP
+            # while the scatter above reduce-scatters on top of it.
+            if should_use_dp_reduce_scatterv():
+                return True
+            if forward_batch.dp_padding_mode.is_max_len():
+                return True
 
         if dsa_use_prefill_cp(forward_batch):
             return True
