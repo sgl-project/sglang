@@ -140,9 +140,9 @@ def is_dsa_prefill_cp_round_robin_split():
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        is_cuda()
+        (is_cuda() or is_hip())
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
-        and forward_batch.forward_mode.is_extend_without_speculative()
+        and forward_batch.forward_mode.is_extend()
     )
 
 

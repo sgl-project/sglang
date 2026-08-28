@@ -81,6 +81,12 @@ else:
     deepgemm_paged_mqa_logits_native = None
     deepgemm_paged_mqa_logits_split = None
 
+# Plain-torch graph helpers: usable wherever the split-op surface is.
+from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+    logits_head_gate_graph,
+    scale_head_gate_graph,
+)
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsa import pick_dsl_expand
 else:
@@ -138,10 +144,6 @@ if _is_cuda:
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])
