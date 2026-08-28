@@ -211,13 +211,9 @@ def _precompile_splitk_tactics() -> None:
     torch.cuda.synchronize()
 
 
-def _flashinfer_pr4266_bf16_gemm(
-    x: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
+def _flashinfer_pr4266_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x_2d = x.view(-1, x.shape[-1])
-    out = torch.empty(
-        (x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
-    )
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
     tactic = _flashinfer_pr4266_splitk_tactic(
         *_FLASHINFER_PR4266_TUNED_TACTICS[
             (x_2d.shape[0], weight.shape[0], weight.shape[1])

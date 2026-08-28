@@ -21,7 +21,9 @@ def _check_topk_values(score, lengths, indices, topk, row_starts):
         row = indices[b]
         if length <= topk:
             # naive path: identity indices, then -1 fill
-            assert torch.equal(row[:length].cpu(), torch.arange(length, dtype=torch.int32))
+            assert torch.equal(
+                row[:length].cpu(), torch.arange(length, dtype=torch.int32)
+            )
             assert (row[length:] == -1).all()
             continue
         assert (row >= 0).all(), "long rows must fill every slot"

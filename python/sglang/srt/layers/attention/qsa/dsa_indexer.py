@@ -95,9 +95,7 @@ class QwenDSAIndexer(MultiPlatformOp):
         if page_size != 64:
             # The paged index-K layout and every fast path assume 64-token
             # pages, matching qsa_0511.
-            raise ValueError(
-                f"tokenwise QSA requires page_size = 64, got {page_size}"
-            )
+            raise ValueError(f"tokenwise QSA requires page_size = 64, got {page_size}")
         if envs.SGLANG_QWEN_DSA_USE_FP8_INDEXER.get():
             raise NotImplementedError(
                 "The FP8 tokenwise indexer path (qsa_0511 deep_gemm) is not "
@@ -174,9 +172,7 @@ class QwenDSAIndexer(MultiPlatformOp):
             dtype=torch.get_default_dtype(),
         )
 
-    def project_qkw(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor
-    ):
+    def project_qkw(self, hidden_states: torch.Tensor, positions: torch.Tensor):
         """Fused Q/K/W projection, per-head RMS norm and indexer RoPE."""
 
         qkw, _ = self.index_qkw_proj(hidden_states)
@@ -200,15 +196,11 @@ class QwenDSAIndexer(MultiPlatformOp):
         indexer_metadata,
     ) -> torch.Tensor:
         forward_mode = forward_batch.forward_mode
-        is_target_verify = getattr(
-            forward_mode, "is_target_verify", lambda: False
-        )()
-        is_draft_extend = getattr(
-            forward_mode, "is_draft_extend", lambda **_: False
-        )(include_v2=True)
-        is_paged = (
-            forward_mode.is_decode() or is_target_verify or is_draft_extend
+        is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
+        is_draft_extend = getattr(forward_mode, "is_draft_extend", lambda **_: False)(
+            include_v2=True
         )
+        is_paged = forward_mode.is_decode() or is_target_verify or is_draft_extend
         if is_paged:
             # See the compressed QSAIndexer: speculative/decode rows derive
             # their physical causal length from the paged metadata, not from
@@ -217,9 +209,7 @@ class QwenDSAIndexer(MultiPlatformOp):
         else:
             logical_positions = getattr(forward_batch, "positions", None)
             if logical_positions is None:
-                logical_positions = (
-                    positions[0] if positions.ndim == 2 else positions
-                )
+                logical_positions = positions[0] if positions.ndim == 2 else positions
             logical_positions = logical_positions.flatten()
 
         # DP padding adds token rows without assigning them to a request;
@@ -268,9 +258,7 @@ class QwenDSAIndexer(MultiPlatformOp):
         out_cache_loc = getattr(indexer_metadata, "out_cache_loc", None)
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
-        pool.set_dsa_index_k_buffer(
-            self.layer_id, out_cache_loc[:num_valid_tokens], k
-        )
+        pool.set_dsa_index_k_buffer(self.layer_id, out_cache_loc[:num_valid_tokens], k)
 
         if is_paged:
             return self._select_paged(q, w, indexer_metadata)
@@ -298,9 +286,7 @@ class QwenDSAIndexer(MultiPlatformOp):
         output = torch.full(
             (rows, self.token_topk), -1, dtype=torch.int32, device=q.device
         )
-        row_chunk = _qsa_prefill_row_chunk_size(
-            rows, max_len, self.index_n_heads
-        )
+        row_chunk = _qsa_prefill_row_chunk_size(rows, max_len, self.index_n_heads)
         table_long = table.long()
         for row_start in range(0, rows, row_chunk):
             row_end = min(row_start + row_chunk, rows)

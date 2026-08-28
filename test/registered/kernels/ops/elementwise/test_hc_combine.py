@@ -36,7 +36,9 @@ def _reference_hc_combine(
     return (R + injection).flatten(-2)
 
 
-def _make_inputs(num_tokens: int, dtype: torch.dtype, hc: int = HC_COUNT, hs: int = HIDDEN_SIZE):
+def _make_inputs(
+    num_tokens: int, dtype: torch.dtype, hc: int = HC_COUNT, hs: int = HIDDEN_SIZE
+):
     torch.manual_seed(0)
     block_output = torch.randn(num_tokens, hs, dtype=dtype, device="cuda")
     residual = torch.randn(num_tokens, hc * hs, dtype=dtype, device="cuda")
@@ -191,7 +193,9 @@ def test_hc_combine_dtype_mismatch():
 def test_hc_combine_shape_mismatch():
     dtype = torch.bfloat16
     block_output, residual, normed_residual, inject_weight = _make_inputs(4, dtype)
-    bad_weight = torch.randn(HC_COUNT, HC_COUNT * HIDDEN_SIZE + 2048, dtype=dtype, device="cuda")
+    bad_weight = torch.randn(
+        HC_COUNT, HC_COUNT * HIDDEN_SIZE + 2048, dtype=dtype, device="cuda"
+    )
     with pytest.raises(RuntimeError):
         hc_combine(
             block_output,

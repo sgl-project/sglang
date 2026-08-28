@@ -1,4 +1,5 @@
 import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -37,12 +38,10 @@ def _make_inputs(num_tokens: int, dtype: torch.dtype):
     torch.manual_seed(0)
     x = torch.randn(num_tokens, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda")
     w_down = (
-        torch.randn(LOWRANK, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda")
-        * 0.02
+        torch.randn(LOWRANK, HC_COUNT * HIDDEN_SIZE, dtype=dtype, device="cuda") * 0.02
     )
     w_up = (
-        torch.randn(HC_COUNT * HIDDEN_SIZE, LOWRANK, dtype=dtype, device="cuda")
-        * 0.02
+        torch.randn(HC_COUNT * HIDDEN_SIZE, LOWRANK, dtype=dtype, device="cuda") * 0.02
     )
     return x, w_down, w_up
 
@@ -60,9 +59,7 @@ def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     assert fused_hc_mix_supported(x, w_down, w_up)
     out = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
     ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
-    torch.testing.assert_close(
-        out.to(torch.float64), ref, **_TOLERANCES[dtype]
-    )
+    torch.testing.assert_close(out.to(torch.float64), ref, **_TOLERANCES[dtype])
 
 
 def test_fused_hc_mix_no_less_accurate_than_eager():
