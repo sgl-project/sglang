@@ -8,6 +8,7 @@ import unittest
 import torch
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
@@ -114,7 +115,10 @@ class TestModelOptFp8LayerwiseOffloadLoad(unittest.TestCase):
         # Postprocess ran: the weight was requantized to the shared max scale
         # and rebound transposed.
         weight = model.qkv.weight
-        self.assertEqual(weight.dtype, torch.float8_e4m3fn)
+        expected_weight_dtype = (
+            torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+        )
+        self.assertEqual(weight.dtype, expected_weight_dtype)
         self.assertEqual(tuple(weight.shape), (_IN_FEATURES, 2 * _SHARD_OUT))
         weight_scale = model.qkv.weight_scale
         torch.testing.assert_close(
