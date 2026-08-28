@@ -595,6 +595,15 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def is_moe_input_scattered_across_dp_ranks() -> bool:
+    """Whether sparse MoE routing runs on a DP-local token shard."""
+    return (
+        not get_moe_a2a_backend().is_none()
+        or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or get_parallel().dwdp_size > 1
+    )
+
+
 def should_use_dp_reduce_scatterv():
     """
     Use reduce_scatterv in the standard dispatcher's combine() for DP attention
