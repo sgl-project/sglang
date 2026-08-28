@@ -18,6 +18,16 @@ at 1284/1319 = 97.35% on MI300X. 0.92 follows this repo's `measured - 0.05`
 convention for sgl-eval gsm8k thresholds and matches the gfx950 gate, so the
 two arches stay directly comparable.
 
+Runtime: budget this job generously. gfx942 gets neither of the two fast paths
+#36607 added -- AITER mHC and the fused DSA top-k are both gfx95-gated -- so it
+runs the generic mHC path and the portable unfused Torch top-k, and evaluates
+roughly 3x slower than the MI35x job for the identical eval. A measured run
+spent 1628 s loading the 328 GB checkpoint and ~87 min decoding, and still had
+2 of 1319 requests in flight when a 7200 s per-file cap fired. The workflow now
+allows 14400 s. If that ever proves tight again, prefer raising it over
+trimming the eval: a full-split score is what makes this arch's number
+comparable to the gfx950 one.
+
 Eval harness: `api="sgl_eval"` rather than the default 5-shot completion
 scorer, because GLM-5.3-Flash thinks by default and the completion scorer reads
 the last number in the response. The parameters below are the accuracy command
@@ -36,10 +46,11 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test (~90 min: the 328 GB
-# checkpoint dominates startup, then full-split GSM8K with thinking at TP8)
+# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. Measured at ~2h15m
+# (1628 s checkpoint load + ~87 min decode and not quite finished); 9000 s is
+# that plus margin.
 register_amd_ci(
-    est_time=5400,
+    est_time=9000,
     suite="nightly-amd-accuracy-8-gpu-glm53-flash",
     nightly=True,
 )

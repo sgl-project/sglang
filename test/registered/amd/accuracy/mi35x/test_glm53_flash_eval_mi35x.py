@@ -23,6 +23,13 @@ It lands on the same 0.92 as the GLM-5.2-FP8 nightlies on both AMD and CUDA, so
 a red run here reads as "GLM-5.3-Flash on gfx950 regressed" rather than "this
 gate is stricter than its neighbours".
 
+This exact harness has since been run on gfx950: 0.9704 on the rocm720 image
+and 0.9712 on rocm724, eval latency 1913 s and 1498 s. Two things to take from
+that. The score reproduces #36607's 97.65% to within 0.006, so the sgl-eval
+zero-shot/\\boxed{}/math_verify path and the checkpoint's sampling defaults are
+not costing accuracy relative to their harness. And the two image flavors agree
+to 0.001, so a future gap between them is signal rather than noise.
+
 Eval harness: `api="sgl_eval"` rather than the default 5-shot completion
 scorer. GLM-5.3-Flash thinks by default, and the completion scorer takes the
 last number in the response, which a reasoning trace makes meaningless. The

@@ -2205,15 +2205,18 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      # The 328 GB checkpoint means weight download and load dominate wall time
-      # well before full-split GSM8K with thinking enabled starts.
+      # Budgeted from a measured run, not guessed: ~27 min to load the 328 GB
+      # checkpoint plus ~90 min of decode still left 2/1319 requests unfinished
+      # at 7200 s. gfx942 has no AITER mHC and no fused DSA top-k -- both are
+      # gfx95-gated -- so it evaluates roughly 3x slower than the MI35x job for
+      # the identical eval. 14400 s is ~2x the observed need.
       - name: Accuracy Test ROCm 7.2 (8-GPU GLM-5.3-Flash DSA+KDA)
-        timeout-minutes: 180
+        timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm53-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm53-flash --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
