@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 import struct
 import threading
 import time
@@ -68,6 +69,28 @@ logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
 KV_MEM_KINDS = {"VRAM", "DRAM"}
+_READY_PROTOCOL_VERSION = "1"
+_READY_ITEM_SIZE = 8
+_DCP_PHASE_TIMING_FIELDS = (
+    "sglang_plan_us",
+    "nixl_compact_prepare_us",
+    "cuda_sync_owner_gpu_gather_post_us",
+    "dcp_completion_us",
+    "aux_post_us",
+    "all_completion_us",
+    "ready_publish_us",
+)
+
+
+def _set_rank_local_gpunetio_oob_port(
+    backend_params: Dict[str, str], rank: int
+) -> None:
+    if "oob_port" not in backend_params:
+        raise ValueError("DCP GPUNETIO peer rows require an explicit base oob_port")
+    rank_oob_port = int(backend_params["oob_port"]) + rank
+    if not 0 < rank_oob_port <= 65535:
+        raise ValueError("DCP GPUNETIO peer-row oob_port is out of range")
+    backend_params["oob_port"] = str(rank_oob_port)
 
 
 def _normalize_kv_mem_kinds(kinds: Optional[List[str]], expected_len: int) -> List[str]:
@@ -167,6 +190,9 @@ class TransferInfo:
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
+    # Appended frames; absent on legacy peers.
+    ready_slot: Optional[int] = None
+    ready_epoch: Optional[int] = None
 
     def is_dummy(self):
         # A transfer is "dummy" only for CP non-authoritative ranks.
@@ -200,6 +226,16 @@ class TransferInfo:
             is_dummy_rank=(
                 bool(int(msg[9].decode("ascii")))
                 if len(msg) > 9 and msg[9] != b""
+                else None
+            ),
+            ready_slot=(
+                int(msg[10].decode("ascii"))
+                if len(msg) > 10 and msg[10] != b""
+                else None
+            ),
+            ready_epoch=(
+                int(msg[11].decode("ascii"))
+                if len(msg) > 11 and msg[11] != b""
                 else None
             ),
         )
@@ -237,6 +273,19 @@ class KVArgsRegisterInfo:
     kv_xfer_segments: Optional[List[_KVXferPreparedSegment]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    ready_protocol_version: Optional[str] = None
+    ready_base_ptr: int = 0
+    ready_slot_count: int = 0
+    ready_item_size: int = 0
+
+    @property
+    def ready_enabled(self) -> bool:
+        return (
+            self.ready_protocol_version == _READY_PROTOCOL_VERSION
+            and self.ready_base_ptr != 0
+            and self.ready_slot_count > 0
+            and self.ready_item_size == _READY_ITEM_SIZE
+        )
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -277,6 +326,25 @@ class KVArgsRegisterInfo:
             if len(msg) > 20 and msg[20] != b""
             else []
         )
+        ready_protocol_version = (
+            msg[23].decode("ascii") if len(msg) > 23 and msg[23] != b"" else None
+        )
+        ready_base_ptr = (
+            struct.unpack("Q", msg[24])[0] if len(msg) > 24 and len(msg[24]) == 8 else 0
+        )
+        ready_slot_count = (
+            int(msg[25].decode("ascii")) if len(msg) > 25 and msg[25] != b"" else 0
+        )
+        ready_item_size = (
+            int(msg[26].decode("ascii")) if len(msg) > 26 and msg[26] != b"" else 0
+        )
+        if ready_protocol_version is not None and (
+            ready_protocol_version != _READY_PROTOCOL_VERSION
+            or ready_base_ptr == 0
+            or ready_slot_count <= 0
+            or ready_item_size != _READY_ITEM_SIZE
+        ):
+            raise ValueError("Invalid DCP peer-row ready-pool capability")
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -313,6 +381,10 @@ class KVArgsRegisterInfo:
             staging_total_size=(
                 int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
             ),
+            ready_protocol_version=ready_protocol_version,
+            ready_base_ptr=ready_base_ptr,
+            ready_slot_count=ready_slot_count,
+            ready_item_size=ready_item_size,
         )
 
 
@@ -439,6 +511,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
+        if self.enable_dcp_peer_rows:
+            _set_rank_local_gpunetio_oob_port(
+                backend_params, self.transfer_source_rank
+            )
         # self.transfer_worker and self._start_bootstrap_thread runs concurrently
         # so we cannot use sync_mode=None which is thread-unsafe.
         agent_config = nixl_agent_config(
@@ -456,7 +532,50 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 backend_params.setdefault("thread_count", str(num_threads))
             elif backend == "UCCL":
                 backend_params.setdefault("num_cpus", str(num_threads))
+        if backend == "GPUNETIO":
+            # GPUNETIO starts a full-SM persistent progress kernel on its
+            # communication GPU. FlashInfer's first CuTe RMSNorm invocation can
+            # otherwise block after that kernel starts, even when the model is
+            # on another GPU. Materialize the model's exact RMSNorm variant
+            # before creating the backend; different hidden sizes do not warm
+            # the required CuTe specialization.
+            import torch
+            from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+
+            model_config = server_args.get_model_config()
+            if model_config.dtype in (torch.float16, torch.bfloat16):
+                torch.cuda.set_device(self.kv_args.gpu_id)
+                norm_sizes = {model_config.hidden_size}
+                for attr in ("q_lora_rank", "kv_lora_rank"):
+                    size = getattr(model_config.hf_text_config, attr, None)
+                    if size:
+                        norm_sizes.add(size)
+                for size in sorted(norm_sizes):
+                    warmup_x = torch.empty(
+                        (1, size),
+                        dtype=model_config.dtype,
+                        device=self.kv_args.gpu_id,
+                    )
+                    warmup_weight = torch.ones_like(warmup_x[0])
+                    rmsnorm(warmup_x, warmup_weight, 1e-6)
+                    warmup_residual = torch.empty_like(warmup_x)
+                    fused_add_rmsnorm(
+                        warmup_x, warmup_residual, warmup_weight, 1e-6
+                    )
+                torch.cuda.synchronize(self.kv_args.gpu_id)
+                del warmup_x, warmup_residual, warmup_weight
+                logger.info(
+                    "Prewarmed model norm kernels before GPUNETIO progress startup: "
+                    f"sizes={sorted(norm_sizes)} dtype={model_config.dtype}"
+                )
         self.agent.create_backend(backend, backend_params)
+        if backend == "GPUNETIO":
+            # GPUNETIO initializes its QP/progress context on the communication
+            # GPU. Restore the model/KV owner before SGLang creates streams or
+            # allocates the destination-ready pool.
+            import torch
+
+            torch.cuda.set_device(self.kv_args.gpu_id)
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
@@ -467,6 +586,34 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         logger.info(f"NIXL KVManager initialized with backend: {backend}")
 
         self.register_buffer_to_engine()
+        self._ready_pool = None
+        self._ready_stream_events: Dict[
+            int, List[Tuple[Tuple[int, int, int], Any]]
+        ] = {}
+        self._ready_release_events: Dict[Tuple[int, int, int], Any] = {}
+        self._ready_wait_stream = None
+        self._ready_descs = None
+        self._ready_slot_count = 0
+        self._ready_next_epoch: List[int] = []
+        self._ready_leases: Dict[Tuple[int, int, int], Tuple[int, int]] = {}
+        self._ready_poisoned_slots: Set[int] = set()
+        if self.enable_dcp_peer_rows:
+            self._init_peer_rows_ready_pool()
+            import torch
+
+            current_device = torch.cuda.current_device()
+            logger.info(
+                "SGLANG_DCP_DEVICE_RESTORE "
+                f"current_device={current_device} model_device={self.kv_args.gpu_id}"
+            )
+            # Memory registration and ready-pool setup can invoke backend CUDA
+            # APIs after backend creation. Keep the scheduler on the model/KV
+            # owner before it enters model execution.
+            torch.cuda.set_device(self.kv_args.gpu_id)
+            if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") == "1":
+                self._ready_wait_stream = torch.cuda.Stream(
+                    device=self.kv_args.gpu_id
+                )
 
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_buffer_tensors = None
@@ -478,6 +625,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # peer_name -> (handle, num_slots, head_group_idx)
         self.prep_handles_segment_src: Dict[Tuple[int, int, str], Any] = {}
         self._num_slots_src: int = 0
+        self._dcp_phase_by_peer: Dict[str, Dict[str, float]] = {}
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -506,7 +654,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 threading.Thread(
                     target=self.transfer_worker,
-                    args=(queue, staging_buffer),
+                    args=(queue, staging_buffer, i),
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -573,6 +721,82 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"NIXL memory registration failed for staging buffer "
                 f"(ptr=0x{ptr:x}, size={size})"
             )
+
+    def _init_peer_rows_ready_pool(self) -> None:
+        """Allocate and register one persistent uint64 marker per aux/KV slot."""
+        if not self.is_mla_backend or self.is_hybrid_mla_backend:
+            raise ValueError("DCP GPUNETIO peer rows support pure MLA only")
+        if not self.kv_args.aux_item_lens or not self.kv_args.aux_data_lens:
+            raise ValueError("DCP GPUNETIO peer rows require aux-slot geometry")
+        slot_count = self.kv_args.aux_data_lens[0] // self.kv_args.aux_item_lens[0]
+        if slot_count <= 0:
+            raise ValueError("DCP GPUNETIO peer rows require nonzero KV slots")
+        import torch
+
+        self._ready_pool = torch.zeros(
+            slot_count, dtype=torch.uint64, device=f"cuda:{self.kv_args.gpu_id}"
+        )
+        descs = self.agent.register_memory(
+            [
+                (
+                    self._ready_pool.data_ptr(),
+                    slot_count * _READY_ITEM_SIZE,
+                    self.kv_args.gpu_id,
+                    "",
+                )
+            ],
+            "VRAM",
+        )
+        if not descs:
+            raise RuntimeError("NIXL memory registration failed for ready pool")
+        self._ready_descs = descs
+        self._ready_slot_count = slot_count
+        self._ready_next_epoch = [0] * slot_count
+
+    def reserve_ready_lease(
+        self, room: int, aux_index: Optional[int], pp_rank: int = -1
+    ) -> Tuple[int, int]:
+        if aux_index is None or aux_index < 0 or aux_index >= self._ready_slot_count:
+            raise ValueError("DCP peer-row ready slot is outside aux-slot bounds")
+        for lease_key, lease in list(self._ready_leases.items()):
+            if lease[0] != aux_index:
+                continue
+            release_event = self._ready_release_events.get(lease_key)
+            if release_event is not None:
+                release_event.synchronize()
+                self._ready_release_events.pop(lease_key, None)
+                self._ready_leases.pop(lease_key, None)
+        key = (room, 0, pp_rank)
+        if key in self._ready_leases:
+            raise RuntimeError(f"DCP peer-row ready lease already exists for {key}")
+        if aux_index in (lease[0] for lease in self._ready_leases.values()):
+            raise RuntimeError(f"DCP peer-row ready slot {aux_index} is leased")
+        if aux_index in self._ready_poisoned_slots:
+            raise RuntimeError(f"DCP peer-row ready slot {aux_index} is poisoned")
+        epoch = self._ready_next_epoch[aux_index] + 1
+        if epoch <= 0:
+            raise RuntimeError("DCP peer-row ready epoch overflow")
+        self._ready_next_epoch[aux_index] = epoch
+        self._ready_leases[key] = (aux_index, epoch)
+        return aux_index, epoch
+
+    def _publish_ready_epoch(self, slot: int, epoch: int) -> int:
+        if (
+            self._ready_pool is None
+            or slot < 0
+            or slot >= self._ready_slot_count
+            or epoch <= 0
+            or slot in self._ready_poisoned_slots
+        ):
+            raise RuntimeError("Invalid DCP peer-row source ready marker")
+        self._ready_pool[slot].fill_(epoch)
+        import torch
+
+        torch.cuda.current_stream(self._ready_pool.device).synchronize()
+        return int(self._ready_pool.data_ptr()) + slot * _READY_ITEM_SIZE
+
+    def _poison_ready_slots(self, slots: Set[int]) -> None:
+        self._ready_poisoned_slots.update(slots)
 
     def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
         # NOTE: matches mooncake behavior -- staging buffers are now
@@ -1080,7 +1304,33 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
-    def transfer_worker(self, queue: FastQueue, staging_buffer=None):
+    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+        self._register_staging_memory(ptr, size, self.kv_args.gpu_id)
+
+    def _validate_peer_rows_chunk(
+        self, kv_chunk: TransferKVChunk, req: TransferInfo, dst_info: KVArgsRegisterInfo
+    ) -> None:
+        if not getattr(self, "enable_dcp_peer_rows", False):
+            return
+        if (
+            not self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or self.enable_staging
+            or kv_chunk.chunk_id != 0
+            or not kv_chunk.is_last_chunk
+            or kv_chunk.state_indices
+            or req.ready_slot is None
+            or req.ready_epoch is None
+            or not dst_info.requires_dcp_relayout
+            or not dst_info.ready_enabled
+        ):
+            raise RuntimeError(
+                "DCP GPUNETIO peer rows support only one pure MLA direct KV chunk"
+            )
+        if req.ready_slot >= dst_info.ready_slot_count or req.ready_epoch <= 0:
+            raise RuntimeError("Invalid DCP GPUNETIO peer-row ready slot or epoch")
+
+    def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
@@ -1090,7 +1340,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
             handles: List[Any] = []
+            ready_slots: Set[int] = set()
+            phase_timing_enabled = getattr(
+                self, "enable_dcp_gpunetio_phase_timing", False
+            )
+            worker_start_ns = (
+                time.perf_counter_ns() if phase_timing_enabled else 0
+            )
             try:
+                if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                    logger.info(
+                        "SGLANG_DCP_TRANSFER_DEQUEUE "
+                        f"room={room} chunk={kv_chunk.chunk_id} "
+                        f"last={kv_chunk.is_last_chunk} worker={worker_index}"
+                    )
                 # Counted at dequeue, before the status check, so
                 # `outstanding == 0` means nothing is dequeued or in flight --
                 # the predicate the abort ack relies on. The flag survives
@@ -1120,12 +1383,36 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
+                batch_dcp_enabled = getattr(
+                    self, "enable_dcp_gpunetio_batch_post", False
+                )
+                dcp_peer_reqs = [
+                    req for req in reqs_to_be_processed if not req.is_dummy()
+                ]
+                if batch_dcp_enabled and len(dcp_peer_reqs) != 4:
+                    raise RuntimeError(
+                        "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST requires exactly "
+                        f"four DCP peers, got {len(dcp_peer_reqs)}"
+                    )
+                pending_dcp_handles: List[Any] = []
+                pending_aux_requests: List[Tuple[Any, ...]] = []
+                dcp_phase_samples: List[Tuple[str, Dict[str, float]]] = []
+                ready_publish_us: Dict[Tuple[int, int], float] = {}
+                ready_publish_total_us = 0.0
+                kv_issue_us = 0.0
+                aux_issue_us = 0.0
+                batch_post_start_ns: Optional[int] = None
+                batch_post_end_ns: Optional[int] = None
+                aux_post_us = 0.0
+                dcp_done_ns: Optional[int] = None
+                all_done_ns: Optional[int] = None
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
                 # per-req loop and `continue` the worker main loop without
                 # touching room status -- the next pop will retry.
                 staging_deferred = False
+                published_ready: Dict[Tuple[int, int], int] = {}
 
                 for req in reqs_to_be_processed:
                     assert room == req.room
@@ -1134,6 +1421,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                     assert req.agent_name in self.decode_kv_args_table
                     dst_info = self.decode_kv_args_table[req.agent_name]
+                    self._validate_peer_rows_chunk(kv_chunk, req, dst_info)
                     decode_tp_size = dst_info.decode_tp_size
 
                     # Skip KV RDMA transfer when there are no pages to send
@@ -1209,6 +1497,38 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
+                                pack_buffer = (
+                                    None
+                                    if self.enable_dcp_peer_rows
+                                    else self._dcp_pack_buffer_for_worker(worker_index)
+                                )
+                                if self.enable_dcp_peer_rows:
+                                    assert req.ready_slot is not None
+                                    assert req.ready_epoch is not None
+                                    ready_slots.add(req.ready_slot)
+                                    ready_key = (req.ready_slot, req.ready_epoch)
+                                    if ready_key not in published_ready:
+                                        ready_start_ns = (
+                                            time.perf_counter_ns()
+                                            if phase_timing_enabled
+                                            else 0
+                                        )
+                                        published_ready[ready_key] = (
+                                            self._publish_ready_epoch(*ready_key)
+                                        )
+                                        if phase_timing_enabled:
+                                            elapsed_ready_us = (
+                                                time.perf_counter_ns() - ready_start_ns
+                                            ) / 1000.0
+                                            ready_publish_us[ready_key] = (
+                                                elapsed_ready_us
+                                            )
+                                            ready_publish_total_us += elapsed_ready_us
+                                kv_issue_start_ns = (
+                                    time.perf_counter_ns()
+                                    if phase_timing_enabled
+                                    else 0
+                                )
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -1218,7 +1538,31 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     decode_prefix_len=req.decode_prefix_len or 0,
                                     num_kv_tokens=kv_chunk.num_kv_tokens,
                                     notif=notif,
+                                    pack_buffer=pack_buffer,
+                                    ready_slot=req.ready_slot,
+                                    ready_epoch=req.ready_epoch,
+                                    ready_src_ptr=(
+                                        published_ready[ready_key]
+                                        if self.enable_dcp_peer_rows
+                                        else None
+                                    ),
+                                    post=not batch_dcp_enabled,
                                 )
+                                if phase_timing_enabled:
+                                    kv_issue_us += (
+                                        time.perf_counter_ns() - kv_issue_start_ns
+                                    ) / 1000.0
+                                if phase_timing_enabled and getattr(
+                                    self, "enable_dcp_gpunetio_compact_plan", False
+                                ):
+                                    phase = self._dcp_phase_by_peer.pop(
+                                        req.agent_name, None
+                                    )
+                                    if phase is not None:
+                                        phase["ready_publish_us"] = ready_publish_us.get(
+                                            ready_key, 0.0
+                                        )
+                                        dcp_phase_samples.append((req.agent_name, phase))
                             elif (
                                 self.is_mla_backend
                                 or self.is_hybrid_mla_backend
@@ -1258,7 +1602,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 )
 
                         if kv_xfer_handle is not None:
-                            handles.append(kv_xfer_handle)
+                            if batch_dcp_enabled and is_dcp_transfer:
+                                pending_dcp_handles.append(kv_xfer_handle)
+                            else:
+                                handles.append(kv_xfer_handle)
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1294,20 +1641,78 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 f"_nokv_{self.transfer_source_rank}"
                                 f"_{kv_chunk.chunk_id}"
                             )
-                        aux_xfer_handle = self.send_aux(
+                        aux_request = (
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
                             dst_info.dst_aux_ptrs,
                             req.dst_aux_index,
                             aux_notif,
                         )
-                        handles.append(aux_xfer_handle)
+                        if batch_dcp_enabled:
+                            pending_aux_requests.append(aux_request)
+                        else:
+                            aux_start_ns = (
+                                time.perf_counter_ns()
+                                if phase_timing_enabled
+                                else 0
+                            )
+                            handles.append(self.send_aux(*aux_request))
+                            if phase_timing_enabled:
+                                aux_issue_us += (
+                                    time.perf_counter_ns() - aux_start_ns
+                                ) / 1000.0
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
+                if batch_dcp_enabled:
+                    if pending_dcp_handles:
+                        if len(pending_dcp_handles) != 4:
+                            raise RuntimeError(
+                                "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST created "
+                                f"{len(pending_dcp_handles)} DCP handles, expected 4"
+                            )
+                        batch_post_start_ns = time.perf_counter_ns()
+                        batch_state = self.agent.transfer_batch4_gpunetio_experimental(
+                            pending_dcp_handles
+                        )
+                        batch_post_end_ns = time.perf_counter_ns()
+                        if phase_timing_enabled:
+                            kv_issue_us += (
+                                batch_post_end_ns - batch_post_start_ns
+                            ) / 1000.0
+                        if batch_state == "ERR":
+                            raise RuntimeError(
+                                "NIXL GPUNETIO DCP batch post returned ERR"
+                            )
+                        handles.extend(pending_dcp_handles)
+                    # Aux remains on the existing path and is posted only after
+                    # all DCP payload/ready requests have been submitted.
+                    aux_start_ns = time.perf_counter_ns()
+                    handles.extend(
+                        self.send_aux(*aux_request)
+                        for aux_request in pending_aux_requests
+                    )
+                    if phase_timing_enabled:
+                        aux_post_us = (time.perf_counter_ns() - aux_start_ns) / 1000.0
+                        aux_issue_us = aux_post_us
+
+                completion_start_ns = (
+                    time.perf_counter_ns() if phase_timing_enabled else 0
+                )
                 while handles:
+                    if (
+                        phase_timing_enabled
+                        and pending_dcp_handles
+                        and dcp_done_ns is None
+                    ):
+                        dcp_states = [
+                            self.agent.check_xfer_state(handle)
+                            for handle in pending_dcp_handles
+                        ]
+                        if all(state == "DONE" for state in dcp_states):
+                            dcp_done_ns = time.perf_counter_ns()
                     all_done = True
                     for handle in handles:
                         state = self.agent.check_xfer_state(handle)
@@ -1318,8 +1723,80 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         if state != "DONE":
                             all_done = False
                     if all_done:
+                        if phase_timing_enabled:
+                            all_done_ns = time.perf_counter_ns()
                         break
                     time.sleep(0)
+                completion_us = (
+                    (time.perf_counter_ns() - completion_start_ns) / 1000.0
+                    if phase_timing_enabled
+                    else 0.0
+                )
+
+                if phase_timing_enabled and dcp_phase_samples:
+                    if batch_post_start_ns is None or batch_post_end_ns is None:
+                        raise RuntimeError("compact DCP phase timing missed batch post")
+                    if dcp_done_ns is None:
+                        dcp_done_ns = all_done_ns or time.perf_counter_ns()
+                    if all_done_ns is None:
+                        all_done_ns = time.perf_counter_ns()
+                    for peer_name, phase in dcp_phase_samples:
+                        phase.update(
+                            {
+                                "cuda_sync_owner_gpu_gather_post_us": (
+                                    batch_post_end_ns - batch_post_start_ns
+                                )
+                                / 1000.0,
+                                "dcp_completion_us": (
+                                    dcp_done_ns - batch_post_end_ns
+                                )
+                                / 1000.0,
+                                "aux_post_us": aux_post_us,
+                                "all_completion_us": (
+                                    all_done_ns - batch_post_end_ns
+                                )
+                                / 1000.0,
+                            }
+                        )
+                    logger.info(
+                        "SGLANG_DCP_PHASE %s",
+                        json.dumps(
+                            {
+                                "room": room,
+                                "chunk": kv_chunk.chunk_id,
+                                "peers": [
+                                    {"peer": peer_name, **phase}
+                                    for peer_name, phase in dcp_phase_samples
+                                ],
+                            },
+                            sort_keys=True,
+                        ),
+                    )
+
+                if phase_timing_enabled:
+                    logger.info(
+                        "SGLANG_DCP_COMMON_PHASE %s",
+                        json.dumps(
+                            {
+                                "room": room,
+                                "chunk": kv_chunk.chunk_id,
+                                "variant": (
+                                    "peer" if self.enable_dcp_peer_rows else "legacy"
+                                ),
+                                "peer_count": len(dcp_peer_reqs),
+                                "handle_count": len(handles),
+                                "ready_publish_us": ready_publish_total_us,
+                                "kv_issue_us": kv_issue_us,
+                                "aux_issue_us": aux_issue_us,
+                                "completion_us": completion_us,
+                                "worker_total_us": (
+                                    time.perf_counter_ns() - worker_start_ns
+                                )
+                                / 1000.0,
+                            },
+                            sort_keys=True,
+                        ),
+                    )
 
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -1363,6 +1840,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
+                if ready_slots:
+                    # Existing handles may still be in flight after an error.
+                    # Keep their source marker slots permanently unavailable.
+                    self._poison_ready_slots(ready_slots)
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
                 # No ack here on purpose: the DONE barrier bails on the first
@@ -1431,9 +1912,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+        if self.enable_dcp_peer_rows and not decode_kv_args.ready_enabled:
+            raise RuntimeError(
+                "DCP GPUNETIO peer rows require a ready-pool capable decode peer"
+            )
         decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
+        if self.enable_dcp_peer_rows and not decode_kv_args.requires_dcp_relayout:
+            raise RuntimeError("DCP GPUNETIO peer rows require a 1->N DCP relayout")
+        if decode_kv_args.requires_dcp_relayout and not self.enable_dcp_peer_rows:
+            self._init_dcp_pack_buffers_once()
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1454,6 +1943,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_mem_kind: str = "VRAM",
         force_flat: bool = False,
         bypass_prepped: bool = False,
+        ready_tail: Optional[Tuple[int, int]] = None,
+        post: bool = True,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -1493,9 +1984,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            state = self.agent.transfer(xfer_handle)
-            if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
+            if post:
+                state = self.agent.transfer(xfer_handle)
+                if state == "ERR":
+                    raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -1587,6 +2079,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_reqs = make_req_array(
             dst_addrs, dst_lens, _nixl_device_id(dst_mem_kind, dst_gpu_id)
         )
+        if ready_tail is not None:
+            src_tail, dst_tail = ready_tail
+            src_reqs = np.vstack(
+                (
+                    src_reqs,
+                    np.array(
+                        [[src_tail, _READY_ITEM_SIZE, self.kv_args.gpu_id]],
+                        dtype=np.uint64,
+                    ),
+                )
+            )
+            dst_reqs = np.vstack(
+                (
+                    dst_reqs,
+                    np.array(
+                        [[dst_tail, _READY_ITEM_SIZE, dst_gpu_id]], dtype=np.uint64
+                    ),
+                )
+            )
 
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_data_indices)}, after group: {len(src_addrs)}"
@@ -1594,19 +2105,81 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_descs = self.agent.get_xfer_descs(src_reqs, src_mem_kind)
         dst_descs = self.agent.get_xfer_descs(dst_reqs, dst_mem_kind)
         # Transfer data
+        xfer_kwargs = {}
+        if ready_tail is not None:
+            xfer_kwargs = {"backends": ["GPUNETIO"]}
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
             src_descs,
             dst_descs,
             peer_name,
             notif.encode("ascii"),  # type: ignore
+            **xfer_kwargs,
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        state = self.agent.transfer(xfer_handle)
-        if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+        if post:
+            state = self.agent.transfer(xfer_handle)
+            if state == "ERR":
+                raise Exception("KVSender failed to post transfer")
         return xfer_handle
+
+    def _build_compact_dcp_layer_descs(
+        self,
+        src_kv_ptrs: list[int],
+        dst_kv_ptrs: list[int],
+        src_token_indices: npt.NDArray[np.integer],
+        dst_token_indices: npt.NDArray[np.integer],
+        token_item_lens: list[int],
+        src_gpu_id: int,
+        dst_gpu_id: int,
+    ) -> tuple[np.ndarray, np.ndarray, int, int]:
+        """Build the 27-layer DCP4 plan without expanding its 1,728 rows."""
+        rows = 64
+        item_size = 576
+        if len(src_kv_ptrs) != 27 or len(dst_kv_ptrs) != 27:
+            raise RuntimeError("compact DCP requires exactly 27 source/destination layers")
+        if len(token_item_lens) != 27 or any(item_len != item_size for item_len in token_item_lens):
+            raise RuntimeError("compact DCP requires 27 layers of 576-byte rows")
+        src_indices = np.asarray(src_token_indices, dtype=np.int64)
+        dst_indices = np.asarray(dst_token_indices, dtype=np.int64)
+        if src_indices.size != rows or dst_indices.size != rows:
+            raise RuntimeError("compact DCP requires exactly 64 source and destination rows")
+        src_stride = int(src_indices[1] - src_indices[0])
+        dst_stride = int(dst_indices[1] - dst_indices[0])
+        if src_stride <= 0 or dst_stride <= 0:
+            raise RuntimeError("compact DCP row strides must be positive")
+        if not np.all(np.diff(src_indices) == src_stride) or not np.all(
+            np.diff(dst_indices) == dst_stride
+        ):
+            raise RuntimeError("compact DCP source and destination rows must be affine")
+        if src_stride != 4 or dst_stride != 1:
+            raise RuntimeError(
+                "compact DCP direct plan only supports source stride 4 and destination stride 1"
+            )
+
+        src_bases = np.asarray(src_kv_ptrs, dtype=np.uint64) + np.uint64(
+            int(src_indices[0]) * item_size
+        )
+        dst_bases = np.asarray(dst_kv_ptrs, dtype=np.uint64) + np.uint64(
+            int(dst_indices[0]) * item_size
+        )
+        layer_len = np.uint64(rows * item_size)
+        src_layers = np.column_stack(
+            (
+                src_bases,
+                np.full(27, layer_len, dtype=np.uint64),
+                np.full(27, src_gpu_id, dtype=np.uint64),
+            )
+        )
+        dst_layers = np.column_stack(
+            (
+                dst_bases,
+                np.full(27, layer_len, dtype=np.uint64),
+                np.full(27, dst_gpu_id, dtype=np.uint64),
+            )
+        )
+        return src_layers, dst_layers, src_stride, dst_stride
 
     def send_kvcache(
         self,
@@ -1643,6 +2216,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_prefix_len: int,
         num_kv_tokens: int,
         notif: str,
+        pack_buffer=None,
+        ready_slot: Optional[int] = None,
+        ready_epoch: Optional[int] = None,
+        ready_src_ptr: Optional[int] = None,
+        post: bool = True,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
@@ -1650,6 +2228,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise RuntimeError("Missing NIXL destination KV memory kind")
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
+        if self.enable_dcp_peer_rows:
+            if (
+                pack_buffer is not None
+                or not dst_info.ready_enabled
+                or ready_slot is None
+                or ready_epoch is None
+                or ready_slot < 0
+                or ready_slot >= dst_info.ready_slot_count
+                or ready_epoch <= 0
+            ):
+                raise RuntimeError("Invalid DCP GPUNETIO peer-row ready transfer")
 
         physical_page_size = self.kv_args.page_size
         plan = build_dcp_token_transfer_plan(
@@ -1663,23 +2252,116 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             num_kv_tokens=num_kv_tokens,
         )
         if plan.src_token_indices.size == 0:
+            if self.enable_dcp_peer_rows:
+                raise RuntimeError("DCP GPUNETIO peer rows require payload descriptors")
             self.agent.send_notif(peer_name, notif.encode("ascii"))
             return None
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            logger.info(
+                "SGLANG_DCP_GEOMETRY_TRANSFER %s",
+                json.dumps(
+                    {
+                        "physical_page_size": physical_page_size,
+                        "dst_dcp_size": dst_info.dst_dcp_size,
+                        "dst_dcp_rank": dst_info.dst_dcp_rank,
+                        "src_page_offset": src_page_offset,
+                        "decode_prefix_len": decode_prefix_len,
+                        "num_kv_tokens": num_kv_tokens,
+                        "layer_count": len(token_item_lens),
+                        "dcp_token_item_lens": token_item_lens,
+                        "src_token_indices": plan.src_token_indices.tolist(),
+                        "dst_token_indices": plan.dst_token_indices.tolist(),
+                    },
+                    sort_keys=True,
+                ),
+            )
         dst_kv_ptrs = [
             dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
+        src_kv_ptrs = self.kv_args.kv_data_ptrs
+        src_token_indices = plan.src_token_indices
+        if pack_buffer is not None:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
-        # Prepared handles encode page-level offsets, while DCP relayout needs
-        # flat descriptors for the selected token rows.
+            src_tensors = self._pack_src_tensors(src_kv_ptrs)
+            packed = (
+                try_pack_dcp_src(
+                    pack_buffer=pack_buffer,
+                    kv_buffers=src_tensors,
+                    src_token_indices=src_token_indices,
+                    token_item_lens=token_item_lens[: len(src_kv_ptrs)],
+                    gpu_id=self.kv_args.gpu_id,
+                )
+                if src_tensors is not None
+                else None
+            )
+            if packed is not None:
+                src_kv_ptrs, src_token_indices = packed
+                token_item_lens = token_item_lens[: len(src_kv_ptrs)]
+
+        ready_tail = None
+        if self.enable_dcp_peer_rows:
+            ready_tail = (
+                (
+                    ready_src_ptr
+                    if ready_src_ptr is not None
+                    else self._publish_ready_epoch(ready_slot, ready_epoch)
+                ),
+                dst_info.ready_base_ptr + ready_slot * _READY_ITEM_SIZE,
+            )
+        if self.enable_dcp_gpunetio_compact_plan:
+            if post or ready_tail is None:
+                raise RuntimeError(
+                    "compact DCP plans must be created with post=False and a ready tail"
+                )
+            plan_start = time.perf_counter_ns()
+            src_layers, dst_layers, src_stride, dst_stride = (
+                self._build_compact_dcp_layer_descs(
+                    src_kv_ptrs,
+                    dst_kv_ptrs,
+                    src_token_indices,
+                    plan.dst_token_indices,
+                    token_item_lens,
+                    self.kv_args.gpu_id,
+                    dst_info.gpu_id,
+                )
+            )
+            plan_end = time.perf_counter_ns()
+            prepare_start = plan_end
+            xfer_handle = self.agent.initialize_compact_dcp_xfer(
+                src_layers,
+                dst_layers,
+                peer_name,
+                ready_src_ptr=ready_tail[0],
+                ready_dst_ptr=ready_tail[1],
+                src_stride=src_stride,
+                dst_stride=dst_stride,
+                src_mem_kind=self.src_mem_kind,
+                dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
+                notif_msg=notif.encode("ascii"),
+            )
+            prepare_end = time.perf_counter_ns()
+            self._dcp_phase_by_peer[peer_name] = {
+                "sglang_plan_us": (plan_end - plan_start) / 1000.0,
+                "nixl_compact_prepare_us": (prepare_end - prepare_start) / 1000.0,
+                "descriptor_count": 28,
+                "rows": 64,
+                "item_size": 576,
+                "src_stride": src_stride,
+                "dst_stride": dst_stride,
+            }
+            if not xfer_handle:
+                raise Exception("KVSender failed to create compact DCP transfer")
+            return xfer_handle
         return self._send_kvcache_generic(
             peer_name=peer_name,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_data_ptrs=src_kv_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
             item_lens=token_item_lens,
-            prefill_data_indices=plan.src_token_indices,
+            prefill_data_indices=src_token_indices,
             dst_data_indices=plan.dst_token_indices,
             dst_gpu_id=dst_info.gpu_id,
             notif=notif,
@@ -1687,6 +2369,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_mem_kind=dst_info.dst_homogeneous_mem_kind,
             force_flat=True,
             bypass_prepped=True,
+            ready_tail=ready_tail,
+            post=post,
         )
 
     def send_kvcache_mixed(
@@ -2416,11 +3100,27 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
             )
         )
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            logger.info(
+                "SGLANG_DCP_TRANSFER_ENQUEUE "
+                f"room={bootstrap_room} chunk={chunk_id} last={is_last_chunk} "
+                f"kv_rows={len(kv_indices)} worker={shard_idx}"
+            )
         return None
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
+        phase_timing_enabled = getattr(
+            self, "enable_dcp_gpunetio_phase_timing", False
+        )
+        fetch_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
         notif_map = self.agent.get_new_notifs()
+        fetch_us = (
+            (time.perf_counter_ns() - fetch_start_ns) / 1000.0
+            if phase_timing_enabled
+            else 0.0
+        )
+        process_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
         for peer_name, messages in notif_map.items():
             for msg in messages:
                 # Notification tag layouts (underscore-separated):
@@ -2441,6 +3141,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     is_last_chunk = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
                     if len(components) > 7 and components[5] == "part":
+                        if getattr(self, "enable_dcp_peer_rows", False):
+                            self._fail_ready_room(
+                                room,
+                                "DCP GPUNETIO peer rows reject mixed KV parts",
+                            )
+                            continue
                         self._track_kv_part_arrival(
                             room,
                             chunk_id,
@@ -2450,16 +3156,123 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             int(components[7]),
                         )
                     else:
+                        if getattr(self, "enable_dcp_peer_rows", False):
+                            try:
+                                self._wait_for_peer_row_ready(
+                                    room, chunk_id, is_last_chunk, pp_rank
+                                )
+                            except Exception as e:
+                                self._fail_ready_room(room, str(e))
+                                continue
                         self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
                 elif tag == "stg":
+                    if getattr(self, "enable_dcp_peer_rows", False):
+                        self._fail_ready_room(
+                            room, "DCP GPUNETIO peer rows reject staging transfers"
+                        )
+                        continue
                     self._handle_stg_notification(components, room)
                 elif tag == "aux":
                     # Main's "nokv" marker carries the number of earlier KV
                     # chunks expected from this PP rank.
                     self._handle_aux_notification(room, components)
                 elif tag == "state":
+                    if getattr(self, "enable_dcp_peer_rows", False):
+                        self._fail_ready_room(
+                            room, "DCP GPUNETIO peer rows reject state transfers"
+                        )
+                        continue
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+        process_us = (
+            (time.perf_counter_ns() - process_start_ns) / 1000.0
+            if phase_timing_enabled
+            else 0.0
+        )
+        return fetch_us, process_us
+
+    def _fail_ready_room(self, room: int, reason: str) -> None:
+        self.record_failure(room, f"DCP GPUNETIO peer-row ready failure: {reason}")
+        self.update_status(room, KVPoll.Failed)
+
+    def _wait_for_peer_row_ready(
+        self, room: int, chunk_id: int, is_last_chunk: bool, pp_rank: int
+    ) -> None:
+        if chunk_id != 0 or not is_last_chunk:
+            raise RuntimeError(
+                "DCP GPUNETIO peer rows require chunk_id=0 and last chunk"
+            )
+        key = (room, chunk_id, pp_rank)
+        lease = self._ready_leases.get(key)
+        if lease is None:
+            raise RuntimeError(f"missing or duplicate DCP peer-row ready lease for {key}")
+        slot, epoch = lease
+        if (
+            self._ready_pool is None
+            or slot < 0
+            or slot >= self._ready_slot_count
+            or epoch <= 0
+        ):
+            raise RuntimeError("invalid DCP peer-row ready lease")
+        from sglang.srt.disaggregation.common.destination_ready import (
+            enqueue_driver_ready_epoch_acquire,
+            wait_for_destination_ready_epoch,
+        )
+
+        phase_timing_enabled = getattr(
+            self, "enable_dcp_gpunetio_phase_timing", False
+        )
+        ready_wait_start_ns = (
+            time.perf_counter_ns() if phase_timing_enabled else 0
+        )
+        if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") == "1":
+            if self._ready_wait_stream is None:
+                raise RuntimeError("DCP GPUNETIO driver-ready stream is unavailable")
+            self._ready_stream_events.setdefault(room, []).append(
+                (
+                    key,
+                    enqueue_driver_ready_epoch_acquire(
+                        self._ready_pool.narrow(0, slot, 1),
+                        epoch,
+                        stream=self._ready_wait_stream,
+                    ),
+                )
+            )
+        else:
+            wait_for_destination_ready_epoch(
+                self._ready_pool.narrow(0, slot, 1), epoch
+            )
+        if phase_timing_enabled:
+            logger.info(
+                "SGLANG_DCP_READY_WAIT %s",
+                json.dumps(
+                    {
+                        "room": room,
+                        "chunk": chunk_id,
+                        "pp_rank": pp_rank,
+                        "engine_rank": self.kv_args.engine_rank,
+                        "wait_us": (
+                            time.perf_counter_ns() - ready_wait_start_ns
+                        )
+                        / 1000.0,
+                    },
+                    sort_keys=True,
+                ),
+            )
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            ready_marker = (
+                "SGLANG_DCP_READY_WAIT_ENQUEUED"
+                if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") == "1"
+                else "SGLANG_DCP_READY_ACQUIRED"
+            )
+            logger.info(
+                f"{ready_marker} "
+                f"room={room} chunk={chunk_id} pp_rank={pp_rank} "
+                f"slot={slot} epoch={epoch}"
+            )
+
+    def _release_peer_row_ready(self, room: int, chunk_id: int, pp_rank: int) -> None:
+        self._ready_leases.pop((room, chunk_id, pp_rank), None)
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -2523,6 +3336,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 and self._staging_handler.is_staging_room(room)
             ):
                 self._maybe_submit_last_scatter(room)
+        if getattr(self, "enable_dcp_peer_rows", False):
+            if os.environ.get("SGLANG_DCP_GPUNETIO_DRIVER_READY", "0") != "1":
+                self._release_peer_row_ready(room, chunk_id, pp_rank)
 
     def _track_kv_part_arrival(
         self,
@@ -2690,6 +3506,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self._add_remote_peer(
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                        logger.info(
+                            "SGLANG_DCP_BOOTSTRAP_REGISTER "
+                            f"agent={agent_name} total={len(self.decode_kv_args_table)}"
+                        )
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
@@ -2701,6 +3522,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
+                if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                    logger.info(
+                        "SGLANG_DCP_BOOTSTRAP_ROOM "
+                        f"room={room} agent={agent_name} "
+                        f"seen={len(self.transfer_infos[room])} "
+                        f"required={required_dst_info_num}"
+                    )
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.resolve_kv_replica_factor(self.transfer_infos[room])
@@ -2713,6 +3541,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
+                    if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+                        logger.info(f"SGLANG_DCP_BOOTSTRAP_READY room={room}")
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -2757,6 +3587,12 @@ class NixlKVSender(CommonKVSender):
         )
         if should_skip:
             return
+        if self.kv_mgr.enable_dcp_peer_rows and (
+            self.chunk_id != 0 or not is_last_chunk or state_indices
+        ):
+            raise ValueError(
+                "DCP GPUNETIO peer rows require exactly one KV chunk and no state"
+            )
 
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None
@@ -2845,6 +3681,12 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
+        self._phase_start_ns = 0
+        self._phase_update_us = 0.0
+        self._phase_fetch_us = 0.0
+        self._phase_process_us = 0.0
+        self._phase_check_us = 0.0
+        self._phase_poll_count = 0
 
     def send_metadata(
         self,
@@ -2859,6 +3701,22 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        ready_slot = None
+        ready_epoch = None
+        if self.kv_mgr.enable_dcp_peer_rows and kv_indices.size != 0:
+            if (
+                state_indices
+                or self.kv_mgr.enable_staging
+                or self.target_tp_rank is None
+                or set(self.target_pp_ranks) != {0}
+            ):
+                raise ValueError(
+                    "DCP GPUNETIO peer rows require PP=1 with no state or staging"
+                )
+            ready_slot, ready_epoch = self.kv_mgr.reserve_ready_lease(
+                self.bootstrap_room, aux_index, int(self.target_tp_rank)
+            )
 
         # Register staging room bootstrap info for staging handler
         self.chunk_staging_infos = []
@@ -2901,6 +3759,16 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_state_indices,
                             str(decode_prefix_len or 0).encode("ascii"),
                             str(int(is_dummy)).encode("ascii"),
+                            (
+                                str(ready_slot).encode("ascii")
+                                if ready_slot is not None
+                                else b""
+                            ),
+                            (
+                                str(ready_epoch).encode("ascii")
+                                if ready_epoch is not None
+                                else b""
+                            ),
                         ]
                     )
             except zmq.ZMQError:
@@ -2922,6 +3790,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+        if getattr(self.kv_mgr, "enable_dcp_gpunetio_phase_timing", False):
+            self._phase_start_ns = time.perf_counter_ns()
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -2938,8 +3808,70 @@ class NixlKVReceiver(CommonKVReceiver):
         # completion notifications are only ingested here via
         # update_transfer_status(); a completion queued by NIXL at/after the
         # deadline would otherwise lose to the timeout purely by poll ordering.
-        self.kv_mgr.update_transfer_status()
-        if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
+        phase_timing_enabled = getattr(
+            self.kv_mgr, "enable_dcp_gpunetio_phase_timing", False
+        )
+        if phase_timing_enabled:
+            self._phase_poll_count += 1
+        update_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
+        fetch_us, process_us = self.kv_mgr.update_transfer_status()
+        if phase_timing_enabled:
+            self._phase_update_us += (
+                time.perf_counter_ns() - update_start_ns
+            ) / 1000.0
+            self._phase_fetch_us += fetch_us
+            self._phase_process_us += process_us
+        check_start_ns = time.perf_counter_ns() if phase_timing_enabled else 0
+        transfer_done = self.kv_mgr.check_transfer_done(self.bootstrap_room)  # type: ignore
+        if phase_timing_enabled:
+            self._phase_check_us += (
+                time.perf_counter_ns() - check_start_ns
+            ) / 1000.0
+        if transfer_done:
+            ready_events = self.kv_mgr._ready_stream_events.get(
+                self.bootstrap_room, []
+            )
+            if ready_events and not all(event.query() for _, event in ready_events):
+                timeout_result = self._check_waiting_timeout()
+                if timeout_result is not None:
+                    return timeout_result
+                return KVPoll.WaitingForInput  # type: ignore
+            if ready_events:
+                import torch
+
+                self.kv_mgr._ready_stream_events.pop(self.bootstrap_room, None)
+                stream = torch.cuda.current_stream(self.kv_mgr.kv_args.gpu_id)
+                for _, ready_event in ready_events:
+                    stream.wait_event(ready_event)
+                release_event = torch.cuda.Event()
+                release_event.record(stream)
+                for lease_key, _ in ready_events:
+                    self.kv_mgr._ready_release_events[lease_key] = release_event
+            if phase_timing_enabled:
+                logger.info(
+                    "SGLANG_DCP_RECEIVER_PHASE %s",
+                    json.dumps(
+                        {
+                            "room": self.bootstrap_room,
+                            "engine_rank": self.kv_mgr.kv_args.engine_rank,
+                            "variant": (
+                                "peer"
+                                if self.kv_mgr.enable_dcp_peer_rows
+                                else "legacy"
+                            ),
+                            "poll_count": self._phase_poll_count,
+                            "update_transfer_status_us": self._phase_update_us,
+                            "notification_fetch_us": self._phase_fetch_us,
+                            "notification_process_us": self._phase_process_us,
+                            "check_transfer_done_us": self._phase_check_us,
+                            "receiver_total_us": (
+                                time.perf_counter_ns() - self._phase_start_ns
+                            )
+                            / 1000.0,
+                        },
+                        sort_keys=True,
+                    ),
+                )
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
@@ -2952,6 +3884,24 @@ class NixlKVReceiver(CommonKVReceiver):
             return timeout_result
 
         return KVPoll.WaitingForInput  # type: ignore
+
+    def clear(self) -> None:
+        pending_ready = self.kv_mgr._ready_stream_events.pop(
+            self.bootstrap_room, []
+        )
+        for lease_key, _ in pending_ready:
+            lease = self.kv_mgr._ready_leases.get(lease_key)
+            if lease is not None and self.kv_mgr._ready_pool is not None:
+                slot, epoch = lease
+                self.kv_mgr._ready_pool[slot].fill_(epoch)
+        for lease_key, lease in list(self.kv_mgr._ready_leases.items()):
+            if (
+                lease_key[0] == self.bootstrap_room
+                and lease_key not in self.kv_mgr._ready_release_events
+            ):
+                self.kv_mgr._ready_poisoned_slots.add(lease[0])
+                self.kv_mgr._ready_leases.pop(lease_key, None)
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
@@ -3002,6 +3952,18 @@ class NixlKVReceiver(CommonKVReceiver):
             else:
                 dst_kv_item_len = 0
                 dst_num_slots = 0
+            if self.kv_mgr.enable_dcp_peer_rows:
+                if self.kv_mgr._ready_pool is None:
+                    raise RuntimeError("DCP peer-row ready pool is not initialized")
+                ready_protocol_version = _READY_PROTOCOL_VERSION.encode("ascii")
+                ready_base_ptr = struct.pack("Q", self.kv_mgr._ready_pool.data_ptr())
+                ready_slot_count = str(self.kv_mgr._ready_slot_count).encode("ascii")
+                ready_item_size = str(_READY_ITEM_SIZE).encode("ascii")
+            else:
+                ready_protocol_version = b""
+                ready_base_ptr = b""
+                ready_slot_count = b""
+                ready_item_size = b""
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -3032,6 +3994,10 @@ class NixlKVReceiver(CommonKVReceiver):
                             packed_kv_layer_ids,
                             str(self.kv_mgr.dcp_size).encode("ascii"),
                             str(self.kv_mgr.dcp_rank).encode("ascii"),
+                            ready_protocol_version,
+                            ready_base_ptr,
+                            ready_slot_count,
+                            ready_item_size,
                         ]
                     )
             except zmq.ZMQError:

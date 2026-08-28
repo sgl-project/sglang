@@ -20,7 +20,9 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -237,6 +239,14 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_data_tensors = None
+        kv_pool = self.token_to_kv_pool
+        if hasattr(kv_pool, "full_kv_pool"):
+            kv_pool = kv_pool.full_kv_pool
+        if hasattr(kv_pool, "kv_buffer") and len(kv_pool.kv_buffer) == len(
+            kv_data_ptrs
+        ):
+            kv_args.kv_data_tensors = list(kv_pool.kv_buffer)
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
             if self.draft_token_to_kv_pool is None
@@ -249,6 +259,30 @@ class PrefillBootstrapQueue:
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
+
+        if os.environ.get("SGLANG_DCP_GEOMETRY_PROBE") == "1":
+            tensor_geometry = []
+            if kv_args.kv_data_tensors is not None:
+                tensor_geometry = [
+                    {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+                    for tensor in kv_args.kv_data_tensors
+                ]
+            logger.info(
+                "SGLANG_DCP_GEOMETRY_SOURCE %s",
+                json.dumps(
+                    {
+                        "model_path": self.scheduler.server_args.model_path,
+                        "model_revision": self.scheduler.server_args.revision,
+                        "kv_cache_dtype": kv_args.kv_cache_dtype_str,
+                        "page_size": kv_args.page_size,
+                        "prefill_start_layer": kv_args.prefill_start_layer,
+                        "prefill_end_layer": kv_args.prefill_end_layer,
+                        "kv_item_lens": kv_args.kv_item_lens,
+                        "tensor_geometry": tensor_geometry,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()

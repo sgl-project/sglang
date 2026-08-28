@@ -167,6 +167,8 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
+        self._configure_dcp_pack_mode()
+        self._dcp_pack_buffers = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -326,6 +328,45 @@ class CommonKVManager(BaseKVManager):
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
 
+    def _pack_src_tensors(self, src_kv_ptrs: List[int]):
+        tensors = getattr(self.kv_args, "kv_data_tensors", None)
+        if tensors is None or len(tensors) != len(src_kv_ptrs):
+            return None
+        return tensors
+
+    def _configure_dcp_pack_mode(self) -> None:
+        self.enable_dcp_peer_rows = envs.SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS.get()
+        self.enable_dcp_gpunetio_batch_post = (
+            envs.SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST.get()
+        )
+        self.enable_dcp_gpunetio_compact_plan = (
+            envs.SGLANG_DISAGG_DCP_GPUNETIO_COMPACT_PLAN.get()
+        )
+        self.enable_dcp_gpunetio_phase_timing = (
+            envs.SGLANG_DISAGG_DCP_GPUNETIO_PHASE_TIMING.get()
+        )
+        if self.enable_dcp_gpunetio_batch_post and not self.enable_dcp_peer_rows:
+            raise ValueError(
+                "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST=1 requires "
+                "SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS=1"
+            )
+        if self.enable_dcp_gpunetio_compact_plan and not self.enable_dcp_gpunetio_batch_post:
+            raise ValueError(
+                "SGLANG_DISAGG_DCP_GPUNETIO_COMPACT_PLAN=1 requires "
+                "SGLANG_DISAGG_DCP_GPUNETIO_BATCH_POST=1"
+            )
+        if self.enable_dcp_peer_rows:
+            backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+            if backend != "GPUNETIO":
+                raise ValueError(
+                    "SGLANG_DISAGG_DCP_GPUNETIO_PEER_ROWS=1 requires "
+                    "SGLANG_DISAGGREGATION_NIXL_BACKEND=GPUNETIO, got "
+                    f"{backend!r}"
+                )
+        self.enable_dcp_pack = (
+            envs.SGLANG_DISAGG_DCP_PACK.get() and not self.enable_dcp_peer_rows
+        )
+
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size
         src_token_lens = [
@@ -338,6 +379,29 @@ class CommonKVManager(BaseKVManager):
                 f"src={src_token_lens}, dst={dst_token_lens}"
             )
         return src_token_lens
+
+    def _register_dcp_pack_memory(self, ptr: int, size: int) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support DCP pack buffer registration"
+        )
+
+    def _init_dcp_pack_buffers_once(self) -> None:
+        if self._dcp_pack_buffers is not None or not self.enable_dcp_pack:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
+
+        self._dcp_pack_buffers = init_dcp_pack_buffers(
+            self._register_dcp_pack_memory,
+            self.kv_args,
+            len(self.transfer_queues),
+        )
+
+    def _dcp_pack_buffer_for_worker(self, worker_index: int):
+        if self.enable_dcp_peer_rows or not self._dcp_pack_buffers:
+            return None
+        return self._dcp_pack_buffers[worker_index]
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
