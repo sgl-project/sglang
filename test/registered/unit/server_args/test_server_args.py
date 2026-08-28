@@ -845,21 +845,21 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self, _mock_is_hip):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
         the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
@@ -876,14 +876,14 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
         self, _mock_is_hip
     ):
@@ -892,7 +892,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -905,7 +905,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -917,7 +917,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",

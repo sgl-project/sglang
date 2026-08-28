@@ -37,11 +37,9 @@ import argparse
 import copy
 import dataclasses
 import functools
-import glob
 import json
 import logging
 import math
-import os
 import tempfile
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
@@ -69,23 +67,14 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
-    Phase,
     parse_cuda_graph_config_arg,
-    with_phase,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     human_readable_int,
-    is_flashinfer_available,
-    is_hip,
-    is_hopper_with_cuda_12_3,
-    is_mps,
-    is_no_spec_infer_or_topk_one,
-    is_sm100_supported,
     json_list_type,
     nullable_str,
 )
@@ -3777,25 +3766,6 @@ class ServerArgs:
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
 
-    def _apply_cuda_graph_disaggregation_roles(self):
-        cfg = resolving_view(self)
-        if cfg.disaggregation_mode == "prefill":
-            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                self._declare(
-                    "_apply_cuda_graph_disaggregation_roles",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-                    ),
-                )
-        elif cfg.disaggregation_mode == "decode":
-            if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
-                self._declare(
-                    "_apply_cuda_graph_disaggregation_roles",
-                    cuda_graph_config=with_phase(
-                        cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-                    ),
-                )
-
     def post_capture_kv_sizing_planned(self) -> bool:
         """Whether the mem_fraction heuristic may skip the graph reserve; must be
         False for any config the runtime won't post-capture-size, else it gets an
@@ -3870,236 +3840,10 @@ class ServerArgs:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
 
-    def reserve_for_graph_mb(self) -> float:
-        cfg = resolving_view(self)
-        decode_cuda_graph_config = cfg.cuda_graph_config.decode
-        prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
-
-        reserved_mem = 0.0
-        if (
-            cfg.disaggregation_mode != "prefill"
-            and decode_cuda_graph_config.backend != Backend.DISABLED
-        ):
-            reserved_mem += decode_cuda_graph_config.max_bs * 2
-
-        if (
-            self._resolved().enable_dp_attention
-            and cfg.disaggregation_mode != "prefill"
-        ):
-            # DP attention needs more padding for some operations, and much more for large
-            # cuda graph max bs (torch allocator / implementation inefficiencies).
-            reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 3
-            if decode_cuda_graph_config.max_bs > 300:
-                reserved_mem += decode_cuda_graph_config.max_bs * cfg.dp_size * 1.5
-
-        if (
-            cfg.disaggregation_mode != "decode"
-            and prefill_cuda_graph_config.backend != Backend.DISABLED
-        ):
-            if not self.use_mla_backend():
-                # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
-                reserved_mem += len(prefill_cuda_graph_config.bs) * 8
-            else:
-                # MLA backend overhead is much higher than expected with fa3.
-                reserved_mem += 1.5 * 1024
-
-            if (
-                prefill_cuda_graph_config.backend == Backend.BREAKABLE
-                and resolved_view(self).moe_a2a_backend == "deepep"
-            ):
-                # Prefill-BCG DeepEP delta (bridge pool + NVL first-touch
-                # during capture); decode-side DeepEP is a baseline cost.
-                reserved_mem += 1 * 1024
-
-        return reserved_mem
-
-    def reserve_for_deepep_a2a_mb(self) -> float:
-        # DeepEP all-to-all buffers captured in the decode graph are real extra
-        # allocations, reserved on top of the floor.
-
-        cfg = resolving_view(self)
-        decode_cuda_graph_config = cfg.cuda_graph_config.decode
-        if (
-            cfg.disaggregation_mode != "prefill"
-            and decode_cuda_graph_config.backend != Backend.DISABLED
-            and resolved_view(self).moe_a2a_backend == "deepep"
-        ):
-            return 2 * 1024
-        return 0.0
-
-    def _generate_decode_cuda_graph_batch_sizes(self, max_bs: int):
-        """
-        Generate the list of batch sizes for CUDA graph capture based on max_bs.
-        This integrates the logic from cuda_graph_runner.py.
-        """
-        cfg = resolving_view(self)
-        # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
-        if cfg.disable_cuda_graph_padding:
-            capture_bs = list(range(1, max_bs + 1))
-        elif cfg.speculative_algorithm is None:
-            # Normal case:
-            capture_bs = (
-                [1, 2, 4, 8, 12]
-                + list(range(16, 257, 8))
-                + list(range(272, 512, 16))
-                + list(range(512, max_bs + 1, 32))
-            )
-        else:
-            # Spec decoding case: less padding for smaller batch sizes
-            capture_bs = (
-                list(range(1, 9, 1))
-                + list(range(10, 33, 2))
-                + list(range(40, 65, 4))
-                + list(range(72, 257, 8))
-                + list(range(272, max_bs + 1, 16))
-            )
-
-        capture_bs = [bs for bs in capture_bs if bs <= max_bs]
-
-        if max_bs not in capture_bs:
-            capture_bs.append(max_bs)
-
-        return capture_bs
-
-    def _generate_cpu_graph_batch_sizes(self):
-        """
-        Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
-        """
-        cfg = resolving_view(self)
-        if cfg.disable_cuda_graph_padding:
-            capture_bs = list(range(1, cfg.torch_compile_max_bs + 1))
-        else:
-            capture_bs = sorted(
-                set().union(
-                    range(1, 17),
-                    range(18, 31, 2),
-                    range(32, 81, 4),
-                    range(84, cfg.torch_compile_max_bs + 1, 8),
-                    {cfg.torch_compile_max_bs},
-                )
-            )
-        capture_bs = [bs for bs in capture_bs if bs <= cfg.torch_compile_max_bs]
-
-        return capture_bs
-
-    def _generate_prefill_cuda_graph_batch_sizes(self, max_bs: int):
-        """
-        Generate the list of batch sizes for prefill CUDA graph capture
-        based on max_bs. For tc_piecewise prefill, bs carries the
-        captured token count (one shape knob per phase).
-        """
-        capture_sizes = (
-            list(range(4, 33, 4))
-            + list(range(48, 257, 16))
-            + list(range(288, 513, 32))
-            + list(range(576, 1024 + 1, 64))
-            + list(range(1280, 4096 + 1, 256))
-            + list(range(4608, max_bs + 1, 512))
-        )
-
-        capture_sizes = [s for s in capture_sizes if s <= max_bs]
-
-        return capture_sizes
-
-    def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> None:
-        # Moved to the resolution pipeline (arg_groups/overrides.py:
-        # _dsa_kv_cache_dtype_default), invoked here at its legacy slot.
-        from sglang.srt.arg_groups.overrides import (
-            _dsa_kv_cache_dtype_default,
-            run_post_process_pass,
-        )
-
-        run_post_process_pass(self, _dsa_kv_cache_dtype_default)
-
-    def _set_default_dsa_backends(self, major: int) -> None:
-        # Moved to the resolution pipeline (arg_groups/overrides.py:
-        # _dsa_split_backend_resolution), invoked here at its legacy slot.
-        from sglang.srt.arg_groups.overrides import (
-            _dsa_split_backend_resolution,
-            run_post_process_pass,
-        )
-
-        run_post_process_pass(self, _dsa_split_backend_resolution)
-
     def _support_mamba_cache_extra_buffer(self, model_arch: str):
         from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
         return supports_mamba_cache_extra_buffer(self, model_arch)
-
-    def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
-        """
-        Auto select the fastest attention backend.
-
-        1. Models with MHA Architecture (e.g: Llama, QWen)
-            1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-            1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
-               Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
-            1.3 In other cases, we will use flashinfer if available, otherwise use triton.
-        2. Models with MLA Architecture and using FA3
-            2.1 We will use FA3 backend on hopper.
-            2.2 We will use Flashinfer backend on blackwell.
-            2.3 Otherwise, we will use triton backend.
-        """
-        cfg = resolving_view(self)
-        # OOT platforms provide their own default attention backend.
-        if current_platform.is_out_of_tree():
-            return current_platform.get_default_attention_backend()
-
-        # Whisper requires flashinfer for cross-attention CUDA graph support.
-        if "WhisperForConditionalGeneration" in (
-            model_config.hf_config.architectures or []
-        ):
-            return "flashinfer"
-
-        if not use_mla_backend:
-            # MHA architecture
-
-            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
-                resolved_view(self)
-            ):
-                # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
-                # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
-                # ref: https://github.com/sgl-project/sglang/issues/17411
-                return "fa3"
-            elif (
-                is_sm100_supported()
-                and is_no_spec_infer_or_topk_one(resolved_view(self))
-                and (
-                    cfg.speculative_algorithm is None
-                    or cfg.speculative_eagle_topk is not None
-                )
-            ):
-                # trtllm_mha requires equal K/V row widths; fa4 carries
-                # v_head_dim through.
-                if model_config.has_asymmetric_kv:
-                    return "fa4"
-                return "trtllm_mha"
-            elif is_hip():
-                return "aiter"
-            elif is_mps():
-                return "torch_native"
-            else:
-                # FlashInfer does not support attention sinks.
-                if is_flashinfer_available() and not model_config.has_attention_sinks:
-                    return "flashinfer"
-                return "triton"
-        else:
-            # MLA architecture
-            if is_hopper_with_cuda_12_3():
-                return "fa3"
-            elif is_sm100_supported():
-                return "flashinfer"
-            elif is_hip():
-                head_num = model_config.get_num_kv_heads(self.tp_size)
-                # TODO current aiter only support head number 16 or 128 head number
-                if head_num == 128 or head_num == 16:
-                    return "aiter"
-                else:
-                    return "triton"
-            elif is_mps():
-                return "torch_native"
-            else:
-                return "triton"
 
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
@@ -4136,80 +3880,7 @@ class ServerArgs:
             tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
         return tokens
 
-    def _required_mori_dispatch_tokens_per_rank(self) -> int:
-        """Max tokens a single rank dispatches through MoRI in one forward."""
-        cfg = resolving_view(self)
-        return cfg.chunked_prefill_size
-
-    def _required_pplx_dispatch_tokens_per_rank(self) -> int:
-        """Max tokens a single rank dispatches through pplx in one forward."""
-        cfg = resolving_view(self)
-        required = cfg.chunked_prefill_size
-        if cfg.cuda_graph_max_bs_decode is not None:
-            required = max(required, cfg.cuda_graph_max_bs_decode)
-        return required
-
         # ===== END TO BE REFACTORED ====
-
-    def _is_mistral_native_format(self) -> bool:
-        """True iff the checkpoint requires load_format=mistral.
-
-        Looks for consolidated*.safetensors with no competing
-        model*.safetensors; when both weight formats ship in the
-        same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
-        preferred to avoid loading Mistral-named weights into an
-        HF-named architecture.
-
-        Name override: mistral-large-3 / mistral-small-4 /
-        leanstral always treat as Mistral-native when params.json
-        is present -- those families need Mistral weight loading
-        regardless of which weight files happen to be present.
-        """
-        cfg = resolving_view(self)
-        _MISTRAL_NATIVE_PATTERNS = (
-            "mistral-large-3",
-            "mistral-small-4",
-            "leanstral",
-        )
-        name_matches = any(
-            p in str(cfg.model_path).lower() for p in _MISTRAL_NATIVE_PATTERNS
-        )
-
-        def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
-            if has_params and name_matches:
-                return True
-            return has_consolidated and not has_hf_weights
-
-        if os.path.isdir(cfg.model_path):
-            return _check_format(
-                has_params=os.path.exists(os.path.join(cfg.model_path, "params.json")),
-                has_consolidated=bool(
-                    glob.glob(os.path.join(cfg.model_path, "consolidated*.safetensors"))
-                ),
-                has_hf_weights=bool(
-                    glob.glob(os.path.join(cfg.model_path, "model*.safetensors"))
-                ),
-            )
-
-        try:
-            from huggingface_hub import HfApi
-
-            files = {s.rfilename for s in HfApi().model_info(cfg.model_path).siblings}
-            return _check_format(
-                has_params="params.json" in files,
-                has_consolidated=any(
-                    f.startswith("consolidated") and f.endswith(".safetensors")
-                    for f in files
-                ),
-                has_hf_weights=any(
-                    f.startswith("model")
-                    and f.endswith(".safetensors")
-                    and "/" not in f
-                    for f in files
-                ),
-            )
-        except Exception:
-            return False
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
 
@@ -4675,14 +4346,6 @@ class ServerArgs:
         model_config = self.get_model_config()
         return model_config.attention_arch == AttentionArch.MLA
 
-    def is_attention_backend_not_set(self):
-        cfg = resolving_view(self)
-        return (
-            cfg.attention_backend is None
-            and cfg.prefill_attention_backend is None
-            and cfg.decode_attention_backend is None
-        )
-
     def enable_mamba_extra_buffer(self) -> bool:
         return mamba_extra_buffer_of(resolving_view(self))
 
@@ -4757,46 +4420,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-
-    def adjust_mem_fraction_for_vlm(self, model_config):
-        cfg = resolving_view(self)
-        vision_config = getattr(model_config.hf_config, "vision_config", None)
-        if vision_config is None:
-            return
-
-        # roughly reduce the mem_fraction_static base on params of Vit
-        original_server_arg_mem_fraction = cfg.mem_fraction_static
-        # a base mem_fraction_static factor for regular Vit
-        base_mem_fraction_reduction_ratio = 0.95
-
-        vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
-        vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
-
-        # baseline ViT params (ViT-L/14)
-        baseline_vit_layers = 24
-        baseline_vit_hidden_size = 1024
-
-        # weight params count
-        current_complexity_score = vit_num_layers * (vit_hidden_size**2)
-        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
-        complexity_ratio = (
-            current_complexity_score / baseline_complexity_score
-            if baseline_complexity_score > 0
-            else 1.0
-        )
-
-        # every time the complexity grows 100%, adjust final factor for 10%
-        sensitivity_scale = 0.1
-        dynamic_adjustment_factor = 1.0 - sensitivity_scale * (complexity_ratio - 1.0)
-        dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
-
-        final_overall_factor = (
-            base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
-        )
-        self._declare(
-            "adjust_mem_fraction_for_vlm",
-            mem_fraction_static=original_server_arg_mem_fraction * final_overall_factor,
-        )
 
     @property
     def _parsed_modelexpress_config(self) -> dict:

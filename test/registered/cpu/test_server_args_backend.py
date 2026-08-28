@@ -58,12 +58,12 @@ class TestServerArgsIBDeviceValidation(unittest.TestCase):
         real_listdir = os.listdir
 
         with patch(
-            "sglang.srt.server_args.os.path.isdir",
+            "sglang.srt.arg_groups.validation_hook.os.path.isdir",
             side_effect=lambda path: (
                 True if path == "/sys/class/infiniband" else real_isdir(path)
             ),
         ), patch(
-            "sglang.srt.server_args.os.listdir",
+            "sglang.srt.arg_groups.validation_hook.os.listdir",
             side_effect=lambda path: (
                 available_devices
                 if path == "/sys/class/infiniband"

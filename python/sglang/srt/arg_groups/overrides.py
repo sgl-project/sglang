@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
@@ -57,9 +58,11 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_hopper_with_cuda_12_3,
     is_mnnvl_fabric_device,
     is_mps,
     is_musa,
+    is_no_spec_infer_or_topk_one,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -702,7 +705,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if not (is_sm100_supported() and get_device_sm() in (100, 103)):
         return {}
-    backends_unset = server_args.is_attention_backend_not_set()
+    backends_unset = is_attention_backend_not_set(cfg)
     if cfg.speculative_algorithm != "DSPARK":
         if not backends_unset:
             return {}
@@ -809,7 +812,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
         # Set attention backend for DeepSeek
-        if server_args.is_attention_backend_not_set():
+        if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
             logger.info("Use dsa attention backend for DeepSeek with DSA.")
         if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
@@ -971,7 +974,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         quant_resolved = quant_method
 
     if is_hip():
-        if server_args.is_attention_backend_not_set():
+        if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "triton"
         if cfg.moe_runner_backend == "auto" and quant_resolved == "mxfp8":
             overrides["moe_runner_backend"] = "triton"
@@ -994,7 +997,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         if not aiter_fusion_resolved and not envs.SGLANG_M3_ALLOW_CUSTOM_AR.get():
             overrides["disable_custom_all_reduce"] = True
     elif is_sm100_supported():
-        if server_args.is_attention_backend_not_set():
+        if is_attention_backend_not_set(cfg):
             if (
                 cfg.kv_cache_dtype == "fp8_e4m3"
                 and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
@@ -1025,7 +1028,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             f"moe_runner_backend={overrides.get('moe_runner_backend', cfg.moe_runner_backend)}."
         )
     elif is_sm90_supported():
-        if server_args.is_attention_backend_not_set():
+        if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "fa3"
         page_resolved = cfg.page_size
         if (
@@ -1117,7 +1120,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
     # Set attention backend for GPT-OSS
-    if server_args.is_attention_backend_not_set():
+    if is_attention_backend_not_set(cfg):
         if is_sm100_supported():
             overrides["attention_backend"] = "trtllm_mha"
         elif is_sm90_supported():
@@ -1254,7 +1257,7 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
     default_attention_backend = "trtllm_mha" if is_sm100_supported() else "triton"
-    if server_args.is_attention_backend_not_set():
+    if is_attention_backend_not_set(cfg):
         logger.info(
             f"Use {default_attention_backend} as default attention backend for Gemma4"
         )
@@ -1278,7 +1281,7 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("MossVLForConditionalGeneration")
 def _moss_vl_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides: Dict[str, Any] = {}
-    if server_args.is_attention_backend_not_set():
+    if is_attention_backend_not_set(resolving_view(server_args)):
         overrides["prefill_attention_backend"] = "flashinfer"
         logger.info("Use flashinfer as default prefill attention backend for Moss-VL")
     prefill_backend = (
@@ -1323,7 +1326,7 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
         if dense_decode is not None:
             overrides["decode_attention_backend"] = dense_decode
     elif has_sparse_attention:
-        uses_sparse_backend = cfg.is_attention_backend_not_set() or any(
+        uses_sparse_backend = is_attention_backend_not_set(cfg) or any(
             backend in ("minicpm_flashattn", "minicpm_flashinfer")
             for backend in (
                 cfg.attention_backend,
@@ -1335,7 +1338,7 @@ def _minicpm_sala_overrides(server_args: Any, hf_config: Any) -> dict:
             raise ValueError(
                 "MiniCPM sparse attention does not support PD disaggregation"
             )
-        if cfg.is_attention_backend_not_set():
+        if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = (
                 "minicpm_flashinfer"
                 if is_blackwell_supported()
@@ -1477,7 +1480,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # supported default when the user left every attention-backend flag unset
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
-    if server_args.is_attention_backend_not_set():
+    if is_attention_backend_not_set(cfg):
         inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
         overrides["attention_backend"] = inkling_attn_backend
         logger.info(
@@ -1565,7 +1568,7 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
-    if is_blackwell_supported() and cfg.is_attention_backend_not_set():
+    if is_blackwell_supported() and is_attention_backend_not_set(cfg):
         if cfg.speculative_algorithm is not None:
             speculative_algorithm = cfg.speculative_algorithm.upper()
             if is_sm100_supported() and cfg.speculative_eagle_topk in (
@@ -1611,7 +1614,8 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     # There is only one case where page_size=1 is required,
     # which is when radix cache is enabled and both extra_buffer
     # and spec decoding are disabled.
-    default_attn_backend = server_args._get_default_attn_backend(
+    default_attn_backend = get_default_attn_backend(
+        server_args,
         use_mla_backend=server_args.use_mla_backend(),
         model_config=server_args.get_model_config(),
     )
@@ -1746,7 +1750,7 @@ def _olmo2_overrides(server_args: Any, hf_config: Any) -> dict:
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
-    if server_args.is_attention_backend_not_set():
+    if is_attention_backend_not_set(cfg):
         if is_blackwell_supported():
             logger.info("Auto-select fa4 attention backend for Step3p7 on Blackwell.")
             overrides["attention_backend"] = "fa4"
@@ -2413,8 +2417,8 @@ def _attention_backend_default(view: Any) -> dict:
     ):  # override the default attention backend
         return {"attention_backend": view.prefill_attention_backend}
     if view.attention_backend is None:
-        backend = view._get_default_attn_backend(
-            view.use_mla_backend(), view.get_model_config()
+        backend = get_default_attn_backend(
+            record_of(view), view.use_mla_backend(), view.get_model_config()
         )
         logger.info(
             f"Attention backend not specified. Use {backend} backend by default."
@@ -3036,3 +3040,103 @@ def _hrm_text_attention_force(view: Any) -> dict:
             "attention."
         )
     return {"attention_backend": "triton"}
+
+
+def record_of(view: Any) -> Any:
+    """The record a view reads through.
+
+    For the few helpers a view cannot serve: `get_default_attn_backend` reads
+    through *both* overlays, so it needs the record the two views are built
+    from rather than either one of them.
+    """
+    return object.__getattribute__(view, "_server_args")
+
+
+def is_attention_backend_not_set(cfg: Any):
+    """None of the three attention backends has been decided yet.
+
+    Takes the view rather than the record: every read is a view read, and the
+    callers that hold a view (the override providers) would otherwise have to
+    reach back through it for a record.
+    """
+    return (
+        cfg.attention_backend is None
+        and cfg.prefill_attention_backend is None
+        and cfg.decode_attention_backend is None
+    )
+
+
+def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_config):
+    """
+    Auto select the fastest attention backend.
+
+    1. Models with MHA Architecture (e.g: Llama, QWen)
+        1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+        1.2 Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+           Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
+        1.3 In other cases, we will use flashinfer if available, otherwise use triton.
+    2. Models with MLA Architecture and using FA3
+        2.1 We will use FA3 backend on hopper.
+        2.2 We will use Flashinfer backend on blackwell.
+        2.3 Otherwise, we will use triton backend.
+    """
+    cfg = resolving_view(server_args)
+    # OOT platforms provide their own default attention backend.
+    if current_platform.is_out_of_tree():
+        return current_platform.get_default_attention_backend()
+
+    # Whisper requires flashinfer for cross-attention CUDA graph support.
+    if "WhisperForConditionalGeneration" in (
+        model_config.hf_config.architectures or []
+    ):
+        return "flashinfer"
+
+    if not use_mla_backend:
+        # MHA architecture
+
+        if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
+            resolved_view(server_args)
+        ):
+            # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
+            # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
+            # ref: https://github.com/sgl-project/sglang/issues/17411
+            return "fa3"
+        elif (
+            is_sm100_supported()
+            and is_no_spec_infer_or_topk_one(resolved_view(server_args))
+            and (
+                cfg.speculative_algorithm is None
+                or cfg.speculative_eagle_topk is not None
+            )
+        ):
+            # trtllm_mha requires equal K/V row widths; fa4 carries
+            # v_head_dim through.
+            if model_config.has_asymmetric_kv:
+                return "fa4"
+            return "trtllm_mha"
+        elif is_hip():
+            return "aiter"
+        elif is_mps():
+            return "torch_native"
+        else:
+            # FlashInfer does not support attention sinks.
+            if is_flashinfer_available() and not model_config.has_attention_sinks:
+                return "flashinfer"
+            return "triton"
+    else:
+        # MLA architecture
+        if is_hopper_with_cuda_12_3():
+            return "fa3"
+        elif is_sm100_supported():
+            return "flashinfer"
+        elif is_hip():
+            head_num = model_config.get_num_kv_heads(cfg.tp_size)
+            # TODO current aiter only support head number 16 or 128 head number
+            if head_num == 128 or head_num == 16:
+                return "aiter"
+            else:
+                return "triton"
+        elif is_mps():
+            return "torch_native"
+        else:
+            return "triton"
