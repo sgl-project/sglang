@@ -321,6 +321,17 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
+            # Upstream fix (sgl-project/sglang#38346): `_qsa_write_plan`'s
+            # capacity is a shape-derived worst-case bound (avoids a
+            # device-to-host sync), so it can reserve more compacted entries
+            # than this forward actually has complete groups for. The padding
+            # entries are inert (member_rows == 0, routed to a shared,
+            # never-read write slot), but for very short extend chunks the
+            # unclamped gather still walks past the end of `token_k`. On XPU,
+            # SYCL's bounds-checked gather kernel aborts the process (SIGABRT)
+            # instead of silently reading past the buffer, which is how we
+            # originally found this bug; the same clamp now benefits all
+            # backends.
             group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
@@ -626,6 +637,24 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+        )
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        # forward_cuda's fast/fused sub-paths (fused qk-prep, fused compress
+        # store, sgl_kernel/JIT fast-topk) are all internally gated on
+        # `tensor.is_cuda`, with portable torch (and, for block-index
+        # expansion, Triton) fallbacks used otherwise. XPU tensors report
+        # `is_cuda == False`, so those guards already route us to the
+        # device-agnostic reference implementations. Reuse the same
+        # orchestration instead of duplicating it.
+        return self.forward_cuda(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 
