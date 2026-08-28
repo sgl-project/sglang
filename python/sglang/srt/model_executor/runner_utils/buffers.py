@@ -359,6 +359,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         pp_size: int = 1,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        pp_proxy_residual_num_blocks: Optional[int] = None,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -388,15 +389,20 @@ class PrefillInputBuffers(ForwardInputBuffers):
 
             if pp_size > 1:
                 is_mhc = hc_hidden_size is not None
-                proxy_hidden_size = hc_hidden_size if is_mhc else hidden_size
+                pp_hidden_size = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (max_num_tokens, proxy_hidden_size), dtype=dtype
-                    ),
+                        (max_num_tokens, pp_hidden_size), dtype=dtype
+                    )
                 }
                 if not is_mhc:
+                    residual_shape = (
+                        (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size)
+                        if pp_proxy_residual_num_blocks is not None
+                        else (max_num_tokens, hidden_size)
+                    )
                     pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_num_tokens, hidden_size), dtype=dtype
+                        residual_shape, dtype=dtype
                     )
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(

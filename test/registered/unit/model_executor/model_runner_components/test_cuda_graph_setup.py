@@ -5,6 +5,7 @@ import pytest
 
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+    _align_pipeline_layers,
     capture_decode_graph,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
@@ -89,6 +90,31 @@ def test_model_runner_can_override_decode_graph_runner(monkeypatch):
         assert capture.runner.model_runner is model_runner
     finally:
         override.restore()
+
+
+def test_align_pipeline_layers_uses_absolute_indices():
+    class PipelineStage:
+        start_layer = 3
+        end_layer = 5
+        layers = [object()] * 8
+
+    local_layers = ["layer-3", "layer-4"]
+    assert _align_pipeline_layers(local_layers, PipelineStage()) == [
+        None,
+        None,
+        None,
+        "layer-3",
+        "layer-4",
+        None,
+        None,
+        None,
+    ]
+    full_model = SimpleNamespace(layers=local_layers)
+    assert _align_pipeline_layers(local_layers, full_model) == local_layers
+    with pytest.raises(AssertionError, match="together"):
+        _align_pipeline_layers(
+            local_layers, SimpleNamespace(start_layer=0, layers=local_layers)
+        )
 
 
 if __name__ == "__main__":

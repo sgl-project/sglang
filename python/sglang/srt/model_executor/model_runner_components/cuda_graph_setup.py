@@ -57,6 +57,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _align_pipeline_layers(layers: list, layer_model) -> list:
+    has_start_layer = hasattr(layer_model, "start_layer")
+    has_end_layer = hasattr(layer_model, "end_layer")
+    assert (
+        has_start_layer == has_end_layer
+    ), "pipeline layer ranges must define start_layer and end_layer together"
+    start_layer = layer_model.start_layer if has_start_layer else 0
+    end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
+    assert isinstance(start_layer, int) and isinstance(
+        end_layer, int
+    ), "pipeline layer ranges must define integer start_layer and end_layer"
+    assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
+        f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
+        f"{len(layer_model.layers)} layers"
+    )
+    assert (
+        len(layers) <= end_layer - start_layer
+    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
+    return [None] * start_layer + layers + [None] * (
+        len(layer_model.layers) - end_layer
+    )
+
+
 def has_standard_gqa_for_all_local_layers(
     *, attention_layer_count: int, start_layer: int, end_layer: int
 ) -> bool:
@@ -65,13 +88,20 @@ def has_standard_gqa_for_all_local_layers(
 
 
 def index_attention_layers_by_global_id(
-    attention_layers: list[Any], mha_companion_layers: list[Any]
+    attention_layers: list[Any],
+    mha_companion_layers: list[Any],
+    layer_model=None,
 ) -> tuple[list[Any], list[Any]]:
     """Pad PP-local attention metadata so global layer_id remains a valid index."""
     if len(attention_layers) != len(mha_companion_layers):
         raise ValueError("attention and MHA companion metadata must be parallel")
     populated = [layer for layer in attention_layers if layer is not None]
     if not populated or any(not hasattr(layer, "layer_id") for layer in populated):
+        if layer_model is not None:
+            return (
+                _align_pipeline_layers(attention_layers, layer_model),
+                _align_pipeline_layers(mha_companion_layers, layer_model),
+            )
         return attention_layers, mha_companion_layers
     max_layer_id = max(int(layer.layer_id) for layer in populated)
     indexed_attention = [None] * (max_layer_id + 1)
@@ -405,7 +435,9 @@ def capture_prefill_graph(
         model_runner.attention_layers,
         model_runner.mha_companion_layers,
     ) = index_attention_layers_by_global_id(
-        model_runner.attention_layers, model_runner.mha_companion_layers
+        model_runner.attention_layers,
+        model_runner.mha_companion_layers,
+        layer_model,
     )
 
     if not has_standard_gqa_for_all_local_layers(
