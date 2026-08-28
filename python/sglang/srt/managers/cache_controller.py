@@ -231,6 +231,10 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        # Set by the IO thread on a page read/write failure; read by the
+        # scheduler thread (via the ack queues) to classify the outcome.
+        self.prefetch_read_failed = False
+        self.write_storage_failed = False
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -1001,6 +1005,7 @@ class HiCacheController:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
+                operation.prefetch_read_failed = True
                 break
             inc += 1
         return inc
@@ -1021,6 +1026,7 @@ class HiCacheController:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
+                operation.prefetch_read_failed = True
                 break
             if operation.is_terminated():
                 break
@@ -1259,6 +1265,7 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
+                operation.write_storage_failed = True
                 log_hicache_event(
                     event="backup",
                     tier="l2_to_l3",
@@ -1281,6 +1288,7 @@ class HiCacheController:
         try:
             self._page_backup(operation)
         except Exception as e:
+            operation.write_storage_failed = True
             log_hicache_event(
                 event="backup",
                 tier="l2_to_l3",

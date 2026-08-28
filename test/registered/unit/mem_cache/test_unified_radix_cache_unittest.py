@@ -3114,6 +3114,12 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(cons.pop_prefetch_loaded_tokens(req_id), len(seq))
         self.assertEqual(stats["l3_demand_requests"], 1)
         self.assertEqual(stats["l3_miss_tokens"], 0)
+        # Failure/actual counters: clean success path -- no failures, and the
+        # post-IO actual read equals the demand (full hit read back).
+        self.assertEqual(stats["aux_alloc_failed"], 0)
+        self.assertEqual(stats["host_alloc_failed"], 0)
+        self.assertEqual(stats["l3_read_failed_tokens"], 0)
+        self.assertEqual(stats["l3_actual_read_tokens"], len(seq))
 
         # Saturate the device pool with unrelated evictable spans: the
         # load-back must evict, not degrade to recompute (run-2 regression).
@@ -3185,7 +3191,73 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(cpu_events, [])
 
         self.assertIn("occupancy_ratio", cons.prefetch_outcome_stats_snapshot())
+        self.assertIn("l3_actual_read_tokens", cons.prefetch_outcome_stats_snapshot())
+        # Buffer mode routes load-back/write through the pipeline, not the
+        # cache-mode _load_back_transfers / _execute_kv_backup paths that feed
+        # the outcome dicts, so both stay empty here.
+        self.assertEqual(cons.load_outcome_stats_snapshot(), {})
+        self.assertEqual(cons.write_outcome_stats_snapshot(), {})
         cons.sanity_check()
+
+    def test_buffer_only_prefetch_read_failure_counted(self):
+        """Derived property: when the L3 read short-reads (a page returns
+        falsy from batch_get_v1), the post-IO counters must reflect it --
+        read_failed and l3_read_failed_tokens absorb the unread tokens, and
+        l3_actual_read_tokens excludes them, so demand minus actual is fully
+        explained in-dict. Guards against the prior gap where
+        _page_get_zero_copy's break left no trace in _prefetch_outcome_stats:
+        demand counted a full hit while the actual read was silently less."""
+        self._skip_unsupported_hicache_test()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        seq = self._buffer_swa_seq()
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, cons_alloc, cons_rtp = build_fixture(
+            self.cfg, enable_kv_cache_events=True
+        )
+        self._init_buffer_hicache(cons, storage_dir)
+        cons.take_events()
+        stats = cons._prefetch_outcome_stats
+
+        # Drive the read through _page_get_zero_copy and make the last page of
+        # each batch fail (falsy entry) so the read short-reads by one page.
+        cons.cache_controller.page_get_func = cons.cache_controller._page_get_zero_copy
+
+        def _short_read_batch_get_v1(keys, host_indices, extra_info=None):
+            return [True] * (len(keys) - 1) + [False]
+
+        with mock.patch.object(
+            cons.cache_controller.storage_backend,
+            "batch_get_v1",
+            side_effect=_short_read_batch_get_v1,
+        ):
+            req_id = "buffer-read-failure"
+            cons.prefetch_from_storage(
+                req_id, cons.root_node.id, array("q", seq), None, None
+            )
+            self._pump_hicache_until(
+                cons,
+                lambda: cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id),
+                "prefetch did not settle",
+            )
+
+        self.assertEqual((stats["attempts"], stats["issued"]), (1, 1))
+        self.assertEqual(stats["l3_demand_requests"], 1)
+        # One page short-read: classified as a read failure, the unread page
+        # charged to l3_read_failed_tokens, actual read excludes it.
+        self.assertEqual(stats["read_failed"], 1)
+        self.assertEqual(stats["l3_read_failed_tokens"], self.cfg.page_size)
+        self.assertEqual(stats["l3_actual_read_tokens"], len(seq) - self.cfg.page_size)
+        self.assertEqual(stats["host_alloc_failed"], 0)
+        self.assertEqual(stats["aux_alloc_failed"], 0)
+        # Actual + failed tokens reconciles to the expected hit read.
+        self.assertEqual(
+            stats["l3_actual_read_tokens"] + stats["l3_read_failed_tokens"],
+            len(seq),
+        )
 
     def test_buffer_load_back_swa_window_charged_at_admission(self):
         """Admission contract: a request the SWA budget gate accepts must be
@@ -5133,6 +5205,58 @@ class UnifiedRadixCacheSuite:
             req_to_token_pool.mamba_allocator.available_size(), mamba_avail
         )
         self._release_ongoing_load_back_locks(cache)
+
+    def test_load_back_device_alloc_failure_counted(self):
+        """Derived property: when cache_controller.load returns None (device
+        alloc failure), the L2->L1 load outcome dict must record one
+        device_alloc_failed so the tier's failure rate is observable.
+        Guards the _handle_prefetch_result-adjacent accounting in
+        _load_back_transfers: a None load must not pass silently as success."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 1:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=len(leaf.key)))
+        self.assertTrue(leaf.evicted)
+
+        stats = cache._load_outcome_stats
+        attempts_before = stats.get("l2_to_l1_load", {}).get("attempts", 0)
+        failed_before = stats.get("l2_to_l1_load", {}).get("device_alloc_failed", 0)
+
+        with mock.patch.object(cache.cache_controller, "load", return_value=None):
+            loaded = cache.load_back(leaf.id)
+        self.assertFalse(loaded)
+
+        bucket = stats["l2_to_l1_load"]
+        self.assertEqual(bucket["attempts"], attempts_before + 1)
+        self.assertEqual(bucket["device_alloc_failed"], failed_before + 1)
+        self._release_ongoing_load_back_locks(cache)
+
+    def test_write_backup_host_alloc_failure_counted(self):
+        """Derived property: when cache_controller.write returns None (host
+        alloc failure), the L1->L2 write outcome dict must record one
+        failed_host_alloc_none. Guards the accounting in _execute_kv_backup:
+        a None write must not pass silently, and attempts/success must stay
+        reconcilable (attempts = success + failed_host_alloc_none)."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 1:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        stats = cache._write_outcome_stats
+        attempts_before = stats.get("l1_to_l2_writ", {}).get("attempts", 0)
+        failed_before = stats.get("l1_to_l2_writ", {}).get("host_alloc_failed", 0)
+
+        with mock.patch.object(cache.cache_controller, "write", return_value=None):
+            written = _write_backup(cache, leaf, write_back=False)
+        self.assertEqual(written, 0)
+
+        bucket = stats["l1_to_l2_writ"]
+        self.assertEqual(bucket["attempts"], attempts_before + 1)
+        self.assertEqual(bucket["host_alloc_failed"], failed_before + 1)
 
     def test_load_back_load_failure_frees_unpublished_mamba_slot(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:

@@ -21,6 +21,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -1851,6 +1852,18 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    # Cumulative outcome snapshots (tier -> reason -> count), fed by the
+    # cache and consumed under delta accounting in log_storage_metrics.
+    prefetch_stats: Optional[dict] = None
+    load_outcome_stats: Optional[dict] = None
+    write_outcome_stats: Optional[dict] = None
+
+
+class TransferTier(str, Enum):
+    L1_TO_L2_WRIT = "l1_to_l2_writ"
+    L2_TO_L3_WRIT = "l2_to_l3_writ"
+    L3_TO_L2_LOAD = "l3_to_l2_load"
+    L2_TO_L1_LOAD = "l2_to_l1_load"
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -1894,6 +1907,22 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "— the whole storage fetch is forfeited, not just the aux part.",
             labelnames=labels.keys(),
         )
+
+        self.hicache_transfer_outcomes_total = Counter(
+            name="sglang:hicache_transfer_outcomes_total",
+            documentation=(
+                "HiCache layer transmission statistics. The outcome label is bounded to "
+                "attempts, issued, decline reasons, and revoke reasons."
+            ),
+            labelnames=list(labels.keys()) + ["tier", "reason"],
+        )
+
+        # Delta bookkeeping for the cumulative outcome snapshots: each flush
+        # incs (current - last) so cumulative dicts map to cumulative counters
+        # without double counting. Survives collector reuse (detach/reattach).
+        self._last_prefetch_outcome: dict = {}
+        self._last_load_outcome: dict = {}
+        self._last_write_outcome: dict = {}
 
         bucket_io = [
             1,
@@ -1962,6 +1991,58 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
 
+    def _flush_outcome_delta(self, current: Optional[dict], last: dict) -> None:
+        """Inc the transfer-outcomes Counter by the delta since the last flush.
+
+        ``current`` is a cumulative {tier: {reason: count}} snapshot from the
+        cache; the Counter is also cumulative, so each flush incs
+        (current - last) and updates last. Both sides survive reset (cumulative
+        across the process), so the delta is always non-negative.
+        """
+        if not current:
+            return
+        for tier, reasons in current.items():
+            prev_tier = last.setdefault(tier, {})
+            for reason, count in reasons.items():
+                previous = prev_tier.get(reason, 0)
+                delta = count if count < previous else count - previous
+                if delta > 0:
+                    self.hicache_transfer_outcomes_total.labels(
+                        **self.labels, tier=tier, reason=reason
+                    ).inc(delta)
+                prev_tier[reason] = count
+
+    def log_prefetch_outcomes(self, prefetch_stats: Mapping[str, float]) -> None:
+        """Export cumulative cache outcomes as monotonic Prometheus counters.
+
+        UnifiedRadixCache owns the source counters and may reset them while this
+        collector survives a storage detach/reattach. A lower snapshot therefore
+        starts a new epoch: export its current value, never a negative delta.
+        """
+        for outcome in (
+            "attempts",
+            "issued",
+            "declined_too_short",
+            "declined_rate_limited",
+            "revoked_insufficient",
+            "revoked_full_miss",
+            "l1l2_miss_tokens",
+            "l3_miss_tokens",
+            "aux_alloc_failed",
+            "host_alloc_failed",
+            "read_failed",
+            "l3_read_failed_tokens",
+            "l3_actual_read_tokens",
+        ):
+            current = max(float(prefetch_stats.get(outcome, 0)), 0.0)
+            previous = self._last_prefetch_outcome.get(outcome, 0.0)
+            increment = current if current < previous else current - previous
+            if increment > 0:
+                self.hicache_transfer_outcomes_total.labels(
+                    **self.labels, tier=TransferTier.L3_TO_L2_LOAD.value, reason=outcome
+                ).inc(increment)
+            self._last_prefetch_outcome[outcome] = current
+
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:
             return
@@ -1976,6 +2057,14 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+        self._flush_outcome_delta(
+            storage_metrics.load_outcome_stats, self._last_load_outcome
+        )
+        self._flush_outcome_delta(
+            storage_metrics.write_outcome_stats, self._last_write_outcome
+        )
+        self.log_prefetch_outcomes(storage_metrics.prefetch_stats)
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

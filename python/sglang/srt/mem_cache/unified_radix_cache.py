@@ -80,6 +80,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
+    TransferTier,
 )
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
@@ -261,7 +262,23 @@ class UnifiedRadixCache(BasePrefixCache):
             "l3_demand_total_tokens": 0,
             "l3_sum_rate_all": 0.0,
             "l3_sum_rate_main_weighted": 0.0,
+            # Failure-side counters recorded after the demand accounting, so
+            # the gap between l3_demand_total_tokens (pre-IO) and
+            # l3_actual_read_tokens (post-IO) is explainable in-dict.
+            "aux_alloc_failed": 0,
+            "host_alloc_failed": 0,
+            "read_failed": 0,
+            "l3_read_failed_tokens": 0,
+            "l3_actual_read_tokens": 0,
         }
+
+        # Cumulative transfer-outcome counters for the non-prefetch tiers
+        # (L2->L1 load, L1->L2 / L2->L3 write). L3->L2 is already covered by
+        # _prefetch_outcome_stats and projected at consumption time. Each is
+        # {tier: {reason: count}}; exported through log_storage_metrics under
+        # delta accounting to sglang:hicache_transfer_outcomes_total.
+        self._load_outcome_stats: dict[str, dict[str, int]] = {}
+        self._write_outcome_stats: dict[str, dict[str, int]] = {}
 
         self.reset()
         logger.info(
@@ -1268,6 +1285,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
+        self._account_transfer_outcome(
+            self._write_outcome_stats, TransferTier.L1_TO_L2_WRIT, "attempts"
+        )
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
@@ -1279,6 +1299,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     reason="host_mem_capacity_insufficient",
                     node_id=node_id,
                     tokens=len(device_value),
+                )
+                self._account_transfer_outcome(
+                    self._write_outcome_stats,
+                    TransferTier.L1_TO_L2_WRIT,
+                    "host_alloc_failed",
                 )
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1294,6 +1319,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="host_mem_alloc_failed",
                 node_id=node_id,
                 tokens=len(device_value),
+            )
+            self._account_transfer_outcome(
+                self._write_outcome_stats,
+                TransferTier.L1_TO_L2_WRIT,
+                "host_alloc_failed",
             )
         return host_indices
 
@@ -1400,6 +1430,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
         kv_tokens = len(kv_xfer.host_indices)
+        self._account_transfer_outcome(
+            self._load_outcome_stats, TransferTier.L2_TO_L1_LOAD, "attempts"
+        )
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
@@ -1418,6 +1451,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 rid=req.rid,
                 tokens=kv_tokens,
                 extra=f"load_back_threshold={self.load_back_threshold},mem_quota={mem_quota}",
+            )
+            self._account_transfer_outcome(
+                self._load_outcome_stats,
+                TransferTier.L2_TO_L1_LOAD,
+                "declined_too_short",
             )
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
@@ -1442,6 +1480,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     tokens=kv_tokens,
                     extra=f"avail={avail},num_tokens_evicted={result.num_tokens_evicted}",
                 )
+                self._account_transfer_outcome(
+                    self._load_outcome_stats,
+                    TransferTier.L2_TO_L1_LOAD,
+                    "device_alloc_failed",
+                )
                 return False
 
         # Load H→D
@@ -1462,6 +1505,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 reason="mem_alloc_failed",
                 rid=req.rid,
                 tokens=kv_tokens,
+            )
+            self._account_transfer_outcome(
+                self._load_outcome_stats,
+                TransferTier.L2_TO_L1_LOAD,
+                "device_alloc_failed",
             )
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
@@ -1558,6 +1606,15 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.hash_value,
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
+        )
+        self._account_transfer_outcome(
+            self._write_outcome_stats, TransferTier.L2_TO_L3_WRIT, "attempts"
+        )
+        self._account_transfer_outcome(
+            self._write_outcome_stats,
+            TransferTier.L2_TO_L3_WRIT,
+            "l3_write_tokens",
+            len(spec.token_ids),
         )
         self.ongoing_backup[operation_id] = (
             node_id,
@@ -1736,6 +1793,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 rid=req_id,
                 tokens=prefetch_length,
             )
+            stats["aux_alloc_failed"] += 1
             return
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1837,6 +1895,16 @@ class UnifiedRadixCache(BasePrefixCache):
         completed_tokens = operation.completed_tokens
         hash_value = operation.hash_value
 
+        # Post-IO accounting: classify short reads (page-read failure vs
+        # terminate) and record the actual L3 read so demand vs actual is
+        # reconcilable. hash_value was truncated to the allocated hit length
+        # before IO, so len(hash_value) * page_size is the expected read.
+        stats = self._prefetch_outcome_stats
+        expected_tokens = len(hash_value) * self.page_size
+        if operation.prefetch_read_failed:
+            stats["read_failed"] += 1
+            stats["l3_read_failed_tokens"] += max(0, expected_tokens - completed_tokens)
+        stats["l3_actual_read_tokens"] += completed_tokens
         (
             last_host_node_id,
             prefetch_key,
@@ -2101,6 +2169,20 @@ class UnifiedRadixCache(BasePrefixCache):
             "occupancy_ratio": cc.prefetch_tokens_occupied / cap,
         }
 
+    def _account_transfer_outcome(
+        self, stats: dict, tier: TransferTier, reason: str, value: int = 1
+    ) -> None:
+        """Bump a cumulative {tier: {reason: count}} outcome counter.
+        ``value`` is the increment amount, default 1."""
+        tier_bucket = stats.setdefault(tier.value, {})
+        tier_bucket[reason] = tier_bucket.get(reason, 0) + value
+
+    def load_outcome_stats_snapshot(self) -> dict:
+        return {t: dict(rs) for t, rs in self._load_outcome_stats.items()}
+
+    def write_outcome_stats_snapshot(self) -> dict:
+        return {t: dict(rs) for t, rs in self._write_outcome_stats.items()}
+
     def _prefetch_occupied_span(self, prefetch_key, host_indices) -> int:
         """Occupancy units held by a prefetch: cache mode reserves the
         requested span at enqueue; buffer mode grants at hit-alloc, sized
@@ -2218,6 +2300,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if buffer_mode:
                     return False
+                self._prefetch_outcome_stats["host_alloc_failed"] += 1
                 self.revoke_pending_prefetch(req_id)
                 return True
 
@@ -2323,6 +2406,21 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                # L2->L3 outcome: write_storage_failed is set by the backup IO
+                # thread on a page-set failure or exception; otherwise acked.
+                if operation.write_storage_failed:
+                    self._account_transfer_outcome(
+                        self._write_outcome_stats,
+                        TransferTier.L2_TO_L3_WRIT,
+                        "write_failed",
+                    )
+                    self._account_transfer_outcome(
+                        self._write_outcome_stats,
+                        TransferTier.L2_TO_L3_WRIT,
+                        "l3_write_failed_tokens",
+                        len(operation.token_ids),
+                    )
+
             return drained
 
         def _drain_release():
@@ -2745,6 +2843,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 # controller-side prefetch outcome counters.
                 storage_metrics = StorageMetrics()
             storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
+            storage_metrics.load_outcome_stats = self.load_outcome_stats_snapshot()
+            storage_metrics.write_outcome_stats = self.write_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def ready_to_load_host_cache(self) -> int:
