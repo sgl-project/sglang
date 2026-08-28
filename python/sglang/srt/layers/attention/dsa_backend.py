@@ -2936,6 +2936,7 @@ class DeepseekSparseAttnBackend(
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
+        # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
             q=q,
             k=k,
