@@ -48,7 +48,10 @@ TOPK = 2
 #   num_gpus = 2
 #   num_logical = 4 (3 single-copy + 1 replicated)
 #   num_phy = 6 (4 + 2 redundant copies of expert 0)
-# → NC = 1 + 2 = 3, NV = 2 + 2 + 2 = 6 (well within H20 shmem budget)
+# The solver sizes its buffers for the placement-independent worst case
+# (R = 2, max_red_log = 2, max_red_phy = 4), giving a static
+# NC = 2 + 2 = 4, NV = 4 + 2 + 2 = 8 -- well within the H20 shmem budget.
+# Individual placements below sit at or under that and are zero-padded.
 NUM_LOGICAL = 4
 NUM_PHY = 6
 
@@ -72,6 +75,25 @@ def _make_metadata(rebalanced: bool = False):
     num_valid = torch.ones(NUM_LOGICAL, dtype=torch.int64)
     num_valid[replicated_logical] = 3
     return phy2log, log2phy, num_valid
+
+
+def test_lp_is_rejected_without_redundant_experts():
+    """LPLB must be refused at config time when no expert has a replica.
+
+    With ep_num_redundant_experts == 0 every logical expert has exactly one
+    physical destination, so the LP has nothing to divide -- but it would
+    still build and solve a degenerate program on every MoE layer of every
+    forward. A silently-inert LPLB is indistinguishable from a working one
+    from the outside, so this has to fail loudly while the config is read.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    with pytest.raises(ValueError, match="no redundant experts"):
+        ServerArgs(
+            model_path="deepseek-ai/DeepSeek-V2-Lite",
+            ep_dispatch_algorithm="lp",
+            ep_num_redundant_experts=0,
+        )
 
 
 @pytest.mark.skipif(
@@ -118,6 +140,269 @@ def test_dispatch_probability_matches_torch_reference():
     )
 
 
+def _make_spread_metadata():
+    """A placement with a DIFFERENT natural LP size than `_make_metadata`.
+
+    Here the two redundant slots go to two different logical experts, so
+    num_red_log=2, num_red_phy=4, num_single=2 -- versus 1/3/3 above. Under
+    per-placement templating that shape difference is exactly what forced a
+    kernel recompile and a buffer reallocation, and so broke any captured
+    CUDA graph.
+    """
+    phy2log = torch.tensor([0, 1, 2, 3, 0, 1], dtype=torch.int64)
+    log2phy = torch.full((NUM_LOGICAL, 3), -1, dtype=torch.int64)
+    for i in range(NUM_LOGICAL):
+        log2phy[i, 0] = i
+    log2phy[0, 1] = 4
+    log2phy[1, 1] = 5
+    num_valid = torch.ones(NUM_LOGICAL, dtype=torch.int64)
+    num_valid[0] = 2
+    num_valid[1] = 2
+    return phy2log, log2phy, num_valid
+
+
+def _single_rank_solver(metadata):
+    """Build an LPLBSolver on cuda:0 with no EP group (single-rank tests)."""
+    from sglang.srt.eplb.lplb_solver import LPLBSolver
+
+    phy2log, log2phy, num_valid = metadata
+    return LPLBSolver(
+        phy2log=phy2log.cuda(),
+        log2phy=log2phy.cuda(),
+        num_gpus=NUM_GPUS,
+        ep_group=None,
+        logical_to_all_physical_map_num_valid=num_valid.cuda(),
+    )
+
+
+# Every tensor LPLBSolver hands to a JIT kernel. A captured CUDA graph bakes
+# in each one's data_ptr(), so all of them must survive a rebalance in place.
+_KERNEL_BUFFERS = (
+    "_A_full",
+    "_b",
+    "_t1",
+    "_x",
+    "_log2phy_prob",
+    "_A_base_row_sum",
+    "B1",
+    "log_single",
+    "phy_single",
+    "log_replicated",
+    "phy_replicated",
+    "log2phy",
+    "c_vec",
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_solver_buffers_are_stable_across_rebalance():
+    """A rebalance must not change any kernel buffer's shape OR address.
+
+    This is the invariant CUDA-graph safety rests on. With per-placement
+    sizing, a rebalance that changed num_red_log rebuilt the solver with
+    freshly allocated, differently-shaped tensors, so a graph captured at
+    startup replayed against freed memory.
+    """
+    solver = _single_rank_solver(_make_metadata())
+    before = {n: getattr(solver, n) for n in _KERNEL_BUFFERS}
+    ptrs = {n: t.data_ptr() for n, t in before.items()}
+    shapes = {n: tuple(t.shape) for n, t in before.items()}
+    natural_before = (solver.num_red_log, solver.num_red_phy, solver.num_single)
+
+    solver.update_placement(*[t.cuda() for t in _make_spread_metadata()])
+    natural_after = (solver.num_red_log, solver.num_red_phy, solver.num_single)
+
+    # Guard against a vacuous test: the placement must really change the
+    # natural LP size, which is what used to force the recompile.
+    assert (
+        natural_before != natural_after
+    ), f"test is vacuous -- both placements have LP size {natural_before}"
+    assert natural_before == (1, 3, 3) and natural_after == (2, 4, 2)
+
+    for name in _KERNEL_BUFFERS:
+        t = getattr(solver, name)
+        assert t is before[name], f"{name} was reassigned, not updated in place"
+        assert t.data_ptr() == ptrs[name], f"{name} moved in memory"
+        assert tuple(t.shape) == shapes[name], f"{name} changed shape"
+
+    # R = 6-4 = 2, so max_red_log = min(R, L) = 2 and max_red_phy = 2 + R = 4.
+    assert (solver.max_red_log, solver.max_red_phy, solver.max_single) == (2, 4, 4)
+    assert (solver.nc, solver.nv) == (2 + NUM_GPUS, 4 + NUM_GPUS + 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_batch_padding_rows_do_not_reach_the_counts():
+    """Rows past ``num_token_non_padded`` must not enter the LP's load counts.
+
+    ``solve()`` reads ``topk_ids`` in ``_post_process_topk_ids`` BEFORE
+    ``_mask_topk_ids_padded_region`` fills the padded rows, so at that point
+    they hold whatever the router left: a top-k of stale logits on the fused
+    path, or outright garbage on the custom_routing_function path. Counting
+    them puts phantom load into the LP -- and under CUDA graph capture the
+    padded fraction can be most of the batch.
+
+    Garbage here is deliberately out of range as well as wrong, since that is
+    the other half of the failure: an unmasked scatter_add_ would index
+    outside the counts buffer.
+    """
+    solver = _single_rank_solver(_make_metadata())
+    real = torch.tensor([[0, 1], [0, 2], [3, 0]], dtype=torch.int32, device="cuda")
+    n_real = real.shape[0]
+
+    # Same batch padded to 8 rows, padding filled with out-of-range garbage.
+    padded = torch.full((8, 2), 9999, dtype=torch.int32, device="cuda")
+    padded[:n_real] = real
+    num_token_non_padded = torch.tensor(n_real, dtype=torch.int32, device="cuda")
+
+    from_padded = solver.solve(padded, num_token_non_padded).clone()
+    from_real = solver.solve(real).clone()
+
+    assert torch.equal(from_padded, from_real), (
+        "padded rows changed the LP result, so they reached the load counts: "
+        f"max abs diff {(from_padded - from_real).abs().max().item():.3e}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_padded_lp_matches_unpadded_lp():
+    """Zero-padding the LP must not change the solution it encodes.
+
+    Extracts the real sub-LP out of the padded buffers and solves both with
+    the same reference solver. Verifies the two claims the padding rests on:
+    padded variables never move off their 1.0 init, and the real variables
+    agree with the unpadded solve.
+    """
+    from sglang.kernels.ops.lplb.torch_solver import solve_ipm_torch_reference
+
+    solver = _single_rank_solver(_make_metadata())
+    global_counts = torch.tensor(
+        [120.0, 30.0, 25.0, 20.0], dtype=torch.float32, device="cuda"
+    )
+    solver._solve(global_counts)  # populates the padded _A_full / _b
+
+    assert solver.num_red_log < solver.max_red_log, "no padded rows to test"
+    assert solver.num_red_phy < solver.max_red_phy, "no padded columns to test"
+
+    # Real rows: replicated-logical block, then the per-GPU block at its fixed
+    # offset. Real cols: replicated-physical block, then slack / M / Big-M.
+    rows = torch.tensor(
+        list(range(solver.num_red_log))
+        + list(range(solver.max_red_log, solver.max_red_log + NUM_GPUS)),
+        device="cuda",
+    )
+    cols = torch.tensor(
+        list(range(solver.num_red_phy))
+        + list(range(solver.max_red_phy, solver.max_red_phy + NUM_GPUS + 2)),
+        device="cuda",
+    )
+    pad_cols = torch.tensor(
+        list(range(solver.num_red_phy, solver.max_red_phy)), device="cuda"
+    )
+
+    padded_x = solve_ipm_torch_reference(solver._A_full, solver._b, solver.c_vec)
+    small_x = solve_ipm_torch_reference(
+        solver._A_full[rows][:, cols], solver._b[rows], solver.c_vec[cols]
+    )
+
+    assert not torch.allclose(
+        padded_x, torch.full_like(padded_x, 0.5)
+    ), "padded LP hit the 0.5 non-convergence sentinel -- comparison is trivial"
+    # Padded variables are untouched by construction: A[:, j] = 0 and c[j] = 0
+    # make d[j] identically 0, so x[j] keeps its 1.0 init every iteration.
+    assert torch.equal(
+        padded_x[pad_cols], torch.ones_like(padded_x[pad_cols])
+    ), f"padded variables moved off 1.0: {padded_x[pad_cols].tolist()}"
+    max_diff = (padded_x[cols] - small_x).abs().max().item()
+    assert torch.allclose(
+        padded_x[cols], small_x, atol=1e-4, rtol=1e-3
+    ), f"padded LP disagrees with the equivalent unpadded LP: {max_diff:.3e}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="This test requires CUDA")
+def test_cuda_graph_replay_survives_rebalance():
+    """Capture a CUDA graph over the LP solve, rebalance, then replay.
+
+    This is the end-to-end regression guard. The graph is captured once (as
+    the model runner does at startup) and never re-captured; after
+    `update_placement` its replay must reflect the NEW placement, because it
+    reads and writes the same buffers the solver just updated in place.
+    """
+    solver = _single_rank_solver(_make_metadata())
+    counts = torch.tensor([120.0, 30.0, 25.0, 20.0], dtype=torch.float32, device="cuda")
+
+    # Warm up on a side stream: the JIT prep/post modules compile on first use
+    # and every lazy init must be done before capture.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            solver._solve(counts)
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        solver._solve(counts)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    before = solver._log2phy_prob.clone()
+
+    # Rebalance to a placement with a different natural LP size, then replay
+    # the SAME graph. No recapture, no reallocation.
+    new_meta = _make_spread_metadata()
+    solver.update_placement(*[t.cuda() for t in new_meta])
+    new_counts = torch.tensor(
+        [90.0, 80.0, 25.0, 20.0], dtype=torch.float32, device="cuda"
+    )
+    counts.copy_(new_counts)
+    graph.replay()
+    torch.cuda.synchronize()
+    after = solver._log2phy_prob.clone()
+
+    assert torch.isfinite(after).all(), "graph replay produced non-finite output"
+    assert not torch.equal(
+        before, after
+    ), "graph replay is not picking up the new placement"
+
+    # The replayed result must equal what a fresh solver computes eagerly.
+    reference = _single_rank_solver(new_meta)
+    expected = reference._solve(new_counts)
+    max_diff = (after - expected).abs().max().item()
+    assert torch.allclose(
+        after, expected, atol=1e-4, rtol=1e-3
+    ), f"graph replay after rebalance disagrees with reference: {max_diff:.3e}"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="LPLB's fused IPM requires Hopper or newer",
+)
+def test_shmem_budget_admits_only_launchable_shapes():
+    """Any shape ``assert_fits`` accepts must actually launch.
+
+    ``shmem_budget`` is a hand-maintained model of the ``ipm_smem`` struct in
+    ``csrc/lplb/ipm.cuh``. If the two drift, the model under-reports, a shape
+    sails through ``assert_fits``, and the launch then fails with
+    ``cudaErrorInvalidValue`` -- at whatever expert placement first happens to
+    need it, i.e. potentially mid-run after an EPLB rebalance rather than at
+    startup.
+
+    Checked at the largest shape LPLB is expected to build: EP=64 with 64
+    redundant experts, where NC = R + G and NV = 2R + G + 2. That is close
+    enough to the per-block cap that a mis-modelled array shows up.
+    """
+    from sglang.kernels.ops.lplb.cuda_solver import warmup
+    from sglang.kernels.ops.lplb.shmem_budget import assert_fits, shmem_bytes
+
+    nc, nv = 128, 194
+    assert_fits(nc, nv)
+    # Raises if cudaFuncSetAttribute or the launch rejects the shape.
+    warmup(nc, nv)
+    print(
+        f"\n[shmem] NC={nc} NV={nv} -> {shmem_bytes(nc, nv) / 1024:.1f} KiB, launched"
+    )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="This test requires CUDA",
@@ -157,14 +442,12 @@ def test_solve_ipm_matches_torch_reference():
         [120.0, 30.0, 25.0, 20.0], dtype=torch.float32, device=device
     )
 
-    # Reconstruct the LP exactly as LPLBSolver._solve builds it.
-    counts_norm = global_counts / global_counts.sum().clamp(min=1.0)
-    t1 = counts_norm[solver.log_single]
-    b1 = counts_norm[solver.log_replicated]
-    b2 = -(solver.B1 @ t1).flatten()
-    b = torch.cat([b1, b2])
-    big_M_col = b - solver._A_base_row_sum
-    A_full = torch.hstack([solver.A_base, big_M_col.unsqueeze(1)])
+    # Run the real pipeline so `_A_full` / `_b` hold exactly the (zero-padded)
+    # LP the prep kernel builds, then compare the two IPM backends on it.
+    # Reconstructing the LP by hand here would have to re-derive the padding
+    # layout and would drift from the kernels.
+    solver._solve(global_counts)
+    A_full, b = solver._A_full, solver._b
 
     cuda_x = cuda_solve_ipm(A_full, b, solver.c_vec)
     torch_x = solve_ipm_torch_reference(A_full, b, solver.c_vec)
@@ -376,7 +659,10 @@ def _check_solver_determinism(rank: int, world_size: int, device: torch.device):
     else:
         topk_ids = torch.empty((0, TOPK), dtype=torch.int32, device=device)
 
-    out1 = solver.solve(topk_ids)
+    # solve() returns the solver's reusable output buffer, so the first
+    # result must be cloned -- otherwise the second call overwrites it and the
+    # comparison below is against itself and can never fail.
+    out1 = solver.solve(topk_ids).clone()
     out2 = solver.solve(topk_ids)
     assert torch.equal(out1, out2), (
         f"rank {rank}: solve() not deterministic across calls "

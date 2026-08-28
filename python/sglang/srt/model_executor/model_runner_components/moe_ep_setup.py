@@ -8,7 +8,7 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.eplb.lplb_solver import (
     LPLBSolver,
     assert_lplb_supported_model,
-    clear_global_lplb_solvers,
+    get_global_lplb_solver,
     set_global_lplb_solver,
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
@@ -74,7 +74,14 @@ def prepare_moe_topk(
 
 
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
-    """Initialize per-layer LPLB solvers from current expert location metadata."""
+    """Create or refresh per-layer LPLB solvers from expert location metadata.
+
+    Called once at startup and again after every EPLB rebalance. On the
+    refresh path the existing solvers are updated IN PLACE: their kernel
+    buffers keep their addresses and shapes, so CUDA graphs captured at
+    startup remain valid. Reallocating here would leave those graphs pointing
+    at freed memory.
+    """
     from sglang.srt.distributed import get_moe_ep_group
 
     # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
@@ -87,19 +94,30 @@ def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     metadata = get_global_expert_location_metadata()
     if metadata is None:
         return
-    clear_global_lplb_solvers()
     ep_group = get_moe_ep_group()
     for lid in range(metadata.num_layers):
-        solver = LPLBSolver(
+        args = dict(
             phy2log=metadata.physical_to_logical_map[lid],
             log2phy=metadata.logical_to_all_physical_map[lid],
-            num_gpus=metadata.ep_size,
-            ep_group=ep_group,
             logical_to_all_physical_map_num_valid=(
                 metadata.logical_to_all_physical_map_num_valid[lid]
             ),
         )
-        set_global_lplb_solver(lid, solver)
+        solver = get_global_lplb_solver(lid)
+        # An in-place update can only absorb a new *placement*. If the EP
+        # group itself was resized (elastic EP), the static buffer shapes no
+        # longer apply and the solver must be rebuilt -- captured graphs are
+        # invalid across such a resize anyway.
+        if solver is not None and solver.num_gpus != metadata.ep_size:
+            solver = None
+        if solver is None:
+            set_global_lplb_solver(
+                lid, LPLBSolver(num_gpus=metadata.ep_size, ep_group=ep_group, **args)
+            )
+        else:
+            # Rebind in case the group coordinator object was replaced.
+            solver.ep_group = ep_group
+            solver.update_placement(**args)
     logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
 
 

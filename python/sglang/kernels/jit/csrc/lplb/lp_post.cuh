@@ -13,6 +13,14 @@
 // emulate torch.take's wrap-around by adding `phy_prob_size` to negative
 // indices, which lands at the always-zero sink slot.
 //
+// Static-shape padding (see ipm.cuh): NUM_SINGLE and NUM_RED_PHY are
+// placement-independent upper bounds, so `phy_single` / `phy_replicated`
+// carry -1 in their unused tail and their scatters are guarded.
+// PHY_PROB_SIZE is derived from NUM_PHY rather than NUM_SINGLE +
+// NUM_RED_PHY: those only sum to the physical-expert count in the exact
+// (unpadded) case, and the -1 wrap-to-sink above depends on the sink
+// sitting at exactly PHY_PROB_SIZE - 1.
+//
 // Single-block launch. `phy_prob` lives in shared memory.
 
 #include <sgl_kernel/tensor.h>
@@ -32,6 +40,7 @@ template <
     int MAX_COPIES,
     int NUM_SINGLE,
     int NUM_RED_PHY,
+    int NUM_PHY,
     int BLOCK_DIM>
 __global__ void lp_post_kernel(
     float* __restrict__ log2phy_prob,            // (NUM_LOGICAL, MAX_COPIES) — written
@@ -40,7 +49,7 @@ __global__ void lp_post_kernel(
     const int64_t* __restrict__ phy_single,      // (NUM_SINGLE,)
     const int64_t* __restrict__ phy_replicated,  // (NUM_RED_PHY,)
     const int64_t* __restrict__ log2phy) {       // (NUM_LOGICAL, MAX_COPIES)
-  constexpr int PHY_PROB_SIZE = NUM_SINGLE + NUM_RED_PHY + 1;
+  constexpr int PHY_PROB_SIZE = NUM_PHY + 1;
 
   extern __shared__ unsigned char raw_smem[];
   float* phy_prob = reinterpret_cast<float*>(raw_smem);
@@ -54,14 +63,20 @@ __global__ void lp_post_kernel(
   __syncthreads();
 
   // Stage 2: scatter x_ratios = clamp(x[:NUM_RED_PHY], min=0) at phy_replicated.
+  // A -1 index is a padding slot: x[i] there is the IPM's untouched 1.0 init
+  // (or the 0.5 non-convergence sentinel), and must not reach phy_prob.
   for (int i = tid; i < NUM_RED_PHY; i += BLOCK_DIM) {
     int64_t idx = phy_replicated[i];
-    phy_prob[idx] = fmaxf(x[i], 0.f);
+    if (idx >= 0) {
+      phy_prob[idx] = fmaxf(x[i], 0.f);
+    }
   }
   // Stage 3: scatter t1 at phy_single.
   for (int i = tid; i < NUM_SINGLE; i += BLOCK_DIM) {
     int64_t idx = phy_single[i];
-    phy_prob[idx] = t1[i];
+    if (idx >= 0) {
+      phy_prob[idx] = t1[i];
+    }
   }
   __syncthreads();
 
@@ -75,7 +90,7 @@ __global__ void lp_post_kernel(
   }
 }
 
-template <int NUM_LOGICAL, int MAX_COPIES, int NUM_SINGLE, int NUM_RED_PHY, int BLOCK_DIM>
+template <int NUM_LOGICAL, int MAX_COPIES, int NUM_SINGLE, int NUM_RED_PHY, int NUM_PHY, int BLOCK_DIM>
 void lp_post(
     tvm::ffi::TensorView log2phy_prob,
     tvm::ffi::TensorView x,
@@ -93,11 +108,11 @@ void lp_post(
   TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(log2phy);
   // x has shape (NV,) which we don't constrain at this layer.
 
-  constexpr int PHY_PROB_SIZE = NUM_SINGLE + NUM_RED_PHY + 1;
+  constexpr int PHY_PROB_SIZE = NUM_PHY + 1;
   const size_t smem_bytes = PHY_PROB_SIZE * sizeof(float);
 
   using KernelT = void (*)(float*, const float*, const float*, const int64_t*, const int64_t*, const int64_t*);
-  KernelT kernel = lp_post_kernel<NUM_LOGICAL, MAX_COPIES, NUM_SINGLE, NUM_RED_PHY, BLOCK_DIM>;
+  KernelT kernel = lp_post_kernel<NUM_LOGICAL, MAX_COPIES, NUM_SINGLE, NUM_RED_PHY, NUM_PHY, BLOCK_DIM>;
 
   if (smem_bytes > 48 * 1024) {
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));

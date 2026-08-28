@@ -16,6 +16,14 @@
 // NV-1 columns are pre-filled with A_base.copy_() at solver init and not
 // touched by this kernel.
 //
+// Static-shape padding (see ipm.cuh): NUM_SINGLE and NUM_RED_LOG are
+// placement-independent upper bounds, and the caller pads `log_single` /
+// `log_replicated` with -1 in the unused tail. A -1 entry must contribute
+// NOTHING to `total` -- otherwise the normalization denominator is wrong and
+// every probability the LP produces is silently scaled off. It yields
+// t1[i] = 0 and b[i] = 0, which is exactly the all-zero padded row the IPM
+// kernel needs.
+//
 // Single-block launch. All intermediate state lives in shared memory.
 
 #include <sgl_kernel/tensor.h>
@@ -57,12 +65,14 @@ __global__ void lp_prep_kernel(
   // ---- Stage 1: gather raw t1 / b1 + partial sum for total ----
   float local_sum = 0.f;
   for (int i = tid; i < NUM_SINGLE; i += BLOCK_DIM) {
-    float v = global_counts[log_single[i]];
-    shared_t1[i] = v;  // raw, scaled below
+    const int64_t li = log_single[i];
+    float v = (li >= 0) ? global_counts[li] : 0.f;  // -1 == padding slot
+    shared_t1[i] = v;                               // raw, scaled below
     local_sum += v;
   }
   for (int i = tid; i < NUM_RED_LOG; i += BLOCK_DIM) {
-    float v = global_counts[log_replicated[i]];
+    const int64_t li = log_replicated[i];
+    float v = (li >= 0) ? global_counts[li] : 0.f;  // -1 == padding slot
     shared_b1[i] = v;
     local_sum += v;
   }
