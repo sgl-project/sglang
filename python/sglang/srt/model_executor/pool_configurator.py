@@ -70,6 +70,10 @@ class MemoryPoolConfig:
 
     mem_fraction_static: Optional[float] = None
 
+    # The default scheduler gate. ``max_running_requests`` remains the physical
+    # capacity used to size request-indexed pools and runtime buffers.
+    normal_max_running_requests: Optional[int] = None
+
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."
