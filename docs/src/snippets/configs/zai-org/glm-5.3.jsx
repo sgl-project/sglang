@@ -16,7 +16,7 @@ export const config = {
   quantizations: [
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
-    { id: "nvfp4", label: "NVFP4" },
+    { id: "nvfp4", label: "NVFP4 (Experimental)" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -798,7 +798,7 @@ sgl-eval run aime25 \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
