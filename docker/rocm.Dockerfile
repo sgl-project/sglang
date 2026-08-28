@@ -685,17 +685,17 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 
 # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
-# cannot be satisfied on the ROCm 7.2.4/1000 torch 2.11 stack. The *_torch2_11
+# cannot be satisfied on the ROCm 7.2.4/1000 torch 2.11 stack. The *_rocm724
 # extras carry a 0.16.0 pin instead; all other flavors keep the extras they used before.
 RUN cd sglang \
     && cp python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *-rocm1000) srt_extras="srt_hip_torch2_11,diffusion_hip"; \
-                     all_extras="all_hip_torch2_11" ; \
+         *-rocm1000) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+                     all_extras="all_hip_rocm724" ; \
                      CONS="-c /tmp/constraints.txt" ; \
                      ;; \
-         *-rocm724) srt_extras="srt_hip_torch2_11,diffusion_hip"; \
-                    all_extras="all_hip_torch2_11" ; \
+         *-rocm724) srt_extras="srt_hip_rocm724,diffusion_hip"; \
+                    all_extras="all_hip_rocm724" ; \
                     CONS="-c /tmp/constraints.txt" ; \
                     ;; \
          *-rocm720) srt_extras="srt_hip,diffusion_hip"; \
@@ -861,13 +861,21 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       jq \
       libopenmpi-dev \
       libpci-dev \
-      libdrm-dev \
       initramfs-tools \
-      librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool \
-      libibverbs-dev rdma-core \
-      openssh-server openmpi-bin openmpi-common libopenmpi-dev \
-      libgrpc++-dev protobuf-compiler-grpc \
   && rm -rf /var/lib/apt/lists/*; \
+  \
+  # gfx1250 brought its own MORI build up against a wider set of RDMA, MPI and
+  # gRPC packages. Scoped to that arch so the CDNA images keep the package set
+  # they were released with.
+  if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libdrm-dev \
+        librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool \
+        libibverbs-dev rdma-core \
+        openssh-server openmpi-bin openmpi-common libopenmpi-dev \
+        libgrpc++-dev protobuf-compiler-grpc \
+    && rm -rf /var/lib/apt/lists/*; \
+  fi; \
   \
   # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
   # Only vendor packages are installed here for dlopen (e.g. libionic.so); no compile-time flags needed.
@@ -974,7 +982,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # nixl fails at metadata generation. Drop just the -dev package (headers and
   # pkg-config files); the runtime library that already-built components link
   # against stays in place.
-  apt-get remove -y libabsl-dev libabsl20220623 || true; \
+  #
+  # gfx1250 was brought up dropping the runtime package as well, so keep that
+  # for gfx1250 only rather than changing what the CDNA images were released with.
+  if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
+    apt-get remove -y libabsl-dev libabsl20220623 || true; \
+  else \
+    case "${GPU_ARCH}" in *-rocm724|*-rocm1000) apt-get remove -y libabsl-dev ;; esac; \
+  fi; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
@@ -998,70 +1013,70 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # Hot patch: torch-ROCm
-# Torch may hardcode triton== in Requires-Dist. Relax to >= so the pinned Triton
-# installed below satisfies the requirement without pip pulling CUDA torch.
-#   rocm720:   repack the base-image .whl (bundled at /) and reinstall torch.
-#   rocm724:   torch upgraded earlier; Requires-Dist fixed after the Triton swap.
-#   others:    skip (BUILD_TRITON=0 or no pin to relax).
-# --- rocm720: repack the base-image torch .whl with the triton pin relaxed ---
+# The artifact hardcoded the supported triton version to be 3.5.1.
+# Rewrite the restriction directly.
 ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN cat > /tmp/relax_triton_whl.py <<'PY'
-import csv, os, re, sys, zipfile
+RUN mkdir /tmp/whl && cd /tmp/whl \
+     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
+     && cat > hack.py <<"PY"
+import zipfile, csv, os, re
 from pathlib import Path
 
-TRITON_PIN = re.compile(
-    r"^((?:Requires-Dist:\s*)?triton)==([^;+\s]+)[^;\s]*", re.MULTILINE
-)
-
-def relax_triton_metadata(meta_path):
-    txt = meta_path.read_text(encoding="utf-8")
-    txt2, n = TRITON_PIN.subn(r"\1>=\2", txt)
-    if n == 0:
-        print(f"No triton== pin found in {meta_path}; nothing to patch")
-        sys.exit(0)
-    meta_path.write_text(txt2, encoding="utf-8")
-    return n
-
-def blank_record(record_path):
-    rows = []
-    with record_path.open(newline="", encoding="utf-8") as f:
-        for r in csv.reader(f):
-            if r:
-                rows.append([r[0], "", ""])
-    with record_path.open("w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
-
 fname = os.environ["TORCH_ROCM_FILE"]
-in_whl = Path("/") / fname
-out_whl = Path("/tmp") / fname
-work = Path("/tmp/torch-whl")
-work.mkdir(parents=True, exist_ok=True)
+in_whl  = Path("/")   / fname
+out_whl = Path("/tmp")/ fname
+work = Path("/tmp/whl")
 
+# 1) Extract
 with zipfile.ZipFile(in_whl, "r") as z:
     z.extractall(work)
 
+# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
 dist_info = next(work.glob("*.dist-info"))
-n = relax_triton_metadata(dist_info / "METADATA")
-blank_record(dist_info / "RECORD")
+meta = dist_info / "METADATA"
+txt = meta.read_text(encoding="utf-8")
 
+# Example: replace one exact requirement form.
+# Adjust the string to match what you actually see.
+pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
+txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
+if txt2 == txt:
+    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
+meta.write_text(txt2, encoding="utf-8")
+
+# 3) Hacky step: blank hash/size columns in RECORD
+record = dist_info / "RECORD"
+rows = []
+with record.open(newline="", encoding="utf-8") as f:
+    for r in csv.reader(f):
+        if not r:
+            continue
+        # keep filename, blank out hash and size
+        rows.append([r[0], "", ""])
+with record.open("w", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerows(rows)
+
+# 4) Re-zip as a wheel
 with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
     for p in work.rglob("*"):
         if p.is_file():
             z.write(p, p.relative_to(work).as_posix())
 
-print(f"Relaxed {n} triton pin(s); wrote {out_whl}")
+print("Wrote", out_whl)
 PY
 
-RUN case "${GPU_ARCH}" in \
+RUN cd /tmp/whl \
+    && case "${GPU_ARCH}" in \
       *rocm720*) \
-        echo "[torch patch] ROCm 7.2 (${GPU_ARCH}): repack and reinstall ${TORCH_ROCM_FILE}"; \
-        TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" python3 /tmp/relax_triton_whl.py \
-        && python3 -m pip install --force-reinstall --no-deps "/tmp/${TORCH_ROCM_FILE}" \
-        && rm -rf /tmp/torch-whl "/tmp/${TORCH_ROCM_FILE}" ;; \
-      *) echo "[torch patch] rocm720: skip (${GPU_ARCH})" ;; \
-    esac \
-    && rm -f /tmp/relax_triton_whl.py
-
+        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        python hack.py \
+        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
+        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
+        ;; \
+      *) \
+        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
+        ;; \
+    esac
 
 # transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
 # (transformers#46618, not yet released).
