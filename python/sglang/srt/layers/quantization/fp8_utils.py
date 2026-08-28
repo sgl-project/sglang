@@ -3,22 +3,9 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
-
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_group_quant_fp8_row_padded,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
-from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils.common import torch_release
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
@@ -28,12 +15,18 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_group_quant_fp8_row_padded,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -54,6 +47,7 @@ from sglang.srt.utils import (
     is_xpu,
     offloader,
 )
+from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
@@ -799,11 +793,11 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+def initialize_fp8_gemm_config() -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
-    backend = server_args.fp8_gemm_runner_backend
+    backend = get_exec().kernel.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
         backend = "cutlass"
 
@@ -2126,7 +2120,9 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    tp_size = getattr(layer, "tp_size", get_parallel().tp_size)
+    # Lazy: a ``getattr`` default would read the published bag even for a
+    # layer that carries its own tp_size.
+    tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
     block_n, block_k = block_size[0], block_size[1]
 
     # Required by row parallel

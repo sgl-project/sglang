@@ -168,7 +168,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_context,
     get_device,
     get_exec,
@@ -182,6 +182,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     is_ep_joiner,
     is_ep_scale_joiner,
+    max_speculative_num_draft_tokens,
     remote_instance_transfer_engine_enabled,
     set_global_dwdp_manager,
 )
@@ -192,6 +193,9 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     ServerArgs,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
+)
+from sglang.srt.speculative.adaptive_spec_params import (
+    resolve_candidate_steps_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -223,7 +227,7 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.offloader import (
-    create_offloader_from_server_args,
+    create_offloader,
     get_offloader,
     set_offloader,
 )
@@ -270,7 +274,6 @@ class ModelRunnerOutput:
 def resolve_draft_attention_backend(
     *,
     draft_attention_backend: Optional[str],
-    server_args: ServerArgs,
     is_draft_worker: bool,
 ) -> Optional[str]:
     """The attention backend a runner uses because it is a draft runner.
@@ -332,20 +335,16 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        # Set the global server_args in the scheduler process (target worker
-        # only, so a draft init cannot clobber target-derived global state).
-        # Before the constructor's bag reads (page_size below): a standalone
-        # construction (benchmark/one_batch, the manual runner tests) has no
-        # earlier publish.
+        # The process entry published; a draft runner is not one (it must not
+        # clobber the target's config), so only the target checks.
         if not is_draft_worker:
-            ensure_published(server_args, role="scheduler")
+            assert_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
         self.device = get_device().device
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
-            server_args=server_args,
             is_draft_worker=is_draft_worker,
         )
         # This runner's own load format, resolved before anything keys off it:
@@ -433,9 +432,7 @@ class ModelRunner:
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
-        set_offloader(
-            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
-        )
+        set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
@@ -592,7 +589,6 @@ class ModelRunner:
             model=self.model,
             model_config=self.model_config,
             req_to_token_pool=self.req_to_token_pool,
-            server_args=self.server_args,
             max_running_requests=self.max_running_requests,
             device=self.device,
         )
@@ -656,7 +652,6 @@ class ModelRunner:
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
-            server_args=self.server_args,
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
@@ -703,7 +698,6 @@ class ModelRunner:
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_rank=expert_rank,
             )
@@ -728,7 +722,6 @@ class ModelRunner:
     def maybe_init_eplb_manager(self):
         self.eplb_manager = (
             EPLBManager(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 ps=self.ps,
                 get_model=lambda: self.model,
@@ -827,9 +820,44 @@ class ModelRunner:
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_req = self.decode_num_tokens_per_req()
-        capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
-        return max(capture_bs) * num_tokens_per_req
+        # Resolution can turn speculative_adaptive off, so the effective value
+        # lives in the bags while the startup record keeps the CLI input.
+        spec = get_spec()
+        draft_token_counts = [max_speculative_num_draft_tokens()]
+        if spec.speculative_adaptive:
+            draft_token_counts.extend(
+                steps + 1
+                for steps in resolve_candidate_steps_from_config(
+                    spec.speculative_adaptive_config
+                )
+            )
+
+        max_rows = 0
+        for draft_tokens in draft_token_counts:
+            num_tokens_per_req = self.decode_num_tokens_per_req(
+                num_draft_tokens=draft_tokens
+            )
+            capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
+            max_rows = max(max_rows, max(capture_bs) * num_tokens_per_req)
+        return max_rows
+
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        value = self.loader.preloaded_weights_bytes
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                "ModelLoader.preloaded_weights_bytes must be a non-negative int, "
+                f"got {value!r}"
+            )
+        return value
+
+    def account_preloaded_weights(self, preloaded_weights_bytes: int) -> None:
+        # Dist-init sampled B after the daemon already held weights, so slack
+        # (B * (1 - mem_fraction_static)) is too small. Add those bytes back
+        # onto the existing MIN'd baseline. Skip when nothing was preloaded.
+        if preloaded_weights_bytes == 0:
+            return
+        self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
@@ -1077,9 +1105,7 @@ class ModelRunner:
         self.pre_model_load_memory = result.pre_model_load_memory
 
     def init_shared_mooncake_transfer_engine(self):
-        maybe_init_shared_mooncake_transfer_engine(
-            server_args=self.server_args, gpu_id=self.gpu_id
-        )
+        maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -1092,9 +1118,7 @@ class ModelRunner:
         if self.device != "cpu":
             torch.set_num_threads(1)
         if self.device == "cuda":
-            maybe_downgrade_dtype_for_legacy_gpu(
-                server_args=self.server_args, model_config=self.model_config
-            )
+            maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
 
@@ -1114,7 +1138,6 @@ class ModelRunner:
         # and derive the per-rank daemon socket. Idempotent across reloads.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
-            server_args=self.server_args,
             tp_size=self.ps.tp_size,
             pp_rank=self.ps.pp_rank,
             tp_rank=self.ps.tp_rank,
@@ -1125,7 +1148,6 @@ class ModelRunner:
             )
 
         maybe_trigger_remote_instance_nccl_send_group(
-            server_args=self.server_args,
             tp_rank=self.ps.tp_rank,
             load_format=draft_load_format,
         )
@@ -1164,7 +1186,6 @@ class ModelRunner:
         # before configure_kv_cache_dtype.)
         load_kv_cache_scales(
             model=self.model,
-            server_args=self.server_args,
             kv_cache_dtype=get_model().kv_cache_dtype,
         )
 
@@ -1196,11 +1217,12 @@ class ModelRunner:
                 f"mem usage={self.weight_load_mem_usage:.2f} GB."
             )
 
-        report_online_quantization(model=self.model, server_args=self.server_args)
+        report_online_quantization(
+            model=self.model,
+        )
 
         maybe_register_debug_tensor_dump_hook(
             model=self.model,
-            server_args=self.server_args,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
             tp_size=self.ps.tp_size,
@@ -1215,7 +1237,6 @@ class ModelRunner:
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
             self.model,
-            self.server_args,
             self.model_config,
             logger,
         )
@@ -1282,7 +1303,6 @@ class ModelRunner:
         )
         if not cuda_graph_fully_disabled():
             init_lora_cuda_graph_moe_buffers(
-                server_args=self.server_args,
                 model=self.model,
                 lora_manager=self.lora_manager,
                 dtype=self.dtype,
@@ -1472,13 +1492,11 @@ class ModelRunner:
         if (
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer(self.server_args)
+            and require_gathered_buffer()
             and not is_dsa_enable_prefill_cp()
             and not is_mla_prefill_cp_enabled()
         ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                server_args=self.server_args,
-            )
+            forward_batch.adjust_num_token_non_padded_for_attn_tp()
 
         # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
@@ -1927,7 +1945,6 @@ class ModelRunner:
             start=old_num_physical - num_local * initial_ep_size,
         )
         new_metadata = ExpertLocationMetadata.init_by_mapping(
-            self.server_args,
             self.model_config,
             physical_to_logical_map=expanded_p2l,
             moe_ep_rank=self._elastic_global_rank(),

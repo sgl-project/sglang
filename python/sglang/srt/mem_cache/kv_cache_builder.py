@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
 
@@ -65,7 +66,6 @@ def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
-    server_args: ServerArgs,
 ) -> None:
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
@@ -84,7 +84,6 @@ def maybe_register_hicache_draft(
     specs, entries = build_hicache_draft_sidecars(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
     for spec, entry in zip(specs, entries, strict=True):
         tree_cache.register_sidecar_pool(spec, entry)
@@ -143,6 +142,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
+            # Large ROCm retraction restores can fault the GPU process. Keep
+            # host_pool opt-in on HIP until the retraction path is safe at scale.
+            and not is_hip()
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
@@ -318,7 +320,6 @@ def build_kv_cache(
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
-            server_args=server_args,
         )
 
     if retraction_backup == "host_pool":

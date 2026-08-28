@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 TOOL_CALL_BEGIN = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
@@ -26,7 +27,7 @@ ARG_PAIR_PATTERN = re.compile(
 
 
 @dataclass(frozen=True)
-class _Spark3ToolCall:
+class _Spark2_5ToolCall:
     name: str
     arguments: dict[str, Any]
 
@@ -47,17 +48,14 @@ def _get_param_type(tools: list[Tool], function_name: str, param_name: str) -> s
         parameters = getattr(function, "parameters", None)
         if not isinstance(parameters, dict):
             continue
-        properties = parameters.get("properties")
-        if not isinstance(properties, dict):
-            continue
-        definition = properties.get(param_name)
+        definition = get_schema_properties(parameters).get(param_name)
         if isinstance(definition, dict) and isinstance(definition.get("type"), str):
             return definition["type"]
     return "string"
 
 
 def _convert_value(value: str, param_type: str) -> Any:
-    """Convert Spark3 XML text according to the model's tool protocol."""
+    """Convert Spark2_5 XML text according to the model's tool protocol."""
     if value.lower() == "null":
         return None
 
@@ -83,7 +81,7 @@ def _convert_value(value: str, param_type: str) -> Any:
             return value
 
 
-def _parse_tool_call_xml(tool_xml: str, tools: list[Tool]) -> _Spark3ToolCall | None:
+def _parse_tool_call_xml(tool_xml: str, tools: list[Tool]) -> _Spark2_5ToolCall | None:
     if not tool_xml.startswith(TOOL_CALL_BEGIN) or not tool_xml.endswith(TOOL_CALL_END):
         return None
 
@@ -102,7 +100,7 @@ def _parse_tool_call_xml(tool_xml: str, tools: list[Tool]) -> _Spark3ToolCall | 
             raw_value,
             _get_param_type(tools, function_name, key),
         )
-    return _Spark3ToolCall(name=function_name, arguments=arguments)
+    return _Spark2_5ToolCall(name=function_name, arguments=arguments)
 
 
 def _partial_marker_suffix_length(text: str, marker: str) -> int:
@@ -113,8 +111,8 @@ def _partial_marker_suffix_length(text: str, marker: str) -> int:
     return 0
 
 
-class Spark3Detector(BaseFormatDetector):
-    """Detector for Spark3's XML-KV tool-call format.
+class Spark25Detector(BaseFormatDetector):
+    """Detector for Spark2_5's XML-KV tool-call format.
 
     Wire format::
 
@@ -137,7 +135,7 @@ class Spark3Detector(BaseFormatDetector):
 
     def _build_item(
         self,
-        parsed: _Spark3ToolCall,
+        parsed: _Spark2_5ToolCall,
         tools: list[Tool],
         tool_index: int,
     ) -> ToolCallItem | None:
@@ -153,7 +151,7 @@ class Spark3Detector(BaseFormatDetector):
         )
 
     def _record_streamed_item(
-        self, parsed: _Spark3ToolCall, item: ToolCallItem
+        self, parsed: _Spark2_5ToolCall, item: ToolCallItem
     ) -> None:
         self.prev_tool_call_arr.append(
             {"name": parsed.name, "arguments": parsed.arguments}
@@ -259,5 +257,5 @@ class Spark3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(
-            "Spark3 XML arguments cannot be represented by legacy structural tags"
+            "Spark2_5 XML arguments cannot be represented by legacy structural tags"
         )
