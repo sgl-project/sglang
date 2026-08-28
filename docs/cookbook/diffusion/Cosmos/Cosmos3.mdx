@@ -123,7 +123,7 @@ curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
     "guidance_scale": 6.0,
     "flow_shift": 3.0,
     "seed": 0,
-    "extra_args": {
+    "extra_body": {
       "use_resolution_template": false,
       "guardrails": true
     }
@@ -141,7 +141,7 @@ curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
     "n": 1,
     "guidance_scale": 1.0,
     "seed": 0,
-    "extra_args": {
+    "extra_body": {
       "use_resolution_template": false,
       "guardrails": true
     }
@@ -390,7 +390,10 @@ Cosmos3 omnimodal fields are accepted as extra JSON fields or multipart form fie
 - `action_view_point`: viewpoint used in the structured action caption.
 - `action_normalization`: dataset normalization mode, such as `quantile`, `meanstd`, or `minmax`.
 
-Put model-specific compatibility knobs in `extra_params` for video requests, or `extra_args` for image requests:
+Pass model-specific controls through `extra_body` with the OpenAI Python SDK.
+Raw JSON may keep them at the top level; multipart video requests should put
+them in the `extra_params` JSON object. The legacy image `extra_args` container
+remains accepted for compatibility, but new clients should use `extra_body`:
 
 - `use_duration_template`: whether to append SGLang's generated duration suffix to video prompts.
 - `use_resolution_template`: accepted for vLLM-Omni request compatibility.

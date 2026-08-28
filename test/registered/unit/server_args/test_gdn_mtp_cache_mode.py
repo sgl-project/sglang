@@ -8,6 +8,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.arg_groups.mamba_hook import (  # noqa: E402
+    validate_gdn_mtp_cache_mode,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (  # noqa: E402
     FlashInferGDNKernel,
     fi_recovery_kernel,
@@ -48,7 +51,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
                     disable_radix_cache=False,
                     mamba_radix_cache_strategy="extra_buffer",
                 )
-                self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
+                self.assertIsNone(validate_gdn_mtp_cache_mode(sa))
 
     def test_none_mode_rejects_replayssm(self):
         # Both ReplaySSM flags must be rejected, not just the spec-verify one.
@@ -61,7 +64,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
             with self.subTest(flag=flag):
                 sa = make_server_args(**{flag: True}, speculative_eagle_topk=1)
                 with self.assertRaises(ValueError) as cm:
-                    sa._validate_gdn_mtp_cache_mode()
+                    validate_gdn_mtp_cache_mode(sa)
                 self.assertIn(
                     "--gdn-mtp-cache-mode=none is mutually exclusive with ReplaySSM",
                     str(cm.exception),
@@ -73,7 +76,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
             speculative_eagle_topk=8,
         )
         with self.assertRaises(ValueError) as cm:
-            sa._validate_gdn_mtp_cache_mode()
+            validate_gdn_mtp_cache_mode(sa)
         msg = str(cm.exception)
         self.assertIn("mutually exclusive with ReplaySSM", msg)
         self.assertNotIn("linear draft chain", msg)
@@ -81,7 +84,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
     def test_none_mode_rejects_topk_gt_one(self):
         sa = make_server_args(speculative_eagle_topk=2)
         with self.assertRaises(ValueError) as cm:
-            sa._validate_gdn_mtp_cache_mode()
+            validate_gdn_mtp_cache_mode(sa)
         msg = str(cm.exception)
         self.assertIn("--gdn-mtp-cache-mode=none requires a linear draft chain", msg)
         self.assertIn("--speculative-eagle-topk=2", msg)
@@ -90,7 +93,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
         for topk in (None, 1):
             with self.subTest(topk=topk):
                 sa = make_server_args(speculative_eagle_topk=topk)
-                self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
+                self.assertIsNone(validate_gdn_mtp_cache_mode(sa))
 
     def test_none_mode_allows_mamba_extra_buffer(self):
         # none-mode + extra_buffer is supported on both recover paths (FlashInfer
@@ -103,7 +106,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
                     disable_radix_cache=False,
                     mamba_radix_cache_strategy=strategy,
                 )
-                self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
+                self.assertIsNone(validate_gdn_mtp_cache_mode(sa))
 
     def test_extra_buffer_disabled_when_radix_cache_off(self):
         sa = make_server_args(
@@ -111,7 +114,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
             disable_radix_cache=True,
             mamba_radix_cache_strategy="extra_buffer",
         )
-        self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
+        self.assertIsNone(validate_gdn_mtp_cache_mode(sa))
 
     def test_valid_recover_ssm_config_no_buffer(self):
         sa = make_server_args(
@@ -119,7 +122,7 @@ class TestValidateGdnMtpCacheMode(CustomTestCase):
             disable_radix_cache=False,
             mamba_radix_cache_strategy="no_buffer",
         )
-        self.assertIsNone(sa._validate_gdn_mtp_cache_mode())
+        self.assertIsNone(validate_gdn_mtp_cache_mode(sa))
 
 
 class TestFiRecoveryKernel(CustomTestCase):
