@@ -25,7 +25,7 @@ class KvSlotWeightVersions:
         self._version_str_by_id: List[str] = []
         self._version_id_by_str: Dict[str, int] = {}
 
-    def stamp_slots(self, *, slot_indices: torch.Tensor, version: str) -> None:
+    def record(self, *, slot_indices: torch.Tensor, version: str) -> None:
         self._slot_version_ids[slot_indices] = self._intern(version=version)
 
     def fill_req_prefill_weight_versions(self, req: Req) -> None:
@@ -58,7 +58,7 @@ class KvSlotWeightVersions:
                 version=self._version_str_by_id[version_id], start=start, end=end
             )
             for version_id, start, end in zip(
-                run_version_ids, run_bounds_list, run_bounds_list[1:]
+                run_version_ids, run_bounds_list[:-1], run_bounds_list[1:], strict=True
             )
         ]
 

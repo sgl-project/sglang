@@ -55,7 +55,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_single_version_collapses_into_one_span(self):
         """Slots written by one version compress into a single span."""
         table = _table()
-        table.stamp_slots(slot_indices=_slots(3, 4, 5), version="v0")
+        table.record(slot_indices=_slots(3, 4, 5), version="v0")
 
         self.assertEqual(
             table._lookup_spans(_slots(3, 4, 5)),
@@ -65,8 +65,8 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_rewriting_slots_under_a_new_version_splits_the_lookup(self):
         """Re-recording the tail of a sequence yields an old-version prefix and a new-version suffix."""
         table = _table()
-        table.stamp_slots(slot_indices=_slots(1, 2, 3, 4), version="v0")
-        table.stamp_slots(slot_indices=_slots(3, 4), version="v1")
+        table.record(slot_indices=_slots(1, 2, 3, 4), version="v0")
+        table.record(slot_indices=_slots(3, 4), version="v1")
 
         self.assertEqual(
             table._lookup_spans(_slots(1, 2, 3, 4)),
@@ -79,7 +79,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_one_unwritten_slot_among_written_ones_fails_the_lookup(self):
         """A single never-stamped slot inside a prompt is reported by index."""
         table = _table()
-        table.stamp_slots(slot_indices=_slots(1, 3), version="v0")
+        table.record(slot_indices=_slots(1, 3), version="v0")
 
         with self.assertRaisesRegex(ValueError, r"\[2\]"):
 <<<<<<< ours
@@ -91,7 +91,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_non_adjacent_slots_with_the_same_version_merge(self):
         """Compression follows lookup order, not slot order, so the same version merges."""
         table = _table()
-        table.stamp_slots(slot_indices=_slots(9, 2, 5), version="v0")
+        table.record(slot_indices=_slots(9, 2, 5), version="v0")
 
         self.assertEqual(
             table._lookup_spans(_slots(9, 2, 5)),
@@ -101,9 +101,9 @@ class TestKvSlotWeightVersions(CustomTestCase):
     def test_version_ids_are_interned_and_never_reassigned(self):
         """Re-recording an already seen version reuses its id instead of growing the table."""
         table = _table()
-        table.stamp_slots(slot_indices=_slots(0), version="v0")
-        table.stamp_slots(slot_indices=_slots(1), version="v1")
-        table.stamp_slots(slot_indices=_slots(2), version="v0")
+        table.record(slot_indices=_slots(0), version="v0")
+        table.record(slot_indices=_slots(1), version="v1")
+        table.record(slot_indices=_slots(2), version="v0")
 
         self.assertEqual(table._version_str_by_id, ["v0", "v1"])
         self.assertEqual(
@@ -127,8 +127,8 @@ class TestKvSlotWeightVersions(CustomTestCase):
     ):
         """The prompt's KV slots resolve to the versions that computed them."""
         table = _table(slots_of_req=[4, 5, 6, 7, 8])
-        table.stamp_slots(slot_indices=_slots(4, 5), version="v0")
-        table.stamp_slots(slot_indices=_slots(6), version="v1")
+        table.record(slot_indices=_slots(4, 5), version="v0")
+        table.record(slot_indices=_slots(6), version="v1")
         req = _ReqStub(num_prompt_tokens=3, kv_committed_len=5)
 
         table.fill_req_prefill_weight_versions(req)
@@ -150,7 +150,7 @@ class TestKvSlotWeightVersions(CustomTestCase):
     ):
         """A prompt whose KV is only partially committed reports only the committed tokens."""
         table = _table(slots_of_req=[4, 5])
-        table.stamp_slots(slot_indices=_slots(4, 5), version="v0")
+        table.record(slot_indices=_slots(4, 5), version="v0")
         req = _ReqStub(num_prompt_tokens=5, kv_committed_len=2)
 
         table.fill_req_prefill_weight_versions(req)
