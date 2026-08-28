@@ -119,6 +119,7 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    INTEL_XPU = "intel_xpu"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -181,6 +182,9 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+    def is_intel_xpu(self):
+        return self == MoeRunnerBackend.INTEL_XPU
 
 
 class DeepEPv2Fp8ScaleFormat(NamedTuple):
@@ -651,7 +655,7 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     """
     if should_skip_mlp_all_reduce():
         return True
-    if get_parallel().config.dwdp_size > 1:
+    if get_parallel().dwdp_size > 1:
         return True
     if should_use_dp_reduce_scatterv():
         return True

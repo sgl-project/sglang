@@ -354,10 +354,6 @@ def xpu_has_xmx_support():
     return False
 
 
-def use_intel_xpu_backend():
-    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
-
-
 @lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
@@ -2219,14 +2215,17 @@ def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
     skip_pid: int = None,
-    wait_timeout: Optional[float] = None,
+    wait_timeout: Optional[float] = 60,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
-    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    raises `RuntimeError` on timeout. SIGKILL only queues the teardown, so
+    returning without waiting leaves the GPU context, the pinned host memory
+    and the ports held for seconds; pass `None` only where blocking is
+    unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
+    calls `sys.exit(0)` and cannot wait for itself -- use
+    `include_parent=False` if child reap must finish first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2239,10 +2238,10 @@ def kill_process_tree(
 
     try:
         itself = psutil.Process(parent_pid)
+        children = itself.children(recursive=True)
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
     killed = []
     for child in children:
         if child.pid == skip_pid:
@@ -3727,8 +3726,8 @@ def require_mlp_tp_gather():
     from sglang.srt.runtime_context import get_exec, get_parallel
 
     # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().config.enable_dp_attention:
-        assert get_parallel().config.dp_size > 1, "dp_size must be greater than 1"
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3737,10 +3736,10 @@ def require_mlp_tp_gather():
             if elastic_expanded_world_enabled():
                 return True
         if (
-            get_parallel().config.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not get_parallel().config.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3754,10 +3753,23 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+            "SGLANG_MORI_RECV_BOUND", "false"
+        ):
+            # Same bookkeeping, for the same reason. Bounding mori's receive
+            # buffer means baking a fan-in size into a captured graph, and the
+            # fan-in depends on what the *peers* send. Without a DP-synchronized
+            # bucket every rank buckets its own batch, so a rank on a narrow tier
+            # can be handed rows by a peer on a wider one; the only bound valid
+            # under that is the widest tier's, which is 4-16x looser than the
+            # batch actually being run and costs more in expert-GEMM tiles than
+            # the trim saves. With uniform buckets the per-tier fan-in is exact.
+            # Scoped to the opt-in gate so the default path is untouched.
+            return True
         else:
             return (
-                get_parallel().config.moe_dense_tp_size
-                > get_parallel().config.tp_size // get_parallel().config.dp_size
+                get_parallel().moe_dense_tp_size
+                > get_parallel().tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3773,17 +3785,17 @@ def require_attn_tp_gather():
     # autotuners to pick suboptimal kernel variants at small batches.
     from sglang.srt.runtime_context import get_parallel
 
-    if get_parallel().config.disable_attn_tp_gather:
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if (
         not get_moe_a2a_backend().is_none()
-        or get_parallel().config.moe_dense_tp_size is not None
+        or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().config.enable_dp_attention:
-            return get_parallel().config.dp_size < get_parallel().config.tp_size
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < get_parallel().tp_size
         else:
             return True
     else:
@@ -3797,7 +3809,7 @@ def require_gathered_buffer():
 def require_mlp_sync():
     from sglang.srt.runtime_context import get_parallel
 
-    return get_parallel().config.enable_dp_attention or require_gathered_buffer()
+    return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:

@@ -1117,7 +1117,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if get_parallel().config.pp_size > 1:
+            if get_parallel().pp_size > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:

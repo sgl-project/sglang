@@ -261,6 +261,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # stage does not COPY; force a pip copy into /usr/local so it survives the stage split.
 RUN python3 -m pip install --ignore-installed --no-deps distro
 
+# Cosmos3 guardrails default ON: sglang enables them whenever `cosmos_guardrail`
+# is importable (Cosmos3Pipeline.create_pipeline_stages); opt out at runtime with
+# SGLANG_DISABLE_COSMOS3_GUARDRAILS=1. Installed with --no-deps because the
+# package metadata conflicts with our pins in ways that don't matter at runtime
+# (imageio>=2.37 vs our ==2.36) or would be harmful (opencv-python — also pulled
+# by retinaface-py — would shadow our opencv-python-headless cv2). The deps not
+# already in the image are installed explicitly; the find_spec check mirrors
+# sglang's availability probe plus cosmos_guardrail's own imports.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-deps \
+        cosmos-guardrail==0.3.1 \
+        retinaface-py==0.0.2 \
+    && python3 -m pip install \
+        "better-profanity==0.7.0" \
+        "nltk==3.9.1" \
+        "peft==0.18.1" \
+    && python3 -c "import importlib.util as u; missing = [m for m in ('cosmos_guardrail', 'retinaface', 'better_profanity', 'nltk', 'cv2', 'peft', 'sentencepiece') if u.find_spec(m) is None]; assert not missing, f'guardrail deps missing: {missing}'"
+
 ########################################################
 # PARALLEL STAGE 2: HPC-Ops Builder (needs torch_deps)
 ########################################################
