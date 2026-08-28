@@ -1,6 +1,7 @@
 """Unit tests for prefill CUDA graph wrapper helpers."""
 
 import unittest
+from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
 
@@ -186,6 +187,38 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
 
         finalized = runner._finalize_execute_output(output)
         self.assertEqual(finalized["hidden_states"].shape, (3, 8))
+
+    def test_bcg_eager_tail_uses_live_multimodal_embeddings(self):
+        live_embeds = object()
+        live_batch = SimpleNamespace(mm_input_embeds=live_embeds)
+        static_batch = SimpleNamespace(
+            input_ids=None,
+            positions=None,
+            mm_input_embeds=None,
+        )
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner._input_embeds_arg_idx = None
+        runner.buffer_registry = SimpleNamespace(has_slot=lambda _name: False)
+        runner.backend = SimpleNamespace(replay=lambda *_args, **_kwargs: None)
+        runner.layer_model = SimpleNamespace(forward=lambda *_args, **_kwargs: None)
+        runner.model_runner = SimpleNamespace(
+            model=SimpleNamespace(
+                forward=lambda _ids, _positions, batch, **_kwargs: batch.mm_input_embeds
+            )
+        )
+        runner._prefill_forward_context = lambda *_args, **_kwargs: nullcontext()
+
+        output = runner._execute_body_capture(
+            live_batch,
+            static_batch,
+            static_num_tokens=1,
+            raw_num_tokens=1,
+            shape_key=object(),
+        )
+
+        self.assertIs(output, live_embeds)
 
 
 if __name__ == "__main__":

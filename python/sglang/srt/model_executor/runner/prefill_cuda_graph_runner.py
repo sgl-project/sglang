@@ -1763,6 +1763,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = forward_batch if full_path else static_forward_batch
+        if not full_path:
+            # MTP consumes the target model's live multimodal embeddings in its
+            # eager wrapper before the captured transformer body is replayed.
+            tail_batch.mm_input_embeds = forward_batch.mm_input_embeds
         try:
             with self._prefill_forward_context(
                 static_forward_batch,
