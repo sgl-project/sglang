@@ -2506,6 +2506,7 @@ export const Deployment = ({ config, benchmarks }) => {
           sel.variant,
           sel.quant && sel.quant.toUpperCase(),
           sel.strategy,
+          sel.kvDsaPair,
           sel.nodes,
         ]
           .filter((part) => part !== undefined && part !== null && part !== "")

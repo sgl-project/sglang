@@ -46,6 +46,7 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 
 class Mxfp4FlashinferTrtllmMoEMethod:
+    fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -58,9 +59,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self.moe_runner_config = moe_runner_config
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        assert (
-            swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -400,8 +398,12 @@ def maybe_fuse_routed_scale_and_shared_add(
         ),
     )
     if fused:
+        already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
         if shared is not None:
-            return shared.add_(routed, alpha=routed_scaling_factor)
+            alpha = 1.0 if already_scaled else routed_scaling_factor
+            return shared.add_(routed, alpha=alpha)
+        if already_scaled:
+            return routed
         return routed.mul_(routed_scaling_factor)
     if shared is not None:
         routed += shared
