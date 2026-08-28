@@ -3135,10 +3135,6 @@ class TestAutoResidencySkipReason:
             # resident aux components on CPU): its peaks are not serving peaks
             ({"enable_torch_compile": True}, "stripped memory layout"),
             ({"batching_max_size": 4}, "batching"),
-            ({"quantization": "fp8"}, "quantized"),
-            ({"component_quantizations": {"transformer": "fp8"}}, "quantized"),
-            ({"transformer_weights_path": "/x.safetensors"}, "quantized"),
-            ({"direct_gpu_weight_loading": True}, "direct GPU"),
         ],
     )
     def test_excluded_paths(self, monkeypatch, overrides, expected_fragment):
@@ -3146,6 +3142,44 @@ class TestAutoResidencySkipReason:
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
         reason = self._skip_reason(self._base_args(**overrides))
         assert reason is not None and expected_fragment in reason
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"quantization": "fp8"},
+            {"component_quantizations": {"image_encoder": "fp8"}},
+            {"transformer_weights_path": "/x.safetensors"},
+            {"direct_gpu_weight_loading": True},
+        ],
+    )
+    def test_fixed_loading_paths_still_calibrate_other_components(
+        self, monkeypatch, overrides
+    ):
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
+        monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        reason = self._skip_reason(self._base_args(**overrides))
+        assert reason is None or reason == "requires CUDA"
+
+    def test_fixed_loading_components_are_excluded_individually(self):
+        from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+            fixed_loading_residency_components,
+        )
+
+        component_names = ("transformer", "transformer_2", "image_encoder", "vae")
+        assert fixed_loading_residency_components(
+            self._base_args(quantization="fp8"), component_names
+        ) == {"transformer", "transformer_2"}
+        assert fixed_loading_residency_components(
+            self._base_args(component_quantizations={"image_encoder": "fp8"}),
+            component_names,
+        ) == {"image_encoder"}
+        assert (
+            fixed_loading_residency_components(
+                self._base_args(transformer_weights_path="/x.safetensors"),
+                component_names,
+            )
+            == set()
+        )
 
     def test_cache_dit_excluded(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)

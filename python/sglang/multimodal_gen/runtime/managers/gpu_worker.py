@@ -118,6 +118,9 @@ from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin 
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSessionCache
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+    fixed_loading_residency_components,
+)
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
@@ -1763,11 +1766,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _fixed_custom_residency_strategy_names(self) -> set[str]:
         if self.pipeline is None:
             return set()
-        return {
+        fixed = {
             name
             for name, strategy in self.pipeline.component_residency_strategies.items()
             if not strategy.supports_auto_residency()
         }
+        fixed.update(
+            fixed_loading_residency_components(self.server_args, self.pipeline.modules)
+        )
+        return fixed
 
     def _latest_auto_residency_round(self) -> list[AppliedResidencyChange]:
         if not self._auto_residency_round_sizes:
