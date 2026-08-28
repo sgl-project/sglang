@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    mamba_cache_chunk_size,
     resolved_view,
     resolving_view,
 )
@@ -847,7 +848,7 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
         validate_mamba_extra_buffer(
             view,
             model_arch,
-            mamba_cache_chunk_size_of=lambda: server_args.mamba_cache_chunk_size,
+            mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
     else:
         validate_mamba_no_buffer(view, model_arch)

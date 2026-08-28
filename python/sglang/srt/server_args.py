@@ -39,7 +39,6 @@ import dataclasses
 import functools
 import json
 import logging
-import math
 import tempfile
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
@@ -57,7 +56,6 @@ from sglang.srt.arg_groups.overrides import (
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
-    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -3733,7 +3731,7 @@ class ServerArgs:
 
         # Everything outside the fields, enumerated from the instance: the raw
         # snapshot, the stash, and what resolution memoized -- including the
-        # `model_config_of()` memo, which the copy carries over rather than
+        # model-configuration memo, which the copy carries over rather than
         # rebuild.
         field_names = {field.name for field in dataclasses.fields(self)}
         for name, value in vars(self).items():
@@ -3754,65 +3752,6 @@ class ServerArgs:
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
-
-    def post_capture_kv_sizing_planned(self) -> bool:
-        """Whether the mem_fraction heuristic may skip the graph reserve; must be
-        False for any config the runtime won't post-capture-size, else it gets an
-        under-reserved fraction."""
-        from sglang.srt.arg_groups.overrides import model_config_of
-
-        cfg = resolving_view(self)
-        # `ModelRunner` writes a bool named `use_mla_backend` onto the record
-        # (see the FIXME there). At args time nothing has, and the answer comes
-        # from the model configuration instead.
-        from sglang.srt.arg_groups.overrides import use_mla_backend
-
-        runner_flag = getattr(self, "use_mla_backend", None)
-        mla_enabled = (
-            bool(runner_flag) if runner_flag is not None else use_mla_backend(self)
-        )
-        if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
-            return False
-        if cfg.device != "cuda":
-            return False
-        if cfg.dcp_size != 1:
-            return False
-        if mla_enabled:
-            return False
-        if cfg.kv_cache_dtype == "fp4_e2m1":
-            return False
-        if cfg.prefill_only_disable_kv_cache:
-            return False
-        if cfg.enable_memory_saver:
-            return False
-        if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
-            return False
-
-        if (
-            cfg.disaggregation_mode != "prefill"
-            and cfg.cuda_graph_config.decode.backend == Backend.DISABLED
-        ):
-            return False
-
-        if cfg.disaggregation_mode != "decode":
-            prefill_cfg = cfg.cuda_graph_config.prefill
-            # We can only skip eager activation headroom when the largest
-            # prefill forward batch size is already graph-captured. Otherwise,
-            # an eager forward will need more memory and lead to OOM.
-            if (
-                prefill_cfg.backend == Backend.DISABLED
-                or cfg.chunked_prefill_size <= 0
-                or self.max_prefill_buffer_tokens() > max(prefill_cfg.bs or (0,))
-            ):
-                return False
-
-        from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
-
-        hf_config = model_config_of(self).hf_config
-        if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
-            return False
-
-        return True
 
     def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
         # Runtime activation working-set reserve for eager decode above the captured
@@ -3840,41 +3779,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 
         return supports_mamba_cache_extra_buffer(self, model_arch)
-
-    def cutedsl_moe_max_num_tokens(self) -> int:
-        """Largest number of tokens a single forward routes through a CuteDSL
-        MoE layer on one (DP) rank. Single source of truth for both the
-        standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
-        budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-        capture, and decode/verify bounds; num_tokens_per_req is
-        speculative_num_draft_tokens under speculative decoding, else 1.
-        """
-        cfg = resolving_view(self)
-        if cfg.speculative_algorithm:
-            num_tokens_per_req = cfg.speculative_num_draft_tokens or 1
-        else:
-            num_tokens_per_req = 1
-        prefill_tokens = cfg.max_prefill_tokens
-        cg_config = cfg.cuda_graph_config
-        if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-            prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-        decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-        decode_tokens = decode_max_bs * num_tokens_per_req
-        return max(prefill_tokens, decode_tokens)
-
-    def max_prefill_buffer_tokens(self) -> int:
-        """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
-        chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
-        cfg = resolving_view(self)
-        chunked = (
-            cfg.chunked_prefill_size
-            if cfg.chunked_prefill_size and cfg.chunked_prefill_size > 0
-            else 0
-        )
-        tokens = chunked
-        if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
-            tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
-        return tokens
 
         # ===== END TO BE REFACTORED ====
 
@@ -4277,72 +4181,6 @@ class ServerArgs:
 
     def enable_mamba_extra_buffer_lazy(self) -> bool:
         return mamba_extra_buffer_lazy_of(resolving_view(self))
-
-    @property
-    def max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count speculative decoding may use.
-
-        Memoized only once the record is resolved: an answer computed off a raw
-        record describes inputs resolution is about to rewrite (auto speculative
-        sizing fills `speculative_num_draft_tokens` in), and a cache filled that
-        early would keep answering with it.
-        """
-        cfg = resolving_view(self)
-
-        memo = self.__dict__.get("_max_speculative_num_draft_tokens")
-        if memo is not None:
-            return memo
-        if cfg.speculative_num_draft_tokens is None:
-            result = None
-        elif not cfg.speculative_adaptive:
-            result = cfg.speculative_num_draft_tokens
-        else:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_candidate_steps_from_config,
-            )
-
-            candidate_steps = resolve_candidate_steps_from_config(
-                cfg_path=cfg.speculative_adaptive_config,
-            )
-            # TODO: adaptive spec currently requires topk=1, so each runtime
-            # state needs steps + 1 draft-token slots. Revisit this if topk>1
-            # is supported.
-            result = max(candidate_steps) + 1
-        if getattr(self, "_resolution_finished", False):
-            self._max_speculative_num_draft_tokens = result
-        return result
-
-    @property
-    def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
-        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
-        # It is used to determine the caching point in a sequence during prefill.
-        # A pre-seeded `_mamba_cache_chunk_size` (fixtures supply one so a dummy
-        # model never loads an HF config) is honored as-is; otherwise the memo
-        # is only kept once the record is resolved, because `page_size` below
-        # is resolution-written.
-        from sglang.srt.arg_groups.overrides import model_config_of
-
-        if not hasattr(self, "_mamba_cache_chunk_size"):
-
-            try:
-                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-                    CHUNK_SIZE as FLA_CHUNK_SIZE,
-                )
-            except ImportError:
-                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
-                FLA_CHUNK_SIZE = 64
-
-            hf_config = model_config_of(self).hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
-            page_size = resolved_view(self).page_size
-            assert (
-                max(chunk_size, page_size) % min(chunk_size, page_size) == 0
-            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
-            if not getattr(self, "_resolution_finished", False):
-                return max(chunk_size, page_size)
-            self._mamba_cache_chunk_size = max(chunk_size, page_size)
-        return self._mamba_cache_chunk_size
 
     def check_server_args(self):
         from sglang.srt.arg_groups.validation_hook import check_server_args

@@ -37,7 +37,10 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import (
+    cutedsl_moe_max_num_tokens,
+    resolution_result,
+)
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
@@ -2100,7 +2103,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
         return server_args
 
     def test_prefill_dominates_in_default_config(self):
-        self.assertEqual(self._args().cutedsl_moe_max_num_tokens(), 16384)
+        self.assertEqual(cutedsl_moe_max_num_tokens(self._args()), 16384)
 
     def test_speculative_decoding_scales_decode_bound(self):
         # decode bound 512 * 8 dominates the small prefill/piecewise bounds
@@ -2110,7 +2113,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
             speculative_algorithm="EAGLE",
             speculative_num_draft_tokens=8,
         )
-        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 4096)
+        self.assertEqual(cutedsl_moe_max_num_tokens(args), 4096)
 
     def test_piecewise_bound_excluded_when_disabled(self):
         args = self._args(
@@ -2118,7 +2121,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
             disable_piecewise_cuda_graph=True,
             cuda_graph_max_bs=64,
         )
-        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
+        self.assertEqual(cutedsl_moe_max_num_tokens(args), 512)
 
 
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
@@ -2470,10 +2473,9 @@ class TestDeepEPv2Args(CustomTestCase):
             dp_size=8,
             enable_dp_attention=True,
         )
-        with patch.object(
-            ServerArgs,
-            "max_speculative_num_draft_tokens",
-            new=property(lambda _self: 16),
+        with patch(
+            "sglang.srt.arg_groups.moe_hook.max_speculative_num_draft_tokens",
+            return_value=16,
         ):
             with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
                 with self.assertRaisesRegex(ValueError, "tokens/request=16"):
