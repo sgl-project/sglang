@@ -6055,7 +6055,7 @@ class ServerArgs:
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
