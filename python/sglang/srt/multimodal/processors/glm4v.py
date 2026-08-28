@@ -425,12 +425,16 @@ def glm_sample_and_decode_sync(vr, video_config=None):
     return frames, _glm_video_metadata(len(vr), fps, duration, indices)
 
 
-def _collapse_consecutive_token_ids(input_ids: list[int], token_id: int) -> list[int]:
-    """Collapse processor-expanded placeholder spans back to one token."""
+def _collapse_glm5_next_image_tokens(
+    input_ids: list[int], image_token_id: int
+) -> list[int]:
+    """Collapse GLM-5.3 processor-expanded image spans to placeholders."""
     return [
         current
         for index, current in enumerate(input_ids)
-        if current != token_id or index == 0 or input_ids[index - 1] != token_id
+        if current != image_token_id
+        or index == 0
+        or input_ids[index - 1] != image_token_id
     ]
 
 
@@ -516,8 +520,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         # the original images. Collapse each image-token span before media
         # loading so one image is not interpreted as N separate placeholders;
         # process_and_combine_mm_data will expand it to the same span again.
-        if isinstance(input_text, list):
-            input_text = _collapse_consecutive_token_ids(input_text, self.IM_TOKEN_ID)
+        if self.hf_config.model_type == "glm5_next" and isinstance(input_text, list):
+            input_text = _collapse_glm5_next_image_tokens(input_text, self.IM_TOKEN_ID)
 
         # Normalize inline media dictionaries before loading. In particular, a
         # bare base64 video must go through SGLang's decoder rather than being
