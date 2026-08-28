@@ -413,13 +413,15 @@ class CudaGraphBufferRegistry:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Phase 1: reset padded regions where it matters.
-        for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None:
-                continue
-            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-            padded_n = slot._padded_n(padded_bs, padded_num_tokens)
-            slot.reset_padding(raw_n, padded_n)
+        # Phase 1: reset padded regions where it matters. Avoid walking every
+        # slot when this replay exactly matches its graph bucket.
+        if raw_bs != padded_bs or raw_num_tokens != padded_num_tokens:
+            for slot in self._slots.values():
+                if not slot.enabled or slot.buffer is None:
+                    continue
+                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
+                padded_n = slot._padded_n(padded_bs, padded_num_tokens)
+                slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
         gpu_dsts: List[torch.Tensor] = []
