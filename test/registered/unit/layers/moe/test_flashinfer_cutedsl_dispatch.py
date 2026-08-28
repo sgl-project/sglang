@@ -1,9 +1,10 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import torch
-
+import pytest
 import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl as cutedsl_runner
+import torch
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
@@ -55,3 +56,7 @@ def test_flashinfer_prefill_returns_standard_combine_input():
     assert isinstance(result, StandardCombineInput)
     assert result.hidden_states is expected_output
     wrapper.run.assert_called_once()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
