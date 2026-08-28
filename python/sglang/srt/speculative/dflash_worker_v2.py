@@ -637,7 +637,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 vocab_size=int(self.model_runner.model_config.vocab_size),
                 block_size=self.block_size,
                 shift_label=self.draft_model.shift_label,
-                max_bs=max(self.server_args.cuda_graph_config.decode.bs),
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 candidate_pool_size=self.domino_candidate_pool_size,
             )
         if not hasattr(lm_head, "shard_indices"):
