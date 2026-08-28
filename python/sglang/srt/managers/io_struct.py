@@ -1002,6 +1002,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # For DP routing
     routed_dp_rank: Optional[int] = None
+    # Internal per-rank sequence assigned by the DP controller. The scheduler
+    # echoes the latest observed value through its load snapshot so projected
+    # routing state is not replaced before all dispatched requests are visible.
+    dp_dispatch_seq: int = 0
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
 

@@ -56,6 +56,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_last_dp_dispatch_seq: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -231,6 +232,7 @@ class SchedulerLoadInquirer:
             num_active_tokens=num_active_tokens,
             num_running_input_tokens=num_running_input_tokens,
             num_assigned_input_tokens=num_assigned_input_tokens,
+            last_dp_dispatch_seq=self.get_last_dp_dispatch_seq(),
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             token_usage=round(kv_token_usage, 4),

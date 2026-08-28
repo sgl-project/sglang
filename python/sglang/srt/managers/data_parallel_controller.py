@@ -111,6 +111,11 @@ class DPBudget:
         self.total_tokens = [0] * dp_size
         self.active_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        self.last_dispatched_seq = [0] * dp_size
+
+    def record_dispatch(self, rank: int) -> int:
+        self.last_dispatched_seq[rank] += 1
+        return self.last_dispatched_seq[rank]
 
     def update_budget(
         self,
@@ -123,6 +128,10 @@ class DPBudget:
             loads_by_rank = {load.dp_rank: load for load in loads}
             if len(loads_by_rank) != self.dp_size or any(
                 load.timestamp == self.last_timestamp[rank]
+                or (
+                    project_pending
+                    and load.last_dp_dispatch_seq < self.last_dispatched_seq[rank]
+                )
                 for rank, load in loads_by_rank.items()
             ):
                 return
@@ -244,6 +253,10 @@ class DataParallelController:
         )
 
         self.dp_budget = DPBudget(get_parallel().dp_size)
+        self._project_pending_load = (
+            self.load_balance_method == LoadBalanceMethod.ACTIVE_TOKENS
+            and get_disagg().disaggregation_mode == "decode"
+        )
         self._active_token_request_cap = None
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
@@ -378,14 +391,10 @@ class DataParallelController:
         if now - self._last_refresh_time < 0.02:
             return
         self._last_refresh_time = now
-        project_pending = (
-            self.load_balance_method == LoadBalanceMethod.ACTIVE_TOKENS
-            and get_disagg().disaggregation_mode == "decode"
-        )
         self.dp_budget.update_budget(
             self.load_snapshot_reader.read_all(),
-            require_full_refresh=project_pending,
-            project_pending=project_pending,
+            require_full_refresh=self._project_pending_load,
+            project_pending=self._project_pending_load,
         )
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
@@ -879,6 +888,8 @@ class DataParallelController:
             estimated_tokens=len(req.input_ids),
             max_requests=self._active_token_request_cap,
         )
+        if self._project_pending_load:
+            req.dp_dispatch_seq = self.dp_budget.record_dispatch(target_worker)
         sock_send(self.workers[target_worker], req)
 
     def dispatch_generate_burst(self, requests):

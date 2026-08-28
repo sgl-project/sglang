@@ -171,6 +171,30 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.active_requests, [3, 5])
 
+    def test_pending_refresh_waits_for_latest_dispatch_ack(self):
+        budget = DPBudget(dp_size=2)
+        budget.active_requests[0] = 1
+        self.assertEqual(budget.record_dispatch(0), 1)
+        budget.update_budget(
+            [
+                _load(dp_rank=0, timestamp=1.0, last_dp_dispatch_seq=0),
+                _load(dp_rank=1, timestamp=1.0, last_dp_dispatch_seq=0),
+            ],
+            require_full_refresh=True,
+            project_pending=True,
+        )
+        self.assertEqual(budget.active_requests, [1, 0])
+
+        budget.update_budget(
+            [
+                _load(dp_rank=0, timestamp=2.0, last_dp_dispatch_seq=1),
+                _load(dp_rank=1, timestamp=2.0, last_dp_dispatch_seq=0),
+            ],
+            require_full_refresh=True,
+            project_pending=True,
+        )
+        self.assertEqual(budget.active_requests, [0, 0])
+
 
 class TestDPBudgetDispatch(CustomTestCase):
     """DPBudget.dispatch picks a rank from current state and updates counters."""

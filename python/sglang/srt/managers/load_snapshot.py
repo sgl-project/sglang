@@ -210,6 +210,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # Original input tokens for all requests already assigned to this rank,
     # including disaggregated-decode preallocation and transfer queues.
     num_assigned_input_tokens: int = 0
+    # Latest per-rank DP-controller assignment observed by this scheduler.
+    last_dp_dispatch_seq: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
     token_usage: float = 0.0
@@ -284,7 +286,7 @@ snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 # ---------------------------------------------------------------------------
 
 MAGIC = b"SLNS"
-VERSION = 4
+VERSION = 5
 HEADER_STRUCT = struct.Struct("<4sHHI")
 SLOT_LEN_STRUCT = struct.Struct("<I")
 SLOT_SIZE = 16 * 1024

@@ -2164,6 +2164,7 @@ class Scheduler(
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
+        self.last_dp_dispatch_seq = 0
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_step: Optional[Tuple[int, float, bool]] = None
         self._sched_idled = False
@@ -2194,6 +2195,7 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_last_dp_dispatch_seq=lambda: self.last_dp_dispatch_seq,
         )
 
     def init_output_streamer(self) -> None:
@@ -2432,6 +2434,9 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        self.last_dp_dispatch_seq = max(
+            self.last_dp_dispatch_seq, recv_req.dp_dispatch_seq
+        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
