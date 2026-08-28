@@ -486,19 +486,17 @@ class ModelRunner:
         if not (get_exec().moe.elastic_ep_backend is not None and is_ep_scale_joiner()):
             return
 
-        join_effective_ep_size = (
-            get_parallel().config.ep_join_rank_offset + self.ps.tp_size
-        )
+        join_effective_ep_size = get_parallel().ep_join_rank_offset + self.ps.tp_size
         dist.barrier(group=self.tp_group.cpu_group)
         if self.ps.tp_rank == 0:
             register_scale_cohort(
-                get_parallel().config.ep_join_rank_offset,
+                get_parallel().ep_join_rank_offset,
                 join_effective_ep_size,
             )
         join_scale_process_group()
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -654,7 +652,6 @@ class ModelRunner:
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
-            server_args=self.server_args,
             moe_ep_size=self.ps.moe_ep_size,
             moe_ep_rank=self.ps.moe_ep_rank,
         )
@@ -697,7 +694,7 @@ class ModelRunner:
         if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
-            get_parallel().config.ep_join_rank_offset if is_ep_scale_joiner() else 0
+            get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
         )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
@@ -928,7 +925,7 @@ class ModelRunner:
             device=self.device,
             tp_group=(
                 self.attention_tp_group.cpu_group
-                if get_parallel().config.enable_dp_attention
+                if get_parallel().enable_dp_attention
                 else self.tp_group.cpu_group
             ),
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
@@ -964,7 +961,7 @@ class ModelRunner:
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
 
-        global_ep_rank = self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
             model_config=self.model_config,
             moe_ep_rank=global_ep_rank,
@@ -1004,7 +1001,7 @@ class ModelRunner:
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
 
-        if get_parallel().dcp_enabled and get_parallel().config.dcp_replicate_q_proj:
+        if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
 
     def _prepare_replicated_q_proj(self) -> None:
@@ -1189,7 +1186,6 @@ class ModelRunner:
         # before configure_kv_cache_dtype.)
         load_kv_cache_scales(
             model=self.model,
-            server_args=self.server_args,
             kv_cache_dtype=get_model().kv_cache_dtype,
         )
 
@@ -1282,7 +1278,7 @@ class ModelRunner:
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
-        if get_parallel().config.dwdp_size <= 1:
+        if get_parallel().dwdp_size <= 1:
             return
         from sglang.srt.layers.moe.dwdp import DwdpManager
 
@@ -1455,7 +1451,7 @@ class ModelRunner:
         # rather than spawning additional processes, so dp_size must not be
         # multiplied into the process count here (unlike regular DP, where
         # dp_size * tp_size * pp_size is the true worker count).
-        dp_size = 1 if get_parallel().config.enable_dp_attention else self.ps.dp_size
+        dp_size = 1 if get_parallel().enable_dp_attention else self.ps.dp_size
         self.local_omp_cpuid = numa_utils.init_threads_binding(
             numa_index=self.gpu_id,
             world_size=dp_size * self.ps.tp_size * self.ps.pp_size,
@@ -1938,7 +1934,7 @@ class ModelRunner:
         if added <= 0:
             return
 
-        initial_ep_size = get_parallel().config.elastic_ep_initial_size
+        initial_ep_size = get_parallel().elastic_ep_initial_size
         assert initial_ep_size is not None
         get_context().override("elastic_ep.scale", ep_size=effective_size)
 
@@ -1956,7 +1952,7 @@ class ModelRunner:
         set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
 
     def _elastic_global_rank(self) -> int:
-        return self.ps.tp_rank + get_parallel().config.ep_join_rank_offset
+        return self.ps.tp_rank + get_parallel().ep_join_rank_offset
 
     def _rearm_eplb_after_elastic_scale(self) -> None:
         if self.eplb_manager is None:
