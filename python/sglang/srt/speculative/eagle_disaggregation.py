@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import get_dsa_seed_metadata_dim
 from sglang.srt.layers.attention.dsa.utils import (
     should_remap_pd_dsa_seed_to_local_slots,
 )
@@ -18,11 +19,7 @@ if TYPE_CHECKING:
 
 
 def _requires_dsa_seed_for_cuda_graph(hf_config, topk: int) -> bool:
-    return (
-        topk == 1
-        and getattr(hf_config, "index_share_for_mtp_iteration", False)
-        and getattr(hf_config, "index_topk", None) is not None
-    )
+    return topk == 1 and get_dsa_seed_metadata_dim(hf_config) > 0
 
 
 def build_eagle_disagg_draft_input(

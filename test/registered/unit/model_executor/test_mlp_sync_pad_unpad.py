@@ -66,7 +66,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         batch = SimpleNamespace(
             global_num_tokens=[2, 0, 3],
             global_num_tokens_for_logprob=[2, 0, 3],
-            can_run_dp_cuda_graph=True,
+            can_run_decode_cuda_graph=True,
             can_run_dp_draft_cuda_graph=False,
         )
 
@@ -79,7 +79,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         torch.testing.assert_close(
             fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
         )
-        self.assertTrue(fb.can_run_dp_cuda_graph)
+        self.assertTrue(fb.can_run_decode_cuda_graph)
         self.assertFalse(fb.can_run_dp_draft_cuda_graph)
 
     def test_draft_graph_gate_has_an_independent_dp_vote(self):
@@ -120,7 +120,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             spec_info=SimpleNamespace(num_tokens_per_req=1),
             batch_size=1,
             seq_lens=torch.ones(1),
-            can_run_dp_cuda_graph=True,
+            can_run_decode_cuda_graph=True,
             can_run_dp_draft_cuda_graph=False,
         )
 
@@ -223,6 +223,38 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # sample() derives prefill sampling positions from seq_lens - 1, so the
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
+
+    def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
+        spec_info = MagicMock()
+        spec_info.num_tokens_per_req = 4
+        spec_info.is_draft_input.return_value = False
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            batch_size=1,
+            input_ids=torch.empty(0, dtype=torch.int64),
+            req_pool_indices=torch.empty(0, dtype=torch.int64),
+            seq_lens=torch.empty(0, dtype=torch.int64),
+            seq_lens_sum=0,
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int64),
+            seq_lens_cpu=torch.empty(0, dtype=torch.int64),
+            extend_seq_lens=torch.empty(0, dtype=torch.int32),
+            extend_prefix_lens=torch.empty(0, dtype=torch.int64),
+            extend_seq_lens_cpu=[],
+            extend_prefix_lens_cpu=[],
+            extend_logprob_start_lens_cpu=[],
+            spec_info=spec_info,
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=4, bs=1)
+
+        torch.testing.assert_close(
+            fb.extend_seq_lens, torch.tensor([4], dtype=torch.int32)
+        )
+        torch.testing.assert_close(fb.extend_prefix_lens, torch.tensor([0]))
+        self.assertEqual(fb.extend_seq_lens_cpu, [4])
+        self.assertEqual(fb.extend_prefix_lens_cpu, [0])
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
 
 
 if __name__ == "__main__":

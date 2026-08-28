@@ -6,9 +6,9 @@ resolution the fields are the record the config bags were projected from, so a
 write desyncs every namespace reader, and a copy invites publishing stale
 variants. Both are gone: post-publish changes go to the bags
 (``get_context().override``), a value one runner or worker owns travels as a
-constructor argument, and late launcher-stage resolution writes in place
-through ``arg_groups.overrides.declare_late_resolution``, which refuses the
-published instance.
+constructor argument, and late launcher-stage resolution declares through
+``arg_groups.overrides.declare_late_resolution``, which writes no field and
+refuses the published instance.
 
 The textual half of this guard matters because the resolution pipeline's own file
 is exempt from the mutation ratchet: a ``self.override(...)`` there — exactly

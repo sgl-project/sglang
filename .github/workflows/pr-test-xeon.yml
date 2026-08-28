@@ -83,11 +83,41 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     strategy:
+      fail-fast: true
       matrix:
         include:
+          # GNR runs only the TP suite (needs >=6 NUMA nodes for --tp 6),
+          # full machine, no partitioning. 4 files: 3 TP + autoround.
           - runner: xeon-gnr
-            suite: base-b-test-cpu
-            partition_args: ""
+            role: gnr
+            suite: "base-b-tp-test-cpu"
+            name: gnr
+
+          # Three SPR boxes each run ONE full-machine container taking one
+          # partition of a 3-way split over the merged non-TP pool
+          # (base-b non-TP + base-c). Single container per box (no socket
+          # split): sglang auto-computes mem_fraction_static from host memory
+          # and does not honor cgroup limits, so two parallel containers on
+          # one box exhaust host RAM and OOM (tracked upstream). One container
+          # per box keeps each server within the box's memory budget.
+          - runner: xeon-spr
+            role: spr
+            suite: "base-b-test-cpu,base-c-test-cpu"
+            name: spr1
+            part_id: 0
+            part_size: 3
+          - runner: xeon-spr
+            role: spr
+            suite: "base-b-test-cpu,base-c-test-cpu"
+            name: spr2
+            part_id: 1
+            part_size: 3
+          - runner: xeon-spr
+            role: spr
+            suite: "base-b-test-cpu,base-c-test-cpu"
+            name: spr3
+            part_id: 2
+            part_size: 3
     steps:
       - name: Cleanup workspace
         run: |
@@ -100,10 +130,12 @@ jobs:
           clean: false
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Build and Push
+      - name: Build image
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
-          tag=v${version}-xeon
+          # Fixed tag (no SHA): a new build overwrites the previous image so a
+          # self-hosted box does not accumulate multi-GB images across PRs.
+          # --no-cache keeps the CPU image clean (past sgl-eval/accelerate gaps
+          # came from stale layers). One build per job, one container per box.
           PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
           PR_HEAD_REF=${{ github.head_ref }}
 
@@ -112,37 +144,68 @@ jobs:
             ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
             . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
 
-      - name: Run container
+      # ==================== GNR: full machine, TP suite ==================== #
+      - name: Run container (GNR)
+        if: matrix.role == 'gnr'
         run: |
+          docker rm -f ci_sglang_${{ matrix.name }} || true
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+            -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
-            --name ci_sglang_${{ matrix.runner }} \
+            --name ci_sglang_${{ matrix.name }} \
             sglang_xeon
 
-      - name: Check AMX support
-        id: check_amx
+      - name: Check AMX support (GNR)
+        if: matrix.role == 'gnr'
         timeout-minutes: 5
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.runner }} \
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
             bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
 
-      - name: Run unit tests
+      - name: Run unit tests (GNR)
+        if: matrix.role == 'gnr'
         timeout-minutes: 120
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.runner }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} ${{ matrix.partition_args }}"
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --timeout-from-est-time"
 
+      # ============ SPR: single full-machine container, one partition ====== #
+      - name: Run container (SPR)
+        if: matrix.role == 'spr'
+        run: |
+          docker rm -f ci_sglang_${{ matrix.name }} || true
+          docker run -dt \
+            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+            -v $HOME/.cache/sgl_eval:/root/.cache/sgl_eval \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
+            --name ci_sglang_${{ matrix.name }} \
+            sglang_xeon
+
+      - name: Check AMX support (SPR)
+        if: matrix.role == 'spr'
+        timeout-minutes: 5
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
+
+      - name: Run unit tests (SPR)
+        if: matrix.role == 'spr'
+        timeout-minutes: 120
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.name }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --auto-partition-id ${{ matrix.part_id }} --auto-partition-size ${{ matrix.part_size }} --timeout-from-est-time"
+
+      # ============================ Common ================================= #
       - name: Change permission
+        if: always()
         timeout-minutes: 2
         run: |
-          docker exec -u root ci_sglang_${{ matrix.runner }} bash -c "
-            rm -rf /tmp/ci-home  &&
-            chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
-          "
+          docker exec -u root ci_sglang_${{ matrix.name }} bash -c "rm -rf /tmp/ci-home && chown -R $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true" 2>/dev/null || true
 
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f ci_sglang_${{ matrix.runner }} || true
+          docker rm -f ci_sglang_${{ matrix.name }} || true
