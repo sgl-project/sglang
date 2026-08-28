@@ -1967,10 +1967,7 @@ class TestSizeAccounting:
 
         runtime = component_runtime_weight_bytes({"transformer": module})
 
-        assert runtime["transformer"] == (
-            module.layers[0].cache.untyped_storage().nbytes()
-            + manager.peak_managed_device_weight_bytes()
-        )
+        assert runtime["transformer"] == manager.peak_managed_device_weight_bytes()
 
 
 class TestCollectResidencyTargets:
