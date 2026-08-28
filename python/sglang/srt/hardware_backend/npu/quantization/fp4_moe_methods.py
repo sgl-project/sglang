@@ -8,14 +8,11 @@ for the plain (init-routing) path and for the DeepEP dispatch path.
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.activation.swiglu_mxfp8_quant import swiglu_quant
 
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    _get_float4_e2m1fn_x2_dtype,
-    _get_float8_e8m0fnu_dtype,
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    prepare_w4a8_mxfp_weight,
+    w4a8_mxfp_gmm,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
 
@@ -24,44 +21,6 @@ if TYPE_CHECKING:
 
 # MXFP4 group size, fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
-
-
-def _configure_dsv4_deepep_dispatcher(layer: torch.nn.Module) -> None:
-    """Select the DSV4 FP4 DeepEP wire format without changing other MoEs."""
-    dispatcher = getattr(layer, "dispatcher", None)
-    if dispatcher is None:
-        return
-
-    # This method is only instantiated for DSV4 FP4 experts on A5 today, but
-    # retain the former BF16 setting if that selection changes in the future.
-    if not is_npu_arch35():
-        dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
-        return
-
-    # Import lazily to avoid importing the MoE backend during quant method
-    # module initialization.
-    from sglang.srt.layers.moe import get_moe_a2a_backend
-
-    if not get_moe_a2a_backend().is_deepep():
-        dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
-        return
-
-    low_latency_dtype = envs.SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE.get()
-    if low_latency_dtype not in {"mxfp8", "bf16"}:
-        raise ValueError(
-            "SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE must be one of "
-            "'mxfp8' or 'bf16' for A5 DSV4 DeepEP low-latency dispatch; "
-            f"got {low_latency_dtype!r}."
-        )
-
-    # The concrete dispatcher selects one mode-specific value. Normal (prefill)
-    # remains BF16, while low-latency (decode) defaults to MXFP8.
-    dispatcher.set_quant_config(
-        {
-            "normal_dispatcher_output_dtype": "bf16",
-            "low_latency_dispatcher_output_dtype": low_latency_dtype,
-        }
-    )
 
 
 def _wrap_mxfp4_scale_weight_loader(weight_loader):
@@ -157,7 +116,7 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
         self._fp8.moe_runner_config = moe_runner_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
+        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
 
         if layer.w13_weight_scale_inv.data.max() == 0:
             raise RuntimeError(
@@ -172,28 +131,22 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
                 "not match w2_weight_scale_inv."
             )
 
-        nz_kwargs = {
-            "customize_dtype": torch.float8_e4m3fn,
-            "input_dtype": _get_float4_e2m1fn_x2_dtype(),
-        }
         nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
-        layer.w13_weight.data = npu_format_cast(
-            layer.w13_weight.data.view(torch.uint8), nz_format, **nz_kwargs
-        ).transpose(1, 2)
-        layer.w2_weight.data = npu_format_cast(
-            layer.w2_weight.data.view(torch.uint8), nz_format, **nz_kwargs
-        ).transpose(1, 2)
-
-        layer.w13_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w13_weight_scale_inv.data),
-            requires_grad=False,
+        layer.w13_weight.data, w13_scale = prepare_w4a8_mxfp_weight(
+            layer.w13_weight.data.view(torch.uint8),
+            layer.w13_weight_scale_inv.data,
+            npu_format=nz_format,
         )
-        layer.w2_weight_scale_inv = torch.nn.Parameter(
-            _reshape_mxfp4_scale_for_npu(layer.w2_weight_scale_inv.data),
-            requires_grad=False,
+        layer.w2_weight.data, w2_scale = prepare_w4a8_mxfp_weight(
+            layer.w2_weight.data.view(torch.uint8),
+            layer.w2_weight_scale_inv.data,
+            npu_format=nz_format,
         )
+        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
 
-        _configure_dsv4_deepep_dispatcher(layer)
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
     def apply(
         self,
@@ -231,19 +184,6 @@ class NPUW4A4Fp4MoEMethod(FusedMoEMethodBase):
             swiglu_limit=moe_runner_config.swiglu_limit,
         )
         return StandardCombineInput(hidden_states=output)
-
-
-def _reshape_mxfp4_scale_for_npu(scale: torch.Tensor) -> torch.Tensor:
-    """``[E, N, K/32] -> [E, K/64, N, 2]``, the packed-pair layout the GMM wants."""
-    if scale.dim() != 3:
-        return scale
-    num_experts, n, k32 = scale.shape
-    if k32 % 2 != 0:
-        raise ValueError(
-            "MXFP4 scale K dimension must be divisible by 2 for the "
-            f"[E, K/64, N, 2] layout, got {tuple(scale.shape)}."
-        )
-    return scale.view(num_experts, n, k32 // 2, 2).transpose(1, 2)
 
 
 def _apply_swiglu_limit_npu(
@@ -330,18 +270,11 @@ def npu_fused_experts_w4a4_mxfp(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    assert swiglu_limit is not None
-    hidden_states, hidden_states_scale = swiglu_quant(
-        hidden_states,
-        group_list=expert_tokens,
-        group_list_type=0,
-        need_quant=True,
-        do_limit=True,
-        limit=swiglu_limit,
-    )
+    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
-        input_scale=hidden_states_scale,
+        input_scale=None,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=0,
@@ -405,18 +338,11 @@ def npu_fused_experts_w4a4_mxfp_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    assert swiglu_limit is not None
-    hidden_states, hidden_states_scale = swiglu_quant(
-        hidden_states,
-        group_list=expert_tokens,
-        group_list_type=group_list_type,
-        need_quant=True,
-        do_limit=True,
-        limit=swiglu_limit,
-    )
+    _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = w4a8_mxfp_gmm(
         input=hidden_states,
-        input_scale=hidden_states_scale,
+        input_scale=None,
         weight=w2,
         weight_scale=w2_weight_scale_inv,
         group_list_type=group_list_type,
@@ -521,110 +447,14 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_list=group_list,
         output_dtype=output_dtype,
     )
-    assert layer.moe_runner_config.swiglu_limit is not None
-    hidden_states, hidden_states_scale = swiglu_quant(
-        hidden_states,
-        group_list=group_list,
-        group_list_type=group_list_type,
-        need_quant=True,
-        do_limit=True,
-        limit=layer.moe_runner_config.swiglu_limit,
-    )
+    _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     return w4a8_mxfp_gmm(
         input=hidden_states,
-        input_scale=hidden_states_scale,
+        input_scale=None,
         weight=layer.w2_weight,
         weight_scale=layer.w2_weight_scale_inv,
         group_list_type=group_list_type,
         group_list=group_list,
         output_dtype=output_dtype,
     )
-
-
-def _pair_pack_mxfp_act_scale(
-    scale: torch.Tensor, input_shape: Optional[tuple[int, int]] = None
-) -> torch.Tensor:
-    """Adapt MXFP activation scales to the A5 GMM ``[M, K/64, 2]`` layout.
-
-    Low-latency DeepEP MXFP8 returns a flat E8M0 scale buffer, one byte for
-    every 32 activation elements. The grouped-matmul kernel expects those
-    bytes paired on the final dimension instead.
-    """
-    if scale.ndim == 1:
-        if input_shape is None or len(input_shape) != 2:
-            raise ValueError(
-                "A flat MXFP activation scale requires its two-dimensional "
-                "activation input shape."
-            )
-        num_tokens, hidden_size = input_shape
-        if hidden_size % (2 * MXFP4_BLOCK_SIZE) != 0:
-            raise ValueError(
-                "MXFP activation hidden size must be divisible by "
-                f"{2 * MXFP4_BLOCK_SIZE}; got {hidden_size}."
-            )
-        expected_num_scales = num_tokens * (hidden_size // MXFP4_BLOCK_SIZE)
-        if scale.numel() != expected_num_scales:
-            raise ValueError(
-                "Invalid flat MXFP activation scale length: expected "
-                f"{expected_num_scales} for input shape {input_shape}, got "
-                f"{scale.numel()}."
-            )
-        scale = scale.reshape(num_tokens, hidden_size // MXFP4_BLOCK_SIZE)
-
-    # ``[M, K/32] -> [M, K/64, 2]`` MX per-token scale layout for the A5 GMM.
-    if scale.ndim != 2:
-        return scale
-    if scale.shape[-1] % 2 != 0:
-        raise ValueError(f"Invalid MXFP per-token scale shape: {tuple(scale.shape)}")
-    return scale.reshape(scale.shape[0], scale.shape[1] // 2, 2)
-
-
-def w4a8_mxfp_gmm(
-    *,
-    input: torch.Tensor,
-    input_scale: Optional[torch.Tensor],
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    group_list_type: int,
-    group_list: torch.Tensor,
-    output_dtype: torch.dtype,
-    scale_alg=None,
-) -> torch.Tensor:
-    """FP4 weight x FP8-e4m3 activation (the checkpoint's W4A8_MXFP scheme).
-
-    W4A8MXFP GMM call: FP8 ``x_dtype``, FP4
-    ``weight_dtype``, and the weight block scales fed through ``antiquant_scale``
-    with ``scale=None`` — the ``scale=`` + ``scale_dtype=`` form belongs to
-    W4A4_MXFP4 and dequantizes differently.
-    """
-    group_list = group_list.to(torch.int64)
-    if input_scale is None:
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            input,
-            axis=1,
-            round_mode="rint",
-            dst_type=torch.float8_e4m3fn,
-            block_size=MXFP4_BLOCK_SIZE,
-            scale_alg=scale_alg,
-        )
-    else:
-        x, x_scale = input, input_scale
-
-    return torch.ops.npu.npu_grouped_matmul(
-        [x],
-        [weight],
-        scale=None,
-        antiquant_scale=[weight_scale],
-        scale_dtype=None,
-        per_token_scale=[
-            _pair_pack_mxfp_act_scale(x_scale, input_shape=tuple(x.shape))
-        ],
-        split_item=2,
-        group_type=0,
-        group_list=group_list,
-        group_list_type=group_list_type,
-        output_dtype=output_dtype,
-        x_dtype=torch.float8_e4m3fn,
-        weight_dtype=_get_float4_e2m1fn_x2_dtype(),
-        per_token_scale_dtype=_get_float8_e8m0fnu_dtype(),
-    )[0]
