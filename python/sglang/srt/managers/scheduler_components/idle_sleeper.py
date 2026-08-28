@@ -46,7 +46,7 @@ class RustServerIdleSleeper:
     """Idle sleeper for the embedded Rust server.
 
     The Rust ingress is an in-process request ring, not a zmq socket.
-    Instead park directly on the ring: ``wait_ingress`` blocks until
+    Instead park directly on the ring: ``wait_request`` blocks until
     a request is pushed — the request ring wakes the parked thread
     the instant a producer pushes, so there's no added latency for real
     requests — or the timeout elapses.
@@ -59,7 +59,7 @@ class RustServerIdleSleeper:
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
     def maybe_sleep(self):
-        self.rust_server.wait_ingress(self.timeout_ms)
+        self.rust_server.wait_request(self.timeout_ms)
         if (
             self.empty_cache_interval > 0
             and real_time() - self.last_empty_time > self.empty_cache_interval
