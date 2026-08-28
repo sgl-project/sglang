@@ -57,12 +57,11 @@ def _mtp_quant_config(quant_config):
     # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
     # BF16. Disable quantization for those checkpoints; non-serialized
     # modelopt_fp4 still converts MoE expert weights on load.
+    if quant_config and quant_config.get_name() == "modelopt_mixed":
+        return getattr(quant_config, "mtp_quant_config", None)
     if quant_config and (
-        quant_config.get_name() == "modelopt_mixed"
-        or (
-            quant_config.get_name() == "modelopt_fp4"
-            and quant_config.is_checkpoint_nvfp4_serialized
-        )
+        quant_config.get_name() == "modelopt_fp4"
+        and quant_config.is_checkpoint_nvfp4_serialized
     ):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:

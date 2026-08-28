@@ -780,6 +780,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
+        mtp_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
@@ -788,6 +789,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        # Qwen checkpoints normally keep the embedded MTP module unquantized,
+        # even when the target uses ModelOpt mixed precision.  A checkpoint
+        # may opt into a separately serialized MTP format (currently block
+        # FP8) without changing the target model's mixed/residue dispatch.
+        self.mtp_quant_config = mtp_quant_config
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -814,6 +820,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         kv_cache_quant_algo = None
         exclude_modules = None
         quantized_layers = {}
+        mtp_quantization_config = config.get("mtp_quantization_config")
 
         quant_algo = config.get("quant_algo")
         if quant_algo is not None:
@@ -841,6 +848,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             kv_cache_quant_algo = quantization_section.get("kv_cache_quant_algo")
             exclude_modules = quantization_section.get("exclude_modules")
             quantized_layers = quantization_section.get("quantized_layers", {})
+            mtp_quantization_config = quantization_section.get(
+                "mtp_quantization_config", mtp_quantization_config
+            )
 
         if quant_algo != "MIXED_PRECISION":
             raise ValueError(
@@ -882,6 +892,24 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        mtp_quant_config = None
+        if mtp_quantization_config is not None:
+            if not isinstance(mtp_quantization_config, dict):
+                raise ValueError("mtp_quantization_config must be a dictionary.")
+            mtp_quant_method = str(
+                mtp_quantization_config.get("quant_method", "")
+            ).lower()
+            if mtp_quant_method != "fp8":
+                raise ValueError(
+                    "modelopt_mixed currently supports only an FP8 "
+                    "mtp_quantization_config."
+                )
+            mtp_quant_config = Fp8Config.from_config(mtp_quantization_config)
+            # The target's NVFP4 experts use FlashInfer CUTLASS, but this
+            # separately serialized MTP module has native FP8 experts. Mark
+            # only this child config for the supported Triton fallback; stock
+            # FP8 configs and the target model keep their existing routing.
+            mtp_quant_config.force_triton_moe_runner = True
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -908,6 +936,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             mxfp8_config=mxfp8_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
+            mtp_quant_config=mtp_quant_config,
         )
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):

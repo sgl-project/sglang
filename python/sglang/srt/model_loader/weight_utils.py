@@ -259,6 +259,24 @@ def _resolve_explicit_draft_quant_config(
     return quant_config
 
 
+def _finalize_quant_config(
+    model_config: ModelConfig,
+    quant_config: QuantizationConfig,
+) -> QuantizationConfig:
+    """Draft-config resolution + checkpoint-driven residue detection.
+
+    A ModelOpt NVFP4 checkpoint that ships residue_kernel_metadata.json is
+    served by the residue-aware config; without the file the stock config is
+    returned unchanged. A present-but-invalid file raises at load.
+    """
+    quant_config = _resolve_explicit_draft_quant_config(model_config, quant_config)
+    from sglang.srt.layers.quantization.residue_nvfp4.config import (
+        maybe_wrap_residue_fp4_config,
+    )
+
+    return maybe_wrap_residue_fp4_config(model_config, quant_config)
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -266,7 +284,13 @@ def get_quant_config(
     packed_modules_mapping: Dict[str, List[str]],
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
-    quant_cls = get_quantization_config(model_config.quantization)
+    if model_config.quantization == "modelopt_fp4_residue":
+        # The residue config cannot be built from the HF config alone; parse
+        # as stock modelopt_fp4 and let _finalize_quant_config attach the
+        # (required) residue metadata.
+        quant_cls = get_quantization_config("modelopt_fp4")
+    else:
+        quant_cls = get_quantization_config(model_config.quantization)
 
     # GGUF doesn't have config file
     if model_config.quantization == "gguf":
@@ -297,7 +321,7 @@ def get_quant_config(
             if model_config.quantization in REQUANTIZATION_METHODS:
                 hf_quant_config["requantization_method"] = model_config.quantization
 
-            return _resolve_explicit_draft_quant_config(
+            return _finalize_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
 
@@ -415,12 +439,10 @@ def get_quant_config(
             elif "FP4" in quant_algo:
                 if not issubclass(quant_cls, ModelOptFp4Config):
                     quant_cls = ModelOptFp4Config
-                return _resolve_explicit_draft_quant_config(
+                return _finalize_quant_config(
                     model_config, quant_cls.from_config(config)
                 )
-        return _resolve_explicit_draft_quant_config(
-            model_config, quant_cls.from_config(config)
-        )
+        return _finalize_quant_config(model_config, quant_cls.from_config(config))
 
 
 def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:

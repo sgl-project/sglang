@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_RESIDUE_BLACKWELL = frozenset(
+    CapabilityRequirement.cuda(min_sm=sm, max_sm=sm) for sm in ((10, 0), (10, 3))
+)
 
 register_kernel(
     KernelSpec(
@@ -161,3 +164,37 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="gemm.residue_fold",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.residue_fold:run_fold",
+        capabilities=_RESIDUE_BLACKWELL,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float16"),
+            description=(
+                "mext_r1 fold GEMM: row-pair FP4 activation x packed "
+                "FP4 weight, (base, residue) output pairs summed in-kernel"
+            ),
+        ),
+        description="Residue NVFP4 mext_r1 fold GEMM (CuTeDSL, Blackwell).",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="gemm.residue_nvfp4_linear",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.residue_nvfp4_linear:nvfp4_linear",
+        capabilities=_RESIDUE_BLACKWELL,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float16"),
+            description=(
+                "opaque residue NVFP4 dense linear: quant + GEMM in one op; "
+                "per-layer constants select fold / two-GEMM / plain chains"
+            ),
+        ),
+        description="Residue NVFP4 dense linear dispatch (opaque custom op).",
+    )
+)

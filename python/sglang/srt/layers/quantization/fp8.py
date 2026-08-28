@@ -235,6 +235,7 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
+        force_triton_moe_runner: bool = False,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -259,6 +260,10 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        # Used by an independently serialized FP8 MTP child config when the
+        # target model selects a MoE backend that cannot consume native FP8
+        # experts. Default-off keeps every stock FP8 config unchanged.
+        self.force_triton_moe_runner = force_triton_moe_runner
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -2345,6 +2350,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        # A ModelOpt mixed checkpoint can explicitly mark its separately
+        # serialized FP8 MTP config for this fallback. Keep stock FP8 behavior
+        # unchanged and retain FlashInfer CUTLASS for the target's NVFP4 MoE.
+        if moe_runner_backend.is_flashinfer_cutlass() and getattr(
+            self.quant_config, "force_triton_moe_runner", False
+        ):
+            print_warning_once(
+                "The flashinfer_cutlass MoE backend does not support native "
+                "FP8 experts. Falling back to the Triton MoE runner for this "
+                "FP8 layer."
+            )
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_deep_gemm()
