@@ -440,6 +440,157 @@ void causal_conv1d_update_kernel_impl(
   });
 }
 
+// Store one token's conv window for the post-verify rollback. `cols` lists the
+// window columns oldest-first, each a [dim] slice of a dim-contiguous source;
+// the destination entry is [dim, state_len], so the copy transposes.
+template <typename scalar_t>
+inline void store_intermediate_conv_window(
+    scalar_t* __restrict__ dst, const scalar_t* const* cols, int64_t dim, int64_t state_len) {
+  for (int64_t d = 0; d < dim; ++d) {
+    for (int64_t w = 0; w < state_len; ++w) {
+      dst[d * state_len + w] = cols[w][d];
+    }
+  }
+}
+
+// Tree (topk > 1) target-verify update: each draft token convolves over its
+// ancestor chain in the draft tree. Walking past the root reads the committed
+// conv_states history, which stays untouched here because siblings share it.
+// Also derives retrieve_parent_token for the downstream delta-rule verify.
+//
+// input / out : [batch, seqlen, dim] token-major
+// conv_states : [num_lines, dim, width - 1] with dim contiguous (as_strided)
+// weight      : vnni-packed [dim/BLOCK_N, width/2, BLOCK_N, 2]
+// retrieve_*  : [>= batch, >= seqlen] int64 rows
+// icw         : [cache_size, icw_steps, dim, width - 1] contiguous
+template <typename scalar_t>
+void causal_conv1d_update_tree_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ conv_states,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ conv_indices,
+    const int64_t* __restrict__ next_token,
+    const int64_t* __restrict__ next_sibling,
+    int64_t* __restrict__ parent_token,
+    scalar_t* __restrict__ icw,
+    const int32_t* __restrict__ icw_indices,
+    int64_t icw_steps,
+    bool silu_activation,
+    int64_t batch,
+    int64_t dim,
+    int64_t seqlen,
+    int64_t width,
+    int64_t next_token_stride,
+    int64_t next_sibling_stride,
+    int64_t parent_token_stride) {
+  const bool has_conv_indices = conv_indices != nullptr;
+  const int64_t state_len = width - 1;
+
+  // step 1: derive each token's parent. A child or sibling link always points
+  // at a larger index, so ascending order sees parent[t] final before use.
+  at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t bs = begin; bs < end; ++bs) {
+      const int64_t* nt = next_token + bs * next_token_stride;
+      const int64_t* ns = next_sibling + bs * next_sibling_stride;
+      int64_t* parent = parent_token + bs * parent_token_stride;
+      std::fill(parent, parent + seqlen, int64_t(0));
+      for (int64_t t = 0; t < seqlen; ++t) {
+        if (nt[t] != -1) {
+          parent[nt[t]] = t;
+        }
+        if (ns[t] != -1) {
+          parent[ns[t]] = parent[t];
+        }
+      }
+    }
+  });
+
+  // step 2: unpack the vnni-packed weight to per-tap fp32 columns [width, dim]
+  constexpr int64_t BN = block_size_n();
+  const int64_t K2 = width / 2;
+  std::vector<float> w_taps(width * dim);
+  for (int64_t k = 0; k < width; ++k) {
+    for (int64_t d = 0; d < dim; ++d) {
+      w_taps[k * dim + d] = static_cast<float>(weight[(((d / BN) * K2 + (k >> 1)) * BN + d % BN) * 2 + (k & 1)]);
+    }
+  }
+
+  // step 3: convolve each token over its ancestors; tokens are independent
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = bVec::size();
+  constexpr int64_t fVecSize = fVec::size();
+  const bool has_bias = bias != nullptr;
+
+  at::parallel_for(0, batch * seqlen, 0, [&](int64_t begin, int64_t end) {
+    std::vector<const scalar_t*> srcs(width);
+    std::vector<const scalar_t*> cols(state_len);
+
+    for (int64_t i = begin; i < end; ++i) {
+      int64_t bs = i / seqlen;
+      int64_t t = i % seqlen;
+
+      // padded rows carry a negative slot and their output is discarded
+      int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+      if (conv_state_index < 0) {
+        continue;
+      }
+
+      // sources newest-to-oldest: self, then up the tree; indices <= 0 map
+      // onto the committed history columns (0 -> newest = state_len - 1)
+      const int64_t* parent = parent_token + bs * parent_token_stride;
+      int64_t idx = t;
+      for (int64_t j = 0; j < width; ++j) {
+        srcs[j] = (idx >= 0) ? input + (bs * seqlen + idx) * dim
+                             : conv_states + conv_state_index * state_len * dim + (state_len + idx) * dim;
+        idx = (idx > 0) ? parent[idx] : idx - 1;
+      }
+
+      scalar_t* out_ptr = out + (bs * seqlen + t) * dim;
+      int64_t d = 0;
+      for (; d <= dim - kVecSize; d += kVecSize) {
+        fVec acc0(0.f), acc1(0.f);
+        if (has_bias) {
+          std::tie(acc0, acc1) = load_float_vec2(bias + d);
+        }
+        for (int64_t j = 0; j < width; ++j) {
+          const float* w_ptr = w_taps.data() + (width - 1 - j) * dim + d;
+          auto [x0, x1] = load_float_vec2(srcs[j] + d);
+          acc0 = acc0 + x0 * fVec::loadu(w_ptr);
+          acc1 = acc1 + x1 * fVec::loadu(w_ptr + fVecSize);
+        }
+        if (silu_activation) {
+          acc0 = fast_silu(acc0);
+          acc1 = fast_silu(acc1);
+        }
+        bVec out_vec = at::vec::convert_from_float<scalar_t>(acc0, acc1);
+        out_vec.store(out_ptr + d);
+      }
+      for (; d < dim; ++d) {
+        float acc = has_bias ? static_cast<float>(bias[d]) : 0.f;
+        for (int64_t j = 0; j < width; ++j) {
+          acc += static_cast<float>(srcs[j][d]) * w_taps[(width - 1 - j) * dim + d];
+        }
+        if (silu_activation) {
+          acc = acc / (1.f + std::exp(-acc));
+        }
+        out_ptr[d] = static_cast<scalar_t>(acc);
+      }
+
+      // srcs is newest-first, the window oldest-first
+      if (icw != nullptr && icw_indices[bs] >= 0) {
+        for (int64_t w = 0; w < state_len; ++w) {
+          cols[w] = srcs[state_len - 1 - w];
+        }
+        store_intermediate_conv_window<scalar_t>(
+            icw + (icw_indices[bs] * icw_steps + t) * dim * state_len, cols.data(), dim, state_len);
+      }
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // from [dim, width] or [N, K]
@@ -642,6 +793,12 @@ at::Tensor causal_conv1d_fwd_cpu(
 //   cache_seqlens: (batch,), dtype int32.
 //   conv_state_indices: (batch,), dtype int32
 //   pad_slot_id: int
+//   intermediate_conv_window: (cache_size, steps, dim, state_len); per-step
+//       post-update conv windows for speculative verify rollback
+//   intermediate_state_indices: (>= batch,), dtype int32
+//   retrieve_next_token: (>= batch, >= seqlen), int64 first-child links
+//   retrieve_next_sibling: (>= batch, >= seqlen), int64 sibling links
+//   retrieve_parent_token: (>= batch, >= seqlen), int64; written by this call
 //   out: (batch, dim) or (batch, dim, seqlen)
 //
 at::Tensor causal_conv1d_update_cpu(
@@ -653,18 +810,21 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& cache_seqlens,
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
-    bool is_vnni) {
-  CHECK_CONTIGUOUS(x);
+    bool is_vnni,
+    const std::optional<at::Tensor>& intermediate_conv_window,
+    const std::optional<at::Tensor>& intermediate_state_indices,
+    const std::optional<at::Tensor>& retrieve_next_token,
+    const std::optional<at::Tensor>& retrieve_next_sibling,
+    const std::optional<at::Tensor>& retrieve_parent_token) {
   CHECK_CONTIGUOUS(weight);
   auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
 
-  // TODO: add multi-token prediction support
-  TORCH_CHECK(x.dim() == 2, "causal_conv1d_update_cpu: expect x to be 2D tensor.");
+  TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "causal_conv1d_update_cpu: expect x to be 2D or 3D tensor.");
   TORCH_CHECK(!cache_seqlens.has_value(), "causal_conv1d_update_cpu: don't support cache_seqlens.");
 
   int64_t batch = x.size(0);
   int64_t dim = x.size(1);
-  int64_t seqlen = 1;
+  int64_t seqlen = x.dim() == 3 ? x.size(2) : 1;
   int64_t width = weight.size(-1);
 
   const auto scalar_type = x.scalar_type();
@@ -684,20 +844,148 @@ at::Tensor causal_conv1d_update_cpu(
     conv_states.copy_(conv_states_copy);
   }
 
-  at::Tensor out = at::empty_like(x);
+  const bool is_tree = retrieve_next_token.has_value();
+  TORCH_CHECK(
+      retrieve_next_token.has_value() == retrieve_next_sibling.has_value() &&
+          retrieve_next_token.has_value() == retrieve_parent_token.has_value(),
+      "causal_conv1d_update_cpu: retrieve_next_token, retrieve_next_sibling and "
+      "retrieve_parent_token must be passed together.");
+  TORCH_CHECK(!(is_tree && x.dim() == 2), "causal_conv1d_update_cpu: tree verify expects multi-token input.");
+
+  if (x.dim() == 2) {
+    CHECK_CONTIGUOUS(x);
+    at::Tensor out = at::empty_like(x);
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
+      causal_conv1d_update_kernel_impl<scalar_t>(
+          out.data_ptr<scalar_t>(),
+          x.data_ptr<scalar_t>(),
+          conv_states.data_ptr<scalar_t>(),
+          packed_w.data_ptr<scalar_t>(),
+          conditional_data_ptr<scalar_t>(bias),
+          conditional_data_ptr<int32_t>(conv_state_indices),
+          silu_activation,
+          batch,
+          dim,
+          1,
+          width);
+    });
+    return out;
+  }
+
+  TORCH_CHECK(
+      intermediate_conv_window.has_value() == intermediate_state_indices.has_value(),
+      "causal_conv1d_update_cpu: intermediate_conv_window and intermediate_state_indices "
+      "must be passed together.");
+  const bool cache_intermediate = intermediate_conv_window.has_value();
+  const int64_t state_len = width - 1;
+  if (cache_intermediate) {
+    auto& icw = intermediate_conv_window.value();
+    auto& isi = intermediate_state_indices.value();
+    CHECK_DIM(4, icw);
+    CHECK_CONTIGUOUS(icw);
+    CHECK_EQ(icw.scalar_type(), scalar_type);
+    CHECK_GE(icw.size(1), seqlen);
+    CHECK_EQ(icw.size(2), dim);
+    CHECK_EQ(icw.size(3), state_len);
+    CHECK_DIM(1, isi);
+    CHECK_EQ(isi.scalar_type(), at::kInt);
+    CHECK_CONTIGUOUS(isi);
+    CHECK_GE(isi.size(0), batch);
+  }
+  const int32_t* intermediate_indices_ptr =
+      cache_intermediate ? intermediate_state_indices.value().data_ptr<int32_t>() : nullptr;
+  const int64_t icw_steps = cache_intermediate ? intermediate_conv_window.value().size(1) : 0;
+
+  if (is_tree) {
+    auto check_retrieve = [&](const at::Tensor& tensor) {
+      CHECK_DIM(2, tensor);
+      CHECK_EQ(tensor.scalar_type(), at::kLong);
+      CHECK_EQ(tensor.stride(1), 1);
+      CHECK_GE(tensor.size(0), batch);
+      CHECK_GE(tensor.size(1), seqlen);
+    };
+    auto& rnt = retrieve_next_token.value();
+    auto& rns = retrieve_next_sibling.value();
+    auto& rpt = retrieve_parent_token.value();
+    check_retrieve(rnt);
+    check_retrieve(rns);
+    check_retrieve(rpt);
+
+    // no-op for the verify call site's transpose view; copies otherwise
+    at::Tensor x_token_major = x.transpose(1, 2).contiguous();
+
+    at::Tensor out_token_major = at::empty({batch, seqlen, dim}, x.options());
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_tree_kernel_impl", [&] {
+      causal_conv1d_update_tree_kernel_impl<scalar_t>(
+          out_token_major.data_ptr<scalar_t>(),
+          x_token_major.data_ptr<scalar_t>(),
+          conv_states.data_ptr<scalar_t>(),
+          packed_w.data_ptr<scalar_t>(),
+          conditional_data_ptr<scalar_t>(bias),
+          conditional_data_ptr<int32_t>(conv_state_indices),
+          rnt.data_ptr<int64_t>(),
+          rns.data_ptr<int64_t>(),
+          rpt.data_ptr<int64_t>(),
+          cache_intermediate ? intermediate_conv_window.value().data_ptr<scalar_t>() : nullptr,
+          intermediate_indices_ptr,
+          icw_steps,
+          silu_activation,
+          batch,
+          dim,
+          seqlen,
+          width,
+          rnt.stride(0),
+          rns.stride(0),
+          rpt.stride(0));
+    });
+    return out_token_major.transpose(1, 2);
+  }
+
+  // Chain (topk <= 1) target verify: one draft token per step, updating
+  // conv_state after each. The output is allocated token-major and returned as
+  // its [batch, dim, seqlen] transpose, so the caller's
+  // `.transpose(1, 2).view(...)` stays a zero-copy view.
+  at::Tensor out_token_major = at::empty({batch, seqlen, dim}, x.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_update_kernel_impl", [&] {
-    causal_conv1d_update_kernel_impl<scalar_t>(
-        out.data_ptr<scalar_t>(),
-        x.data_ptr<scalar_t>(),
-        conv_states.data_ptr<scalar_t>(),
-        packed_w.data_ptr<scalar_t>(),
-        conditional_data_ptr<scalar_t>(bias),
-        conditional_data_ptr<int32_t>(conv_state_indices),
-        silu_activation,
-        batch,
-        dim,
-        seqlen,
-        width);
+    const int32_t* csi_ptr = conditional_data_ptr<int32_t>(conv_state_indices);
+    scalar_t* icw_ptr = cache_intermediate ? intermediate_conv_window.value().data_ptr<scalar_t>() : nullptr;
+    const scalar_t* cs_ptr = conv_states.data_ptr<scalar_t>();
+    const int64_t entry_size = dim * state_len;
+
+    for (int64_t t = 0; t < seqlen; ++t) {
+      auto x_t = x.select(2, t).contiguous();
+      auto out_t = at::empty({batch, dim}, x_t.options());
+      causal_conv1d_update_kernel_impl<scalar_t>(
+          out_t.data_ptr<scalar_t>(),
+          x_t.data_ptr<scalar_t>(),
+          conv_states.data_ptr<scalar_t>(),
+          packed_w.data_ptr<scalar_t>(),
+          conditional_data_ptr<scalar_t>(bias),
+          csi_ptr,
+          silu_activation,
+          batch,
+          dim,
+          1,
+          width);
+
+      if (icw_ptr != nullptr) {
+        at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
+          std::vector<const scalar_t*> cols(state_len);
+          for (int64_t b = begin; b < end; ++b) {
+            int32_t idx = intermediate_indices_ptr[b];
+            if (idx < 0) continue;
+            int32_t cs_idx = csi_ptr ? csi_ptr[b] : static_cast<int32_t>(b);
+            const scalar_t* row = cs_ptr + cs_idx * entry_size;
+            for (int64_t w = 0; w < state_len; ++w) {
+              cols[w] = row + w * dim;
+            }
+            store_intermediate_conv_window<scalar_t>(
+                icw_ptr + (idx * icw_steps + t) * entry_size, cols.data(), dim, state_len);
+          }
+        });
+      }
+      out_token_major.select(1, t).copy_(out_t);
+    }
   });
-  return out;
+  return out_token_major.transpose(1, 2);
 }
