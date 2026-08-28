@@ -112,7 +112,7 @@ class StandardDispatcher(BaseDispatcher):
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
         # - hpc_ops consumes global ids together with rank_ep / num_expert_total
-        self.skip_local_expert_mapping = (
+        backend_accepts_global_expert_ids = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
             or backend.is_flashinfer_trtllm()
@@ -120,6 +120,11 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_flashinfer_trtllm_routed()
             or backend.is_hpc_ops()
             or self.enable_flashinfer_mxfp4_moe
+        )
+        self.skip_local_expert_mapping = (
+            backend_accepts_global_expert_ids
+            if moe_runner_config.accepts_global_expert_ids is None
+            else moe_runner_config.accepts_global_expert_ids
         )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
