@@ -131,11 +131,8 @@ class SpeculativeAlgorithm(Enum):
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
 
-        In a mixed step every running request commits one plain token and
-        the worker resumes drafting afterward; an algorithm joins this list
-        once that resume path is verified. ngram cannot join as is: its
-        overlap relay skips output_tokens_buf, which the mixed input
-        resolve reads.
+        ngram cannot join as is: its overlap relay skips output_tokens_buf,
+        which the mixed input resolve reads.
         """
         return self in (
             SpeculativeAlgorithm.EAGLE,

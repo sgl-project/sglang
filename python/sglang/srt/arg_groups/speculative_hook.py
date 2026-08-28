@@ -675,8 +675,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    # Under mixed chunk, running requests degrade to a plain 1-token decode
-    # inside a mixed step (no draft/verify that step); see
+    # Mixed steps degrade running requests to a plain 1-token decode; see
     # SpeculativeAlgorithm.supports_mixed_chunk for which workers handle it.
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
