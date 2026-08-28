@@ -2,6 +2,7 @@ import json
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import requests
 
@@ -90,7 +91,12 @@ class TestWeightVersionSpans(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def _generate(self, max_new_tokens: int, prompt: str = "The capital of France is"):
+    def _generate(
+        self,
+        max_new_tokens: int,
+        prompt: str = "The capital of France is",
+        dp_rank: Optional[int] = None,
+    ):
         response = requests.post(
             f"{self.base_url}/generate",
             json={
@@ -100,6 +106,7 @@ class TestWeightVersionSpans(CustomTestCase):
                     "max_new_tokens": max_new_tokens,
                     "ignore_eos": True,
                 },
+                "routed_dp_rank": dp_rank,
             },
             timeout=_REQUEST_TIMEOUT,
         )
@@ -650,13 +657,16 @@ class TestWeightVersionSpans(CustomTestCase):
     def test_17_reused_prefix_keeps_the_version_that_computed_it(self):
         """A radix hit on KV computed before a relabel shows up as a stale leading prefill span."""
         self._flush_cache()
-        self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Name three colors.")
+        self._generate(
+            max_new_tokens=8, prompt=_SHARED_PREFIX + "Name three colors.", dp_rank=0
+        )
         version_before = self._current_version()
 
         self._set_weight_version("reuse-v4")
         data = self._generate(
             max_new_tokens=8,
             prompt=_SHARED_PREFIX + "Name three colors. Then name three shapes.",
+            dp_rank=0,
         )
 
         meta_info = data["meta_info"]
@@ -706,6 +716,100 @@ class TestWeightVersionSpans(CustomTestCase):
         spans = _assert_spans_contiguous(self, meta_info)
         self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
         _assert_prefill_spans_contiguous(self, meta_info)
+
+    def test_20_prefix_grown_across_versions_reports_every_version(self):
+        """A prompt whose prefix was extended under three successive versions reports three prefill spans."""
+        self._flush_cache()
+        self._set_weight_version("grow-v1")
+        self._generate(max_new_tokens=8, prompt=_SHARED_PREFIX + "Step one.", dp_rank=0)
+        self._set_weight_version("grow-v2")
+        self._generate(
+            max_new_tokens=8,
+            prompt=_SHARED_PREFIX + "Step one. Step two follows the first one.",
+            dp_rank=0,
+        )
+        self._set_weight_version("grow-v3")
+
+        data = self._generate(
+            max_new_tokens=8,
+            prompt=_SHARED_PREFIX
+            + "Step one. Step two follows the first one. Step three ends it.",
+            dp_rank=0,
+        )
+
+        meta_info = data["meta_info"]
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(
+            [span["version"] for span in prefill_spans],
+            ["grow-v1", "grow-v2", "grow-v3"],
+        )
+        self.assertEqual(prefill_spans[1]["end"], meta_info["cached_tokens"])
+        self.assertEqual(
+            [span["version"] for span in _assert_spans_contiguous(self, meta_info)],
+            ["grow-v3"],
+        )
+
+    def test_21_multi_turn_reuses_the_previous_turn_under_its_version(self):
+        """The second turn of a conversation reports the first turn's prompt and reply as a stale span."""
+        self._flush_cache()
+        self._set_weight_version("turn-v1")
+        first_prompt = _SHARED_PREFIX + "User: Name a planet.\nAssistant:"
+        first = self._generate(max_new_tokens=16, prompt=first_prompt, dp_rank=0)
+        self.assertEqual(
+            [span["version"] for span in first["meta_info"]["prefill_weight_versions"]],
+            ["turn-v1"],
+        )
+
+        self._set_weight_version("turn-v2")
+        second = self._generate(
+            max_new_tokens=16,
+            prompt=first_prompt
+            + first["text"]
+            + "\nUser: Name another one.\nAssistant:",
+            dp_rank=0,
+        )
+
+        meta_info = second["meta_info"]
+        self.assertGreater(
+            meta_info["cached_tokens"], first["meta_info"]["prompt_tokens"]
+        )
+        prefill_spans = _assert_prefill_spans_contiguous(
+            self, meta_info, prompt_tokens=meta_info["prompt_tokens"]
+        )
+        self.assertEqual(
+            [span["version"] for span in prefill_spans], ["turn-v1", "turn-v2"]
+        )
+        self.assertEqual(prefill_spans[0]["end"], meta_info["cached_tokens"])
+        self.assertEqual(
+            [span["version"] for span in _assert_spans_contiguous(self, meta_info)],
+            ["turn-v2"],
+        )
+
+    def test_22_the_other_dp_rank_recomputes_the_prefix(self):
+        """A prefix cached on one DP rank is not shared, so the other rank prefills it fresh."""
+        self._flush_cache()
+        self._set_weight_version("rank-v1")
+        prompt = _SHARED_PREFIX + "Which rank served me?"
+        self._generate(max_new_tokens=8, prompt=prompt, dp_rank=0)
+        self._set_weight_version("rank-v2")
+
+        cached = self._generate(max_new_tokens=8, prompt=prompt, dp_rank=0)
+        fresh = self._generate(max_new_tokens=8, prompt=prompt, dp_rank=1)
+
+        self.assertEqual(
+            [
+                span["version"]
+                for span in cached["meta_info"]["prefill_weight_versions"]
+            ],
+            ["rank-v1", "rank-v2"],
+        )
+        self.assertEqual(fresh["meta_info"]["cached_tokens"], 0)
+        self.assertEqual(
+            [span["version"] for span in fresh["meta_info"]["prefill_weight_versions"]],
+            ["rank-v2"],
+        )
 
 
 if __name__ == "__main__":
