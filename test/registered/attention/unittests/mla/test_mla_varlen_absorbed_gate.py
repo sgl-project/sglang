@@ -26,6 +26,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=1, stage="base-b", runner_config="1-gpu-large")
 
 
+def _skip_unless_fp4_dtype_available(test_case):
+    try:
+        torch.float4_e2m1fn_x2
+    except AttributeError:
+        test_case.skipTest("torch build has no float4_e2m1fn_x2")
+
+
 class TestVarlenAbsorbedMLAGate(CustomTestCase):
     # In-tree backends that swap the decode kernel. Pinned so the scan below
     # cannot pass vacuously when an import above is dropped, and so that adding
@@ -130,8 +137,7 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
         # tc_piecewise for a config forward_extend refuses to serve.
         from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
-        if not hasattr(torch, "float4_e2m1fn_x2"):
-            self.skipTest("torch build has no float4_e2m1fn_x2")
+        _skip_unless_fp4_dtype_available(self)
 
         def resolve(name):
             _, dtype = configure_kv_cache_dtype(
@@ -153,8 +159,7 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
 
     def test_string_and_dtype_forms_agree(self):
         # ServerArgs passes the CLI string, the backend passes a torch dtype.
-        if not hasattr(torch, "float4_e2m1fn_x2"):
-            self.skipTest("torch build has no float4_e2m1fn_x2")
+        _skip_unless_fp4_dtype_available(self)
         with patch(f"{self._BACKEND}.is_sm100_supported", return_value=True):
             self.assertFalse(varlen_absorbed_mla_supported("nvfp4"))
             self.assertFalse(varlen_absorbed_mla_supported(torch.float4_e2m1fn_x2))
