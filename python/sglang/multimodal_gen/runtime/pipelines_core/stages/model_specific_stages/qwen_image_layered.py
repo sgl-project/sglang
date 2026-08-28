@@ -164,7 +164,6 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         processor,
         transformer,
         scheduler,
-        model_path,
         vae_dtype: torch.dtype,
         text_encoder_dtype: torch.dtype,
     ) -> None:
@@ -172,15 +171,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae = vae.to(dtype=vae_dtype)
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
-        if text_encoder is None:
-            from transformers import Qwen2_5_VLForConditionalGeneration
-
-            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path, subfolder="text_encoder"
-            )
-        self.text_encoder = text_encoder.to(
-            device=get_local_torch_device(), dtype=self.text_encoder_dtype
-        )
+        self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer
@@ -285,11 +276,12 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             padding=True,
             return_tensors="pt",
         ).to(device)
-        encoder_hidden_states = self.text_encoder(
-            input_ids=txt_tokens.input_ids,
-            attention_mask=txt_tokens.attention_mask,
-            output_hidden_states=True,
-        )
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            encoder_hidden_states = self.text_encoder(
+                input_ids=txt_tokens.input_ids,
+                attention_mask=txt_tokens.attention_mask,
+                output_hidden_states=True,
+            )
         hidden_states = encoder_hidden_states.hidden_states[-1]
         split_hidden_states = self._extract_masked_hidden(
             hidden_states, txt_tokens.attention_mask

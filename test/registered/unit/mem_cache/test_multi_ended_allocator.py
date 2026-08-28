@@ -79,6 +79,24 @@ class _FakeKVCache:
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
+class _RejectScalarIndexTensor:
+    """Tensor proxy that rejects one-row-at-a-time mapping lookups."""
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+
+    def __getattr__(self, name):
+        return getattr(self.tensor, name)
+
+    def __getitem__(self, index):
+        if isinstance(index, int):
+            raise AssertionError("physical_to_virtual was read one row at a time")
+        return self.tensor[index]
+
+    def __setitem__(self, index, value):
+        self.tensor[index] = value
+
+
 class TestUnifiedKVPoolViews(unittest.TestCase):
     def test_min_slot_index_and_disjoint_bytes(self):
         full = _make_mha_spec("full", "up", layer_num=4)
@@ -725,6 +743,33 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
             int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
         )
         self.assertIn(tgt, free_full)
+
+    def test_swa_free_full_defers_inside_a_free_group(self):
+        """The full-only release joins the barrier, like `free`."""
+        _, allocator, kvcache = self._build()
+        v = self._alloc(allocator, kvcache, 3)
+        target = v[1:2]
+        tgt = int(target.item())
+        # Tombstone the swa side, erasing each marker before its release
+        # (compaction runs inside both).
+        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        kvcache.swa_kv_pool.buf[target_swa] = -1
+        allocator.free_swa(target)
+        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        kvcache.full_kv_pool.buf[full_phys] = -1
+
+        allocator.free_group_begin()
+        allocator.free_full(target)
+        deferred = set(
+            int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
+        )
+        self.assertNotIn(tgt, deferred)
+
+        allocator.free_group_end()
+        drained = set(
+            int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist()
+        )
+        self.assertIn(tgt, drained)
 
     # 4. Compaction diverges between the two sub-pools (each runs its own).
     def test_swa_compaction_diverges_physical_layout(self):
@@ -2048,6 +2093,27 @@ class TestLazyCompaction(unittest.TestCase):
             if p == -1:
                 continue  # freed
             self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
+
+    def test_lazy_flush_gathers_survivor_mappings_as_one_batch(self):
+        """Compaction must not synchronize once per relocated survivor."""
+        _pool, fa, kv = self._make_full(lazy=True)
+        values = fa.alloc(12)
+        self._stamp_kv(kv, fa, values)
+        fa.free(values[1:5].clone())
+
+        physical_to_virtual = fa.physical_to_virtual
+        fa.physical_to_virtual = _RejectScalarIndexTensor(physical_to_virtual)
+        try:
+            self.assertEqual(fa._flush(urgent=True), 4)
+        finally:
+            fa.physical_to_virtual = physical_to_virtual
+
+        for virtual in values.tolist():
+            physical = int(fa.virtual_to_physical[virtual].item())
+            if physical == -1:
+                continue
+            self.assertEqual(int(fa.physical_to_virtual[physical].item()), virtual)
+            self.assertEqual(int(kv.buf[physical].item()), virtual)
 
     def _replay_sequence(self, ops, lazy: bool):
         """Run a given alloc/free op trace under eager OR lazy mode and

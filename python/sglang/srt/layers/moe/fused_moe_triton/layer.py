@@ -38,6 +38,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -97,6 +98,29 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # layers can resolve to different quant methods, so print_info_once (keyed on the
 # full message) would otherwise fire once per distinct quant method.
 _deferred_finalize_info_logged = False
+
+
+def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
+    return (
+        getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
+        or (
+            isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
+            and not getattr(
+                quant_method, "_moe_runner_backend", get_moe_runner_backend()
+            ).is_marlin()
+        )
+        or (
+            isinstance(quant_method, Fp8MoEMethod)
+            and (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            )
+        )
+        or (
+            isinstance(quant_method, UnquantizedFusedMoEMethod)
+            and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
+    )
 
 
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
@@ -166,6 +190,15 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
+    elif a2a_backend.is_deepep_v2():
+        return DeepEPv2Dispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -203,6 +236,34 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
         )
 
 
+def _validate_deepep_v2_quant_method(quant_method) -> None:
+    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    config = (
+        quant_method.quant_config if isinstance(quant_method, Fp8MoEMethod) else None
+    )
+    reason = None
+    if not isinstance(quant_method, Fp8MoEMethod):
+        reason = f"selected {type(quant_method).__name__}"
+    elif quant_method.use_mxfp8:
+        reason = "selected MXFP8 weights"
+    elif quant_method.is_fp4_expert:
+        reason = "selected FP4 experts"
+    elif list(quant_method.weight_block_size or []) != [128, 128]:
+        reason = f"has weight_block_size={quant_method.weight_block_size}"
+    elif config.activation_scheme != "dynamic":
+        reason = f"has activation_scheme={config.activation_scheme!r}"
+
+    if reason is not None:
+        raise ValueError(
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
+            f"experts with dynamic activation scaling, but this layer {reason}. "
+            "Use a compatible checkpoint or --moe-a2a-backend deepep."
+        )
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -227,6 +288,9 @@ class FusedMoE(torch.nn.Module):
     # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
     # backend resolution distinguish them from routed experts.
     is_shared_fused_moe = False
+
+    # Attached by quant methods for a quantized MoE layer; see LinearBase.scheme.
+    scheme = None
 
     _skip_aiter_moe_shuffle: bool = False
 
@@ -381,6 +445,7 @@ class FusedMoE(torch.nn.Module):
                     self.use_deep_gemm,
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
+        _validate_deepep_v2_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
             and get_moe_runner_backend().is_flashinfer_trtllm()
@@ -438,23 +503,7 @@ class FusedMoE(torch.nn.Module):
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (
-            (
-                isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
-                and not getattr(
-                    self.quant_method, "_moe_runner_backend", get_moe_runner_backend()
-                ).is_marlin()
-            )
-            or (
-                isinstance(self.quant_method, Fp8MoEMethod)
-                and (
-                    get_moe_runner_backend().is_cutlass()
-                    or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-                )
-            )
-            or (
-                isinstance(self.quant_method, UnquantizedFusedMoEMethod)
-                and get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            )
+            _fuses_routed_scaling_factor_in_topk(self.quant_method)
         )
 
         self.routing_method_type = routing_method_type
@@ -1082,7 +1131,7 @@ class FusedMoE(torch.nn.Module):
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if hasattr(self, "scheme"):
+        if self.scheme is not None:
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
@@ -1349,7 +1398,7 @@ class FusedMoE(torch.nn.Module):
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
         method = self.quant_method
-        if hasattr(self, "scheme"):
+        if self.scheme is not None:
             method = self.scheme
         if isinstance(method, Fp8MoEMethod) and (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
