@@ -38,6 +38,7 @@ import einops
 import torch
 import torch.distributed
 
+from sglang.srt.arg_groups.overrides import should_report_expert_balancedness
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.observability.metrics_collector import (
@@ -179,7 +180,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
-        if server_args.should_report_expert_balancedness():
+        if should_report_expert_balancedness(server_args):
             logger.info(
                 "ExpertDistributionRecorder auto start record since "
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
@@ -718,7 +719,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._enable = self._server_args.should_report_expert_balancedness()
+        self._enable = should_report_expert_balancedness(self._server_args)
 
         if self._enable:
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES

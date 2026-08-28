@@ -54,7 +54,6 @@ from sglang.srt.arg_groups.argparse_actions import (
     LoRAPathAction,
 )
 from sglang.srt.arg_groups.overrides import (
-    attention_backends_of,
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
@@ -3761,10 +3760,15 @@ class ServerArgs:
         False for any config the runtime won't post-capture-size, else it gets an
         under-reserved fraction."""
         cfg = resolving_view(self)
-        # use_mla_backend is a method at args time but ModelRunner overwrites it
-        # with a bool on global_server_args (see the FIXME there) -- handle both.
-        use_mla = self.use_mla_backend
-        mla_enabled = use_mla() if callable(use_mla) else use_mla
+        # `ModelRunner` writes a bool named `use_mla_backend` onto the record
+        # (see the FIXME there). At args time nothing has, and the answer comes
+        # from the model configuration instead.
+        from sglang.srt.arg_groups.overrides import use_mla_backend
+
+        runner_flag = getattr(self, "use_mla_backend", None)
+        mla_enabled = (
+            bool(runner_flag) if runner_flag is not None else use_mla_backend(self)
+        )
         if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
             return False
         if cfg.device != "cuda":
@@ -4294,30 +4298,6 @@ class ServerArgs:
             )
         object.__setattr__(self, name, value)
 
-    def _resolved_attention_backends(self):
-        """Mid-resolution (prefill, decode) backends: reads through the pass
-        view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-        )
-
-        return attention_backends_of(resolved_view(self))
-
-    def get_attention_backends(self):
-        """The (prefill, decode) pair resolution decided.
-
-        Reads through the declaration stash, not the fields: the model-specific
-        overrides declare into the stash without writing the fields, so a field
-        read answers with what the operator typed.
-        """
-        return attention_backends_of(resolved_view(self))
-
-    def use_mla_backend(self):
-        from sglang.srt.configs.model_config import AttentionArch
-
-        model_config = self.get_model_config()
-        return model_config.attention_arch == AttentionArch.MLA
-
     def enable_mamba_extra_buffer(self) -> bool:
         return mamba_extra_buffer_of(resolving_view(self))
 
@@ -4546,10 +4526,6 @@ class ServerArgs:
             descriptor["load_endpoint_port_base"] = resolved_range[1]
             descriptor["load_topic"] = LOAD_TOPIC
         return descriptor
-
-    def should_report_expert_balancedness(self) -> bool:
-        cfg = resolving_view(self)
-        return cfg.expert_balancedness_report_mode != "off"
 
     def should_log_expert_balancedness_to_server_log(self) -> bool:
         cfg = resolving_view(self)

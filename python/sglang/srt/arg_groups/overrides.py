@@ -885,7 +885,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 )
         # MLA prefill CP auto-config. Mirrors the NSA CP block above
         # (minus the in-seq/round-robin mode split, which MLA CP does not support)
-        if cfg.enable_prefill_cp and server_args.use_mla_backend():
+        if cfg.enable_prefill_cp and use_mla_backend(server_args):
             logger.warning(
                 "MLA prefill context parallel is still experimental. "
                 "Verified on Hopper with the fa3 backend."
@@ -1286,7 +1286,7 @@ def _moss_vl_overrides(server_args: Any, hf_config: Any) -> dict:
         logger.info("Use flashinfer as default prefill attention backend for Moss-VL")
     prefill_backend = (
         overrides.get("prefill_attention_backend")
-        or server_args.get_attention_backends()[0]
+        or attention_backends_of(resolved_view(server_args))[0]
     )
     assert prefill_backend == "flashinfer", (
         "MossVLForConditionalGeneration requires flashinfer prefill "
@@ -1616,7 +1616,7 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     # and spec decoding are disabled.
     default_attn_backend = get_default_attn_backend(
         server_args,
-        use_mla_backend=server_args.use_mla_backend(),
+        use_mla_backend=use_mla_backend(server_args),
         model_config=server_args.get_model_config(),
     )
     # The mamba radix-cache pass runs before this dispatch: read the
@@ -2418,7 +2418,7 @@ def _attention_backend_default(view: Any) -> dict:
         return {"attention_backend": view.prefill_attention_backend}
     if view.attention_backend is None:
         backend = get_default_attn_backend(
-            record_of(view), view.use_mla_backend(), view.get_model_config()
+            view, use_mla_backend(view), view.get_model_config()
         )
         logger.info(
             f"Attention backend not specified. Use {backend} backend by default."
@@ -2604,7 +2604,7 @@ def _fa4_page_constraint(view: Any) -> dict:
             or view.decode_attention_backend == "fa4"
             or view.prefill_attention_backend == "fa4"
         )
-        and not view.use_mla_backend()
+        and not use_mla_backend(view)
         and is_sm100_supported()
         # EAGLE topk>1 spec runs the two-pass page-tree cascade, which the FA4
         # CUTLASS kernel aborts on at page_size>1. That path only works at
@@ -2645,7 +2645,7 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 def _intel_xpu_page_constraint(view: Any) -> dict:
     _, decode_backend = attention_backends_of(view)
     if decode_backend == "intel_xpu":
-        if view.use_mla_backend():
+        if use_mla_backend(view):
             supported_page_sizes = [16, 32, 64, 128]
             msg = "Intel XPU attention backend for MLA Decode"
         else:
@@ -3140,3 +3140,15 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "torch_native"
         else:
             return "triton"
+
+
+def use_mla_backend(server_args: Any):
+    from sglang.srt.configs.model_config import AttentionArch
+
+    model_config = server_args.get_model_config()
+    return model_config.attention_arch == AttentionArch.MLA
+
+
+def should_report_expert_balancedness(server_args: Any) -> bool:
+    cfg = resolving_view(server_args)
+    return cfg.expert_balancedness_report_mode != "off"

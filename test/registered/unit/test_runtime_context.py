@@ -16,6 +16,7 @@ from unittest.mock import patch
 import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
+from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -1243,7 +1244,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         )
                         get_context().set_server_args(args)
                         self.assertEqual(
-                            ServerArgs.get_attention_backends(args),
+                            attention_backends_of(resolved_view(args)),
                             attention_backends(),
                         )
 

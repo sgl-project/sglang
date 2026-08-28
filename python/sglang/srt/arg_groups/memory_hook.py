@@ -47,6 +47,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         generate_decode_cuda_graph_batch_sizes,
         generate_prefill_cuda_graph_batch_sizes,
     )
+    from sglang.srt.arg_groups.overrides import use_mla_backend
 
     cfg = resolving_view(server_args)
     # A copy, so an earlier declaration keeps the value it recorded.
@@ -181,7 +182,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
         # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
         # To avoid the performance regression, we set max_bs to 2048 by default.
-        if not server_args.use_mla_backend():
+        if not use_mla_backend(server_args):
             prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
         else:
             prefill_cuda_graph_config.max_bs = 2048
@@ -273,6 +274,8 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
 
 
 def reserve_for_graph_mb(server_args: Any) -> float:
+    from sglang.srt.arg_groups.overrides import use_mla_backend
+
     cfg = resolving_view(server_args)
     decode_cuda_graph_config = cfg.cuda_graph_config.decode
     prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
@@ -298,7 +301,7 @@ def reserve_for_graph_mb(server_args: Any) -> float:
         cfg.disaggregation_mode != "decode"
         and prefill_cuda_graph_config.backend != Backend.DISABLED
     ):
-        if not server_args.use_mla_backend():
+        if not use_mla_backend(server_args):
             # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
             reserved_mem += len(prefill_cuda_graph_config.bs) * 8
         else:

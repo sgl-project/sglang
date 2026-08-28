@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_specific_adjustments(server_args: Any):
+    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         get_mimo_v2_fused_qkv_expected_tp_size,
@@ -274,7 +276,7 @@ def handle_model_specific_adjustments(server_args: Any):
             # MLA prefill CP auto-config: the field declarations moved to
             # the override registry (arg_groups/overrides.py:
             # _deepseek_family_overrides).
-            if cfg.enable_prefill_cp and server_args.use_mla_backend():
+            if cfg.enable_prefill_cp and use_mla_backend(server_args):
                 declare_resolution(
                     server_args,
                     "_handle_model_specific_adjustments",
@@ -376,8 +378,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 "intel_xpu",
                 "aiter",
             ]
-            prefill_attn_backend, decode_attn_backend = (
-                server_args._resolved_attention_backends()
+            prefill_attn_backend, decode_attn_backend = attention_backends_of(
+                resolved_view(server_args)
             )
             assert (
                 prefill_attn_backend in supported_backends
@@ -480,7 +482,9 @@ def handle_model_specific_adjustments(server_args: Any):
     ):
         # Default attention backend selection moved to the override registry
         # (arg_groups/overrides.py: _gemma4_overrides).
-        prefill_backend, decode_backend = server_args._resolved_attention_backends()
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
         accepted_backends = (
             "trtllm_mha",
             "triton",

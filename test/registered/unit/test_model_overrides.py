@@ -25,6 +25,7 @@ from sglang.srt.arg_groups.overrides import (
     validate_declarations,
 )
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
@@ -1943,10 +1944,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             ns = SimpleNamespace(**defaults)
-            ns.get_attention_backends = lambda: (
-                ns.prefill_attention_backend or ns.attention_backend,
-                ns.decode_attention_backend or ns.attention_backend,
-            )
             return ns
 
         # nothing set: prefill defaults to flashinfer
@@ -2243,7 +2240,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
-                use_mla_backend=lambda: False,
                 get_model_config=lambda: None,
                 mamba_radix_cache_strategy="auto",
                 disable_radix_cache=False,
@@ -2260,6 +2256,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             overrides_module,
             "get_default_attn_backend",
             lambda server_args, **_: server_args.default_backend_for_test,
+        ), patch.object(
+            overrides_module, "use_mla_backend", return_value=False
         ):
             # radix on + no extra buffer + no spec -> page_size=1 path
             self.assertEqual(
@@ -2465,6 +2463,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 prefill_attention_backend=None,
                 speculative_draft_attention_backend=None,
                 page_size=1,
+                # `use_mla_backend` reads the model configuration; a non-MLA
+                # one keeps these assertions about the page constraints.
+                get_model_config=lambda: SimpleNamespace(attention_arch=None),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -2523,7 +2524,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _fa4_page_constraint(
                     _view(
                         attention_backend="fa4",
-                        use_mla_backend=lambda: False,
                         speculative_eagle_topk=None,
                     )
                 ),
@@ -2533,7 +2533,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _fa4_page_constraint(
                     _view(
                         attention_backend="fa4",
-                        use_mla_backend=lambda: False,
                         speculative_eagle_topk=2,  # EAGLE topk>1 keeps default
                     )
                 ),
@@ -2544,7 +2543,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
-                    use_mla_backend=lambda: False,
                 )
             ),
             {"page_size": 128},
@@ -2553,7 +2551,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
-                    use_mla_backend=lambda: True,
+                    get_model_config=lambda: SimpleNamespace(
+                        attention_arch=AttentionArch.MLA
+                    ),
                     page_size=16,  # MLA decode accepts 16
                 )
             ),

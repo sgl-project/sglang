@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolved_view,
     resolving_view,
+    should_report_expert_balancedness,
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -640,7 +641,7 @@ def handle_expert_distribution_metrics(server_args: Any):
             "prometheus, both."
         )
 
-    if server_args.should_report_expert_balancedness() and (
+    if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
         declare_resolution(
