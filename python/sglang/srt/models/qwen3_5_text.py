@@ -80,7 +80,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     quant_config=quant_config,
                     org_num_embeddings=config.vocab_size,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             self.lm_head = PPMissingLayer()
