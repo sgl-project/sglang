@@ -415,7 +415,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
         self.startup_time: Optional[Dict[str, Any]] = None
-        self.elastic_worker_count = get_parallel().config.dp_size
+        self.elastic_worker_count = get_parallel().dp_size
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
@@ -490,7 +490,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             import_processors("sglang.srt.multimodal.processors")
             if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
                 import_processors(mm_process_pkg, overwrite=True)
-            _processor = get_processor_wrapper(server_args)
+            _processor = get_processor_wrapper()
             transport_mode = determine_tensor_transport_mode()
 
             # We want to parallelize the image pre-processing so we create an executor for it
@@ -1550,7 +1550,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return batch_size > 0 and (
             get_serving().enable_tokenizer_batch_encode
             or (
-                (not get_parallel().config.enable_dp_attention)
+                (not get_parallel().enable_dp_attention)
                 and (not self._batch_has_text(batch_size, requests))
             )
         )
@@ -3602,7 +3602,7 @@ async def print_exception_wrapper(func):
         sys.exit(1)
 
 
-def get_processor_wrapper(server_args):
+def get_processor_wrapper():
     return get_processor(
         get_serving().tokenizer_path,
         tokenizer_mode=get_serving().tokenizer_mode,

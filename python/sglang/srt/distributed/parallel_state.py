@@ -51,7 +51,9 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
+    derive_parallel_widths,
     get_global_dwdp_manager,
+    get_parallel,
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
@@ -2504,7 +2506,18 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    # The groups below are built at these numbers, and the same dict is stamped
+    # once they exist.
+    derived_widths = derive_parallel_widths(
+        tp_size=tensor_model_parallel_size,
+        attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=expert_model_parallel_size,
+        moe_dp_size=moe_data_model_parallel_size,
+        dcp_size=decode_context_parallel_size,
+        dcp_enabled=_DCP is not None,
+    )
+    attn_tp_size = derived_widths["attn_tp_size"]
 
     global _ATTN_CP
     assert (
@@ -2590,7 +2603,7 @@ def initialize_model_parallel(
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
-    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
+    moe_tp_size = derived_widths["moe_tp_size"]
 
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
@@ -2703,6 +2716,8 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
+    get_parallel().stamp_derived_widths(**derived_widths)
+
 
 def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
@@ -2803,14 +2818,19 @@ _TP_STATE_PATCHED = False
 
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
+    """Run under a different tensor-parallel group until this scope ends.
 
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
+    This is for draft workers of speculative decoding, which run the draft model
+    at the target's attention-TP width rather than its global TP width.
+
+    The scope replaces both the module global that ``get_tp_group()`` reads and
+    the three members the runtime context answers with.
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
     """
+    from sglang.srt.runtime_context import get_parallel
+
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
@@ -2819,9 +2839,13 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     global _TP
     _TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
-        # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
@@ -2921,6 +2945,7 @@ def get_moe_tensor_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
+    get_parallel().clear_derived_widths()
     dwdp_mgr = get_global_dwdp_manager()
     if dwdp_mgr is not None:
         dwdp_mgr.cleanup()

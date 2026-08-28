@@ -5,6 +5,8 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.platform_hook import handle_cpu_backends
+from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -20,22 +22,22 @@ class TestServerArgsCPUBackend(unittest.TestCase):
         server_args.sampling_backend = None
         return server_args
 
-    @patch("sglang.srt.server_args.is_host_cpu_arm64", return_value=True)
+    @patch("sglang.srt.arg_groups.platform_hook.is_host_cpu_arm64", return_value=True)
     def test_arm_cpu_defaults_to_torch_native(self, _mock_is_arm64):
         server_args = self._make_server_args()
 
-        ServerArgs._handle_cpu_backends(server_args)
+        handle_cpu_backends(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "attention_backend"), "torch_native"
         )
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
-    @patch("sglang.srt.server_args.is_host_cpu_arm64", return_value=False)
+    @patch("sglang.srt.arg_groups.platform_hook.is_host_cpu_arm64", return_value=False)
     def test_x86_cpu_defaults_to_intel_amx(self, _mock_is_arm64):
         server_args = self._make_server_args()
 
-        ServerArgs._handle_cpu_backends(server_args)
+        handle_cpu_backends(server_args)
 
         self.assertEqual(
             resolution_result(server_args, "attention_backend"), "intel_amx"
@@ -68,7 +70,7 @@ class TestServerArgsIBDeviceValidation(unittest.TestCase):
                 else real_listdir(path)
             ),
         ):
-            return ServerArgs._validate_ib_devices(server_args, device_str)
+            return validate_ib_devices(server_args, device_str)
 
     def test_validate_ib_devices_accepts_comma_separated(self):
         self.assertEqual(
