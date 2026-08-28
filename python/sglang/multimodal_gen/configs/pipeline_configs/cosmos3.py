@@ -113,7 +113,7 @@ class Cosmos3Config(PipelineConfig):
     vae_precision: str = "bf16"
 
     # Pipeline-level (not sampling) knobs.
-    max_sequence_length: int = 512
+    max_sequence_length: int = 4096
     use_duration_template: bool = True
     use_system_prompt: bool = False
 

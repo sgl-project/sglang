@@ -1,5 +1,5 @@
+import argparse
 import dataclasses
-import importlib
 import json
 import os
 import socket
@@ -29,7 +29,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.runtime_context import get_context, get_serving
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -45,6 +45,17 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_weight_cache_daemon_allows_static_eplb(self):
+        args = ServerArgs(
+            model_path="dummy",
+            weight_cache_mode="daemon",
+            enable_eplb=True,
+        )
+
+        # This validation runs before model construction and should allow the
+        # daemon to build the same static EPLB layout as the engine.
+        args._handle_load_format()
+
     def test_enable_w4a4_mxfp4_megamoe_sets_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
@@ -272,7 +283,7 @@ class TestImageProcessorBackend(CustomTestCase):
 class TestMultimodalFeatureTransport(CustomTestCase):
     @staticmethod
     def _set_model_type(server_args, *, is_multimodal):
-        server_args.model_config = SimpleNamespace(is_multimodal=is_multimodal)
+        server_args._model_config = SimpleNamespace(is_multimodal=is_multimodal)
 
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
@@ -909,8 +920,8 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
-        args.model_config = MagicMock()
-        args.model_config.hf_config.dual_chunk_attention_config = None
+        args._model_config = MagicMock()
+        args._model_config.hf_config.dual_chunk_attention_config = None
         return args
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
@@ -1798,7 +1809,7 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=False,
@@ -1871,7 +1882,7 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
 
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=False,
@@ -1904,7 +1915,7 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         # Pin the tc_piecewise LoRA rule itself, with the hardware rule
         # neutralized so this runs on CPU-only CI.
         args = ServerArgs(model_path="dummy", enable_lora=True)
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=False,
@@ -1934,7 +1945,7 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
 
     def _handled_args(self, *, architectures, is_multimodal, allowlisted):
         args = ServerArgs(model_path="dummy")
-        args.model_config = SimpleNamespace(
+        args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=architectures),
             is_piecewise_cuda_graph_disabled_model=False,
             is_multimodal=is_multimodal,
@@ -2056,54 +2067,61 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
 
-    The choice set is built once at server_args.py import time, so each subtest
-    reloads the module with the env var set to the desired value.
+    The choice set is finalized when CLI arguments are registered, so each
+    parser must reflect the environment at construction time.
     """
 
-    def _reload_server_args_with_env(self, *, enabled: bool):
-        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
-        try:
-            return importlib.reload(server_args_module)
-        finally:
-            if previous is None:
-                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
-            else:
-                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
-
     def test_token_oracle_rejected_when_env_disabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=False)
-        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "0"}):
+            with self.assertRaises(SystemExit):
+                server_args_module.prepare_server_args(
+                    [
+                        "--model-path",
+                        DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                        "--sampling-backend",
+                        "token_oracle",
+                    ]
+                )
 
-        with self.assertRaises(SystemExit):
-            reloaded.prepare_server_args(
+    def test_token_oracle_accepted_when_env_enabled(self):
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1"}):
+            parsed = server_args_module.prepare_server_args(
                 [
                     "--model-path",
                     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
                     "--sampling-backend",
                     "token_oracle",
+                    # Explicit device so ServerArgs.__post_init__ does not call
+                    # get_device() (fails on CPU-only CI runners) and does not run
+                    # _handle_cpu_backends (which would override sampling_backend
+                    # to "pytorch", masking what we want to verify).
+                    "--device",
+                    "cuda",
                 ]
             )
-
-    def test_token_oracle_accepted_when_env_enabled(self):
-        reloaded = self._reload_server_args_with_env(enabled=True)
-        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
-
-        parsed = reloaded.prepare_server_args(
-            [
-                "--model-path",
-                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-                "--sampling-backend",
-                "token_oracle",
-                # Explicit device so ServerArgs.__post_init__ does not call
-                # get_device() (fails on CPU-only CI runners) and does not run
-                # _handle_cpu_backends (which would override sampling_backend
-                # to "pytorch", masking what we want to verify).
-                "--device",
-                "cuda",
-            ]
-        )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+    def test_gate_is_recomputed_for_each_parser(self):
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1"}):
+            enabled_parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(enabled_parser)
+
+        with patch.dict(os.environ, {"SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "0"}):
+            disabled_parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(disabled_parser)
+
+        enabled_action = next(
+            action
+            for action in enabled_parser._actions
+            if action.dest == "sampling_backend"
+        )
+        disabled_action = next(
+            action
+            for action in disabled_parser._actions
+            if action.dest == "sampling_backend"
+        )
+        self.assertIn("token_oracle", enabled_action.choices)
+        self.assertNotIn("token_oracle", disabled_action.choices)
 
 
 class TestDeepEPv2Args(CustomTestCase):
@@ -2111,7 +2129,7 @@ class TestDeepEPv2Args(CustomTestCase):
 
     def _args(self, **overrides):
         server_args = ServerArgs(model_path="dummy", moe_a2a_backend="deepep_v2")
-        server_args.model_config = SimpleNamespace(
+        server_args._model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
         )
         # The dummy path does not initialize phase configs.
@@ -2134,7 +2152,7 @@ class TestDeepEPv2Args(CustomTestCase):
             "Qwen3MoeForCausalLM",
         ):
             args = self._args(moe_runner_backend="deep_gemm")
-            args.model_config.hf_config.architectures = [architecture]
+            args._model_config.hf_config.architectures = [architecture]
             args._handle_a2a_moe()
 
     def test_unvalidated_and_missing_architectures_rejected(self):
@@ -2145,7 +2163,7 @@ class TestDeepEPv2Args(CustomTestCase):
             None,
         ):
             args = self._args(moe_runner_backend="deep_gemm")
-            args.model_config.hf_config.architectures = architectures
+            args._model_config.hf_config.architectures = architectures
             with self.assertRaisesRegex(ValueError, "not validated"):
                 args._handle_a2a_moe()
 
@@ -2170,7 +2188,7 @@ class TestDeepEPv2Args(CustomTestCase):
             moe_runner_backend="deep_gemm",
             rl_on_policy_target="fsdp",
         )
-        args.model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
+        args._model_config.hf_config.architectures = ["Qwen3MoeForCausalLM"]
         with (
             envs.SGLANG_VLM_CACHE_SIZE_MB.override(envs.SGLANG_VLM_CACHE_SIZE_MB.get()),
             envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(
@@ -2227,8 +2245,9 @@ class TestDeepEPv2Args(CustomTestCase):
         for mode in ("direct", "hybrid"):
             args = self._args(moe_runner_backend="deep_gemm", deepep_v2_mode=mode)
             args._handle_a2a_moe()
-            self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
-            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+            declared = resolution_result(args, "cuda_graph_config")
+            self.assertEqual(declared.decode.backend, Backend.FULL)
+            self.assertEqual(declared.prefill.backend, Backend.DISABLED)
 
     def test_two_batch_overlap_rejected(self):
         args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)
@@ -2495,7 +2514,7 @@ class TestGrpcServerArgs(CustomTestCase):
         with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
             sa._handle_deprecated_args()
         self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
-        self.assertEqual(sa.grpc_worker_threads, 8)
+        self.assertEqual(resolution_result(sa, "grpc_worker_threads"), 8)
 
     def test_env_grpc_port_enables_native(self):
         sa = self._args(port=30000)
@@ -2679,13 +2698,11 @@ class TestGrpcServerArgs(CustomTestCase):
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
-        # The host comes from the `serving` bag; `grpc_worker_threads` is not a
-        # field (resolution sets it from the environment), so it stays on the
-        # stand-in the call site is handed.
-        override = get_context().override_server_args(host="127.0.0.1", grpc_port=50051)
-        override.install()
+        override = get_context().override_server_args(
+            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+        )
+        server_args = override.install()
         self.addCleanup(override.restore)
-        server_args = SimpleNamespace(grpc_worker_threads=4)
         with (
             patch(
                 "sglang.srt.rust_extensions.load_rust_extension",
@@ -2709,6 +2726,7 @@ class TestGrpcServerArgs(CustomTestCase):
         self.assertEqual(
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
         )
+        self.assertEqual(kwargs["worker_threads"], 4)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
