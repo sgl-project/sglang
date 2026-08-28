@@ -111,7 +111,9 @@ def test_grouped_wo_a_preserves_backend_segments_and_chunk_size():
 
     assert backend.batch_info is info
     assert info.max_len == 2
-    torch.testing.assert_close(info.seg_indptr, torch.tensor([0, 1, 3]))
+    torch.testing.assert_close(
+        info.seg_indptr, torch.tensor([0, 1, 3], dtype=torch.int32)
+    )
     assert backend.a_input_shapes == [(3, 4)] * groups
     assert backend.b_weight_shapes == [(2, 5, 3)] * groups
 
