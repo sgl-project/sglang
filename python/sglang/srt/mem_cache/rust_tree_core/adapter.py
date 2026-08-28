@@ -154,7 +154,7 @@ def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
         delta=result.delta,
         swa_uuid_for_lock=result.swa_uuid_for_lock,
         swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
-        skip_lock_node_ids=_skip_lock_node_ids_from_binding(result.skip_lock_node_ids),
+        mamba_lock_acquired=result.mamba_lock_acquired,
     )
 
 
@@ -243,26 +243,6 @@ def _match_result_from_binding(result) -> MatchResult:
         full_kv_hit_length=result.full_kv_hit_length,
         cache_actions=_cache_actions_from_tagged(result.cache_actions),
     )
-
-
-def _skip_lock_node_ids_from_binding(
-    skip_lock_node_ids: dict[int, set[int]],
-) -> dict[ComponentType, set[int]]:
-    """Rekey the binding's component-value skip map by ComponentType."""
-    return {
-        ComponentType(component): set(node_ids)
-        for component, node_ids in skip_lock_node_ids.items()
-    }
-
-
-def _skip_lock_node_ids_to_binding(
-    skip_lock_node_ids: dict[ComponentType, set[int]],
-) -> dict[int, set[int]]:
-    """Rekey a ComponentType skip map by the binding's component values."""
-    return {
-        int(component): set(node_ids)
-        for component, node_ids in skip_lock_node_ids.items()
-    }
 
 
 def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
@@ -406,29 +386,21 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def inc_lock_ref(
         self,
         node_id: NodeId,
-        skip_lock_components: Sequence[ComponentType] = (),
+        lock_mamba: bool = True,
     ) -> IncLockRefResult:
-        result = self._binding.inc_lock_ref(
-            node_id, [int(component) for component in skip_lock_components]
-        )
+        result = self._binding.inc_lock_ref(node_id, lock_mamba)
         return _inc_lock_ref_result_from_binding(result)
 
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: Optional[DecLockRefParams] = None,
+        params: DecLockRefParams,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        binding_params = (
-            self._bindings.DecLockRefParamsBinding(
-                swa_uuid_for_lock=params.swa_uuid_for_lock,
-                swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-                skip_lock_node_ids=_skip_lock_node_ids_to_binding(
-                    params.skip_lock_node_ids
-                ),
-            )
-            if params is not None
-            else None
+        binding_params = self._bindings.DecLockRefParamsBinding(
+            swa_uuid_for_lock=params.swa_uuid_for_lock,
+            swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
+            mamba_lock_acquired=params.mamba_lock_acquired,
         )
         self._binding.dec_lock_ref(node_id, binding_params, skip_swa)
         return DecLockRefResult()
@@ -436,18 +408,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
-        swa_uuid_for_lock: Optional[int],
-        skip_lock_node_ids: Optional[dict] = None,
+        params: DecLockRefParams,
     ) -> DecSwaLockOnlyResult:
         result = DecSwaLockOnlyResult()
         new_device_frees, new_host_frees = self._binding.dec_swa_lock_only(
-            node_id,
-            swa_uuid_for_lock,
-            (
-                _skip_lock_node_ids_to_binding(skip_lock_node_ids)
-                if skip_lock_node_ids
-                else None
-            ),
+            node_id, params.swa_uuid_for_lock, params.mamba_lock_acquired
         )
         for component, tensors in new_device_frees.items():
             result.device_frees[ComponentType(component)].extend(tensors)
@@ -497,14 +462,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         result = self._binding.inc_host_lock_ref(node_id)
-        return IncLockRefResult(
-            delta=result.delta,
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            swa_uuid_for_host_lock=result.swa_uuid_for_host_lock,
-            skip_lock_node_ids=_skip_lock_node_ids_from_binding(
-                result.skip_lock_node_ids
-            ),
-        )
+        return _inc_lock_ref_result_from_binding(result)
 
     def dec_host_lock_ref(
         self, node_id: NodeId, params: Optional[DecLockRefParams] = None
@@ -513,9 +471,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             self._bindings.DecLockRefParamsBinding(
                 swa_uuid_for_lock=params.swa_uuid_for_lock,
                 swa_uuid_for_host_lock=params.swa_uuid_for_host_lock,
-                skip_lock_node_ids=_skip_lock_node_ids_to_binding(
-                    params.skip_lock_node_ids
-                ),
+                mamba_lock_acquired=params.mamba_lock_acquired,
             )
             if params is not None
             else None

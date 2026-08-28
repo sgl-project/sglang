@@ -302,6 +302,8 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
+    # Receipt for the inc_lock_ref held on hicache_restored_node.
+    hicache_restored_lock_params: Optional[DecLockRefParams] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
@@ -411,7 +413,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _release_matched_prefix_lock(self, req: Req) -> None:
-        params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        params = DecLockRefParams(
+            swa_uuid_for_lock=req.swa_uuid_for_lock,
+            mamba_lock_acquired=req.mamba_lock_acquired,
+        )
         if req.swa_prefix_lock_released:
             self.tree_cache.dec_lock_ref(req.last_node, params, skip_swa=True)
             req.swa_prefix_lock_released = False
@@ -665,9 +670,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
-        # boundary needed for the matching dec_lock_ref.
+        # boundary needed for the matching dec_lock_ref; the full receipt
+        # travels on the req so every later release mirrors this acquire.
         lock_result = self.tree_cache.inc_lock_ref(result.last_device_node)
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+        req.mamba_lock_acquired = lock_result.mamba_lock_acquired
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -1229,7 +1236,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 ):
                     self.tree_cache.dec_swa_lock_only(
                         decode_req.req.last_node,
-                        decode_req.req.swa_uuid_for_lock,
+                        DecLockRefParams(
+                            swa_uuid_for_lock=decode_req.req.swa_uuid_for_lock,
+                            mamba_lock_acquired=decode_req.req.mamba_lock_acquired,
+                        ),
                     )
                     decode_req.req.swa_prefix_lock_released = True
 

@@ -2,7 +2,7 @@
 //! the rest from the `TreeComponent` defaults.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 
 use tch::{Kind, Tensor};
 
@@ -276,8 +276,6 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         mut result: IncLockRefResult,
         lock_host: bool,
     ) -> IncLockRefResult {
-        let ct = FULL;
-
         // Only the last host node needs to be protected.
         if lock_host {
             let node = tree_core.arena.node_mut(node_id);
@@ -290,20 +288,17 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             return result;
         }
 
-        // Skip the bottom evicted segment, recording it for the matching release.
-        let on_boundary = |node: &Node<K>| node.is_root() || node.has_device_value(FULL);
+        // The bottom device-evicted segment is locked too (no ledger move —
+        // nothing is on device); a load-back that materializes a value under
+        // lock credits protected directly.
         let mut cur = node_id;
-        let mut node = tree_core.arena.node(cur);
-        if !on_boundary(node) {
-            let skip_lock_node_ids = result.skip_lock_node_ids.entry(ct).or_default();
-            loop {
-                skip_lock_node_ids.insert(node.id);
-                cur = node.parent();
-                node = tree_core.arena.node(cur);
-                if on_boundary(node) {
-                    break;
-                }
+        loop {
+            let node = tree_core.arena.node_mut(cur);
+            if node.is_root() || node.has_device_value(FULL) {
+                break;
             }
+            node.inc_device_lock_ref(FULL);
+            cur = node.parent();
         }
 
         // Lock the device-on segment up to the root.
@@ -343,8 +338,6 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         params: Option<&DecLockRefParams>,
         lock_host: bool,
     ) {
-        let ct = FULL;
-
         if lock_host {
             let node = tree_core.arena.node_mut(node_id);
             if node.host_lock_ref(FULL) == 0 {
@@ -359,10 +352,6 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             return;
         }
 
-        let empty = HashSet::new();
-        let skip_lock_node_ids = params
-            .and_then(|p| p.skip_lock_node_ids.get(&ct))
-            .unwrap_or(&empty);
         let mut cur = node_id;
         loop {
             let node = tree_core.arena.node_mut(cur);
@@ -370,20 +359,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 break;
             }
             let parent = node.parent();
-            if skip_lock_node_ids.contains(&node.id) {
-                cur = parent;
-                continue;
-            }
-            assert!(
-                node.has_device_value(FULL),
-                "release_component_lock: node {cur} has no FULL device value"
-            );
             let old_lock_ref = node.device_lock_ref(FULL);
             assert!(
                 old_lock_ref > 0,
-                "release_component_lock: node {cur} is not locked"
+                "FULL segment release hit lock_ref=0 on node {cur}"
             );
-            let newly_unlocked_len = if old_lock_ref == 1 {
+            let newly_unlocked_len = if old_lock_ref == 1 && node.has_device_value(FULL) {
                 Some(node.device_value_len(FULL))
             } else {
                 None
@@ -392,6 +373,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
             if let Some(key_len) = newly_unlocked_len {
                 tree_core.dec_protected_size(FULL, key_len);
                 tree_core.inc_evictable_size(FULL, key_len);
+            }
+            if old_lock_ref == 1 {
                 tree_core.update_evictable_leaf_sets_(cur);
             }
             cur = parent;
@@ -474,9 +457,16 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                         let n_len = loaded.host_value_len(FULL) as i64;
                         loaded
                             .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
+                        let locked = loaded.device_lock_ref(FULL) > 0;
                         offset += n_len;
-                        // Full uses leaf sets, not LRU.
-                        tree_core.inc_evictable_size(FULL, n_len as usize);
+                        // Full uses leaf sets, not LRU. A value materialized
+                        // under lock is protected; the last release moves it
+                        // to evictable.
+                        if locked {
+                            tree_core.inc_protected_size(FULL, n_len as usize);
+                        } else {
+                            tree_core.inc_evictable_size(FULL, n_len as usize);
+                        }
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
                     }
                 }

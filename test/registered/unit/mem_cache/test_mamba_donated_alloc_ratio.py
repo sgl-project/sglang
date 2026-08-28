@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     IncLockRefResult,
 )
@@ -182,12 +183,12 @@ class _RecordingComp:
 
 class TestDecSwaLockSkip(unittest.TestCase):
     """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
-    locks. On a full-only-locked node (decode skip) it must thread the skip set
-    into that lower-tier release, else it drops a mamba lock it never took --
-    another request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the
-    contract without booting a 3-component model."""
+    locks. On a node whose acquire skipped Mamba (decode hold), the release
+    must skip it too, else it drops a mamba lock it never took -- another
+    request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the contract
+    without booting a 3-component model."""
 
-    def test_threads_skip_ids_into_lower_tier_release(self):
+    def _run(self, mamba_lock_acquired):
         # internal-node priority: full=2 > swa=1 > mamba=0
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
@@ -198,20 +199,23 @@ class TestDecSwaLockSkip(unittest.TestCase):
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
         )
-
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            swa_uuid_for_lock=None,
-            skip_lock_node_ids={ComponentType.MAMBA: {7}},
+            DecLockRefParams(mamba_lock_acquired=mamba_lock_acquired),
         )
+        return full, mamba
 
-        # mamba (below swa) is released, honoring the skip set
-        self.assertEqual(len(mamba.released), 1)
-        self.assertEqual(
-            mamba.released[0].skip_lock_node_ids.get(ComponentType.MAMBA), {7}
-        )
+    def test_unlocked_mamba_is_not_released(self):
+        full, mamba = self._run(mamba_lock_acquired=False)
+        # mamba took no lock at acquire, so the early release skips it too
+        self.assertEqual(mamba.released, [])
         # full (above swa) is never touched
+        self.assertEqual(full.released, [])
+
+    def test_lower_tier_released_when_locked(self):
+        full, mamba = self._run(mamba_lock_acquired=True)
+        self.assertEqual(len(mamba.released), 1)
         self.assertEqual(full.released, [])
 
 

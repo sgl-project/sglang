@@ -441,19 +441,17 @@ class MambaComponent(TreeComponent):
             return result
         cd = node.component_data[ct]
         value = cd.host_value if lock_host else cd.value
-        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
-        if value is None:
-            result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
-            return result
-
+        # Tombstones are counted too; ledger/LRU track only data-bearing
+        # nodes (a value materialized under lock is credited to protected
+        # at the materialization site).
         if lock_host:
-            if cd.host_lock_ref == 0:
+            if cd.host_lock_ref == 0 and value is not None:
                 host_lru = self.tree_core.host_lru_lists[ct]
                 if host_lru.in_list(node):
                     host_lru.remove_node(node)
             cd.host_lock_ref += 1
         else:
-            if cd.lock_ref == 0:
+            if cd.lock_ref == 0 and value is not None:
                 vlen = len(value)
                 self.tree_core.component_evictable_size_[ct] -= vlen
                 self.tree_core.component_protected_size_[ct] += vlen
@@ -470,12 +468,12 @@ class MambaComponent(TreeComponent):
         if node is self.tree_core.root_node:
             return
         cd = node.component_data[ct]
-        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
-        if node.id in skip_lock_node_ids:
-            return
 
         value = cd.host_value if lock_host else cd.value
         if lock_host:
+            assert cd.host_lock_ref > 0, (
+                f"Mamba release hit host_lock_ref=0 on node {node.id}"
+            )
             cd.host_lock_ref -= 1
             if cd.host_lock_ref == 0 and cd.value is None and cd.host_value is not None:
                 host_lru = self.tree_core.host_lru_lists[ct]
@@ -483,12 +481,12 @@ class MambaComponent(TreeComponent):
                     host_lru.insert_mru(node)
             return
 
-        if cd.lock_ref > 0:
-            if cd.lock_ref == 1:
-                vlen = len(value)
-                self.tree_core.component_evictable_size_[ct] += vlen
-                self.tree_core.component_protected_size_[ct] -= vlen
-            cd.lock_ref -= 1
+        assert cd.lock_ref > 0, f"Mamba release hit lock_ref=0 on node {node.id}"
+        if cd.lock_ref == 1 and value is not None:
+            vlen = len(value)
+            self.tree_core.component_evictable_size_[ct] += vlen
+            self.tree_core.component_protected_size_[ct] -= vlen
+        cd.lock_ref -= 1
 
     def _alloc_mamba_slot(self) -> torch.Tensor:
         """Allocate one mamba pool slot, evicting if necessary."""
@@ -809,15 +807,11 @@ class MambaComponent(TreeComponent):
                 return
             transfer = transfers[0]
             if transfer.device_indices is not None:
-                cd = node.component_data[ct]
-                cd.value = transfer.device_indices.clone()
-                count = len(cd.value)
-                # Move from host LRU to device LRU
-                host_lru = self.tree_core.host_lru_lists[ct]
-                if host_lru.in_list(node):
-                    host_lru.remove_node(node)
-                self.tree_core.lru_lists[ct].insert_mru(node)
-                self.tree_core.component_evictable_size_[ct] += count
+                # The materialization primitive owns the ledger/LRU moves,
+                # including crediting protected when restored under lock.
+                self.tree_core.set_component_device_value(
+                    node.id, ct, transfer.device_indices.clone()
+                )
 
         elif phase == CacheTransferPhase.PREFETCH:
             if not transfers:

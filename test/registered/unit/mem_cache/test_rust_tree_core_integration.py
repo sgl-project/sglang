@@ -263,10 +263,10 @@ def test_lock_and_unlock_move_tokens_between_protected_and_evictable():
     _insert(core, [1, 2, 3], [10, 11, 12])
     _insert(core, [1, 2, 3, 4, 5], [20, 21, 22, 13, 14])
     matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4, 5])))
-    core.inc_lock_ref(matched.best_match_node)
+    lock = core.inc_lock_ref(matched.best_match_node)
     assert core.protected_size() == 5
     assert core.evictable_size() == 0
-    core.dec_lock_ref(matched.best_match_node)
+    core.dec_lock_ref(matched.best_match_node, lock.to_dec_params())
     assert core.protected_size() == 0
     assert core.evictable_size() == 5
 
@@ -1402,20 +1402,20 @@ def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
     node = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
 
     owner = core.inc_lock_ref(node)
-    skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,))
-    assert skipped.skip_lock_node_ids == {ComponentType.MAMBA: {node}}
+    holder = core.inc_lock_ref(node, lock_mamba=False)
+    assert owner.mamba_lock_acquired
+    assert not holder.mamba_lock_acquired
     assert core.mamba_protected_size() == 1
 
-    released = core.dec_swa_lock_only(
-        node,
-        skipped.swa_uuid_for_lock,
-        skip_lock_node_ids=skipped.skip_lock_node_ids,
-    )
+    # The holder's receipt says it never took mamba: its early SWA release
+    # must leave the owner's mamba lock alone.
+    released = core.dec_swa_lock_only(node, holder.to_dec_params())
     assert dict(released.device_frees) == {}
     assert dict(released.host_frees) == {}
     assert core.mamba_protected_size() == 1
 
-    core.dec_lock_ref(node, skipped.to_dec_params(), skip_swa=True)
+    core.dec_lock_ref(node, holder.to_dec_params(), skip_swa=True)
+    assert core.mamba_protected_size() == 1
     core.dec_lock_ref(node, owner.to_dec_params())
     assert core.protected_size() == 0
     assert core.swa_protected_size() == 0
@@ -1493,10 +1493,9 @@ def test_mamba_eviction_walk_frees_slots_through_the_adapter():
     assert torch.cat(device_frees[ComponentType.MAMBA]).tolist() == [7]
     assert core.mamba_evictable_size() == 1
 
-    # A pre-eviction node handle locked after the tombstoning lands in the
-    # skip map, and the replay keeps the release off it.
+    # A pre-eviction node handle still lock-round-trips: the segment lock
+    # counts the tombstone and the paired release takes it back exactly.
     lock = core.inc_lock_ref(internal)
-    assert internal in lock.skip_lock_node_ids[ComponentType.MAMBA]
     core.dec_lock_ref(internal, lock.to_dec_params())
     core.sanity_check([], [])
 
@@ -1731,10 +1730,7 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert core.swa_evictable_size() == 1
     core.dec_lock_ref(
         node,
-        DecLockRefParams(
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            skip_lock_node_ids=result.skip_lock_node_ids,
-        ),
+        DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
     )
     # The uuid-bounded release returned the window to evictable.
     assert core.swa_protected_size() == 0
@@ -1744,32 +1740,29 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert again.swa_uuid_for_lock == result.swa_uuid_for_lock
 
 
-def test_swa_skip_map_crosses_the_binding_and_replays():
+def test_swa_tombstones_cross_the_binding_and_release_balanced():
     from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 
     core = _swa_tree_core(window=8)
     _insert(core, [1, 2], [10, 11])
     second = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13])
     leaf = second.cache_actions[-1].node_id
-    # Only the leaf carries SWA; its ancestor is recorded as a tombstone skip.
+    # Only the leaf carries SWA; the ancestor tombstone is counted too, and
+    # the under-window walk reaches the root without stamping a uuid.
     core.set_component_device_value(
         leaf, ComponentType.SWA, torch.tensor([52, 53], dtype=torch.int64)
     )
     result = core.inc_lock_ref(leaf)
-    assert result.skip_lock_node_ids[ComponentType.SWA]
+    assert result.swa_uuid_for_lock is None
+    assert core.swa_protected_size() == 2
     core.dec_lock_ref(
         leaf,
-        DecLockRefParams(
-            swa_uuid_for_lock=result.swa_uuid_for_lock,
-            skip_lock_node_ids=result.skip_lock_node_ids,
-        ),
+        DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
     )
     assert core.swa_protected_size() == 0
 
 
 def test_dec_swa_lock_only_frees_flow_after_the_full_release():
-    from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-
     core = _swa_tree_core(window=2)
     first = _insert(core, [1, 2], [10, 11])
     node = first.cache_actions[0].node_id
@@ -1777,17 +1770,15 @@ def test_dec_swa_lock_only_frees_flow_after_the_full_release():
         node, ComponentType.SWA, torch.tensor([50, 51], dtype=torch.int64)
     )
     result = core.inc_lock_ref(node)
+    # A non-None boundary: the window fills at the locked node itself.
+    assert result.swa_uuid_for_lock is not None
     # The FULL lock releases first (skip_swa), then the early window release
     # finds a fully unlocked device leaf and evicts it in place.
-    core.dec_lock_ref(
-        node,
-        DecLockRefParams(skip_lock_node_ids=result.skip_lock_node_ids),
-        skip_swa=True,
-    )
+    core.dec_lock_ref(node, result.to_dec_params(), skip_swa=True)
     device_frees: dict = {}
     host_frees: dict = {}
     _accumulate_step(
-        core.dec_swa_lock_only(node, result.swa_uuid_for_lock),
+        core.dec_swa_lock_only(node, result.to_dec_params()),
         {},
         device_frees,
         host_frees,
@@ -1796,7 +1787,7 @@ def test_dec_swa_lock_only_frees_flow_after_the_full_release():
     assert core.get_component_device_value(node, ComponentType.SWA) is None
 
 
-def test_dec_swa_lock_only_returns_the_window_frees():
+def test_dec_swa_lock_only_releases_once_and_a_repeat_dies_loud():
     core = _swa_tree_core(window=2)
     first = _insert(core, [1, 2, 3], [10, 11, 12])
     for action in first.cache_actions:
@@ -1810,22 +1801,19 @@ def test_dec_swa_lock_only_returns_the_window_frees():
     device_frees: dict = {}
     host_frees: dict = {}
     _accumulate_step(
-        core.dec_swa_lock_only(node, result.swa_uuid_for_lock),
+        core.dec_swa_lock_only(node, result.to_dec_params()),
         {},
         device_frees,
         host_frees,
     )
-    # The FULL lock still protects the path: the SWA release frees nothing and
-    # the rebuilt values survive; a repeat release is a no-op.
+    # The FULL lock still protects the path: the SWA release frees nothing
+    # and the rebuilt values survive.
     assert device_frees == {}
     assert core.get_component_device_value(node, ComponentType.SWA) is not None
-    _accumulate_step(
-        core.dec_swa_lock_only(node, result.swa_uuid_for_lock),
-        {},
-        device_frees,
-        host_frees,
-    )
-    assert device_frees == {}
+    # A repeat release of the same window is a protocol violation and dies
+    # at the segment instead of silently walking it.
+    with pytest.raises(BaseException, match="SWA window release hit lock_ref=0"):
+        core.dec_swa_lock_only(node, result.to_dec_params())
 
 
 def test_swa_rebuild_applies_through_the_python_allocator():
@@ -1854,7 +1842,7 @@ def test_recover_with_locked_full_applies_through_the_python_allocator():
     # The decode advanced past the window: the SWA lock releases early, then
     # window eviction tombstones the SWA slot under the FULL lock (the state a
     # locked-full overlap recovers from); its frees return to the allocator.
-    cache.dec_swa_lock_only(node, lock.swa_uuid_for_lock)
+    cache.dec_swa_lock_only(node, lock.to_dec_params())
     tracker = {ComponentType.FULL: 0, ComponentType.SWA: 0}
     device_frees: dict = {}
     host_frees: dict = {}

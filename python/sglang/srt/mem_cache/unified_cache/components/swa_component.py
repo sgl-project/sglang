@@ -73,6 +73,9 @@ class SWAComponent(TreeComponent):
         ), (
             f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
         )
+        if params.sliding_window_size is None or params.sliding_window_size <= 0:
+            raise ValueError("SWAComponent requires a positive sliding_window_size")
+
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
@@ -353,9 +356,9 @@ class SWAComponent(TreeComponent):
 
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         swa_evicted_seqlen = params.swa_evicted_seqlen
-        assert node.component_data[self.component_type].lock_ref == 0, (
-            f"tombstone {self.component_type} lock_ref should be 0, node {node.id}"
-        )
+        # A locked tombstone is legal (segment locks count every node); the
+        # full-value swap below is safe because full lock_ref >= swa
+        # lock_ref, so a locked-SWA node always takes the Recover branch.
         assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
             f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
         )
@@ -429,9 +432,6 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         if node.component_data[ct].value is not None:
             return
-        assert node.component_data[ct].lock_ref == 0, (
-            f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
-        )
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
             f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
@@ -538,6 +538,9 @@ class SWAComponent(TreeComponent):
         ].lock_ref
         new_parent.component_data[
             self.component_type
+        ].host_lock_ref = child.component_data[self.component_type].host_lock_ref
+        new_parent.component_data[
+            self.component_type
         ].session_ref = child.component_data[self.component_type].session_ref
         assert new_parent.component_data[self.component_type].session_ids is None
 
@@ -563,18 +566,30 @@ class SWAComponent(TreeComponent):
                 split_len:
             ].clone()
             host_lru = self.tree_core.host_lru_lists[self.component_type]
-            if new_parent.component_data[self.component_type].value is None:
+            # Host-locked halves stay out of the host LRU: in-flight IO
+            # holds them, and host acquire removed the node at 0->1.
+            if (
+                new_parent.component_data[self.component_type].value is None
+                and new_parent.component_data[self.component_type].host_lock_ref == 0
+            ):
                 host_lru.insert_mru(new_parent)
-            if child.component_data[
-                self.component_type
-            ].value is None and not host_lru.in_list(child):
+            if (
+                child.component_data[self.component_type].value is None
+                and child.component_data[self.component_type].host_lock_ref == 0
+                and not host_lru.in_list(child)
+            ):
                 host_lru.insert_mru(child)
 
-        # parent inherits the swa_uuid from child for swa lock ref
+        # The window-boundary uuids mark the node's older edge, which the
+        # split moves to the parent — both tiers migrate with it.
         new_parent.component_data[self.component_type].metadata["uuid"] = (
             child.component_data[self.component_type].metadata.get("uuid")
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
+        new_parent.component_data[self.component_type].metadata["host_uuid"] = (
+            child.component_data[self.component_type].metadata.get("host_uuid")
+        )
+        child.component_data[self.component_type].metadata.pop("host_uuid", None)
 
     def evict_component(
         self,
@@ -702,10 +717,20 @@ class SWAComponent(TreeComponent):
         result: IncLockRefResult,
         lock_host: bool = False,
     ) -> IncLockRefResult:
+        """Lock the contiguous segment covering the trailing window.
+
+        Every node in [node, boundary] is counted, tombstones included, so
+        the paired release decrements the same contiguous segment with no
+        carried skip state. Coverage is position-based (len(cur.key)); the
+        boundary node is always uuid-stamped, so a release without a uuid
+        means the segment reached the root. Ledger/LRU transitions track
+        only data-bearing nodes; a value materialized later under lock is
+        credited to protected by set_component_device_value.
+        """
         ct = self.component_type
         root = self.tree_core.root_node
         sliding_window_size = self.sliding_window_size
-        swa_lock_size = 0
+        covered = 0
         swa_uuid = None
         uuid_key = "host_uuid" if lock_host else "uuid"
         lru = (
@@ -714,33 +739,25 @@ class SWAComponent(TreeComponent):
             else self.tree_core.lru_lists[ct]
         )
 
-        # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
-        # skip them and keep walking up. This path is hit when HiCache
-        # backs up a FULL present internal node whose SWA was already evicted.
         cur = node
-        while cur != root and swa_lock_size < sliding_window_size:
+        while cur != root and covered < sliding_window_size:
             comp = cur.component_data[ct]
             value = comp.host_value if lock_host else comp.value
-            if value is None:
-                result.skip_lock_node_ids.setdefault(ct, set()).add(cur.id)
-                cur = cur.parent
-                continue
-
             ref = comp.host_lock_ref if lock_host else comp.lock_ref
-            if ref == 0:
+            if ref == 0 and value is not None:
                 if lock_host:
                     if lru.in_list(cur):
                         lru.remove_node(cur)
                 else:
-                    key_len = len(cur.key)
+                    key_len = len(value)
                     self.tree_core.component_evictable_size_[ct] -= key_len
                     self.tree_core.component_protected_size_[ct] += key_len
             if lock_host:
                 comp.host_lock_ref = ref + 1
             else:
                 comp.lock_ref = ref + 1
-            swa_lock_size += len(value)
-            if swa_lock_size >= sliding_window_size:
+            covered += len(cur.key)
+            if covered >= sliding_window_size:
                 if comp.metadata.get(uuid_key) is None:
                     comp.metadata[uuid_key] = next_component_uuid()
                 swa_uuid = comp.metadata[uuid_key]
@@ -765,29 +782,28 @@ class SWAComponent(TreeComponent):
             if params
             else None
         )
-        skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         dec_swa = True
         uuid_key = "host_uuid" if lock_host else "uuid"
 
-        # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         cur = node
         while cur != root and dec_swa:
             comp = cur.component_data[ct]
-            if cur.id in skip_lock_node_ids:
-                cur = cur.parent
-                continue
             ref = comp.host_lock_ref if lock_host else comp.lock_ref
-            if ref == 0:
-                cur = cur.parent
-                continue
-            if ref == 1:
+            # Acquire counted every segment node and splits copy refs, so a
+            # zero here means the release does not mirror its acquire.
+            assert ref > 0, (
+                f"SWA segment release hit {'host_' if lock_host else ''}"
+                f"lock_ref=0 on node {cur.id}"
+            )
+            value = comp.host_value if lock_host else comp.value
+            if ref == 1 and value is not None:
                 if lock_host:
-                    if comp.value is None and comp.host_value is not None:
+                    if comp.value is None:
                         host_lru = self.tree_core.host_lru_lists[ct]
                         if not host_lru.in_list(cur):
                             host_lru.insert_mru(cur)
                 else:
-                    key_len = len(comp.value)
+                    key_len = len(value)
                     self.tree_core.component_evictable_size_[ct] += key_len
                     self.tree_core.component_protected_size_[ct] -= key_len
             if lock_host:
@@ -805,15 +821,14 @@ class SWAComponent(TreeComponent):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Early-release the SWA lock along [node, swa_uuid_for_lock] while
-        leaving Full and Mamba locks intact.
+        """Early-release the SWA lock along [node, swa_uuid_for_lock]; this
+        method touches only SWA state. The wrapping ``dec_swa_lock_only`` also
+        drops strictly-lower-priority co-located locks (e.g. Mamba) per the
+        receipt; the Full lock stays so the request's prefix is protected.
 
         Called when a request's decode position has advanced past the sliding
-        window — the SWA portion of the tree lock is no longer needed but the
-        Full lock must stay so the request's prefix is protected.
-
-        Caller (UnifiedRadixCache.dec_swa_lock_only) must ensure this is
-        invoked at most once per (node, swa_uuid_for_lock) pair.
+        window. The caller must invoke this at most once per
+        (node, swa_uuid_for_lock) pair.
         """
         ct = self.component_type
         root = self.tree_core.root_node
@@ -821,17 +836,12 @@ class SWAComponent(TreeComponent):
         cur = node
         while cur is not root:
             cd = cur.component_data[ct]
-            # Acquire skips tombstoned nodes; release must skip them too. Same
-            # for nodes with lock_ref == 0 — acquire never credited them.
-            if cd.value is None or cd.lock_ref == 0:
-                if swa_uuid_for_lock and cd.metadata.get("uuid") == swa_uuid_for_lock:
-                    break
-                cur = cur.parent
-                continue
-
+            assert cd.lock_ref > 0, (
+                f"SWA window release hit lock_ref=0 on node {cur.id}"
+            )
             cd.lock_ref -= 1
-            if cd.lock_ref == 0:
-                key_len = len(cur.key)
+            if cd.lock_ref == 0 and cd.value is not None:
+                key_len = len(cd.value)
                 self.tree_core.component_protected_size_[ct] -= key_len
                 self.tree_core.component_evictable_size_[ct] += key_len
                 if self.tree_core._is_device_leaf(cur):

@@ -1,7 +1,7 @@
 //! Python bindings: the `mem_cache` extension module and its TreeCore adapter.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use pyo3::buffer::PyBuffer;
@@ -642,26 +642,26 @@ impl InsertResultBinding {
 
 /// Python-visible dec-lock params; converts into DecLockRefParams.
 #[pyclass(get_all, set_all)]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DecLockRefParamsBinding {
     pub swa_uuid_for_lock: Option<i64>,
     pub swa_uuid_for_host_lock: Option<i64>,
-    pub skip_lock_node_ids: HashMap<u8, HashSet<NodeId>>,
+    pub mamba_lock_acquired: bool,
 }
 
 #[pymethods]
 impl DecLockRefParamsBinding {
     #[new]
-    #[pyo3(signature = (swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, skip_lock_node_ids = None))]
+    #[pyo3(signature = (swa_uuid_for_lock = None, swa_uuid_for_host_lock = None, mamba_lock_acquired = false))]
     fn new(
         swa_uuid_for_lock: Option<i64>,
         swa_uuid_for_host_lock: Option<i64>,
-        skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
+        mamba_lock_acquired: bool,
     ) -> Self {
         DecLockRefParamsBinding {
             swa_uuid_for_lock,
             swa_uuid_for_host_lock,
-            skip_lock_node_ids: skip_lock_node_ids.unwrap_or_default(),
+            mamba_lock_acquired,
         }
     }
 }
@@ -672,25 +672,19 @@ impl DecLockRefParamsBinding {
         Ok(DecLockRefParams {
             swa_uuid_for_lock: self.swa_uuid_for_lock,
             swa_uuid_for_host_lock: self.swa_uuid_for_host_lock,
-            skip_lock_node_ids: self
-                .skip_lock_node_ids
-                .iter()
-                .map(|(ct, node_ids)| {
-                    Ok::<_, PyErr>((parse_component_type(*ct)?, node_ids.clone()))
-                })
-                .collect::<PyResult<_>>()?,
+            mamba_lock_acquired: self.mamba_lock_acquired,
         })
     }
 }
 
-/// Python-visible inc_lock_ref result; hand skip_lock_node_ids back to the
-/// matching dec_lock_ref.
+/// Python-visible inc_lock_ref result; the receipt (boundary uuids +
+/// mamba_lock_acquired) is handed back to the matching dec_lock_ref.
 #[pyclass(get_all)]
 pub struct IncLockRefResultBinding {
     delta: Option<usize>,
     swa_uuid_for_lock: Option<i64>,
     swa_uuid_for_host_lock: Option<i64>,
-    skip_lock_node_ids: HashMap<u8, HashSet<NodeId>>,
+    mamba_lock_acquired: bool,
 }
 
 impl IncLockRefResultBinding {
@@ -699,11 +693,7 @@ impl IncLockRefResultBinding {
             delta: result.delta,
             swa_uuid_for_lock: result.swa_uuid_for_lock,
             swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            skip_lock_node_ids: result
-                .skip_lock_node_ids
-                .into_iter()
-                .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
-                .collect(),
+            mamba_lock_acquired: result.mamba_lock_acquired,
         }
     }
 }
@@ -1075,17 +1065,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        skip_lock_components: Option<Vec<u8>>,
+        lock_mamba: bool,
     ) -> PyResult<IncLockRefResultBinding> {
-        let skip_lock_components = skip_lock_components
-            .unwrap_or_default()
-            .into_iter()
-            .map(parse_component_type)
-            .collect::<PyResult<Vec<_>>>()?;
-        let result = py.allow_threads(|| {
-            self.core()
-                .inc_lock_ref_with_skip(node_id, &skip_lock_components)
-        });
+        let result = py.allow_threads(|| self.core().inc_lock_ref(node_id, lock_mamba));
         Ok(IncLockRefResultBinding::from_result(result))
     }
 
@@ -1094,11 +1076,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         &self,
         py: Python<'_>,
         node_id: NodeId,
-        params: Option<&DecLockRefParamsBinding>,
+        params: &DecLockRefParamsBinding,
         skip_swa: bool,
     ) -> PyResult<()> {
-        let params = params.map(|p| p.to_dec_lock_ref_params()).transpose()?;
-        py.allow_threads(|| self.core().dec_lock_ref(node_id, params.as_ref(), skip_swa));
+        let params = params.to_dec_lock_ref_params()?;
+        py.allow_threads(|| self.core().dec_lock_ref(node_id, &params, skip_swa));
         Ok(())
     }
 
@@ -1109,23 +1091,18 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py: Python<'_>,
         node_id: NodeId,
         swa_uuid_for_lock: Option<i64>,
-        skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
+        mamba_lock_acquired: bool,
     ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-        let skip_lock_node_ids = skip_lock_node_ids
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(ct, node_ids)| Ok((parse_component_type(ct)?, node_ids)))
-            .collect::<PyResult<HashMap<_, _>>>()?;
+        let params = DecLockRefParams {
+            swa_uuid_for_lock,
+            mamba_lock_acquired,
+            ..Default::default()
+        };
         let (device_frees, host_frees) = py.allow_threads(|| {
             let mut device_frees = HashMap::new();
             let mut host_frees = HashMap::new();
-            self.core().dec_swa_lock_only_with_skip(
-                node_id,
-                swa_uuid_for_lock,
-                Some(&skip_lock_node_ids),
-                &mut device_frees,
-                &mut host_frees,
-            );
+            self.core()
+                .dec_swa_lock_only(node_id, &params, &mut device_frees, &mut host_frees);
             (device_frees, host_frees)
         });
         Ok((frees_to_py(py, device_frees)?, frees_to_py(py, host_frees)?))
@@ -1703,11 +1680,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             delta: result.delta,
             swa_uuid_for_lock: result.swa_uuid_for_lock,
             swa_uuid_for_host_lock: result.swa_uuid_for_host_lock,
-            skip_lock_node_ids: result
-                .skip_lock_node_ids
-                .into_iter()
-                .map(|(ct, node_ids)| (component_type_to_u8(ct), node_ids))
-                .collect(),
+            mamba_lock_acquired: result.mamba_lock_acquired,
         }
     }
 
@@ -2297,23 +2270,24 @@ macro_rules! tree_core_binding {
             }
 
             /// Bump the reference count on a node's component locks.
-            #[pyo3(signature = (node_id, skip_lock_components = None))]
+            #[pyo3(signature = (node_id, lock_mamba = true))]
             fn inc_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                skip_lock_components: Option<Vec<u8>>,
+                lock_mamba: bool,
             ) -> PyResult<IncLockRefResultBinding> {
-                self.inner.inc_lock_ref(py, node_id, skip_lock_components)
+                self.inner.inc_lock_ref(py, node_id, lock_mamba)
             }
 
-            /// Decrease the reference count on a node's component locks.
-            #[pyo3(signature = (node_id, params = None, skip_swa = false))]
+            /// Decrease the reference count on a node's component locks. The
+            /// receipt is required: a release must replay its acquire's evidence.
+            #[pyo3(signature = (node_id, params, skip_swa = false))]
             fn dec_lock_ref(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
-                params: Option<&DecLockRefParamsBinding>,
+                params: &DecLockRefParamsBinding,
                 skip_swa: bool,
             ) -> PyResult<()> {
                 self.inner.dec_lock_ref(py, node_id, params, skip_swa)
@@ -2321,20 +2295,16 @@ macro_rules! tree_core_binding {
 
             /// Early-release the SWA portion of a request's tree lock; returns this
             /// release's per-component (device_frees, host_frees).
-            #[pyo3(signature = (node_id, swa_uuid_for_lock = None, skip_lock_node_ids = None))]
+            #[pyo3(signature = (node_id, swa_uuid_for_lock, mamba_lock_acquired))]
             fn dec_swa_lock_only(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
                 swa_uuid_for_lock: Option<i64>,
-                skip_lock_node_ids: Option<HashMap<u8, HashSet<NodeId>>>,
+                mamba_lock_acquired: bool,
             ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-                self.inner.dec_swa_lock_only(
-                    py,
-                    node_id,
-                    swa_uuid_for_lock,
-                    skip_lock_node_ids,
-                )
+                self.inner
+                    .dec_swa_lock_only(py, node_id, swa_uuid_for_lock, mamba_lock_acquired)
             }
 
             /// Store a component's device value on a node (the SWA rebuild write-back).

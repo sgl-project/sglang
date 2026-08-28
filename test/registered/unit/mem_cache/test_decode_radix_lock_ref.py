@@ -32,7 +32,10 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
-from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCacheTransferMixin,
+    DecodePrefixMatch,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -373,6 +376,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.finished_reason = None
         req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = 123
+        req.mamba_lock_acquired = True
         req.swa_prefix_lock_released = False
         req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
@@ -442,15 +446,64 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(req.last_node, 123)
+        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=123, mamba_lock_acquired=True),
+        )
         queue.tree_cache.dec_lock_ref.assert_called_once_with(
             req.last_node,
-            DecLockRefParams(swa_uuid_for_lock=123),
+            DecLockRefParams(swa_uuid_for_lock=123, mamba_lock_acquired=True),
             skip_swa=True,
         )
         self.assertFalse(req.swa_prefix_lock_released)
         queue._swa_tail_len.assert_called_once_with(8)
         queue._allocatable_token_budgets.assert_called_once()
+
+    def test_hicache_restore_commit_hands_over_lock_with_receipt(self):
+        """The hicache-restore commit must release the prealloc lock with the
+        req's receipt, honoring a prior early SWA release (skip_swa), and hand
+        the restored node's lock to the req atomically: receipt fields move
+        with last_node, the early-release flag resets (the restored lock is
+        fresh), and the decode_req drops ownership so a post-commit abort
+        cannot release the restored lock a second time."""
+        q = DecodeHiCacheTransferMixin.__new__(DecodeHiCacheTransferMixin)
+        q.tree_cache = MagicMock()
+
+        req = MagicMock()
+        req.req_pool_idx = 0
+        req.swa_uuid_for_lock = 123
+        req.mamba_lock_acquired = True
+        req.swa_prefix_lock_released = True  # SWA tail-prealloc released early
+
+        prealloc_node = object()
+        restored_node = object()
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.prefix_match = DecodePrefixMatch(
+            prefix_indices=torch.arange(4, dtype=torch.int64),
+            l2_host_hit_length=4,
+            l3_storage_hit_length=0,
+            last_device_node=prealloc_node,
+        )
+        decode_req.hicache_restored_node = restored_node
+        decode_req.hicache_restored_lock_params = DecLockRefParams(
+            swa_uuid_for_lock=456, mamba_lock_acquired=False
+        )
+        decode_req.hicache_restored_kv_indices = torch.arange(4, 8, dtype=torch.int64)
+
+        q._commit_hicache_local_restore_to_req(decode_req)
+
+        q.tree_cache.dec_lock_ref.assert_called_once_with(
+            prealloc_node,
+            DecLockRefParams(swa_uuid_for_lock=123, mamba_lock_acquired=True),
+            skip_swa=True,
+        )
+        self.assertIs(req.last_node, restored_node)
+        self.assertEqual(req.swa_uuid_for_lock, 456)
+        self.assertFalse(req.mamba_lock_acquired)
+        self.assertFalse(req.swa_prefix_lock_released)
+        self.assertIsNone(decode_req.hicache_restored_node)
+        self.assertIsNone(decode_req.hicache_restored_lock_params)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

@@ -32,6 +32,13 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 // ---- interface types ----
 
 /// Result of `inc_lock_ref`, handed back to the matching `dec_lock_ref`.
+///
+/// The receipt a release needs is per-component lock evidence: the SWA
+/// segment boundary uuid (None means the segment reached the root) and
+/// whether the single-node Mamba lock was taken (the decode hold opts
+/// out). Locks count every node in their contiguous segment, so no
+/// per-node skip state exists. Receipt fields default to nothing-acquired;
+/// `inc_lock_ref` stamps what it actually took.
 #[derive(Default)]
 pub struct IncLockRefResult {
     /// Tokens newly protected (moved out of evictable) by this lock.
@@ -40,20 +47,21 @@ pub struct IncLockRefResult {
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid minted/reused by the host lock walk.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Per-component nodes that were tombstones at acquire time; replayed at
-    /// release so the unlock skips them.
-    pub skip_lock_node_ids: HashMap<ComponentType, HashSet<NodeId>>,
+    /// Whether the acquire took the single-node Mamba lock.
+    pub mamba_lock_acquired: bool,
 }
 
-/// Params for `dec_lock_ref`.
+/// Params for `dec_lock_ref`. Receipt fields default to nothing-acquired so
+/// a lost receipt under-releases (a leak sanity checks report) instead of
+/// releasing a lock another holder owns.
 #[derive(Default)]
 pub struct DecLockRefParams {
     /// SWA lock-window uuid the device unlock stops at, from the matching acquire.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid the host unlock stops at, from the matching acquire.
     pub swa_uuid_for_host_lock: Option<i64>,
-    /// Per-component nodes the unlock walk skips (from the matching acquire).
-    pub skip_lock_node_ids: HashMap<ComponentType, HashSet<NodeId>>,
+    /// Whether the matching acquire took the single-node Mamba lock.
+    pub mamba_lock_acquired: bool,
 }
 
 /// Result of `dec_lock_ref`.
@@ -790,35 +798,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.swa_uuid_counter
     }
 
-    /// Bump the reference count on a node's component locks.
-    pub fn inc_lock_ref(&mut self, node_id: NodeId) -> IncLockRefResult {
-        self.inc_lock_ref_with_skip(node_id, &[])
-    }
-
-    /// Bump component locks, leaving explicitly skipped target components evictable.
-    pub fn inc_lock_ref_with_skip(
-        &mut self,
-        node_id: NodeId,
-        skip_lock_components: &[ComponentType],
-    ) -> IncLockRefResult {
+    /// Bump the reference count on a node's component locks; lock_mamba=false
+    /// leaves the single-node mamba lock untaken (recorded in the result).
+    pub fn inc_lock_ref(&mut self, node_id: NodeId, lock_mamba: bool) -> IncLockRefResult {
         let node_id = self.arena.resolve(node_id);
-        let node = self.arena.node(node_id);
-        let node_handle = node.id;
-        let is_root = node.is_root();
-        let mut result = IncLockRefResult::default();
+        // The result records what was locked; the paired dec mirrors it.
+        let mut result = IncLockRefResult {
+            mamba_lock_acquired: lock_mamba,
+            ..Default::default()
+        };
         for i in 0..self.components.len() {
-            let component_type = self.components[i].component_type();
-            if skip_lock_components.contains(&component_type) {
-                if !is_root {
-                    result
-                        .skip_lock_node_ids
-                        .entry(component_type)
-                        .or_default()
-                        .insert(node_handle);
-                }
+            let component = Arc::clone(&self.components[i]);
+            if !lock_mamba && component.component_type() == MAMBA {
                 continue;
             }
-            let component = Arc::clone(&self.components[i]);
             result = component
                 .acquire_component_lock(self, node_id, result, /* lock_host = */ false);
         }
@@ -826,20 +819,42 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         result
     }
 
-    /// Decrease the reference count on a node's component locks.
+    /// Decrease the reference count on a node's component locks. The receipt
+    /// is required: a release must replay its acquire's evidence.
     pub fn dec_lock_ref(
         &mut self,
         node_id: NodeId,
-        params: Option<&DecLockRefParams>,
+        params: &DecLockRefParams,
         skip_swa: bool,
     ) -> DecLockRefResult {
         let node_id = self.arena.resolve(node_id);
+        let mamba_lock_acquired = params.mamba_lock_acquired;
+        // skip_swa mirrors dec_swa_lock_only, which also dropped every
+        // strictly-lower-priority component's lock (e.g. Mamba) — skipping
+        // only SWA here would double-release those.
+        let swa_priority = if skip_swa {
+            self.try_component_by_type_(SWA)
+                .map(|swa| swa.eviction_priority(/* is_leaf = */ false))
+        } else {
+            None
+        };
         for i in 0..self.components.len() {
-            if skip_swa && self.components[i].component_type() == SWA {
+            let component = Arc::clone(&self.components[i]);
+            let ct = component.component_type();
+            if let Some(swa_priority) = swa_priority
+                && (ct == SWA || component.eviction_priority(/* is_leaf = */ false) < swa_priority)
+            {
                 continue;
             }
-            let component = Arc::clone(&self.components[i]);
-            component.release_component_lock(self, node_id, params, /* lock_host = */ false);
+            if !mamba_lock_acquired && ct == MAMBA {
+                continue;
+            }
+            component.release_component_lock(
+                self,
+                node_id,
+                Some(params),
+                /* lock_host = */ false,
+            );
         }
         self.update_evictable_leaf_sets_(node_id);
         // TODO: delta is not aggregated from components; no caller uses it yet.
@@ -851,25 +866,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn dec_swa_lock_only(
         &mut self,
         node_id: NodeId,
-        swa_uuid_for_lock: Option<i64>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-    ) {
-        self.dec_swa_lock_only_with_skip(
-            node_id,
-            swa_uuid_for_lock,
-            /* skip_lock_node_ids = */ None,
-            device_frees,
-            host_frees,
-        );
-    }
-
-    /// Skip-aware variant used when an acquire deliberately omitted a component.
-    pub fn dec_swa_lock_only_with_skip(
-        &mut self,
-        node_id: NodeId,
-        swa_uuid_for_lock: Option<i64>,
-        skip_lock_node_ids: Option<&HashMap<ComponentType, HashSet<NodeId>>>,
+        params: &DecLockRefParams,
         device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {
@@ -877,22 +874,27 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return;
         };
-        swa.release_window_lock(self, node_id, swa_uuid_for_lock, device_frees, host_frees);
+        swa.release_window_lock(
+            self,
+            node_id,
+            params.swa_uuid_for_lock,
+            device_frees,
+            host_frees,
+        );
 
-        // Drop strictly-lower-priority locks (e.g. Mamba) co-located on the node.
+        // Drop strictly-lower-priority locks (e.g. Mamba) co-located on the
+        // node, skipping any the paired inc never took.
         let swa_priority = swa.eviction_priority(/* is_leaf = */ false);
-        let dec_params = DecLockRefParams {
-            swa_uuid_for_lock,
-            skip_lock_node_ids: skip_lock_node_ids.cloned().unwrap_or_default(),
-            ..Default::default()
-        };
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
+            if !params.mamba_lock_acquired && component.component_type() == MAMBA {
+                continue;
+            }
             if component.eviction_priority(/* is_leaf = */ false) < swa_priority {
                 component.release_component_lock(
                     self,
                     node_id,
-                    Some(&dec_params),
+                    Some(params),
                     /* lock_host = */ false,
                 );
             }
@@ -1866,7 +1868,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn unevict_node_on_insert_(&mut self, node_id: NodeIdx_, fresh_value: &Tensor) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
-        self.inc_evictable_size(FULL, fresh_value.size()[0] as usize);
+        let tokens = fresh_value.size()[0] as usize;
+        // A value materialized under lock is protected; the last release
+        // moves it to evictable.
+        if self.arena.device_lock_ref(node_id, FULL) > 0 {
+            self.inc_protected_size(FULL, tokens);
+        } else {
+            self.inc_evictable_size(FULL, tokens);
+        }
         self.update_evictable_leaf_sets_(node_id);
         self.update_full_coexisting_host_tracking_(node_id);
         if let Some(parent_id) = self.arena.node(node_id).try_parent() {
@@ -2648,6 +2657,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         if node.is_host_locked() {
+            return false;
+        }
+        // Segment locks count evicted nodes too: a device-locked candidate is
+        // a live segment's anchor, and evict_host_leaf_ would delete it.
+        if node.is_device_locked() {
             return false;
         }
         if !node.children.is_empty() {
@@ -3719,7 +3733,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             host_lru.remove_node(node_id);
         }
         self.device_lru_list_mut(component_type).insert_mru(node_id);
-        self.inc_evictable_size(component_type, tokens);
+        // A value materialized under lock is protected; the last release
+        // moves it to evictable.
+        if self.arena.device_lock_ref(node_id, component_type) > 0 {
+            self.inc_protected_size(component_type, tokens);
+        } else {
+            self.inc_evictable_size(component_type, tokens);
+        }
     }
 
     /// The component's device value on the node, or None if evicted.
@@ -3948,12 +3968,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         device_state.lock_ref
                     ));
                 }
-                if device_state.value.is_none() && device_state.lock_ref > 0 {
-                    errors.push(format!(
-                        "node {node_id} {ct:?} evicted but lock_ref={}",
-                        device_state.lock_ref
-                    ));
-                }
+                // Locked tombstones are legal: segment locks count every
+                // node in [start, boundary], data-bearing or not.
             }
 
             // Collect expected leaf qualification (single pass)
