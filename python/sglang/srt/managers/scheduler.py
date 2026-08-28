@@ -3979,10 +3979,11 @@ class Scheduler(
         flush_trace_batch(batch.reqs)
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
-        if self.kv_slot_weight_versions is not None and batch.out_cache_loc is not None:
-            self.kv_slot_weight_versions.record(
-                slot_indices=batch.out_cache_loc,
-                version=get_server_args().weight_version,
+        if (x := self.kv_slot_weight_versions) is not None and (
+            slot_indices := batch.out_cache_loc
+        ) is not None:
+            x.record(
+                slot_indices=slot_indices, version=get_server_args().weight_version
             )
 
         if batch.forward_mode.is_decode():
