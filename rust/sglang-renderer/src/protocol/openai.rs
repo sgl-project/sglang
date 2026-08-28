@@ -5,19 +5,26 @@ use std::collections::{BTreeMap, HashMap};
 use dynamo_protocols::types::{
     ChatCompletionAudio, ChatCompletionFunctionCall, ChatCompletionFunctions,
     ChatCompletionRequestMessage, ChatCompletionStreamOptions, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, PredictionContent, Prompt, ReasoningEffort, ResponseFormat,
-    ServiceTier, Stop, WebSearchOptions,
+    ChatCompletionToolChoiceOption, PredictionContent, Prompt, ResponseFormat, ServiceTier, Stop,
+    WebSearchOptions,
 };
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, OneOrManyItem,
+    ChatRequest, GenerateRequestMetadata, GenerationOptions, OneOrMany, ReasoningEffort,
     RendererConfig, RendererError, SamplingDefaults, SamplingParams, SamplingParamsOverrides,
     TextRequest, TokenIds, TokenIdsRequest,
 };
 
 const MAX_OPENAI_CHOICES: usize = 4096;
+
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum ResponseModality {
+    Text,
+    Audio,
+}
 
 fn reject_unsupported_fields(fields: &HashMap<String, Value>) -> Result<(), String> {
     if fields.is_empty() {
@@ -44,6 +51,8 @@ pub(crate) struct ChatCompletionRequest {
     #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
+    pub reasoning: Option<Value>,
+    #[serde(default)]
     pub metadata: Option<Value>,
     #[serde(default)]
     pub frequency_penalty: Option<f32>,
@@ -60,7 +69,7 @@ pub(crate) struct ChatCompletionRequest {
     #[serde(default)]
     pub n: Option<u8>,
     #[serde(default)]
-    pub modalities: Option<Value>,
+    modalities: Option<Vec<ResponseModality>>,
     #[serde(default)]
     pub prediction: Option<PredictionContent>,
     #[serde(default)]
@@ -307,7 +316,7 @@ impl RequestExtensions {
     }
 }
 
-fn expand_per_prompt<T: Clone + OneOrManyItem>(
+fn expand_per_prompt<T: Clone>(
     name: &str,
     value: Option<OneOrMany<T>>,
     prompt_count: usize,
@@ -334,8 +343,13 @@ fn generated_response_id(prefix: &str) -> String {
 /// `ChatPreprocessor`, where every transport shares them.
 pub(crate) fn lower_chat_request(
     config: &RendererConfig,
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
 ) -> Result<(String, ChatRequest), RendererError> {
+    normalize_reasoning_inputs(
+        &mut request.reasoning_effort,
+        request.reasoning.take(),
+        &mut request.chat_template_kwargs,
+    )?;
     // Accepted OpenAI metadata fields do not affect SGLang generation.
     let _ = (&request.store, &request.metadata, &request.user);
     reject_unsupported_fields(&request.unsupported_fields)?;
@@ -349,10 +363,7 @@ pub(crate) fn lower_chat_request(
         .pop()
         .expect("one chat prompt produces one metadata context")
         .metadata;
-    let mut sampling_params = chat_sampling_params(
-        &request,
-        &ChatSamplingDefaults::CHAT.with_model_defaults(&config.default_sampling_params),
-    )?;
+    let mut sampling_params = chat_sampling_params(&request, &config.default_sampling_params)?;
     request.sampling_overrides.apply(&mut sampling_params);
     Ok((
         response_id.clone(),
@@ -377,6 +388,63 @@ pub(crate) fn lower_chat_request(
     ))
 }
 
+pub(crate) fn normalize_reasoning_inputs(
+    reasoning_effort: &mut Option<ReasoningEffort>,
+    reasoning: Option<Value>,
+    chat_template_kwargs: &mut Option<HashMap<String, Value>>,
+) -> Result<(), RendererError> {
+    let mut thinking = None;
+    if let Some(Value::Object(reasoning)) = reasoning {
+        let nested_effort = reasoning
+            .get("effort")
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                reasoning
+                    .get("reasoning_effort")
+                    .filter(|value| !value.is_null())
+            });
+        if let Some(nested_effort) = nested_effort {
+            *reasoning_effort = Some(
+                serde_json::from_value(nested_effort.clone())
+                    .map_err(|error| format!("invalid reasoning effort: {error}"))?,
+            );
+        }
+
+        let enabled = reasoning
+            .get("enabled")
+            .filter(|value| !value.is_null())
+            .or_else(|| reasoning.get("enable"));
+        if enabled.is_some_and(json_truthy) {
+            thinking = Some(true);
+        }
+    }
+
+    if let Some(effort) = reasoning_effort.as_ref() {
+        thinking = Some(!effort.disables_thinking());
+    }
+    if let Some(thinking) = thinking {
+        let args = chat_template_kwargs.get_or_insert_with(HashMap::new);
+        args.entry("thinking".into()).or_insert(thinking.into());
+        args.entry("enable_thinking".into())
+            .or_insert(thinking.into());
+    }
+    Ok(())
+}
+
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "on"
+        ),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
 fn validate_chat_request(
     config: &RendererConfig,
     request: &ChatCompletionRequest,
@@ -392,9 +460,11 @@ fn validate_chat_request(
     if max_tokens == Some(0) {
         return Err("max_completion_tokens must be positive".into());
     }
-    if request.modalities.as_ref().is_some_and(|modalities| {
-        serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
-    }) || request.audio.is_some()
+    if request
+        .modalities
+        .as_ref()
+        .is_some_and(|modalities| modalities.contains(&ResponseModality::Audio))
+        || request.audio.is_some()
         || request.prediction.is_some()
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
@@ -413,41 +483,10 @@ fn validate_chat_request(
     Ok(())
 }
 
-/// Where an omitted `temperature` / `top_p` gets its value. Mirrors Python's
-/// `to_sampling_params` priority: user value > model generation_config (when
-/// `--sampling-defaults model`) > OpenAI terminal default
-/// (`_DEFAULT_SAMPLING_PARAMS`: chat uses 1.0/1.0).
-pub struct ChatSamplingDefaults {
-    /// Model defaults; `None` when the model config doesn't set them or when
-    /// `--sampling-defaults openai` (the Python dump is then empty).
-    temperature: Option<f64>,
-    top_p: Option<f64>,
-    /// OpenAI terminal defaults for chat completions.
-    fallback_temperature: f64,
-    fallback_top_p: f64,
-}
-
-impl ChatSamplingDefaults {
-    /// `protocol.py` chat `_DEFAULT_SAMPLING_PARAMS`: temperature 1.0, top_p 1.0.
-    pub const CHAT: ChatSamplingDefaults = ChatSamplingDefaults {
-        temperature: None,
-        top_p: None,
-        fallback_temperature: 1.0,
-        fallback_top_p: 1.0,
-    };
-    /// The resolved model defaults (empty in `--sampling-defaults openai`
-    /// mode), which slot between the user's values and the OpenAI terminals.
-    pub fn with_model_defaults(mut self, model: &SamplingDefaults) -> ChatSamplingDefaults {
-        self.temperature = model.temperature;
-        self.top_p = model.top_p;
-        self
-    }
-}
-
 #[allow(deprecated)]
 pub fn chat_sampling_params(
     request: &ChatCompletionRequest,
-    defaults: &ChatSamplingDefaults,
+    model_defaults: &SamplingDefaults,
 ) -> Result<SamplingParams, String> {
     let mut stop = None;
     let mut stop_token_ids = None;
@@ -484,13 +523,13 @@ pub fn chat_sampling_params(
         temperature: request
             .temperature
             .map(f64::from)
-            .or(defaults.temperature)
-            .unwrap_or(defaults.fallback_temperature),
+            .or(model_defaults.temperature)
+            .unwrap_or(1.0),
         top_p: request
             .top_p
             .map(f64::from)
-            .or(defaults.top_p)
-            .unwrap_or(defaults.fallback_top_p),
+            .or(model_defaults.top_p)
+            .unwrap_or(1.0),
         frequency_penalty: request.frequency_penalty.unwrap_or(0.0) as f64,
         presence_penalty: request.presence_penalty.unwrap_or(0.0) as f64,
         n: 1,

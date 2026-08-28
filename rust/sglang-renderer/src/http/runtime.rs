@@ -23,25 +23,18 @@ pub struct RendererRuntimeConfig {
 }
 
 pub async fn serve(config: RendererRuntimeConfig) -> Result<(), String> {
-    if config.renderer.skip_tokenizer_init {
-        return Err("standalone rendering requires a tokenizer".into());
-    }
     let tokenizer_without_specials = load_tokenizer(
         (!config.renderer.tokenizer_path.is_empty())
             .then_some(config.renderer.tokenizer_path.as_str()),
         config.renderer.revision.as_deref(),
         false,
-        false,
-    )?
-    .ok_or_else(|| "standalone rendering requires a tokenizer".to_owned())?;
+    )?;
     let tokenizer_with_specials = load_tokenizer(
         (!config.renderer.tokenizer_path.is_empty())
             .then_some(config.renderer.tokenizer_path.as_str()),
         config.renderer.revision.as_deref(),
-        false,
         true,
-    )?
-    .ok_or_else(|| "standalone rendering requires a tokenizer".to_owned())?;
+    )?;
     let encode_tokenizer: Arc<dyn TextTokenizer> = Arc::new(DynamoTokenizer::new(
         tokenizer_without_specials.clone(),
         tokenizer_with_specials,

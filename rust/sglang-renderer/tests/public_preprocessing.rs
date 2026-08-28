@@ -32,11 +32,8 @@ fn config() -> RendererConfig {
         reasoning_parser: None,
         default_chat_template_kwargs: Default::default(),
         stream_response_default_include_usage: false,
-        skip_tokenizer_init: false,
-        vocab_size: 128,
         default_sampling_params: SamplingDefaults::default(),
         limits: RendererLimits {
-            skip_tokenizer_init: false,
             vocab_size: 128,
             context_len: 128,
             num_reserved_tokens: 0,
@@ -64,7 +61,7 @@ fn completion_and_chat_share_the_public_text_preparation_boundary() {
             ..Default::default()
         },
     );
-    futures::executor::block_on(renderer.prepare_text_request(completion)).unwrap();
+    futures::executor::block_on(renderer.prepare_text_requests(vec![completion])).unwrap();
 
     let messages: Vec<ChatCompletionRequestMessage> = serde_json::from_value(serde_json::json!([
         {"role": "user", "content": "hello"}

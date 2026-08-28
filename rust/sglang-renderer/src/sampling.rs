@@ -313,11 +313,10 @@ impl Default for SamplingParams {
 impl SamplingParams {
     /// `__post_init__` → `normalize` → `verify`, the order
     /// `TokenizerManager._create_tokenized_object` runs them in. `Err` is a
-    /// request-local 400. `skip_tokenizer_init` stands in for Python's
-    /// `tokenizer is None`; `vocab_size` bounds `logit_bias` keys.
-    pub fn normalize(&mut self, skip_tokenizer_init: bool, vocab_size: u64) -> Result<(), Error> {
+    /// request-local 400. `vocab_size` bounds `logit_bias` keys.
+    pub fn normalize(&mut self, vocab_size: u64) -> Result<(), Error> {
         self.post_init();
-        self.normalize_stops(skip_tokenizer_init)?;
+        self.normalize_stops()?;
         self.verify(vocab_size)
     }
 
@@ -349,10 +348,9 @@ impl SamplingParams {
         }
     }
 
-    /// Python `normalize(tokenizer)`: size the stop match windows, reject
-    /// tokenizer-dependent features when there is no tokenizer, and clear the API
-    /// aliases so they don't ride the wire twice.
-    fn normalize_stops(&mut self, skip_tokenizer_init: bool) -> Result<(), Error> {
+    /// Python `normalize(tokenizer)`: size the stop match windows and clear the
+    /// API aliases so they don't ride the wire twice.
+    fn normalize_stops(&mut self) -> Result<(), Error> {
         // Match window: UTF-8 byte length is a safe upper bound on the token count.
         self.stop_str_max_len = self.stop_strs.iter().map(|s| s.len()).max().unwrap_or(0);
         // Validate + bound every stop_regex here, before it can reach the
@@ -384,32 +382,6 @@ impl SamplingParams {
             stop_regex_max_len = stop_regex_max_len.max(pattern.max_len());
         }
         self.stop_regex_max_len = stop_regex_max_len;
-
-        // Python `raise_if_tokenizer_required`: these need `tokenizer.decode` /
-        // `eos_token_id`, which `skip_tokenizer_init` does not have.
-        if skip_tokenizer_init {
-            if !self.stop_strs.is_empty() {
-                return Err(bad(
-                    "stop is unavailable when skip_tokenizer_init=True (requires a \
-                     tokenizer to decode tokens to text for matching)"
-                        .into(),
-                ));
-            }
-            if !self.stop_regex_strs.is_empty() {
-                return Err(bad(
-                    "stop_regex is unavailable when skip_tokenizer_init=True (requires a \
-                     tokenizer to decode tokens to text for matching)"
-                        .into(),
-                ));
-            }
-            if self.min_new_tokens > 0 {
-                return Err(bad(format!(
-                    "min_new_tokens={} is unavailable when skip_tokenizer_init=True \
-                     (requires a tokenizer for eos_token_id)",
-                    self.min_new_tokens
-                )));
-            }
-        }
 
         self.stop = None;
         self.stop_regex = None;
@@ -606,13 +578,13 @@ mod tests {
     /// Parse client JSON exactly as `/generate` does, then run the full pipeline.
     fn norm(json: &str) -> SamplingParams {
         let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-        sp.normalize(false, TEST_VOCAB).expect("normalizes");
+        sp.normalize(TEST_VOCAB).expect("normalizes");
         sp
     }
 
     fn norm_err(json: &str) -> Error {
         let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-        sp.normalize(false, TEST_VOCAB).expect_err("must reject")
+        sp.normalize(TEST_VOCAB).expect_err("must reject")
     }
 
     /// The wire shape the scheduler decodes: a map of field names → values — the
@@ -891,7 +863,7 @@ mod tests {
             r#"{"n": 1}"#,
         ] {
             let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-            sp.normalize(false, TEST_VOCAB)
+            sp.normalize(TEST_VOCAB)
                 .unwrap_or_else(|e| panic!("{json} is in range but was rejected: {e}"));
         }
     }
@@ -914,7 +886,7 @@ mod tests {
         ] {
             let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
             assert!(
-                sp.normalize(false, TEST_VOCAB).is_err(),
+                sp.normalize(TEST_VOCAB).is_err(),
                 "{json} is out of range but was accepted"
             );
         }
@@ -969,7 +941,7 @@ mod tests {
         let mut once = norm(r#"{"stop": ["END", "STOP"], "stop_regex": "\\d{3}"}"#);
         let twice = {
             let mut p = once.clone();
-            p.normalize(false, TEST_VOCAB).expect("second normalize");
+            p.normalize(TEST_VOCAB).expect("second normalize");
             p
         };
         assert_eq!(once, twice, "a second normalize must change nothing");
@@ -979,29 +951,8 @@ mod tests {
 
         // Greedy handling must not re-fire either: temperature is 1.0 after the
         // first pass, which is not in the greedy window.
-        once.normalize(false, TEST_VOCAB).unwrap();
+        once.normalize(TEST_VOCAB).unwrap();
         assert_eq!(once.top_k, twice.top_k);
-    }
-
-    /// `skip_tokenizer_init` has no tokenizer, so the text-matching stop features
-    /// and `min_new_tokens` (needs eos_token_id) are 400s, not silent no-ops.
-    /// Mirrors Python `raise_if_tokenizer_required`.
-    #[test]
-    fn tokenizer_dependent_features_rejected_without_tokenizer() {
-        for json in [
-            r#"{"stop": "END"}"#,
-            r#"{"stop_regex": "\\d+"}"#,
-            r#"{"min_new_tokens": 1}"#,
-        ] {
-            let mut sp: SamplingParams = serde_json::from_str(json).expect("parses");
-            assert!(
-                sp.normalize(true, TEST_VOCAB).is_err(),
-                "{json} must be rejected under skip_tokenizer_init"
-            );
-        }
-        // The same params are fine when a tokenizer is present.
-        let mut sp: SamplingParams = serde_json::from_str(r#"{"stop": "END"}"#).unwrap();
-        assert!(sp.normalize(false, TEST_VOCAB).is_ok());
     }
 
     /// `logit_bias` keys index the logits row, so an out-of-vocab id is a 400
@@ -1012,12 +963,12 @@ mod tests {
     fn logit_bias_keys_are_vocab_bounded() {
         let mut sp: SamplingParams =
             serde_json::from_str(r#"{"logit_bias": {"1000": 1.0}}"#).unwrap();
-        assert!(sp.clone().normalize(false, 1000).is_err());
-        assert!(sp.normalize(false, 1001).is_ok());
+        assert!(sp.clone().normalize(1000).is_err());
+        assert!(sp.normalize(1001).is_ok());
 
         let mut sp: SamplingParams =
             serde_json::from_str(r#"{"logit_bias": {"999": -1.0}}"#).unwrap();
-        assert!(sp.normalize(false, 1000).is_ok());
+        assert!(sp.normalize(1000).is_ok());
     }
 
     /// The key *format* check is separate from the vocab bound: the scheduler
@@ -1056,7 +1007,7 @@ mod tests {
         assert!(
             serde_json::from_str::<SamplingParams>(&json)
                 .unwrap()
-                .normalize(false, TEST_VOCAB)
+                .normalize(TEST_VOCAB)
                 .is_ok(),
             "the cap itself must be accepted"
         );

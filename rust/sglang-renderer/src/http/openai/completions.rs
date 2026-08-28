@@ -8,9 +8,7 @@ use super::{completion_usage, unix_seconds_u32};
 use crate::http::{
     CompletionRequest, OpenAIHttpFrontend,
     error::{error_payload, openai_error, renderer_status},
-    submission::{
-        collect_output, merge_indexed, submit_completion_inputs, submit_token_ids_inputs,
-    },
+    submission::{collect_output, merge_indexed, submit_generate_requests},
 };
 use crate::protocol::openai::{lower_text_completion_request, lower_token_ids_completion_request};
 use crate::{
@@ -117,7 +115,18 @@ async fn completions(
                 (index, prompt_index, prompt_echo)
             })
             .collect();
-        let streams = match submit_completion_inputs(&state, completion_requests, stream).await {
+        let generate_requests = match state
+            .renderer
+            .prepare_text_requests(completion_requests)
+            .await
+        {
+            Ok(requests) => requests,
+            Err(error) => {
+                let status = renderer_status(&error);
+                return openai_error(status, error.to_string(), false);
+            }
+        };
+        let streams = match submit_generate_requests(&state, generate_requests, stream).await {
             Ok(streams) => streams,
             Err(response) => return response,
         };
@@ -154,7 +163,14 @@ async fn completions(
             }
             metadata.push((index, prompt_index, prompt_echo.clone()));
         }
-        let streams = match submit_token_ids_inputs(&state, token_requests, stream).await {
+        let generate_requests = match state.renderer.prepare_token_ids_requests(token_requests) {
+            Ok(requests) => requests,
+            Err(error) => {
+                let status = renderer_status(&error);
+                return openai_error(status, error.to_string(), false);
+            }
+        };
+        let streams = match submit_generate_requests(&state, generate_requests, stream).await {
             Ok(streams) => streams,
             Err(response) => return response,
         };
@@ -454,82 +470,43 @@ pub(super) fn completion_logprobs(
         return result;
     };
     if include_input {
-        append_selected_logprobs(
-            &mut result,
-            &extras.input_logprobs,
-            &extras.input_logprob_token_ids,
-            &extras.input_logprob_text,
-        );
-        append_top_logprobs(
-            &mut result,
-            &extras.input_top_logprobs,
-            &extras.input_top_logprob_token_ids,
-            &extras.input_top_logprob_lengths,
-            &extras.input_top_logprob_text,
-        );
+        append_logprobs(&mut result, &extras.input_logprobs);
     }
-    append_selected_logprobs(
-        &mut result,
-        &extras.output_logprobs,
-        &extras.output_logprob_token_ids,
-        &extras.output_logprob_text,
-    );
-    append_top_logprobs(
-        &mut result,
-        &extras.output_top_logprobs,
-        &extras.output_top_logprob_token_ids,
-        &extras.output_top_logprob_lengths,
-        &extras.output_top_logprob_text,
-    );
+    append_logprobs(&mut result, &extras.output_logprobs);
     result
 }
 
-fn append_selected_logprobs(result: &mut Logprobs, values: &[f32], ids: &[i32], texts: &[String]) {
-    for (index, (&value, &id)) in values.iter().zip(ids).enumerate() {
+fn append_logprobs(result: &mut Logprobs, positions: &[crate::PositionLogprobs]) {
+    for position in positions {
+        let selected = &position.token;
         result.tokens.push(
-            texts
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| format!("token_id:{id}")),
+            selected
+                .text
+                .clone()
+                .unwrap_or_else(|| format!("token_id:{}", selected.token_id)),
         );
-        result
-            .token_logprobs
-            .push((!value.is_nan()).then_some(value));
+        result.token_logprobs.push(selected.logprob);
         // Dynamo's field is `u32`; Python's `-1` sentinel is applied once at
         // final wire shaping in `completion_response_value`.
         result.text_offset.push(0);
-    }
-}
-
-fn append_top_logprobs(
-    result: &mut Logprobs,
-    values: &[f32],
-    ids: &[i32],
-    lens: &[u32],
-    texts: &[String],
-) {
-    let mut offset = 0usize;
-    for &len in lens {
-        let len = len as usize;
-        if len == 0 {
+        if position.top.is_empty() {
             result.top_logprobs.push(serde_json::Value::Null);
             continue;
         }
         let mut top = BTreeMap::new();
-        for index in offset..offset.saturating_add(len) {
-            let (Some(&value), Some(&id)) = (values.get(index), ids.get(index)) else {
+        for candidate in &position.top {
+            let Some(logprob) = candidate.logprob else {
                 continue;
             };
             top.insert(
-                texts
-                    .get(index)
-                    .cloned()
-                    .unwrap_or_else(|| format!("token_id:{id}")),
-                value,
+                candidate
+                    .text
+                    .clone()
+                    .unwrap_or_else(|| format!("token_id:{}", candidate.token_id)),
+                logprob,
             );
         }
         result.top_logprobs.push(serde_json::json!(top));
-        offset = offset.saturating_add(len);
     }
 }
 
@@ -541,55 +518,22 @@ mod tests {
     };
     use crate::GenerationOutputExtras;
     use crate::http::test_utils::{chunk, submitted};
-    use crate::protocol::openai::token_ids_completion_prompts;
+    use crate::{PositionLogprobs, TokenLogprob};
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{
-        Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
-    };
+    use dynamo_protocols::types::{Choice, CreateCompletionResponse};
     use futures::StreamExt;
-
-    #[test]
-    fn completion_request_deserializes_directly() {
-        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "prompt": ["a", "b"],
-            "max_tokens": 8,
-            "n": 2,
-            "stream_options": {
-                "include_usage": true,
-                "continuous_usage_stats": true
-            }
-        }))
-        .unwrap();
-        assert!(matches!(request.prompt, Prompt::StringArray(_)));
-        assert_eq!(request.n, Some(2));
-        assert!(request.stream_options.unwrap().continuous_usage_stats);
-    }
-
-    #[test]
-    fn max_tokens_zero_is_rejected_before_submission() {
-        let request: CreateCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "prompt": "hello",
-            "max_tokens": 0
-        }))
-        .unwrap();
-        assert_eq!(request.max_tokens, Some(0));
-    }
-
-    #[test]
-    fn token_prompt_is_normalized_without_echo_state() {
-        let prompts = token_ids_completion_prompts(&Prompt::IntegerArray(vec![1, 2])).unwrap();
-        assert_eq!(prompts, [vec![1, 2]]);
-    }
 
     #[test]
     fn zero_top_logprobs_keeps_selected_token_and_empty_top_map() {
         let extras = GenerationOutputExtras {
-            output_logprobs: vec![-0.25],
-            output_logprob_token_ids: vec![7],
-            output_logprob_text: vec!["x".into()],
-            output_top_logprob_lengths: vec![0],
+            output_logprobs: vec![PositionLogprobs {
+                token: TokenLogprob {
+                    logprob: Some(-0.25),
+                    token_id: 7,
+                    text: Some("x".into()),
+                },
+                top: Vec::new(),
+            }],
             ..Default::default()
         };
         let logprobs = completion_logprobs(Some(&extras), false);

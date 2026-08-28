@@ -2,9 +2,8 @@
 
 use crate::{
     RendererError as Error, RendererLimits, SamplingParams, TextRequest, TokenIds, TokenIdsRequest,
-    TokenizationBackend,
 };
-use futures::{channel::oneshot, future::BoxFuture};
+use futures::channel::oneshot;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -37,23 +36,6 @@ impl Drop for TokenizerPoolInner {
 #[derive(Clone)]
 pub(crate) struct PooledTokenizer {
     inner: Arc<TokenizerPoolInner>,
-}
-
-#[cfg(test)]
-pub(crate) struct NoTokenizer;
-
-#[cfg(test)]
-impl TokenizationBackend for NoTokenizer {
-    fn tokenize(
-        &self,
-        _request: TextRequest,
-    ) -> BoxFuture<'static, Result<TokenIdsRequest, Error>> {
-        Box::pin(async {
-            Err(Error::Validation(
-                "this server accepts token-ID prompts only".into(),
-            ))
-        })
-    }
 }
 
 impl PooledTokenizer {
@@ -95,19 +77,17 @@ impl PooledTokenizer {
     }
 }
 
-impl TokenizationBackend for PooledTokenizer {
-    fn tokenize(&self, request: TextRequest) -> BoxFuture<'static, Result<TokenIdsRequest, Error>> {
+impl PooledTokenizer {
+    pub(crate) async fn tokenize(&self, request: TextRequest) -> Result<TokenIdsRequest, Error> {
         let jobs = self.inner.jobs.clone();
-        Box::pin(async move {
-            let (reply, result) = oneshot::channel();
-            jobs.send_async(PoolJob::Tokenize {
-                request: Box::new(request),
-                reply,
-            })
-            .await
-            .map_err(|_| Error::Unavailable)?;
-            result.await.map_err(|_| Error::WorkerDropped)?
+        let (reply, result) = oneshot::channel();
+        jobs.send_async(PoolJob::Tokenize {
+            request: Box::new(request),
+            reply,
         })
+        .await
+        .map_err(|_| Error::Unavailable)?;
+        result.await.map_err(|_| Error::WorkerDropped)?
     }
 }
 
@@ -130,22 +110,15 @@ pub trait TextTokenizer: Send + Sync {
 }
 
 /// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
-/// `None` under `skip_tokenizer_init`, else required (missing/failed load → `Err`).
 /// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
 /// (resolved from the local cache — no network).
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
-    skip_tokenizer_init: bool,
     add_special_tokens: bool,
-) -> Result<Option<dynamo_tokenizers::Tokenizer>, String> {
-    if skip_tokenizer_init {
-        tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
-        return Ok(None);
-    }
-    let path = tokenizer_path.ok_or_else(|| {
-        "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
-    })?;
+) -> Result<dynamo_tokenizers::Tokenizer, String> {
+    let path =
+        tokenizer_path.ok_or_else(|| "no tokenizer configured: set tokenizer_path".to_string())?;
     let file = resolve_tokenizer_file(path, revision).ok_or_else(|| {
         format!(
             "no supported tokenizer file found for '{path}' (expected tokenizer.json, tiktoken.model, or *.tiktoken)"
@@ -157,7 +130,7 @@ pub fn load_tokenizer(
     )
     .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded tokenizer");
-    Ok(Some(tokenizer))
+    Ok(tokenizer)
 }
 
 /// Resolve the tokenizer source used by the renderer.
@@ -459,11 +432,6 @@ pub fn validate_completion_fields(
     return_hidden_states: bool,
     limits: &RendererLimits,
 ) -> Result<(), Error> {
-    if limits.skip_tokenizer_init && input_ids.is_none_or(|ids| ids.is_empty()) {
-        return Err(Error::Validation(
-            "skip_tokenizer_init is set: request must provide input_ids".into(),
-        ));
-    }
     for &id in input_ids.iter().flat_map(|ids| ids.iter()) {
         if id < 0 || id as u64 >= limits.vocab_size {
             return Err(Error::Validation(format!(

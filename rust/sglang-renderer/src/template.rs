@@ -6,6 +6,7 @@
 //! `Conversation.get_prompt()` so there is exactly one implementation of the
 //! per-style formatting logic (no Jinja translation to drift).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use dynamo_protocols::types::{
@@ -22,6 +23,14 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::OneOrMany;
+use crate::kimi_k25::{deep_sort, encode_tools_to_typescript};
+
+const DSV4_BOS: &str = "<｜begin▁of▁sentence｜>";
+const DSV4_OFFICIAL_MAX: &str = concat!(
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n",
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+);
 
 const SUPPORTED_STYLES: &[&str] = &[
     "ADD_COLON_SINGLE",
@@ -58,7 +67,19 @@ const SUPPORTED_STYLES: &[&str] = &[
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
+    KimiK25(PromptFormatter),
+    DeepSeekV4 {
+        formatter: PromptFormatter,
+        profile: DeepSeekV4Profile,
+        environment_effort: Option<String>,
+    },
     Legacy(Box<LegacyFormatter>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeepSeekV4Profile {
+    Preview,
+    Official,
 }
 
 impl ChatFormatter {
@@ -75,13 +96,58 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(formatter) => {
-                let PromptFormatter::OAI(formatter) = formatter;
-                formatter
-                    .render_prompt(request)
-                    .map_err(|error| TemplateError::Renderer {
-                        message: error.to_string(),
-                    })
+            ChatFormatter::HuggingFace(formatter) => render_oai(formatter, request),
+            ChatFormatter::KimiK25(formatter) => {
+                let mut args = request.chat_template_args().cloned().unwrap_or_default();
+                if let Some(tools) = request.tools() {
+                    let mut tools =
+                        serde_json::to_value(tools).map_err(|error| TemplateError::Renderer {
+                            message: format!("failed to serialize Kimi K2.5 tools: {error}"),
+                        })?;
+                    deep_sort(&mut tools);
+                    if let Some(tool_array) = tools.as_array()
+                        && let Some(typescript) = encode_tools_to_typescript(tool_array)
+                    {
+                        args.insert("tools_ts_str".into(), Value::String(typescript));
+                    }
+                    args.insert("tools".into(), tools);
+                }
+                render_oai(formatter, &TemplateArgsRequest { request, args })
+            }
+            ChatFormatter::DeepSeekV4 {
+                formatter,
+                profile,
+                environment_effort,
+            } => {
+                let mut args = request.chat_template_args().cloned().unwrap_or_default();
+                let requested = args
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .or(environment_effort.as_deref());
+                let thinking = dynamo_renderer::thinking_bool_from_args(Some(&args)) != Some(false);
+                let official_max =
+                    thinking && *profile == DeepSeekV4Profile::Official && requested == Some("max");
+                let mapped = match (*profile, requested) {
+                    (DeepSeekV4Profile::Preview, Some("max")) => "max",
+                    (DeepSeekV4Profile::Official, Some("high")) => "max",
+                    _ => "high",
+                };
+                args.insert("reasoning_effort".into(), Value::String(mapped.into()));
+                let rendered = render_oai(formatter, &TemplateArgsRequest { request, args })?;
+                if official_max {
+                    let prompt = rendered.into_text();
+                    let prompt =
+                        prompt
+                            .strip_prefix(DSV4_BOS)
+                            .ok_or_else(|| TemplateError::Renderer {
+                                message: "DeepSeek V4 formatter omitted the BOS token".into(),
+                            })?;
+                    Ok(RenderedPrompt::text(format!(
+                        "{DSV4_BOS}{DSV4_OFFICIAL_MAX}{prompt}"
+                    )))
+                } else {
+                    Ok(rendered)
+                }
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
@@ -93,9 +159,66 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(_)
+            | ChatFormatter::KimiK25(_)
+            | ChatFormatter::DeepSeekV4 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
+    }
+}
+
+fn render_oai(
+    formatter: &PromptFormatter,
+    request: &dyn OAIChatLikeRequest,
+) -> Result<RenderedPrompt, TemplateError> {
+    let PromptFormatter::OAI(formatter) = formatter;
+    formatter
+        .render_prompt(request)
+        .map_err(|error| TemplateError::Renderer {
+            message: error.to_string(),
+        })
+}
+
+struct TemplateArgsRequest<'a> {
+    request: &'a dyn OAIChatLikeRequest,
+    args: HashMap<String, Value>,
+}
+
+impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
+    fn model(&self) -> String {
+        self.request.model()
+    }
+
+    fn messages(&self) -> minijinja::Value {
+        self.request.messages()
+    }
+
+    fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
+        self.request.typed_messages()
+    }
+
+    fn tools(&self) -> Option<minijinja::Value> {
+        self.request.tools()
+    }
+
+    fn tool_choice(&self) -> Option<minijinja::Value> {
+        self.request.tool_choice()
+    }
+
+    fn response_format(&self) -> Option<minijinja::Value> {
+        self.request.response_format()
+    }
+
+    fn reasoning_effort(&self) -> Option<minijinja::Value> {
+        self.request.reasoning_effort()
+    }
+
+    fn should_add_generation_prompt(&self) -> bool {
+        self.request.should_add_generation_prompt()
+    }
+
+    fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
+        Some(&self.args)
     }
 }
 
@@ -1358,15 +1481,21 @@ pub(crate) fn builtin_template(name: &str) -> Option<LegacySpec> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use dynamo_protocols::types::{
         ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartText,
         ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
         ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
         ChatCompletionRequestUserMessageContentPart, CreateChatCompletionRequest,
     };
+    use dynamo_renderer::PromptFormatter;
+    use dynamo_renderer::deepseek::v4::DeepSeekV4Formatter;
 
     use super::{
-        ChatFormatter, LegacyFormatter, LegacySpec, OneOrMany, TemplateError, builtin_template,
+        ChatFormatter, DeepSeekV4Profile, LegacyFormatter, LegacySpec, OneOrMany,
+        TemplateArgsRequest, TemplateError, builtin_template,
         infer_legacy_template_from_model_path, load_chat_formatter,
     };
 
@@ -1393,6 +1522,49 @@ mod tests {
             stop_str: Some(OneOrMany::One("<stop>".into())),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn deepseek_v4_profiles_map_effort_without_coercing_unsupported_tiers() {
+        fn render(profile: DeepSeekV4Profile, effort: Option<&str>, thinking: bool) -> String {
+            let request = request();
+            let mut args = HashMap::new();
+            if let Some(effort) = effort {
+                args.insert("reasoning_effort".into(), serde_json::json!(effort));
+            }
+            args.insert("thinking".into(), serde_json::json!(thinking));
+            ChatFormatter::DeepSeekV4 {
+                formatter: PromptFormatter::OAI(Arc::new(DeepSeekV4Formatter::new_thinking())),
+                profile,
+                environment_effort: None,
+            }
+            .render(&TemplateArgsRequest {
+                request: &request,
+                args,
+            })
+            .unwrap()
+        }
+
+        let preview_default = render(DeepSeekV4Profile::Preview, None, true);
+        assert!(!preview_default.contains("Reasoning Effort:"));
+        assert!(
+            render(DeepSeekV4Profile::Preview, Some("max"), true)
+                .contains("Reasoning Effort: Absolute maximum")
+        );
+        assert!(
+            render(DeepSeekV4Profile::Official, Some("high"), true)
+                .contains("Reasoning Effort: Absolute maximum")
+        );
+        assert!(
+            render(DeepSeekV4Profile::Official, Some("max"), true)
+                .contains("Reasoning Effort: Beyond maximum")
+        );
+        assert!(
+            !render(DeepSeekV4Profile::Official, Some("xhigh"), true).contains("Reasoning Effort:")
+        );
+        assert!(
+            !render(DeepSeekV4Profile::Official, Some("max"), false).contains("Reasoning Effort:")
+        );
     }
 
     fn render(style: &str) -> String {

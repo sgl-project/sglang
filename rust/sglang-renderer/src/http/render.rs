@@ -85,7 +85,7 @@ async fn render_completions(
                 return openai_error(renderer_status(&error), error.to_string(), false);
             }
         };
-        renderer.prepare_completions(requests).await
+        renderer.prepare_text_requests(requests).await
     } else {
         let (_, requests) = match lower_token_ids_completion_request(renderer.config(), &request) {
             Ok(requests) => requests,
@@ -108,34 +108,15 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
-    use futures::future::BoxFuture;
     use tower::ServiceExt;
 
-    use crate::{
-        RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextRequest,
-        TokenIdsRequest, TokenizationBackend,
-    };
+    use crate::{RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer};
 
     struct WordTokenizer;
 
-    impl TokenizationBackend for WordTokenizer {
-        fn tokenize(
-            &self,
-            request: TextRequest,
-        ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>> {
-            Box::pin(async move {
-                Ok(TokenIdsRequest {
-                    rid: request.rid,
-                    input_ids: request
-                        .prompt
-                        .as_str()
-                        .split_whitespace()
-                        .map(|_| 7)
-                        .collect(),
-                    options: request.options,
-                    metadata: request.metadata,
-                })
-            })
+    impl TextTokenizer for WordTokenizer {
+        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+            Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }
 
@@ -150,11 +131,8 @@ mod tests {
             reasoning_parser: None,
             default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
-            skip_tokenizer_init: false,
-            vocab_size: 100,
             default_sampling_params: SamplingDefaults::default(),
             limits: RendererLimits {
-                skip_tokenizer_init: false,
                 vocab_size: 100,
                 context_len: 64,
                 num_reserved_tokens: 0,
@@ -162,9 +140,11 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        routes(Arc::new(RendererService::with_backend(
+        routes(Arc::new(RendererService::with_tokenizer(
             config,
             Arc::new(WordTokenizer),
+            2,
+            2,
         )))
     }
 

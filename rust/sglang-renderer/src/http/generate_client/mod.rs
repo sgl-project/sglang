@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     GenerateRequest, GenerationFinishReason, GenerationOutput, GenerationOutputExtras,
-    GenerationStream, MatchedStop, ResponseError, TokenIds,
+    GenerationStream, MatchedStop, PositionLogprobs, ResponseError, TokenIds, TokenLogprob,
 };
 
 #[derive(Clone)]
@@ -292,51 +292,10 @@ fn truncate_output(output: &mut GenerationOutput, kept_tokens: usize) -> Result<
     let Some(extras) = output.extras.as_deref_mut() else {
         return Ok(());
     };
-    truncate_optional(&mut extras.output_logprobs, kept_tokens, "output logprobs")?;
     truncate_optional(
-        &mut extras.output_logprob_token_ids,
+        &mut extras.output_logprobs,
         kept_tokens,
-        "output logprob token IDs",
-    )?;
-    truncate_optional(
-        &mut extras.output_logprob_text,
-        kept_tokens,
-        "output logprob text",
-    )?;
-    if extras.output_top_logprob_lengths.is_empty() {
-        return Ok(());
-    }
-    if extras.output_top_logprob_lengths.len() < kept_tokens {
-        return Err(internal(format!(
-            "engine returned {} top-logprob positions for {kept_tokens} retained tokens",
-            extras.output_top_logprob_lengths.len()
-        )));
-    }
-    let alternatives =
-        extras.output_top_logprob_lengths[..kept_tokens]
-            .iter()
-            .try_fold(0usize, |total, &length| -> Result<usize, ResponseError> {
-                total
-                    .checked_add(usize::try_from(length).map_err(|_| {
-                        internal("engine top-logprob count exceeds addressable memory")
-                    })?)
-                    .ok_or_else(|| internal("engine top-logprob count overflowed"))
-            })?;
-    extras.output_top_logprob_lengths.truncate(kept_tokens);
-    truncate_optional(
-        &mut extras.output_top_logprobs,
-        alternatives,
-        "output top logprobs",
-    )?;
-    truncate_optional(
-        &mut extras.output_top_logprob_token_ids,
-        alternatives,
-        "output top-logprob token IDs",
-    )?;
-    truncate_optional(
-        &mut extras.output_top_logprob_text,
-        alternatives,
-        "output top-logprob text",
+        "output logprob positions",
     )
 }
 
@@ -363,42 +322,29 @@ fn fill_logprob_text(
     extras: Option<&mut GenerationOutputExtras>,
 ) {
     let Some(extras) = extras else { return };
-    fill_texts(
-        tokenizer,
-        &extras.output_logprob_token_ids,
-        &mut extras.output_logprob_text,
-    );
-    fill_texts(
-        tokenizer,
-        &extras.input_logprob_token_ids,
-        &mut extras.input_logprob_text,
-    );
-    fill_texts(
-        tokenizer,
-        &extras.output_top_logprob_token_ids,
-        &mut extras.output_top_logprob_text,
-    );
-    fill_texts(
-        tokenizer,
-        &extras.input_top_logprob_token_ids,
-        &mut extras.input_top_logprob_text,
-    );
+    for position in extras
+        .output_logprobs
+        .iter_mut()
+        .chain(&mut extras.input_logprobs)
+    {
+        fill_text(tokenizer, &mut position.token);
+        for token in &mut position.top {
+            fill_text(tokenizer, token);
+        }
+    }
 }
 
-fn fill_texts(tokenizer: &dynamo_tokenizers::Tokenizer, ids: &[i32], texts: &mut Vec<String>) {
-    if texts.len() == ids.len() {
+fn fill_text(tokenizer: &dynamo_tokenizers::Tokenizer, token: &mut TokenLogprob) {
+    if token.text.is_some() {
         return;
     }
-    *texts = ids
-        .iter()
-        .map(|&id| {
-            u32::try_from(id)
-                .ok()
-                .and_then(|id| tokenizer.decode(&[id], false).ok())
-                .map(String::from)
-                .unwrap_or_default()
-        })
-        .collect();
+    token.text = Some(
+        u32::try_from(token.token_id)
+            .ok()
+            .and_then(|id| tokenizer.decode(&[id], false).ok())
+            .map(String::from)
+            .unwrap_or_default(),
+    );
 }
 
 #[derive(Default)]
@@ -527,34 +473,20 @@ fn parse_engine_frame(payload: &str) -> Result<GenerationOutput, ResponseError> 
         || !frame.meta_info.input_token_logprobs.is_empty()
         || !frame.meta_info.output_top_logprobs.is_empty()
         || !frame.meta_info.input_top_logprobs.is_empty();
-    let mut extras = GenerationOutputExtras::default();
-    flatten_logprobs(
+    let output_logprobs = group_logprobs(
         frame.meta_info.output_token_logprobs,
-        &mut extras.output_logprobs,
-        &mut extras.output_logprob_token_ids,
-        &mut extras.output_logprob_text,
-    );
-    flatten_logprobs(
-        frame.meta_info.input_token_logprobs,
-        &mut extras.input_logprobs,
-        &mut extras.input_logprob_token_ids,
-        &mut extras.input_logprob_text,
-    );
-    flatten_top_logprobs(
         frame.meta_info.output_top_logprobs,
-        &mut extras.output_top_logprobs,
-        &mut extras.output_top_logprob_token_ids,
-        &mut extras.output_top_logprob_lengths,
-        &mut extras.output_top_logprob_text,
-    );
-    flatten_top_logprobs(
+        "output",
+    )?;
+    let input_logprobs = group_logprobs(
+        frame.meta_info.input_token_logprobs,
         frame.meta_info.input_top_logprobs,
-        &mut extras.input_top_logprobs,
-        &mut extras.input_top_logprob_token_ids,
-        &mut extras.input_top_logprob_lengths,
-        &mut extras.input_top_logprob_text,
-    );
-    let extras = has_extras.then_some(Box::new(extras));
+        "input",
+    )?;
+    let extras = has_extras.then_some(Box::new(GenerationOutputExtras {
+        output_logprobs,
+        input_logprobs,
+    }));
     Ok(GenerationOutput {
         text: String::new(),
         token_ids: frame.output_ids,
@@ -600,51 +532,10 @@ fn trim_cumulative_output_extras(
     extras: &mut GenerationOutputExtras,
     prefix: usize,
 ) -> Result<(), ResponseError> {
-    drain_optional_prefix(&mut extras.output_logprobs, prefix, "output logprobs")?;
     drain_optional_prefix(
-        &mut extras.output_logprob_token_ids,
+        &mut extras.output_logprobs,
         prefix,
-        "output logprob token IDs",
-    )?;
-    drain_optional_prefix(
-        &mut extras.output_logprob_text,
-        prefix,
-        "output logprob text",
-    )?;
-
-    if extras.output_top_logprob_lengths.is_empty() {
-        return Ok(());
-    }
-    if extras.output_top_logprob_lengths.len() < prefix {
-        return Err(internal(format!(
-            "engine returned {} top-logprob positions for a {prefix}-token cumulative prefix",
-            extras.output_top_logprob_lengths.len()
-        )));
-    }
-    let alternatives = extras.output_top_logprob_lengths[..prefix]
-        .iter()
-        .try_fold(0usize, |total, &length| -> Result<usize, ResponseError> {
-            let length = usize::try_from(length)
-                .map_err(|_| internal("engine top-logprob count exceeds addressable memory"))?;
-            total
-                .checked_add(length)
-                .ok_or_else(|| internal("engine top-logprob count overflowed"))
-        })?;
-    extras.output_top_logprob_lengths.drain(..prefix);
-    drain_prefix(
-        &mut extras.output_top_logprobs,
-        alternatives,
-        "output top logprobs",
-    )?;
-    drain_prefix(
-        &mut extras.output_top_logprob_token_ids,
-        alternatives,
-        "output top-logprob token IDs",
-    )?;
-    drain_optional_prefix(
-        &mut extras.output_top_logprob_text,
-        alternatives,
-        "output top-logprob text",
+        "output logprob positions",
     )
 }
 
@@ -674,33 +565,49 @@ fn drain_optional_prefix<T>(
     drain_prefix(values, prefix, description)
 }
 
-fn flatten_logprobs(
-    values: Vec<WireLogprob>,
-    logprobs: &mut Vec<f32>,
-    token_ids: &mut TokenIds,
-    texts: &mut Vec<String>,
-) {
-    for (value, token_id, text) in values {
-        logprobs.push(value.unwrap_or(f32::NAN));
-        token_ids.push(token_id);
-        if let Some(text) = text {
-            texts.push(text);
-        }
+fn wire_logprob((logprob, token_id, text): WireLogprob) -> TokenLogprob {
+    TokenLogprob {
+        logprob,
+        token_id,
+        text,
     }
 }
 
-fn flatten_top_logprobs(
-    values: WireTopLogprobs,
-    logprobs: &mut Vec<f32>,
-    token_ids: &mut TokenIds,
-    lengths: &mut Vec<u32>,
-    texts: &mut Vec<String>,
-) {
-    for position in values {
-        let position = position.unwrap_or_default();
-        lengths.push(u32::try_from(position.len()).unwrap_or(u32::MAX));
-        flatten_logprobs(position, logprobs, token_ids, texts);
+fn group_logprobs(
+    values: Vec<WireLogprob>,
+    top_values: WireTopLogprobs,
+    kind: &str,
+) -> Result<Vec<PositionLogprobs>, ResponseError> {
+    if !top_values.is_empty() && top_values.len() != values.len() {
+        return Err(internal(format!(
+            "engine returned {} {kind} top-logprob positions for {} selected-token positions",
+            top_values.len(),
+            values.len()
+        )));
     }
+
+    if top_values.is_empty() {
+        return Ok(values
+            .into_iter()
+            .map(|token| PositionLogprobs {
+                token: wire_logprob(token),
+                top: Vec::new(),
+            })
+            .collect());
+    }
+
+    Ok(values
+        .into_iter()
+        .zip(top_values)
+        .map(|(token, top)| PositionLogprobs {
+            token: wire_logprob(token),
+            top: top
+                .unwrap_or_default()
+                .into_iter()
+                .map(wire_logprob)
+                .collect(),
+        })
+        .collect())
 }
 
 fn engine_error_message(body: &str) -> Option<String> {
@@ -742,6 +649,24 @@ mod tests {
     };
     use std::convert::Infallible;
     use std::sync::Mutex;
+
+    fn logprob(token_id: i32, logprob: f32) -> TokenLogprob {
+        TokenLogprob {
+            logprob: Some(logprob),
+            token_id,
+            text: None,
+        }
+    }
+
+    fn position(token_id: i32, value: f32, top: &[(i32, f32)]) -> PositionLogprobs {
+        PositionLogprobs {
+            token: logprob(token_id, value),
+            top: top
+                .iter()
+                .map(|&(token_id, logprob)| self::logprob(token_id, logprob))
+                .collect(),
+        }
+    }
 
     fn request(stop: Vec<&str>) -> GenerateRequest {
         TokenIdsRequest {
@@ -821,11 +746,11 @@ mod tests {
             token_ids: vec![7, 8, 9],
             completion_tokens: 3,
             extras: Some(Box::new(GenerationOutputExtras {
-                output_logprobs: vec![-0.1, -0.2, -0.3],
-                output_logprob_token_ids: vec![7, 8, 9],
-                output_top_logprobs: vec![-0.1, -1.0, -0.2, -0.3],
-                output_top_logprob_token_ids: vec![7, 6, 8, 9],
-                output_top_logprob_lengths: vec![2, 1, 1],
+                output_logprobs: vec![
+                    position(7, -0.1, &[(7, -0.1), (6, -1.0)]),
+                    position(8, -0.2, &[(8, -0.2)]),
+                    position(9, -0.3, &[(9, -0.3)]),
+                ],
                 ..Default::default()
             })),
             ..Default::default()
@@ -836,11 +761,10 @@ mod tests {
         assert_eq!(output.token_ids, [7, 8]);
         assert_eq!(output.completion_tokens, 2);
         let extras = output.extras.unwrap();
-        assert_eq!(extras.output_logprobs, [-0.1, -0.2]);
-        assert_eq!(extras.output_logprob_token_ids, [7, 8]);
-        assert_eq!(extras.output_top_logprobs, [-0.1, -1.0, -0.2]);
-        assert_eq!(extras.output_top_logprob_token_ids, [7, 6, 8]);
-        assert_eq!(extras.output_top_logprob_lengths, [2, 1]);
+        assert_eq!(extras.output_logprobs.len(), 2);
+        assert_eq!(extras.output_logprobs[0].top.len(), 2);
+        assert_eq!(extras.output_logprobs[1].top.len(), 1);
+        assert_eq!(extras.output_logprobs[1].token.token_id, 8);
     }
 
     #[test]
@@ -909,8 +833,30 @@ mod tests {
             Some(GenerationFinishReason::Stop(Some(MatchedStop::Token(9))))
         );
         let extras = output.extras.unwrap();
-        assert_eq!(extras.output_logprob_token_ids, [7]);
-        assert_eq!(extras.output_top_logprob_lengths, [2]);
+        assert_eq!(extras.output_logprobs.len(), 1);
+        assert_eq!(extras.output_logprobs[0].token.token_id, 7);
+        assert_eq!(extras.output_logprobs[0].top.len(), 2);
+    }
+
+    #[test]
+    fn engine_frame_rejects_misaligned_logprob_positions() {
+        let error = parse_engine_frame(
+            r#"{
+                "output_ids":[7,8],
+                "meta_info":{
+                    "completion_tokens":2,
+                    "output_token_logprobs":[[-0.25,7,null],[-0.5,8,null]],
+                    "output_top_logprobs":[[[-0.25,7,null]]]
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status_code, 500);
+        assert_eq!(
+            error.message,
+            "engine returned 1 output top-logprob positions for 2 selected-token positions"
+        );
     }
 
     #[test]
@@ -930,11 +876,10 @@ mod tests {
             token_ids: vec![7, 8],
             completion_tokens: 2,
             extras: Some(Box::new(GenerationOutputExtras {
-                output_logprobs: vec![-0.5, -0.25],
-                output_logprob_token_ids: vec![7, 8],
-                output_top_logprobs: vec![-0.5, -1.0, -0.25],
-                output_top_logprob_token_ids: vec![7, 9, 8],
-                output_top_logprob_lengths: vec![2, 1],
+                output_logprobs: vec![
+                    position(7, -0.5, &[(7, -0.5), (9, -1.0)]),
+                    position(8, -0.25, &[(8, -0.25)]),
+                ],
                 ..Default::default()
             })),
             ..Default::default()
@@ -946,11 +891,9 @@ mod tests {
         assert_eq!(output.completion_tokens, 1);
         assert_eq!(emitted_tokens, 2);
         let extras = output.extras.unwrap();
-        assert_eq!(extras.output_logprobs, [-0.25]);
-        assert_eq!(extras.output_logprob_token_ids, [8]);
-        assert_eq!(extras.output_top_logprobs, [-0.25]);
-        assert_eq!(extras.output_top_logprob_token_ids, [8]);
-        assert_eq!(extras.output_top_logprob_lengths, [1]);
+        assert_eq!(extras.output_logprobs.len(), 1);
+        assert_eq!(extras.output_logprobs[0].token.token_id, 8);
+        assert_eq!(extras.output_logprobs[0].top.len(), 1);
     }
 
     #[test]

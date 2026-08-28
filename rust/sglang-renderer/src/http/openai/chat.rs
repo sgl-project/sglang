@@ -424,47 +424,32 @@ fn chat_logprobs(extras: Option<&GenerationOutputExtras>) -> ChatChoiceLogprobs 
             refusal: None,
         };
     };
-    let mut top_offset = 0usize;
-    for (position, (&logprob, &token_id)) in extras
-        .output_logprobs
-        .iter()
-        .zip(&extras.output_logprob_token_ids)
-        .enumerate()
-    {
-        let token = extras
-            .output_logprob_text
-            .get(position)
-            .cloned()
-            .unwrap_or_else(|| format!("token_id:{token_id}"));
-        let top_len = extras
-            .output_top_logprob_lengths
-            .get(position)
-            .copied()
-            .unwrap_or(0) as usize;
-        let top_logprobs = extras.output_top_logprobs[top_offset..]
+    for position in &extras.output_logprobs {
+        let selected = &position.token;
+        let token = selected
+            .text
+            .clone()
+            .unwrap_or_else(|| format!("token_id:{}", selected.token_id));
+        let top_logprobs = position
+            .top
             .iter()
-            .zip(&extras.output_top_logprob_token_ids[top_offset..])
-            .take(top_len)
-            .enumerate()
-            .map(|(offset, (&logprob, &id))| {
-                let text = extras
-                    .output_top_logprob_text
-                    .get(top_offset + offset)
-                    .cloned()
-                    .unwrap_or_else(|| format!("token_id:{id}"));
+            .map(|candidate| {
+                let text = candidate
+                    .text
+                    .clone()
+                    .unwrap_or_else(|| format!("token_id:{}", candidate.token_id));
                 TopLogprobs {
                     bytes: Some(text.as_bytes().to_vec()),
                     token: text,
-                    logprob,
+                    logprob: candidate.logprob.unwrap_or(f32::NAN),
                 }
             })
             .collect();
-        top_offset = top_offset.saturating_add(top_len);
         content.push(ChatCompletionTokenLogprob {
             bytes: Some(token.as_bytes().to_vec()),
             token,
-            logprob,
-            token_id: u32::try_from(token_id).ok(),
+            logprob: selected.logprob.unwrap_or(f32::NAN),
+            token_id: u32::try_from(selected.token_id).ok(),
             top_logprobs,
         });
     }
@@ -549,17 +534,13 @@ fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::{ChatStreamWireContext, chat_event_stream, chat_logprobs, unary_chat};
     use crate::http::test_utils::{chat_submitted, chunk};
     use crate::protocol::openai::ChatCompletionRequest;
-    use crate::protocol::openai::{
-        ChatSamplingDefaults as SamplingDefaults, chat_sampling_params, lower_chat_request,
-    };
+    use crate::protocol::openai::{chat_sampling_params, lower_chat_request};
     use crate::{
-        GenerationOutputExtras, NoTokenizer, RendererConfig, RendererLimits, RendererService,
-        SamplingDefaults as ModelSamplingDefaults,
+        ChatPreprocessor, GenerationOutputExtras, PositionLogprobs, RendererConfig, RendererLimits,
+        SamplingDefaults, TokenLogprob,
     };
     use axum::http::StatusCode;
     use futures::StreamExt;
@@ -586,11 +567,8 @@ mod tests {
             default_chat_template_kwargs: Default::default(),
             revision: None,
             stream_response_default_include_usage: false,
-            skip_tokenizer_init: false,
-            vocab_size: 128,
-            default_sampling_params: ModelSamplingDefaults::default(),
+            default_sampling_params: SamplingDefaults::default(),
             limits: RendererLimits {
-                skip_tokenizer_init: false,
                 vocab_size: 128,
                 context_len: 128,
                 num_reserved_tokens: 0,
@@ -605,10 +583,13 @@ mod tests {
         }))
         .unwrap();
         let (_, chat) = lower_chat_request(&config, request).unwrap();
-        RendererService::with_backend(config, Arc::new(NoTokenizer))
-            .preprocess_chat(chat)
-            .unwrap()
-            .response_processor
+        ChatPreprocessor::new(
+            &config,
+            Some(crate::template::load_chat_formatter(None, None, Some("chatml")).unwrap()),
+        )
+        .preprocess(chat)
+        .unwrap()
+        .response_processor
     }
 
     fn wire_context(include_usage: bool) -> ChatStreamWireContext {
@@ -626,16 +607,12 @@ mod tests {
     /// config (`--sampling-defaults model`) > OpenAI terminal default.
     #[test]
     fn sampling_defaults_follow_python_priority_chain() {
-        let model = ModelSamplingDefaults {
+        let model = SamplingDefaults {
             temperature: Some(0.6),
             top_p: Some(0.9),
         };
         // Omitted → model defaults, not the 1.0 OpenAI terminals.
-        let sampling = chat_sampling_params(
-            &request(),
-            &SamplingDefaults::CHAT.with_model_defaults(&model),
-        )
-        .unwrap();
+        let sampling = chat_sampling_params(&request(), &model).unwrap();
         assert_eq!(sampling.temperature, 0.6);
         assert_eq!(sampling.top_p, 0.9);
         // Explicit request values win. `Option<f32>` loses precision in f64 —
@@ -643,11 +620,7 @@ mod tests {
         let mut request = request();
         request.temperature = Some(0.2);
         request.top_p = Some(0.5);
-        let sampling = chat_sampling_params(
-            &request,
-            &SamplingDefaults::CHAT.with_model_defaults(&model),
-        )
-        .unwrap();
+        let sampling = chat_sampling_params(&request, &model).unwrap();
         assert!((sampling.temperature - 0.2).abs() < 1e-6);
         assert!((sampling.top_p - 0.5).abs() < 1e-6);
     }
@@ -656,12 +629,8 @@ mod tests {
     /// conversion falls back to the OpenAI terminal defaults.
     #[test]
     fn sampling_defaults_fall_back_to_openai_terminals_in_openai_mode() {
-        let openai_mode = ModelSamplingDefaults::default();
-        let sampling = chat_sampling_params(
-            &request(),
-            &SamplingDefaults::CHAT.with_model_defaults(&openai_mode),
-        )
-        .unwrap();
+        let openai_mode = SamplingDefaults::default();
+        let sampling = chat_sampling_params(&request(), &openai_mode).unwrap();
         assert_eq!(sampling.temperature, 1.0);
         assert_eq!(sampling.top_p, 1.0);
     }
@@ -676,7 +645,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            chat_sampling_params(&request, &SamplingDefaults::CHAT)
+            chat_sampling_params(&request, &SamplingDefaults::default())
                 .unwrap()
                 .max_new_tokens,
             None
@@ -686,13 +655,25 @@ mod tests {
     #[test]
     fn chat_logprobs_use_dynamo_wire_types() {
         let extras = GenerationOutputExtras {
-            output_logprobs: vec![-0.25],
-            output_logprob_token_ids: vec![7],
-            output_logprob_text: vec!["x".into()],
-            output_top_logprobs: vec![-0.25, -1.0],
-            output_top_logprob_token_ids: vec![7, 8],
-            output_top_logprob_lengths: vec![2],
-            output_top_logprob_text: vec!["x".into(), "y".into()],
+            output_logprobs: vec![PositionLogprobs {
+                token: TokenLogprob {
+                    logprob: Some(-0.25),
+                    token_id: 7,
+                    text: Some("x".into()),
+                },
+                top: vec![
+                    TokenLogprob {
+                        logprob: Some(-0.25),
+                        token_id: 7,
+                        text: Some("x".into()),
+                    },
+                    TokenLogprob {
+                        logprob: Some(-1.0),
+                        token_id: 8,
+                        text: Some("y".into()),
+                    },
+                ],
+            }],
             ..Default::default()
         };
         let logprobs = chat_logprobs(Some(&extras));

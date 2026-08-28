@@ -10,18 +10,114 @@ use dynamo_parsers::{
 };
 use dynamo_protocols::types::{
     ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ReasoningEffort, ResponseFormat,
+    ChatCompletionToolChoiceOption, ResponseFormat,
 };
 use dynamo_renderer::{
     OAIChatLikeRequest, RenderedPrompt, RenderedSegment, may_be_fix_tool_schema,
 };
 use minijinja::Value;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ChatResponseProcessor;
 use crate::{
     ChatFormatter, GenerateRequestMetadata, GenerationOptions, OneOrMany, RendererConfig,
     RendererError, SamplingParams, TextRequest,
 };
+
+/// SGLang reasoning effort, including Inkling's fine-grained numeric form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Numeric(f64),
+}
+
+impl ReasoningEffort {
+    pub(crate) const fn disables_thinking(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    const fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Numeric(_) => None,
+        }
+    }
+}
+
+impl Serialize for ReasoningEffort {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Numeric(value) => serializer.serialize_f64(*value),
+            _ => serializer.serialize_str(self.name().expect("named reasoning effort")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(value) => {
+                let effort = match value.as_str() {
+                    "none" => Some(Self::None),
+                    "minimal" => Some(Self::Minimal),
+                    "low" => Some(Self::Low),
+                    "medium" => Some(Self::Medium),
+                    "high" => Some(Self::High),
+                    "xhigh" => Some(Self::XHigh),
+                    "max" => Some(Self::Max),
+                    _ => None,
+                };
+                if let Some(effort) = effort {
+                    return Ok(effort);
+                }
+                let numeric = value.parse::<f64>().map_err(|_| {
+                    serde::de::Error::custom(format!("invalid reasoning effort: {value:?}"))
+                })?;
+                numeric_reasoning_effort(numeric).map_err(serde::de::Error::custom)
+            }
+            serde_json::Value::Number(value) => {
+                let numeric = value.as_f64().ok_or_else(|| {
+                    serde::de::Error::custom("reasoning_effort must be a finite number")
+                })?;
+                numeric_reasoning_effort(numeric).map_err(serde::de::Error::custom)
+            }
+            serde_json::Value::Bool(_) => Err(serde::de::Error::custom(
+                "reasoning_effort must not be a boolean",
+            )),
+            _ => Err(serde::de::Error::custom(
+                "reasoning_effort must be a string or number",
+            )),
+        }
+    }
+}
+
+fn numeric_reasoning_effort(value: f64) -> Result<ReasoningEffort, String> {
+    if !value.is_finite() || !(0.0..=0.99).contains(&value) {
+        return Err(format!(
+            "reasoning_effort must be a finite number in [0.0, 0.99], got {value}"
+        ));
+    }
+    Ok(ReasoningEffort::Numeric(value))
+}
 
 /// Renderer-owned normalized chat state.
 ///
@@ -122,8 +218,7 @@ impl ChatPreprocessor {
     }
 
     pub fn preprocess(&self, mut request: ChatRequest) -> Result<LoweredChat, RendererError> {
-        validate_chat(&request)?;
-        self.normalize_template_args(&mut request);
+        self.prepare_for_render(&mut request)?;
         merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
 
         let tool_choice = dynamo_tool_choice(&request.tool_choice);
@@ -184,9 +279,7 @@ impl ChatPreprocessor {
 
     /// Render chat for tokenization without creating generation/output state.
     pub fn lower_to_text(&self, mut request: ChatRequest) -> Result<TextRequest, RendererError> {
-        validate_chat(&request)?;
-        self.normalize_template_args(&mut request);
-        merge_template_stops(&mut request.sampling_params, self.formatter.as_ref());
+        self.prepare_for_render(&mut request)?;
         let prompt = self.render(&request)?;
         Ok(TextRequest::rendered(
             request.rid,
@@ -200,6 +293,12 @@ impl ChatPreprocessor {
         .with_metadata(request.metadata))
     }
 
+    fn prepare_for_render(&self, request: &mut ChatRequest) -> Result<(), RendererError> {
+        validate_chat(request)?;
+        self.normalize_template_args(request);
+        Ok(())
+    }
+
     fn normalize_template_args(&self, request: &mut ChatRequest) {
         let request_args = request.chat_template_args.take().unwrap_or_default();
         let mut args = self.default_chat_template_kwargs.clone();
@@ -208,6 +307,13 @@ impl ChatPreprocessor {
                 "reasoning_effort".into(),
                 serde_json::to_value(reasoning_effort).expect("reasoning effort must serialize"),
             );
+            let thinking = !reasoning_effort.disables_thinking();
+            if !request_args.contains_key("thinking") {
+                args.insert("thinking".into(), thinking.into());
+            }
+            if !request_args.contains_key("enable_thinking") {
+                args.insert("enable_thinking".into(), thinking.into());
+            }
         }
         args.extend(request_args);
         request.chat_template_args = (!args.is_empty()).then_some(args);
@@ -560,11 +666,8 @@ mod tests {
             reasoning_parser: None,
             default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
-            skip_tokenizer_init: false,
-            vocab_size: 128,
             default_sampling_params: SamplingDefaults::default(),
             limits: RendererLimits {
-                skip_tokenizer_init: false,
                 vocab_size: 128,
                 context_len: 128,
                 num_reserved_tokens: 0,

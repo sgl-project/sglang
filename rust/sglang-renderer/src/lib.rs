@@ -12,6 +12,7 @@ mod error;
 mod generation;
 #[cfg(feature = "http")]
 mod http;
+mod kimi_k25;
 mod output;
 #[cfg(feature = "http")]
 mod protocol;
@@ -25,13 +26,14 @@ mod types;
 mod regex;
 
 pub(crate) use chat::ChatPreprocessor;
-pub use chat::ChatRequest;
 pub(crate) use chat::LoweredChat;
+pub use chat::{ChatRequest, ReasoningEffort};
 pub use config::{RendererConfig, RendererLimits, SamplingDefaults};
 pub use error::{RendererError, RendererErrorKind};
 #[cfg(feature = "http")]
 pub(crate) use generation::{
-    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream, MatchedStop,
+    GenerationFinishReason, GenerationOutput, GenerationOutputExtras, GenerationStream,
+    MatchedStop, PositionLogprobs, TokenLogprob,
 };
 #[cfg(feature = "http")]
 pub use http::{RendererRuntimeConfig, serve};
@@ -46,12 +48,7 @@ pub use request::{
 pub use sampling::SamplingParams;
 #[cfg(feature = "http")]
 pub(crate) use sampling::SamplingParamsOverrides;
-pub(crate) use service::TokenizationBackend;
 pub use service::{PreparedChat, RendererService};
 pub(crate) use template::ChatFormatter;
-#[cfg(test)]
-pub(crate) use tokenizer::NoTokenizer;
-#[cfg(test)]
-pub(crate) use tokenizer::PooledTokenizer;
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
-pub use types::{OneOrMany, OneOrManyItem, TokenIds};
+pub use types::{OneOrMany, TokenIds};

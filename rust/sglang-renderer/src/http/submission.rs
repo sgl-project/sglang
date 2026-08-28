@@ -1,90 +1,14 @@
 use axum::{http::StatusCode, response::Response};
 use futures::{StreamExt, stream::BoxStream};
 
-use crate::{
-    GenerateRequest, GenerationOutput, GenerationStream, ResponseError, TextRequest,
-    TokenIdsRequest,
-};
+use crate::{GenerateRequest, GenerationOutput, GenerationStream, ResponseError};
 
 use super::{OpenAIHttpFrontend, error::openai_error};
 
-/// Prepare and submit each request in input order.
+/// Submit prepared token-only requests in input order.
 ///
 /// All streams are established before either endpoint starts collecting them,
-/// preserving concurrent engine execution without introducing a backend trait.
-pub(super) async fn submit_completion_inputs(
-    frontend: &OpenAIHttpFrontend,
-    inputs: Vec<TextRequest>,
-    stream_response: bool,
-) -> Result<Vec<GenerationStream>, Response> {
-    let mut streams = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let generate_request = frontend
-            .renderer
-            .prepare_text_request(input)
-            .await
-            .map_err(|error| {
-                openai_error(
-                    super::error::renderer_status(&error),
-                    error.to_string(),
-                    false,
-                )
-            })?;
-        let events = frontend
-            .generate_client
-            .generate(generate_request)
-            .await
-            .map_err(|error| {
-                openai_error(
-                    StatusCode::from_u16(error.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    error.message,
-                    stream_response,
-                )
-            })?;
-        streams.push(events);
-    }
-    Ok(streams)
-}
-
-/// Validate and submit requests that were already tokenized by the protocol
-/// adapter. They never enter the text tokenizer path.
-pub(super) async fn submit_token_ids_inputs(
-    frontend: &OpenAIHttpFrontend,
-    inputs: Vec<TokenIdsRequest>,
-    stream_response: bool,
-) -> Result<Vec<GenerationStream>, Response> {
-    let mut streams = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let generate_request = frontend
-            .renderer
-            .prepare_token_ids_request(input)
-            .await
-            .map_err(|error| {
-                openai_error(
-                    super::error::renderer_status(&error),
-                    error.to_string(),
-                    false,
-                )
-            })?;
-        let events = frontend
-            .generate_client
-            .generate(generate_request)
-            .await
-            .map_err(|error| {
-                openai_error(
-                    StatusCode::from_u16(error.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    error.message,
-                    stream_response,
-                )
-            })?;
-        streams.push(events);
-    }
-    Ok(streams)
-}
-
-/// Submit token-only requests produced by the shared chat pipeline.
+/// preserving concurrent engine execution.
 pub(super) async fn submit_generate_requests(
     frontend: &OpenAIHttpFrontend,
     inputs: Vec<GenerateRequest>,
@@ -152,34 +76,8 @@ fn fold_output(collected: &mut GenerationOutput, output: GenerationOutput) {
             .extras
             .get_or_insert_with(|| Box::new(crate::GenerationOutputExtras::default()));
         collected.output_logprobs.extend(output.output_logprobs);
-        collected
-            .output_logprob_token_ids
-            .extend(output.output_logprob_token_ids);
-        collected
-            .output_logprob_text
-            .extend(output.output_logprob_text);
-        collected
-            .output_top_logprobs
-            .extend(output.output_top_logprobs);
-        collected
-            .output_top_logprob_token_ids
-            .extend(output.output_top_logprob_token_ids);
-        collected
-            .output_top_logprob_lengths
-            .extend(output.output_top_logprob_lengths);
-        collected
-            .output_top_logprob_text
-            .extend(output.output_top_logprob_text);
         if !output.input_logprobs.is_empty() {
             collected.input_logprobs = output.input_logprobs;
-            collected.input_logprob_token_ids = output.input_logprob_token_ids;
-            collected.input_logprob_text = output.input_logprob_text;
-        }
-        if !output.input_top_logprob_lengths.is_empty() {
-            collected.input_top_logprobs = output.input_top_logprobs;
-            collected.input_top_logprob_token_ids = output.input_top_logprob_token_ids;
-            collected.input_top_logprob_lengths = output.input_top_logprob_lengths;
-            collected.input_top_logprob_text = output.input_top_logprob_text;
         }
     }
 }
@@ -189,7 +87,7 @@ mod tests {
     use futures::{StreamExt, stream};
 
     use super::{fold_output, merge_indexed};
-    use crate::{GenerationOutput, GenerationOutputExtras};
+    use crate::{GenerationOutput, GenerationOutputExtras, PositionLogprobs, TokenLogprob};
 
     #[test]
     fn unary_output_appends_generated_logprobs_and_replaces_prompt_logprobs() {
@@ -199,19 +97,28 @@ mod tests {
                 &mut collected,
                 GenerationOutput {
                     extras: Some(Box::new(GenerationOutputExtras {
-                        output_logprobs: vec![-0.1],
-                        output_logprob_token_ids: vec![output_token],
-                        input_logprobs: vec![-0.2],
-                        input_logprob_token_ids: vec![input_token],
-                        ..Default::default()
+                        output_logprobs: vec![position(output_token, -0.1)],
+                        input_logprobs: vec![position(input_token, -0.2)],
                     })),
                     ..Default::default()
                 },
             );
         }
         let extras = collected.extras.unwrap();
-        assert_eq!(extras.output_logprob_token_ids, [1, 2]);
-        assert_eq!(extras.input_logprob_token_ids, [20]);
+        assert_eq!(extras.output_logprobs[0].token.token_id, 1);
+        assert_eq!(extras.output_logprobs[1].token.token_id, 2);
+        assert_eq!(extras.input_logprobs[0].token.token_id, 20);
+    }
+
+    fn position(token_id: i32, logprob: f32) -> PositionLogprobs {
+        PositionLogprobs {
+            token: TokenLogprob {
+                logprob: Some(logprob),
+                token_id,
+                text: None,
+            },
+            top: Vec::new(),
+        }
     }
 
     #[tokio::test]

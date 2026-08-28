@@ -10,7 +10,6 @@ pub struct SamplingDefaults {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RendererLimits {
-    pub skip_tokenizer_init: bool,
     pub vocab_size: u64,
     pub context_len: u64,
     pub num_reserved_tokens: u64,
@@ -30,8 +29,6 @@ pub struct RendererConfig {
     #[serde(default)]
     pub default_chat_template_kwargs: std::collections::HashMap<String, serde_json::Value>,
     pub stream_response_default_include_usage: bool,
-    pub skip_tokenizer_init: bool,
-    pub vocab_size: u64,
     pub default_sampling_params: SamplingDefaults,
     pub limits: RendererLimits,
 }

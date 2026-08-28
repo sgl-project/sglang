@@ -4,19 +4,19 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{State, rejection::JsonRejection},
     response::{IntoResponse, Response},
     routing::post,
 };
 use dynamo_protocols::types::{
     ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ReasoningEffort,
 };
 use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{ChatRequest, RendererService};
+use crate::protocol::openai::normalize_reasoning_inputs;
+use crate::{ChatRequest, OneOrMany, ReasoningEffort, RendererService};
 
 use super::error::{error_payload, renderer_status};
 
@@ -29,34 +29,26 @@ pub(super) fn routes(renderer: Arc<RendererService>) -> Router<()> {
 
 async fn tokenize(
     State(renderer): State<Arc<RendererService>>,
-    Json(body): Json<Value>,
+    body: Result<Json<TokenizeRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Response> {
-    let object = body
-        .as_object()
-        .ok_or_else(|| bad_request("request body must be a JSON object"))?;
-    let has_prompt = object.get("prompt").is_some_and(|value| !value.is_null());
-    let has_messages = object.get("messages").is_some_and(|value| !value.is_null());
+    let Json(mut request) = body.map_err(|error| bad_request(error.body_text()))?;
+    let has_prompt = request.prompt.is_some();
+    let has_messages = request.messages.is_some();
     if has_prompt == has_messages {
         return Err(exactly_one_input());
     }
-    let request = serde_json::from_value::<TokenizeRequest>(body)
-        .map_err(|error| bad_request(error.to_string()))?;
-    let (tokens, count) = match request {
-        TokenizeRequest::Prompt(request) => {
-            if request.messages.is_some() {
-                return Err(exactly_one_input());
-            }
+    let (tokens, count) = match request.prompt.take() {
+        Some(prompt) => {
             let add_special_tokens = request.add_special_tokens;
-            let prompt = request.prompt;
             match prompt {
-                TokenizePrompt::One(text) => {
+                OneOrMany::One(text) => {
                     let tokens = renderer
                         .tokenize_prompt(text, add_special_tokens)
                         .await
                         .map_err(renderer_error)?;
                     (json!(tokens), json!(tokens.len()))
                 }
-                TokenizePrompt::Many(texts) => {
+                OneOrMany::Many(texts) => {
                     let tokens = try_join_all(
                         texts
                             .into_iter()
@@ -69,10 +61,7 @@ async fn tokenize(
                 }
             }
         }
-        TokenizeRequest::Chat(request) => {
-            if request.prompt.is_some() {
-                return Err(exactly_one_input());
-            }
+        None => {
             let request = request
                 .into_chat(&renderer.config().served_model_name)
                 .map_err(renderer_error)?;
@@ -91,35 +80,15 @@ async fn tokenize(
 }
 
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum TokenizeRequest {
-    Prompt(TokenizePromptRequest),
-    Chat(TokenizeChatRequest),
-}
-
-#[derive(Deserialize)]
-struct TokenizePromptRequest {
-    prompt: TokenizePrompt,
+struct TokenizeRequest {
     #[serde(default)]
-    messages: Option<Value>,
+    prompt: Option<OneOrMany<String>>,
+    #[serde(default)]
+    messages: Option<Vec<ChatCompletionRequestMessage>>,
     #[serde(default = "default_true")]
     add_special_tokens: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TokenizePrompt {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Deserialize)]
-struct TokenizeChatRequest {
     #[serde(default)]
     model: Option<String>,
-    messages: Vec<ChatCompletionRequestMessage>,
-    #[serde(default)]
-    prompt: Option<Value>,
     #[serde(default)]
     tools: Option<Vec<ChatCompletionTool>>,
     #[serde(default)]
@@ -127,13 +96,20 @@ struct TokenizeChatRequest {
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
+    reasoning: Option<Value>,
+    #[serde(default)]
     continue_final_message: bool,
     #[serde(default)]
     chat_template_kwargs: Option<std::collections::HashMap<String, Value>>,
 }
 
-impl TokenizeChatRequest {
-    fn into_chat(self, served_model: &str) -> Result<ChatRequest, crate::RendererError> {
+impl TokenizeRequest {
+    fn into_chat(mut self, served_model: &str) -> Result<ChatRequest, crate::RendererError> {
+        normalize_reasoning_inputs(
+            &mut self.reasoning_effort,
+            self.reasoning.take(),
+            &mut self.chat_template_kwargs,
+        )?;
         let model = self.model.unwrap_or_else(|| served_model.to_owned());
         if model != served_model {
             return Err(format!("The model `{model}` does not exist").into());
@@ -141,7 +117,10 @@ impl TokenizeChatRequest {
         Ok(ChatRequest {
             rid: "tokenize".into(),
             model,
-            messages: self.messages,
+            messages: self
+                .messages
+                .take()
+                .expect("chat tokenization request has messages"),
             tools: self.tools,
             tool_choice: self.tool_choice,
             response_format: None,
@@ -186,10 +165,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::{
-        PooledTokenizer, RendererConfig, RendererError, RendererLimits, SamplingDefaults,
-        TextTokenizer,
-    };
+    use crate::{RendererConfig, RendererError, RendererLimits, SamplingDefaults, TextTokenizer};
 
     struct PrefixTokenizer;
 
@@ -215,11 +191,8 @@ mod tests {
             reasoning_parser: None,
             default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
-            skip_tokenizer_init: false,
-            vocab_size: 100,
             default_sampling_params: SamplingDefaults::default(),
             limits: RendererLimits {
-                skip_tokenizer_init: false,
                 vocab_size: 100,
                 context_len: 64,
                 num_reserved_tokens: 0,
@@ -227,9 +200,11 @@ mod tests {
                 enable_return_hidden_states: false,
             },
         };
-        routes(Arc::new(RendererService::with_backend(
+        routes(Arc::new(RendererService::with_tokenizer(
             config,
-            Arc::new(PooledTokenizer::new(Arc::new(PrefixTokenizer), 2, 2)),
+            Arc::new(PrefixTokenizer),
+            2,
+            2,
         )))
     }
 
@@ -319,7 +294,7 @@ mod tests {
 
     #[test]
     fn chat_tokenization_lowers_tokenize_specific_options() {
-        let request: TokenizeChatRequest = serde_json::from_value(json!({
+        let request: TokenizeRequest = serde_json::from_value(json!({
             "messages": [{"role": "assistant", "content": "partial"}],
             "reasoning_effort": "high",
             "continue_final_message": true,

@@ -20,22 +20,23 @@ pub enum GenerationFinishReason {
     Other(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    pub logprob: Option<f32>,
+    pub token_id: i32,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionLogprobs {
+    pub token: TokenLogprob,
+    pub top: Vec<TokenLogprob>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GenerationOutputExtras {
-    pub output_logprobs: Vec<f32>,
-    pub output_logprob_token_ids: TokenIds,
-    pub output_logprob_text: Vec<String>,
-    pub input_logprobs: Vec<f32>,
-    pub input_logprob_token_ids: TokenIds,
-    pub input_logprob_text: Vec<String>,
-    pub output_top_logprobs: Vec<f32>,
-    pub output_top_logprob_token_ids: TokenIds,
-    pub output_top_logprob_lengths: Vec<u32>,
-    pub output_top_logprob_text: Vec<String>,
-    pub input_top_logprobs: Vec<f32>,
-    pub input_top_logprob_token_ids: TokenIds,
-    pub input_top_logprob_lengths: Vec<u32>,
-    pub input_top_logprob_text: Vec<String>,
+    pub output_logprobs: Vec<PositionLogprobs>,
+    pub input_logprobs: Vec<PositionLogprobs>,
 }
 
 /// One decoded engine delta. All owned buffers are moved across the boundary.

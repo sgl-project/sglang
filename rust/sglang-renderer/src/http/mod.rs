@@ -61,7 +61,6 @@ mod tests {
         response::sse::{Event, Sse},
         routing::post,
     };
-    use futures::future::BoxFuture;
     use tower::ServiceExt;
 
     use super::{
@@ -73,7 +72,7 @@ mod tests {
     };
     use crate::{
         RendererConfig, RendererError, RendererLimits, RendererService, SamplingDefaults,
-        TextRequest, TokenIdsRequest, TokenizationBackend,
+        TextTokenizer,
     };
 
     #[test]
@@ -135,6 +134,75 @@ mod tests {
             .to_string();
 
         assert_eq!(error, "unsupported request fields: input_ids, task");
+    }
+
+    #[test]
+    fn chat_modalities_keep_the_typed_openai_contract() {
+        for modalities in [serde_json::json!("text"), serde_json::json!(["vision"])] {
+            let request = serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "modalities": modalities
+            });
+            assert!(serde_json::from_value::<ChatCompletionRequest>(request).is_err());
+        }
+
+        let text_request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "modalities": ["text"]
+        }))
+        .unwrap();
+        lower_chat_request(&renderer_config(), text_request).unwrap();
+    }
+
+    #[test]
+    fn reasoning_inputs_normalize_with_python_precedence() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high",
+            "reasoning": {"effort": "none", "enabled": true},
+            "chat_template_kwargs": {"thinking": true}
+        }))
+        .unwrap();
+        let (_, request) = lower_chat_request(&renderer_config(), request).unwrap();
+        let args = request.chat_template_args.unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request.reasoning_effort).unwrap(),
+            serde_json::json!("none")
+        );
+        assert_eq!(args.get("thinking"), Some(&serde_json::json!(true)));
+        assert_eq!(args.get("enable_thinking"), Some(&serde_json::json!(false)));
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "0.5"
+        }))
+        .unwrap();
+        let (_, request) = lower_chat_request(&renderer_config(), request).unwrap();
+        assert_eq!(
+            serde_json::to_value(request.reasoning_effort).unwrap(),
+            serde_json::json!(0.5)
+        );
+        assert_eq!(
+            request
+                .chat_template_args
+                .as_ref()
+                .and_then(|args| args.get("thinking")),
+            Some(&serde_json::json!(true))
+        );
+
+        for invalid in [serde_json::json!(true), serde_json::json!(1.0)] {
+            let request = serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": invalid
+            });
+            assert!(serde_json::from_value::<ChatCompletionRequest>(request).is_err());
+        }
     }
 
     #[test]
@@ -213,6 +281,20 @@ mod tests {
     }
 
     #[test]
+    fn completion_lowering_rejects_zero_max_tokens() {
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "model",
+            "prompt": "hello",
+            "max_tokens": 0
+        }))
+        .unwrap();
+
+        let error = lower_text_completion_request(&renderer_config(), &request).unwrap_err();
+
+        assert_eq!(error.to_string(), "max_tokens must be positive");
+    }
+
+    #[test]
     fn token_id_completion_lowering_attaches_batched_metadata() {
         let request: CompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "model",
@@ -240,24 +322,9 @@ mod tests {
 
     struct WordTokenizer;
 
-    impl TokenizationBackend for WordTokenizer {
-        fn tokenize(
-            &self,
-            request: TextRequest,
-        ) -> BoxFuture<'static, Result<TokenIdsRequest, RendererError>> {
-            Box::pin(async move {
-                Ok(TokenIdsRequest {
-                    rid: request.rid,
-                    input_ids: request
-                        .prompt
-                        .as_str()
-                        .split_whitespace()
-                        .map(|_| 7)
-                        .collect(),
-                    options: request.options,
-                    metadata: request.metadata,
-                })
-            })
+    impl TextTokenizer for WordTokenizer {
+        fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<i32>, RendererError> {
+            Ok(text.split_whitespace().map(|_| 7).collect())
         }
     }
 
@@ -297,11 +364,8 @@ mod tests {
             reasoning_parser: None,
             default_chat_template_kwargs: Default::default(),
             stream_response_default_include_usage: false,
-            skip_tokenizer_init: false,
-            vocab_size: 128,
             default_sampling_params: SamplingDefaults::default(),
             limits: RendererLimits {
-                skip_tokenizer_init: false,
                 vocab_size: 128,
                 context_len: 128,
                 num_reserved_tokens: 0,
@@ -356,9 +420,11 @@ mod tests {
             )
             .into_future(),
         );
-        let renderer = Arc::new(RendererService::with_backend(
+        let renderer = Arc::new(RendererService::with_tokenizer(
             renderer_config(),
             Arc::new(WordTokenizer),
+            2,
+            2,
         ));
         let client =
             HttpGenerateClient::new(format!("http://{address}"), tiny_tokenizer()).unwrap();
