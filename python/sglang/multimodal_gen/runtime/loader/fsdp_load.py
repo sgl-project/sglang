@@ -98,14 +98,12 @@ def _make_param_like(
     return new_param
 
 
-def _can_assign_cpu_tensor_without_copy(
+def _can_assign_tensor_without_copy(
     actual_param: torch.nn.Parameter,
     full_tensor: torch.Tensor,
     target_param: torch.Tensor,
 ) -> bool:
-    """Return whether a TP=1 linear loader would only copy this CPU tensor."""
-    if full_tensor.device.type != "cpu":
-        return False
+    """Return whether a TP=1 linear loader would only copy this tensor."""
     weight_loader = actual_param.__dict__.get("weight_loader")
     if not isinstance(weight_loader, MethodType):
         return False
@@ -122,6 +120,8 @@ def _can_assign_cpu_tensor_without_copy(
         return False
     if type(actual_param) is not nn.Parameter:
         return False
+    if actual_param.__dict__.get("checkpoint_mapping_unsafe", False):
+        return False
     if any(
         actual_param.__dict__.get(attribute, False)
         for attribute in (
@@ -134,6 +134,8 @@ def _can_assign_cpu_tensor_without_copy(
     return (
         full_tensor.shape == target_param.shape
         and full_tensor.dtype == target_param.dtype
+        and full_tensor.layout == target_param.layout
+        and full_tensor.stride() == target_param.stride()
     )
 
 
@@ -734,7 +736,7 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = full_tensor
             elif weight_loader is not None:
                 assert actual_param is not None
-                if _can_assign_cpu_tensor_without_copy(
+                if _can_assign_tensor_without_copy(
                     actual_param,
                     full_tensor,
                     meta_sharded_param,
