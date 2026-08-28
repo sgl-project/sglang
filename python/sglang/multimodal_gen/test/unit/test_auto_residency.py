@@ -3178,6 +3178,35 @@ class TestCollectResidencyTargets:
             (RESIDENCY_POLICY_STRIDED, RESIDENCY_POLICY_STRIDED),
         }
 
+    def test_repeated_non_dit_group_can_tune_policy(self):
+        manager = _FakeLayerwiseManager(
+            {f"layers.{index}.w": torch.zeros(16) for index in range(4)},
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"custom_refiner": module},
+            residency_mode_of=self._modes({"custom_refiner": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_policy_is_explicit=lambda _name, _dit_group: False,
+            layerwise_layer_uses={"custom_refiner": {"layers": (4, 4, 4, 4)}},
+        )
+
+        policies = {
+            candidate.target_layerwise_residency_policies
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+            and candidate.target_layerwise_pinned_layers == ((),)
+        }
+        assert policies == {
+            (RESIDENCY_POLICY_LEADING,),
+            (RESIDENCY_POLICY_STRIDED,),
+        }
+
     def test_fully_pinned_component_can_release_hostpin_for_a_hotter_component(self):
         manager = _FakeLayerwiseManager(
             {

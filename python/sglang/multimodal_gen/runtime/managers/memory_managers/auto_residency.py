@@ -1856,8 +1856,7 @@ def collect_residency_targets(
             and module.layerwise_offload_dit_group_enabled
         )
         tune_residency_policy = bool(
-            is_dit_component_name(name)
-            and layerwise_policy_is_explicit is not None
+            layerwise_policy_is_explicit is not None
             and not layerwise_policy_is_explicit(name, dit_group)
         )
 
