@@ -2094,6 +2094,17 @@ class ServerArgs:
         "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
         NS("spec"),
     ] = None
+    enable_native_mtp: A[
+        bool,
+        Arg(
+            help=(
+                "Enable native MTP inside the target model instead of loading "
+                "the MTP block as a separate draft model."
+            ),
+            aliases=["--enable_native_mtp"],
+        ),
+        NS("spec"),
+    ] = False
     speculative_draft_model_path: A[
         Optional[str],
         Arg(
@@ -3863,6 +3874,7 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+        self._handle_native_mtp()
 
         # expert_pack may replace a raw GGUF input with its generated local
         # model metadata before any model-specific handler calls get_model_config.
@@ -4648,6 +4660,37 @@ class ServerArgs:
                 "_handle_missing_default_values",
                 speculative_draft_model_quantization=None,
             )
+
+    def _handle_native_mtp(self):
+        if not self.enable_native_mtp:
+            return
+
+        logger.warning(
+            "--enable-native-mtp is experimental. Native MTP draft CUDA graph "
+            "capture for decode/extend is temporarily disabled and may affect "
+            "decode performance."
+        )
+
+        if self.speculative_draft_model_path is not None:
+            raise ValueError(
+                "--enable-native-mtp loads the MTP block from the target model; "
+                "do not set --speculative-draft-model-path."
+            )
+
+        try:
+            model_override_args = json.loads(self.json_model_override_args)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                "--json-model-override-args must be valid JSON when "
+                "--enable-native-mtp is set."
+            ) from e
+        if not isinstance(model_override_args, dict):
+            raise ValueError("--json-model-override-args must decode to a JSON object.")
+
+        model_override_args["enable_native_mtp"] = True
+        self.json_model_override_args = json.dumps(
+            model_override_args, separators=(",", ":")
+        )
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local

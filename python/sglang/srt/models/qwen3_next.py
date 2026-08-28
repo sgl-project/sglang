@@ -1,5 +1,7 @@
+import copy
 import enum
 import logging
+from contextlib import ExitStack
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -13,6 +15,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 )
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -49,7 +52,13 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_model,
+    get_parallel,
+    get_spec,
+    get_stream,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -987,6 +996,95 @@ class HybridLayerType(enum.Enum):
     mamba2 = "mamba"
 
 
+class Qwen3NextMTPBlock(nn.Module):
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        config = copy.deepcopy(config)
+        self.config = config
+        if _is_npu and get_spec().speculative_draft_model_quantization is None:
+            quant_config = None
+        self.quant_config = quant_config
+
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.pre_fc_norm_embedding = GemmaRMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.pre_fc_norm_hidden = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
+        self.model = Qwen3NextModel(
+            mtp_config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            is_nextn=True,
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        exit_stack = ExitStack()
+        if (
+            _is_npu
+            and self.quant_config is None
+            and get_model().quantization is not None
+        ):
+            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+            exit_stack.enter_context(
+                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+            )
+
+        try:
+            if input_embeds is None:
+                input_embeds = self.model.embed_tokens(input_ids)
+
+            hidden_states = forward_batch.spec_info.hidden_states
+            if not forward_batch.forward_mode.is_idle():
+                input_embeds = self.pre_fc_norm_embedding(input_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            hidden_states = self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
+
+            with get_global_expert_distribution_recorder().disable_this_region():
+                hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    forward_batch,
+                    hidden_states,
+                )
+        finally:
+            exit_stack.close()
+
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+
+
 class Qwen3NextForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -1029,6 +1127,7 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
+        self.maybe_enable_native_mtp(config, quant_config, prefix)
         self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
@@ -1053,6 +1152,44 @@ class Qwen3NextForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def maybe_enable_native_mtp(
+        self,
+        config: Qwen3NextConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> None:
+        self.mtp = None
+        if not getattr(config, "enable_native_mtp", False):
+            return
+
+        self.mtp = Qwen3NextMTPBlock(
+            config,
+            quant_config,
+            prefix=add_prefix("mtp", prefix),
+        )
+        self.mtp.set_embed_and_head(self.model.embed_tokens.weight, self.lm_head.weight)
+
+    def _remap_native_mtp_weight_name(self, name: str) -> Optional[str]:
+        if self.mtp is None:
+            return None
+
+        if name.startswith(("mtp.embed_tokens.", "mtp.model.embed_tokens.")):
+            return None
+        if name.startswith(
+            (
+                "mtp.lm_head.",
+                "mtp.shared_head.head.",
+                "mtp.model.shared_head.head.",
+            )
+        ):
+            return None
+
+        if name.startswith("mtp.layers."):
+            return name.replace("mtp.layers.", "mtp.model.layers.", 1)
+        if name.startswith("mtp.norm."):
+            return name.replace("mtp.norm.", "mtp.model.norm.", 1)
+        return name
 
     def _get_num_fused_shared_experts(self) -> int:
         if not hasattr(self.model, "layers"):
@@ -1144,7 +1281,19 @@ class Qwen3NextForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
+        expect_native_mtp_weights = not is_mtp and self.mtp is not None
+        found_native_mtp_weight = False
         for name, loaded_weight in weights:
+            if expect_native_mtp_weights and name.startswith(
+                (
+                    "mtp.fc.",
+                    "mtp.pre_fc_norm_embedding.",
+                    "mtp.pre_fc_norm_hidden.",
+                    "mtp.layers.",
+                    "mtp.norm.",
+                )
+            ):
+                found_native_mtp_weight = True
 
             if is_mtp:
 
@@ -1161,7 +1310,9 @@ class Qwen3NextForCausalLM(nn.Module):
                     name = name.replace("mtp", "model")
 
             if not is_mtp and "mtp" in name:
-                continue
+                name = self._remap_native_mtp_weight_name(name)
+                if name is None:
+                    continue
 
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -1250,6 +1401,11 @@ class Qwen3NextForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if expect_native_mtp_weights and not found_native_mtp_weight:
+            raise ValueError(
+                "--enable-native-mtp requires checkpoint weights with the 'mtp.' "
+                "prefix, but none were found."
+            )
         return loaded_params
 
     @classmethod
