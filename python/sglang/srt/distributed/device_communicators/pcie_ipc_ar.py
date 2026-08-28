@@ -224,15 +224,40 @@ class PcieIpcCommunicator:
         self._tune(hidden)
         return True
 
+    def prepare(self, hidden: int) -> None:
+        """Build and measure ahead of the first reduction.
+
+        Call this from warmup, before any other autotuning starts. Left to the
+        first reduction instead, the build lands inside SGLang's own FlashInfer
+        autotune pass, and FlashInfer refuses to profile a collective from
+        inside an autotune context it did not open -- so the tuning call would
+        return having measured nothing.
+        """
+        if self.disabled or self._workspace is not None:
+            return
+        probe = torch.empty((1, hidden), dtype=torch.bfloat16, device=self._device)
+        self._ensure_workspace(probe)
+
     def _tune(self, hidden: int) -> None:
         """Measure the launch tactics for this workspace's shapes.
 
         Without this the kernels run FlashInfer's seed policy, and ``supports``
         answers from that policy rather than from measurements on this host.
-        The autotuner rendezvouses on the host group and replays kernels, so it
-        cannot run inside a graph capture; the seed policy stays in force there.
         Results persist to FlashInfer's cache, so only the first server pays.
         """
+        from flashinfer.autotuner import AutoTuner
+
+        if AutoTuner.get().is_tuning_mode:
+            # FlashInfer checks the *installed* autotune process group, which
+            # belongs to whoever opened the enclosing context, so it declines to
+            # profile and the call would measure nothing. Say so rather than
+            # report a tuning that did not happen.
+            logger.warning(
+                "FlashInfer PCIe-IPC all-reduce reached its first reduction inside "
+                "another autotune context; skipping autotune and keeping the seed "
+                "policy. Call PcieIpcCommunicator.prepare() from warmup to tune."
+            )
+            return
         if self._cpu_group is None:
             logger.warning(
                 "FlashInfer PCIe-IPC all-reduce has no host group to autotune on; "
