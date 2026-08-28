@@ -5927,7 +5927,7 @@ class ServerArgs:
                         page_size=128,
                     )
                     logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
-                    if self.kv_cache_dtype == "auto":
+                    if cfg.kv_cache_dtype == "auto":
                         self._declare(
                             "_handle_model_specific_adjustments",
                             kv_cache_dtype="bfloat16",
@@ -5935,12 +5935,12 @@ class ServerArgs:
                         logger.warning(
                             "Setting KV cache dtype to bfloat16 for DeepSeek DSA on XPU."
                         )
-                    if self.dsa_prefill_backend is None:
+                    if cfg.dsa_prefill_backend is None:
                         self._declare(
                             "_handle_model_specific_adjustments",
                             dsa_prefill_backend="intel_xpu",
                         )
-                    if self.dsa_decode_backend is None:
+                    if cfg.dsa_decode_backend is None:
                         self._declare(
                             "_handle_model_specific_adjustments",
                             dsa_decode_backend="intel_xpu",
@@ -5968,14 +5968,14 @@ class ServerArgs:
                     # Use dsa for both prefill and decode so DeepseekSparseAttnBackend
                     # handles the full forward pass (KV cache store, DSA indexer, and
                     # MLA attention) without needing a HybridAttnBackend.
-                    if self.decode_attention_backend is None:
+                    if cfg.decode_attention_backend is None:
                         self._declare(
                             "_handle_model_specific_adjustments",
                             decode_attention_backend="dsa",
                         )
                     # Prefill now uses flash_mla_prefill via the intel_xpu dsa path;
                     # no longer needs a separate Triton backend.
-                    if self.prefill_attention_backend is None:
+                    if cfg.prefill_attention_backend is None:
                         self._declare(
                             "_handle_model_specific_adjustments",
                             prefill_attention_backend="dsa",
