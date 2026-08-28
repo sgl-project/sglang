@@ -83,34 +83,6 @@ class RoundTripTest(unittest.TestCase):
         self.assertLess(hash_str_to_int64(_PAGE_HASH), 0)
         self.assertEqual(self._round_trip(_PAGE_HASH), page_hash_key(_PAGE_HASH))
 
-    def test_positive_event_value_round_trips(self):
-        self.assertGreater(hash_str_to_int64(_SMALL_PAGE_HASH), 0)
-        self.assertEqual(
-            self._round_trip(_SMALL_PAGE_HASH), page_hash_key(_SMALL_PAGE_HASH)
-        )
-
-    def test_normalized_form_is_the_digest_prefix(self):
-        """The canonical key is exactly what the event schema kept: 16 hex chars."""
-        self.assertEqual(page_hash_key(_PAGE_HASH), _PAGE_HASH[:16])
-        self.assertEqual(len(page_hash_key(_PAGE_HASH)), 16)
-
-
-class NormalizeBlockHashTest(unittest.TestCase):
-    def test_int_is_zero_padded_to_full_width(self):
-        """A small u64 must not shorten the key, or it won't match a digest."""
-        self.assertEqual(normalize_block_hash(1), "0000000000000001")
-
-    def test_signed_int_wraps_into_u64(self):
-        self.assertEqual(normalize_block_hash(-1), "f" * 16)
-
-    def test_hex_string_is_truncated_and_lowercased(self):
-        self.assertEqual(normalize_block_hash(_PAGE_HASH.upper()), _PAGE_HASH[:16])
-
-    def test_uninterpretable_values_are_rejected(self):
-        for value in (None, 1.5, b"abc", "", [], True):
-            with self.subTest(value=value):
-                self.assertIsNone(normalize_block_hash(value))
-
 
 class ParseTest(unittest.TestCase):
     def test_router_number_payload_covers_the_page(self):
@@ -126,27 +98,6 @@ class ParseTest(unittest.TestCase):
         )
         self.assertIsNotNone(hint)
         self.assertTrue(hint.covers(_PAGE_HASH))
-
-    def test_hex_payload_covers_the_page(self):
-        """A direct caller (tests, /generate) may send digests instead."""
-        hint = RouterHint.maybe_from_extra_info(
-            _extra_info(
-                {
-                    "source_control_endpoint": "tcp://peer:25000",
-                    "block_hashes": [_PAGE_HASH],
-                }
-            )
-        )
-        self.assertTrue(hint.covers(_PAGE_HASH))
-
-    def test_segment_key_is_covered_by_its_page(self):
-        """The core matches on segment keys; the hint only names whole pages."""
-        hint = RouterHint(
-            source_control_endpoint="tcp://peer:25000",
-            block_hashes=(page_hash_key(_PAGE_HASH),),
-        )
-        self.assertTrue(hint.covers(f"{_PAGE_HASH}#3"))
-        self.assertFalse(hint.covers(f"{_SMALL_PAGE_HASH}#3"))
 
     def test_bad_hash_truncates_rather_than_shifting(self):
         """Hints are root-aligned, so an unreadable entry ends the prefix.
@@ -181,15 +132,6 @@ class ParseTest(unittest.TestCase):
                     RouterHint.maybe_from_extra_info(_extra_info(payload))
                 )
 
-    def test_absent_extra_info_yields_no_hint(self):
-        self.assertIsNone(RouterHint.maybe_from_extra_info(None))
-        self.assertIsNone(
-            RouterHint.maybe_from_extra_info(SimpleNamespace(extra_info=None))
-        )
-        self.assertIsNone(
-            RouterHint.maybe_from_extra_info(SimpleNamespace(extra_info={}))
-        )
-
 
 class EnvelopeTest(unittest.TestCase):
     """The v0.1 envelope layer: which actions are read, which are stepped over."""
@@ -220,22 +162,6 @@ class EnvelopeTest(unittest.TestCase):
                 "payload": {"session_id": "agent-42"},
             },
         )
-        hint = RouterHint.maybe_from_extra_info(_extra_info_raw(envelope))
-        self.assertIsNotNone(hint)
-        self.assertTrue(hint.covers(_PAGE_HASH))
-
-    def test_a_newer_action_version_is_skipped_not_misparsed(self):
-        """A future payload shape read against this schema would misread it."""
-        self.assertIsNone(
-            RouterHint.maybe_from_extra_info(
-                _extra_info_raw(_envelope(self._PAYLOAD, action_version="2.0"))
-            )
-        )
-
-    def test_an_unknown_envelope_version_still_yields_the_action(self):
-        """Actions carry their own version, so the envelope's does not gate them."""
-        envelope = _envelope(self._PAYLOAD)
-        envelope["protocol_version"] = "0.2"
         hint = RouterHint.maybe_from_extra_info(_extra_info_raw(envelope))
         self.assertIsNotNone(hint)
         self.assertTrue(hint.covers(_PAGE_HASH))

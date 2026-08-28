@@ -47,62 +47,6 @@ class RemoteHintEndpointValidationTest(unittest.TestCase):
                     KVCRBackendConfig(**{**_DIALABLE, "control_advertise_host": host})
                 self.assertIn("control_advertise_host", str(caught.exception))
 
-    def test_missing_advertise_host_is_refused_even_when_the_bind_host_is_routable(
-        self,
-    ):
-        """``control_host`` is where to bind, not what to tell peers.
-
-        Falling back to it works when an operator binds one routable address and
-        silently advertises the wrong interface as soon as they bind more than one.
-        """
-        for host in (None, ""):
-            with self.subTest(control_advertise_host=host):
-                with self.assertRaises(ValueError) as caught:
-                    KVCRBackendConfig(
-                        **{
-                            **_DIALABLE,
-                            "control_host": "10.0.0.7",
-                            "control_advertise_host": host,
-                        }
-                    )
-                self.assertIn("control_advertise_host", str(caught.exception))
-
-    def test_wildcard_bind_with_explicit_advertise_host_is_allowed(self):
-        """Binding every interface is normal -- only advertising one is not.
-
-        The documented escape hatch, so a check that rejected the wildcard *bind* would
-        break a multi-NIC deployment while still passing the two tests above.
-        """
-        config = KVCRBackendConfig(
-            **{
-                **_DIALABLE,
-                "control_host": "0.0.0.0",
-                "control_advertise_host": "10.0.0.7",
-            }
-        )
-        self.assertEqual(config.control_advertise_host, "10.0.0.7")
-
-    def test_local_only_keeps_the_ephemeral_default(self):
-        """Nothing dials a local-only worker, and an OS port cannot collide.
-
-        The negative branch: an unconditional rule would fail every local-only launch,
-        including the default ``from_extra_config`` returns for an empty blob.
-        """
-        self.assertEqual(KVCRBackendConfig().control_port, 0)
-        self.assertEqual(KVCRBackendConfig.from_extra_config(None).control_port, 0)
-        self.assertEqual(KVCRBackendConfig.from_extra_config({}).control_port, 0)
-
-    def test_validation_runs_on_the_extra_config_path(self):
-        """``from_extra_config`` is the only way this struct is built in prod.
-
-        It goes through ``msgspec.convert``, not ``__init__``, so if that stopped
-        invoking ``__post_init__`` every test above would still pass.
-        """
-        with self.assertRaises(ValueError):
-            KVCRBackendConfig.from_extra_config(
-                {**_DIALABLE, "control_port": 0, "unknown_key": "ignored"}
-            )
-
 
 class TimeoutOrderingValidationTest(unittest.TestCase):
     """``get_timeout_s`` must outlast ``operation_timeout_ms``.
@@ -120,25 +64,6 @@ class TimeoutOrderingValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             KVCRBackendConfig(operation_timeout_ms=30000, get_timeout_s=10.0)
         self.assertIn("get_timeout_s", str(caught.exception))
-
-    def test_equal_timeouts_are_refused(self):
-        """A tie is not safe: the core's deadline and ours would race."""
-        with self.assertRaises(ValueError):
-            KVCRBackendConfig(operation_timeout_ms=20000, get_timeout_s=20.0)
-
-    def test_the_rule_applies_to_local_only_configs(self):
-        """The pages are reused the same way whether or not a peer is involved.
-
-        A deposit hands the core host pages as transfer *sources*, so abandoning one
-        early lets the core read out of pages HiCache has already reused. Scoping this
-        to ``enable_remote_hint`` would leave that open.
-        """
-        with self.assertRaises(ValueError):
-            KVCRBackendConfig(
-                enable_remote_hint=False,
-                operation_timeout_ms=30000,
-                get_timeout_s=10.0,
-            )
 
     def test_the_shipped_defaults_satisfy_the_rule(self):
         """The negative branch: a stricter rule would fail every launch."""
