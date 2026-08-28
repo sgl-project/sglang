@@ -726,6 +726,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_QSA_PREFILL_GEOMETRY`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen QSA sparse prefill launch geometry: <code>auto</code>, <code>table</code>, or <code>tuned</code>. <code>auto</code> selects tuned configurations on SM120 (excluding SM121) with exactly 188 multiprocessors, Triton 3.7 or newer, top-k 2051, and head dimension 256. The measured head layouts are group size 6 with one KV head and group size 12 with one or two KV heads. Ordinary prefill requires at least 8192 total query rows. Chunk prefill requires at least 512 query rows per request on average and <code>max_query_length * batch_size &lt;= 2 * total_query_rows</code>. <code>table</code> uses the device table for every shape. <code>tuned</code> skips the 188-multiprocessor allowlist for measuring another SM120 part and keeps the workload, architecture, and Triton gates.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_PLE_OFFLOAD_NUMA_INTERLEAVE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interleave the host-offloaded Qwen PLE embedding table across NUMA nodes instead of pinning it node-local, so one node's memory is not exhausted on multi-socket hosts.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>

@@ -308,6 +308,9 @@ class Envs:
     # Select the QSA MQA scoring backend. Auto follows the architecture default;
     # failures from the selected backend are reported to the caller.
     SGLANG_QSA_MQA_BACKEND = EnvStr("auto")
+    # Select QSA sparse prefill launch geometry. Auto enables tuned SM120
+    # configurations for eligible shapes; table keeps device-table selection.
+    SGLANG_QSA_PREFILL_GEOMETRY = EnvStr("auto")
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

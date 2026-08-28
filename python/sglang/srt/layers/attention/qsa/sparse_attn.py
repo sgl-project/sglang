@@ -5,11 +5,18 @@ logical QSA selections through ``req_to_token`` and reads the paged KV pool
 directly, avoiding both the packed scratch copy and a flash-attn dependency.
 """
 
-from typing import Optional
+import logging
+from functools import lru_cache
+from typing import Literal, NamedTuple, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm120_supported, is_sm121
+
+logger = logging.getLogger(__name__)
 
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
@@ -24,11 +31,151 @@ _L20_CONFIGS = [
     (512, (32, 4, 2)),
     (float("inf"), (16, 1, 2)),
 ]
+# The lowest measured ordinary point is 8192 rows. The chunk sweep reached its
+# crossover at 512 rows for one request.
+_SM120_PREFILL_MIN_ORDINARY_ROWS = 8192
+_SM120_PREFILL_MIN_CHUNK_ROWS = 512
+_SM120_PREFILL_TOPK = 2051
+_SM120_PREFILL_SMS = frozenset({188})
+_QSA_PREFILL_GEOMETRIES = {"auto", "table", "tuned"}
 
 
-def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+class _PrefillConfig(NamedTuple):
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+
+
+# These tuples were validated at head dimension 256, the only head dimension
+# served by these kernels.
+_SM120_PREFILL_CONFIGS = {
+    6: _PrefillConfig(8, 16, 4, 3),
+    12: _PrefillConfig(16, 16, 2, 3),
+}
+if any(
+    config.block_m < group_size for group_size, config in _SM120_PREFILL_CONFIGS.items()
+):
+    raise ValueError("_SM120_PREFILL_CONFIGS drops query heads")
+
+
+@lru_cache
+def _get_prefill_device_configs(device_index: int):
+    """Cache the device-name lookup used by the H20/L20 table."""
+    device_name = torch.cuda.get_device_name(device_index)
+    return _H20_CONFIGS if "H20" in device_name else _L20_CONFIGS
+
+
+def _get_best_config(total_q: int, device_index: Optional[int] = None):
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    table = _get_prefill_device_configs(device_index)
     return next(cfg for limit, cfg in table if total_q <= limit)
+
+
+def _get_table_prefill_config(
+    total_q: int, group_size: int, device_index: Optional[int] = None
+) -> _PrefillConfig:
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q, device_index)
+    return _PrefillConfig(block_m, block_n, warps, stages)
+
+
+@lru_cache
+def _sm120_multiprocessor_count(device_index: int) -> int:
+    try:
+        return torch.cuda.get_device_properties(device_index).multi_processor_count
+    except Exception as exc:
+        logger.warning(
+            "QSA prefill tuning disabled; device properties unavailable (%s)", exc
+        )
+        return 0
+
+
+@lru_cache(maxsize=1)
+def _triton_supports_sm120_prefill() -> bool:
+    # The pinned torch package ships a 3.7.x Triton. The tuned family was
+    # measured on 3.7.1, and a 3.6.0 spot check compiled and ran the 8-row dot.
+    # Older versions use the device table because this path lacks coverage.
+    try:
+        from packaging.version import Version
+
+        supported = Version(Version(triton.__version__).base_version) >= Version("3.7")
+    except Exception as exc:
+        logger.warning(
+            "QSA prefill tuning disabled; Triton version %r did not parse (%s)",
+            getattr(triton, "__version__", None),
+            exc,
+        )
+        return False
+    if not supported:
+        logger.info(
+            "QSA prefill tuning disabled on Triton %s; the tested floor is 3.7",
+            triton.__version__,
+        )
+    return supported
+
+
+def _qsa_prefill_geometry() -> str:
+    """Read the QSA sparse prefill geometry override."""
+    geometry = envs.SGLANG_QSA_PREFILL_GEOMETRY.get().strip().lower()
+    if geometry not in _QSA_PREFILL_GEOMETRIES:
+        choices = ", ".join(sorted(_QSA_PREFILL_GEOMETRIES))
+        raise ValueError(
+            f"SGLANG_QSA_PREFILL_GEOMETRY must be one of {choices}; got {geometry!r}"
+        )
+    return geometry
+
+
+def _get_prefill_config(
+    total_q: int,
+    group_size: int,
+    num_requests: int,
+    head_dim: int,
+    *,
+    kernel: Literal["ordinary", "chunk"],
+    topk: int,
+    num_kv_heads: int,
+    max_q: int,
+) -> _PrefillConfig:
+    geometry = _qsa_prefill_geometry()
+    device_index = torch.cuda.current_device()
+    request_count = max(1, num_requests)
+    kv_head_eligible = (group_size == 6 and num_kv_heads == 1) or (
+        group_size == 12 and num_kv_heads in (1, 2)
+    )
+    workload_eligible = (
+        topk == _SM120_PREFILL_TOPK
+        and kv_head_eligible
+        and (
+            (kernel == "ordinary" and total_q >= _SM120_PREFILL_MIN_ORDINARY_ROWS)
+            or (
+                kernel == "chunk"
+                and total_q >= _SM120_PREFILL_MIN_CHUNK_ROWS * request_count
+                and max_q * request_count <= 2 * total_q
+            )
+        )
+    )
+    # GB10 (sm_121) shares the capability major but has not been measured for
+    # these launch configurations, so it keeps the device-table selection.
+    # The auto path admits the measured 188-SM configuration. The tuned
+    # override skips that device allowlist so another SM120 part can be timed;
+    # the measured workload, architecture, and compiler gates still apply.
+    if (
+        geometry != "table"
+        and is_sm120_supported()
+        and not is_sm121()
+        and _triton_supports_sm120_prefill()
+        and head_dim == 256
+        and group_size in _SM120_PREFILL_CONFIGS
+        and workload_eligible
+        and (
+            geometry == "tuned"
+            or _sm120_multiprocessor_count(device_index) in _SM120_PREFILL_SMS
+        )
+    ):
+        return _SM120_PREFILL_CONFIGS[group_size]
+    return _get_table_prefill_config(total_q, group_size, device_index)
 
 
 @triton.jit
@@ -142,8 +289,16 @@ def sparse_gqa_fwd_interface_triton(q, k, v, max_seqlen_k, indices, cu_seqlens, 
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
-    block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_m, block_n, warps, stages = _get_prefill_config(
+        total_q,
+        group_size,
+        cu_seqlens.shape[0] - 1,
+        head_dim,
+        kernel="ordinary",
+        topk=indices.shape[-1],
+        num_kv_heads=num_kv_heads,
+        max_q=max_seqlen_k,
+    )
     out = torch.empty_like(q)
     _sparse_gqa_prefill[(max_seqlen_k, (cu_seqlens.shape[0] - 1) * num_kv_heads)](
         q,
@@ -295,8 +450,16 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
-    block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_m, block_n, warps, stages = _get_prefill_config(
+        total_q,
+        group_size,
+        cu_q.shape[0] - 1,
+        head_dim,
+        kernel="chunk",
+        topk=indices.shape[-1],
+        num_kv_heads=num_kv_heads,
+        max_q=max_q,
+    )
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
