@@ -2215,6 +2215,43 @@ class TestCCADecodeConvFold(CustomTestCase):
         cca.fold_decode_conv()
         self.assertTrue(cca._decode_conv_folded)
 
+    def test_grouped_matmul_is_bitwise_the_einsum_it_replaces(self):
+        """The folded conv runs as an explicit ``bmm`` into a strided ``out=``
+        view instead of ``einsum("tgk,gok->tgo")``.
+
+        The motive is purely the output layout -- einsum batches over ``g``, so
+        its gemm writes ``[G, T, Cg]`` and the permute back to token-major costs
+        a second launch. Pin the two bit-identical: anything short of that means
+        the rewrite changed the arithmetic, not just where the result lands.
+        """
+        from sglang.srt.models.zaya import _cca_decode_conv
+
+        cca, _ = _make_tiny_cca(seed=11)
+        cca.fold_decode_conv()
+        T = 3
+        torch.manual_seed(11)
+        # Already ``taps_ext`` wide, i.e. the ones column ``cca_state_step``
+        # writes is present, so no padding step stands between the two forms.
+        window = (
+            torch.randn(T, cca.in_out_ch, cca.decode_conv_taps_ext, dtype=torch.float32)
+            * 0.3
+        )
+        with torch.no_grad():
+            grouped = window.reshape(T, cca.decode_conv_groups, -1)
+            ref = torch.einsum("tgk,gok->tgo", grouped, cca.decode_conv_weight).reshape(
+                T, -1
+            )
+            got = _cca_decode_conv(
+                window,
+                cca.conv_qk,
+                cca.decode_conv_weight,
+                cca.decode_conv_bias,
+                cca.decode_conv_groups,
+            )
+        self.assertEqual(got.shape, ref.shape)
+        self.assertTrue(got.is_contiguous())
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
     def test_fold_is_refreshed_not_stale(self):
         # The buffers are non-persistent and derived, so a weight change must be
         # picked up by re-folding; a cached-once implementation would go stale on
@@ -4388,7 +4425,7 @@ class TestZayaMoDReachability(CustomTestCase):
     output.
     """
 
-    def _router(self, *, use_mod=True):
+    def _router(self, *, use_mod=True, topk=1):
         from sglang.srt.models.zaya import ZayaRouter
 
         config = _make_swa_config(num_hidden_layers=4, swa_layers=[0, 0, 0, 0])
@@ -4396,7 +4433,7 @@ class TestZayaMoDReachability(CustomTestCase):
         return ZayaRouter(
             config=config,
             num_moe_experts=4,
-            moe_router_topk=1,
+            moe_router_topk=topk,
             mlp_expansion=8,
             layer_id=1,
         )
@@ -4448,10 +4485,167 @@ class TestZayaMoDReachability(CustomTestCase):
         router.fold_mod_reachability()
         self.assertFalse(router.mod_reachable)
 
+    def test_topk_above_one_keeps_mod_live(self):
+        # The bound is on the *maximum*: it proves the skip slot never wins an
+        # argmax, and says nothing about the runner-up a topk > 1 selection also
+        # takes. Applying it there would let a selected skip id reach FusedMoE
+        # unclamped, so the predicate must refuse to fire above top-1 even on
+        # the bias layout that is dead at top-1.
+        router = self._router(topk=2)
+        with torch.no_grad():
+            router.balancing_biases.copy_(
+                torch.tensor([0.03, -0.06, 0.02, -0.01, -1.0])
+            )
+        router.fold_mod_reachability()
+        self.assertTrue(router.mod_reachable)
+
 
 # ---------------------------------------------------------------------------
-# ZayaRouter: fused tail (softmax + bias + top-1 + gather + id munging)
+# ZayaRouter: the routing tail with an unreachable MOD skip slot
 # ---------------------------------------------------------------------------
+
+
+class TestZayaRoutingWithoutReachableMoD(CustomTestCase):
+    """``_routing_reference`` drops the skip slot's dead work, not its answers.
+
+    On a checkpoint whose skip bias puts the slot out of reach, two of the
+    tail's launches are provably dead: the clamp of the expert ids (argmax
+    cannot return the skip index) and the cast of ``route_prob`` to the model
+    dtype (the MOD blend is its only consumer). Both now ride on
+    ``mod_reachable``. What must NOT change is the routing *decision*, so every
+    test here pins the unreachable path against the reachable one on the same
+    router and the same logits.
+    """
+
+    NUM_MOE_EXPERTS = 4
+
+    def _router(self, *, biases, topk=1):
+        from sglang.srt.models.zaya import ZayaRouter
+
+        config = _make_swa_config(num_hidden_layers=4, swa_layers=[0, 0, 0, 0])
+        config.zaya_use_mod = True
+        config.moe_router_topk = topk
+        router = ZayaRouter(
+            config=config,
+            num_moe_experts=self.NUM_MOE_EXPERTS,
+            moe_router_topk=topk,
+            mlp_expansion=8,
+            layer_id=1,
+        )
+        with torch.no_grad():
+            router.balancing_biases.copy_(torch.tensor(biases))
+        router.fold_mod_reachability()
+        return router
+
+    # The shipped ZAYA1-74B layout (skip at -1.0) versus one where the slot can
+    # still win.
+    DEAD_BIASES = [0.03, -0.06, 0.02, -0.01, -1.0]
+    LIVE_BIASES = [0.03, 0.01, 0.02, 0.0, 0.5]
+
+    def _logits(self, rows=6, seed=17, skip_bonus=0.0):
+        torch.manual_seed(seed)
+        logits = torch.randn(rows, self.NUM_MOE_EXPERTS + 1)
+        logits[:, -1] += skip_bonus
+        return logits
+
+    def _route(self, router, logits, model_dtype=torch.bfloat16):
+        hs_next = torch.zeros(logits.shape[0], router.mlp_expansion)
+        return router._routing_reference(logits, model_dtype, hs_next)
+
+    def test_decision_is_identical_with_and_without_the_dead_work(self):
+        router = self._router(biases=self.DEAD_BIASES)
+        self.assertFalse(router.mod_reachable)
+        # A skip logit large enough that it wins the raw softmax outright: the
+        # -1.0 bias is the only thing keeping it out of the selection, which is
+        # exactly the property the removal leans on.
+        logits = self._logits(skip_bonus=6.0)
+
+        without = self._route(router, logits)
+        router.mod_reachable = True  # the pre-change chain: clamp + cast
+        with_dead_work = self._route(router, logits)
+
+        torch.testing.assert_close(
+            without.moe_ids, with_dead_work.moe_ids, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            without.moe_weight, with_dead_work.moe_weight, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            without.skip_ids, with_dead_work.skip_ids, rtol=0, atol=0
+        )
+
+    def test_ids_are_in_range_by_construction(self):
+        # No clamp runs any more, so the guarantee has to come from the
+        # selection itself: the skip column is not offered to the argmax.
+        router = self._router(biases=self.DEAD_BIASES)
+        routing = self._route(router, self._logits(skip_bonus=50.0))
+        self.assertEqual(routing.moe_ids.dtype, torch.int32)
+        self.assertLess(int(routing.moe_ids.max()), self.NUM_MOE_EXPERTS)
+        self.assertGreaterEqual(int(routing.moe_ids.min()), 0)
+        # ``skip_ids`` aliases the ids' values when there is nothing to clamp,
+        # which is the contract ZayaRouting documents for this case.
+        torch.testing.assert_close(
+            routing.skip_ids.to(torch.int32), routing.moe_ids, rtol=0, atol=0
+        )
+
+    def test_nan_logits_cannot_produce_an_out_of_range_expert(self):
+        # An out-of-range id is not a wrong answer in FusedMoE, it is an
+        # out-of-bounds write in moe_align_block_size. A NaN row makes every
+        # comparison false and is the one way an argmax over the full width
+        # could land on the skip column, so pin that the narrowed selection
+        # holds even there.
+        router = self._router(biases=self.DEAD_BIASES)
+        logits = self._logits()
+        logits[2, -1] = float("nan")
+        routing = self._route(router, logits)
+        self.assertLess(int(routing.moe_ids.max()), self.NUM_MOE_EXPERTS)
+
+    def test_reachable_skip_still_clamps_and_casts(self):
+        # The other direction: a checkpoint that really can route to the skip
+        # slot must keep both. Wrong here is silent -- an unclamped skip id
+        # indexing FusedMoE, and a fp32 route_prob widening the MOD blend.
+        router = self._router(biases=self.LIVE_BIASES)
+        self.assertTrue(router.mod_reachable)
+        routing = self._route(router, self._logits(skip_bonus=50.0))
+        skip_slot = self.NUM_MOE_EXPERTS
+        self.assertTrue(bool((routing.skip_ids == skip_slot).any()))
+        self.assertLess(int(routing.moe_ids.max()), self.NUM_MOE_EXPERTS)
+        self.assertEqual(routing.route_prob.dtype, torch.bfloat16)
+        self.assertEqual(routing.moe_weight.dtype, torch.float32)
+
+    def test_unreachable_skip_leaves_route_prob_uncast(self):
+        # The cast exists for the MOD blend alone. Dropping it is what saves the
+        # launch, so pin that it is really gone rather than moved: the fp32
+        # softmax output comes straight back out.
+        router = self._router(biases=self.DEAD_BIASES)
+        self.assertTrue(router.router_softmax_fp32)
+        routing = self._route(router, self._logits())
+        self.assertEqual(routing.moe_weight.dtype, torch.float32)
+        self.assertEqual(routing.route_prob.dtype, torch.float32)
+
+    def test_no_mod_at_all_is_unchanged(self):
+        # ``use_mod=False`` has no skip column to narrow away, so the same code
+        # path must degrade to the plain top-1 it always was.
+        from sglang.srt.models.zaya import ZayaRouter
+
+        config = _make_swa_config(num_hidden_layers=4, swa_layers=[0, 0, 0, 0])
+        config.zaya_use_mod = False
+        router = ZayaRouter(
+            config=config,
+            num_moe_experts=self.NUM_MOE_EXPERTS,
+            moe_router_topk=1,
+            mlp_expansion=8,
+            layer_id=1,
+        )
+        router.fold_mod_reachability()
+        self.assertEqual(router.num_experts, self.NUM_MOE_EXPERTS)
+        logits = torch.randn(5, self.NUM_MOE_EXPERTS)
+        routing = self._route(router, logits)
+        expected = logits.softmax(dim=-1).to(torch.float32)
+        expected = (expected + router.balancing_biases).argmax(dim=-1, keepdim=True)
+        torch.testing.assert_close(
+            routing.moe_ids, expected.to(torch.int32), rtol=0, atol=0
+        )
 
 
 if __name__ == "__main__":

@@ -445,19 +445,38 @@ def _cca_decode_conv(
     The folded weight spans ``taps + 1`` inputs per channel; the extra one is the
     bias, activated by a constant-1.0 column that ``cca_state_step`` writes. A
     window arriving without it gets it appended here.
+
+    Written as an explicit ``bmm`` into a strided view rather than the equivalent
+    ``einsum("tgk,gok->tgo")``: einsum batches over ``g``, so its gemm writes
+    ``[G, T, Cg]`` and the permute back to token-major costs a second launch --
+    a full elementwise copy of the output. Handing the gemm an ``out=`` that is
+    already the ``[G, T, Cg]`` *view* of a token-major buffer makes cuBLAS write
+    the final layout directly. Bit-identical to the einsum, and capturable.
     """
     if decode_conv_weight is not None:
         num_tokens, num_channels = padded.shape[0], padded.shape[1]
-        taps_ext = decode_conv_weight.shape[-1] // (num_channels // decode_conv_groups)
+        ch_per_group = num_channels // decode_conv_groups
+        taps_ext = decode_conv_weight.shape[-1] // ch_per_group
         if padded.shape[-1] != taps_ext:
             padded = F.pad(padded, (0, taps_ext - padded.shape[-1]), value=1.0)
         # [T, C, taps_ext] -> [T, G, Cg*taps_ext] (the trailing dims flatten in
-        # place, matching fold_decode_conv's layout) -> one grouped matmul ->
+        # place, matching fold_decode_conv's layout; a free view on the
+        # contiguous window ``cca_state_step`` emits) -> one grouped matmul ->
         # [T, C], with the bias already inside the accumulator.
         grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
-        return torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight).reshape(
-            num_tokens, -1
+        qk_out = torch.empty(
+            (num_tokens, num_channels),
+            dtype=torch.result_type(grouped, decode_conv_weight),
+            device=grouped.device,
         )
+        torch.bmm(
+            grouped.transpose(0, 1),
+            decode_conv_weight.transpose(1, 2),
+            out=qk_out.view(num_tokens, decode_conv_groups, ch_per_group).transpose(
+                0, 1
+            ),
+        )
+        return qk_out
     return conv_qk(padded).squeeze(-1)
 
 
@@ -1888,18 +1907,23 @@ class ZayaRouting(NamedTuple):
     """Everything :class:`ZayaBlock` needs out of one router forward.
 
     ``moe_weight`` / ``moe_ids`` are the FusedMoE-ready pair: fp32 weights (the
-    dtype every other sglang top-k emits) and int32 expert ids already clamped
-    into ``[0, num_moe_experts - 1]``.
+    dtype every other sglang top-k emits) and int32 expert ids guaranteed to lie
+    in ``[0, num_moe_experts - 1]`` -- by a clamp when the MOD skip slot is
+    reachable, and by leaving that slot out of the selection when it is not.
 
-    ``route_prob`` is the same probability at the model dtype, which the MOD
-    residual blend multiplies the hidden state by. It stays separate from
-    ``moe_weight`` so fusing the tail cannot change the MOD arithmetic's
-    precision.
+    ``route_prob`` is the MOD residual blend's operand: the same probability at
+    the model dtype, which the blend multiplies the hidden state by. It stays
+    separate from ``moe_weight`` so fusing the tail cannot change the MOD
+    arithmetic's precision. It is only *meaningful* when the router reports
+    ``mod_reachable``; when the skip slot cannot win, nothing reads it and the
+    cast to the model dtype is skipped, so it comes back at the softmax's own
+    dtype (fp32 under ``zaya_high_prec``) rather than the model's.
 
     ``skip_ids`` is the *unclamped* choice, which MOD needs: the clamp folds the
     skip slot onto real expert ``num_moe_experts - 1``, so ``moe_ids`` can no
-    longer tell a skipped token from one routed to the last expert. Without MOD
-    it aliases ``moe_ids``.
+    longer tell a skipped token from one routed to the last expert. When the
+    skip slot is unreachable there is nothing to clamp -- the selection never
+    offered it -- and ``skip_ids`` carries the same values as ``moe_ids``.
 
     ``hidden_states_next`` is the POST-EDA, PRE-NORM router state the next MoE
     layer folds in. Publishing the normalized tensor instead would change the EDA
@@ -2026,11 +2050,19 @@ class ZayaRouter(nn.Module):
         work. ZAYA1-74B ships ``b_skip = -1.0`` against real biases peaking near
         +0.03, so it is dead there.
 
+        The argument is about the *maximum*, so it only rules the skip slot out
+        of a top-1 selection: at ``topk > 1`` a slot that can never be first can
+        still be second, and the checkpoints that would exercise that do not
+        exist. Keep MOD live there rather than extend a proof that does not hold.
+
         Deliberately conservative: any bias layout that does not prove
         unreachability keeps the MOD path.
         """
         if not self.use_mod:
             self.mod_reachable = False
+            return
+        if self.topk > 1:
+            self.mod_reachable = True
             return
         biases = self.balancing_biases.detach().float()
         skip_bias = float(biases[-1])
@@ -2101,15 +2133,30 @@ class ZayaRouter(nn.Module):
             expert_prob = torch.softmax(logits, dim=-1)
 
         biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
+        # Every branch below keys off ``mod_reachable``, not ``use_mod``: on a
+        # checkpoint whose skip bias puts the slot permanently out of reach
+        # (ZAYA1-74B ships b_skip = -1.0) the whole MOD apparatus is dead work,
+        # and ``ZayaBlock`` already refuses to run the blend. See
+        # ``fold_mod_reachability``.
+        #
+        # Dropping the unreachable skip column from the *selection* is what
+        # licenses dropping the clamp: every id is then in ``[0,
+        # num_moe_experts)`` by construction rather than by an after-the-fact
+        # clamp. Clamping instead would leave one way for the skip index to
+        # reach FusedMoE -- a NaN-poisoned softmax, where argmax returns the NaN
+        # column -- and an out-of-range expert id there is memory corruption,
+        # not a wrong answer. ``biased[:, :num_moe_experts]`` is a free view, and
+        # a full-width one whenever there is no skip slot at all.
+        candidates = biased if self.mod_reachable else biased[:, : self.num_moe_experts]
         if self.topk == 1:
             # ZAYA1 ships moe_router_topk=1, so argmax is the same selection
             # without a general top-k's sort/heap, and it keeps the trailing dim
             # ``torch.gather`` below expects.
-            expert_choice = biased.argmax(dim=-1, keepdim=True)
+            expert_choice = candidates.argmax(dim=-1, keepdim=True)
         else:
-            _, expert_choice = torch.topk(biased, self.topk, dim=-1)
+            _, expert_choice = torch.topk(candidates, self.topk, dim=-1)
 
-        if self.topk > 1 and self.use_mod:
+        if self.topk > 1 and self.mod_reachable:
             skip_idx = self.num_experts - 1
             n_mask = expert_choice == skip_idx
             cumsum_mask = torch.cumsum(n_mask, dim=-1)
@@ -2117,13 +2164,14 @@ class ZayaRouter(nn.Module):
 
         route_prob = torch.gather(expert_prob, dim=1, index=expert_choice)
         # fp32 for the MoE runner -- a no-op cast whenever the softmax already
-        # ran in fp32, which ``zaya_high_prec`` makes the default -- and the
-        # model dtype for the MOD blend.
+        # ran in fp32, which ``zaya_high_prec`` makes the default.
         moe_weight = route_prob.to(torch.float32)
-        if route_prob.dtype != model_dtype:
-            route_prob = route_prob.to(model_dtype)
 
-        if self.use_mod:
+        if self.mod_reachable:
+            # The model dtype for the MOD blend, which is ``route_prob``'s only
+            # consumer -- so the cast rides on the same predicate as the blend.
+            if route_prob.dtype != model_dtype:
+                route_prob = route_prob.to(model_dtype)
             # Clamp the skip slot into the valid expert range so FusedMoE never
             # indexes out of bounds. ``skip_ids`` keeps the unclamped choice,
             # which is the only thing that can still identify a skipped token.
@@ -2131,6 +2179,9 @@ class ZayaRouter(nn.Module):
                 expert_choice, min=0, max=self.num_moe_experts - 1
             ).to(torch.int32)
         else:
+            # No clamp: ``candidates`` above already excluded the skip column,
+            # so ``expert_choice`` is in range and ``skip_ids`` carries the same
+            # values ``moe_ids`` does.
             moe_ids = expert_choice.to(torch.int32)
 
         return ZayaRouting(
