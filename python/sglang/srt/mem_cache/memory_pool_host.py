@@ -47,6 +47,8 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    cuda_host_get_device_pointer,
+    device_alias_view,
     _cuda_host_register,
     _cuda_host_unregister,
     get_allocator_from_storage,
@@ -314,13 +316,33 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             dtype=torch.uint64,
             device=self.gpu_device,
         )
+        # This host pool is pageable memory mapped in with cudaHostRegister (either in
+        # chunks, or in one shot by the default alloc_with_host_register allocator), so
+        # its host VA is not necessarily a valid device address: it is on hosts where KFD
+        # reports SVM support and is not elsewhere. Every consumer that dereferences the
+        # pool from a GPU kernel must therefore use the device alias, not data_refs' host
+        # VA. Keying this off pin_memory rather than the chunked path matters: the HiCache
+        # stack builds these pools without host_register_chunk_bytes, yet its buffers are
+        # still cudaHostRegister'd and still need the alias.
+        # data_transfer_refs keeps that alias in tensor form so the fast per-layer kernels
+        # can still take a plain tensor. NOTE: get_contiguous_buf_infos() deliberately
+        # still reports the HOST VA, because its only consumer is mori's ibv_reg_mr NIC
+        # registration, which rejects a device-mapped address.
+        if self.data_refs and self.pin_memory:
+            device_addrs = [cuda_host_get_device_pointer(x) for x in self.data_refs]
+            self.data_transfer_refs = [
+                device_alias_view(addr, ref, self.gpu_device)
+                for addr, ref in zip(device_addrs, self.data_refs)
+            ]
+        elif self.data_refs:
+            device_addrs = [x.data_ptr() for x in self.data_refs]
+            self.data_transfer_refs = list(self.data_refs)
+        else:
+            device_addrs = None
+            self.data_transfer_refs = []
         self.data_ptrs = (
-            torch.tensor(
-                [x.data_ptr() for x in self.data_refs],
-                dtype=torch.uint64,
-                device=self.gpu_device,
-            )
-            if self.data_refs
+            torch.tensor(device_addrs, dtype=torch.uint64, device=self.gpu_device)
+            if device_addrs is not None
             else None
         )
         self.can_use_jit = False
@@ -359,8 +381,14 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         )
 
     def get_contiguous_buf_infos(self):
-        """Return per-layer page-row buffers for PD direct-to-host transfer."""
-        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        """Return per-layer page-row buffers for PD direct-to-host transfer.
+
+        The only consumer is mori's NIC RDMA registration, which writes into the
+        host C4 mirror over the wire and therefore needs the HOST virtual address
+        (ibv_reg_mr on a device-mapped address EPERMs on ionic). The GPU transfer
+        kernel uses self.data_ptrs (device-mapped) directly, not this accessor.
+        """
+        data_ptrs = [self.data_refs[i].data_ptr() for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
         return data_ptrs, data_lens, item_lens
@@ -528,7 +556,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
         if io_backend == "kernel" and self.layout == "layer_first":
             transfer_kv_per_layer_mla(
-                src=self.data_refs[layer_id],
+                src=self.data_transfer_refs[layer_id],
                 dst=self.device_buffers[layer_id],
                 src_indices=host_rows,
                 dst_indices=device_rows,

@@ -28,6 +28,7 @@ from mori.io import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -551,6 +552,12 @@ class MoriKVManager(CommonKVManager):
             )
             desc_group: List[MemoryDesc] = []
             offset = 0
+            # _MORI_HOSTREG: register host (DRAM) buffers as (host VA, CPU) so mori's RDMA
+            # backend NIC-writes straight into host memory (no GPU kernel deref, ibv_reg_mr
+            # on pinned host memory succeeds). The device-alias+GPU-loc variant made ionic
+            # reject registration (ibv_reg_mr EPERM + dmabuf export fails on a host-pinned
+            # buffer) -> mori std::abort(). The GPU-side transfer kernel gets its device ptr
+            # independently from memory_pool_host.data_ptrs, so mori does NOT need one here.
             while offset < length:
                 chunk_size = min(register_chunk_size, length - offset)
                 desc_group.append(

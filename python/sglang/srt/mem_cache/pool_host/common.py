@@ -120,7 +120,7 @@ def get_allocator_type(server_args) -> str:
 def _cuda_host_register(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     n_bytes = buffer.numel() * buffer.element_size()
-    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 0)
+    rc = cudart.cudaHostRegister(buffer.data_ptr(), n_bytes, 2)  # _L1_DEVPTR Mapped
     if int(rc) != 0:
         raise RuntimeError(
             f"cudaHostRegister failed (rc={int(rc)}, "
@@ -141,6 +141,79 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
             cudart.cudaGetErrorString(rc),
             buffer.data_ptr(),
         )
+
+
+_HIP_LIB = None
+def cuda_host_get_device_pointer(buffer):
+    """_L1_DEVPTR: device-mapped addr for a Mapped-registered host tensor, via
+    ctypes into HIP (torch cudart lacks this on ROCm)."""
+    import ctypes, torch
+    global _HIP_LIB
+    if _HIP_LIB is None:
+        for nm in ("libamdhip64.so","libamdhip64.so.7","libamdhip64.so.6"):
+            try:
+                _HIP_LIB=ctypes.CDLL(nm); break
+            except OSError: pass
+    if _HIP_LIB is None:
+        raise RuntimeError(
+            "cuda_host_get_device_pointer: libamdhip64 not loadable; cannot obtain a "
+            "device alias for host-registered memory. Falling back to the host VA would "
+            "hand an unmapped address to a GPU kernel and fault later, far from here."
+        )
+    dptr = ctypes.c_void_p()
+    rc = _HIP_LIB.hipHostGetDevicePointer(
+        ctypes.byref(dptr), ctypes.c_void_p(int(buffer.data_ptr())), ctypes.c_uint(0)
+    )
+    if int(rc) != 0 or not dptr.value:
+        raise RuntimeError(
+            f"hipHostGetDevicePointer failed (rc={int(rc)}) for host buffer "
+            f"{hex(buffer.data_ptr())}. The host VA is not a valid device address on "
+            "this kernel, so the transfer kernels cannot use it."
+        )
+    return int(dptr.value)
+
+
+class _CudaAliasView:
+    """Minimal __cuda_array_interface__ provider so torch can wrap a raw device address."""
+
+    def __init__(self, dev_ptr: int, shape, typestr: str):
+        self.__cuda_array_interface__ = {
+            "data": (int(dev_ptr), False),
+            "shape": tuple(shape),
+            "typestr": typestr,
+            "version": 3,
+            "strides": None,
+        }
+
+
+_ALIAS_TYPESTR = {
+    torch.uint8: "|u1",
+    torch.int8: "|i1",
+    torch.float16: "<f2",
+    torch.float32: "<f4",
+    torch.int32: "<i4",
+    torch.int64: "<i8",
+}
+
+
+def device_alias_view(dev_ptr: int, like: torch.Tensor, gpu_device) -> torch.Tensor:
+    """Wrap a device-mapped address as a CUDA tensor shaped/typed like ``like``.
+
+    Host-registered pool memory is reachable from the GPU only through its device
+    alias. Wrapping that alias once lets the fast per-layer transfer kernels keep
+    taking a plain tensor argument, instead of switching to the pointer-array
+    (all-layer) kernels which are far slower when driven one layer at a time.
+    """
+    typestr = _ALIAS_TYPESTR.get(like.dtype)
+    if typestr is not None:
+        return torch.as_tensor(
+            _CudaAliasView(dev_ptr, tuple(like.shape), typestr), device=gpu_device
+        )
+    n_bytes = like.numel() * like.element_size()
+    raw = torch.as_tensor(
+        _CudaAliasView(dev_ptr, (n_bytes,), "|u1"), device=gpu_device
+    )
+    return raw.view(like.dtype).reshape(like.shape)
 
 
 def alloc_with_host_register(
