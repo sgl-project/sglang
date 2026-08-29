@@ -256,6 +256,11 @@ class TestDeepSeekV4FP4IndexerPool(CustomTestCase):
             patch.object(pool_configurator, "get_schedule", return_value=schedule),
             patch.object(pool_configurator, "get_spec", return_value=spec),
             patch.object(pool_configurator, "get_disagg", return_value=disagg),
+            patch.object(
+                pool_configurator,
+                "get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
         ):
             fp4_configurator = make_configurator(True)
             legacy_configurator = make_configurator(False)

@@ -236,7 +236,8 @@ class TestDSV4FP4QProducer(unittest.TestCase):
         cuda_fp4.assert_not_called()
 
         backend = CompressorBackendMixin.__new__(CompressorBackendMixin)
-        backend._get_paged_compress_metadata = Mock(return_value=object())
+        plan = (None, torch.empty((self.num_tokens,), dtype=torch.int32))
+        backend._get_paged_compress_metadata = Mock(return_value=plan)
         compressed = torch.empty((self.num_tokens, 128), dtype=torch.bfloat16)
         with (
             patch.object(compressor_v2, "compress_forward", return_value=compressed),
