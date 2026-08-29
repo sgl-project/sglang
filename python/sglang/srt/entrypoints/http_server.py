@@ -228,12 +228,12 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
+    publish(server_args, role="tokenizer")
+
     # API key authentication is not supported in multi-tokenizer mode
     assert (
-        server_args.api_key is None
+        get_serving().api_key is None
     ), "API key is not supported in multi-tokenizer mode"
-
-    publish(server_args, role="tokenizer")
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -673,6 +673,13 @@ async def health_generate(request: Request) -> Response:
 
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
+
+    # Let an external E2E driver establish a balanced DP batch before health traffic.
+    if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
+        "/health",
+        "/health_generate",
+    ):
+        return Response(status_code=200)
 
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
@@ -2180,7 +2187,7 @@ async def _send_disaggregation_warmup_requests(
         return await asyncio.gather(
             *(
                 send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().config.dp_size)
+                for dp_rank in range(get_parallel().dp_size)
             )
         )
 
@@ -2239,11 +2246,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [
-            [10, 11, 12] for _ in range(get_parallel().config.dp_size)
-        ]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().config.dp_size == 1:
+        if get_parallel().dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2287,11 +2292,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = [
-            "The capital city of France is"
-        ] * get_parallel().config.dp_size
+        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().config.dp_size == 1:
+        if get_parallel().dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2332,7 +2335,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().config.dp_size,
+                    get_parallel().dp_size,
                 )
                 logger.info("End of disaggregation warmup")
             else:
@@ -2442,6 +2445,7 @@ def _run_granian_server(
     port,
     log_level,
     http2_max_concurrent_streams,
+    http2_initial_connection_window_size,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2479,7 +2483,8 @@ def _run_granian_server(
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
         http2_settings=HTTP2Settings(
-            max_concurrent_streams=http2_max_concurrent_streams
+            initial_connection_window_size=http2_initial_connection_window_size,
+            max_concurrent_streams=http2_max_concurrent_streams,
         ),
         log_level=log_level,
         ssl_cert=ssl_certfile,
@@ -2614,6 +2619,9 @@ def _setup_and_run_http_server(
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
                     ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
+                    ),
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2704,6 +2712,9 @@ def _setup_and_run_http_server(
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
                     ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
+                    ),
                     tokenizer_worker_num=server_args.tokenizer_worker_num,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2758,7 +2769,7 @@ def _start_native_grpc_server_for_runtime(
         host=get_serving().host,
         port=grpc_port,
         runtime_handle=runtime_handle,
-        worker_threads=server_args.grpc_worker_threads,
+        worker_threads=get_serving().grpc_worker_threads,
     )
     logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle

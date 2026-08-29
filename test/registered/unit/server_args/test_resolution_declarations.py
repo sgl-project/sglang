@@ -24,7 +24,6 @@ import unittest
 import unittest.mock
 
 import sglang
-from sglang.srt import server_args as server_args_module
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -147,7 +146,7 @@ def _late_resolvers():
                     if isinstance(node.func, ast.Attribute)
                     else getattr(node.func, "id", None)
                 )
-                if called in ("declare_late_resolution", "_late_resolution"):
+                if called == "declare_late_resolution":
                     return True
                 if called and reaches(called, seen):
                     return True
@@ -433,19 +432,11 @@ class TestResolutionDeclarations(CustomTestCase):
         mapping = namespace_of(ServerArgs)
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
-        # The five sizes keep a live property shadowing the bare name; the
-        # comparison below reaches them anyway, through `get_parallel().config`.
-        self.assertGreaterEqual(
-            _live_topology_leaves()
-            & {
-                "tp_size",
-                "pp_size",
-                "moe_dp_size",
-                "attn_cp_size",
-                "dcp_size",
-            },
-            {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
-            "a parallel size stopped being served from the live topology",
+        self.assertEqual(
+            set(),
+            _live_topology_leaves() & set(mapping),
+            "a parallel leaf gained a live member of the same name, so the "
+            "comparison below reads the group rather than the published leaf",
         )
 
         compared = 0
@@ -461,10 +452,6 @@ class TestResolutionDeclarations(CustomTestCase):
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
-                if groups[0] == "parallel":
-                    # Bare names there are the live topology; the published
-                    # leaves are one hop down, so the reader takes that hop.
-                    node = node.config
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)
@@ -538,14 +525,16 @@ class TestResolutionDeclarations(CustomTestCase):
             reset_context()
             child = pickle.loads(blob)
             entered = []
-            original = ServerArgs._run_resolution_pipeline
+            from sglang.srt.arg_groups import pipeline as pipeline_module
 
-            def counted(self, _original=original):
+            original = pipeline_module.run_resolution_pipeline
+
+            def counted(server_args, _original=original):
                 entered.append(1)
-                return _original(self)
+                return _original(server_args)
 
             with unittest.mock.patch.object(
-                ServerArgs, "_run_resolution_pipeline", counted
+                pipeline_module, "run_resolution_pipeline", counted
             ):
                 publish(child, role="scheduler")
             self.assertEqual(
@@ -860,7 +849,7 @@ class TestResolutionDeclarations(CustomTestCase):
             "capturing like apply_server_args_defaults",
         )
 
-        pipeline = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
+        pipeline = (_SRT / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
         for hook in sorted(taking_the_record):
             self.assertIn(
                 f"current_platform.{hook},",
@@ -897,16 +886,20 @@ class TestResolutionDeclarations(CustomTestCase):
         # The pipeline asks the platform other questions on the way through
         # (whether it is out of tree, whether it supports piecewise capture),
         # and which of those it reaches depends on the host.
-        class _Plugin(type(server_args_module.current_platform)):
+        from sglang.srt.platforms import current_platform
+
+        class _Plugin(type(current_platform)):
             device_name = "oot"
 
             def apply_server_args_defaults(self, server_args):
                 server_args.attention_backend = "triton"
                 server_args.schedule_conservativeness = 0.5
 
-        with unittest.mock.patch.object(
-            server_args_module, "current_platform", _Plugin()
-        ):
+        from sglang.srt.arg_groups import pipeline as pipeline_module
+
+        # The write capture runs in the dispatcher, so that is the namespace the
+        # plugin has to be installed in.
+        with unittest.mock.patch.object(pipeline_module, "current_platform", _Plugin()):
             server_args = self._resolve({})
         self.assertEqual(
             (
@@ -918,6 +911,99 @@ class TestResolutionDeclarations(CustomTestCase):
             "result, so the projection publishes what the operator passed "
             "instead of what the platform decided",
         )
+
+
+class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
+    """A declaration records a value, not a handle on one.
+
+    The stash keeps whatever object the declaring handler passed, so a handler
+    that declares a mutable and then edits it in place rewrites an entry that
+    already went into the log. The projection still answers with the end state,
+    which is why nothing else notices: what is lost is *which* handler decided
+    what, and `validate_declarations` never sees the later change at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        environment = dict(os.environ)
+
+        def restore():
+            os.environ.clear()
+            os.environ.update(environment)
+
+        self.addCleanup(restore)
+
+    def _resolve_recording_each_entry(self, **supplied):
+        """Resolve, deep-copying every stash entry the moment it is appended.
+
+        The property is about the stash, so the seam is the stash: a list that
+        snapshots on append. Every declaration path -- `declare_resolution`,
+        `declare_late_resolution`, `declare_direct_writes` and the passes --
+        reaches it through `.append`, whatever it was imported as.
+        """
+        recorded = []
+
+        class _SnapshotOnAppend(list):
+            def append(self, entry):
+                super().append(entry)
+                recorded.append((len(self) - 1, copy.deepcopy(entry)))
+
+        class _WatchedArgs(ServerArgs):
+            """Whatever list the pipeline installs, snapshot what lands in it.
+
+            The pipeline resets the stash at the start of a resolution, so the
+            seam has to survive that assignment rather than precede it.
+            """
+
+            def __setattr__(self, name, value):
+                if name == "_resolved_overrides" and not isinstance(
+                    value, _SnapshotOnAppend
+                ):
+                    value = _SnapshotOnAppend(value)
+                super().__setattr__(name, value)
+
+        path = tempfile.mkdtemp(prefix="declared_values_")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        with open(os.path.join(path, "config.json"), "w") as handle:
+            json.dump(_MINI_CONFIG, handle)
+        server_args = _WatchedArgs(
+            model_path=path, device="cuda", random_seed=42, **supplied
+        )
+        server_args.resolve_once()
+        return server_args, recorded
+
+    def test_no_entry_changes_after_it_is_recorded(self):
+        # One shape per family of handlers that decides a graph setting.
+        for label, supplied in (
+            ("plain", {}),
+            ("cuda_graph_knobs", {"cuda_graph_max_bs_decode": 16}),
+            ("chunked_prefill", {"chunked_prefill_size": 1024}),
+            ("explicit_json", {"cuda_graph_config": {"decode": {"max_bs": 12}}}),
+            ("disaggregation", {"disaggregation_mode": "prefill"}),
+            ("deterministic", {"enable_deterministic_inference": True}),
+            ("speculative", {"speculative_algorithm": "EAGLE"}),
+            ("dp_attention", {"tp_size": 2, "dp_size": 2, "enable_dp_attention": True}),
+        ):
+            with self.subTest(shape=label):
+                server_args, recorded = self._resolve_recording_each_entry(**supplied)
+                stash = server_args._resolved_overrides
+                self.assertGreater(
+                    len(recorded),
+                    0,
+                    "nothing was recorded, so this case is not watching the "
+                    "declaration paths it thinks it is",
+                )
+                drifted = [
+                    (index, was, stash[index])
+                    for index, was in recorded
+                    if stash[index] != was
+                ]
+                self.assertEqual(
+                    [],
+                    drifted,
+                    "these entries changed after they were declared, so the log "
+                    f"credits the wrong handler for the end state: {drifted}",
+                )
 
 
 if __name__ == "__main__":
