@@ -268,8 +268,14 @@ def handle_a2a_moe(server_args: Any):
         assert resolved_view(server_args).moe_runner_backend in [
             "flashinfer_cutlass",
             "flashinfer_cutedsl",
+            "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
-        ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
+            "deep_gemm",
+        ], (
+            "FlashInfer MoE A2A is supported with flashinfer_cutlass, "
+            "flashinfer_cutedsl, flashinfer_trtllm, "
+            "flashinfer_trtllm_routed, or deep_gemm."
+        )
 
     if a2a_backend == "mori":
         if cfg.deepep_mode == "auto":
