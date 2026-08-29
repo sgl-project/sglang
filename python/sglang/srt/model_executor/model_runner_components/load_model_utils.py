@@ -11,6 +11,10 @@ import msgspec
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.overrides import (
+    modelexpress_transport_of,
+    modelexpress_url_of,
+)
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
@@ -219,8 +223,8 @@ def build_load_config(
         remote_instance_weight_loader_backend=get_model().remote_instance_weight_loader_backend,
         remote_instance_weight_loader_transfer_engine=remote_instance_weight_transporter_engine,
         remote_instance_weight_loader_transfer_engine_session_id=remote_instance_weight_transporter_session_id,
-        modelexpress_url=server_args.modelexpress_url,
-        modelexpress_transport=server_args.modelexpress_transport,
+        modelexpress_url=modelexpress_url_of(server_args),
+        modelexpress_transport=modelexpress_transport_of(server_args),
         modelopt_config=modelopt_config,
         rl_quant_profile=get_model().rl_quant_profile,
         draft_model_idx=draft_model_idx,

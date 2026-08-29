@@ -2840,8 +2840,13 @@ class TestDcpKvEventContract(CustomTestCase):
     def test_kv_event_block_size_widens_a_single_token_page(self):
         # page_size=1 + DCP is a real deployment shape: the allocator is still
         # paged, at dcp_size.
+        from sglang.srt.arg_groups.overrides import (
+            kv_event_block_size_of,
+            resolving_view,
+        )
+
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
-        self.assertEqual(args.kv_event_block_size, 8)
+        self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
 
 
 if __name__ == "__main__":

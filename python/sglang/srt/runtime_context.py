@@ -2100,7 +2100,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     helpers the scheduler binds through — so the advertisement cannot
     drift from the sockets.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.overrides import kv_event_block_size_of, resolving_view
 
     # Lazy import so loading server_args doesn't pull in
     # disaggregation / msgspec / zmq at module top level.
@@ -2135,7 +2135,7 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         "endpoint_host": host,
         "endpoint_port_base": port,
         "topic": cfg.topic,
-        "block_size": resolved.kv_event_block_size,
+        "block_size": kv_event_block_size_of(resolved),
         "dp_size": resolved.dp_size,
     }
     # Load range, from the same resolver SchedulerLoadPublisher binds

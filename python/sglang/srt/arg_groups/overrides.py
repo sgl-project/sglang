@@ -321,22 +321,42 @@ def _plain(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def kv_event_block_size_of(cfg: Any) -> int:
+    """Width KV events are emitted at.
+
+    Under DCP the radix tree pages at ``page_size * dcp_size``
+    (`mem_cache/kv_cache_builder.py`), and subscribers key on this.
+    """
+    return cfg.page_size * cfg.dcp_size
+
+
+def modelexpress_config_of(cfg: Any) -> dict:
+    """``modelexpress_config`` parsed.
+
+    It is a JSON string (or an already-parsed dict) rather than a leaf of its
+    own, so everything that wants a key out of it goes through here -- one parse,
+    for every reader.
+    """
+    raw = cfg.modelexpress_config
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
+def modelexpress_url_of(cfg: Any) -> Optional[str]:
+    """The modelexpress endpoint a config-shaped object points at."""
+    return modelexpress_config_of(cfg).get("url")
+
+
 def modelexpress_transport_of(cfg: Any) -> str:
     """The modelexpress transport a config-shaped object asks for.
 
-    ``modelexpress_config`` is a JSON string (or an already-parsed dict) rather
-    than a leaf of its own; this is the shared parse for the transfer-engine
-    gate (`remote_instance_transfer_engine_of`) and any future bag reader.
-    ``ServerArgs.modelexpress_transport`` keeps its own instance-cached parse
-    (`_parsed_modelexpress_config`) -- same rule, cached seed-side."""
-    raw = cfg.modelexpress_config
-    if raw is None:
-        parsed = {}
-    elif isinstance(raw, str):
-        parsed = json.loads(raw)
-    else:
-        parsed = raw
-    return parsed.get("transport", "nixl")
+    The shared parse for the transfer-engine gate
+    (`remote_instance_transfer_engine_of`) and any bag reader.
+    """
+    return modelexpress_config_of(cfg).get("transport", "nixl")
 
 
 def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> bool:
@@ -471,8 +491,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 )
 
 # Architectures that support the extra_buffer mamba radix cache strategy.
-# Single source of truth: ServerArgs._support_mamba_cache_extra_buffer
-# delegates here.
+# The single source of truth; `supports_mamba_cache_extra_buffer` reads it.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",

@@ -58,7 +58,6 @@ from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
-    supports_mamba_cache_extra_buffer,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -3781,10 +3780,6 @@ class ServerArgs:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
 
-    def _support_mamba_cache_extra_buffer(self, model_arch: str):
-
-        return supports_mamba_cache_extra_buffer(self, model_arch)
-
         # ===== END TO BE REFACTORED ====
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
@@ -4190,41 +4185,10 @@ class ServerArgs:
 
         check_server_args(self)
 
-    @property
-    def _parsed_modelexpress_config(self) -> dict:
-        cache = getattr(self, "_mx_config_cache", None)
-        if cache is not None:
-            return cache
-        if self.modelexpress_config is None:
-            result = {}
-        elif isinstance(self.modelexpress_config, str):
-            result = json.loads(self.modelexpress_config)
-        else:
-            result = self.modelexpress_config
-        self._mx_config_cache = result
-        return result
-
-    @property
-    def modelexpress_url(self) -> Optional[str]:
-        return self._parsed_modelexpress_config.get("url")
-
-    @property
-    def modelexpress_transport(self) -> str:
-        """Transport backend for modelexpress."""
-        return self._parsed_modelexpress_config.get("transport", "nixl")
-
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
-
-    @property
-    def kv_event_block_size(self) -> int:
-        """Width KV events are emitted at: under DCP the radix tree pages at
-        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
-        """
-        cfg = resolving_view(self)
-        return cfg.page_size * self.dcp_size
 
 
 # --------------------------------------------------------------------------
