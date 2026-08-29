@@ -1365,10 +1365,12 @@ class MQALayer(MqaAttentionBase):
         kv_handle = None
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
             is_unified_kv_triton,
         )
 
         unified = is_unified_kv_triton()
+        fp8_2buff = is_unified_kv_fp8()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         # The kernel is token-indexed (q, kv and positions are all length M), so
         # a verify batch carrying several draft tokens per request is a shape it
@@ -1377,6 +1379,10 @@ class MQALayer(MqaAttentionBase):
         fuse_verify = (
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
+            # Under fp8 this path would have to hand the backend a packed pair
+            # instead of the bf16 kv it stores today; MTP + fp8 is gated off
+            # until that store is wired (M10).
+            and not fp8_2buff
         )
         do_fused_qk_norm_rope = (unified and (is_decode or fuse_verify)) or (
             not unified and self.use_fused_qk_norm_rope
@@ -1401,6 +1407,7 @@ class MQALayer(MqaAttentionBase):
             )
 
             token_to_kv_pool = get_token_to_kv_pool()
+            swa_rope_cache = None
             if unified and fuse_verify:
                 # Target-verify runs through the unified_kv decode path. The
                 # backend writes the current chunk's KV into the ring *before*
@@ -1426,7 +1433,12 @@ class MQALayer(MqaAttentionBase):
                 # swa_loc is layer-independent; computed once per forward by the
                 # backend and cached on the metadata (read here by every layer).
                 swa_loc = attn_backend.get_unified_swa_loc(forward_batch)
-                swa_page_size, bf16_store = 1, True
+                swa_page_size, bf16_store = 1, not fp8_2buff
+                if fp8_2buff:
+                    swa_rope_cache = token_to_kv_pool.get_unified_kv_rope(self.layer_id)
+                    # aiter reads kv with a fixed row stride, unlike the Triton
+                    # kernel this replaces; kv is still a strided slice of qkv_a.
+                    kv = kv.contiguous()
             else:
                 swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
@@ -1456,6 +1468,8 @@ class MQALayer(MqaAttentionBase):
                 q_out=q_out,
                 dtype=x.dtype,
                 bf16_store=bf16_store,
+                fp8_2buff=fp8_2buff,
+                swa_rope_cache=swa_rope_cache,
             )
             # On the verify path the kernel normed + RoPE'd kv in place and wrote
             # nothing, so hand it back: the caller feeds it to attention as the

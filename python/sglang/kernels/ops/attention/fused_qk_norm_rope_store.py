@@ -9,15 +9,33 @@ Grid: (cdiv(M, BLOCK_SIZE_M), num_local_heads + 1).
   pid_h == num_local_heads: KV program (norm + RoPE + FP8 quant nope + paged scatter)
 """
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
+    check_two_pool_pair,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported
 
 _fp8_fnuz = is_fp8_fnuz()
+
+# The two-pool fp8 store defers to aiter: its kernel already emits the exact
+# 512 B nope row (448 fp8 + 14 dup e8m0 + pad) that the v4 asm attention reader
+# expects, so the Triton kernel below stays bf16/legacy-packed only.
+try:
+    from aiter.ops.fused_qk_norm_rope_cache_quant import fused_qk_norm_rope_group_quant
+
+    _HAS_AITER_OP = True
+except ImportError:
+    fused_qk_norm_rope_group_quant = None
+    _HAS_AITER_OP = False
+
+_HAS_GROUP_QUANT = _HAS_AITER_OP and is_gfx95_supported()
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +316,115 @@ def _fused_qk_norm_rope_store_kernel(
 # ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=None)
+def _token_identity_map(num_tokens: int, device: torch.device) -> torch.Tensor:
+    # Cached because every layer asks for it on every decode step and the answer
+    # only depends on the token count. Never evict: a captured cuda graph holds
+    # this address, and the default capture list has ~36 distinct batch sizes, so
+    # a bounded cache would free a live graph's buffer back into the graph pool.
+    return torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+
+def _fp8_2buff_store(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    q_norm_weight: Optional[torch.Tensor],
+    kv_norm_weight: torch.Tensor,
+    rms_eps: float,
+    rope_head_dim: int,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    q_out: torch.Tensor,
+    swa_cache: Optional[torch.Tensor],
+    swa_rope_cache: Optional[torch.Tensor],
+    swa_loc: Optional[torch.Tensor],
+    k_nope_out: Optional[torch.Tensor],
+    k_rope_out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if not _HAS_GROUP_QUANT:
+        # is_unified_kv_fp8() already falls back to bf16 off gfx95, so reaching here
+        # on gfx95 means the installed aiter predates the op
+        raise RuntimeError(
+            "fp8 two-pool unified_kv needs aiter's fused_qk_norm_rope_group_quant: "
+            f"aiter exports it={_HAS_AITER_OP}, gfx95={is_gfx95_supported()}"
+        )
+
+    assert (
+        q.dim() == 2
+    ), f"aiter takes q as [T, H, D] with no split-K reduce, got {tuple(q.shape)}"
+    assert (
+        cos_cache.shape[-1] * 2 == rope_head_dim
+    ), f"rot_dim from cos_cache ({cos_cache.shape[-1] * 2}) != {rope_head_dim}"
+    # int64 is what the kernel indexes with; a silent .to() here would copy every
+    # call and hide a caller that changed dtype.
+    assert (
+        positions.dtype == torch.int64
+    ), f"positions must be int64, got {positions.dtype}"
+
+    batch_id = None
+    has_swa = swa_cache is not None
+    if has_swa:
+        # Same coupling as store_swa_into_unified: one row index addresses both
+        # pools, and aiter bounds-checks neither -- a short rope pool aborts the
+        # process with nothing on stderr, so the pair is checked there first.
+        assert swa_loc is not None, "fp8 SWA store needs swa_loc alongside the pools"
+        check_two_pool_pair(
+            swa_cache,
+            swa_rope_cache,
+            rope_width=rope_head_dim,
+            rope_dtype=kv.dtype,
+        )
+        # aiter rejects the SWA write without a token->seq map even in dest-row
+        # mode, where all it does with it is drop tokens whose id is negative
+        # (CG pad). The ring row itself comes from swa_loc, and stale tokens are
+        # dropped on positions < 0, so identity is the map decode wants: one
+        # token per sequence, nothing masked. A caller with several tokens per
+        # sequence would have to pass its own.
+        batch_id = _token_identity_map(kv.shape[0], kv.device)
+
+    # aiter has no stride arguments, so it can only write a packed q_out. With
+    # attn_tp_size > 1 the caller hands us a slice of a head-padded buffer
+    # ([T, 64, D] sliced to [T, n_local_heads, D]), which is strided unless the
+    # padding happened to be zero -- stage through a packed buffer then.
+    # contiguous_format is explicit: empty_like's default would copy q_out's
+    # strides for any input that is dense, and a strided staging buffer would
+    # silently misplace the heads.
+    q_dst = (
+        q_out
+        if q_out.is_contiguous()
+        else torch.empty_like(q_out, memory_format=torch.contiguous_format)
+    )
+
+    # The packed K pair lands in the caller's buffers when it passed them (verify
+    # and prefill hand those to store_swa_into_unified); decode only wants the
+    # fused ring write, so it lets aiter allocate them and drops them.
+    q_packed, _, _, _ = fused_qk_norm_rope_group_quant(
+        q.view(q_dst.shape),
+        kv,
+        kv_norm_weight,
+        positions,
+        cos_cache,
+        sin_cache,
+        rms_eps,
+        is_neox=False,
+        q_nope_scale_buff=q_dst,
+        k_nope_scale_buff=k_nope_out,
+        k_rope_buff=k_rope_out,
+        q_weight=q_norm_weight,
+        quant_group_size=64,
+        scale_dtype="e8m0",
+        swa_nope_scale_buff=swa_cache,
+        swa_rope_buff=swa_rope_cache,
+        swa_dest_row=swa_loc,
+        batch_id_per_token=batch_id,
+    )
+    if q_dst is not q_out:
+        q_out.copy_(q_packed)
+        return q_out
+    return q_packed
+
+
 def fused_qk_norm_rope_swa_store(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -315,6 +442,10 @@ def fused_qk_norm_rope_swa_store(
     q_out: Optional[torch.Tensor] = None,
     dtype: torch.dtype = torch.bfloat16,
     bf16_store: bool = False,
+    fp8_2buff: bool = False,
+    swa_rope_cache: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused Q norm + KV norm + RoPE + optional SWA store.
 
@@ -325,6 +456,11 @@ def fused_qk_norm_rope_swa_store(
         swa_loc: [M] int32 pre-translated paged indices
         swa_page_size: tokens per SWA page (default 128)
         bf16_store: write the whole head_dim as plain bf16 at swa_cache[swa_loc]
+        fp8_2buff: two-pool fp8 unified_kv. Delegates to aiter; ``swa_cache`` is
+            the fp8 nope pool and ``swa_rope_cache`` the bf16 rope pool, both
+            addressed by ``swa_loc``. Q stays bf16. Unlike the Triton path this
+            leaves ``kv`` untouched -- the normed + RoPE'd K comes back packed in
+            ``k_nope_out`` / ``k_rope_out`` when the caller supplies them.
     """
     head_dim = kv.shape[1]
 
@@ -345,6 +481,29 @@ def fused_qk_norm_rope_swa_store(
     if q_out is None:
         q_out = torch.empty(
             (M, num_local_heads, head_dim), dtype=dtype, device=q.device
+        )
+
+    if fp8_2buff:
+        assert not bf16_store, "fp8_2buff and bf16_store are different stores"
+        assert (
+            q_rms_eps == kv_rms_eps
+        ), f"aiter norms Q and K with one eps, got {q_rms_eps} / {kv_rms_eps}"
+        return _fp8_2buff_store(
+            q,
+            kv,
+            q_norm_weight,
+            kv_norm_weight,
+            kv_rms_eps,
+            rope_head_dim,
+            cos_cache,
+            sin_cache,
+            positions,
+            q_out,
+            swa_cache,
+            swa_rope_cache,
+            swa_loc,
+            k_nope_out,
+            k_rope_out,
         )
 
     HAS_SWA_STORE = swa_cache is not None and swa_loc is not None
