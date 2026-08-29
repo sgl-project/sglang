@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Structural inventory and adapter manifest for Kimi K3 GGUF assets."""
+"""Structural inventory and adapter manifest for Kimi K3 GGUF expert packs."""
 
 from __future__ import annotations
 

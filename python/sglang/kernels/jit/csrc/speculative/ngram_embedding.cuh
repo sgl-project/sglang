@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 

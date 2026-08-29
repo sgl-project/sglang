@@ -227,23 +227,18 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     A slot that runs after resolution -- ``check_server_args`` hosts one -- lands
     in the same stash, which publish projects from later, so it needs no field
     write either. After *publish* there is no such later projection: the stash
-    would grow an entry nothing reads. So, like ``declare_late_resolution``,
-    this refuses the published record -- post-publish changes go to the bags
-    through ``get_context().override(...)``.
+    would grow an entry nothing reads.
+
+    So what is refused is the *declaration*, not the record. A pass that returns
+    an empty dict is a validation, and it may run on the published instance --
+    it has to, because ``Engine(server_args=sa)`` after ``Engine.shutdown()``
+    re-runs ``check_server_args`` on the very instance the context still holds.
+    A pass that returns a non-empty dict there is refused, as
+    ``declare_late_resolution`` is -- post-publish changes go to the bags through
+    ``get_context().override(...)``.
     """
     from sglang.srt.runtime_context import get_context
 
-    try:
-        published = get_context().server_args
-    except ValueError:
-        published = None
-    if published is server_args:
-        raise ValueError(
-            f"run_post_process_pass({fn.__qualname__!r}) called on the published "
-            "config; the stash is projected at publish and never again, so a "
-            "declaration made here would be a silent no-op -- post-publish "
-            "changes go to the bags via get_context().override(...)"
-        )
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
         raise TypeError(
@@ -251,6 +246,23 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             f"got {type(declared).__name__}"
         )
     if declared:
+        # Refused only once there is something to record. A pass that declares
+        # nothing is a validation, and `check_server_args` runs those again on
+        # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
+        # back the same instance while the context still holds it, and
+        # refusing on identity alone would fail that launch.
+        try:
+            published = get_context().server_args
+        except ValueError:
+            published = None
+        if published is server_args:
+            raise ValueError(
+                f"run_post_process_pass({fn.__qualname__!r}) declared "
+                f"{sorted(declared)} on the published config; the stash is "
+                "projected at publish and never again, so this would be a "
+                "silent no-op -- post-publish changes go to the bags via "
+                "get_context().override(...)"
+            )
         entry = (fn.__qualname__, dict(declared))
         stash = getattr(server_args, "_resolved_overrides", None)
         if stash is None:

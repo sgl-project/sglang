@@ -22,7 +22,7 @@ dependencies = [
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
-  "compressed-tensors",
+  "compressed-tensors==0.18.0",
   "cuda-python>=13.0",
   # Transitive dep of flashinfer-python, pinned because 1.6.0rc6 shipped no cp310 linux x86_64 wheel.
   "cuda-tile==1.6.0rc5",
