@@ -1394,6 +1394,11 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
     def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)
 
+    def extend_host_mirrors(self):
+        """Lazy host mirrors for the reference extend host loop (a device sync
+        on first call per step; see ShortConvAttnBackend.extend_host_mirrors)."""
+        return self.short_conv_backend.extend_host_mirrors()
+
     def track_conv_states_extend(self, conv_states, conv_inputs):
         """Radix mamba-cache checkpoint, extend side (per conv layer)."""
         return self.short_conv_backend.track_conv_states_extend(
