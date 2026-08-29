@@ -4,6 +4,20 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
+def _domino_gru_cell(
+    prefix_gru: nn.GRU, input: torch.Tensor, hidden: torch.Tensor
+) -> torch.Tensor:
+    """Run one feedback token without cuDNN's per-call weight packing."""
+    return torch.ops.aten.gru_cell.default(
+        input,
+        hidden,
+        prefix_gru.weight_ih_l0,
+        prefix_gru.weight_hh_l0,
+        prefix_gru.bias_ih_l0 if prefix_gru.bias else None,
+        prefix_gru.bias_hh_l0 if prefix_gru.bias else None,
+    )
+
 _DOMINO_CANDIDATE_POOL_SIZE = 2048
 
 
@@ -193,6 +207,8 @@ def domino_greedy_rollout(
             ).squeeze(1)
         proposals.append(next_ids)
         if index + 1 < num_proposals:
-            _, gru_hidden = prefix_gru(target_embedding(next_ids[:, None]), gru_hidden)
+            gru_hidden = _domino_gru_cell(
+                prefix_gru, target_embedding(next_ids), gru_hidden[0]
+            )[None]
 
     return torch.stack(proposals, dim=1)
