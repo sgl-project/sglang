@@ -619,6 +619,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if self.pp_size <= 1:
+            # Requests are broadcast to all TP schedulers before they enter this
+            # queue. Activate the sticky poll epoch here, before local queue and
+            # retraction progress can diverge across ranks.
+            self.scheduler.decode_poll_collective_active = True
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -2720,9 +2725,24 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+        has_retracted_reqs = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
+        is_pp_mode = self.disagg_decode_prealloc_queue.pp_size > 1
+        if has_retracted_reqs and is_pp_mode:
             # if there are still retracted requests, we do not allocate new requests
             return
+
+        if not is_pp_mode:
+            local_has_poll_work = bool(
+                has_retracted_reqs
+                or self.disagg_decode_prealloc_queue.queue
+                or self.disagg_decode_prealloc_queue.pending_reqs
+                or self.disagg_decode_transfer_queue.queue
+            )
+            if not hasattr(self, "decode_poll_collective_active"):
+                self.decode_poll_collective_active = False
+            self.decode_poll_collective_active |= local_has_poll_work
+            if not self.decode_poll_collective_active:
+                return
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -2731,33 +2751,64 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            if self.disagg_decode_prealloc_queue.pp_size > 1:
+            if is_pp_mode:
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
                 transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
             else:
-                prealloc_window, prealloc_tensor = (
-                    self.disagg_decode_prealloc_queue.prepare_poll_tensor()
-                )
-                transfer_count, transfer_tensor = (
-                    self.disagg_decode_transfer_queue.prepare_poll_tensor()
-                )
-                combined_tensor = torch.cat((prealloc_tensor, transfer_tensor))
+                collective_size = self.req_to_metadata_buffer_idx_allocator.size
+                # Header is [can_poll, local_idle]. MIN gives a global retraction
+                # gate and deactivates the sticky collective only when every rank
+                # is idle; the remaining entries are the fixed poll payload.
+                if has_retracted_reqs:
+                    prealloc_window = []
+                    transfer_count = 0
+                    combined_tensor = torch.full(
+                        (2 * collective_size + 2,),
+                        int(KVPoll.Bootstrapping),
+                        dtype=torch.uint8,
+                        device="cpu",
+                    )
+                    combined_tensor[0] = 0
+                    combined_tensor[1] = 0
+                else:
+                    prealloc_window, prealloc_tensor = (
+                        self.disagg_decode_prealloc_queue.prepare_poll_tensor()
+                    )
+                    transfer_count, transfer_tensor = (
+                        self.disagg_decode_transfer_queue.prepare_poll_tensor()
+                    )
+                    combined_tensor = torch.cat(
+                        (
+                            torch.tensor(
+                                [1, int(not local_has_poll_work)],
+                                dtype=torch.uint8,
+                                device="cpu",
+                            ),
+                            prealloc_tensor,
+                            transfer_tensor,
+                        )
+                    )
                 torch.distributed.all_reduce(
                     combined_tensor,
                     op=torch.distributed.ReduceOp.MIN,
                     group=self.disagg_decode_prealloc_queue.gloo_group,
                 )
-                collective_size = self.req_to_metadata_buffer_idx_allocator.size
+                if combined_tensor[1].item() == 1:
+                    self.decode_poll_collective_active = False
+                    self.polling_count = 0
+                    return
+                if combined_tensor[0].item() == 0:
+                    return
                 transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                     precomputed_polls=combined_tensor[
-                        collective_size : collective_size + transfer_count
+                        collective_size + 2 : collective_size + 2 + transfer_count
                     ].tolist()
                 )
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
                     precomputed_polls=(
                         prealloc_window,
-                        combined_tensor[: len(prealloc_window)].tolist(),
+                        combined_tensor[2 : len(prealloc_window) + 2].tolist(),
                     )
                 )
                 self.disagg_decode_transfer_queue.extend(req_conns)

@@ -35,6 +35,71 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def _make_non_pp_poll_scheduler(
+        self, *, retracted=False, prealloc_work=True, transfer_work=True, active=None
+    ):
+        poll_group = MagicMock()
+        prealloc_req = MagicMock()
+        prealloc_queue = MagicMock(
+            pp_size=1,
+            queue=[prealloc_req] if prealloc_work else [],
+            pending_reqs=[],
+            retracted_queue=[MagicMock()] if retracted else [],
+            gloo_group=poll_group,
+        )
+        prealloc_queue.resume_retracted_reqs.return_value = []
+        prealloc_queue.prepare_poll_tensor.return_value = (
+            [prealloc_req] if prealloc_work else [],
+            torch.tensor(
+                [
+                    KVPoll.WaitingForInput if prealloc_work else KVPoll.Bootstrapping,
+                    KVPoll.Bootstrapping,
+                ],
+                dtype=torch.uint8,
+            ),
+        )
+        prealloc_queue.pop_preallocated.return_value = (["new-transfer"], [])
+
+        transfer_queue = MagicMock(queue=[MagicMock()] if transfer_work else [])
+        transfer_queue.prepare_poll_tensor.return_value = (
+            int(transfer_work),
+            torch.tensor(
+                [
+                    KVPoll.Success if transfer_work else KVPoll.Bootstrapping,
+                    KVPoll.Bootstrapping,
+                ],
+                dtype=torch.uint8,
+            ),
+        )
+        transfer_queue.pop_transferred.return_value = ["ready"]
+
+        scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            disagg_decode_prealloc_queue=prealloc_queue,
+            disagg_decode_transfer_queue=transfer_queue,
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(size=2),
+            waiting_queue=[],
+        )
+        if active is not None:
+            scheduler.decode_poll_collective_active = active
+            scheduler.polling_count = 0
+            scheduler.polling_interval = 1
+        return scheduler, prealloc_queue, transfer_queue, prealloc_req, poll_group
+
+    def test_non_pp_decode_queue_add_activates_poll_collective(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.scheduler = SimpleNamespace(decode_poll_collective_active=False)
+        queue.retracted_queue = []
+        queue._check_if_req_exceed_kv_capacity = MagicMock(return_value=False)
+        req = MagicMock()
+
+        queue.add(req, is_retracted=True)
+
+        self.assertTrue(queue.scheduler.decode_poll_collective_active)
+        self.assertEqual(queue.retracted_queue, [req])
+
     @patch("sglang.srt.disaggregation.decode.get_disagg")
     @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
     def test_non_pp_decode_uses_one_fixed_poll_collective(
@@ -44,32 +109,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             disaggregation_decode_enable_offload_kvcache=False,
             disaggregation_decode_polling_interval=1,
         )
-        poll_group = MagicMock()
-        prealloc_req = MagicMock()
-        prealloc_queue = MagicMock(
-            pp_size=1,
-            retracted_queue=[],
-            gloo_group=poll_group,
-        )
-        prealloc_queue.resume_retracted_reqs.return_value = []
-        prealloc_queue.prepare_poll_tensor.return_value = (
-            [prealloc_req],
-            torch.tensor([KVPoll.WaitingForInput, KVPoll.Bootstrapping]),
-        )
-        prealloc_queue.pop_preallocated.return_value = (["new-transfer"], [])
-        transfer_queue = MagicMock()
-        transfer_queue.prepare_poll_tensor.return_value = (
-            1,
-            torch.tensor([KVPoll.Success, KVPoll.Bootstrapping]),
-        )
-        transfer_queue.pop_transferred.return_value = ["ready"]
-        scheduler = SimpleNamespace(
-            enable_decode_hicache=False,
-            enable_hisparse=False,
-            disagg_decode_prealloc_queue=prealloc_queue,
-            disagg_decode_transfer_queue=transfer_queue,
-            req_to_metadata_buffer_idx_allocator=SimpleNamespace(size=2),
-            waiting_queue=[],
+        scheduler, prealloc_queue, transfer_queue, prealloc_req, poll_group = (
+            self._make_non_pp_poll_scheduler()
         )
 
         SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
@@ -78,6 +119,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(
             tensor.tolist(),
             [
+                1,
+                0,
                 KVPoll.WaitingForInput,
                 KVPoll.Bootstrapping,
                 KVPoll.Success,
@@ -92,6 +135,73 @@ class TestDecodeQueueCleanup(CustomTestCase):
             precomputed_polls=([prealloc_req], [KVPoll.WaitingForInput])
         )
         self.assertEqual(scheduler.waiting_queue, ["ready"])
+
+    @patch("sglang.srt.disaggregation.decode.get_disagg")
+    @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
+    def test_non_pp_decode_retraction_participates_in_poll_collective(
+        self, mock_all_reduce, mock_get_disagg
+    ):
+        mock_get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=1,
+        )
+        scheduler, prealloc_queue, transfer_queue, _, poll_group = (
+            self._make_non_pp_poll_scheduler(
+                retracted=True, prealloc_work=False, transfer_work=False
+            )
+        )
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        tensor = mock_all_reduce.call_args.args[0]
+        self.assertEqual(
+            tensor.tolist(),
+            [0, 0] + [KVPoll.Bootstrapping] * 4,
+        )
+        self.assertIs(mock_all_reduce.call_args.kwargs["group"], poll_group)
+        prealloc_queue.prepare_poll_tensor.assert_not_called()
+        transfer_queue.prepare_poll_tensor.assert_not_called()
+        transfer_queue.pop_transferred.assert_not_called()
+        prealloc_queue.pop_preallocated.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode.get_disagg")
+    @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
+    def test_non_pp_decode_remote_retraction_defers_poll_results(
+        self, mock_all_reduce, mock_get_disagg
+    ):
+        mock_get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=1,
+        )
+        mock_all_reduce.side_effect = lambda tensor, **_: tensor[0].fill_(0)
+        scheduler, prealloc_queue, transfer_queue, _, _ = (
+            self._make_non_pp_poll_scheduler()
+        )
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        transfer_queue.pop_transferred.assert_not_called()
+        prealloc_queue.pop_preallocated.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode.get_disagg")
+    @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
+    def test_non_pp_decode_deactivates_collective_after_global_idle(
+        self, mock_all_reduce, mock_get_disagg
+    ):
+        mock_get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+        )
+        scheduler, _, _, _, _ = self._make_non_pp_poll_scheduler(
+            prealloc_work=False,
+            transfer_work=False,
+            active=True,
+        )
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        mock_all_reduce.assert_called_once()
+        self.assertFalse(scheduler.decode_poll_collective_active)
 
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
