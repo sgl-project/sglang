@@ -23,15 +23,19 @@ class SentinelTokenizer:
         return [101, 7592, 102] if add_special_tokens else [7592]
 
 
+class FiniteTokenizer(SentinelTokenizer):
+    model_max_length = 32_768
+
+
 class OpenAIServingTokenizeTest(CustomTestCase):
-    def test_serializes_effective_context_length(self):
-        tokenizer_manager = SimpleNamespace(
+    def setUp(self):
+        self.tokenizer_manager = SimpleNamespace(
             tokenizer=SentinelTokenizer(),
             model_config=SimpleNamespace(context_len=65_536),
             server_args=SimpleNamespace(),
             request_logger=SimpleNamespace(log_requests=False),
         )
-        serving = OpenAIServingTokenize(tokenizer_manager)
+        serving = OpenAIServingTokenize(self.tokenizer_manager)
         app = FastAPI()
         app.state.openai_serving_tokenize = serving
 
@@ -41,8 +45,13 @@ class OpenAIServingTokenizeTest(CustomTestCase):
                 request, raw_request
             )
 
-        with TestClient(app) as client:
-            response = client.post("/v1/tokenize", json={"prompt": "hello"})
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        self.client.close()
+
+    def test_serializes_effective_context_length_for_unlimited_sentinel(self):
+        response = self.client.post("/v1/tokenize", json={"prompt": "hello"})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -51,6 +60,21 @@ class OpenAIServingTokenizeTest(CustomTestCase):
                 "tokens": [101, 7592, 102],
                 "count": 3,
                 "max_model_len": 65_536,
+            },
+        )
+
+    def test_preserves_finite_tokenizer_limit(self):
+        self.tokenizer_manager.tokenizer = FiniteTokenizer()
+
+        response = self.client.post("/v1/tokenize", json={"prompt": "hello"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "tokens": [101, 7592, 102],
+                "count": 3,
+                "max_model_len": 32_768,
             },
         )
 
