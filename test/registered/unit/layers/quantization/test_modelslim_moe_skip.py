@@ -39,9 +39,7 @@ class TestModelSlimMoESkip(CustomTestCase):
 
     def test_quantized_experts_are_not_skipped(self):
         config = ModelSlimConfig(
-            _moe_quant_description(
-                "W8A8_DYNAMIC", "W8A8_DYNAMIC", "W8A8_DYNAMIC"
-            )
+            _moe_quant_description("W8A8_DYNAMIC", "W8A8_DYNAMIC", "W8A8_DYNAMIC")
         )
 
         self.assertFalse(config._is_moe_layer_skipped(_MOE_PREFIX))
