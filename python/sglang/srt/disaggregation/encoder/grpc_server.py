@@ -166,6 +166,14 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
             return sglang_encoder_pb2.EncodeResponse()
 
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(self.encoder.release_request(request.req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", request.req_id
+                )
+            raise
         except Exception as e:
             logger.error(f"Encode error: {e}")
             traceback.print_exc()
@@ -190,6 +198,14 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             await self.encoder.release_request(request.req_id)
             return sglang_encoder_pb2.SendResponse()
 
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(self.encoder.release_request(request.req_id))
+            except Exception:
+                logger.exception(
+                    "Failed to release cancelled encoder request %s", request.req_id
+                )
+            raise
         except Exception as e:
             logger.error(f"Send error: {e}")
             traceback.print_exc()

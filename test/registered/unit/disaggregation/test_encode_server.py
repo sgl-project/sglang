@@ -546,6 +546,83 @@ class TestEncoderDelivery(CustomTestCase):
 
         asyncio.run(run())
 
+    def test_grpc_encode_cancellation_releases_request(self):
+        async def run():
+            _, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
+
+            encode_started = asyncio.Event()
+
+            async def encode_request(*_args):
+                encode_started.set()
+                await asyncio.Event().wait()
+
+            encoder = SimpleNamespace(
+                encode_dispatch_lock=asyncio.Lock(),
+                encode_request=AsyncMock(side_effect=encode_request),
+                release_request=AsyncMock(),
+            )
+            server = SGLangEncoderServer(
+                encoder=encoder,
+                send_sockets=[],
+                server_args=SimpleNamespace(),
+            )
+            request = sglang_encoder_pb2.EncodeRequest(
+                mm_items=["image"],
+                req_id="cancelled-encode",
+                num_parts=1,
+                part_idx=0,
+            )
+            context = SimpleNamespace(
+                set_code=unittest.mock.Mock(),
+                set_details=unittest.mock.Mock(),
+            )
+
+            task = asyncio.create_task(server.Encode(request, context))
+            await encode_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            encoder.release_request.assert_awaited_once_with("cancelled-encode")
+
+        asyncio.run(run())
+
+    def test_grpc_send_cancellation_releases_request(self):
+        async def run():
+            _, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
+
+            send_started = asyncio.Event()
+
+            async def send(*_args, **_kwargs):
+                send_started.set()
+                await asyncio.Event().wait()
+
+            encoder = SimpleNamespace(
+                send=AsyncMock(side_effect=send),
+                release_request=AsyncMock(),
+            )
+            server = SGLangEncoderServer(
+                encoder=encoder,
+                send_sockets=[],
+                server_args=SimpleNamespace(),
+            )
+            request = sglang_encoder_pb2.SendRequest(
+                req_id="cancelled-send",
+                prefill_host="127.0.0.1",
+                embedding_port=30001,
+            )
+            context = SimpleNamespace()
+
+            task = asyncio.create_task(server.Send(request, context))
+            await send_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            encoder.release_request.assert_awaited_once_with("cancelled-send")
+
+        asyncio.run(run())
+
     def test_mooncake_embedding_is_ready_only_after_cuda_sync(self):
         class FakeCudaEmbedding:
             shape = (2, 4)
