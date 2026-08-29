@@ -1818,8 +1818,25 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Short-conv hybrid served by ShortConvAttnBackend, which implements the
+        # track snapshot for both of ZAYA1's conv entries. LFM2 rides the same
+        # backend and derivation but is deliberately NOT listed: unvalidated on
+        # hardware, and no_buffer is a safe default for it.
+        "ZayaForCausalLM",
     }
 )
+
+
+# Archs whose extra_buffer track is implemented by ShortConvAttnBackend. Its
+# extend-side snapshot is a gather whose row count is data dependent, and it has
+# no per-draft-token verify hook, so it refuses a prefill CUDA graph and
+# speculative decoding -- see requires_short_conv_track_limits.
+_SHORT_CONV_TRACK_ARCHS = frozenset({"ZayaForCausalLM"})
+
+
+def requires_short_conv_track_limits(model_arch: str) -> bool:
+    """Whether extra_buffer on ``model_arch`` is served by the short-conv track."""
+    return model_arch in _SHORT_CONV_TRACK_ARCHS
 
 
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:

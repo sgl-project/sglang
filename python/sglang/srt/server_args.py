@@ -397,6 +397,59 @@ add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.exte
 # --------------------------------------------------------------------------
 
 
+try:
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+except ImportError:
+    # Kept guarded so server_args stays importable without the kernel package.
+    # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE.
+    FLA_CHUNK_SIZE = 64
+
+
+def _max_conv_state_window(hf_config: Any) -> int:
+    """Widest conv sliding window over a hybrid model's conv states, or 0.
+
+    The window is the trailing axis of each ``mamba2_cache_params.shape.conv``
+    entry, and deliberately the ONLY thing read here: it is the one part of the
+    conv-state shape that does not depend on the TP width, so a memoized property
+    gets the same answer either side of distributed init.
+
+    Returns 0 when there is no conv state or the shape cannot be built yet;
+    callers must treat 0 as "unknown" and fall back to the generic chunk, never
+    to a smaller one.
+    """
+    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        if cfg is None:
+            continue
+        try:
+            params = getattr(cfg, "mamba2_cache_params", None)
+        except (AttributeError, AssertionError, RuntimeError, ValueError):
+            continue
+        conv_shapes = getattr(getattr(params, "shape", None), "conv", None)
+        if conv_shapes:
+            return max(int(shape[-1]) for shape in conv_shapes)
+    return 0
+
+
+def _short_conv_cache_chunk_size(hf_config: Any) -> int:
+    """Radix caching granularity for a model with no chunked recurrence.
+
+    A short-conv model reports ``mamba_chunk_size == 1``, honest about the model
+    but useless as a caching granularity: it makes every token a caching point,
+    and it is below the conv window, so a checkpoint cannot even be built.
+
+    Use the generic FLA chunk instead, raised to clear the widest conv window --
+    the extend-side snapshot gathers ``window`` rows ending at the aligned
+    position -- and rounded up to a whole number of ``FLA_CHUNK_SIZE`` so the
+    caller's page-size divisibility assert still holds.
+    """
+    fla_chunk_size = FLA_CHUNK_SIZE
+    floor = _max_conv_state_window(hf_config) + 1
+    num_chunks = max(1, -(-floor // fla_chunk_size))
+    return fla_chunk_size * num_chunks
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -6314,11 +6367,31 @@ class ServerArgs:
         ), "no_buffer do not support trtllm_mha attention backend."
 
     def _validate_mamba_extra_buffer(self, view, model_arch: str):
-        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+        from sglang.srt.arg_groups.overrides import (
+            requires_short_conv_track_limits,
+            supports_mamba_cache_extra_buffer,
+        )
 
         assert supports_mamba_cache_extra_buffer(
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+        if requires_short_conv_track_limits(model_arch):
+            # The extend snapshot's row count is mamba_track_mask.sum(), so a
+            # captured prefill graph freezes it at whatever capture saw (zero,
+            # since the capture mask is all-False) and never snapshots again.
+            assert view.cuda_graph_backend_prefill in (None, "disabled"), (
+                f"extra_buffer for {model_arch} is not supported together with a "
+                "prefill CUDA graph: the extend track gather has a "
+                "data-dependent shape. Use --mamba-radix-cache-strategy "
+                "no_buffer, or --cuda-graph-backend-prefill disabled."
+            )
+            # The snapshot has to land on the accepted step, and the decode
+            # graph runner drops its mamba-track buffers outright when a spec
+            # algorithm is set, so it would silently never fire.
+            assert view.speculative_algorithm is None, (
+                f"extra_buffer for {model_arch} does not support speculative "
+                "decoding; use --mamba-radix-cache-strategy no_buffer."
+            )
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
@@ -10231,26 +10304,31 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
-        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
-        # It is used to determine the caching point in a sequence during prefill.
-        # A pre-seeded `_mamba_cache_chunk_size` (fixtures supply one so a dummy
-        # model never loads an HF config) is honored as-is; otherwise the memo
-        # is only kept once the record is resolved, because `page_size` below
-        # is resolution-written.
+        """Radix caching-point granularity for hybrid linear-attention models.
+
+        The *caching* chunk: how often a prefill may checkpoint the per-request
+        state, and so at what boundary a cached prefix may be trimmed. NOT the
+        model's chunk-scan length, though for an SSM the two coincide, since a
+        scan checkpoints at chunk boundaries anyway.
+
+        For a conv-only model they come apart: ``mamba_chunk_size == 1`` means
+        "no chunked recurrence", not "cache every token", so those take the
+        short-conv derivation. Every model with a real scan, and every model that
+        declares none, keeps the historical ``max(scan_chunk, page_size)``.
+
+        The memo is only kept once the record is resolved, because ``page_size``
+        is resolution-written; a pre-seeded ``_mamba_cache_chunk_size`` (fixtures
+        supply one so a dummy model never loads an HF config) is honored as-is.
+        """
         if not hasattr(self, "_mamba_cache_chunk_size"):
 
-            try:
-                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-                    CHUNK_SIZE as FLA_CHUNK_SIZE,
-                )
-            except ImportError:
-                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
-                FLA_CHUNK_SIZE = 64
-
             hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            scan_chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
             page_size = resolved_view(self).page_size
+            if scan_chunk_size > 1:
+                chunk_size = scan_chunk_size
+            else:
+                chunk_size = _short_conv_cache_chunk_size(hf_config)
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
