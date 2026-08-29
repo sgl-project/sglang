@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -21,7 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+    from sglang.srt.managers.schedule_batch import Req
 
 
 logger = logging.getLogger(__name__)
@@ -43,10 +44,10 @@ class SessionSlot:
 
     virtual_node: _VirtualNode = field(default_factory=_VirtualNode)
 
-    # KV pool state (None means no KV is currently held by this slot)
+    # KV pool state
     req_pool_idx: Optional[int] = None
     kv_committed_len: int = 0
-    kv: Optional[ReqKvInfo] = None
+    kv: ReqKvInfo = field(default_factory=ReqKvInfo)
 
     # First req's radix tree node (for dec_lock_ref on session close)
     last_node: Any = None
@@ -67,7 +68,7 @@ class SessionSlot:
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
-        return self.kv is not None
+        return self.req_pool_idx is not None
 
     def save_from_req(self, req: Req, is_first: bool):
         """Save KV state from a finishing request into this slot."""
@@ -97,7 +98,7 @@ class SessionSlot:
         # the slot's tensor to be reused by a new req and leaked when
         # the slot is later freed.
         req.req_pool_idx = None
-        req.kv = None
+        req.kv = ReqKvInfo()
         req.mamba_pool_idx = None
         req.mamba_ping_pong_track_buffer = None
         req.mamba_next_track_idx = None
@@ -221,7 +222,7 @@ class StreamingSession(BasePrefixCache):
         if not _is_streaming(req):
             return None
         slot = self.slots.get(req.session.session_id)
-        if slot is None or slot.kv is None:
+        if slot is None or not slot.is_holding_kv:
             return None
         if req.to_finish is not None:
             req.session.abort_req()
@@ -350,7 +351,7 @@ class StreamingSession(BasePrefixCache):
             )
             self.release_session(session_id)
             req.req_pool_idx = None
-            req.kv = None
+            req.kv = ReqKvInfo()
             req.session.abort_req()
             return True
 

@@ -21,7 +21,6 @@ from sglang.srt.managers.overlap_utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -76,22 +75,20 @@ class DSparkVerifyPlanner:
         model_runner,
         device,
         tp_rank: int,
-        server_args: ServerArgs,
         verify_num_draft_tokens: int,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
         self.model_runner = model_runner
         self.device = device
-        self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._align_verify_tokens_to_graph_tier = (
-            server_args.speculative_dspark_align_verify_tokens_to_graph_tier
+            get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
 
-        sts_path = server_args.speculative_dspark_confidence_sts_path
+        sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
             sts_temperatures = torch.tensor(
@@ -148,7 +145,6 @@ class DSparkVerifyPlanner:
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
-                server_args=self.server_args,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
             )
             self._is_verify_all = (
@@ -1120,10 +1116,9 @@ class HostConfidenceBudgetPlanner:
 
 def build_sps_cost_table(
     *,
-    server_args: ServerArgs,
     verify_num_draft_tokens: int,
 ) -> Union[SpsCostTable, SpsAdditiveCostTable]:
-    sps_table_path = server_args.speculative_dspark_sps_table_path
+    sps_table_path = get_spec().speculative_dspark_sps_table_path
     if sps_table_path:
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(
