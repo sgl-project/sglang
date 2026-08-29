@@ -267,17 +267,12 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         self.assertEqual(model_weight.data_ptr(), checkpoint_weight.data_ptr())
         torch.testing.assert_close(model_weight, checkpoint_weight)
 
-    def test_zero_copy_assignment_rejects_transformed_or_tp_weights(self):
+    def test_zero_copy_assignment_rejects_incompatible_layout_or_tp_weights(self):
         with torch.device("meta"):
             model = _ReplicatedLinearModel()
         param = model.proj.weight
         tensor = torch.empty(4, 4)
 
-        param.checkpoint_mapping_unsafe = True
-        self.assertFalse(
-            fsdp_load._can_assign_tensor_without_copy(param, tensor, param)
-        )
-        del param.checkpoint_mapping_unsafe
         self.assertFalse(
             fsdp_load._can_assign_tensor_without_copy(
                 param, tensor.as_strided((4, 4), (1, 4)), param

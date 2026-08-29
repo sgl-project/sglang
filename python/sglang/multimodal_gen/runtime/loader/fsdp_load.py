@@ -120,8 +120,6 @@ def _can_assign_tensor_without_copy(
         return False
     if type(actual_param) is not nn.Parameter:
         return False
-    if actual_param.__dict__.get("checkpoint_mapping_unsafe", False):
-        return False
     if any(
         actual_param.__dict__.get(attribute, False)
         for attribute in (
