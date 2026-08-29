@@ -7,16 +7,8 @@ from contextlib import nullcontext
 
 import torch
 
-# NOTE: `_cuda_beginAllocateCurrentThreadToPool` and `_cuda_endAllocateToPool`
-# were added in torch 2.8 (2.7 spelled the latter
-# `_cuda_endAllocateCurrentStreamToPool`), so importing them at module scope
-# aborts startup on backends pinned to older torch -- notably Ascend NPU, where
-# torch_npu pins torch 2.7. This module is imported eagerly across the codebase
-# (model_runner, linear, dp_attention, fp8, ... and the NPU graph runners), so
-# that crash lands before any device dispatch. `torch.cuda.memory` re-exports
-# these straight from `torch._C`, so the call sites below reach them lazily via
-# `torch._C.<name>` instead -- matching the sibling calls already there, and
-# deferring the lookup to the symmetric-memory path that needs them.
+# The private _cuda_* pool APIs are absent before torch 2.8; the call sites below
+# reach them via torch._C.<name> so torch 2.7 (Ascend NPU) can still import this.
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator

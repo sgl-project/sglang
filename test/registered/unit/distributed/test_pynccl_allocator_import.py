@@ -1,17 +1,7 @@
 """Regression test for https://github.com/sgl-project/sglang/issues/28999.
 
-``pynccl_allocator`` is imported eagerly across the codebase (model_runner,
-linear, dp_attention, fp8, ... and the Ascend NPU graph runners), so importing
-a torch>=2.8-only symbol at module scope aborts startup on backends pinned to
-older torch. On Ascend, ``torch_npu`` pins torch 2.7, whose
-``torch.cuda.memory`` exposes neither ``_cuda_beginAllocateCurrentThreadToPool``
-nor ``_cuda_endAllocateToPool`` -- and a ``from ... import (a, b, c)`` statement
-is all-or-nothing, so one missing name takes the whole import down.
-
-Those symbols are re-exported from ``torch._C``, so the call sites reach them
-lazily via ``torch._C.<name>``. This test guards the module-scope import list
-statically: it detects a regression on any torch version, without a GPU or NPU,
-and without importing the module under test.
+``pynccl_allocator`` must not import private ``torch.cuda.memory`` symbols at
+module scope: they are absent before torch 2.8 and abort startup on Ascend NPU.
 """
 
 import ast
@@ -31,12 +21,7 @@ SOURCE_PATH = (
 
 
 def _import_time_nodes(tree: ast.Module):
-    """Yield nodes that execute when the module is imported.
-
-    Descends into module-level ``try`` / ``if`` blocks -- a guarded import still
-    runs at import time -- but not into functions or classes, where imports are
-    deferred until the symmetric-memory path actually calls them.
-    """
+    """Yield nodes that run at import time, including ``try`` / ``if`` bodies."""
     stack = list(tree.body)
     while stack:
         node = stack.pop()

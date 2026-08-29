@@ -77,10 +77,9 @@ def handle_nccl_pre_warm(server_args: Any):
 
 
 def handle_symm_mem_device_support(server_args: Any):
-    # NCCL symmetric memory needs a CUDA/HIP device: the allocator compiles a
-    # CUDA plugin and links -lnccl. Disable it elsewhere (e.g. Ascend NPU) so
-    # non-CUDA backends never reach that path and fail deep in a build step.
     cfg = resolving_view(server_args)
+    # The symm-mem allocator compiles a CUDA plugin and links -lnccl, so off
+    # CUDA/HIP (e.g. Ascend NPU) it fails deep in a build step rather than here.
     if cfg.enable_symm_mem and not (is_cuda() or is_hip()):
         logger.warning(
             "--enable-symm-mem is not supported on non CUDA/HIP devices "
