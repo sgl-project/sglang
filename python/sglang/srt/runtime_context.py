@@ -13,16 +13,13 @@
 # ==============================================================================
 """A single structured accessor for process-static runtime state.
 
-``get_parallel()`` returns a ``ParallelContext`` whose bare attributes — tp / dcp
-/ pp / moe / attn size and rank, plus the process-group handles — each delegate
-live to the canonical getter in ``distributed.parallel_state`` /
-``layers.dp_attention``. Returned values are exactly what those getters return;
-this is a read-through wrapper, not a cache. It gives call-sites one import and
-one naming scheme in place of a dozen free functions, plus a test-only
-``override()`` hook to force a topology without monkeypatching the underlying
-getters. The resolved parallel **configuration** is the same object's ``config``
-hop (``get_parallel().config.tp_size``), which reads the published ``parallel``
-bag: bare is the live group, ``config`` is what was configured.
+``get_parallel()`` returns a ``ParallelContext``. Ranks and process-group handles
+read through **live** to the canonical getter in ``distributed.parallel_state`` /
+``layers.dp_attention`` — exactly what those getters return, a read-through
+wrapper and not a cache. Every other name, the sizes included, is a leaf of the
+published ``parallel`` bag. It gives call-sites one import and one naming scheme
+in place of a dozen free functions, plus an ``override()`` hook to force a
+topology without monkeypatching the underlying getters.
 
 ``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
 user's raw input, kept **read-only** for debug and reproduction; what
@@ -79,6 +76,23 @@ def _dp():
     return dp_attention
 
 
+@functools.lru_cache(maxsize=1)
+def _parallel_config_leaves() -> frozenset:
+    """Names under the ``parallel`` namespace, for the unpublished error path.
+
+    Read from the field metadata rather than the bag, which is what does not
+    exist yet when this is needed.
+    """
+    from sglang.srt.arg_groups.arg_utils import namespace_of
+    from sglang.srt.server_args import ServerArgs
+
+    return frozenset(
+        field
+        for field, path in namespace_of(ServerArgs).items()
+        if path.split(".")[0] == "parallel"
+    )
+
+
 _PARALLEL_FIELDS = frozenset(
     {
         "world_size",
@@ -117,65 +131,146 @@ _PARALLEL_FIELDS = frozenset(
 )
 
 
+def derive_attention_widths(
+    *, tp_size: int, attn_cp_size: int, dp_size: int, enable_dp_attention: bool
+) -> tuple:
+    """(attn_dp_size, attn_tp_size) from the leaves.
+
+    Split out because the rank computation in
+    `dp_attention.compute_dp_attention_world_info` needs the same two numbers
+    and must not carry a second copy of the arithmetic.
+    """
+    attn_dp_size = dp_size if enable_dp_attention else 1
+    return attn_dp_size, tp_size // attn_dp_size // attn_cp_size
+
+
+def derive_parallel_widths(
+    *,
+    tp_size: int,
+    attn_cp_size: int,
+    attn_dp_size: int,
+    moe_ep_size: int,
+    moe_dp_size: int,
+    dcp_size: int,
+    dcp_enabled: bool,
+) -> dict:
+    """The parallel widths no flag sets, from the leaves that do.
+
+    `tp_size` and its siblings are configured; these are quotients of them, so
+    the arithmetic lives here rather than being read back off the group
+    coordinators.
+
+    `world_size` is not among them: it is not a quotient, and `get_world_size()`
+    answers with the live WORLD group, which stays right through an elastic
+    scale-up that a stamp taken at group build would not survive.
+    """
+    return {
+        "attn_dp_size": attn_dp_size,
+        # `attn_dp_size` is already the effective width (1 when DP attention is
+        # off), so the flag is spent here; a caller passing the raw `dp_size`
+        # leaf with the attention disabled would get tp/dp/cp instead of tp/1/cp.
+        "attn_tp_size": derive_attention_widths(
+            tp_size=tp_size,
+            attn_cp_size=attn_cp_size,
+            dp_size=attn_dp_size,
+            enable_dp_attention=True,
+        )[1],
+        "moe_ep_size": moe_ep_size,
+        "moe_tp_size": tp_size // moe_ep_size // moe_dp_size,
+        "dcp_enabled": dcp_enabled,
+        "attn_dcp_size": dcp_size if dcp_enabled else 1,
+    }
+
+
 class ParallelContext:
-    """Parallel-topology namespace: the live groups bare, configuration under
-    ``config``.
+    """Parallel-topology namespace: one spelling per name.
 
-    ``get_parallel().tp_size`` and its size / rank / group siblings are
-    read-through ``@property`` over the canonical getters, so they answer with
-    the **live** process groups and raise before distributed init. The resolved
-    parallel **configuration** is one hop away, on the published bag:
-    ``get_parallel().config.tp_size``, ``.config.nccl_port``. It answers in any
-    process at any point after publish, and follows a post-publish ``override``.
+    Ranks and group handles are read-through ``@property`` over the canonical
+    getters, so they answer with the **live** process groups and raise before
+    distributed init. Every other name — ``tp_size`` and its size siblings
+    included, alongside config-only leaves such as ``nccl_port`` — is answered
+    from the published ``parallel`` bag, in any process at any point after
+    publish.
 
-    The two disagree by design, so which one a call site wants is spelled at the
-    call site — no ``config`` means live. Elastic EP scales the live world away
-    from the configured one, and ``initialize_model_parallel`` aliases
-    ``_MOE_DP`` to ``_ATTN_CP`` when ``attn_cp_size > moe_dp_size``, which makes
-    a live comparison of that pair degenerate.
+    A size is read from the configuration because the groups are built at
+    exactly the configured widths. Two things do not follow that rule and are
+    asked of the group itself: ``initialize_model_parallel`` aliases ``_MOE_DP``
+    to ``_ATTN_CP`` when ``attn_cp_size > moe_dp_size``, so a reader that means
+    the MoE communicator's width calls ``get_moe_cp_size()``; and
+    ``patch_tensor_parallel_group`` runs a scope under a different TP group,
+    which it declares by overriding ``tp_size``, ``tp_rank`` and ``tp_group``
+    for its duration. Elastic EP is a third case, and it needs no rule here: it
+    scales ``ep_size`` / ``dp_size`` on the published bag while the group
+    coordinators keep the width they were constructed with, so the two are
+    different names rather than two answers to one name.
     """
 
-    __slots__ = ("_overrides", "_config")
+    __slots__ = ("_overrides", "_config", "_derived")
 
     def __init__(self):
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
-
-    @property
-    def config(self) -> _ConfigBag:
-        """The published ``parallel`` config bag.
-
-        Reads the slot directly: ``parallel`` sits outside the per-role
-        namespace table (every process reads topology config), so no role check
-        applies here. The body stays
-        dynamo-traceable — ``get_parallel().config.moe_dense_tp_size`` and the
-        gate helpers over it run inside compiled model forwards.
-        """
-        config = self._config
-        if config is None:
-            raise ValueError("config namespace 'parallel' not published")
-        return config
+        self._derived = {}  # widths stamped when the groups are built
 
     def __getattr__(self, name):
-        # Reached only for names that are neither a live @property nor a slot.
-        # Config leaves are read under ``config``, so naming one here is a
-        # call-site mistake and this only builds the error that says so.
         if name.startswith("_"):
             # This also breaks the recursion when the ``_config`` slot itself is
             # still unset (pickle/copy protocols probe attributes before
             # __init__ runs).
             raise AttributeError(name)
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
         config = self._config
-        if config is not None and name in config._fields:
-            raise AttributeError(
-                f"{name!r} is a parallel config leaf, not live topology; read it "
-                f"as get_parallel().config.{name}"
-            )
+        if config is not None:
+            if name in config._fields:
+                return getattr(config, name)
+        elif name in _parallel_config_leaves():
+            raise ValueError("config namespace 'parallel' not published")
         raise AttributeError(f"ParallelContext has no {name!r}")
 
     def _v(self, name, getter):
         overrides = self._overrides
         return overrides[name] if name in overrides else getter()
+
+    def stamp_derived_widths(self, **widths) -> None:
+        """Record the widths derived from the leaves, as the groups are built.
+
+        `initialize_model_parallel` computes the set through
+        `derive_parallel_widths` and hands it here; `initialize_dp_attention`
+        stamps `attn_dp_size` again once it knows the effective width, and
+        elastic EP restamps it where it already updates the live one. A stamped
+        width is what the readers answer with.
+        """
+        self._derived.update(widths)
+
+    def clear_derived_widths(self) -> None:
+        self._derived.clear()
+
+    def _derived_width(self, name, getter):
+        """A width the leaves imply: the stamp, else the live group.
+
+        The fallback keeps a process that installed groups without going
+        through `initialize_model_parallel` working. When neither is there,
+        the failure says which of the two is missing rather than surfacing a
+        group getter's bare assertion.
+        """
+        overrides = self._overrides
+        if name in overrides:
+            return overrides[name]
+        derived = self._derived
+        if name in derived:
+            return derived[name]
+        try:
+            return getter()
+        except (AssertionError, AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"derived parallel width {name!r} is not available: it is "
+                "computed from the configured leaves when the process groups "
+                "are built (initialize_model_parallel / "
+                "initialize_dp_attention), and neither a stamp nor a live "
+                "group is present"
+            ) from exc
 
     @contextmanager
     def override(self, **kwargs):
@@ -200,16 +295,8 @@ class ParallelContext:
         return self._v("world_rank", _ps().get_world_rank)
 
     @property
-    def tp_size(self) -> int:
-        return self._v("tp_size", _ps().get_tensor_model_parallel_world_size)
-
-    @property
     def tp_rank(self) -> int:
         return self._v("tp_rank", _ps().get_tensor_model_parallel_rank)
-
-    @property
-    def pp_size(self) -> int:
-        return self._v("pp_size", _ps().get_pipeline_model_parallel_world_size)
 
     @property
     def pp_rank(self) -> int:
@@ -217,15 +304,13 @@ class ParallelContext:
 
     @property
     def moe_ep_size(self) -> int:
-        return self._v("moe_ep_size", _ps().get_moe_expert_parallel_world_size)
+        return self._derived_width(
+            "moe_ep_size", _ps().get_moe_expert_parallel_world_size
+        )
 
     @property
     def moe_ep_rank(self) -> int:
         return self._v("moe_ep_rank", _ps().get_moe_expert_parallel_rank)
-
-    @property
-    def moe_dp_size(self) -> int:
-        return self._v("moe_dp_size", _ps().get_moe_data_parallel_world_size)
 
     @property
     def moe_dp_rank(self) -> int:
@@ -233,7 +318,9 @@ class ParallelContext:
 
     @property
     def moe_tp_size(self) -> int:
-        return self._v("moe_tp_size", _ps().get_moe_tensor_parallel_world_size)
+        return self._derived_width(
+            "moe_tp_size", _ps().get_moe_tensor_parallel_world_size
+        )
 
     @property
     def moe_tp_rank(self) -> int:
@@ -241,23 +328,17 @@ class ParallelContext:
 
     @property
     def attn_tp_size(self) -> int:
-        return self._v("attn_tp_size", _ps().get_attn_tensor_model_parallel_world_size)
+        return self._derived_width(
+            "attn_tp_size", _ps().get_attn_tensor_model_parallel_world_size
+        )
 
     @property
     def attn_tp_rank(self) -> int:
         return self._v("attn_tp_rank", _ps().get_attn_tensor_model_parallel_rank)
 
     @property
-    def attn_cp_size(self) -> int:
-        return self._v("attn_cp_size", _ps().get_attn_context_model_parallel_world_size)
-
-    @property
     def attn_cp_rank(self) -> int:
         return self._v("attn_cp_rank", _ps().get_attn_context_model_parallel_rank)
-
-    @property
-    def dcp_size(self) -> int:
-        return self._v("dcp_size", _ps().get_dcp_world_size)
 
     @property
     def dcp_rank(self) -> int:
@@ -268,14 +349,15 @@ class ParallelContext:
         def getter():
             if _ps().get_dcp_group_no_assert() is None:
                 return False
-            return self.dcp_size > 1
+            return _ps().get_dcp_world_size() > 1
 
-        return self._v("dcp_enabled", getter)
+        return self._derived_width("dcp_enabled", getter)
 
     @property
     def attn_dcp_size(self) -> int:
-        return self._v(
-            "attn_dcp_size", lambda: self.dcp_size if self.dcp_enabled else 1
+        return self._derived_width(
+            "attn_dcp_size",
+            lambda: _ps().get_dcp_world_size() if self.dcp_enabled else 1,
         )
 
     @property
@@ -286,7 +368,7 @@ class ParallelContext:
 
     @property
     def attn_dp_size(self) -> int:
-        return self._v("attn_dp_size", _dp().get_attention_dp_size)
+        return self._derived_width("attn_dp_size", _dp().get_attention_dp_size)
 
     @property
     def attn_dp_rank(self) -> int:
@@ -415,6 +497,9 @@ class MoeFlags(_FlagGroupBase):
     # speculative_moe_backend_context is active, so a draft gate's write also
     # lands on the speculative leaf.
     in_speculative_scope: bool = False
+    # Draft construction/execution uses a separate one-sided A2A workspace from
+    # the target model's concurrently live CUDA graphs.
+    speculative_context: bool = False
 
 
 @dataclasses.dataclass
@@ -779,11 +864,11 @@ class RuntimeContext:
         name (the keyed-lazy pattern of the persistent buffers). Creation is
         a driver call that must stay outside cuda-graph capture — call sites
         lease their stream at init/warmup time."""
+        from sglang.srt.arg_groups.overrides import resolution_result
+
         stream = self.resources.streams.get(name)
         if stream is None:
             import torch
-
-            from sglang.srt.arg_groups.overrides import resolution_result
 
             device = (
                 resolution_result(self._server_args, "device")
@@ -1148,8 +1233,8 @@ def get_forward() -> ForwardFlags:
 # --- Resolved config namespaces -------------------------
 # Each returns the top-level snapshot bag; reads are `get_exec().moe.field` etc.
 # All fail with ValueError("... not published") until publish has projected them.
-# ``parallel`` has no getter of its own: its bag is reached as
-# ``get_parallel().config``, alongside the live topology it belongs to.
+# ``parallel`` has no bag getter: ``get_parallel()`` answers its leaves
+# directly, alongside the live topology they belong to.
 def get_device() -> _ConfigBag:
     return _CONTEXT.config_bag("device")
 
@@ -1200,7 +1285,7 @@ def get_observability() -> _ConfigBag:
 # table declares which top-level config namespaces each role reads. ``None``
 # means the full tree — either the role genuinely needs everything (scheduler)
 # or its deployment shape has not been audited yet (restrict only what smoke
-# coverage can verify). ``parallel`` is served by ``get_parallel().config`` and
+# coverage can verify). ``parallel`` is served by ``get_parallel()`` and
 # every process legitimately reads topology config, so it is not in this table.
 #
 # ``SGLANG_ROLE_NAMESPACES`` selects the mode (read once at import):
@@ -1527,7 +1612,9 @@ def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
 
-    Wrapper subsystems (``parallel``) hold no state and are unaffected.
+    ``parallel`` holds the stamped derived widths, which go with the lifecycle
+    that stamped them: `_derived_width` prefers the stamp over the live group,
+    so leaving one behind lets the next test read the previous topology.
     """
     _CONTEXT._server_args = None
     _CONTEXT._config_bags = None
@@ -1535,6 +1622,7 @@ def reset_context() -> None:
     _CONTEXT._overrides_log = []
     _CONTEXT._publish_role = None
     _CONTEXT.parallel._config = None
+    _CONTEXT.parallel.clear_derived_widths()
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
@@ -1584,7 +1672,7 @@ def max_prefill_buffer_tokens() -> int:
 
     Every input is a published leaf (``schedule`` plus the configured PP size),
     so this derives from the bags and follows a post-publish override;
-    ``ServerArgs.max_prefill_buffer_tokens`` is the pre-publish equivalent and
+    ``overrides.max_prefill_buffer_tokens`` is the pre-publish equivalent and
     ``TestDerivedPredicatesAgreeAcrossTiers`` pins the two equal.
     """
     import math
@@ -1596,11 +1684,7 @@ def max_prefill_buffer_tokens() -> int:
         else 0
     )
     tokens = chunked
-    if (
-        schedule.enable_dynamic_chunking
-        and get_parallel().config.pp_size > 1
-        and chunked
-    ):
+    if schedule.enable_dynamic_chunking and get_parallel().pp_size > 1 and chunked:
         tokens = max(
             tokens, schedule.max_prefill_tokens or 0, math.ceil(chunked * 1.25)
         )
@@ -1630,7 +1714,7 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
         activation_tokens = max(schedule.chunked_prefill_size, 2048)
     else:
         activation_tokens = max(schedule.max_prefill_tokens, 2048)
-    parallel = get_parallel().config
+    parallel = get_parallel()
     reserved_mem = (
         512 + activation_tokens * 1.5 + parallel.tp_size * parallel.pp_size / 8 * 1024
     )
@@ -1642,17 +1726,19 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 # --- Derived config accessors ------------------------------------------------
 #
 # A few values are computed from several config fields plus the HF config, so
-# they are ``ServerArgs`` members rather than namespace leaves. Business code
-# must not reach for the startup record to get them: these accessors are the
-# named home, and this module — which owns the slot — is the only place that
-# reads it. Each one keeps the member's exact semantics, including which model
+# they are derived accessors rather than namespace leaves. Business code must
+# not reach for the startup record to get them: these accessors are the named
+# home, and this module — which owns the slot — is the only place that reads
+# it. Each one keeps the pre-publish function's exact semantics, including which model
 # config it derives from (always the process's, i.e. the target's).
 
 
 def mamba_cache_chunk_size() -> int:
     """The caching point granularity for mamba state: ``max(the model's mamba
     chunk size, page_size)``. Cached on the config after the first call."""
-    return get_server_args().mamba_cache_chunk_size
+    from sglang.srt.arg_groups.overrides import mamba_cache_chunk_size as _of
+
+    return _of(get_server_args())
 
 
 def mamba_checkpoint_grid(tree_page: int) -> int:
@@ -1675,7 +1761,7 @@ def max_speculative_num_draft_tokens() -> int | None:
     """The largest draft-token count speculative decoding may use.
 
     All three inputs are ``spec`` leaves, so this derives from the bags and
-    follows a post-publish override; ``ServerArgs.max_speculative_num_draft_tokens``
+    follows a post-publish override; ``overrides.max_speculative_num_draft_tokens``
     is the pre-publish equivalent. Adaptive spec resolves the count from its
     candidate-step table instead of the flat field.
     """
@@ -1704,7 +1790,9 @@ def _adaptive_draft_token_bound(cfg_path: str | None) -> int:
 
 def uses_mla_backend() -> bool:
     """Whether this process's model runs the MLA attention path."""
-    return get_server_args().use_mla_backend()
+    from sglang.srt.arg_groups.overrides import use_mla_backend
+
+    return use_mla_backend(get_server_args())
 
 
 def attention_backends() -> tuple:
@@ -1712,7 +1800,7 @@ def attention_backends() -> tuple:
     back to ``attention_backend``.
 
     All three inputs are ``exec.kernel`` leaves, so this derives from the bags
-    and follows a post-publish override; ``ServerArgs.get_attention_backends``
+    and follows a post-publish override; ``overrides.attention_backends_of``
     is the pre-publish equivalent the resolution pipeline uses. A built runner
     stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
     read that when there is a runner in hand.
@@ -1726,7 +1814,27 @@ def attention_backends() -> tuple:
 
 def process_model_config():
     """The process's ``ModelConfig`` (built once from the published config)."""
-    return get_server_args().get_model_config()
+    from sglang.srt.arg_groups.overrides import model_config_of
+
+    return model_config_of(get_server_args())
+
+
+def reports_expert_balancedness() -> bool:
+    """Whether the expert-balancedness report is on at all.
+
+    `overrides.should_report_expert_balancedness` is the pre-publish equivalent.
+    """
+    return get_exec().moe.expert_balancedness_report_mode != "off"
+
+
+def logs_expert_balancedness_to_server_log() -> bool:
+    """Whether the balancedness report goes to the server log."""
+    return get_exec().moe.expert_balancedness_report_mode in ("server_log", "both")
+
+
+def exports_expert_balancedness_to_prometheus() -> bool:
+    """Whether the balancedness report goes to Prometheus."""
+    return get_exec().moe.expert_balancedness_report_mode in ("prometheus", "both")
 
 
 def cutedsl_moe_max_num_tokens() -> int:
@@ -1734,7 +1842,7 @@ def cutedsl_moe_max_num_tokens() -> int:
 
     Every input is a published leaf (``spec``, ``schedule``, ``exec.graph``), so
     this derives from the bags and follows a post-publish override;
-    ``ServerArgs.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
+    ``overrides.cutedsl_moe_max_num_tokens`` is the pre-publish equivalent the
     resolution pipeline uses. Max over the prefill bound, the piecewise-prefill
     capture, and the decode/verify bound.
     """
