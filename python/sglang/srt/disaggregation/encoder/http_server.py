@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.encoder.runtime import (
     execute_encode_pipeline,
     launch_dp_runtime,
     launch_local_runtime,
+    send_staged_embedding,
 )
 from sglang.srt.disaggregation.encoder.server import (
     EncoderProfiler,
@@ -351,7 +352,6 @@ async def handle_send_request(request: dict):
     """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
     backends deliver embeddings inline during /encode and never call /send."""
     req_id = request["req_id"]
-    receive_count = request.get("receive_count")
     if dp_dispatcher is not None:
         try:
             result = await dp_dispatcher.dispatch_send(request)
@@ -373,13 +373,23 @@ async def handle_send_request(request: dict):
                 status_code=status_code,
             )
         return ORJSONResponse(content=result.get("content"))
-    sent = await encoder.send(
-        req_id=req_id,
-        prefill_host=request["prefill_host"],
-        embedding_port=request["embedding_port"],
-        session_id=request["session_id"],
-        buffer_address=request["buffer_address"],
-    )
+    try:
+        sent = await send_staged_embedding(
+            encoder,
+            request,
+            # A pre-refcount decoder may have sibling ranks still to send.
+            release_without_count=False,
+        )
+    except Exception as error:
+        logger.error("Mooncake send failed for req_id=%s: %s", req_id, error)
+        return ORJSONResponse(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "message": str(error),
+                "req_id": req_id,
+            },
+        )
     if not sent:
         # No transfer happened: fail fast rather than 200 + a phantom count.
         return ORJSONResponse(
@@ -390,11 +400,6 @@ async def handle_send_request(request: dict):
                 "req_id": req_id,
             },
         )
-    # Sibling ranks share this embedding, so free it only once all have sent.
-    # No count means a pre-refcount decoder: leave it to the sweep, as when
-    # some rank never sends at all.
-    if receive_count:
-        await server_module.meta_registry.note_send_done(req_id, receive_count)
     return ORJSONResponse(content=None)
 
 

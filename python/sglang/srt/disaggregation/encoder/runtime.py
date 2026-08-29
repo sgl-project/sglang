@@ -1057,6 +1057,39 @@ async def _push_embedding_to_prefill(
             await enc.release_request(req_id)
 
 
+async def send_staged_embedding(
+    enc: MMEncoder,
+    request: dict,
+    *,
+    release_without_count: bool,
+) -> bool:
+    """Send one Mooncake embedding and retire its state on any failure."""
+    req_id = request["req_id"]
+    try:
+        sent = await enc.send(
+            req_id=req_id,
+            prefill_host=request["prefill_host"],
+            embedding_port=request["embedding_port"],
+            session_id=request["session_id"],
+            buffer_address=request["buffer_address"],
+        )
+        if not sent:
+            return False
+
+        receive_count = request.get("receive_count")
+        if receive_count:
+            await server_module.meta_registry.note_send_done(req_id, receive_count)
+        elif release_without_count:
+            await enc.release_request(req_id)
+        return True
+    except BaseException as error:
+        try:
+            await enc.release_request(req_id)
+        except Exception as cleanup_error:
+            error.add_note(f"Failed to release encoder request: {cleanup_error}")
+        raise
+
+
 def _record_pipeline_result(modality: Modality, status: str) -> None:
     if server_module.encoder_metrics_collector is not None:
         server_module.encoder_metrics_collector.inc_requests_total(
@@ -1282,12 +1315,10 @@ async def _dp_worker_handle_request(
                 ) from e
         elif dp_type == "send":
             req_id = request["req_id"]
-            sent = await enc.send(
-                req_id=req_id,
-                prefill_host=request["prefill_host"],
-                embedding_port=request["embedding_port"],
-                session_id=request["session_id"],
-                buffer_address=request["buffer_address"],
+            sent = await send_staged_embedding(
+                enc,
+                request,
+                release_without_count=True,
             )
             if not sent:
                 # Error envelope, not 200 + phantom count: the decoder must
@@ -1296,13 +1327,6 @@ async def _dp_worker_handle_request(
                     f"no staged embedding for /send req_id={req_id} "
                     f"(already released)"
                 )
-            # Releasing on the first /send breaks decoder TP > 1. No count means
-            # a pre-refcount decoder: stay eager rather than pin until the sweep.
-            receive_count = request.get("receive_count")
-            if receive_count:
-                await server_module.meta_registry.note_send_done(req_id, receive_count)
-            else:
-                await enc.release_request(req_id)
             content = None
         else:
             content = await execute_encode_pipeline(enc, sched, request)
