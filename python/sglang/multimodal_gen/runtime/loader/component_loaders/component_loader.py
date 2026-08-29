@@ -137,6 +137,7 @@ class ComponentLoader(ABC):
     # Gates only --component-quantizations.<name>. Quantization declared by a
     # checkpoint is discovered and admitted by the component's normal loader.
     supports_online_quantization_override = False
+    supports_fsdp_inference = False
 
     _loaders_registered = False
 
@@ -181,6 +182,15 @@ class ComponentLoader(ABC):
     ) -> None:
         """Validate that fallback preserves the exact component's runtime contract."""
         pass
+
+    def disable_unsupported_component_fsdp(
+        self, server_args: ServerArgs, component_name: str
+    ) -> None:
+        if (
+            not self.supports_fsdp_inference
+            and server_args.should_use_fsdp_for_component(component_name)
+        ):
+            server_args.disable_fsdp_for_component(component_name)
 
     def _load_customized_with_context(
         self,
@@ -242,6 +252,7 @@ class ComponentLoader(ABC):
 
         """
         self._native_load_manages_placement = False
+        self.disable_unsupported_component_fsdp(server_args, component_name)
         component_quantization = server_args.component_quantizations.get(component_name)
         if (
             component_quantization is not None
