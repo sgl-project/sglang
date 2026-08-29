@@ -114,14 +114,19 @@ def _expert_pack_path(gguf: Path) -> Path:
     return gguf.parent / f"{gguf.name[: match.start()]}.expert-major.pack"
 
 
-def _repo_root() -> Path:
-    for candidate in Path(__file__).resolve().parents:
-        if (candidate / "tools" / "expert_pack" / "prepare_kimi_pack.py").is_file():
-            return candidate
-    raise RuntimeError(
-        "expert_pack cannot auto-build Kimi artifacts from an installed package; "
-        "run from an SGLang source checkout"
+def _expert_pack_tools_dir() -> Path:
+    tools_dir = Path(__file__).with_name("expert_pack")
+    required_tools = (
+        "prepare_deepseek_pack.py",
+        "prepare_kimi_manifest.py",
+        "prepare_kimi_pack.py",
     )
+    missing = [name for name in required_tools if not (tools_dir / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "expert_pack preparation tools are missing: " + ", ".join(missing)
+        )
+    return tools_dir
 
 
 def ensure_kimi_assets(
@@ -144,26 +149,26 @@ def ensure_kimi_assets(
     manifest = artifact_dir / "kimi-k3-expert-pack.manifest.json"
     tokenizer = resolve_kimi_tokenizer(gguf, tokenizer_dir)
     lock_path = pack.with_name(pack.name + ".startup.lock")
-    repo = _repo_root()
+    tools_dir = _expert_pack_tools_dir()
     with lock_path.open("w") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         model_dir = prepare_kimi_model_metadata(tokenizer, artifact_dir)
         subprocess.run(
             [
                 sys.executable,
-                str(repo / "tools" / "expert_pack" / "prepare_kimi_pack.py"),
+                str(tools_dir / "prepare_kimi_pack.py"),
                 "--gguf",
                 str(gguf),
                 "--model-config",
                 str(model_dir / "config.json"),
             ],
-            cwd=repo,
+            cwd=tools_dir,
             check=True,
         )
         subprocess.run(
             [
                 sys.executable,
-                str(repo / "tools" / "expert_pack" / "prepare_kimi_manifest.py"),
+                str(tools_dir / "prepare_kimi_manifest.py"),
                 "--gguf-dir",
                 str(gguf_dir),
                 "--expert-pack",
@@ -177,7 +182,7 @@ def ensure_kimi_assets(
                 "--payload-samples",
                 "6",
             ],
-            cwd=repo,
+            cwd=tools_dir,
             check=True,
         )
     return {
@@ -480,9 +485,9 @@ def _deepseek_digest(value: object, field: str) -> str:
 
 
 def _prepare_deepseek_pack(
-    source: Path, model_config: Path, repo: Path
+    source: Path, model_config: Path, tools_dir: Path
 ) -> tuple[Path, Path]:
-    tool = repo / "tools" / "expert_pack" / "prepare_deepseek_pack.py"
+    tool = tools_dir / "prepare_deepseek_pack.py"
     if not tool.is_file():
         raise FileNotFoundError(f"missing DeepSeek Expert Pack preparer: {tool}")
     subprocess.run(
@@ -494,7 +499,7 @@ def _prepare_deepseek_pack(
             "--model-config",
             str(model_config),
         ],
-        cwd=repo,
+        cwd=tools_dir,
         check=True,
     )
     return (
@@ -514,14 +519,14 @@ def prepare_raw_deepseek_server_args(
     source = Path(cfg.model_path).expanduser().resolve(strict=True)
     if not source.is_file():
         return
-    repo = _repo_root()
+    tools_dir = _expert_pack_tools_dir()
     artifact_dir = _deepseek_artifact_dir_for_source(source).resolve()
     lock_path = artifact_dir / "deepseek-v4-startup.lock"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     with lock_path.open("w") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         model_config = _prepare_deepseek_model_metadata(source, artifact_dir)
-        pack, manifest = _prepare_deepseek_pack(source, model_config, repo)
+        pack, manifest = _prepare_deepseek_pack(source, model_config, tools_dir)
     manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
     source_value = manifest_value.get("source") or {}
     model_value = manifest_value.get("model") or {}

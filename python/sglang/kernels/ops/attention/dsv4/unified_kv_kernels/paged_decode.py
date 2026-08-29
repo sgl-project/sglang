@@ -56,7 +56,6 @@ import functools
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.device_info import get_num_sms
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
@@ -94,7 +93,12 @@ def _cu_count() -> int:
     Wrapped in ``lru_cache`` so the first decode call pays the device-property
     lookup and all subsequent calls hit the cache — important inside a hot
     decode loop and CUDAGraph capture (no data-dependent host work).
+
+    ``aiter`` is imported lazily: it is a ROCm-only package, and the pure-Python
+    heuristics below must stay importable on a machine without it.
     """
+    from aiter.ops.triton.utils.device_info import get_num_sms
+
     return get_num_sms()
 
 
