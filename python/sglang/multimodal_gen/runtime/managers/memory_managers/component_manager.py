@@ -203,8 +203,9 @@ class ComponentResidencyManager:
         if unmanaged_components:
             names = ", ".join(repr(name) for name in unmanaged_components)
             raise ComponentResidencyError(
-                "Explicit component residency requires a request-time "
-                f"ComponentUse declaration; {names} has none in this pipeline"
+                "Explicit component residency requires "
+                f"{names} to have a request-time ComponentUse declaration; "
+                "none appears in this pipeline"
             )
 
     @staticmethod
