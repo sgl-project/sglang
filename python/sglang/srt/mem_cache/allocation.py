@@ -411,7 +411,7 @@ def _alloc_extend_loc_with_kv_reuse(
         retained_len = len(req.dllm_incomplete_ids)
         if extend_len != retained_len:
             raise RuntimeError("dLLM FDFO retained KV must be reused as a full block.")
-        if not req.is_holding_kv or prefix_len + extend_len > req.kv.kv_allocated_len:
+        if prefix_len + extend_len > req.kv.kv_allocated_len:
             raise RuntimeError("dLLM FDFO retained KV is missing.")
 
     alloc_extend_lens = [
