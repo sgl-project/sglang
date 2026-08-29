@@ -1233,6 +1233,35 @@ class TestOffloadDefaults(unittest.TestCase):
         args.disable_fsdp_for_component("text_encoder")
         self.assertFalse(args.should_use_fsdp_for_component("text_encoder"))
 
+    def test_resident_requirement_rejects_every_explicit_offload_surface(self):
+        cases = (
+            {"component_residency": ["text_encoder=component-offload"]},
+            {"component_residency": ["text_encoder=layerwise-offload"]},
+            {"cpu_offload_components": ["text_encoder"]},
+            {"text_encoder_cpu_offload": True},
+            {"layerwise_offload_components": ["text_encoder"]},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"performance_mode": "manual", **kwargs},
+                )
+
+                with self.assertRaisesRegex(ValueError, "explicit residency option"):
+                    args.require_component_resident(
+                        "text_encoder", feature_name="test backend"
+                    )
+
+    def test_resident_requirement_can_override_automatic_placement(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+        self.assertIsNone(args.explicit_residency_mode("text_encoder"))
+        self.assertNotEqual(args.residency_mode("text_encoder"), RESIDENT)
+
+        args.require_component_resident("text_encoder", feature_name="test backend")
+
+        self.assertEqual(args.residency_mode("text_encoder"), RESIDENT)
+
     def test_diffusers_component_residency_is_pipeline_wide(self):
         self.assertFalse(resolve_diffusers_pipeline_offload({"all": RESIDENT}))
         self.assertTrue(resolve_diffusers_pipeline_offload({"all": COMPONENT_OFFLOAD}))
