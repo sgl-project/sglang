@@ -55,6 +55,8 @@ class GenerationBatchResult:
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
+    # Full-prefill dLLM (e.g. Dream): per-request canvas completion status.
+    dllm_done_per_req_cpu: Optional[List[bool]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and

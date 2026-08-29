@@ -78,10 +78,6 @@ class DllmConfig:
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
-            # TODO: Support FDFO for Dream by carrying partial canvas state
-            # across denoising rounds. Keep it synchronous for now.
-            first_done_first_out_mode=(
-                server_args.dllm_fdfo and not needs_full_prefill
-            ),
+            first_done_first_out_mode=server_args.dllm_fdfo,
             needs_full_prefill=needs_full_prefill,
         )

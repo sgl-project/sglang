@@ -572,6 +572,7 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
+            dllm_done_per_req_cpu,
         ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
 
         return GenerationBatchResult(
@@ -579,6 +580,7 @@ class TpModelWorker(BaseTpWorker):
             next_token_ids=next_token_ids,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
+            dllm_done_per_req_cpu=dllm_done_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 

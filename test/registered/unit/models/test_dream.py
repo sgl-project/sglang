@@ -130,6 +130,51 @@ class TestDreamAlgorithm(CustomTestCase):
         self.assertEqual(forward_batch.input_ids.tolist(), [10, 11, 2, 2, 20, 2, 2])
         self.assertEqual([state["step"] for state in states], [1, 1])
 
+    def test_dream_fdfo_carries_each_request_until_done(self):
+        dream = Dream(_config(algorithm_config={"steps": 2, "alg": "origin"}))
+        model_runner = MagicMock()
+        model_runner.forward.side_effect = [
+            SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    full_logits=torch.zeros((4, 5)),
+                ),
+                can_run_graph=False,
+            ),
+            SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    full_logits=torch.zeros((2, 5)),
+                ),
+                can_run_graph=False,
+            ),
+        ]
+
+        first_batch = self._forward_batch(
+            torch.tensor([10, 99, 20, 99]), [2, 2], top_k=1
+        )
+        first_batch.sampling_info.original_temperatures[:] = 0
+        first_batch.sampling_info.top_ps[:] = 1
+        states = [
+            {"prompt_len": 1, "step": 1},
+            {"prompt_len": 1, "step": 0},
+        ]
+        with patch(
+            "sglang.srt.dllm.algorithm.dream.torch.rand",
+            side_effect=[torch.tensor([0.0]), torch.tensor([1.0])],
+        ):
+            first = dream._run_fdfo_full_prefill(model_runner, first_batch, states)
+
+        self.assertEqual(first[5], [True, False])
+        self.assertEqual(first[3][0], None)
+        self.assertEqual(first[3][1]["step"], 1)
+        self.assertEqual(first[1][1], [20, 99])
+
+        second_batch = self._forward_batch(torch.tensor([20, 99]), [2], top_k=1)
+        second = dream._run_fdfo_full_prefill(model_runner, second_batch, [first[3][1]])
+
+        self.assertEqual(second[5], [True])
+        self.assertEqual(second[3], [None])
+        self.assertEqual(second[1], [[20, 0]])
+
     def test_dream_confidence_algorithms_resolve_final_canvas(self):
         for alg in ("maskgit_plus", "topk_margin", "entropy"):
             with self.subTest(alg=alg):
@@ -165,7 +210,7 @@ class TestDreamCudaGraphPath(CustomTestCase):
 
         def logits_processor(input_ids, states, lm_head, forward_batch):
             del input_ids, lm_head, forward_batch
-            return LogitsProcessorOutput(full_logits=states)
+            return LogitsProcessorOutput(next_token_logits=None, full_logits=states)
 
         dream_model = SimpleNamespace(
             capture_aux_hidden_states=False,
@@ -213,7 +258,7 @@ class TestDreamCudaGraphPath(CustomTestCase):
         full_logits = torch.arange(12, dtype=torch.float32).view(6, 2)
 
         output = runner._trim_logits_output(
-            LogitsProcessorOutput(full_logits=full_logits)
+            LogitsProcessorOutput(next_token_logits=None, full_logits=full_logits)
         )
 
         self.assertEqual(output.full_logits.shape, (4, 2))
@@ -257,7 +302,7 @@ class TestDreamCudaGraphPath(CustomTestCase):
                     args._handle_dllm_inference()
 
                 self.assertTrue(args.disable_radix_cache)
-                self.assertFalse(args.dllm_fdfo)
+                self.assertTrue(args.dllm_fdfo)
                 self.assertEqual(
                     args.cuda_graph_config.decode.backend,
                     Backend.DISABLED,
@@ -356,7 +401,12 @@ class TestDreamConfig(CustomTestCase):
         self.assertIsNone(config.block_size)
         self.assertEqual(config.mask_id, 151666)
         self.assertEqual(config.max_running_requests, 4)
-        self.assertFalse(config.first_done_first_out_mode)
+        self.assertTrue(config.first_done_first_out_mode)
+
+        no_fdfo_config = DllmConfig.from_server_args(
+            self._server_args(max_running_requests=4, fdfo=False)
+        )
+        self.assertFalse(no_fdfo_config.first_done_first_out_mode)
 
     @patch("sglang.srt.dllm.config.ModelConfig.from_server_args")
     def test_block_dllm_defaults_remain_unchanged(self, from_server_args):
@@ -411,6 +461,72 @@ class TestDreamSchedulerAdmission(CustomTestCase):
 
         self.assertEqual(len(scheduler.dllm_manager.waiting_queue), 1)
         self.assertEqual(len(scheduler.waiting_queue), 3)
+
+
+class TestDreamFDFOResultProcessing(CustomTestCase):
+    def test_unresolved_canvas_and_state_survive_scheduler_round(self):
+        config = _config(algorithm_config={"steps": 3})
+        req = Req(
+            rid="req",
+            origin_input_text="prompt",
+            origin_input_ids=array("q", [10]),
+            sampling_params=SamplingParams(max_new_tokens=3),
+            dllm_config=config,
+        )
+        req.init_next_round_input()
+
+        scheduler = SimpleNamespace(
+            dllm_config=config,
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0,
+                report_prefill_stats=MagicMock(),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=MagicMock(),
+                free_group_end=MagicMock(),
+            ),
+            tree_cache=MagicMock(),
+            output_streamer=SimpleNamespace(stream_output=MagicMock()),
+        )
+        batch = SimpleNamespace(
+            batch_size=lambda: 1,
+            reqs=[req],
+            return_logprob=False,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+
+        unresolved = SimpleNamespace(
+            copy_done=None,
+            accept_length_per_req_cpu=None,
+            dllm_done_per_req_cpu=[False],
+            dllm_algo_state=[{"prompt_len": 1, "step": 1}],
+            next_token_ids=[[10, 20, 99, 99]],
+            can_run_cuda_graph=False,
+        )
+        SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, unresolved)
+
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 20, 99, 99])
+        self.assertEqual(req.dllm_algo_state, {"prompt_len": 1, "step": 1})
+        self.assertEqual(list(req.output_ids), [])
+
+        req.init_next_round_input()
+        self.assertEqual(list(req.full_untruncated_fill_ids), [10, 20, 99, 99])
+
+        done = SimpleNamespace(
+            copy_done=None,
+            accept_length_per_req_cpu=None,
+            dllm_done_per_req_cpu=[True],
+            dllm_algo_state=[{"prompt_len": 1, "step": 3}],
+            next_token_ids=[[10, 20, 30, 40]],
+            can_run_cuda_graph=False,
+        )
+        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache"):
+            SchedulerDllmMixin.process_batch_result_dllm(scheduler, batch, done)
+
+        self.assertEqual(list(req.output_ids), [20, 30, 40])
+        self.assertTrue(req.finished())
+        self.assertIsNone(req.dllm_algo_state)
 
 
 if __name__ == "__main__":

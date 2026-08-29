@@ -20,6 +20,7 @@ DllmRunOutput = Tuple[
     Optional[List[int]],
     Optional[List[Any]],
     bool,
+    Optional[List[bool]],
 ]
 
 
@@ -72,6 +73,23 @@ class DllmAlgorithm:
         input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         return (input_ids != self.mask_id).sum(dim=1).tolist()
 
+    def _prepare_states(
+        self,
+        forward_batch: ForwardBatch,
+        algo_states: Optional[List[Any]],
+    ) -> List[Any]:
+        if algo_states is None:
+            return self.init_step_state(forward_batch)
+
+        if all(state is not None for state in algo_states):
+            return list(algo_states)
+
+        fresh_states = self.init_step_state(forward_batch)
+        return [
+            state if state is not None else fresh_states[i]
+            for i, state in enumerate(algo_states)
+        ]
+
     def _run_sync(
         self,
         model_runner: ModelRunner,
@@ -92,7 +110,9 @@ class DllmAlgorithm:
                     states[i] = dict(carried)
                 elif isinstance(states[i], dict):
                     states[i].update(carried)
-        if all(isinstance(state, dict) and "prompt_len" in state for state in states):
+        if self.needs_full_prefill:
+            start_list = self._full_prefill_start_list(states)
+        elif all(isinstance(state, dict) and "prompt_len" in state for state in states):
             start_list = [state["prompt_len"] for state in states]
         else:
             start_list = self._block_start_list(forward_batch)
@@ -101,7 +121,7 @@ class DllmAlgorithm:
         # No mask to denoise: return empty so process_batch_result_dllm skips the
         # stream branch (matches the pre-refactor behavior).
         if all(start == length for start, length in zip(start_list, sequence_lengths)):
-            return out.logits_output, [], None, None, out.can_run_graph
+            return out.logits_output, [], None, None, out.can_run_graph, None
 
         # NPU: attention metadata is stable across a block's denoise steps (the
         # first forward above already planned it), so mark it ready once and let
@@ -118,7 +138,20 @@ class DllmAlgorithm:
         next_token_ids_list = [
             next_token_ids[i][start_list[i] :] for i in range(batch_size)
         ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+        return (
+            out.logits_output,
+            next_token_ids_list,
+            None,
+            None,
+            out.can_run_graph,
+            None,
+        )
+
+    def _full_prefill_start_list(
+        self,
+        states: List[Any],
+    ) -> List[int]:
+        return [state["prompt_len"] for state in states]
 
     def _run_fdfo(
         self,
@@ -126,19 +159,12 @@ class DllmAlgorithm:
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]],
     ) -> DllmRunOutput:
+        if self.needs_full_prefill:
+            return self._run_fdfo_full_prefill(model_runner, forward_batch, algo_states)
+
         batch_size = forward_batch.batch_size
 
-        if algo_states is None:
-            algo_states = [None] * batch_size
-        fresh: Optional[List[Any]] = None
-        states: List[Any] = []
-        for i, carried in enumerate(algo_states):
-            if carried is None:
-                if fresh is None:
-                    fresh = self.init_step_state(forward_batch)
-                states.append(fresh[i])
-            else:
-                states.append(carried)
+        states = self._prepare_states(forward_batch, algo_states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
@@ -155,4 +181,35 @@ class DllmAlgorithm:
             accept_length_per_req_cpu,
             states_out,
             out.can_run_graph,
+            None,
+        )
+
+    def _run_fdfo_full_prefill(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        algo_states: Optional[List[Any]],
+    ) -> DllmRunOutput:
+        batch_size = forward_batch.batch_size
+        sequence_lengths = forward_batch.extend_seq_lens_cpu
+        if sequence_lengths is None:
+            raise RuntimeError(
+                "Full-prefill dLLM FDFO execution requires sequence lengths"
+            )
+
+        states = self._prepare_states(forward_batch, algo_states)
+
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        done = self.step(forward_batch, out.logits_output.full_logits, states)
+        next_token_ids = forward_batch.input_ids.split(sequence_lengths)
+        next_token_ids_list = [tokens.tolist() for tokens in next_token_ids]
+        states_out = [None if done[i] else states[i] for i in range(batch_size)]
+
+        return (
+            out.logits_output,
+            next_token_ids_list,
+            None,
+            states_out,
+            out.can_run_graph,
+            done,
         )
