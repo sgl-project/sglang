@@ -21,7 +21,10 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.overrides import (
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
@@ -43,7 +46,7 @@ if TYPE_CHECKING:
 
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     """Return whether the selected prefill-CP configuration supports BCG."""
-    from sglang.srt.arg_groups.overrides import attention_backends_of, resolving_view
+    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)

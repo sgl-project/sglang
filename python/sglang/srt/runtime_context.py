@@ -864,11 +864,11 @@ class RuntimeContext:
         name (the keyed-lazy pattern of the persistent buffers). Creation is
         a driver call that must stay outside cuda-graph capture — call sites
         lease their stream at init/warmup time."""
+        from sglang.srt.arg_groups.overrides import resolution_result
+
         stream = self.resources.streams.get(name)
         if stream is None:
             import torch
-
-            from sglang.srt.arg_groups.overrides import resolution_result
 
             device = (
                 resolution_result(self._server_args, "device")

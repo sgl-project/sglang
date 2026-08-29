@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolved_view,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -37,7 +38,7 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
 
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
-    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -279,7 +280,7 @@ def handle_page_major_kv_layout(server_args: Any):
     # The unified pool stores state in the page-major envelope-strided layout, so
     # enabling it implies --enable-page-major-kv-layout — routing it through the
     # single page-major path + stride-aware Triton asserts (set before the guard).
-    from sglang.srt.arg_groups.overrides import attention_backends_of, use_mla_backend
+    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
