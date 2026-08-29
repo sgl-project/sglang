@@ -4,7 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8MoEMethod,
+    _is_cuda,
+    _is_gfx95_supported,
+    _is_hip,
+    is_sm100_supported,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
@@ -19,8 +25,12 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 class TestMxfp8MoeScaleLayout(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA is not available")
+        if not (
+            (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
+        ):
+            raise unittest.SkipTest(
+                "MXFP8 MoE quantization requires SM100 or ROCm gfx95"
+            )
 
     def test_cutlass_serialized_scales_remain_expert_first(self):
         class CutlassBackend:
