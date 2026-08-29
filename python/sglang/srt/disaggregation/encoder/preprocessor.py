@@ -127,7 +127,7 @@ class EncoderPreprocessor:
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
             use_image_processor_gpu
-            and resolve_image_processor_backend(server_args) != "pil"
+            and resolve_image_processor_backend(get_mm()) != "pil"
         )
 
         self._load_mm_processor(server_args)
@@ -158,7 +158,7 @@ class EncoderPreprocessor:
     def _load_mm_processor(self, server_args: ServerArgs):
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
-        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_backend = resolve_image_processor_backend(get_mm())
         image_processor_kwargs = (
             {}
             if image_processor_backend == "auto"
@@ -167,7 +167,7 @@ class EncoderPreprocessor:
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
                 **image_processor_kwargs,
             )
@@ -178,7 +178,7 @@ class EncoderPreprocessor:
         try:
             self.video_processor = AutoVideoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
             )
         except Exception as e:
@@ -188,7 +188,7 @@ class EncoderPreprocessor:
         try:
             _audio_proc = AutoProcessor.from_pretrained(
                 get_serving().tokenizer_path or get_model().model_path,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
             )
             if not hasattr(_audio_proc, "feature_extractor"):

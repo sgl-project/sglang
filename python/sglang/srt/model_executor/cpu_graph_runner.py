@@ -40,7 +40,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_exec,
     get_flags,
     get_lora,
@@ -282,9 +281,9 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        # TODO: the kernel aliases query/key for 2D and 4D but allocates for 3D,
-        # which no schema expresses; an accurate fake needs it to pick one
-        return torch.empty_like(query), torch.empty_like(key)
+        if query.ndim == 3:
+            return torch.empty_like(query), torch.empty_like(key)
+        return query, key
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
@@ -599,10 +598,10 @@ class CPUGraphRunner:
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
@@ -610,9 +609,9 @@ class CPUGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         self.dp_size = get_parallel().dp_size
-        self.pp_size = configured_pp_size()
+        self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
