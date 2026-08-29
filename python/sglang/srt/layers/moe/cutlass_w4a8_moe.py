@@ -423,8 +423,6 @@ def cutlass_w4a8_moe_deepep_normal(
     # combine, so this rank-local reduction must remain unscaled.
     hidden_size = c2.shape[1]
     if _is_cuda and deepep_post_reorder_gluon_kernel is not None:
-        # Tuned on H200 (hidden 7168/3584, bf16, topk 2-16); within ~7% of
-        # the per-shape best everywhere measured. See PR #22426 for the sweep.
         BLOCK_SIZE = 512 if (num_tokens <= 16 or hidden_size <= 4096) else 1024
         NUM_WARPS = 4
         grid = (num_tokens, (hidden_size + BLOCK_SIZE - 1) // BLOCK_SIZE)

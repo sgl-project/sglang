@@ -21,7 +21,7 @@ if _is_cuda or _is_musa:
 
 import triton.language as tl
 
-try:  # Gluon ships with Triton >= 3.4; vendor forks (e.g. MUSA) may lack it.
+try:
     from triton.experimental import gluon
     from triton.experimental.gluon import language as gl
 
@@ -155,8 +155,6 @@ if _has_gluon:
 
     @lru_cache(maxsize=None)
     def gluon_post_reorder_layout(block_size: int, num_warps: int):
-        # 1-D blocked layout, contiguous elements per lane; the 32-thread warp
-        # size is why this kernel is registered CUDA-only.
         return gl.BlockedLayout(
             [block_size // (32 * num_warps)], [32], [num_warps], [0]
         )
@@ -174,14 +172,6 @@ if _has_gluon:
         TOPK: gl.constexpr,
         layout: gl.constexpr,
     ):
-        """Gluon variant of deepep_post_reorder_triton_kernel.
-
-        Launch on a 2-D grid (num_tokens, cdiv(hidden_size, BLOCK_SIZE)):
-        splitting hidden across programs keeps the GPU occupied at small
-        token counts, where the 1-D per-token grid starves it.
-        Zero-filled predicated loads make d_k == 0 when dst_k < 0, so the
-        dst_k >= 0 branch disappears and mul+add fuses into fma.rn.bf16x2.
-        """
         InDtype = down_output_ptr.dtype.element_ty
 
         src_idx = gl.program_id(0)
@@ -195,14 +185,10 @@ if _has_gluon:
 
         acc = gl.zeros([BLOCK_SIZE], dtype=InDtype, layout=layout)
         for k in range(TOPK):
-            # int64 is load-bearing: dst_k * hidden_size overflows int32 past
-            # 2**31 elements and corrupts silently (no fault).
             dst_k = gl.load(s2d + k).to(gl.int64)
             w_k = gl.load(tw + k).to(InDtype)
             if routed_scaling_factor != 1.0:
                 w_k = w_k * routed_scaling_factor
-            # other=0.0 pins masked lanes to 0 by contract (dst_k < 0 rows
-            # must add 0); without it the language leaves them undefined.
             d_k = gl.load(
                 down_output_ptr + dst_k * hidden_size + offset,
                 mask=mask & (dst_k >= 0),

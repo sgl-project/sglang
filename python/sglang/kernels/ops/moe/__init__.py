@@ -175,8 +175,6 @@ for _mod, _fn in _PHASE25_TRITON_KERNELS:
     )
 del _mod, _fn
 
-# Gluon variant of the DeepEP post-reorder reduction; its blocked layout
-# hardcodes 32-thread warps, so it is CUDA-only. Import it from its module.
 register_kernel(
     KernelSpec(
         op="moe.deepep_post_reorder_gluon_kernel",
