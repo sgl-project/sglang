@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
     _dllm_overlap_disable,
     _dllm_page_size,
     declare_resolution,
+    model_config_of,
     resolving_view,
     run_post_process_pass,
 )
@@ -49,6 +50,23 @@ def handle_dllm_inference(server_args: Any):
                     cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                 ),
             )
+
+    cfg = resolving_view(server_args)
+    architectures = model_config_of(server_args).hf_config.architectures
+    if (
+        "DreamModel" in architectures
+        and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+    ):
+        logger.warning(
+            "Decode CUDA graph is disabled because Dream requires full per-request prefill."
+        )
+        declare_resolution(
+            server_args,
+            "_handle_dllm_inference",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
 
     run_post_process_pass(server_args, _dllm_attention_backend)
     run_post_process_pass(server_args, _dllm_overlap_disable)
