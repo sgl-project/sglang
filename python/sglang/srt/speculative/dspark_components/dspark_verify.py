@@ -141,8 +141,6 @@ class TargetVerifyExecutor:
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
-        # accept_draft_tokens dispatches on is_all_greedy: the greedy kernel is
-        # deterministic, the sampling one draws rejection coins.
         site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
             if sampling_info is None or sampling_info.is_all_greedy

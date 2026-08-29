@@ -14,31 +14,28 @@ logger = logging.getLogger(__name__)
 class SpecTpSyncSite(IntEnum):
     """Every place a speculative step broadcasts a decision from rank 0.
 
-    Enumerated rather than grouped: any grouping is itself a claim about which
-    sites share a cause, and that claim is what we are trying to establish. Each
-    site has a stable number and slug so coverage can be bisected under live
-    traffic through ``SGLANG_SPEC_TP_SYNC``.
+    Number and slug are the stable handles ``SGLANG_SPEC_TP_SYNC`` selects by.
     """
 
     # -- DSpark --
-    DSPARK_MEM = 1  # free-memory probe gating capture and folded sampling
-    DSPARK_DRAFT_GREEDY = 2  # eager argmax over draft step logits
-    DSPARK_DRAFT_SAMPLE = 3  # eager SampleStepTokens, freshly drawn noise
-    DSPARK_DRAFT_MULTINOMIAL = 4  # eager multinomial mixed with argmax
-    DSPARK_GRAPH_SAMPLE = 5  # SampleStepTokens on in-graph philox noise
-    DSPARK_GRAPH_GREEDY = 6  # argmax inside the captured draft graph
-    DSPARK_PLAN = 7  # per-step verify-length schedule
-    DSPARK_ACCEPT_GREEDY = 8  # AcceptGreedy correct_len/bonus/cap_trim
-    DSPARK_ACCEPT_SAMPLE = 9  # AcceptSampling correct_len/bonus/cap_trim
-    DSPARK_ACCEPT_GRAPH = 10  # accept_greedy_triton in the verify epilogue
-    DSPARK_TARGET = 11  # target-model sampled tokens
+    DSPARK_MEM = 1  # gates both graph capture and folded sampling
+    DSPARK_DRAFT_GREEDY = 2
+    DSPARK_DRAFT_SAMPLE = 3
+    DSPARK_DRAFT_MULTINOMIAL = 4
+    DSPARK_GRAPH_SAMPLE = 5  # in-graph philox, redrawn per replay
+    DSPARK_GRAPH_GREEDY = 6
+    DSPARK_PLAN = 7
+    DSPARK_ACCEPT_GREEDY = 8
+    DSPARK_ACCEPT_SAMPLE = 9
+    DSPARK_ACCEPT_GRAPH = 10
+    DSPARK_TARGET = 11
 
     # -- DFlash --
-    DFLASH_MEM = 12  # free-memory probe gating capture
-    DFLASH_SELECTOR = 13  # selector accept_len/bonus
-    DFLASH_ACCEPT_SAMPLE = 14  # sampling-verify accept_len/bonus
-    DFLASH_ACCEPT_GREEDY = 15  # argmax over target logits
-    DFLASH_TARGET = 16  # target-model sampled tokens
+    DFLASH_MEM = 12
+    DFLASH_SELECTOR = 13
+    DFLASH_ACCEPT_SAMPLE = 14
+    DFLASH_ACCEPT_GREEDY = 15
+    DFLASH_TARGET = 16
 
     @property
     def slug(self) -> str:
@@ -47,8 +44,7 @@ class SpecTpSyncSite(IntEnum):
 
 _ALL = frozenset(SpecTpSyncSite)
 _INIT = frozenset({SpecTpSyncSite.DSPARK_MEM, SpecTpSyncSite.DFLASH_MEM})
-# Sites whose value is drawn from the RNG, so they can differ across ranks even
-# with bit-identical logits and deterministic kernels.
+# Sites that draw from the RNG, so they can differ under identical logits.
 _RNG = frozenset(
     {
         SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
@@ -66,7 +62,7 @@ _PRESETS = {
     "all": _ALL,
     "off": frozenset(),
     "none": frozenset(),
-    # The one measured per-rank input. Never drop it except to test it.
+    # The one input measured to differ across ranks.
     "init": _INIT,
     "rng": _INIT | _RNG,
 }
@@ -89,9 +85,7 @@ def _resolve(name: str) -> frozenset[SpecTpSyncSite]:
 
 
 def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
-    """Parse ``SGLANG_SPEC_TP_SYNC``: comma-separated preset names, site slugs or
-    site numbers, each negatable with a leading ``-`` -- ``all,-dspark-plan,-6``.
-    Underscores in a slug are accepted for its enum spelling."""
+    """Parse ``SGLANG_SPEC_TP_SYNC``; see its comment in environ.py for the syntax."""
     sites: frozenset[SpecTpSyncSite] = frozenset()
     for token in spec.replace(" ", "").replace("_", "-").lower().split(","):
         if not token:
@@ -103,11 +97,7 @@ def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
 
 
 class SpecTpSync:
-    """Broadcasts a speculative decision from rank 0 to its TP group.
-
-    Which sites broadcast is set by ``SGLANG_SPEC_TP_SYNC`` so coverage can be
-    narrowed under live traffic to find where ranks actually diverge.
-    """
+    """Broadcasts a speculative decision from rank 0 to its TP group."""
 
     def __init__(self, tp_group) -> None:
         self._tp_group = tp_group
@@ -129,8 +119,7 @@ class SpecTpSync:
         return values
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
-        """Free GPU memory for a capture decision, reduced to the group minimum
-        when ``site`` is enabled so that every rank decides identically."""
+        """Free GPU memory, reduced to the group minimum when ``site`` is on."""
         distributed = self.enabled(site) and group.world_size > 1
         return get_available_gpu_memory(
             device,
