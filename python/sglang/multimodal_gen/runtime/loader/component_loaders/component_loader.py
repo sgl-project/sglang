@@ -554,6 +554,11 @@ class ComponentLoader(ABC):
 class PlainStateDictComponentLoader(ComponentLoader):
     """Base for native loaders whose current materializer expects plain weights."""
 
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_precisions.get(component_name)
+
     @staticmethod
     def ensure_plain_state_dict_checkpoint(config: object, component_name: str) -> None:
         try:

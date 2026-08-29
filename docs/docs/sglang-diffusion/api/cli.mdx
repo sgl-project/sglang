@@ -168,9 +168,9 @@ their exact overlays are kept in one
 [MiniMax-H3 compatibility table](/cookbook/diffusion/MiniMax/MiniMax-H3#checkpoint-and-adapter-formats).
 
 Exact precision overrides are capability-based. Native text and image encoders,
-plus standard video/image VAEs, support them today; other component loaders
-reject the option instead of accepting a dtype that their execution stage would
-not honor.
+standard video/image VAEs, and native plain-state components support them;
+other component loaders reject the option instead of accepting a dtype that
+their execution stage would not honor.
 
 Component overrides accept a local component directory, a standalone Hub
 repository, or a Hub component subfolder written as `owner/repo/subfolder`.

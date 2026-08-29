@@ -34,6 +34,13 @@ class _TestLoader(PlainStateDictComponentLoader):
 
 
 class TestComponentQuantizationAdmission(unittest.TestCase):
+    def test_plain_loader_admits_its_exact_precision(self):
+        server_args = SimpleNamespace(component_precisions={"vocoder": "fp16"})
+
+        self.assertEqual(
+            _TestLoader().component_load_precision(server_args, "vocoder"), "fp16"
+        )
+
     def test_plain_loader_resolves_weights_separately_from_config(self):
         server_args = SimpleNamespace(
             component_weights_paths={"vocoder": "owner/repo/vocoder.safetensors"}
