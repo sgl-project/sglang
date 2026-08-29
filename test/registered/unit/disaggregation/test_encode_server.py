@@ -241,12 +241,21 @@ class TestEncoderDelivery(CustomTestCase):
         try:
             import grpc
             from smg_grpc_proto import sglang_encoder_pb2
-
-            from sglang.srt.disaggregation.encoder.grpc_server import (
-                SGLangEncoderServer,
-            )
-        except Exception as e:
+        except ImportError as e:
             raise unittest.SkipTest(f"gRPC test dependencies unavailable: {e}") from e
+        except Exception as e:
+            # Generated protobuf modules raise VersionError when the runner's
+            # protobuf runtime is older than the code generator.
+            if type(e).__name__ != "VersionError":
+                raise
+            raise unittest.SkipTest(f"gRPC test dependencies unavailable: {e}") from e
+
+        # Import SGLang outside the dependency guard. Product-code import
+        # failures are regressions and must fail the test instead of skipping.
+        from sglang.srt.disaggregation.encoder.grpc_server import (
+            SGLangEncoderServer,
+        )
+
         return grpc, sglang_encoder_pb2, SGLangEncoderServer
 
     def test_remote_preprocess_failure_stops_all_tp_ranks_before_forward(self):
