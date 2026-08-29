@@ -18,6 +18,9 @@ def _domino_gru_cell(
     )
 
 _DOMINO_CANDIDATE_POOL_SIZE = 2048
+# Throughput policy for the logical full-vocabulary tensor. TP>1 uses the
+# compact candidate pool when this gathered representation would be large.
+_DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES = 96 * 1024 * 1024
 
 
 def _domino_tp_first_ids(
