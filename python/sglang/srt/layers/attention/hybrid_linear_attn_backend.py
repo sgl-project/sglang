@@ -90,6 +90,51 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_extend_query_start_loc: Optional[torch.Tensor] = None
         self.conv_states_shape: tuple[int, int] = None
+        # The PREFILL graph captures BEFORE the decode runner runs, and only the
+        # decode runner calls init_cuda_graph_state -- so anything a captured
+        # prefill kernel reads must already be sized here, in __init__.
+        self._alloc_extend_query_start_loc_buf()
+
+    def _graph_state_max_bs(self) -> int:
+        """Upper bound on the request-axis for BOTH graph phases.
+
+        ``req_to_token_pool.size`` is the prefill runner's ``max_bs``; the decode
+        runner's is its largest capture bs. Size the shared static buffers to the
+        max of the two once, because growing one after a graph captured it moves
+        the address that graph reads.
+        """
+        bounds = [self.req_to_token_pool.size]
+        try:
+            cfg = get_exec().graph.cuda_graph_config
+        except Exception:
+            # Guard tests construct backends without a published exec bag; the
+            # request-pool size alone still bounds every real batch.
+            cfg = None
+        if cfg is not None:
+            bounds.append(cfg.decode.max_bs or 0)
+            bounds.extend(cfg.decode.bs or [])
+        return max(bounds)
+
+    def _alloc_extend_query_start_loc_buf(self, max_bs: Optional[int] = None) -> None:
+        """Size the extend cu-seqlens buffer once, before any capture.
+
+        Extend needs a stable address once the PREFILL graph is captured: the
+        cu-seqlens are per-batch data, not an arange like decode's, so a kernel
+        reading them from inside a graph would bake a per-step temporary that is
+        freed (and its storage recycled) the moment capture ends.
+        """
+        if max_bs is None:
+            max_bs = self._graph_state_max_bs()
+        buf = self.cached_cuda_graph_extend_query_start_loc
+        if buf is not None and buf.shape[0] >= max_bs + 1:
+            return
+        assert buf is None, (
+            f"extend query_start_loc buffer must be sized before any graph "
+            f"capture: have {buf.shape[0] - 1}, need {max_bs}"
+        )
+        self.cached_cuda_graph_extend_query_start_loc = torch.empty(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
 
     @property
     def mamba_chunk_size(self) -> int:
@@ -508,12 +553,9 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # Extend needs a stable address once the PREFILL graph is captured: the
-        # cu-seqlens are per-batch data, not an arange like decode's, so a kernel
-        # reading them from inside a graph would bake a per-step temporary.
-        self.cached_cuda_graph_extend_query_start_loc = torch.empty(
-            (max_bs + 1,), dtype=torch.int32, device=self.device
-        )
+        # Already sized in __init__ (the prefill graph captures first and never
+        # calls this hook); grow-only, never re-bound at the same size.
+        self._alloc_extend_query_start_loc_buf(max_bs)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (

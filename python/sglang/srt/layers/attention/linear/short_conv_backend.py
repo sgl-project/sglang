@@ -136,6 +136,12 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         if self.enable_mamba_extra_buffer:
             self._init_track_state(model_runner.server_args, mamba_cache)
 
+        # Same address-stability requirement as the base's extend cu-seqlens:
+        # a fused extend conv reads the slot ids and the prefix mask from inside
+        # the captured PREFILL graph, and the prefill graph never calls
+        # init_cuda_graph_state (only the decode runner does, and it runs after).
+        self._alloc_cache_indices_buf(self._graph_state_max_bs())
+
     def _init_track_state(self, server_args, mamba_cache) -> None:
         """Validate + precompute the radix track plumbing (extra_buffer only).
 
@@ -147,7 +153,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         """
         # The prefill-CUDA-graph and speculative-decoding refusals are pure
         # config combinations, so they live in
-        # ServerArgs._validate_mamba_extra_buffer, which reads the resolving
+        # mamba_hook.validate_mamba_extra_buffer, which reads the resolving
         # view rather than this supplied record.
         chunk = server_args.mamba_cache_chunk_size
         max_window = max(self.conv_window_lens)
@@ -410,6 +416,12 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         Call once per conv layer on the extend path; the state slot the conv
         itself writes is a different row, so before-or-after is equivalent. A
         no-op unless this step tracks something.
+
+        Eager only, unlike :meth:`track_conv_states_decode`. The row count is
+        ``mamba_track_mask.sum()``, and the fixed-shape alternative (Inkling's
+        ``_refresh_track_conv_indices``) needs a request axis padded to a
+        capture bound, which only the Full prefill backend supplies and this
+        backend has no metadata path for. ``mamba_hook`` refuses the pairing.
         """
         index_list = self._track_conv_indices
         if index_list is None:
