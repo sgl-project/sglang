@@ -32,6 +32,15 @@ on:
         description: "Overlay output suffix appended to the base tag. EMPTY = overwrite the base tag(s); non-empty = append (e.g. 'msa')."
         required: false
         default: ""
+      overlay_only:
+        description: "Skip the base build; overlay directly FROM the already-published base tag on Docker Hub."
+        required: false
+        type: boolean
+        default: false
+      overlay_platforms:
+        description: "Platforms for the overlay image (default 'linux/amd64,linux/arm64'). E.g. 'linux/arm64' for an arm64-only target."
+        required: false
+        default: "linux/amd64,linux/arm64"
   schedule:
     - cron: "0 0 * * *"
 
@@ -140,7 +149,7 @@ jobs:
 
   build-and-publish:
     needs: prepare
-    if: ${{ !inputs.build_only }}
+    if: ${{ !inputs.build_only && !inputs.overlay_only }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
@@ -219,13 +228,18 @@ jobs:
 
   build-overlay:
     needs: [prepare, build-and-publish]
-    if: ${{ !inputs.build_only && inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' }}
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && !inputs.build_only && inputs.overlay_dockerfile != '' && github.repository == 'sgl-project/sglang' && (inputs.overlay_only || needs.build-and-publish.result == 'success') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         cuda: ${{ fromJson(needs.prepare.outputs.overlay_cudas_json) }}
     steps:
+      - name: Free runner disk space (base image needs the room)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -256,7 +270,7 @@ jobs:
           OUT_ARGS=""
           for o in "${OUTS[@]}"; do OUT_ARGS="$OUT_ARGS -t $REPO:$o"; done
           docker buildx build \
-            --platform linux/amd64,linux/arm64 \
+            --platform ${{ inputs.overlay_platforms || 'linux/amd64,linux/arm64' }} \
             -f Dockerfile.overlay \
             $OUT_ARGS \
             --push .
