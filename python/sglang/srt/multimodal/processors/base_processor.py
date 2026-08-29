@@ -860,9 +860,12 @@ class BaseMultimodalProcessor(ABC):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
-                if discard_alpha_channel and img.mode != "RGB":
-                    return img.convert("RGB")
-                img.load()
+                try:
+                    if discard_alpha_channel and img.mode != "RGB":
+                        return img.convert("RGB")
+                    img.load()
+                except OSError as e:
+                    raise ValueError(f"Could not decode image: {e}") from e
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
