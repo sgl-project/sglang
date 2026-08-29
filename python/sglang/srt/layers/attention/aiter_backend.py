@@ -1270,21 +1270,21 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
+                kv_indices, kv_indptr, qo_indptr, _ = (
+                    forward_batch.spec_info.generate_attn_arg_prefill(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.seq_lens_sum,
+                        self.req_to_token,
+                    )
                 )
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    forward_batch.spec_info.num_tokens_per_req,
+                    max_kv_len,
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -2592,7 +2592,7 @@ class AiterAttnBackend(AttentionBackend):
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    cu_seqlens_q=self.qo_indptr[: bs + 1],
+                    cu_seqlens_q=self.forward_metadata.qo_indptr,
                     seqused_k=seqused_k,
                     max_seqlen_q=self.forward_metadata.max_q_len,
                     max_seqlen_k=pt.shape[1] * self.page_size,
