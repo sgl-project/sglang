@@ -72,8 +72,9 @@ class MediaSnapshot:
 
 
 def _snapshot_pil(image: Image.Image) -> MediaSnapshot:
-    snapshot = image.copy()
-    snapshot.load()
+    from sglang.srt.utils import fully_load_pil_image
+
+    snapshot = fully_load_pil_image(image).copy()
     payload = snapshot.tobytes()
     palette = snapshot.palette.tobytes() if snapshot.palette is not None else b""
     palette_mode = (

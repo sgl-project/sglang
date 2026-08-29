@@ -1854,7 +1854,29 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except (OSError, SyntaxError) as e:
+        if isinstance(e, OSError) and e.errno is not None:
+            raise
+        raise ValueError(f"Could not decode image: {e}") from e
+    return fully_load_pil_image(image)
+
+
+def fully_load_pil_image(
+    image: Image.Image, *, mode: Optional[str] = None
+) -> Image.Image:
+    """Eagerly decode a PIL image and classify malformed client media."""
+    try:
+        image.load()
+        if mode is not None and image.mode != mode:
+            image = image.convert(mode)
+            image.load()
+    except (OSError, SyntaxError) as e:
+        if isinstance(e, OSError) and e.errno is not None:
+            raise
+        raise ValueError(f"Could not decode image: {e}") from e
+    return image
 
 
 def load_image(
@@ -1871,7 +1893,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)

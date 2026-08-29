@@ -11,7 +11,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import load_image
+from sglang.srt.utils import fully_load_pil_image, load_image
 
 
 def _first_attr(obj, names: tuple[str, ...], default=None):
@@ -102,9 +102,7 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         images = []
         for data in image_data:
             img, _ = load_image(data)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            images.append(img)
+            images.append(fully_load_pil_image(img, mode="RGB"))
         return images
 
     def _apply_hf_processor(self, text: str, images=None, videos=None):

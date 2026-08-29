@@ -42,7 +42,7 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
-from sglang.srt.utils import load_image
+from sglang.srt.utils import fully_load_pil_image, load_image
 
 
 @runtime_checkable
@@ -155,11 +155,8 @@ class MediaArtifactCacheMixin:
         if isinstance(data, np.ndarray):
             return torch.from_numpy(data)
         if isinstance(data, Image.Image):
-            data.load()
-            return data
+            return fully_load_pil_image(data)
         image, _ = load_image(data, self.gpu_image_decode)
-        if isinstance(image, Image.Image):
-            image.load()
         return image
 
     def snapshot_media_source(self, source: Any, modality: Modality) -> MediaSnapshot:
