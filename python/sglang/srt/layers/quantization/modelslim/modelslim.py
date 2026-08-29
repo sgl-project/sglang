@@ -451,8 +451,7 @@ class ModelSlimConfig(QuantizationConfig):
 
         for projection_names in naming_conventions:
             projection_prefixes = [
-                f"{prefix}.0.{projection_name}"
-                for projection_name in projection_names
+                f"{prefix}.0.{projection_name}" for projection_name in projection_names
             ]
             if all(
                 projection_prefix + ".weight" in self.quant_description
