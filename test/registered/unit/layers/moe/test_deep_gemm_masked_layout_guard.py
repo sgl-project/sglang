@@ -1,6 +1,3 @@
-"""Guard: clamped/swizzled MoE activations must not select the masked layout
-when the DSV4 JIT masked kernel cannot serve their shape or quant group."""
-
 import sys
 
 import pytest
@@ -53,7 +50,6 @@ def _hidden(rows=8, hidden=64):
 
 
 def test_clamp_with_d_div_8_below_experts_forces_compact(caplog):
-    # Hy4 at TP8: D = 2048 / 8 = 256, E = 256 -> D // 8 = 32 < 256.
     with caplog.at_level("INFO", logger=deep_gemm.__name__):
         assert not _should_use_masked_standard_layout(
             _config(d=256, e=256, swiglu_limit=10.0),
@@ -64,7 +60,6 @@ def test_clamp_with_d_div_8_below_experts_forces_compact(caplog):
 
 
 def test_clamp_with_group32_mxfp8_forces_compact():
-    # D // 8 >= E holds here; the group-32 static_assert alone must suffice.
     assert not _should_use_masked_standard_layout(
         _config(d=2048, e=256, swiglu_limit=10.0),
         _quant_info(d=2048, e=256, block_shape=[1, 32]),
@@ -73,7 +68,6 @@ def test_clamp_with_group32_mxfp8_forces_compact():
 
 
 def test_clamp_with_supported_shape_keeps_masked():
-    # DSV4-style TP1 shape: D // 8 = 256 >= E, group 128 -> guard must not fire.
     assert _should_use_masked_standard_layout(
         _config(d=2048, e=256, swiglu_limit=10.0),
         _quant_info(d=2048, e=256, block_shape=[128, 128]),

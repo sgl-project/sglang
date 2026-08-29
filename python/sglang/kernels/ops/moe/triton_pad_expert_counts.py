@@ -1,9 +1,3 @@
-"""Pad per-expert token counts for the DeepGEMM contiguous layout.
-
-One CTA rounds the counts, casts to int32, and adjusts the trailing segment so
-the graph-static total is preserved exactly.
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -33,7 +27,6 @@ def _pad_expert_counts_kernel(
 def pad_expert_counts(
     counts: torch.Tensor, block_e: int, all_tokens: int
 ) -> torch.Tensor:
-    """int32 per-expert counts rounded up to ``block_e``, summing to ``all_tokens``."""
     ne = counts.numel()
     out = torch.empty(ne, dtype=torch.int32, device=counts.device)
     _pad_expert_counts_kernel[(1,)](

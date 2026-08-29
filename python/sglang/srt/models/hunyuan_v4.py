@@ -6,8 +6,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-logger = logging.getLogger(__name__)
-
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
@@ -33,6 +31,8 @@ from sglang.srt.models.deepseek_v2 import (
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import BumpAllocator, get_device_capability, is_cuda
+
+logger = logging.getLogger(__name__)
 
 
 def _hpc_ihc_available(op_name: str, hc_mult: int, hidden_size: int) -> bool:
@@ -371,7 +371,6 @@ class HYV4Attention(DeepseekV2AttentionMLA):
     def _resolve_gate_backend(
         self, gating_type: str | None, fallback_backend: str
     ) -> str:
-        """Select hpc, Triton, or eager for the MLA output gate."""
         weight = getattr(self.linear_gate, "weight", None)
         if self._hpc_gated_mla_supported(
             gating_type,
@@ -392,7 +391,6 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         local_gate_width: int,
         hidden_size: int,
     ) -> bool:
-        """Check whether ``hpc.gated_mla_gemm`` supports this model shard."""
         try:
             import hpc
         except ImportError:
@@ -484,7 +482,6 @@ class HYV4Attention(DeepseekV2AttentionMLA):
         return self.linear_gate(hidden_states)[0]
 
     def apply_attention_output_gate(self, attn_out, gate):
-        """Apply the MLA output gate. ``gate`` is whatever prepare returned."""
         if self._gate_backend == "hpc" and self._hpc_gated_mla_inputs_supported(
             gate, attn_out
         ):

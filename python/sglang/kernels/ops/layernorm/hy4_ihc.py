@@ -1,11 +1,3 @@
-"""Fused kernels for the HYV4 iHC layers.
-
-The pre path splits the flat reduction into BLOCK_K tiles, then replays the
-partials in ascending order before reducing the hc channels. This exposes
-parallelism for decode while preserving the in-tree kernel's fp32 accumulation
-order. The optional hpc-ops path has its own accumulation order.
-"""
-
 from __future__ import annotations
 
 import functools
@@ -25,7 +17,6 @@ _HPC_IHC_HIDDEN_SIZES = (4096, 6144)
 
 @functools.lru_cache(maxsize=None)
 def _hpc_ihc_op(op_name: str, hc_mult: int, hidden_size: int):
-    """Return a compatible hpc iHC op, or ``None`` for the Triton fallback."""
     try:
         import hpc
     except ImportError:
@@ -221,7 +212,6 @@ def fused_hy4_ihc_pre(
     rms_weight: torch.Tensor | None = None,
     rms_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused HYV4HCPreLayer: returns (y (T, hidden) x.dtype, post (T, hc) fp32)."""
     assert x.dim() == 3, f"x must be 3D (T, hc_mult, hidden_size), got {x.shape}"
     assert hc_fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32 and hc_base.dtype == torch.float32
@@ -277,7 +267,7 @@ def fused_hy4_ihc_pre(
         BLOCK_K=BLOCK_K,
         PART_STRIDE=part_stride,
         num_warps=8,
-        # eager rounds the fp32 product before the sum; FMA contraction would not
+        # Disable FMA: eager rounds the fp32 product before summation.
         enable_fp_fusion=False,
     )
     _hy4_ihc_pre_stage2[(T, triton.cdiv(hidden_size, BLOCK_D))](
@@ -315,7 +305,6 @@ def fused_hy4_ihc_post(
     residual: torch.Tensor,
     post: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused HYV4HCLayer.post: (T, hc, hidden) in output.dtype."""
     assert output.dim() == 2, f"output must be 2D (T, hidden_size), got {output.shape}"
     assert post.dtype == torch.float32
 

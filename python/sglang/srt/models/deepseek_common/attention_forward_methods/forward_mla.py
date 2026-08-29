@@ -928,11 +928,8 @@ class DeepseekMLAForwardMixin:
                 self, attn_output, attn_bmm_output
             )
         if attention_output_gate is not None:
-            # Models that build the gate (currently HYV4) may also own how it is
-            # applied, so they can fuse the sigmoid and the product -- or the
-            # gate projection itself -- into one kernel. Bailing's gate arrives
-            # pre-sigmoided and goes through its own _apply_gated. Everyone
-            # else keeps the eager form.
+            # HYV4 owns gate construction/application; Bailing's pre-sigmoided
+            # gate continues through its existing _apply_gated path.
             apply_gate = getattr(self, "apply_attention_output_gate", None)
             if apply_gate is not None:
                 attn_bmm_output = apply_gate(attn_bmm_output, attention_output_gate)

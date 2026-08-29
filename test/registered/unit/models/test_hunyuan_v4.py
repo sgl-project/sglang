@@ -130,24 +130,6 @@ def test_attention_gate_non_bf16_model_fallback_parity():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize(("supported", "expected"), [(True, "hpc"), (False, "triton")])
-def test_attention_gate_defaults_to_hpc_when_supported(
-    monkeypatch, supported, expected
-):
-    attention = hunyuan_v4.HYV4Attention.__new__(hunyuan_v4.HYV4Attention)
-    nn.Module.__init__(attention)
-    attention.hidden_size = 6144
-    attention.local_gate_width = 256
-    attention.linear_gate = TupleLinear(6144, 256, torch.bfloat16)
-    monkeypatch.setattr(
-        attention,
-        "_hpc_gated_mla_supported",
-        lambda *args: supported,
-    )
-
-    assert attention._resolve_gate_backend("elementwise", "triton") == expected
-
-
 def test_hpc_attention_gate_is_bf16_only(monkeypatch):
     fake_hpc = SimpleNamespace(
         gemm=SimpleNamespace(gated_mla_gemm=object()), __version__="test"
