@@ -605,8 +605,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        pp_proxy_tensors = self._next_pp_proxy_tensors
+        if pp_proxy_tensors is None:
+            pp_proxy_tensors = self._next_pp_proxy_tensors
         self._next_pp_proxy_tensors = None
 
         if self._is_lifecycle_only_pp_prefill_rank:
