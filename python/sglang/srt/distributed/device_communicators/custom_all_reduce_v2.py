@@ -11,11 +11,10 @@ The CUDA side is split into independent pieces:
   all-reduce tensors that are not symmetric memory, so it stages them
   through; the K3 fused collectives bring their own symmetric input and
   borrow the semaphores alone.
-- the gather handle: an alias of ``PushPlane``, used by ``2shot_push`` for
-  the all-gather half of its reduce-scatter. Sharing the handle also shares
-  the epoch counter, so both algorithms advance the double buffer together.
-- ``Communicator``: the planes above (any may be absent), the handle every
-  kernel takes, plus the pull launch widths.
+- ``Communicator``: the two planes above (either may be absent), the handle
+  every kernel takes, plus the pull launch widths. ``2shot_push`` reaches its
+  all-gather region through the push plane, so it also shares that plane's
+  epoch counter: both push algorithms advance the double buffer together.
 - the all-reduce kernel: a pure function of ``(Communicator, input, algo,
   graph_params, use_multicast)`` with four algorithms (1shot_push /
   1shot_pull / 2shot_pull / 2shot_push) and three pull data sources (eager
@@ -289,8 +288,8 @@ class CustomAllReduceV2:
         :param max_two_shot_push_size: explicit ``2shot_push`` message ceiling,
                                  which may enlarge the shared push slots;
                                  overrides both the tuned size and
-                                 ``max_size``. ``0`` disables the algo and its
-                                 gather handle.
+                                 ``max_size``. ``0`` disables the algo and
+                                 leaves the slots at the 1shot_push size.
         :param max_pull_blocks: cap on the barrier plane's block count; ``0``
                                 builds a push-only instance.
         :param max_push_blocks: exact push grid width, overriding the tuned
@@ -422,7 +421,6 @@ class CustomAllReduceV2:
             counter=self._push_counter.view(-1, 1).view(torch.uint8),
             mc_workspace=mc_at(0),
         )
-        gather_plane = push_plane if self.two_shot_push_enabled else None
         pull_plane = None
         if self.pull_enabled:
             pull_plane = PullPlane(
@@ -436,7 +434,7 @@ class CustomAllReduceV2:
         if not self.has_multicast or not self.pull_enabled:
             self.config = self.config._replace(num_mc_blocks=None)
 
-        self.obj = Communicator(push=push_plane, pull=pull_plane, gather=gather_plane)
+        self.obj = Communicator(push=push_plane, pull=pull_plane)
         if self.pull_enabled:
             self.obj.set_pull_blocks(self.config.num_pull_blocks)
         if self.config.num_mc_blocks is not None:

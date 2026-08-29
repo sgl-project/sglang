@@ -90,7 +90,7 @@ struct LoadStoreImpl {
     return kWorldSize;
   }
   /// Templated on the params struct so the 2shot_push kernel, whose params carry
-  /// a gather plane as well, reuses the same peer table.
+  /// a gather workspace as well, reuses the same peer table.
   template <typename Params>
   SGL_DEVICE LoadStoreImpl(const Params& params, uint32_t vec_offset = 0) {
     if constexpr (kUseGraph) {
@@ -475,10 +475,13 @@ struct AllReduceKernel {
     using MC = MultiCastImpl<vec_t, kWorldSize, /*kUseGraph=*/false>;
     if (algo == "2shot_push") {
       CHECK_HOST(!use_multicast) << "2shot_push gathers through the shared push plane, not multimem";
-      const auto& gather = comm.get_gather_obj();
-      const uint32_t gather_blocks = gather.num_blocks;
+      // The all-gather half rides the 1shot_push plane, so it inherits that
+      // grid -- bound to the counter array -- and lands in slots that must
+      // have been sized to hold a shard (`get_workspace` checks that).
+      const auto& push = comm.get_push_obj();
+      const uint32_t gather_blocks = push.num_blocks;
       CHECK_HOST(gather_blocks <= pull.num_blocks)
-          << "gather plane is " << gather_blocks << " blocks wide but only " << pull.num_blocks
+          << "push plane is " << gather_blocks << " blocks wide but only " << pull.num_blocks
           << " pull semaphores back it";
       const auto gather_params = AllReduce2ShotPushParams<kWorldSize>{
           .output = out.data_ptr(),
@@ -486,7 +489,7 @@ struct AllReduceKernel {
           .rank = pull.rank,
           .graph_params = static_cast<void* const*>(graph_params),
           .ws = ws,
-          .gather = gather.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
+          .gather = push.get_workspace<kWorldSize>(div_ceil(nbytes, int64_t{kWorldSize})),
       };
       if (!use_graph) cuda_memcpy(local_workspace, in.data_ptr());
       const auto kernel = use_graph ? all_reduce_2shot_push_kernel<LS_GRAPH, T, kWorldSize, kUsePDL>
