@@ -31,25 +31,29 @@ def _fake_aiter_mhc_module(*, mhc_pre=None, mhc_post=None):
     }
 
 
-def test_aiter_mhc_gate_is_rocm_gfx95_only():
-    with (
-        patch.object(mhc, "is_hip", return_value=True),
-        patch.object(mhc, "is_gfx95_supported", return_value=True),
-        patch.object(mhc, "get_bool_env_var", return_value=True),
-        patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", False),
-    ):
-        assert mhc._use_aiter_mhc()
+def test_aiter_mhc_gate_supports_rocm_gfx942_and_gfx95():
+    for is_gfx942, is_gfx95 in ((True, False), (False, True)):
+        with (
+            patch.object(mhc, "is_hip", return_value=True),
+            patch.object(mhc, "is_gfx942_supported", return_value=is_gfx942),
+            patch.object(mhc, "is_gfx95_supported", return_value=is_gfx95),
+            patch.object(mhc, "get_bool_env_var", return_value=True),
+            patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", False),
+        ):
+            assert mhc._use_aiter_mhc()
 
-    for is_hip, is_gfx95, use_aiter in (
-        (False, True, True),
-        (True, False, True),
-        (True, True, False),
+    for is_hip, is_gfx942, is_gfx95, use_aiter, runtime_disabled in (
+        (False, True, False, True, False),
+        (True, False, False, True, False),
+        (True, True, False, False, False),
+        (True, True, False, True, True),
     ):
         with (
             patch.object(mhc, "is_hip", return_value=is_hip),
+            patch.object(mhc, "is_gfx942_supported", return_value=is_gfx942),
             patch.object(mhc, "is_gfx95_supported", return_value=is_gfx95),
             patch.object(mhc, "get_bool_env_var", return_value=use_aiter),
-            patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", False),
+            patch.object(mhc, "_AITER_MHC_RUNTIME_DISABLED", runtime_disabled),
         ):
             assert not mhc._use_aiter_mhc()
 

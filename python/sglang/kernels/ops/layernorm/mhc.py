@@ -16,7 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ def _use_aiter_mhc() -> bool:
     return (
         not _AITER_MHC_RUNTIME_DISABLED
         and is_hip()
-        and is_gfx95_supported()
+        and (is_gfx942_supported() or is_gfx95_supported())
         and get_bool_env_var("SGLANG_USE_AITER")
     )
 
@@ -84,7 +84,7 @@ def _try_aiter_mhc_pre(
         return None
 
     if not _AITER_MHC_ACTIVE_LOGGED:
-        logger.info("Using AITER gfx950 mHC pre/post kernels")
+        logger.info("Using AITER gfx9 mHC pre/post kernels")
         _AITER_MHC_ACTIVE_LOGGED = True
     return result
 
