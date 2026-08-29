@@ -41,7 +41,15 @@ class BaseEvictionResult(msgspec.Struct):
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
+    """One device-walk step.
+
+    ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
+    also covers an internal tombstone that returned no leaf, distinguishing it
+    from true walk exhaustion.
+    """
+
     node_id: Optional[NodeId] = None
+    made_progress: bool = False
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
@@ -230,8 +238,11 @@ class UnifiedTreeCoreInterface(ABC):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """The next evictable node (None node_id when the walk is exhausted);
-        tracker is the caller's running totals, read for the doneness check."""
+        """Advance one eviction step.
+
+        A missing ``node_id`` is exhausted only when ``made_progress`` is also
+        false. ``tracker`` is the caller's running totals, read for doneness.
+        """
         ...
 
     @abstractmethod
