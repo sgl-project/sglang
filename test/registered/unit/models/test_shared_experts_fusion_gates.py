@@ -200,6 +200,7 @@ class TestGlm5NextGate(_FusionGateCase):
         self,
         *,
         is_cuda=False,
+        use_aiter_gfx942=False,
         use_aiter_gfx95=False,
         device_sm=None,
         moe_ep_size=1,
@@ -210,6 +211,9 @@ class TestGlm5NextGate(_FusionGateCase):
         backend = SimpleNamespace(is_deepep=lambda: deepep)
         with (
             unittest.mock.patch.object(glm5_next, "_is_cuda", is_cuda),
+            unittest.mock.patch.object(
+                glm5_next, "_use_aiter_gfx942", use_aiter_gfx942
+            ),
             unittest.mock.patch.object(glm5_next, "_use_aiter_gfx95", use_aiter_gfx95),
             unittest.mock.patch.object(glm5_next, "_device_sm", device_sm),
             unittest.mock.patch.object(
@@ -222,7 +226,8 @@ class TestGlm5NextGate(_FusionGateCase):
                 moe_ep_size=moe_ep_size,
             )
 
-    def test_aiter_gfx95_enables_shared_expert_fusion(self):
+    def test_supported_aiter_rocm_paths_enable_shared_expert_fusion(self):
+        self.assertIsNone(self._reason_for_backend(use_aiter_gfx942=True))
         self.assertIsNone(self._reason_for_backend(use_aiter_gfx95=True))
 
     def test_unsupported_non_cuda_backend_disables_shared_expert_fusion(self):
@@ -238,13 +243,13 @@ class TestGlm5NextGate(_FusionGateCase):
     def test_expert_parallelism_still_disables_shared_expert_fusion(self):
         self.assertIn(
             "expert parallelism",
-            self._reason_for_backend(use_aiter_gfx95=True, moe_ep_size=2),
+            self._reason_for_backend(use_aiter_gfx942=True, moe_ep_size=2),
         )
 
     def test_deepep_still_disables_shared_expert_fusion(self):
         self.assertIn(
             "Deepep",
-            self._reason_for_backend(use_aiter_gfx95=True, deepep=True),
+            self._reason_for_backend(use_aiter_gfx942=True, deepep=True),
         )
 
 

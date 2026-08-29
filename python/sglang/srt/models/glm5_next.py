@@ -100,6 +100,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
+    _use_aiter,
     _use_aiter_gfx95,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -120,6 +121,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_gfx942_supported
 from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
@@ -136,6 +138,7 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 _GLM_AITER_FUSED_MHC_LOGGED = False
+_use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 
 
 @torch.compile
@@ -1400,7 +1403,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if not (_is_cuda or _use_aiter_gfx95):
+        if not (_is_cuda or _use_aiter_gfx942 or _use_aiter_gfx95):
             return (
                 "Shared experts fusion requires CUDA or the supported "
                 "AITER ROCm path."
