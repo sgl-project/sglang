@@ -3549,16 +3549,18 @@ class Scheduler(
                 # Buffer mode: surface a staged prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
                 # which consumption allocates and the request lock pins —
-                # uncharged, the batch alloc can OOM. Set AFTER
+                # uncharged, the batch alloc can OOM. Planned against the same
+                # live prefix admission uses, so only the splice-able span
+                # tail is charged and unusable holds are freed. Set AFTER
                 # init_next_round_input (which recomputes host_hit). Mamba
                 # (fenced in init_hicache) will need the same charge via
                 # mamba_host_hit_length.
-                held_tokens = self.tree_cache.staged_prefetch_tokens(req.rid)
+                held_tokens, held_swa_tokens = self.tree_cache.plan_staged_splice(
+                    req.rid, len(req.prefix_indices)
+                )
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
-                    req.swa_host_hit_length = (
-                        self.tree_cache.staged_prefetch_swa_tokens(req.rid)
-                    )
+                    req.swa_host_hit_length = held_swa_tokens
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
