@@ -674,6 +674,13 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    # Let an external E2E driver establish a balanced DP batch before health traffic.
+    if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
+        "/health",
+        "/health_generate",
+    ):
+        return Response(status_code=200)
+
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
