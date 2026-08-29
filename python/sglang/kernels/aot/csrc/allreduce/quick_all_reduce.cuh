@@ -498,6 +498,21 @@ struct CodecQ8 : public CodecBase {
   }
 };
 
+// Keep the scale on the f32 side of the narrowing conversion. With the HIP
+// intrinsic, LLVM can reassociate (bf16_as_f32 * scale) -> fp16 into
+// fp16(bf16_as_f32) * scale, which clips values above 65504 before the range
+// guard is applied. The opaque ISA conversion makes the scaled f32 values
+// explicit inputs and prevents that transform.
+__quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value, float scale) {
+  float2 scaled = __bfloat1622float2(value);
+  scaled.x *= scale;
+  scaled.y *= scale;
+
+  int packed;
+  asm volatile("v_cvt_pk_f16_f32 %0, %1, %2" : "=v"(packed) : "v"(scaled.x), "v"(scaled.y));
+  return *reinterpret_cast<half2*>(&packed);
+}
+
 // Twoshot All Reduce
 template <typename T, class Codec, bool cast_bf2half>
 struct AllReduceTwoshot {
@@ -540,11 +555,15 @@ struct AllReduceTwoshot {
         half2 half_buf[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          float2 f = __bfloat1622float2(bf_buf[j]);
-          // Scale into fp16 range; undone on store.
-          f.x *= kCastInvScale;
-          f.y *= kCastInvScale;
-          half_buf[j] = __float22half2_rn(f);
+          if constexpr (Codec::kCastScaleLog2 == 0) {
+            float2 f = __bfloat1622float2(bf_buf[j]);
+            // S=1 for quantized codecs; preserve their existing conversion path.
+            f.x *= kCastInvScale;
+            f.y *= kCastInvScale;
+            half_buf[j] = __float22half2_rn(f);
+          } else {
+            half_buf[j] = scaled_bfloat162_to_half2(bf_buf[j], kCastInvScale);
+          }
         }
         tA[i] = *reinterpret_cast<const int32x4_t*>(half_buf);
       }
