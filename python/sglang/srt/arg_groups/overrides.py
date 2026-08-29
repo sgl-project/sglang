@@ -2823,7 +2823,10 @@ def _dllm_attention_backend(view: Any) -> dict:
                 "Attention backend is overridden to 'ascend' when running on NPU for diffusion LLM inference."
             )
             return {"attention_backend": "ascend"}
-    elif view.cuda_graph_config.decode.backend != Backend.DISABLED:
+    elif (
+        view.cuda_graph_config.decode.backend != Backend.DISABLED
+        or view.cuda_graph_config.prefill.backend != Backend.DISABLED
+    ):
         if view.attention_backend != "flashinfer":
             logger.warning(
                 "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"

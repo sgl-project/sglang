@@ -9067,19 +9067,19 @@ class ServerArgs:
                 raise ValueError("Dream dLLM currently only supports TP=1")
             if self.pp_size != 1:
                 raise ValueError("Dream dLLM currently only supports PP=1")
-            logger.warning(
-                "Dream dLLM is experimental: disabling radix prefix cache "
-                "and CUDA graphs"
-            )
+            logger.warning("Dream dLLM is experimental: disabling radix prefix cache")
             self.disable_radix_cache = True
-            self.disable_cuda_graph = True
             if self.dllm_fdfo:
                 logger.warning(
                     "Dream dLLM disables --dllm-fdfo in the initial implementation"
                 )
                 self.dllm_fdfo = False
             self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+                logger.info("Dream CUDA Graph backend: disabled")
+            else:
+                self.cuda_graph_config.prefill.backend = Backend.BREAKABLE
+                logger.info("Dream CUDA Graph backend: Prefill BCG")
 
         # On AMD/HIP, disable cuda graph for DLLM (the attention_backend
         # resolution moved to the pipeline: arg_groups/overrides.py
