@@ -324,6 +324,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict cache entries to cover allocator shortfalls.
+
+        The default implementation preserves the component-count semantics of
+        :meth:`evict`. Multi-component caches backed by shared memory can
+        override this entry point to stop once collateral frees make the
+        requested allocation feasible.
+        """
+        return self.evict(params)
+
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
