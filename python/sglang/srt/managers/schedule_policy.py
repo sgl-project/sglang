@@ -1329,32 +1329,52 @@ class PrefillAdder:
                         return AddReqResult.NO_TOKEN
                     chunk_tokens_limit = min(self.rem_chunk_tokens, swa_cap)
 
-            # Do every deterministic admission check before init_load_back.
-            # Storage restore allocates GPU slots and may launch asynchronous
-            # H2D. A request rejected after that point remains in waiting_queue;
-            # its next prefix match overwrites req.prefix_indices and used to
-            # orphan the restored slots.
+            # Decide whether this request can commit to the current prefill batch
+            # before starting host load-back. Layerwise backends allocate GPU KV
+            # slots in init_load_back(); if a later budget gate returns OTHER,
+            # the waiting-queue rematch overwrites the request-owned slot list and
+            # those allocations become unreachable.
             projected_prefix_len = prefix_len + req.host_hit_length
             projected_input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - projected_prefix_len
             )
+            will_chunk = (
+                self.dllm_config is None
+                and chunk_tokens_limit is not None
+                and projected_input_tokens > chunk_tokens_limit
+            )
+            trunc_len = None
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
                 assert (
                     truncation_align_size is None
                 ), "truncation_align_size is not supported for dllm prefill"
-            elif (
-                chunk_tokens_limit is not None
-                and projected_input_tokens > chunk_tokens_limit
-                and self._get_chunked_prefill_len(
+                if (
+                    tile_stop := self._check_prefill_tile_budget(
+                        projected_input_tokens
+                    )
+                ) is not None:
+                    return tile_stop
+            elif not will_chunk:
+                if (
+                    tile_stop := self._check_prefill_tile_budget(
+                        projected_input_tokens
+                    )
+                ) is not None:
+                    return tile_stop
+            else:
+                trunc_len = self._get_chunked_prefill_len(
                     projected_prefix_len,
                     chunk_tokens_limit,
                     truncation_align_size,
                 )
-                <= 0
-            ):
-                return AddReqResult.OTHER
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
+                if (
+                    tile_stop := self._check_prefill_tile_budget(trunc_len)
+                ) is not None:
+                    return tile_stop
 
             # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
             # report not-prefillable via finalize()) and before init_load_back
@@ -1391,37 +1411,10 @@ class PrefillAdder:
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
-            if (
-                self.rem_chunk_tokens is None
-                and len(self.can_run_list) != 0
-                and input_tokens >= self.rem_input_tokens
-            ):
-                # If without chunked prefill:
-                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
-                # - if the can_run_list is empty, always accept the first prefill request
-                return AddReqResult.OTHER
-
             if self.dllm_config is not None:
-                if self.rem_dllm_tokens <= 0:
-                    return AddReqResult.OTHER
-
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
-                if (
-                    tile_stop := self._check_prefill_tile_budget(input_tokens)
-                ) is not None:
-                    return tile_stop
-
+            elif not will_chunk:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1442,20 +1435,6 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
-                trunc_len = self._get_chunked_prefill_len(
-                    len(req.prefix_indices),
-                    chunk_tokens_limit,
-                    truncation_align_size,
-                )
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                if (
-                    tile_stop := self._check_prefill_tile_budget(trunc_len)
-                ) is not None:
-                    return tile_stop
-
                 # Chunked prefill
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.prefix_indices) + trunc_len
