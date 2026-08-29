@@ -2260,6 +2260,10 @@ def get_hybrid_layer_ids(
         # Generic fallback for custom hybrid SWA models that opt in via
         # hf_text_config.is_hybrid_swa and expose a hybrid_layer_pattern
         # (1 = SWA, 0 = full) without needing to be added to the allowlist.
+        # Any other value is excluded from BOTH lists, which is how a stack that
+        # interleaves non-attention blocks marks "this layer holds no KV". Such a
+        # layer must not report 0: these lists size the sub-pools, not just index
+        # them.
         hybrid_layer_pattern = hf_text_config.hybrid_layer_pattern
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1

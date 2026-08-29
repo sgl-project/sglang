@@ -1511,6 +1511,27 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
 
     # ===================================================================
+    # ZAYA1
+    # ===================================================================
+    # Hold the residual stream in the global DP layout instead of the DP-local
+    # one. One partial gather of the o_proj partials then does the work of both
+    # the attention-TP all-reduce and the DP gather, cutting an attention+MoE
+    # layer pair from three collectives to two and dropping the MoE scatter, at
+    # the cost of running each norm over every replica's rows.
+    #
+    # ON by default: measured +6.3-8.8% tok/s at tp=8/dp=4 on MI350X / MI355X,
+    # greedy ids bit-identical. Self-declining -- global_residual_layout()
+    # returns None unless the expert reduce actually spans DP replicas -- so it
+    # is inert, not wrong, at tp=1 or under plain TP. Set 0 to A/B it back.
+    SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(True)
+    # Run the prefill CCA conv as one varlen Triton kernel pair instead of the
+    # per-request host loop in cca_extend. The loop issues O(batch) launches per
+    # layer and reads CPU sequence lengths; the fused path is driven entirely by
+    # device tensors. Not compatible with a captured prefill graph -- CCA
+    # resolves that conflict in the graph's favour and logs it.
+    SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL = EnvBool(False)
+
+    # ===================================================================
     # Symmetric memory
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

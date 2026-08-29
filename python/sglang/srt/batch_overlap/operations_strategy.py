@@ -73,6 +73,19 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif layer_name in ("ZayaDecoderATTLayer", "ZayaDecoderMLPLayer"):
+            # Deliberately unimplemented, with the arithmetic recorded so it is
+            # not re-derived. TBO splits the batch in two, doubling collective
+            # count, and ZAYA1 tp8/dp4 decode is collective-LATENCY bound: on
+            # MI350X, cutting collective bytes 40% gained 0 to -3% while adding
+            # 60 barriers cost a flat +3.5 ms/step, so 120 -> 240 collectives is
+            # worth roughly -7 ms against a 20.2 ms TPOT. ZAYA1 also alternates
+            # two layer classes, breaking the homogeneous-layer assumption above.
+            raise NotImplementedError(
+                "TBO is not implemented for ZAYA1 on purpose: it doubles "
+                "collective count, and this model's decode is collective-latency "
+                "bound (see the comment above for the measured numbers)."
+            )
         else:
             raise NotImplementedError
 
