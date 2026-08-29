@@ -311,6 +311,11 @@ def _hook_declarations(dispatch, source_module):
     return out
 
 
+# The dispatcher's own file: its imports are what map a bare-name call in it
+# to the family that defines the callable.
+_DISPATCH_MODULE = _SRT / "arg_groups" / "pipeline.py"
+
+
 def _hook_functions():
     """Module-level resolution functions under `arg_groups/`.
 
@@ -341,7 +346,7 @@ def _pipeline():
     # against `arg_groups/` alongside the record's own methods.
     hooks = _hook_functions()
     methods.update({name: node for name, node in hooks.items() if name not in methods})
-    dispatch = methods["_run_resolution_pipeline"]
+    dispatch = methods["run_resolution_pipeline"]
     # A step is either a record method (`self._x()`) or a bare-name hook call.
     steps = [
         name
@@ -501,7 +506,7 @@ def _declaration_positions():
     build_index, build_step, build_method, build_line_in_body = site
     first_build = (build_index, build_step)
 
-    source_module = _SRT / "server_args.py"
+    source_module = _DISPATCH_MODULE
     imported = {}
     for node in ast.walk(_parsed(source_module)):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -551,9 +556,9 @@ def _declaration_positions():
     # the dispatcher*: a handler body sits further down the file than the
     # dispatcher that calls it, so a line number taken from one scope says
     # nothing about ordering against the other.
-    dispatch = methods["_run_resolution_pipeline"]
+    dispatch = methods["run_resolution_pipeline"]
     build_line = step_lines[first_build[1]]
-    for field, line in _hook_declarations(dispatch, _SRT / "server_args.py").items():
+    for field, line in _hook_declarations(dispatch, _DISPATCH_MODULE).items():
         if field in wanted and line > build_line:
             declared_at[field] = max(
                 declared_at.get(field, (build_index, 1)), (10**6, 1)
@@ -656,8 +661,8 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
         documents a hazard that no longer exists and hides the day one appears.
         """
         steps, methods, reached, step_lines = _pipeline()
-        dispatch = methods["_run_resolution_pipeline"]
-        hooks = _hook_declarations(dispatch, _SRT / "server_args.py")
+        dispatch = methods["run_resolution_pipeline"]
+        hooks = _hook_declarations(dispatch, _DISPATCH_MODULE)
         build_line = min(
             step_lines[step]
             for step in steps
@@ -695,8 +700,8 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
         then, rather than keeping a note about a hazard that is gone.
         """
         steps, methods, reached, step_lines = _pipeline()
-        dispatch = methods["_run_resolution_pipeline"]
-        positions = _opaque_callback_positions(dispatch, _SRT / "server_args.py")
+        dispatch = methods["run_resolution_pipeline"]
+        positions = _opaque_callback_positions(dispatch, _DISPATCH_MODULE)
         self.assertEqual(
             sorted(positions),
             [

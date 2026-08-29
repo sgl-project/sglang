@@ -526,14 +526,16 @@ class TestResolutionDeclarations(CustomTestCase):
             reset_context()
             child = pickle.loads(blob)
             entered = []
-            original = ServerArgs._run_resolution_pipeline
+            from sglang.srt.arg_groups import pipeline as pipeline_module
 
-            def counted(self, _original=original):
+            original = pipeline_module.run_resolution_pipeline
+
+            def counted(server_args, _original=original):
                 entered.append(1)
-                return _original(self)
+                return _original(server_args)
 
             with unittest.mock.patch.object(
-                ServerArgs, "_run_resolution_pipeline", counted
+                pipeline_module, "run_resolution_pipeline", counted
             ):
                 publish(child, role="scheduler")
             self.assertEqual(
@@ -848,7 +850,7 @@ class TestResolutionDeclarations(CustomTestCase):
             "capturing like apply_server_args_defaults",
         )
 
-        pipeline = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
+        pipeline = (_SRT / "arg_groups" / "pipeline.py").read_text(encoding="utf-8-sig")
         for hook in sorted(taking_the_record):
             self.assertIn(
                 f"current_platform.{hook},",
@@ -892,9 +894,11 @@ class TestResolutionDeclarations(CustomTestCase):
                 server_args.attention_backend = "triton"
                 server_args.schedule_conservativeness = 0.5
 
-        with unittest.mock.patch.object(
-            server_args_module, "current_platform", _Plugin()
-        ):
+        from sglang.srt.arg_groups import pipeline as pipeline_module
+
+        # The write capture runs in the dispatcher, so that is the namespace the
+        # plugin has to be installed in.
+        with unittest.mock.patch.object(pipeline_module, "current_platform", _Plugin()):
             server_args = self._resolve({})
         self.assertEqual(
             (
