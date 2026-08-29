@@ -105,9 +105,7 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(
-    *, model, server_args: ServerArgs, kv_cache_dtype: str
-) -> None:
+def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""

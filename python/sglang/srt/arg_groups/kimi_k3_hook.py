@@ -55,54 +55,6 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
         )
 
 
-def disable_kimi_k3_symm_mem(server_args: ServerArgs) -> None:
-    """Turn `--enable-symm-mem` back off unless every phase runs eager.
-
-    Symm-mem allocations are per-forward, so an address captured into a graph is
-    neither reserved for its lifetime nor at the same offset on every rank. Under
-    capture that corrupts spec decode: accept collapses to 1.000, or the server
-    silently emits garbage with accept pinned at the ceiling. Prefill counts too --
-    the same allocation sits in any captured RowParallelLinear.
-
-    Gates on the arch itself: this runs from cuda-graph resolution, which is earlier
-    than the model-specific hook block.
-    """
-    cfg = resolving_view(server_args)
-    from sglang.srt.connector import ConnectorType
-    from sglang.srt.model_executor.cuda_graph_config import Backend
-    from sglang.srt.utils import parse_connector_type
-
-    if not cfg.enable_symm_mem:
-        return
-    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
-        return
-    if server_args.get_model_config().hf_config.architectures[0] not in (
-        "KimiLinearForCausalLM",
-        "KimiK3ForConditionalGeneration",
-    ):
-        return
-    graph = cfg.cuda_graph_config
-    if (
-        graph.decode.backend == Backend.DISABLED
-        and graph.prefill.backend == Backend.DISABLED
-    ):
-        return
-    declare_resolution(
-        server_args,
-        "disable_kimi_k3_symm_mem",
-        enable_symm_mem=False,
-    )
-    logger.warning(
-        "Kimi hybrid model: ignoring --enable-symm-mem because CUDA graphs are on. "
-        "The symmetric-memory pool's per-forward allocations are not valid for the "
-        "lifetime of a captured graph, which corrupts speculative decoding and can "
-        "silently produce wrong output. The auto-probed K3 fused all-reduce is faster "
-        "anyway. Disable capture on every phase "
-        "(--cuda-graph-backend-decode=disabled --cuda-graph-backend-prefill=disabled) "
-        "if you genuinely need symmetric memory."
-    )
-
-
 def apply_kimi_k3_linear_attn_defaults(server_args: ServerArgs) -> None:
     """KDA decode-fallback default for Kimi hybrid models (spec-independent)."""
     cfg = resolving_view(server_args)

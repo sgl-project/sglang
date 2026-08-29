@@ -206,6 +206,13 @@ def _maybe_dequantize_fp8(
     return full_tensor
 
 
+def _move_to_device_preserving_meta(model: nn.Module, device: torch.device) -> None:
+    # Buffers absent from the checkpoint (e.g. cosmos3's RoPE inv_freq) are
+    # still on the meta device here and .to() cannot copy out of meta; leave
+    # them for the model's post_load_weights() to rebuild on the real device.
+    model._apply(lambda t: t if t.is_meta else t.to(device))
+
+
 def register_fsdp_entrypoints(model: torch.nn.Module) -> None:
     """Let FSDP2 unshard around forward passes that bypass ``__call__``.
 
@@ -435,7 +442,7 @@ def maybe_load_fsdp_model(
     # 3. postprocessing
     if weight_postprocess_device is not None:
         # move to device to perform postprocessing
-        model.to(weight_postprocess_device)
+        _move_to_device_preserving_meta(model, weight_postprocess_device)
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)

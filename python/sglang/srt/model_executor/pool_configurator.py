@@ -169,7 +169,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
             if has_kv_on_another_pp_stage
-            else kvc.server_args.max_total_tokens or kvc.model_config.context_len
+            else get_schedule().max_total_tokens or kvc.model_config.context_len
         )
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -213,7 +213,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
 
-        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
+        # DFLASH/DSPARK: reserve the draft runner's *actual* per-token KV cost.
+        # The draft allocates its own KV pool at the target's
+        # max_total_num_tokens, whose per-token footprint can differ from the
+        # target's (e.g. an MLA-latent target paired with a full per-head K/V
+        # draft), so size from the draft config rather than the layer ratio.
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
@@ -515,19 +519,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
-                banded_depths = 0
-                if (
-                    model_config.hf_config.architectures[0]
-                    == "InklingForConditionalGeneration"
-                ):
-                    banded_depths = len(
-                        [
-                            i
-                            for i in model_config.hf_text_config.mtp_local_layer_ids
-                            if i < draft_layers
-                        ]
+                mtp_local_layer_ids = getattr(
+                    getattr(model_config, "hf_text_config", None),
+                    "mtp_local_layer_ids",
+                    None,
+                )
+                if mtp_local_layer_ids is not None:
+                    local_layer_ids = set(mtp_local_layer_ids)
+                    self._draft_swa_full_layers_num = sum(
+                        layer_id in local_layer_ids for layer_id in range(draft_layers)
                     )
-                    self._draft_swa_full_layers_num = banded_depths
                 else:
                     draft_swa_layers = kvc.spec_aux_config.eagle_draft_swa_num_layers
                     if draft_swa_layers is not None:
@@ -791,7 +792,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.disaggregation_decode_extra_slots = (
             get_disagg().disaggregation_decode_extra_slots or 0
         )
-        if kvc.server_args.enable_hisparse:
+        if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(

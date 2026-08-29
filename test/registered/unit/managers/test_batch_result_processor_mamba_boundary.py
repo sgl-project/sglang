@@ -64,6 +64,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,
+        beam_coordinator=MagicMock(),
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
