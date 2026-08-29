@@ -14,6 +14,7 @@ from sglang.srt.disaggregation.encoder.server import (
     EncoderDelivery,
     InternalError,
     MMEncoder,
+    MMError,
     MooncakeDelivery,
     ReqState,
     SendDestination,
@@ -427,6 +428,64 @@ class TestEncoderDelivery(CustomTestCase):
                 ["metadata_published", "encode_completed", "send", "release"],
             )
             publish.assert_awaited_once_with("req", 16, 2, 4)
+
+        asyncio.run(run())
+
+    def test_pipeline_releases_request_when_error_publish_fails(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.transfer_backend = "mooncake"
+            encoder.encode = AsyncMock(side_effect=RuntimeError("encode failed"))
+            encoder.release_request = AsyncMock()
+            request = {
+                "req_id": "req",
+                "mm_items": ["item"],
+                "modality": "image",
+                "num_parts": 1,
+                "part_idx": 0,
+            }
+
+            with patch.object(
+                meta_registry,
+                "publish",
+                AsyncMock(side_effect=RuntimeError("registry failed")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "encode failed"):
+                    await execute_encode_pipeline(encoder, None, request)
+
+            encoder.release_request.assert_awaited_once_with(
+                "req", preserve_metadata=False
+            )
+
+        asyncio.run(run())
+
+    def test_pipeline_releases_error_result_when_error_send_fails(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.transfer_backend = "zmq_to_scheduler"
+            encoder.encode = AsyncMock(return_value=(0, 0, 0, "bad image", 400))
+            encoder.release_request = AsyncMock()
+            request = {
+                "req_id": "req",
+                "mm_items": ["item"],
+                "modality": "image",
+                "num_parts": 1,
+                "part_idx": 0,
+            }
+
+            with (
+                patch.object(meta_registry, "publish", AsyncMock()),
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime._push_embedding_to_prefill",
+                    AsyncMock(side_effect=RuntimeError("send failed")),
+                ),
+            ):
+                with self.assertRaisesRegex(MMError, "bad image"):
+                    await execute_encode_pipeline(encoder, None, request)
+
+            encoder.release_request.assert_awaited_once_with(
+                "req", preserve_metadata=False
+            )
 
         asyncio.run(run())
 
