@@ -152,6 +152,7 @@ class KVArgsRegisterInfo:
     dst_state_layer_ids: List[List[int]]
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
+    dst_num_target_kv_layers: int = -1
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
@@ -207,7 +208,10 @@ class KVArgsRegisterInfo:
                 if len(msg) > 19 and msg[19]
                 else []
             ),
-            # Note: always put the staging field at the final
+            dst_num_target_kv_layers=(
+                int(msg[20].decode("ascii")) if len(msg) > 20 and msg[20] != b"" else -1
+            ),
+            # Keep staging slots at frame 18 and per-buffer item lengths at 19.
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
 
@@ -768,6 +772,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        num_dst_target_kv_layers: Optional[int] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -838,7 +843,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_data_ptrs,
+                    num_dst_target_kv_layers=num_dst_target_kv_layers,
+                )
             )
             # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
             # Use correct item lengths for K and V separately
@@ -1050,6 +1059,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        num_dst_target_kv_layers: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1078,6 +1088,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            num_dst_target_kv_layers=num_dst_target_kv_layers,
         )
 
     def send_kvcache_dcp(
@@ -1305,6 +1316,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
+        num_dst_target_kv_layers: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -1380,7 +1392,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
         else:
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_kv_ptrs)
+                self.get_mha_kv_ptrs_with_pp(
+                    src_data_ptrs,
+                    dst_kv_ptrs,
+                    num_dst_target_kv_layers=num_dst_target_kv_layers,
+                )
             )
             layer_ptr_pairs = [
                 (src_k_ptrs[i], dst_k_ptrs[i]) for i in range(layers_current_pp_stage)
@@ -2225,6 +2241,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                num_dst_target_kv_layers=(
+                                    target_rank_registration_info.dst_num_target_kv_layers
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -2259,6 +2278,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
                                 target_rank_registration_info.dst_kv_layer_ids,
+                                num_dst_target_kv_layers=(
+                                    target_rank_registration_info.dst_num_target_kv_layers
+                                ),
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -2879,6 +2901,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("Q", layer_id)
                 for layer_id in (staging_slots.get("slot_layer_ids") or [])
             )
+            dst_num_target_kv_layers = str(
+                getattr(self.kv_mgr.kv_args, "num_target_kv_layers", -1)
+            ).encode("ascii")
 
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -2908,6 +2933,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            dst_num_target_kv_layers,
                         ]
                     )
             except zmq.ZMQError:
