@@ -197,6 +197,93 @@ def test_nvfp4_native_prefill_attention_matches_bf16_reference(
 
 
 @torch.inference_mode()
+def test_nvfp4_native_target_verify_matches_bf16_reference():
+    """Exercise the multi-query-token GenMHA path used by TARGET_VERIFY."""
+    import flashinfer
+
+    torch.manual_seed(17)
+    page_size, prefix, verify_len = 32, 40, 4
+    seq_len = prefix + verify_len
+    pages = math.ceil(seq_len / page_size)
+    q_heads, kv_heads, head_dim = 8, 2, 128
+    global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    q = torch.randn(verify_len, q_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(seq_len, kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+
+    method = NVFP4KVCacheMethod(num_layers=1, device="cuda", page_size=page_size)
+    method.configure_attention_backends("trtllm_mha", "trtllm_mha")
+    buffers = method.create_buffers(
+        pages * page_size, kv_heads, head_dim, layer_num=1, device="cuda"
+    )
+    method.quantize_and_store(
+        buffers["k_buffer"][0],
+        buffers["v_buffer"][0],
+        None,
+        None,
+        torch.arange(seq_len, device="cuda"),
+        k,
+        v,
+        k_scale=global_scale,
+        v_scale=global_scale,
+        native_k_scale_buffer=buffers["native_k_scale_buffer"][0],
+        native_v_scale_buffer=buffers["native_v_scale_buffer"][0],
+    )
+
+    kv_cache = (
+        buffers["k_buffer"][0]
+        .view(pages, page_size, kv_heads, head_dim // 2)
+        .permute(0, 2, 1, 3),
+        buffers["v_buffer"][0]
+        .view(pages, page_size, kv_heads, head_dim // 2)
+        .permute(0, 2, 1, 3),
+    )
+    block_scales = (
+        buffers["native_k_scale_buffer"][0].view(torch.float8_e4m3fn),
+        buffers["native_v_scale_buffer"][0].view(torch.float8_e4m3fn),
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    out = torch.empty_like(q_fp8)
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=q_fp8,
+        kv_cache=kv_cache,
+        workspace_buffer=torch.zeros(
+            256 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+        ),
+        block_tables=torch.arange(pages, dtype=torch.int32, device="cuda").view(
+            1, pages
+        ),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32, device="cuda"),
+        max_seq_len=seq_len,
+        bmm1_scale=1.0 / math.sqrt(head_dim),
+        bmm2_scale=1.0,
+        out=out,
+        kv_cache_sf=block_scales,
+        q_len_per_req=verify_len,
+    )
+
+    repeat = q_heads // kv_heads
+    k_ref = k.repeat_interleave(repeat, dim=1).permute(1, 0, 2).float()
+    v_ref = v.repeat_interleave(repeat, dim=1).permute(1, 0, 2).float()
+    q_ref = q_fp8.bfloat16().permute(1, 0, 2).float()
+    scores = torch.einsum("hqd,hkd->hqk", q_ref, k_ref) / math.sqrt(head_dim)
+    key_positions = torch.arange(seq_len, device="cuda").view(1, 1, -1)
+    query_positions = (prefix + torch.arange(verify_len, device="cuda")).view(1, -1, 1)
+    scores.masked_fill_(key_positions > query_positions, float("-inf"))
+    reference = torch.einsum(
+        "hqk,hkd->hqd", torch.softmax(scores, dim=-1), v_ref
+    ).permute(1, 0, 2)
+
+    cosine = torch.nn.functional.cosine_similarity(
+        out.float().reshape(-1), reference.reshape(-1), dim=0
+    )
+    assert (
+        cosine.item() > 0.86
+    ), f"native NVFP4 target-verify cosine={cosine.item():.4f}"
+
+
+@torch.inference_mode()
 def test_nvfp4_native_scale_move_preserves_logical_rows():
     from sglang.srt.layers.quantization.nvfp4_kv_cache import (
         move_nvfp4_native_scales,

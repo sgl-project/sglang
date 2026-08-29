@@ -57,6 +57,99 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
                 "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
             )
+
+        # SM100 trtllm_mha owns physical, kernel-native NVFP4 scales. The
+        # transfer and host-tier pools do not preserve that layout yet. Keep
+        # these combinations fail-fast while allowing target verification to
+        # reuse the same monolithic cache and GenMHA kernels.
+        uses_sm100_native_nvfp4 = (
+            cfg.kv_cache_dtype == "nvfp4"
+            and is_sm100_supported()
+            and "trtllm_mha" in (prefill_backend, decode_backend)
+        )
+        uses_sm100_mixed_nvfp4 = (
+            uses_sm100_native_nvfp4
+            and prefill_backend == "flashinfer"
+            and decode_backend == "trtllm_mha"
+        )
+        speculative_algorithm = (
+            cfg.speculative_algorithm.upper()
+            if cfg.speculative_algorithm is not None
+            else None
+        )
+        if uses_sm100_native_nvfp4 and speculative_algorithm in (
+            "DFLASH",
+            "DSPARK",
+        ):
+            # These workers commit only a prefix of a dense candidate block
+            # through set_kv_buffer_prefix_valid(). That specialized writer
+            # does not produce GenMHA's physical K/V scale layout yet.
+            raise ValueError(
+                "SM100 native NVFP4 speculative decoding does not yet support "
+                f"{speculative_algorithm}; use EAGLE/NEXTN or NGRAM."
+            )
+        uses_draft_model = speculative_algorithm not in (None, "NGRAM")
+        if uses_sm100_native_nvfp4 and uses_draft_model:
+            # A draft worker owns another physical KV pool. It cannot inherit a
+            # target-only hybrid pair: draft-extend would then select the
+            # prefill child even though the draft pool and its block scales use
+            # the native GenMHA layout. Give every draft phase one layout and
+            # one backend, including prefill-graph capture and multi-step
+            # decode. This also covers explicit hybrid target configurations,
+            # for which the model-default hook intentionally does not choose a
+            # draft backend.
+            draft_backend = cfg.speculative_draft_attention_backend
+            if draft_backend is None:
+                logger.warning(
+                    "SM100 native NVFP4 speculative decoding uses trtllm_mha "
+                    "for the draft worker."
+                )
+                declare_resolution(
+                    server_args,
+                    "_handle_kv4_compatibility",
+                    speculative_draft_attention_backend="trtllm_mha",
+                )
+            elif draft_backend != "trtllm_mha":
+                raise ValueError(
+                    "SM100 native NVFP4 speculative decoding requires "
+                    "--speculative-draft-attention-backend=trtllm_mha so the "
+                    "draft worker consumes its physical NVFP4 KV layout; got "
+                    f"{draft_backend!r}."
+                )
+        if (
+            uses_sm100_mixed_nvfp4
+            and cfg.speculative_algorithm is not None
+            and cfg.speculative_attention_mode == "prefill"
+        ):
+            # FlashInfer prefill reads a transient FP8 dequant workspace. Its
+            # host-built page layout cannot be refreshed inside a target-verify
+            # CUDA graph, whereas the decode child consumes the physical NVFP4
+            # cache directly for both eager and graph execution.
+            logger.warning(
+                "SM100 mixed NVFP4 speculative decoding routes target verify "
+                "to trtllm_mha; overriding --speculative-attention-mode=prefill "
+                "to decode."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_kv4_compatibility",
+                speculative_attention_mode="decode",
+            )
+        if uses_sm100_native_nvfp4 and cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "SM100 native NVFP4 with trtllm_mha does not yet support PD "
+                "disaggregation because its physical block-scale layout is not "
+                "implemented by the KV transfer path."
+            )
+        if uses_sm100_native_nvfp4 and (
+            cfg.enable_hierarchical_cache or cfg.enable_lmcache
+        ):
+            raise ValueError(
+                "SM100 native NVFP4 with trtllm_mha does not yet support "
+                "hierarchical KV cache or LMCache because their host pools do "
+                "not preserve the physical block-scale layout."
+            )
+
         if (
             prefill_backend != decode_backend and prefill_backend != "fa4"
         ):  # Take care of prefill=fa4 later

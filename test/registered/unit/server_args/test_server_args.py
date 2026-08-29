@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_kv4_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -670,81 +671,179 @@ class TestKV4Compatibility(unittest.TestCase):
         args.use_mla_backend = lambda: False
         return args
 
-    def test_sm100_native_nvfp4_rejects_speculative_decoding(self):
+    def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
         for prefill_backend, decode_backend in (
             (None, None),
             ("flashinfer", "trtllm_mha"),
         ):
-            with self.subTest(
-                prefill_backend=prefill_backend,
-                decode_backend=decode_backend,
-            ):
-                args = self._make_nvfp4_args(
-                    prefill_attention_backend=prefill_backend,
-                    decode_attention_backend=decode_backend,
-                    speculative_algorithm="EAGLE",
-                )
+            for speculative_attention_mode in ("prefill", "decode"):
+                with self.subTest(
+                    prefill_backend=prefill_backend,
+                    decode_backend=decode_backend,
+                    speculative_attention_mode=speculative_attention_mode,
+                ):
+                    args = self._make_nvfp4_args(
+                        prefill_attention_backend=prefill_backend,
+                        decode_attention_backend=decode_backend,
+                        speculative_algorithm="EAGLE",
+                        speculative_eagle_topk=1,
+                        speculative_attention_mode=speculative_attention_mode,
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.arg_groups.kv_cache_hook.is_cuda",
+                            return_value=True,
+                        ),
+                        patch(
+                            "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                            return_value=True,
+                        ),
+                        patch(
+                            "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                            return_value=False,
+                        ),
+                    ):
+                        handle_kv4_compatibility(args)
+                    expected_mode = (
+                        "decode"
+                        if prefill_backend == "flashinfer"
+                        and speculative_attention_mode == "prefill"
+                        else speculative_attention_mode
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "speculative_attention_mode"),
+                        expected_mode,
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "speculative_draft_attention_backend"),
+                        "trtllm_mha",
+                    )
+
+    def test_sm100_native_nvfp4_rejects_non_native_draft_backend(self):
+        args = self._make_nvfp4_args(
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_draft_attention_backend="flashinfer",
+        )
+        with (
+            patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(ValueError, "physical NVFP4 KV layout"),
+        ):
+            handle_kv4_compatibility(args)
+
+    def test_sm100_native_nvfp4_ngram_needs_no_draft_backend(self):
+        args = self._make_nvfp4_args(speculative_algorithm="NGRAM")
+        with (
+            patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                return_value=False,
+            ),
+        ):
+            handle_kv4_compatibility(args)
+        self.assertIsNone(
+            resolution_result(args, "speculative_draft_attention_backend")
+        )
+
+    def test_sm100_native_nvfp4_rejects_prefix_commit_spec_algorithms(self):
+        for algorithm in ("DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_nvfp4_args(speculative_algorithm=algorithm)
                 with (
-                    patch("sglang.srt.server_args.is_cuda", return_value=True),
                     patch(
-                        "sglang.srt.server_args.is_sm100_supported",
+                        "sglang.srt.arg_groups.kv_cache_hook.is_cuda",
                         return_value=True,
                     ),
                     patch(
-                        "sglang.srt.server_args.is_sm120_supported",
+                        "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
                         return_value=False,
                     ),
-                    self.assertRaisesRegex(
-                        ValueError, "SM100 native NVFP4.*speculative decoding"
-                    ),
+                    self.assertRaisesRegex(ValueError, algorithm),
                 ):
-                    args._handle_kv4_compatibility()
+                    handle_kv4_compatibility(args)
 
     def test_sm120_xqa_keeps_existing_speculative_support(self):
         args = self._make_nvfp4_args(speculative_algorithm="EAGLE")
         with (
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=False),
-            patch("sglang.srt.server_args.is_sm120_supported", return_value=True),
+            patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                return_value=True,
+            ),
         ):
-            args._handle_kv4_compatibility()
+            handle_kv4_compatibility(args)
 
     def test_sm100_native_nvfp4_allows_monolithic_non_speculative_inference(self):
         args = self._make_nvfp4_args()
         with (
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=True),
-            patch("sglang.srt.server_args.is_sm120_supported", return_value=False),
+            patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                return_value=False,
+            ),
         ):
-            args._handle_kv4_compatibility()
+            handle_kv4_compatibility(args)
 
     def test_sm100_native_nvfp4_rejects_host_tiered_cache(self):
         for option in ("enable_hierarchical_cache", "enable_lmcache"):
             with self.subTest(option=option):
                 args = self._make_nvfp4_args(**{option: True})
                 with (
-                    patch("sglang.srt.server_args.is_cuda", return_value=True),
                     patch(
-                        "sglang.srt.server_args.is_sm100_supported",
+                        "sglang.srt.arg_groups.kv_cache_hook.is_cuda",
                         return_value=True,
                     ),
                     patch(
-                        "sglang.srt.server_args.is_sm120_supported",
+                        "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
                         return_value=False,
                     ),
                     self.assertRaisesRegex(ValueError, "host pools"),
                 ):
-                    args._handle_kv4_compatibility()
+                    handle_kv4_compatibility(args)
 
     def test_sm100_native_nvfp4_rejects_pd_disaggregation(self):
         args = self._make_nvfp4_args(disaggregation_mode="decode")
         with (
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
-            patch("sglang.srt.server_args.is_sm100_supported", return_value=True),
-            patch("sglang.srt.server_args.is_sm120_supported", return_value=False),
+            patch("sglang.srt.arg_groups.kv_cache_hook.is_cuda", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm100_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.is_sm120_supported",
+                return_value=False,
+            ),
             self.assertRaisesRegex(ValueError, "PD disaggregation"),
         ):
-            args._handle_kv4_compatibility()
+            handle_kv4_compatibility(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
