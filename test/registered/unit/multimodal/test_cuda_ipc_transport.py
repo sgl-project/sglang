@@ -250,6 +250,44 @@ class TestCudaIpcTransport(CustomTestCase):
         finally:
             pool.shutdown()
 
+    def test_rejected_request_releases_unconsumed_pool_slice(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = None
+        producer_result = None
+        try:
+            proxy, _ = proxy_queue.get(timeout=60)
+            item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+            mm_inputs = MultimodalInputs(mm_items=[item])
+
+            mm_inputs.release_features()
+            torch.cuda.synchronize()
+
+            self.assertIsNone(item.feature)
+        finally:
+            del proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

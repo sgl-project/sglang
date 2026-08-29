@@ -659,7 +659,18 @@ class MultimodalInputs:
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
-            item.feature = None
+            try:
+                # A request can be rejected before a deferred GPU feature is
+                # reconstructed. Acknowledge that transport lease before the
+                # proxy is dropped so the tokenizer pool can reuse its slice.
+                item.acknowledge_deferred_cuda_ipc_feature()
+            except Exception:
+                logger.warning(
+                    "Failed to release an unused multimodal feature transport",
+                    exc_info=True,
+                )
+            finally:
+                item.feature = None
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
@@ -1905,6 +1916,8 @@ class Req(ReqDllmMixin):
     ):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
