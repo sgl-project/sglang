@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
+    LTX2AVDecodingStage,
+)
 
 
 class _FakeServerArgs:
@@ -125,7 +128,7 @@ class TestMatchCheckpointDtypes(unittest.TestCase):
 
 
 class TestVAELoader(unittest.TestCase):
-    def test_exact_precision_is_admitted_only_for_standard_vae_components(self):
+    def test_exact_precision_is_admitted_for_every_vae_component(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())
         server_args.component_precisions = {"vae": "bf16"}
@@ -133,10 +136,47 @@ class TestVAELoader(unittest.TestCase):
         self.assertEqual(loader.component_load_precision(server_args, "vae"), "bf16")
 
         server_args.component_precisions = {"audio_vae": "bf16"}
-        with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError, "audio_vae.*exact component precision"
+        self.assertEqual(
+            loader.component_load_precision(server_args, "audio_vae"), "bf16"
+        )
+
+    def test_exact_audio_vae_precision_reaches_customized_loader(self):
+        loader = vae_loader.VAELoader()
+        server_args = _FakeServerArgs(LTX2PipelineConfig())
+        server_args.component_precisions = {"audio_vae": "bf16"}
+        audio_vae = nn.Identity()
+
+        with (
+            patch.object(loader, "load_customized", return_value=audio_vae) as load,
+            patch.object(
+                vae_loader.current_platform,
+                "get_available_gpu_memory",
+                side_effect=[10.0, 9.0],
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_memory_usage_of_component",
+                return_value=1.0,
+            ),
         ):
-            loader.component_load_precision(server_args, "audio_vae")
+            loaded, _ = loader.load(
+                "/component/audio_vae", server_args, "audio_vae", "diffusers"
+            )
+
+        self.assertIs(loaded, audio_vae)
+        load.assert_called_once_with("/component/audio_vae", server_args, "audio_vae")
+
+    def test_ltx_audio_vae_use_honors_exact_component_precision(self):
+        stage = LTX2AVDecodingStage(
+            vae=torch.nn.Identity(),
+            audio_vae=torch.nn.Identity(),
+            vocoder=torch.nn.Identity(),
+        )
+        server_args = _FakeServerArgs(LTX2PipelineConfig())
+        server_args.component_precisions = {"audio_vae": "fp32"}
+
+        uses = {use.component_name: use for use in stage.component_uses(server_args)}
+        self.assertEqual(uses["audio_vae"].target_dtype, torch.float32)
 
     def test_weights_override_keeps_base_component_config(self):
         loader = vae_loader.VAELoader()
