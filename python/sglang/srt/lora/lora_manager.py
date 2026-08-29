@@ -150,9 +150,14 @@ class LoRAManager:
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_req=num_tokens_per_req,
         )
+        max_moe_tokens = max_bs_in_cuda_graph * num_tokens_per_req
         if self.enable_dp_attention:
-            self.lora_backend.init_dp_attention_cuda_graph_batch_info(
-                max_bs_in_cuda_graph * num_tokens_per_req
+            self.lora_backend.init_dp_attention_cuda_graph_batch_info(max_moe_tokens)
+            max_moe_tokens *= get_parallel().dp_size
+        if self.lora_backend.resize_cuda_graph_moe_buffers(max_moe_tokens):
+            logger.info(
+                "Right-sized shared MoE LoRA CUDA graph buffers "
+                f"(max_tokens={max_moe_tokens})"
             )
 
         # ===== TO BE REFACTORED ====
@@ -500,6 +505,10 @@ class LoRAManager:
         )
         if self.enable_dp_attention:
             self.lora_backend.prepare_global_lora_batch(forward_batch)
+            if forward_batch.forward_mode.is_idle():
+                # Idle ranks must join the global routing collectives, but
+                # their DP-local attention path has no tokens to adapt.
+                self.lora_backend.batch_info = None
 
     def _use_cuda_graph_batch(self, forward_batch: ForwardBatch) -> bool:
         return (
