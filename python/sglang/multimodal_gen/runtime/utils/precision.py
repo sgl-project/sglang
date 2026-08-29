@@ -79,9 +79,7 @@ def resolve_component_precision(server_args, module_name: str) -> Optional[torch
             exact_precision, f"component_precisions.{module_name}"
         )
 
-    pipeline_config = getattr(server_args, "pipeline_config", None)
-    if pipeline_config is None:
-        return None
+    pipeline_config = server_args.pipeline_config
 
     if module_name in ("audio_vae", "vocoder"):
         precision_attr = "audio_vae_precision"
