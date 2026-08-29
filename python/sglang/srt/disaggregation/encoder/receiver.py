@@ -982,8 +982,8 @@ class WaitingMMRequestBase(ABC):
         return True
 
     def _finish_assemble(self, recv_embedding) -> None:
-        """get_mm_data → bind pool slot → publish onto recv_req → SUCCESS."""
-        mm_inputs = self.mm_processor.get_mm_data(
+        """Build validated mm data, bind its pool slot, then publish it."""
+        mm_inputs = self.mm_processor.get_validated_mm_data(
             _select_mm_processor_prompt(self.recv_req, self.mm_processor),
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
@@ -2024,7 +2024,7 @@ class MMReceiverBase(ABC):
                 )
 
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
-            return mm_processor.get_mm_data(
+            return mm_processor.get_validated_mm_data(
                 prompt,
                 recv_embedding,
                 **recv_embedding_data.get_mm_extra_meta(),
