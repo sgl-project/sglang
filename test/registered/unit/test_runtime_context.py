@@ -16,6 +16,18 @@ from unittest.mock import patch
 import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+)
+from sglang.srt.arg_groups.overrides import (
+    mamba_cache_chunk_size as mamba_cache_chunk_size_of,
+)
+from sglang.srt.arg_groups.overrides import (
+    max_prefill_buffer_tokens as max_prefill_buffer_tokens_of,
+)
+from sglang.srt.arg_groups.overrides import (
+    resolved_view,
+)
 from sglang.srt.runtime_context import (
     Flags,
     ParallelContext,
@@ -404,7 +416,7 @@ class TestServerArgsScopedOverride(_IsolatedServerArgs):
         published = (
             get_context().override_server_args(_mamba_cache_chunk_size=64).install()
         )
-        self.assertEqual(published.mamba_cache_chunk_size, 64)
+        self.assertEqual(mamba_cache_chunk_size_of(published), 64)
 
     def test_installed_config_arms_the_strict_guard(self):
         # The published dummy must behave like a resolved config: bare writes
@@ -1156,7 +1168,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                             )
                             get_context().set_server_args(args)
                             self.assertEqual(
-                                ServerArgs.max_prefill_buffer_tokens(args),
+                                max_prefill_buffer_tokens_of(args),
                                 max_prefill_buffer_tokens(),
                             )
 
@@ -1243,7 +1255,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                         )
                         get_context().set_server_args(args)
                         self.assertEqual(
-                            ServerArgs.get_attention_backends(args),
+                            attention_backends_of(resolved_view(args)),
                             attention_backends(),
                         )
 

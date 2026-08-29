@@ -254,6 +254,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "issued": 0,
             "declined_too_short": 0,
             "declined_rate_limited": 0,
+            "declined_anchor_lost": 0,
+            "declined_device_covered": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
             "l3_demand_requests": 0,
@@ -1788,11 +1790,16 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         )
         if buffer_mode:
-            self.buffer_pipeline.set_prefix_ctx(req_id, matched_prefix_tokens)
-            # Pin the just-matched anchor now: deferred to hit-alloc it is
-            # often already deleted under churn (silent unlocked launch).
-            # The hit-alloc call remains as an idempotent second chance.
-            self.buffer_pipeline.try_lock_anchor(req_id, last_host_node_id)
+            self.buffer_pipeline.set_prefix_ctx(
+                req_id,
+                matched_prefix_tokens,
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+            )
+            # Pin the just-matched anchor now: deferred to IO commit it is
+            # often already deleted under churn. The IO-commit call remains
+            # as the second chance that decides the fetch's fate.
+            self.buffer_pipeline.try_lock_anchor(req_id)
         else:
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
@@ -2054,12 +2061,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
         return False
 
-    def staged_prefetch_tokens(self, req_id: str) -> int:
-        """Tokens a staged buffer-mode prefetch would splice (0 = no hold);
-        surfaced by the scheduler as the request's host_hit_length."""
+    def plan_staged_splice(
+        self, req_id: str, device_prefix_len: int
+    ) -> tuple[int, int]:
+        """(kv, swa) host-hit tokens a staged buffer-mode prefetch will splice
+        given the request's live device prefix; frees unusable holds."""
         if self.buffer_pipeline is None:
-            return 0
-        return self.buffer_pipeline.staged_prefetch_tokens(req_id)
+            return 0, 0
+        return self.buffer_pipeline.plan_staged_splice(req_id, device_prefix_len)
 
     def staged_prefetch_swa_tokens(self, req_id: str) -> int:
         """SWA device tokens consuming a staged buffer-mode prefetch will
@@ -2074,7 +2083,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self._storage_prefetch_missed_rids.discard(rid)
         if (
             self.buffer_pipeline is not None
-            and self.buffer_pipeline.release_aborted_staged(rid)
+            and self.buffer_pipeline.release_staged_hold(rid)
         ):
             return
         if rid not in self.ongoing_prefetch:
@@ -2246,6 +2255,25 @@ class UnifiedRadixCache(BasePrefixCache):
                 # prefetches ahead of us are consumed. The op stays in
                 # ongoing_prefetch, so wait_complete keeps gating admission.
                 return False
+            if buffer_mode:
+                # IO commit: pin before the bounce alloc so a cancel is a
+                # plain revoke and a parked op keeps its pin; a fetch whose
+                # splice base is gone is not worth its storage read.
+                if self.buffer_pipeline.try_lock_anchor(req_id) == "anchor_lost":
+                    self._prefetch_outcome_stats["declined_anchor_lost"] += 1
+                    # Span still L3-resident: arm the paced retry to re-fetch
+                    # from the shorter post-loss match.
+                    self._storage_prefetch_missed_rids.add(req_id)
+                    self.revoke_pending_prefetch(req_id)
+                    return True
+                if self.buffer_pipeline.staged_span_covered(
+                    req_id, operation.storage_hit_count
+                ):
+                    # Live tree already covers the span: nothing left to
+                    # splice, so skip the storage read.
+                    self._prefetch_outcome_stats["declined_device_covered"] += 1
+                    self.revoke_pending_prefetch(req_id)
+                    return True
             alloc_len = operation.storage_hit_count
             host_indices = cc.mem_pool_host.alloc(alloc_len)
             if host_indices is None:
@@ -2273,10 +2301,6 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
             if buffer_mode:
                 cc.prefetch_tokens_occupied += alloc_len
-                # IO commit: pin the anchor until consumption. Do not read
-                # attributes off `operation` here — alternative cache
-                # controllers may expose a narrower surface.
-                self.buffer_pipeline.try_lock_anchor(req_id, info.anchor_node_id)
             cc.prefetch_buffer.put(operation)
             return True
 
