@@ -29,7 +29,9 @@ DEVICE = "cuda"
 PAGE_SIZE = 128
 
 
-def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+def _make_backend_for_hook_test(
+    speculative_num_draft_tokens=None, decode_seq_len_splits=1
+):
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
     backend.max_context_len = 1024
@@ -42,6 +44,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.speculative_step_id = 0
     backend.speculative_num_draft_tokens = speculative_num_draft_tokens
     backend.expand_encoder_only_verify = False
+    backend.decode_seq_len_splits = decode_seq_len_splits
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
@@ -176,7 +179,7 @@ def test_metadata_update_records_inside_cuda_graph():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
-    backend = _make_backend_for_hook_test()
+    backend = _make_backend_for_hook_test(decode_seq_len_splits=2)
     backend.device = torch.device(DEVICE)
     backend.page_size = 2
     backend.max_num_pages = 4
@@ -203,13 +206,33 @@ def test_metadata_update_records_inside_cuda_graph():
     with torch.cuda.graph(graph):
         backend.init_forward_metadata_in_graph(fb)
 
-    fb.seq_lens.copy_(torch.tensor([5, 6], dtype=torch.int32, device=DEVICE))
+    fb.seq_lens.copy_(torch.tensor([6, 5], dtype=torch.int32, device=DEVICE))
     graph.replay()
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
         backend.forward_metadata.cache_seqlens_int32,
+        torch.tensor([6, 5], dtype=torch.int32, device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.decode_sorted_seq_lens,
         torch.tensor([5, 6], dtype=torch.int32, device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.decode_seq_len_order,
+        torch.tensor([1, 0], dtype=torch.int64, device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        backend.forward_metadata.decode_sorted_page_table,
+        backend.forward_metadata.page_table.index_select(
+            0, backend.forward_metadata.decode_seq_len_order
+        ),
         rtol=0,
         atol=0,
     )
