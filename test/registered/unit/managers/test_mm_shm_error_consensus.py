@@ -1,9 +1,13 @@
 import unittest
 from array import array
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.distributed
+import torch.multiprocessing
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -61,6 +65,18 @@ def _failed_pointer() -> ShmPointerMMData:
     return pointer
 
 
+def _successful_pointer() -> ShmPointerMMData:
+    pointer = object.__new__(ShmPointerMMData)
+    pointer.shm_name = "unused"
+    pointer.shape = torch.Size([1])
+    pointer.dtype = torch.float32
+    pointer.precomputed_hash = None
+    pointer._shm_handle = _Handle()
+    pointer.tensor = torch.ones(1)
+    pointer._materialization_error = None
+    return pointer
+
+
 def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
     return TokenizedEmbeddingReqInput(
         rid=rid,
@@ -105,6 +121,39 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
     )
 
 
+def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
+    torch.distributed.init_process_group(
+        backend="gloo",
+        init_method=Path(init_file).as_uri(),
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
+        parallel = SimpleNamespace(enable_dp_attention=False)
+        receiver = _receiver(tp_size=world_size)
+        object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
+        with (
+            patch(
+                "sglang.srt.managers.mm_utils._get_is_default_transport",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.managers.mm_utils.get_serving",
+                return_value=SimpleNamespace(skip_tokenizer_init=False),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+                return_value=parallel,
+            ),
+        ):
+            receiver._finalize_shm_features([req])
+        if not isinstance(req.mm_inputs, MMInputsProcessError):
+            raise AssertionError(f"rank {rank} did not receive the VLM request error")
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class TestShmPointerFailureCleanup(unittest.TestCase):
     def test_clone_failure_still_unlinks_and_closes(self):
         pointer = object.__new__(ShmPointerMMData)
@@ -141,6 +190,16 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
 
 
 class TestShmRequestFailureConsensus(unittest.TestCase):
+    def test_real_gloo_group_propagates_one_rank_failure(self):
+        with TemporaryDirectory() as directory:
+            init_file = str(Path(directory) / "gloo-init")
+            torch.multiprocessing.spawn(
+                _run_consensus_rank,
+                args=(2, init_file),
+                nprocs=2,
+                join=True,
+            )
+
     def test_local_materialization_failure_becomes_request_error(self):
         req = _request(_failed_pointer())
         parallel = SimpleNamespace(enable_dp_attention=False)
