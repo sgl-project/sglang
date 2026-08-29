@@ -76,8 +76,10 @@ def create_kt_config_from_server_args(
     if server_args.kt_weight_path is None:
         return None
 
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     num_layers = getattr(
-        server_args.get_model_config().hf_config, "num_hidden_layers", None
+        model_config_of(server_args).hf_config, "num_hidden_layers", None
     )
 
     return KTConfig(

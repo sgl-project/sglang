@@ -751,6 +751,8 @@ def handle_multimodal_feature_transport(server_args: Any):
     may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
     variable remain supported so existing deployments map to this policy.
     """
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
     legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
@@ -785,7 +787,7 @@ def handle_multimodal_feature_transport(server_args: Any):
                 "--encoder-transfer-backend instead."
             )
         elif (
-            server_args.get_model_config().is_multimodal
+            model_config_of(server_args).is_multimodal
             and is_cuda()
             and cfg.disaggregation_mode == "null"
         ):
@@ -803,7 +805,7 @@ def handle_multimodal_feature_transport(server_args: Any):
                     supports_cuda_vmm_feature_transport,
                 )
 
-                if supports_cuda_vmm_feature_transport(server_args.get_model_config()):
+                if supports_cuda_vmm_feature_transport(model_config_of(server_args)):
                     requested_transport = "cuda_vmm"
                     logger.info(
                         "Multimodal feature transport auto-resolved to "
