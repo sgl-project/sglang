@@ -359,6 +359,7 @@ jobs:
 #      skip_pr_test_health_check: 'true'
 #      image: ${{ needs.set-image-config.outputs.image_a5 }}
 #      install_sglang_deps: false
+#      install_sglang_from_source: true
 #      device_type_for_deps: 'a5'
 #      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
@@ -375,6 +376,7 @@ jobs:
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a5 }}
       install_sglang_deps: false
+      install_sglang_from_source: true
       device_type_for_deps: 'a5'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 

@@ -27,6 +27,11 @@ on:
         type: boolean
         default: false
         description: install sglang dependencies (e.g. PyTorch, CANN packages) when using source installation
+      install_sglang_from_source:
+        required: false
+        type: boolean
+        default: false
+        description: use sglang product code from the checked-out source instead of the docker image
       device_type_for_deps:
         required: false
         type: string
@@ -230,6 +235,10 @@ jobs:
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
+          if [ "${{ inputs.install_sglang_from_source }}" = "true" ]; then
+            export PYTHONPATH=${sglang_source_path}/python:${PYTHONPATH}
+            echo "Use sglang from source: ${sglang_source_path}"
+          fi
 
           # Determine test mode: suite (run_suite.py --suite) or single case file.
           test_suite="${{ inputs.test_suite }}"
