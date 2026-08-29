@@ -146,6 +146,11 @@ class ContextParallelStrategy(ABC):
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
 
+    def local_q_indices(self, num_tokens: int, forward_batch: ForwardBatch) -> Any:
+        raise NotImplementedError(
+            f"{self.name} strategy does not support local q indices"
+        )
+
     def shard_per_request(
         self,
         extend_seqs_cpu: List[int],
