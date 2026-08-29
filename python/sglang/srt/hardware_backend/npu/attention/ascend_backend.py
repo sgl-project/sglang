@@ -21,8 +21,17 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.dp_attention import get_attention_cp_group
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
+from sglang.srt.layers.utils.cp_utils import (
+    MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE,
+    cp_all_gather_rerange_kv_cache,
+    get_prefix_block_slices,
+    get_zigzag_cp_rank_block_lengths,
+    get_zigzag_cp_rank_chunk_indices,
+    get_zigzag_mla_cp_ring_visibility,
+    use_npu_mla_cp_ring,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -46,6 +55,8 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+MLA_CP_RING_PREFIX_BLOCK_SIZE = 32768
+MLA_CP_RING_BATCH_PREFIX_MAX_TOKENS = 16384
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -69,9 +80,28 @@ def _reshape_kv_for_fia_nz(
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
 
 
+def _split_cp_query_halves(q: torch.Tensor, cp_meta):
+    """Split live zigzag rows and report trailing CP-v2 padding rows."""
+    prev_rows = cp_meta.total_q_prev_tokens
+    logical_rows = prev_rows + cp_meta.total_q_next_tokens
+    if q.shape[0] < logical_rows:
+        raise ValueError(
+            "CP query has fewer rows than its metadata: "
+            f"tensor={q.shape[0]}, metadata={logical_rows}."
+        )
+    return q[:prev_rows], q[prev_rows:logical_rows], q.shape[0] - logical_rows
+
+
+def _restore_cp_query_padding(output: torch.Tensor, padding_rows: int) -> torch.Tensor:
+    if padding_rows == 0:
+        return output
+    return torch.cat(
+        [output, output.new_zeros((padding_rows, *output.shape[1:]))], dim=0
+    )
+
+
 @dataclass
 class ForwardMetadata:
-
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
@@ -100,6 +130,15 @@ class ForwardMetadata:
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
+
+
+@dataclass
+class MLACPRingSourceLayout:
+    token_count: int
+    early_token_count: int
+    early_to_prev_seq_lens: torch.Tensor
+    early_to_next_seq_lens: torch.Tensor
+    late_to_next_seq_lens: torch.Tensor
 
 
 class AscendAttnMaskBuilder:
@@ -298,8 +337,100 @@ def _cp_allgather_and_save_kv_npu(
     )
 
 
-class AscendAttnBackend(AttentionBackend):
+def _get_mla_cp_ring_cache_locs(forward_batch, layer, cp_size):
+    """Build natural paged-cache locations for every zigzag CP shard."""
+    cached_locs = getattr(forward_batch, "mla_cp_ring_cache_locs", None)
+    if cached_locs is not None:
+        return cached_locs
 
+    cache_loc = (
+        forward_batch.out_cache_loc
+        if not layer.is_cross_attention
+        else forward_batch.encoder_out_cache_loc
+    )
+    metadata = forward_batch.attn_cp_metadata
+    if cache_loc.shape[0] != sum(metadata.split_list):
+        raise ValueError(
+            "MLA CP ring cache locations do not match zigzag metadata: "
+            f"locations={cache_loc.shape[0]}, splits={sum(metadata.split_list)}."
+        )
+    natural_chunks = torch.split(cache_loc, metadata.split_list, dim=0)
+    cached_locs = tuple(
+        torch.cat(
+            [
+                natural_chunks[index]
+                for index in get_zigzag_cp_rank_chunk_indices(
+                    int(metadata.bs), cp_size, cp_rank
+                )
+            ],
+            dim=0,
+        )
+        for cp_rank in range(cp_size)
+    )
+    forward_batch.mla_cp_ring_cache_locs = cached_locs
+    return cached_locs
+
+
+def _get_mla_cp_ring_source_layouts(forward_batch, cp_size, cp_rank):
+    """Build source-specific block lengths and ATB sequence metadata."""
+    cached_layouts = getattr(forward_batch, "mla_cp_ring_source_layouts", None)
+    if cached_layouts is not None:
+        return cached_layouts
+
+    metadata = forward_batch.attn_cp_metadata
+    bs = int(metadata.bs)
+    local_prev_lens = [int(length) for length in metadata.actual_seq_q_prev_list]
+    local_next_lens = [int(length) for length in metadata.actual_seq_q_next_list]
+    expected_prev_lens, expected_next_lens = get_zigzag_cp_rank_block_lengths(
+        metadata.split_list, bs, cp_size, cp_rank
+    )
+    if local_prev_lens != expected_prev_lens or local_next_lens != expected_next_lens:
+        raise ValueError(
+            "MLA CP ring local Q lengths do not match zigzag metadata: "
+            f"prev={local_prev_lens}/{expected_prev_lens}, "
+            f"next={local_next_lens}/{expected_next_lens}."
+        )
+
+    layouts = []
+    for source_rank in range(cp_size):
+        early_lens, late_lens = get_zigzag_cp_rank_block_lengths(
+            metadata.split_list, bs, cp_size, source_rank
+        )
+        early_to_prev, _, late_to_next = get_zigzag_mla_cp_ring_visibility(
+            cp_rank, source_rank
+        )
+        if early_to_prev and any(
+            kv_len < q_len for q_len, kv_len in zip(local_prev_lens, early_lens)
+        ):
+            raise ValueError("MLA CP ring early KV length is shorter than early Q")
+        if any(kv_len < q_len for q_len, kv_len in zip(local_next_lens, early_lens)):
+            raise ValueError("MLA CP ring early KV length is shorter than late Q")
+        if late_to_next and any(
+            kv_len < q_len for q_len, kv_len in zip(local_next_lens, late_lens)
+        ):
+            raise ValueError("MLA CP ring late KV length is shorter than late Q")
+
+        layouts.append(
+            MLACPRingSourceLayout(
+                token_count=sum(early_lens) + sum(late_lens),
+                early_token_count=sum(early_lens),
+                early_to_prev_seq_lens=torch.tensor(
+                    [local_prev_lens, early_lens], dtype=torch.int32
+                ),
+                early_to_next_seq_lens=torch.tensor(
+                    [local_next_lens, early_lens], dtype=torch.int32
+                ),
+                late_to_next_seq_lens=torch.tensor(
+                    [local_next_lens, late_lens], dtype=torch.int32
+                ),
+            )
+        )
+    cached_layouts = tuple(layouts)
+    forward_batch.mla_cp_ring_source_layouts = cached_layouts
+    return cached_layouts
+
+
+class AscendAttnBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -396,6 +527,20 @@ class AscendAttnBackend(AttentionBackend):
             self.dllm_block_size = self.dllm_config.block_size
 
         self.attn_cp_size = model_runner.ps.attn_cp_size
+        self.mla_cp_ring_prefix_block_size = MLA_CP_RING_PREFIX_BLOCK_SIZE
+        if self.mla_cp_ring_prefix_block_size % self.page_size != 0:
+            raise ValueError(
+                "MLA CP ring prefix block size must be a multiple of "
+                f"page_size={self.page_size}, got "
+                f"{self.mla_cp_ring_prefix_block_size}."
+            )
+        # Shared by all MLA layers in this backend. Ring prefill is eager and
+        # layers execute serially, so two ping-pong receive buffers are enough
+        # for every layer and avoid allocator work in each ring step.
+        self._mla_cp_ring_exchange_buffers = None
+        self._mla_cp_ring_send_buffer = None
+        self._mla_cp_ring_seq_lens_cache = {}
+        self._mla_cp_ring_prefix_indices_cache = {}
 
     def _is_swa_layer(self, layer: RadixAttention) -> bool:
         return (
@@ -552,9 +697,7 @@ class AscendAttnBackend(AttentionBackend):
                 "cpu"
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
-            self.forward_metadata.flatten_prefix_block_tables = torch.empty(
-                0, dtype=torch.int32
-            ).to(self.device)
+            prefix_block_table_chunks = []
             for req_idx, seq_len in zip(
                 forward_batch.req_pool_indices.tolist(), seq_prefix_lens
             ):
@@ -562,12 +705,12 @@ class AscendAttnBackend(AttentionBackend):
                 req_prefix_block_tables = (
                     req_indices[:seq_len][:: self.page_size] // self.page_size
                 )
-                self.forward_metadata.flatten_prefix_block_tables = torch.cat(
-                    (
-                        self.forward_metadata.flatten_prefix_block_tables,
-                        torch.flatten(req_prefix_block_tables),
-                    )
-                )
+                prefix_block_table_chunks.append(torch.flatten(req_prefix_block_tables))
+            self.forward_metadata.flatten_prefix_block_tables = (
+                prefix_block_table_chunks[0]
+                if len(prefix_block_table_chunks) == 1
+                else torch.cat(prefix_block_table_chunks)
+            )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.forward_metadata.swa_out_cache_loc = (
@@ -1008,13 +1151,9 @@ class AscendAttnBackend(AttentionBackend):
 
         # Local tokens are laid out [all_seqs_prev, all_seqs_next]; split at
         # total_q_prev_tokens rather than the midpoint to support bs > 1.
-        split = cp_meta.total_q_prev_tokens
-        q_prev = (
-            q[:split].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
-        q_next = (
-            q[split:].contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        )
+        q_prev, q_next, padding_rows = _split_cp_query_halves(q, cp_meta)
+        q_prev = q_prev.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_next = q_next.contiguous().reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         k_cache_paged = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -1057,8 +1196,895 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv=cp_meta.kv_len_next_list,
         )
 
-        attn_out = torch.cat([attn_out_prev, attn_out_next], dim=0)
+        attn_out = _restore_cp_query_padding(
+            torch.cat([attn_out_prev, attn_out_next], dim=0), padding_rows
+        )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _get_mla_cp_ring_exchange_buffer(
+        self, packed_kv: torch.Tensor, slot: int
+    ) -> torch.Tensor:
+        buffers = getattr(self, "_mla_cp_ring_exchange_buffers", None)
+        spec = (packed_kv.shape, packed_kv.dtype, packed_kv.device)
+        if buffers is None or buffers[0] != spec:
+            buffers = (
+                spec,
+                torch.empty_like(packed_kv),
+                torch.empty_like(packed_kv),
+            )
+            self._mla_cp_ring_exchange_buffers = buffers
+        return buffers[1 + slot]
+
+    def _pack_mla_cp_ring_local_kv(
+        self,
+        local_latent_k: torch.Tensor,
+        local_k_rope: torch.Tensor,
+        max_rank_tokens: int,
+    ) -> torch.Tensor:
+        """Pack compact MLA KV directly into a reusable ring send buffer."""
+        local_token_count = local_latent_k.shape[0]
+        if local_k_rope.shape[0] != local_token_count:
+            raise ValueError("MLA CP ring latent and RoPE token counts differ")
+        if local_token_count > max_rank_tokens:
+            raise ValueError(
+                f"MLA CP ring local payload {local_token_count} exceeds "
+                f"max_rank_len {max_rank_tokens}."
+            )
+
+        latent = local_latent_k.flatten(1)
+        rope = local_k_rope.flatten(1)
+        shape = (max_rank_tokens, latent.shape[-1] + rope.shape[-1])
+        spec = (shape, local_latent_k.dtype, local_latent_k.device)
+        cached = self._mla_cp_ring_send_buffer
+        if cached is None or cached[0] != spec:
+            # The receiver slices by the source rank's exact token count, so
+            # padding is not consumed and only needs deterministic zeroing once.
+            cached = (spec, local_latent_k.new_zeros(shape))
+            self._mla_cp_ring_send_buffer = cached
+        packed = cached[1]
+        packed[:local_token_count, : latent.shape[-1]].copy_(latent)
+        packed[:local_token_count, latent.shape[-1] :].copy_(rope)
+        return packed
+
+    def _get_mla_cp_ring_seq_lens(
+        self, q_lens: List[int], kv_lens: List[int]
+    ) -> torch.Tensor:
+        """Reuse host length tensors across Kimi-K3's many MLA layers."""
+        key = (tuple(q_lens), tuple(kv_lens))
+        cache = getattr(self, "_mla_cp_ring_seq_lens_cache", None)
+        if cache is None:
+            cache = self._mla_cp_ring_seq_lens_cache = {}
+        seq_lens = cache.get(key)
+        if seq_lens is None:
+            # Bound the cache for serving workloads with highly variable
+            # batches. Clearing is safe because ATB consumes host metadata
+            # synchronously when the operator is launched.
+            if len(cache) >= 64:
+                cache.clear()
+            seq_lens = torch.tensor([q_lens, kv_lens], dtype=torch.int32)
+            cache[key] = seq_lens
+        return seq_lens
+
+    def _get_mla_cp_ring_causal_prefix_plan(
+        self, q_len: int, tile_size: int, device: torch.device
+    ) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...]]:
+        """Return the packed strictly-lower causal rectangles for one request."""
+        key = (q_len, tile_size, str(device))
+        cache = getattr(self, "_mla_cp_ring_prefix_indices_cache", None)
+        if cache is None:
+            cache = self._mla_cp_ring_prefix_indices_cache = {}
+        plan = cache.get(key)
+        if plan is None:
+            tile_starts = tuple(range(tile_size, q_len, tile_size))
+            q_lens = tuple(
+                min(tile_size, q_len - tile_start) for tile_start in tile_starts
+            )
+            # ATB TND packs every sequence's keys contiguously. The strictly
+            # lower rectangles reuse progressively longer prefixes, so form
+            # one cached gather plan and apply it to K, K-RoPE and V.
+            prefix_indices = torch.tensor(
+                [index for tile_start in tile_starts for index in range(tile_start)],
+                dtype=torch.int64,
+                device=device,
+            )
+            if len(cache) >= 64:
+                cache.clear()
+            plan = (prefix_indices, q_lens, tile_starts)
+            cache[key] = plan
+        return plan
+
+    def _start_mla_cp_ring_kv_exchange(
+        self, packed_kv: torch.Tensor, recv_kv: Optional[torch.Tensor] = None
+    ):
+        """Start rotating one compact latent-KV shard to the next CP rank."""
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        next_global_rank = cp_group.ranks[(cp_rank + 1) % cp_group.world_size]
+        prev_global_rank = cp_group.ranks[(cp_rank - 1) % cp_group.world_size]
+        if recv_kv is None:
+            recv_kv = torch.empty_like(packed_kv)
+        elif (
+            recv_kv.shape != packed_kv.shape
+            or recv_kv.dtype != packed_kv.dtype
+            or recv_kv.device != packed_kv.device
+        ):
+            raise ValueError("MLA CP ring receive buffer does not match packed KV")
+        ops = [
+            torch.distributed.P2POp(
+                torch.distributed.irecv,
+                recv_kv,
+                prev_global_rank,
+                cp_group.device_group,
+            ),
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                packed_kv,
+                next_global_rank,
+                cp_group.device_group,
+            ),
+        ]
+        requests = torch.distributed.batch_isend_irecv(ops)
+        return recv_kv, requests
+
+    @staticmethod
+    def _finish_mla_cp_ring_kv_exchange(recv_kv, requests):
+        """Wait for a previously started compact-KV rotation."""
+        for request in requests:
+            request.wait()
+        return recv_kv
+
+    def _get_mla_cp_ring_prefix_token_plans(
+        self,
+        forward_batch: ForwardBatch,
+        prefix_lens: List[int],
+        minimum_block_lens: List[int],
+    ):
+        """Cache exact paged-prefix token indices for every bounded round.
+
+        Prefix page tables and block slicing are layer independent.  Building
+        an exact token plan once lets every MLA layer gather directly from the
+        flattened page pool, instead of selecting whole pages per request and
+        concatenating their trimmed data tensors again in every layer.
+        """
+        prefix_block_tables = self.forward_metadata.flatten_prefix_block_tables
+        if prefix_block_tables is None:
+            raise ValueError("MLA CP ring prefix block tables are missing")
+        prefix_block_tables = prefix_block_tables.reshape(-1)
+        key = (
+            tuple(int(length) for length in prefix_lens),
+            tuple(int(length) for length in minimum_block_lens),
+            self.mla_cp_ring_prefix_block_size,
+            self.page_size,
+        )
+        cache = getattr(forward_batch, "_mla_cp_ring_prefix_token_plans", None)
+        if cache is None:
+            cache = {}
+            forward_batch._mla_cp_ring_prefix_token_plans = cache
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        request_page_offsets = []
+        page_offset = 0
+        for prefix_len in prefix_lens:
+            request_page_offsets.append(page_offset)
+            page_offset += (int(prefix_len) + self.page_size - 1) // self.page_size
+        if page_offset != prefix_block_tables.numel():
+            raise ValueError(
+                "Selected MLA CP ring prefix pages do not match prefix lengths: "
+                f"pages={prefix_block_tables.numel()}, expected={page_offset}."
+            )
+
+        page_token_offsets = torch.arange(
+            self.page_size,
+            dtype=torch.int64,
+            device=prefix_block_tables.device,
+        )
+        plans = []
+        for block_slices in get_prefix_block_slices(
+            prefix_lens,
+            self.mla_cp_ring_prefix_block_size,
+            minimum_block_lens,
+        ):
+            block_lens = tuple(int(length) for _, length in block_slices)
+            token_index_chunks = []
+            for request_index, (start, length) in enumerate(block_slices):
+                if length == 0:
+                    continue
+                first_page = start // self.page_size
+                page_start_offset = start % self.page_size
+                page_count = (
+                    page_start_offset + length + self.page_size - 1
+                ) // self.page_size
+                table_start = request_page_offsets[request_index] + first_page
+                page_indices = prefix_block_tables[
+                    table_start : table_start + page_count
+                ].to(torch.int64)
+                physical_token_indices = (
+                    page_indices.view(-1, 1) * self.page_size
+                    + page_token_offsets.view(1, -1)
+                ).reshape(-1)
+                token_index_chunks.append(
+                    physical_token_indices[
+                        page_start_offset : page_start_offset + length
+                    ]
+                )
+            if not token_index_chunks:
+                continue
+            token_indices = (
+                token_index_chunks[0]
+                if len(token_index_chunks) == 1
+                else torch.cat(token_index_chunks)
+            )
+            plans.append((block_lens, token_indices))
+
+        if len(cache) >= 8:
+            cache.clear()
+        cached = tuple(plans)
+        cache[key] = cached
+        return cached
+
+    def _iter_mla_cp_ring_compact_prefix_blocks(
+        self,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prefix_lens: List[int],
+        minimum_block_lens: List[int],
+    ):
+        k_flat = k_buffer.flatten(0, 1)
+        v_flat = v_buffer.flatten(0, 1)
+        for block_lens, token_indices in self._get_mla_cp_ring_prefix_token_plans(
+            forward_batch, prefix_lens, minimum_block_lens
+        ):
+            yield (
+                list(block_lens),
+                torch.index_select(k_flat, 0, token_indices),
+                torch.index_select(v_flat, 0, token_indices),
+            )
+
+    def _iter_mla_cp_ring_prefix_kv_blocks(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        prefix_lens: List[int],
+        minimum_block_lens: List[int],
+    ):
+        """Load and expand the radix prefix in bounded blocks.
+
+        Expanding the complete accumulated prefix made the eager prefill peak
+        grow with every chunk and also presented a new, ever-larger shape to
+        AtbRingMLA.  Yielding one bounded block at a time caps both the
+        projection tensors and the operator workspace shapes.
+        """
+        if not any(prefix_lens):
+            return
+        if (
+            self.forward_metadata.prefix_lens is None
+            or self.forward_metadata.flatten_prefix_block_tables is None
+        ):
+            raise ValueError("MLA CP ring prefix metadata is missing")
+
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        for (
+            block_lens,
+            prefix_latent_k,
+            prefix_k_rope_compact,
+        ) in self._iter_mla_cp_ring_compact_prefix_blocks(
+            k_buffer,
+            v_buffer,
+            forward_batch,
+            prefix_lens,
+            minimum_block_lens,
+        ):
+            if prefix_latent_k.shape[0] != sum(block_lens):
+                raise ValueError(
+                    "MLA CP ring packed prefix block length is inconsistent"
+                )
+
+            projected_kv = layer.kv_b_proj(prefix_latent_k.squeeze(1))[0].view(
+                -1,
+                layer.tp_k_head_num,
+                layer.v_head_dim * 2,
+            )
+            prefix_k_nope, prefix_value = projected_kv.split(
+                [layer.v_head_dim, layer.v_head_dim], dim=-1
+            )
+            prefix_k_rope = prefix_k_rope_compact.expand(-1, layer.tp_k_head_num, -1)
+            # The projected K/V no longer depends on the compact latent
+            # tensor. Release page-selection intermediates before ATB runs.
+            del prefix_latent_k
+            yield block_lens, prefix_k_nope, prefix_k_rope, prefix_value
+            # A generator retains its frame across ``yield``. Explicitly drop
+            # the yielded block before constructing the next one, otherwise
+            # consecutive expanded blocks overlap in allocator lifetime.
+            del (
+                projected_kv,
+                prefix_k_nope,
+                prefix_k_rope,
+                prefix_k_rope_compact,
+                prefix_value,
+            )
+
+    def _run_mla_cp_ring_segment(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        value: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layer: RadixAttention,
+        causal: bool,
+        previous_output: Optional[torch.Tensor],
+        previous_lse: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute and online-merge one visible Q/KV block pair."""
+        if causal:
+            if seq_lens.ndim != 2 or seq_lens.shape[0] != 2:
+                raise ValueError(
+                    "causal MLA CP ring segments require [2, batch] lengths"
+                )
+            q_lens = [int(length) for length in seq_lens[0].tolist()]
+            if max(q_lens, default=0) > MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE:
+                return self._run_mla_cp_ring_causal_tiled(
+                    q_nope,
+                    q_rope,
+                    k_nope,
+                    k_rope,
+                    value,
+                    q_lens,
+                    [int(length) for length in seq_lens[1].tolist()],
+                    layer,
+                    previous_output,
+                    previous_lse,
+                )
+        q_len = q_nope.shape[0]
+        first_block = previous_output is None
+        if first_block != (previous_lse is None):
+            raise ValueError("MLA CP ring output and LSE must be initialized together")
+        if first_block:
+            output = q_nope.new_zeros(q_nope.shape)
+            softmax_lse = torch.zeros(
+                layer.tp_q_head_num,
+                q_len,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        else:
+            # ATB supports in-place online softmax merging. Reusing these two
+            # buffers avoids allocating output and LSE for every visible block.
+            output = previous_output
+            softmax_lse = previous_lse
+        torch_npu.atb.npu_ring_mla(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            k_nope=k_nope,
+            k_rope=k_rope,
+            value=value,
+            mask=self.ringmla_mask,
+            seqlen=seq_lens,
+            head_num=layer.tp_q_head_num,
+            kv_head_num=layer.tp_k_head_num,
+            pre_out=previous_output,
+            prev_lse=previous_lse,
+            qk_scale=layer.scaling,
+            kernel_type="kernel_type_high_precision",
+            mask_type="mask_type_triu" if causal else "no_mask",
+            calc_type=("calc_type_first_ring" if first_block else "calc_type_default"),
+            output=output,
+            softmax_lse=softmax_lse,
+        )
+        return output, softmax_lse
+
+    def _run_mla_cp_ring_causal_tiled(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        value: torch.Tensor,
+        q_lens: List[int],
+        kv_lens: List[int],
+        layer: RadixAttention,
+        previous_output: Optional[torch.Tensor],
+        previous_lse: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tile a large causal diagonal while preserving online softmax.
+
+        ATB fixes the triangular mask at 512x512.  For query tile ``i``, keys
+        from earlier tiles are first merged without a mask and the matching
+        key tile is then merged with the triangular mask.  This is exactly the
+        original causal block, while allowing the real 8K/128K PCP workload
+        to remain on the MLA ring backend instead of silently falling back to
+        absorbed MLA all-gather.
+        """
+        if len(q_lens) != len(kv_lens):
+            raise ValueError("MLA CP ring tiled query/KV batch sizes differ")
+        if any(q_len <= 0 or q_len != kv_len for q_len, kv_len in zip(q_lens, kv_lens)):
+            raise ValueError(
+                "MLA CP ring causal tiling requires equal, non-empty Q/KV blocks"
+            )
+        if (previous_output is None) != (previous_lse is None):
+            raise ValueError("MLA CP ring output and LSE must be initialized together")
+        request_outputs = []
+        request_lses = []
+        q_offset = 0
+        kv_offset = 0
+        tile_size = MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE
+        for q_len, kv_len in zip(q_lens, kv_lens):
+            q_req = q_nope[q_offset : q_offset + q_len]
+            q_rope_req = q_rope[q_offset : q_offset + q_len]
+            k_req = k_nope[kv_offset : kv_offset + kv_len]
+            k_rope_req = k_rope[kv_offset : kv_offset + kv_len]
+            value_req = value[kv_offset : kv_offset + kv_len]
+            prev_req = (
+                previous_output[q_offset : q_offset + q_len]
+                if previous_output is not None
+                else None
+            )
+            prev_lse_req = (
+                previous_lse[:, q_offset : q_offset + q_len]
+                if previous_lse is not None
+                else None
+            )
+
+            # Treat the fixed-size diagonal tiles as independent TND
+            # sequences and execute all of them in one RingMLA launch.
+            # The strictly-lower rectangles are merged afterwards. Online
+            # softmax is order-independent, and the ring already merges
+            # prefix/source blocks out of natural order, so this preserves
+            # the same attention. With packed prefixes enabled below this
+            # reduces 2*T-1 launches to 2; the bounded fallback uses T.
+            tile_lens = [
+                min(tile_size, q_len - tile_start)
+                for tile_start in range(0, q_len, tile_size)
+            ]
+            request_output, request_lse = self._run_mla_cp_ring_segment(
+                q_req,
+                q_rope_req,
+                k_req,
+                k_rope_req,
+                value_req,
+                self._get_mla_cp_ring_seq_lens(tile_lens, tile_lens),
+                layer,
+                causal=True,
+                previous_output=prev_req,
+                previous_lse=prev_lse_req,
+            )
+
+            if (
+                len(tile_lens) > 1
+                and sum(range(tile_size, q_len, tile_size))
+                <= MLA_CP_RING_BATCH_PREFIX_MAX_TOKENS
+            ):
+                prefix_indices, prefix_q_lens, prefix_kv_lens = (
+                    self._get_mla_cp_ring_causal_prefix_plan(
+                        q_len, tile_size, q_req.device
+                    )
+                )
+                first_tile_len = tile_lens[0]
+                self._run_mla_cp_ring_segment(
+                    q_req[first_tile_len:],
+                    q_rope_req[first_tile_len:],
+                    torch.index_select(k_req, 0, prefix_indices),
+                    torch.index_select(k_rope_req, 0, prefix_indices),
+                    torch.index_select(value_req, 0, prefix_indices),
+                    self._get_mla_cp_ring_seq_lens(
+                        list(prefix_q_lens), list(prefix_kv_lens)
+                    ),
+                    layer,
+                    causal=False,
+                    previous_output=request_output[first_tile_len:],
+                    previous_lse=request_lse[:, first_tile_len:],
+                )
+            else:
+                tile_start = tile_lens[0]
+                for tile_len in tile_lens[1:]:
+                    tile_end = tile_start + tile_len
+                    # Earlier keys are fully visible to this query tile.
+                    # The supplied output/LSE slices are updated in place.
+                    self._run_mla_cp_ring_segment(
+                        q_req[tile_start:tile_end],
+                        q_rope_req[tile_start:tile_end],
+                        k_req[:tile_start],
+                        k_rope_req[:tile_start],
+                        value_req[:tile_start],
+                        self._get_mla_cp_ring_seq_lens([tile_len], [tile_start]),
+                        layer,
+                        causal=False,
+                        previous_output=request_output[tile_start:tile_end],
+                        previous_lse=request_lse[:, tile_start:tile_end],
+                    )
+                    tile_start = tile_end
+
+            request_outputs.append(request_output)
+            request_lses.append(request_lse)
+            q_offset += q_len
+            kv_offset += kv_len
+
+        if q_offset != q_nope.shape[0] or kv_offset != k_nope.shape[0]:
+            raise ValueError("MLA CP ring tiled sequence lengths do not match tensors")
+        if len(request_outputs) == 1:
+            return request_outputs[0], request_lses[0]
+        return torch.cat(request_outputs, dim=0), torch.cat(request_lses, dim=1)
+
+    def do_cp_mla_attn_ring(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run zigzag MLA attention by rotating latent KV.
+
+        Each compact shard received during the attention ring is scattered
+        directly to its natural paged-cache locations. No second CP all-gather
+        or full-sequence staging tensor is needed. Every rank still gets a
+        complete cache for radix-prefix correctness, while the existing
+        CP-rank-0 PD sender remains unchanged.
+        """
+        cp_meta = forward_batch.attn_cp_metadata
+        cp_group = get_attention_cp_group()
+        cp_rank = cp_group.rank_in_group
+        cp_size = cp_group.world_size
+        bs = int(cp_meta.bs)
+        block_lens_prev = [int(length) for length in cp_meta.actual_seq_q_prev_list]
+        block_lens_next = [int(length) for length in cp_meta.actual_seq_q_next_list]
+        if len(block_lens_prev) != bs or len(block_lens_next) != bs:
+            raise ValueError(
+                "MLA CP ring requires one early/late block length per request, "
+                f"got bs={bs}, prev={block_lens_prev}, next={block_lens_next}."
+            )
+        split = cp_meta.total_q_prev_tokens
+        next_tokens = cp_meta.total_q_next_tokens
+        if split != sum(block_lens_prev) or next_tokens != sum(block_lens_next):
+            raise ValueError("MLA CP ring token totals do not match CP metadata")
+        source_layouts = _get_mla_cp_ring_source_layouts(
+            forward_batch, cp_size, cp_rank
+        )
+        max_rank_tokens = int(cp_meta.max_rank_len[0])
+        if any(layout.token_count > max_rank_tokens for layout in source_layouts):
+            raise ValueError("MLA CP ring source payload exceeds max_rank_len")
+
+        if (
+            layer.v_head_dim != 128
+            or self.qk_rope_head_dim != 64
+            or layer.qk_head_dim != 192
+        ):
+            raise ValueError(
+                "npu_ring_mla requires q_nope/k_nope/value dim 128 and RoPE "
+                f"dim 64, got qk={layer.qk_head_dim}, v={layer.v_head_dim}, "
+                f"rope={self.qk_rope_head_dim}."
+            )
+        if layer.kv_b_proj is None:
+            raise ValueError("MLA CP ring requires kv_b_proj to expand latent KV")
+
+        local_latent_k = forward_batch.mla_cp_local_k
+        local_k_rope = forward_batch.mla_cp_local_k_rope
+        latent_head_num = local_latent_k.shape[1]
+        rope_head_num = local_k_rope.shape[1]
+        if latent_head_num != 1 or rope_head_num != 1:
+            raise ValueError(
+                "MLA CP ring expects one latent KV head, got "
+                f"K heads={latent_head_num}, K-RoPE heads={rope_head_num}."
+            )
+        local_token_count = split + next_tokens
+        if (
+            local_latent_k.shape[0] != local_token_count
+            or local_token_count != source_layouts[cp_rank].token_count
+        ):
+            raise ValueError(
+                "MLA CP ring local KV length does not match zigzag metadata: "
+                f"KV={local_latent_k.shape[0]}, Q={local_token_count}, "
+                f"layout={source_layouts[cp_rank].token_count}."
+            )
+        latent_feature_size = latent_head_num * self.kv_lora_rank
+
+        packed_kv = self._pack_mla_cp_ring_local_kv(
+            local_latent_k,
+            local_k_rope,
+            max_rank_tokens,
+        )
+
+        q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+        # Materialize each last-dimension split once; the two token halves are
+        # then contiguous views and do not need four separate copy launches.
+        q_nope = q_nope.contiguous()
+        q_rope = q_rope.contiguous()
+        q_nope_prev, q_nope_next = q_nope[:split], q_nope[split:]
+        q_rope_prev, q_rope_next = q_rope[:split], q_rope[split:]
+        if q_nope_prev.shape[0] != split or q_nope_next.shape[0] != next_tokens:
+            raise ValueError(
+                "MLA CP ring local Q halves must match the zigzag metadata, "
+                f"got prev={q_nope_prev.shape[0]}, next={q_nope_next.shape[0]}, "
+                f"expected_prev={split}, expected_next={next_tokens}."
+            )
+
+        local_k_nope, local_expanded_k_rope = k.split(
+            [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        cache_locs_by_rank = _get_mla_cp_ring_cache_locs(forward_batch, layer, cp_size)
+        prefix_lens = [int(length) for length in forward_batch.extend_prefix_lens_cpu]
+        if len(prefix_lens) != bs:
+            raise ValueError(
+                "MLA CP ring prefix lengths do not match batch size: "
+                f"prefixes={len(prefix_lens)}, bs={bs}."
+            )
+        output_prev = lse_prev = None
+        output_next = lse_next = None
+        output_all = lse_all = None
+
+        for ring_step in range(cp_size):
+            recv_kv = exchange_requests = None
+            if ring_step + 1 < cp_size:
+                # Launch the next rotation before projection and attention so
+                # HCCL can transfer compact KV while ATB consumes this shard.
+                recv_kv, exchange_requests = self._start_mla_cp_ring_kv_exchange(
+                    packed_kv,
+                    self._get_mla_cp_ring_exchange_buffer(packed_kv, ring_step % 2),
+                )
+
+            source_rank = (cp_rank - ring_step) % cp_size
+            source_layout = source_layouts[source_rank]
+            (
+                early_to_prev,
+                early_to_next,
+                late_to_next,
+            ) = get_zigzag_mla_cp_ring_visibility(cp_rank, source_rank)
+            source_packed_kv = packed_kv[: source_layout.token_count]
+            source_latent_k = source_packed_kv[:, :latent_feature_size].reshape(
+                -1, latent_head_num, self.kv_lora_rank
+            )
+            source_k_rope_compact = source_packed_kv[:, latent_feature_size:].reshape(
+                -1, rope_head_num, self.qk_rope_head_dim
+            )
+            if ring_step == 0:
+                source_k_nope = local_k_nope
+                source_k_rope = local_expanded_k_rope
+                source_value = v
+            else:
+                projected_kv = layer.kv_b_proj(source_latent_k.squeeze(1))[0].view(
+                    -1,
+                    layer.tp_k_head_num,
+                    layer.v_head_dim * 2,
+                )
+                source_k_nope, source_value = projected_kv.split(
+                    [layer.v_head_dim, layer.v_head_dim], dim=-1
+                )
+                source_k_rope = source_k_rope_compact.expand(
+                    -1, layer.tp_k_head_num, -1
+                )
+
+            # K/V projections are last-dimension views and expanded RoPE has
+            # a zero head stride. Materialize each full shard once, then pass
+            # contiguous first-dimension early/late views to RingMLA. Doing a
+            # separate contiguous() for both halves doubled copy launches.
+            source_k_nope = source_k_nope.contiguous()
+            source_k_rope = source_k_rope.contiguous()
+            source_value = source_value.contiguous()
+            source_early_tokens = source_layout.early_token_count
+            source_early_k = source_k_nope[:source_early_tokens]
+            source_early_rope = source_k_rope[:source_early_tokens]
+            source_early_v = source_value[:source_early_tokens]
+            source_late_k = source_k_nope[source_early_tokens:]
+            source_late_rope = source_k_rope[source_early_tokens:]
+            source_late_v = source_value[source_early_tokens:]
+
+            if source_rank == cp_rank:
+                # Both local early/late blocks are causal diagonals. Q and KV
+                # already use the same packed order
+                #   [all early requests, all late requests],
+                # so one TND launch can process the 2*BS independent causal
+                # sequences. This is the hot path in the captured 128K trace:
+                # it removes one RingMLA launch per MLA layer without copying.
+                diagonal_q_lens = block_lens_prev + block_lens_next
+                diagonal_kv_lens = (
+                    source_layout.early_to_prev_seq_lens[1].tolist()
+                    + source_layout.late_to_next_seq_lens[1].tolist()
+                )
+                output_all, lse_all = self._run_mla_cp_ring_segment(
+                    q_nope,
+                    q_rope,
+                    source_k_nope,
+                    source_k_rope,
+                    source_value,
+                    self._get_mla_cp_ring_seq_lens(diagonal_q_lens, diagonal_kv_lens),
+                    layer,
+                    causal=True,
+                    previous_output=None,
+                    previous_lse=None,
+                )
+                output_prev, output_next = output_all[:split], output_all[split:]
+                lse_prev, lse_next = lse_all[:, :split], lse_all[:, split:]
+
+                # The early local block is also fully visible to the late Q
+                # block. Merge that off-diagonal rectangle after the batched
+                # diagonals; online softmax makes the order irrelevant.
+                output_next, lse_next = self._run_mla_cp_ring_segment(
+                    q_nope_next,
+                    q_rope_next,
+                    source_early_k,
+                    source_early_rope,
+                    source_early_v,
+                    source_layout.early_to_next_seq_lens,
+                    layer,
+                    causal=False,
+                    previous_output=output_next,
+                    previous_lse=lse_next,
+                )
+            elif bs == 1 and source_rank > cp_rank:
+                # For one-request long-context prefill, Q-late sees both the
+                # early and late blocks of every higher source rank. Those KV
+                # blocks are contiguous and can be one unmasked sequence. Do
+                # not similarly merge Q-early and Q-late for lower ranks: ATB
+                # requires KV length >= Q length and their shared early KV may
+                # be shorter than the combined Q.
+                assert output_all is not None and lse_all is not None
+                output_next, lse_next = self._run_mla_cp_ring_segment(
+                    q_nope_next,
+                    q_rope_next,
+                    source_k_nope,
+                    source_k_rope,
+                    source_value,
+                    self._get_mla_cp_ring_seq_lens(
+                        [next_tokens], [source_layout.token_count]
+                    ),
+                    layer,
+                    causal=False,
+                    previous_output=output_next,
+                    previous_lse=lse_next,
+                )
+
+            # Local early Q block r sees early source blocks 0..r. Its own
+            # block is causal; strictly earlier blocks need no mask.
+            else:
+                if early_to_prev:
+                    output_prev, lse_prev = self._run_mla_cp_ring_segment(
+                        q_nope_prev,
+                        q_rope_prev,
+                        source_early_k,
+                        source_early_rope,
+                        source_early_v,
+                        source_layout.early_to_prev_seq_lens,
+                        layer,
+                        causal=source_rank == cp_rank,
+                        previous_output=output_prev,
+                        previous_lse=lse_prev,
+                    )
+
+                # Every early block precedes local late Q block (2*CP-1-r).
+                if early_to_next:
+                    output_next, lse_next = self._run_mla_cp_ring_segment(
+                        q_nope_next,
+                        q_rope_next,
+                        source_early_k,
+                        source_early_rope,
+                        source_early_v,
+                        source_layout.early_to_next_seq_lens,
+                        layer,
+                        causal=False,
+                        previous_output=output_next,
+                        previous_lse=lse_next,
+                    )
+
+                # A source late block (2*CP-1-s) is visible iff s >= r. Only
+                # the current rank's late block needs its causal mask.
+                if late_to_next:
+                    output_next, lse_next = self._run_mla_cp_ring_segment(
+                        q_nope_next,
+                        q_rope_next,
+                        source_late_k,
+                        source_late_rope,
+                        source_late_v,
+                        source_layout.late_to_next_seq_lens,
+                        layer,
+                        causal=source_rank == cp_rank,
+                        previous_output=output_next,
+                        previous_lse=lse_next,
+                    )
+
+            source_cache_locs = cache_locs_by_rank[source_rank]
+            if source_cache_locs.shape[0] != source_latent_k.shape[0]:
+                raise ValueError(
+                    f"MLA CP ring shard {source_rank} cache locations do not "
+                    f"match KV tokens: locations={source_cache_locs.shape[0]}, "
+                    f"KV={source_latent_k.shape[0]}."
+                )
+            self.token_to_kv_pool.set_kv_buffer(
+                layer,
+                KVWriteLoc(source_cache_locs, None),
+                source_latent_k,
+                source_k_rope_compact,
+            )
+
+            if exchange_requests is not None:
+                packed_kv = self._finish_mla_cp_ring_kv_exchange(
+                    recv_kv, exchange_requests
+                )
+
+        if any(prefix_lens):
+            # Prefix KV precedes both local zigzag blocks and is therefore an
+            # unmasked segment. Merge it after the ring so requests with an
+            # empty prefix already have initialized output/LSE buffers. The
+            # ring guard guarantees each non-empty prefix is at least as long
+            # as its Q block, as required by npu_ring_mla.
+            prefix_blocks = iter(
+                self._iter_mla_cp_ring_prefix_kv_blocks(
+                    layer,
+                    forward_batch,
+                    prefix_lens,
+                    [
+                        max(prev_len, next_len)
+                        for prev_len, next_len in zip(block_lens_prev, block_lens_next)
+                    ],
+                )
+            )
+            while True:
+                try:
+                    prefix_block = next(prefix_blocks)
+                except StopIteration:
+                    break
+                (
+                    prefix_block_lens,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                ) = prefix_block
+                # Keep the two query halves separate. The ring operator
+                # requires KV length >= Q length; radix blocks are guaranteed
+                # to cover each half, but not their combined token count.
+                prefix_prev_seq_lens = self._get_mla_cp_ring_seq_lens(
+                    block_lens_prev, prefix_block_lens
+                )
+                prefix_next_seq_lens = self._get_mla_cp_ring_seq_lens(
+                    block_lens_next, prefix_block_lens
+                )
+                output_prev, lse_prev = self._run_mla_cp_ring_segment(
+                    q_nope_prev,
+                    q_rope_prev,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                    prefix_prev_seq_lens,
+                    layer,
+                    causal=False,
+                    previous_output=output_prev,
+                    previous_lse=lse_prev,
+                )
+                output_next, lse_next = self._run_mla_cp_ring_segment(
+                    q_nope_next,
+                    q_rope_next,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                    prefix_next_seq_lens,
+                    layer,
+                    causal=False,
+                    previous_output=output_next,
+                    previous_lse=lse_next,
+                )
+                # Drop the current block before requesting the next one so two
+                # expanded prefix blocks never overlap in allocator lifetime.
+                del (
+                    prefix_block,
+                    prefix_k_nope,
+                    prefix_k_rope,
+                    prefix_value,
+                    prefix_prev_seq_lens,
+                    prefix_next_seq_lens,
+                )
+
+        assert output_prev is not None and output_next is not None
+        del forward_batch.mla_cp_local_k
+        del forward_batch.mla_cp_local_k_rope
+
+        if output_all is None:
+            output_all = torch.cat((output_prev, output_next), dim=0)
+        return output_all.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_sparse(
         self,
@@ -1225,14 +2251,15 @@ class AscendAttnBackend(AttentionBackend):
                 sinks=sinks,
             )
 
-        if not self.use_mla:
-            # Detect CP mode for prefill (context parallel)
-            is_cp_mode = (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            )
+        # Detect CP mode for prefill (context parallel).  MLA and dense MHA use
+        # different kernels below, but both consume the same zigzag metadata.
+        is_cp_mode = (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        )
 
+        if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 if is_cp_mode:
@@ -1627,6 +2654,18 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
+        elif is_cp_mode:
+            if not use_npu_mla_cp_ring(forward_batch):
+                raise NotImplementedError(
+                    "Ascend MLA prefill CP is implemented for Kimi-K3 ring only."
+                )
+            if save_kv_cache:
+                raise ValueError("Kimi-K3 MLA CP ring owns its KV cache writes.")
+            if not hasattr(forward_batch, "mla_cp_local_k") or not hasattr(
+                forward_batch, "mla_cp_local_k_rope"
+            ):
+                raise ValueError("Kimi-K3 MLA CP ring local KV is missing.")
+            return self.do_cp_mla_attn_ring(q, k, v, layer, forward_batch)
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             # This branch adds support for prefix cache for GLM-4.7-Flash.
             # When using the MLA architecture, if qk head dim equals v head dim and the head count is not a power of 2,
@@ -2856,9 +3895,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 attn_output = attn_output[:, :, : layer.tp_q_head_num, :]
             else:
-                assert (
-                    self.graph_mode == False
-                )  # _npu_paged_attention_mla not support graph mode
+                assert not self.graph_mode  # _npu_paged_attention_mla no graph support
                 if q_rope is not None:
                     q = torch.cat([q, q_rope], dim=-1)
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim)

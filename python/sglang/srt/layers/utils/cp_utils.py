@@ -22,6 +22,10 @@ from sglang.srt.runtime_context import (
     uses_mla_backend,
 )
 
+# ``npu_ring_mla`` has a fixed 512x512 causal mask.  Larger zigzag blocks are
+# query-tiled by the Ascend backend; this is a tile size, not a request limit.
+MLA_CP_RING_MAX_CAUSAL_BLOCK_SIZE = 512
+
 
 @dataclass
 class ContextParallelMetadata:
@@ -87,6 +91,204 @@ def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
     )
 
 
+def get_npu_mla_cp_ring_validation_error(forward_batch, attention=None):
+    """Return why the Ascend MLA CP ring path cannot run.
+
+    The ring path accepts uneven zigzag blocks and radix prefixes that satisfy
+    the ATB ``kvSeqLen >= qSeqLen`` rule. Every block must also be non-empty.
+    Causal blocks larger than the 512-token ATB mask are tiled and
+    online-merged.
+    """
+    if attention is not None and (
+        getattr(attention, "qk_nope_head_dim", None) != 128
+        or getattr(attention, "qk_rope_head_dim", None) != 64
+        or getattr(attention, "v_head_dim", None) != 128
+    ):
+        return "npu_ring_mla requires 128-dim NoPE/value and 64-dim RoPE"
+
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if metadata is None:
+        return "context-parallel metadata is missing"
+    bs = getattr(metadata, "bs", None)
+    if bs is None or int(bs) <= 0:
+        return "batch size must be positive"
+    bs = int(bs)
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if (
+        prefix_lens is None
+        or len(prefix_lens) != bs
+        or any(int(length) < 0 for length in prefix_lens)
+    ):
+        return "prefix-cache metadata is invalid"
+
+    cp_size = get_parallel().attn_cp_size
+    split_list = getattr(metadata, "split_list", None)
+    blocks_per_request = 2 * cp_size
+    if split_list is None or len(split_list) != bs * blocks_per_request:
+        return "only the zigzag CP layout is supported"
+    for request_id in range(bs):
+        begin = request_id * blocks_per_request
+        request_blocks = split_list[begin : begin + blocks_per_request]
+        if min(request_blocks) <= 0:
+            return "each request's zigzag blocks must have non-zero lengths"
+        prefix_len = int(prefix_lens[request_id])
+        if prefix_len != 0 and prefix_len < max(request_blocks):
+            return (
+                "non-zero prefix length must be at least the largest zigzag "
+                "block for npu_ring_mla"
+            )
+
+    per_rank_tokens = getattr(metadata, "per_rank_actual_token", None)
+    max_rank_len = getattr(metadata, "max_rank_len", None)
+    if (
+        per_rank_tokens is None
+        or len(per_rank_tokens) != cp_size
+        or max_rank_len is None
+        or len(max_rank_len) != cp_size
+        or len(set(max_rank_len)) != 1
+        or max_rank_len[0] < max(per_rank_tokens)
+    ):
+        return "context-parallel ring payload metadata is invalid"
+    return None
+
+
+def use_npu_mla_cp_ring(forward_batch, attention=None) -> bool:
+    selected = (
+        getattr(attention, "_use_npu_mla_cp_ring", False)
+        if attention is not None
+        else getattr(forward_batch, "_use_npu_mla_cp_ring", False)
+    )
+    return selected and (
+        get_npu_mla_cp_ring_validation_error(forward_batch, attention) is None
+    )
+
+
+def get_zigzag_mla_cp_ring_visibility(cp_rank: int, source_rank: int):
+    """Return visibility of a source rank's early/late KV zigzag blocks.
+
+    The tuple is ``(early_to_local_early, early_to_local_late,
+    late_to_local_late)``. Equality denotes the two causal diagonal blocks;
+    the caller applies a triangular mask only in that case.
+    """
+    return source_rank <= cp_rank, True, source_rank >= cp_rank
+
+
+def get_zigzag_cp_rank_chunk_indices(bs: int, cp_size: int, cp_rank: int):
+    """Return natural-layout chunk indices owned by one zigzag CP rank.
+
+    The returned order is ``[all request early blocks, all request late
+    blocks]``, matching the rank-local tensor layout used by CP-v2.
+    """
+    if bs <= 0 or cp_size <= 0 or not 0 <= cp_rank < cp_size:
+        raise ValueError(
+            f"Invalid zigzag CP topology: bs={bs}, cp_size={cp_size}, "
+            f"cp_rank={cp_rank}."
+        )
+    segments = 2 * cp_size
+    return list(range(cp_rank, bs * segments, segments)) + list(
+        range(segments - cp_rank - 1, bs * segments, segments)
+    )
+
+
+def get_zigzag_cp_rank_block_lengths(split_list, bs: int, cp_size: int, cp_rank: int):
+    """Return per-request ``(early, late)`` block lengths for a CP rank."""
+    segments = 2 * cp_size
+    if len(split_list) != bs * segments:
+        raise ValueError(
+            "Zigzag split metadata does not match batch/CP topology: "
+            f"splits={len(split_list)}, expected={bs * segments}."
+        )
+    chunk_indices = get_zigzag_cp_rank_chunk_indices(bs, cp_size, cp_rank)
+    return (
+        [int(split_list[index]) for index in chunk_indices[:bs]],
+        [int(split_list[index]) for index in chunk_indices[bs:]],
+    )
+
+
+def pack_paged_prefix_cache(paged_cache, prefix_lens, page_size: int):
+    """Remove per-request tail padding from selected prefix-cache pages."""
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    page_offset = 0
+    packed_requests = []
+    for prefix_len in prefix_lens:
+        prefix_len = int(prefix_len)
+        if prefix_len < 0:
+            raise ValueError(f"prefix length must be non-negative, got {prefix_len}")
+        page_count = (prefix_len + page_size - 1) // page_size
+        request_pages = paged_cache[page_offset : page_offset + page_count]
+        page_offset += page_count
+        if prefix_len > 0:
+            packed_requests.append(request_pages.flatten(0, 1)[:prefix_len])
+    if page_offset != paged_cache.shape[0]:
+        raise ValueError(
+            "Selected prefix pages do not match prefix lengths: "
+            f"pages={paged_cache.shape[0]}, consumed={page_offset}."
+        )
+    if not packed_requests:
+        return paged_cache.flatten(0, 1)[:0]
+    return torch.cat(packed_requests, dim=0)
+
+
+def get_prefix_block_slices(
+    prefix_lens: List[int],
+    block_size: int,
+    minimum_block_lens: List[int] | None = None,
+):
+    """Plan bounded, round-major slices for packed per-request prefixes.
+
+    ``npu_ring_mla`` requires every non-empty KV segment to be at least as
+    long as its query segment.  A short tail is therefore folded into the
+    preceding block instead of being emitted as a separate undersized block.
+    The resulting block size is bounded by ``block_size + minimum - 1``.
+    """
+    if block_size <= 0:
+        raise ValueError(f"prefix block size must be positive, got {block_size}")
+    if minimum_block_lens is None:
+        minimum_block_lens = [0] * len(prefix_lens)
+    if len(prefix_lens) != len(minimum_block_lens):
+        raise ValueError(
+            "prefix and minimum block length lists must have the same size"
+        )
+
+    request_slices = []
+    for prefix_len, minimum_block_len in zip(prefix_lens, minimum_block_lens):
+        prefix_len = int(prefix_len)
+        minimum_block_len = int(minimum_block_len)
+        if prefix_len < 0 or minimum_block_len < 0:
+            raise ValueError(
+                "prefix and minimum block lengths must be non-negative, got "
+                f"prefix={prefix_len}, minimum={minimum_block_len}"
+            )
+
+        slices = []
+        start = 0
+        while start < prefix_len:
+            remaining = prefix_len - start
+            length = min(block_size, remaining)
+            tail = remaining - length
+            if tail and tail < minimum_block_len:
+                length = remaining
+            slices.append((start, length))
+            start += length
+        request_slices.append(slices)
+
+    rounds = []
+    max_rounds = max((len(slices) for slices in request_slices), default=0)
+    for round_index in range(max_rounds):
+        rounds.append(
+            [
+                (
+                    slices[round_index]
+                    if round_index < len(slices)
+                    else (int(prefix_len), 0)
+                )
+                for prefix_len, slices in zip(prefix_lens, request_slices)
+            ]
+        )
+    return rounds
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # Base conditions: CP must be enabled, size > 1, and this must be a
     # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures
@@ -137,9 +339,9 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_parallel().attn_cp_size
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        assert input_.shape[0] % cp_size == 0, (
+            f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        )
         return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(

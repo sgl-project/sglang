@@ -37,7 +37,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import ceil_align, require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -45,6 +45,45 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+_KIMI_K3_LOCAL_PREFILL_CP_ARCHS = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+        "KimiLinearForCausalLM",
+    }
+)
+
+
+def _requires_local_prefill_cp_latch(
+    server_args: ServerArgs, model_config: ModelConfig
+) -> bool:
+    """Whether this worker must latch PCP from the real local batch."""
+    if (
+        not envs.SGLANG_ENABLE_CP_V2.get()
+        or not server_args.enable_prefill_cp
+        or server_args.attn_cp_size <= 1
+    ):
+        return False
+
+    architectures = set(getattr(model_config.hf_config, "architectures", None) or [])
+    text_config = getattr(model_config, "hf_text_config", None)
+    architectures.update(getattr(text_config, "architectures", None) or [])
+    return bool(architectures & _KIMI_K3_LOCAL_PREFILL_CP_ARCHS)
+
+
+def _local_prefill_cp_candidate(
+    local_batch: Optional[ScheduleBatch],
+    num_tokens: int,
+    attn_tp_size: int,
+) -> bool:
+    """Evaluate PCP before DP padding fabricates or reshapes local work."""
+    if local_batch is None or num_tokens <= 0:
+        return False
+
+    from sglang.srt.layers.cp.utils import can_cp_v2_apply
+
+    planned_num_tokens = ceil_align(num_tokens, attn_tp_size)
+    return can_cp_v2_apply(local_batch, num_tokens=planned_num_tokens)
 
 
 def _resolve_elastic_world_dp_size(
@@ -97,6 +136,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    local_prefill_cp_active: Optional[bool]
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -241,6 +281,7 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.local_prefill_cp_active = mlp_sync_info.local_prefill_cp_active
 
 
 def should_skip_scheduler_all_gather(dp_size: int) -> bool:
@@ -355,6 +396,7 @@ def prepare_mlp_sync_batch_raw(
     disable_overlap_schedule: bool,
     offload_tags: set[str],
     dwdp: bool = False,
+    latch_local_prefill_cp: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -432,6 +474,11 @@ def prepare_mlp_sync_batch_raw(
             local_forward_mode=local_forward_mode,
         )
     skip_all_gather = should_skip_scheduler_all_gather(dp_size)
+    local_prefill_cp_active = (
+        _local_prefill_cp_candidate(local_batch, num_tokens, attn_tp_size)
+        if latch_local_prefill_cp
+        else None
+    )
 
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
@@ -444,6 +491,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_prefill_cp_active=local_prefill_cp_active,
     )
 
     if dp_size == 1:
@@ -529,6 +577,9 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            latch_local_prefill_cp=_requires_local_prefill_cp_latch(
+                self.server_args, self.model_config
+            ),
         )
 
     def maybe_prepare_mlp_sync_batch(

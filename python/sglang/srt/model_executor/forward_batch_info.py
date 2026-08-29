@@ -459,6 +459,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
+    # Kimi-K3 PCP policy latched from this replica's real local batch.
+    local_prefill_cp_active: Optional[bool] = None
     global_forward_mode: Optional[ForwardMode] = None
 
     # For two-batch overlap
@@ -804,6 +806,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
+            local_prefill_cp_active=batch.local_prefill_cp_active,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
