@@ -319,6 +319,43 @@ class TestHunyuanDetectorArgDeserialization(CustomTestCase):
         args = json.loads(result.calls[0].parameters)
         self.assertIs(args["verbose"], True)
 
+    def test_top_level_composed_schema_args(self):
+        cases = (
+            ("anyOf", {"type": "integer"}, "7", 7),
+            ("oneOf", {"type": "boolean"}, "true", True),
+            ("allOf", {"type": "array", "items": {"type": "integer"}}, "[1,2]", [1, 2]),
+        )
+        for keyword, arg_schema, raw_value, expected in cases:
+            with self.subTest(keyword=keyword):
+                function_name = f"composed_{keyword}"
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=function_name,
+                            description="Composed schema",
+                            parameters={
+                                keyword: [
+                                    {
+                                        "type": "object",
+                                        "properties": {"value": arg_schema},
+                                    }
+                                ]
+                            },
+                        ),
+                    )
+                ]
+                text = (
+                    f"<tool_calls><tool_call>{function_name}<tool_sep>"
+                    f"<arg_key>value</arg_key><arg_value>{raw_value}</arg_value>"
+                    "</tool_call></tool_calls>"
+                )
+
+                result = self.detector.detect_and_parse(text, tools)
+                args = json.loads(result.calls[0].parameters)
+
+                self.assertEqual(args, {"value": expected})
+
     def test_string_arg_not_deserialized(self):
         """String-typed args should stay as strings even if they look like JSON."""
         text = (
