@@ -577,6 +577,12 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.enable_hierarchical_cache:
+            cache_controller = self.tree_cache.cache_controller
+            if cache_controller is not None:
+                cache_controller.load_fence_stream = (
+                    self.tp_worker.model_runner.forward_stream
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -2845,7 +2851,39 @@ class Scheduler(
                     tree_cache.get_last_hash_value(last_host_node),
                     prefix_keys,
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                    extra_key=req.extra_key,
+                    cache_salt=req.cache_salt,
                 )
+
+    def _retry_missed_storage_prefetches(self):
+        """Re-issue the availability check for queued requests whose prefetch
+        missed. Pacing counts scheduling passes so TP ranks re-issue on the
+        same pass; a sweep (the admission loop stops at the first
+        unschedulable request) covers the whole queue."""
+        interval = get_memory().hicache_storage_prefetch_retry_poll_interval
+        if interval <= 0 or not self.waiting_queue:
+            return
+        max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        for req in self.waiting_queue:
+            if self.tree_cache.pop_storage_prefetch_miss(req.rid):
+                req.storage_prefetch_retry_pending = True
+                req.storage_prefetch_retry_wait_polls = 0
+            if (
+                not req.storage_prefetch_retry_pending
+                or req.storage_prefetch_retry_attempts >= max_attempts
+            ):
+                continue
+            req.storage_prefetch_retry_wait_polls += 1
+            if req.storage_prefetch_retry_wait_polls <= interval:
+                continue
+            req.storage_prefetch_retry_pending = False
+            req.storage_prefetch_retry_attempts += 1
+            logger.debug(
+                "HiCache storage prefetch retry req=%s attempt=%d",
+                req.rid,
+                req.storage_prefetch_retry_attempts,
+            )
+            self._prefetch_kvcache(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3353,6 +3391,8 @@ class Scheduler(
 
         if self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
+            if self.enable_hicache_storage:
+                self._retry_missed_storage_prefetches()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.

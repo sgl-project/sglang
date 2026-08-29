@@ -31,6 +31,7 @@ under its own default configuration.
 
 import unittest
 
+from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -68,7 +69,7 @@ def _accepts(
     sa.use_mla_backend = lambda: use_mla
     sa._resolved_attention_backends = lambda: [backend]
     try:
-        ServerArgs._handle_page_major_kv_layout(sa)
+        handle_page_major_kv_layout(sa)
         return True
     except AssertionError:
         return False
