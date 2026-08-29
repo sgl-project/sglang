@@ -927,6 +927,12 @@ class DPDispatcher:
                     return
                 await asyncio.sleep(min(0.1 * consecutive_errors, 1.0))
                 continue
+            if not isinstance(msg, dict):
+                logger.error(
+                    "_result_listener received a non-dict envelope (%s); dropping",
+                    type(msg).__name__,
+                )
+                continue
             req_id = msg.get("req_id", "")
             dp_type = msg.get("_dp_type", "encode")
             if dp_type == "send":
@@ -1431,7 +1437,12 @@ async def _dp_worker_handle_request(
             f"req_id={request.get('req_id', '?')}: {e}",
             exc_info=True,
         )
-        err_code = int(getattr(e, "code", None) or HTTPStatus.INTERNAL_SERVER_ERROR)
+        # Only MMError carries an HTTP status in this protocol. Third-party
+        # exceptions may expose a callable ``code`` attribute (for example
+        # gRPC errors), which must not make error reporting fail a second time.
+        err_code = int(
+            e.code if isinstance(e, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR
+        )
         envelope = {
             "req_id": request.get("req_id", ""),
             "_dp_type": dp_type,

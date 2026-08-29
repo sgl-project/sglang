@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
 from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
@@ -27,12 +28,86 @@ from sglang.srt.disaggregation.encoder.server import (
     rid_to_receive_count,
     rid_to_receive_endpoint,
 )
+from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+class TestEncoderDPErrorHandling(CustomTestCase):
+    @staticmethod
+    async def _run_registration_error(error):
+        encoder = SimpleNamespace(
+            register_embedding_destinations=AsyncMock(side_effect=error)
+        )
+        send = AsyncMock()
+        request = {
+            "req_id": "req",
+            "receive_count": 1,
+            "receive_url": "tcp://127.0.0.1:1",
+        }
+        with patch.object(encoder_runtime, "async_sock_send", send):
+            await encoder_runtime._dp_worker_handle_request(
+                encoder,
+                None,
+                object(),
+                asyncio.Lock(),
+                0,
+                request,
+                "register_destinations",
+            )
+        return unwrap_from_pickle(send.await_args.args[1])
+
+    def test_worker_reports_third_party_exception_with_callable_code(self):
+        class RpcLikeError(Exception):
+            def code(self):
+                return "INTERNAL"
+
+        envelope = asyncio.run(
+            self._run_registration_error(RpcLikeError("registration failed"))
+        )
+        self.assertEqual(envelope["_error"], "registration failed")
+        self.assertEqual(envelope["_error_code"], 500)
+
+    def test_worker_preserves_mm_error_status(self):
+        envelope = asyncio.run(
+            self._run_registration_error(MMError("bad destination", code=400))
+        )
+        self.assertEqual(envelope["_error_code"], 400)
+
+    def test_dispatcher_drops_malformed_result_without_stopping_listener(self):
+        async def run():
+            dispatcher = encoder_runtime.DPDispatcher(
+                dp_size=1,
+                dispatch_sockets=[object()],
+                result_socket=object(),
+                worker_processes=[],
+            )
+            future = asyncio.get_running_loop().create_future()
+            dispatcher.pending_futures[0]["req"] = future
+            dispatcher.req_id_to_rank["req"] = 0
+            valid = {"req_id": "req", "_dp_type": "encode", "content": None}
+            recv = AsyncMock(
+                side_effect=[
+                    ["not", "an", "envelope"],
+                    valid,
+                    asyncio.CancelledError(),
+                ]
+            )
+
+            with patch.object(encoder_runtime, "async_sock_recv", recv):
+                listener = asyncio.create_task(dispatcher._result_listener())
+                await asyncio.wait_for(future, timeout=1)
+                listener.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await listener
+
+            self.assertEqual(future.result(), valid)
+
+        asyncio.run(run())
 
 
 class TestEncoderPreprocessorKimiGrid(CustomTestCase):
