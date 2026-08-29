@@ -25,9 +25,9 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    resolve_transformer_checkpoint_files,
     resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
-    resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
@@ -214,10 +214,13 @@ class TransformerLoader(ComponentLoader):
             # A GGUF file holds the whole transformer; the remaining components
             # still load from the base model path.
             safetensors_list = []
+            transformer_override_config_path = None
         else:
-            safetensors_list = resolve_transformer_safetensors_to_load(
+            checkpoint_files = resolve_transformer_checkpoint_files(
                 component_server_args, component_model_path
             )
+            safetensors_list = list(checkpoint_files.safetensors)
+            transformer_override_config_path = checkpoint_files.config_path
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -286,6 +289,7 @@ class TransformerLoader(ComponentLoader):
             component_name=component_name,
             gguf_file=gguf_file,
             checkpoint_quant_config=checkpoint_quant_config,
+            transformer_override_config_path=transformer_override_config_path,
         )
         if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
