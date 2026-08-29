@@ -36,13 +36,18 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
+    DCPTokenTransferPlan,
     FastQueue,
     TransferKVChunk,
+    build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    resolve_dcp_dst_entry_indices,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
@@ -50,6 +55,7 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
+MORI_DCP_GUARD = b"MoriDCPMsgGuard"
 _TAG_ABORT = b"ABORT"
 
 
@@ -194,6 +200,13 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_kv_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    dst_dcp_size: int = 1
+    dst_dcp_rank: int = 0
+    requires_dcp_relayout: bool = False
+    dcp_token_item_lens: Optional[List[int]] = None
+    dcp_dst_region_indices: Optional[List[int]] = None
 
     @property
     def engine_key(self) -> str:
@@ -221,6 +234,21 @@ class KVArgsRegisterInfo:
             if len(payload) > 12 and payload[12]
             else []
         )
+        dst_kv_item_lens = (
+            list(struct.unpack(f"{len(payload[13]) // 8}Q", payload[13]))
+            if len(payload) > 13 and payload[13]
+            else [dst_kv_item_len] * len(dst_kv_mem_descs)
+        )
+        if len(dst_kv_item_lens) != len(dst_kv_mem_descs):
+            raise ValueError(
+                "dst_kv_item_lens length mismatch: "
+                f"got {len(dst_kv_item_lens)}, expected {len(dst_kv_mem_descs)}"
+            )
+        dst_kv_layer_ids = (
+            list(struct.unpack(f"{len(payload[14]) // 4}I", payload[14]))
+            if len(payload) > 14 and payload[14]
+            else []
+        )
         return cls(
             endpoint=endpoint,
             dst_port=dst_port,
@@ -234,6 +262,18 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=dst_kv_item_len,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            dst_kv_item_lens=dst_kv_item_lens,
+            dst_kv_layer_ids=dst_kv_layer_ids,
+            dst_dcp_size=(
+                int(payload[15].decode("ascii"))
+                if len(payload) > 15 and payload[15]
+                else 1
+            ),
+            dst_dcp_rank=(
+                int(payload[16].decode("ascii"))
+                if len(payload) > 16 and payload[16]
+                else 0
+            ),
         )
 
 
@@ -462,6 +502,7 @@ class MoriKVManager(CommonKVManager):
             kv_chunk.is_last_chunk,
             aux_index=kv_chunk.prefill_aux_index,
             state_indices=kv_chunk.state_indices,
+            num_kv_tokens=kv_chunk.num_kv_tokens,
         )
 
         if self._should_skip_transfer(room):
@@ -641,7 +682,7 @@ class MoriKVManager(CommonKVManager):
             logger.exception("Failed to parse transfer info message")
 
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
-        if not msg or msg[0] != MORI_GUARD:
+        if not msg or msg[0] not in (MORI_GUARD, MORI_DCP_GUARD):
             logger.warning("Received malformed bootstrap message")
             return None
         payload = msg[1:]
@@ -741,6 +782,27 @@ class MoriKVManager(CommonKVManager):
         if engine_key in self.decode_kv_args_table:
             logger.debug("Remote peer %s already registered. Skipping.", engine_key)
             return
+        register_info.requires_dcp_relayout = self.requires_dcp_relayout(
+            register_info.dst_dcp_size, register_info.dst_dcp_rank
+        )
+        if register_info.requires_dcp_relayout:
+            if self.kv_args.kv_layer_ids or register_info.dst_kv_layer_ids:
+                dst_indices = resolve_dcp_dst_entry_indices(
+                    self.kv_args.kv_layer_ids,
+                    register_info.dst_kv_layer_ids,
+                    len(self.kv_mem_descs),
+                    len(register_info.dst_kv_mem_descs),
+                )
+            else:
+                _, dst_indices, _ = self.get_mla_kv_ptrs_with_pp(
+                    list(range(len(self.kv_mem_descs))),
+                    list(range(len(register_info.dst_kv_mem_descs))),
+                )
+            register_info.dcp_dst_region_indices = dst_indices
+            register_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                [register_info.dst_kv_item_lens[index] for index in dst_indices],
+                register_info.dst_dcp_size,
+            )
         self.engine.register_remote_engine(register_info.engine_desc)
         self.decode_kv_args_table[engine_key] = register_info
         logger.debug(
@@ -1033,6 +1095,55 @@ class MoriKVManager(CommonKVManager):
                     src_v_descs[layer_id],
                     dst_v_descs[layer_id],
                     layer_plan,
+                )
+            )
+        return statuses
+
+    def send_kvcache_dcp(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        plan: DCPTokenTransferPlan,
+    ) -> List[TransferStatus]:
+        if plan.target_src_token_indices.size == 0:
+            return []
+        if (
+            peer_info.dcp_dst_region_indices is None
+            or peer_info.dcp_token_item_lens is None
+        ):
+            raise RuntimeError("MORI DCP peer transfer metadata is not initialized")
+
+        dst_descs = [
+            peer_info.dst_kv_mem_descs[index]
+            for index in peer_info.dcp_dst_region_indices
+        ]
+        if not (
+            len(self.kv_mem_descs)
+            == len(dst_descs)
+            == len(peer_info.dcp_token_item_lens)
+        ):
+            raise RuntimeError(
+                "MORI DCP source/destination KV region count differs: "
+                f"src={len(self.kv_mem_descs)}, dst={len(dst_descs)}, "
+                f"item_lens={len(peer_info.dcp_token_item_lens)}"
+            )
+
+        grouped_plan = GroupedIndexPlan.from_groups(
+            *group_concurrent_contiguous(
+                plan.target_src_token_indices,
+                plan.target_dst_token_indices,
+            )
+        )
+        statuses: List[TransferStatus] = []
+        for src_desc, dst_desc, token_item_len in zip(
+            self.kv_mem_descs,
+            dst_descs,
+            peer_info.dcp_token_item_lens,
+        ):
+            statuses.extend(
+                self._submit_batch_transfer_plan(
+                    src_desc,
+                    dst_desc,
+                    self._build_contiguous_transfer_plan(grouped_plan, token_item_len),
                 )
             )
         return statuses
@@ -1419,6 +1530,7 @@ class MoriKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[npt.NDArray[np.int32]]] = None,
+        num_kv_tokens: Optional[int] = None,
     ) -> List[TransferStatus]:
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
 
@@ -1456,10 +1568,25 @@ class MoriKVManager(CommonKVManager):
                 peer_info = target.peer_info
 
                 if not info.is_dummy:
-                    dst_indices_chunk = info.dst_kv_indices[index_slice]
-                    result_statuses.extend(
-                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
-                    )
+                    if peer_info.requires_dcp_relayout:
+                        if num_kv_tokens is None:
+                            raise ValueError("PD DCP transfer requires num_kv_tokens")
+                        plan = build_dcp_token_transfer_plan(
+                            kv_indices,
+                            info.dst_kv_indices,
+                            physical_page_size=self.kv_args.page_size,
+                            dcp_size=peer_info.dst_dcp_size,
+                            dcp_rank=peer_info.dst_dcp_rank,
+                            src_page_offset=index_slice.start or 0,
+                            decode_prefix_len=info.decode_prefix_len or 0,
+                            num_kv_tokens=num_kv_tokens,
+                        )
+                        result_statuses.extend(self.send_kvcache_dcp(peer_info, plan))
+                    else:
+                        dst_indices_chunk = info.dst_kv_indices[index_slice]
+                        result_statuses.extend(
+                            self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                        )
 
                 if (
                     is_last_chunk
@@ -1629,6 +1756,17 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
+        packed_kv_item_lens = struct.pack(
+            f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
+            *self.kv_mgr.kv_args.kv_item_lens,
+        )
+        packed_kv_layer_ids = struct.pack(
+            f"{len(self.kv_mgr.kv_args.kv_layer_ids)}I",
+            *self.kv_mgr.kv_args.kv_layer_ids,
+        )
+        dst_dcp_size = str(self.kv_mgr.dcp_size).encode("ascii")
+        dst_dcp_rank = str(self.kv_mgr.dcp_rank).encode("ascii")
+        registration_guard = MORI_DCP_GUARD if self.kv_mgr.dcp_size > 1 else MORI_GUARD
 
         for bootstrap_info in self.bootstrap_infos:
             try:
@@ -1636,7 +1774,7 @@ class MoriKVReceiver(CommonKVReceiver):
                 with lock:
                     sock.send_multipart(
                         [
-                            MORI_GUARD,
+                            registration_guard,
                             "None".encode("ascii"),
                             self.kv_mgr.local_ip.encode("ascii"),
                             str(self.kv_mgr.rank_port).encode("ascii"),
@@ -1650,6 +1788,10 @@ class MoriKVReceiver(CommonKVReceiver):
                             kv_item_len,
                             packed_state_item_lens,
                             packed_state_dim_per_tensor,
+                            packed_kv_item_lens,
+                            packed_kv_layer_ids,
+                            dst_dcp_size,
+                            dst_dcp_rank,
                         ]
                     )
             except zmq.ZMQError:
