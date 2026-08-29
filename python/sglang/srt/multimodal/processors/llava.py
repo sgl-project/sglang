@@ -95,6 +95,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 return pixel_values, image_hash, image.size
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            raise
 
     async def _fetch_remote_image_bytes(self, url):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
