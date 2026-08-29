@@ -42,7 +42,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     autocast_context,
     autocast_enabled,
-    resolve_component_precision,
+    resolve_component_precision_override,
     resolve_precision,
     temporary_module_dtype,
 )
@@ -161,7 +161,7 @@ class ImageEncodingStage(PipelineStage):
                 ComponentUse(
                     stage_name,
                     "image_encoder",
-                    target_dtype=resolve_component_precision(
+                    target_dtype=resolve_component_precision_override(
                         server_args, "image_encoder"
                     ),
                 )
@@ -171,7 +171,7 @@ class ImageEncodingStage(PipelineStage):
                 ComponentUse(
                     stage_name,
                     "text_encoder",
-                    target_dtype=resolve_component_precision(
+                    target_dtype=resolve_component_precision_override(
                         server_args, "text_encoder"
                     ),
                 )

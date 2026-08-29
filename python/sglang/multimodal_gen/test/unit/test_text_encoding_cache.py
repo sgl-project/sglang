@@ -92,7 +92,7 @@ def test_component_uses_exact_encoder_precision():
     uses = stage.component_uses(server_args)
 
     assert [(use.component_name, use.target_dtype) for use in uses] == [
-        ("text_encoder", torch.bfloat16),
+        ("text_encoder", None),
         ("text_encoder_2", torch.float32),
     ]
 

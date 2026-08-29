@@ -239,6 +239,22 @@ def test_image_encoder_use_has_exact_precision():
     ]
 
 
+def test_image_encoder_use_preserves_loaded_dtype_without_override():
+    stage = ImageEncodingStage.__new__(ImageEncodingStage)
+    stage.image_encoder = object()
+    stage.text_encoder = None
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={}),
+        "ImageEncodingStage",
+    )
+
+    assert [(use.component_name, use.target_dtype) for use in uses] == [
+        ("image_encoder", None)
+    ]
+
+
 def test_qwen_layered_uses_loaded_text_encoder(monkeypatch):
     from sglang.multimodal_gen.runtime.pipelines import qwen_image
 
