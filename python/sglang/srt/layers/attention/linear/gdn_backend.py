@@ -510,6 +510,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            layer_id=layer.layer_id,
         )
 
         self._track_mamba_state_decode(
@@ -716,6 +717,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     intermediate_state_indices=intermediate_state_indices,
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
+                    layer_id=layer.layer_id,
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
@@ -731,10 +733,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
+                cake_state_checkpoint_cu_starts=(
+                    forward_metadata.cake_state_checkpoint_cu_starts
+                ),
                 num_state_checkpoints=forward_metadata.num_state_checkpoints,
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                layer_id=layer.layer_id,
             )
 
             if is_npu() and last_recurrent_state is not None:
