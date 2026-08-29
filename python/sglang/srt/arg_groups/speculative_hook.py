@@ -546,9 +546,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode not in (
+        "prefill",
+        "decode",
+    ):
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "Currently DSpark speculative decoding with pp_size > 1 is only "
+            "supported under PD disaggregation."
         )
 
     if cfg.speculative_draft_model_path is None:

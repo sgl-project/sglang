@@ -67,9 +67,15 @@ def check_server_args(server_args: Any):
                     "on prefill nodes (disaggregation-mode=prefill)"
                 )
         else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert (
+                cfg.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            pp_dspark_prefill = (
+                cfg.speculative_algorithm or ""
+            ).upper() == "DSPARK" and cfg.disaggregation_mode == "prefill"
+            assert cfg.speculative_algorithm is None or pp_dspark_prefill, (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for DSPARK on a PD prefill server"
             )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
