@@ -22,6 +22,9 @@ from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     TreeNodeCpp,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.runtime_context import (
+    get_memory,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -33,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 
 class RadixCacheCpp(BasePrefixCache):
+    @staticmethod
+    def _reject_cache_salt(cache_salt: Optional[str]) -> None:
+        if cache_salt is not None:
+            raise ValueError(
+                "cache_salt is not supported by the experimental C++ radix tree"
+            )
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -52,7 +62,7 @@ class RadixCacheCpp(BasePrefixCache):
         self.ongoing_load_back: Set[IOHandle] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
-            1 if server_args.hicache_write_policy == "write_through" else 2
+            1 if get_memory().hicache_write_policy == "write_through" else 2
         )
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.device = self.token_to_kv_pool_allocator.device
@@ -65,7 +75,7 @@ class RadixCacheCpp(BasePrefixCache):
         if params.enable_metrics:
             self.init_metrics_collector()
 
-        if not server_args.enable_hierarchical_cache:
+        if not get_memory().enable_hierarchical_cache:
             self.tree = RadixTreeCpp(
                 disabled=self.disable,
                 page_size=self.page_size,
@@ -100,6 +110,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
+        self._reject_cache_salt(key.cache_salt)
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.raw_token_ids())
         )
@@ -173,6 +184,7 @@ class RadixCacheCpp(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
         """Cache request when it finishes."""
+        self._reject_cache_salt(req.cache_salt)
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -210,6 +222,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
+        self._reject_cache_salt(req.cache_salt)
         assert req.req_pool_idx is not None
         token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)

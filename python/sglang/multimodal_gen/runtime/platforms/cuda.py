@@ -151,8 +151,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
     def resolve(cls, platform) -> str | AttentionBackendEnum:
         try:
             from sageattention import sageattn  # noqa: F401
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
             )
@@ -176,8 +175,7 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn.SageAttentionBackend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention backend failed to import. Falling back to Flash Attention."
             )
@@ -195,8 +193,7 @@ class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
             )
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn3.SageAttention3Backend"
-        except ImportError as e:
-            logger.info(e)
+        except ImportError:
             logger.info(
                 "Sage Attention 3 backend is not installed (To install it, see https://github.com/thu-ml/SageAttention/tree/main/sageattention3_blackwell#installation). Falling back to Torch SDPA."
             )
@@ -297,6 +294,58 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video MoBA Attention backend is not installed. ") from e
 
 
+class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+
+    # Hopper uses SGLang's SM90 CuTe-DSL block-sparse kernel. Blackwell uses the
+    # FlashInfer blk64 kernel built specifically for sm_100a; 10.3 and 12.x do
+    # not have a compatible cubin and must still fail closed.
+    supported_capabilities = {(9, 0), (10, 0)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "SubBlock sparse attention needs compute capability 9.0 "
+                f"(Hopper) or 10.0 (B200 / GB200); this device reports {found}."
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (  # noqa: F401
+                SubBlockSparseAttentionBackend,
+            )
+
+            if capability_tuple == (9, 0):
+                # Importing catches missing/incompatible CuTe-DSL and Quack;
+                # the CUDA kernel itself is compiled lazily on the first call.
+                from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (  # noqa: F401
+                    BlockSparseTensorsTorch,
+                )
+                from sglang.kernels.ops.attention.flash_attn.cute.interface import (  # noqa: F401
+                    flash_attn_func,
+                )
+            else:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
+                    load_bsa_attn_blk64_fwd,
+                )
+
+                load_bsa_attn_blk64_fwd()
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
+        except Exception as e:
+            logger.error("Failed to import SubBlock sparse attention: %s", str(e))
+            dependency = (
+                "SGLang's SM90 CuTe-DSL FlashAttention dependencies"
+                if capability_tuple == (9, 0)
+                else "FlashInfer with the blk64 block-sparse kernel "
+                "(flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)"
+            )
+            raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
+
+
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA2
 
@@ -338,6 +387,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
+        _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
         _FlashAttentionBackendResolver,
     )

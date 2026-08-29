@@ -8,13 +8,18 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_fp8 import ComfyFp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
+    KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
@@ -25,6 +30,7 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
@@ -234,6 +240,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         checkpoint_uses_packed_qkv: bool = False,
         swap_weight_nibbles: bool = False,
         checkpoint_weight_scale_layout: str = "linear",
+        checkpoint_uses_comfy_quantization: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -246,6 +253,33 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self.checkpoint_uses_packed_qkv = checkpoint_uses_packed_qkv
         self.swap_weight_nibbles = swap_weight_nibbles
         self.checkpoint_weight_scale_layout = checkpoint_weight_scale_layout
+        self.checkpoint_uses_comfy_quantization = checkpoint_uses_comfy_quantization
+        self._comfy_int8_config: KitchenInt8Config | None = None
+        self._comfy_fp8_config: ComfyFp8Config | None = None
+
+    def set_comfy_layer_markers(self, layer_markers: dict[str, dict[str, Any]]) -> None:
+        unsupported = {
+            str(marker.get("format")) for marker in layer_markers.values()
+        } - {"nvfp4", "int8_tensorwise", "float8_e4m3fn"}
+        if unsupported:
+            raise ValueError(
+                "NVFP4 checkpoints cannot dispatch companion Comfy formats: "
+                + ", ".join(sorted(unsupported))
+            )
+        int8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "int8_tensorwise"
+        }
+        self._comfy_int8_config = (
+            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+        )
+        fp8_markers = {
+            prefix: marker
+            for prefix, marker in layer_markers.items()
+            if marker.get("format") == "float8_e4m3fn"
+        }
+        self._comfy_fp8_config = ComfyFp8Config(fp8_markers) if fp8_markers else None
 
     @classmethod
     def get_name(cls) -> str:
@@ -346,9 +380,22 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             checkpoint_weight_scale_layout=config.get(
                 "checkpoint_weight_scale_layout", "linear"
             ),
+            checkpoint_uses_comfy_quantization=config.get(
+                "checkpoint_uses_comfy_quantization", False
+            ),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        if (
+            self._comfy_int8_config is not None
+            and prefix in self._comfy_int8_config.layer_markers
+        ):
+            return self._comfy_int8_config.get_quant_method(layer, prefix)
+        if (
+            self._comfy_fp8_config is not None
+            and prefix in self._comfy_fp8_config.layer_markers
+        ):
+            return self._comfy_fp8_config.get_quant_method(layer, prefix)
         return self._get_quant_method(layer, prefix, Linear=ModelOptFp4LinearMethod)
 
 
@@ -411,8 +458,25 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ROCm gfx942 (MI300X/MI325X) uses e4m3fnuz as its native fp8 dtype, so
+        # scaled_fp8_quant() produces e4m3fnuz activations. ModelOpt checkpoints
+        # ship e4m3fn weights. hipBLASLt rejects the resulting e4m3fn x e4m3fnuz
+        # torch._scaled_mm with HIPBLAS_STATUS_NOT_SUPPORTED. Reinterpreting the
+        # weights as e4m3fnuz and doubling the static scales is numerically
+        # identical and keeps the GEMM on the native fp8 path.
+        weight = layer.weight
+        if is_fp8_fnuz():
+            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+            )
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            if input_scale is not None:
+                copy_or_rebind_param(layer, "input_scale", input_scale)
+
         max_w_scale, quantized_weight = requantize_with_max_scale(
-            layer.weight, layer.weight_scale, layer.logical_widths
+            weight, layer.weight_scale, layer.logical_widths
         )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.
@@ -443,6 +507,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     """NVFP4 linear method using the selected FP4 GEMM backend."""
 
     def __init__(self, quant_config: ModelOptFp4Config):
+        # the FlashInfer FP4 kernels this method dispatches to are Blackwell-only.
+        # without this the load succeeds and the failure surfaces much later as
+        # an opaque CUDA error inside the kernel. an undetectable capability is
+        # left alone rather than rejected, so this only ever converts a crash
+        # into a message and never blocks a card that would have worked.
+        capability = current_platform.get_device_capability()
+        min_capability = quant_config.get_min_capability()
+        if capability is not None and capability.to_int() < min_capability:
+            raise RuntimeError(
+                f"NVFP4 checkpoints need compute capability "
+                f"{min_capability // 10}.{min_capability % 10} or newer "
+                f"(Blackwell); this GPU is {capability.as_version_str()}. "
+                f"Load an FP8 or BF16 checkpoint instead."
+            )
         self.quant_config = quant_config
 
     def create_weights(

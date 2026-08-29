@@ -185,7 +185,21 @@ class TestMetalCaptureProfilerMPS(unittest.TestCase):
 
 @unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
 class TestSchedulerProfilerManagerMPS(unittest.TestCase):
-    """SchedulerProfilerManager._start_profile handles Metal capture failures."""
+    """SchedulerProfilerManager._start_profile handles Metal capture failures.
+
+    apply_metal_profiler_patches() dispatches on use_mlx(), which reads
+    SGLANG_USE_MLX and is cached for the process (tensor_bridge.use_mlx).
+    This class exists to exercise the MPS strategy, so it pins use_mlx at
+    its point of use in profiler.py rather than the ambient environment;
+    an env-only pin would not reliably override an already-cached value.
+    """
+
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.hardware_backend.mlx.profiler.use_mlx", return_value=False
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _make_manager(self, output_dir):
         from sglang.srt.managers.scheduler_components.profiler_manager import (

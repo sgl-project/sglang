@@ -23,7 +23,7 @@ uv venv --python 3.12 && source .venv/bin/activate
 # tagged release — install from main. The serving runtime is in the base dependencies, no extra needed:
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-uv pip install -e python
+uv pip install --prerelease=allow -e python
 ```
 
 Then run the **Python** output of the command panel below in that environment. The **Docker** tab is simpler — `lmsysorg/sglang:latest` bundles the CUDA-13 runtime and the M.1 code.

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Transformer building blocks for the MiniMax H3 visual VAE ViT decoder.
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -11,9 +12,9 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion.triton.scale_shift import (
-    try_fused_scaled_residual_add_exact,
-)
+from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -63,6 +64,12 @@ class FeedForward(nn.Module):
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
 
+        self.silu_and_mul = (
+            SiluAndMul()
+            if use_gated and activation_fn == "silu" and current_platform.is_npu()
+            else None
+        )
+
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
         self._compile_forward_enabled = _env_flag(
             "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0"
@@ -84,6 +91,8 @@ class FeedForward(nn.Module):
                 and hidden_states.shape[-1] % 32 == 0
             ):
                 hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+            elif self.silu_and_mul is not None:
+                hidden_states = self.silu_and_mul(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
@@ -173,7 +182,10 @@ class RotaryEmbeddingND(nn.Module):
         if D != self.n_dim:
             raise ValueError(f"Expected {self.n_dim} dimensions, got {D}")
 
-        with torch.autocast("cuda", enabled=False):
+        autocast_context = (
+            torch.autocast("cuda", enabled=False) if img_ids.is_cuda else nullcontext()
+        )
+        with autocast_context:
             angles = (
                 self.angle_scale
                 * img_ids[:, :, :, None]
@@ -256,12 +268,11 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
-        pack_info: dict = {},
     ):
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )
-        attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
+        attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1

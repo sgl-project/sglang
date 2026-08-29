@@ -37,6 +37,9 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+)
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -774,6 +777,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens, **processor_kwargs
         )
 
+        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+
         audio_feature_lengths = None
 
         if self.model_type == "qwen3_omni_moe":
@@ -885,3 +890,17 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+
+    def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
+        if not (
+            self.keep_mm_features_on_device
+            and self.server_args.mm_enable_dp_encoder
+            and self.model_type
+            in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+        ):
+            return
+        for item in mm_items:
+            if item.is_image() or item.is_video():
+                item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
+                    True
+                )

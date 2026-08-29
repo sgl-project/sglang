@@ -44,6 +44,7 @@ class AttentionBackendEnum(enum.Enum):
     BLOCK_SPARSE_ATTN = enum.auto()
     RAIN_FUSION_ATTN = enum.auto()
     SOL_ATTN = enum.auto()
+    SUBBLOCK_SPARSE_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -62,6 +63,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,
             AttentionBackendEnum.SOL_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
         }
 
 
@@ -120,6 +122,14 @@ class Platform:
     simple_compile_backend: str = "inductor"
 
     supported_quantization: list[str] = []
+
+    def get_compile_backend(self, mode: str | None = None) -> str:
+        """Return the backend used to compile diffusion modules."""
+        return self.simple_compile_backend
+
+    def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
+        """Return backend-specific options for a diffusion module."""
+        return None
 
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
@@ -185,6 +195,10 @@ class Platform:
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
         return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
+
+    def is_device_type(self, device_type: str | None) -> bool:
+        """Return whether a device type belongs to this platform."""
+        return device_type == self.device_type
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
@@ -411,8 +425,8 @@ class Platform:
         return CpuArchEnum.UNSPECIFIED
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """Whether to enable DIT layerwise offload by default on the current platform."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return True
 
     @classmethod

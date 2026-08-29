@@ -103,9 +103,7 @@ def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    # FlashMLA exposes natural-log softmax LSE. FlashInfer MLA and the other
-    # currently supported MLA DCP decode backends expose base-2 LSE.
-    return attention_backend == "flashmla"
+    return attention_backend in {"flashmla", "cutedsl_mla"}
 
 
 if _is_cuda:
@@ -150,6 +148,8 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            return False
         # Shared activation surface with the DSA indexer graph dispatch
         # (in piecewise/breakable graph + non-speculative extend). Like the indexer
         # dispatch, this fusion is on by default on that surface.
@@ -479,6 +479,17 @@ class DeepseekMLAForwardMixin:
                 .transpose(0, 1)
                 .contiguous()
             )
+        elif getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            k_type = int(self.k_b_qweight_type.weight_type)
+            q_nope_out = torch.stack(
+                [
+                    fused_mul_mat_gguf(q_nope[:, head], self.k_b_qweight[head], k_type)
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
+            )
         elif fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
             # this transposed alias directly.
@@ -670,6 +681,7 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
@@ -799,7 +811,20 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
-        if self.use_deep_gemm_bmm:
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            v_type = int(self.v_b_qweight_type.weight_type)
+            attn_bmm_output = torch.stack(
+                [
+                    fused_mul_mat_gguf(
+                        attn_output[:, head], self.v_b_qweight[head], v_type
+                    )
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
+            ).flatten(1, 2)
+        elif self.use_deep_gemm_bmm:
             (
                 attn_output_val,
                 attn_output_scale,
@@ -886,6 +911,8 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
+        if gate is not None:
+            attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
