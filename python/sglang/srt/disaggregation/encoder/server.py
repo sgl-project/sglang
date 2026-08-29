@@ -143,6 +143,7 @@ class EncoderMetaRegistry:
         self._rid_to_send_done: Dict[str, int] = {}
         self._pending_at: Dict[str, float] = {}
         self._sweeper_task: Optional[asyncio.Task] = None
+        self._stale_release_tasks: Dict[str, asyncio.Task] = {}
         # Set only where the embedding also lives; None in the DP main process.
         self.on_release: Optional[Callable[[str], Awaitable[None]]] = None
 
@@ -169,9 +170,36 @@ class EncoderMetaRegistry:
                 rid
                 for rid, ts in self._pending_at.items()
                 if now - ts > self.sweep_timeout
+                and rid not in self._stale_release_tasks
             ]
             for rid in stale:
-                await self._release(rid)
+                self._schedule_stale_release(rid)
+
+    def _schedule_stale_release(self, req_id: str) -> asyncio.Task:
+        """Release one stale request without blocking cleanup of other requests."""
+        if task := self._stale_release_tasks.get(req_id):
+            return task
+        task = asyncio.create_task(self._release_stale(req_id))
+        self._stale_release_tasks[req_id] = task
+        task.add_done_callback(
+            lambda done, rid=req_id: self._finish_stale_release(rid, done)
+        )
+        return task
+
+    def _finish_stale_release(self, req_id: str, task: asyncio.Task) -> None:
+        if self._stale_release_tasks.get(req_id) is task:
+            self._stale_release_tasks.pop(req_id)
+
+    async def _release_stale(self, req_id: str) -> None:
+        try:
+            await self._release(req_id)
+        except Exception:
+            logger.exception("Failed to release stale encoder request %s", req_id)
+            # Keep the request eligible for a later sweep without retrying in a
+            # tight loop. Its metadata and buffer ownership remain intact.
+            async with rid_lock:
+                if req_id in self._pending_at:
+                    self._pending_at[req_id] = time.monotonic()
 
     async def publish(
         self,

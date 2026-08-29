@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
     EncodeContext,
     EncoderDelivery,
+    EncoderMetaRegistry,
     InternalError,
     MMEncoder,
     MMError,
@@ -113,6 +114,65 @@ class TestEncoderDPErrorHandling(CustomTestCase):
                     await listener
 
             self.assertEqual(future.result(), valid)
+
+        asyncio.run(run())
+
+
+class TestEncoderMetaRegistry(CustomTestCase):
+    def test_stale_releases_do_not_block_each_other(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            blocked_started = asyncio.Event()
+            unblock = asyncio.Event()
+            fast_released = asyncio.Event()
+
+            async def release(req_id):
+                if req_id == "blocked":
+                    blocked_started.set()
+                    await unblock.wait()
+                else:
+                    fast_released.set()
+
+            registry.on_release = release
+            registry._pending_at.update(blocked=0, fast=0)
+
+            blocked_task = registry._schedule_stale_release("blocked")
+            await asyncio.wait_for(blocked_started.wait(), timeout=1)
+            fast_task = registry._schedule_stale_release("fast")
+            await asyncio.wait_for(fast_released.wait(), timeout=1)
+            await fast_task
+
+            self.assertIn("blocked", registry._pending_at)
+            self.assertNotIn("fast", registry._pending_at)
+
+            unblock.set()
+            await blocked_task
+            self.assertNotIn("blocked", registry._pending_at)
+
+        asyncio.run(run())
+
+    def test_failed_stale_release_is_retried(self):
+        async def run():
+            registry = EncoderMetaRegistry(wait_timeout=1, sweep_timeout=1)
+            attempts = 0
+
+            async def release(_req_id):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient cleanup failure")
+
+            registry.on_release = release
+            registry._pending_at["req"] = 0
+
+            await registry._release_stale("req")
+            self.assertIn("req", registry._pending_at)
+            retry_at = registry._pending_at["req"]
+            self.assertGreater(retry_at, 0)
+
+            await registry._release_stale("req")
+            self.assertNotIn("req", registry._pending_at)
+            self.assertEqual(attempts, 2)
 
         asyncio.run(run())
 
