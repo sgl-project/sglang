@@ -7,10 +7,25 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _deepseek_moe_quant_resolution,
+    _deepseek_spec_moe_resolution,
+    _dsa_kv_cache_dtype_default,
+    _dsa_split_backend_resolution,
+    _enforce_disable_allreduce_fusion,
+    _flashinfer_allreduce_fusion_auto_enable,
+    _hrm_text_attention_force,
+    _mamba_radix_cache_resolution,
+    _sparse_head_overlap_disable,
+    collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
+    mamba_extra_buffer_of,
+    model_config_of,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
+    use_mla_backend,
+    validate_declarations,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
@@ -35,11 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_specific_adjustments(server_args: Any):
-    from sglang.srt.arg_groups.overrides import (
-        attention_backends_of,
-        model_config_of,
-        use_mla_backend,
-    )
+    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -107,10 +118,6 @@ def handle_model_specific_adjustments(server_args: Any):
     # server_args is never mutated — mid-resolution readers see the
     # declared values through resolved_view, runtime readers through the
     # flags tier.
-    from sglang.srt.arg_groups.overrides import (
-        collect_model_override_declarations,
-        validate_declarations,
-    )
 
     model_overrides = collect_model_override_declarations(
         model_arch, server_args, hf_config
@@ -210,11 +217,6 @@ def handle_model_specific_adjustments(server_args: Any):
                 import torch
 
                 major, _ = torch.cuda.get_device_capability()
-                from sglang.srt.arg_groups.overrides import (
-                    _dsa_kv_cache_dtype_default,
-                    _dsa_split_backend_resolution,
-                    run_post_process_pass,
-                )
 
                 run_post_process_pass(server_args, _dsa_kv_cache_dtype_default)
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
@@ -298,10 +300,6 @@ def handle_model_specific_adjustments(server_args: Any):
         # kv-cache-dtype default above must read the pristine
         # quantization). The HIP arm (fusion log + spec_moe writes, the
         # latter awaiting the speculative-hook migration) stays below.
-        from sglang.srt.arg_groups.overrides import (
-            _deepseek_moe_quant_resolution,
-            run_post_process_pass,
-        )
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if is_hip():
@@ -324,9 +322,6 @@ def handle_model_specific_adjustments(server_args: Any):
             # resolution pipeline (arg_groups/overrides.py:
             # _deepseek_spec_moe_resolution), invoked here at its legacy
             # slot.
-            from sglang.srt.arg_groups.overrides import (
-                _deepseek_spec_moe_resolution,
-            )
 
             run_post_process_pass(server_args, _deepseek_spec_moe_resolution)
 
@@ -576,11 +571,6 @@ def handle_model_specific_adjustments(server_args: Any):
     # resolved before that tail write of disable_overlap_schedule.
     handle_mamba_radix_cache(server_args, model_arch)
 
-    from sglang.srt.arg_groups.overrides import (
-        _sparse_head_overlap_disable,
-        run_post_process_pass,
-    )
-
     run_post_process_pass(server_args, _sparse_head_overlap_disable)
 
     # The FlashInfer AllReduce Fusion auto-enable and the enforce-disable
@@ -588,10 +578,6 @@ def handle_model_specific_adjustments(server_args: Any):
     # _flashinfer_allreduce_fusion_auto_enable /
     # _enforce_disable_allreduce_fusion), invoked here at their legacy
     # slots.
-    from sglang.srt.arg_groups.overrides import (
-        _enforce_disable_allreduce_fusion,
-        _flashinfer_allreduce_fusion_auto_enable,
-    )
 
     run_post_process_pass(server_args, _flashinfer_allreduce_fusion_auto_enable)
     run_post_process_pass(server_args, _enforce_disable_allreduce_fusion)
@@ -604,15 +590,10 @@ def handle_model_capability_adjustments(server_args: Any):
     from sglang.srt.arg_groups.kv_cache_hook import (
         validate_prefill_only_disable_kv_cache_args,
     )
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         return
-    from sglang.srt.arg_groups.overrides import (
-        _hrm_text_attention_force,
-        run_post_process_pass,
-    )
 
     model_config = model_config_of(server_args)
     hf_config = model_config.hf_config
@@ -786,7 +767,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 }
                 if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
                     sizing["bs"] = generate_prefill_cuda_graph_batch_sizes(
-                        server_args, sizing["max_bs"]
+                        sizing["max_bs"]
                     )
                 declare_resolution(
                     server_args,
@@ -833,11 +814,6 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
         validate_mamba_extra_buffer,
         validate_mamba_no_buffer,
     )
-    from sglang.srt.arg_groups.overrides import (
-        _mamba_radix_cache_resolution,
-        mamba_extra_buffer_of,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
@@ -855,7 +831,6 @@ def handle_mamba_radix_cache(server_args: Any, model_arch: str):
 
 
 def handle_language_model_only(server_args: Any):
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     if not cfg.language_model_only:

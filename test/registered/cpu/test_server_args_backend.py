@@ -47,7 +47,6 @@ class TestServerArgsCPUBackend(unittest.TestCase):
 
 class TestServerArgsIBDeviceValidation(unittest.TestCase):
     def _validate_ib_devices(self, device_str, available_devices=None):
-        server_args = ServerArgs.__new__(ServerArgs)
         available_devices = available_devices or [
             "mlx5_0",
             "mlx5_1",
@@ -70,7 +69,7 @@ class TestServerArgsIBDeviceValidation(unittest.TestCase):
                 else real_listdir(path)
             ),
         ):
-            return validate_ib_devices(server_args, device_str)
+            return validate_ib_devices(device_str)
 
     def test_validate_ib_devices_accepts_comma_separated(self):
         self.assertEqual(

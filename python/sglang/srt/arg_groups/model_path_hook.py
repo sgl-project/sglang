@@ -10,8 +10,10 @@ import os
 from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    _gguf_quantization,
     declare_resolution,
     resolving_view,
+    run_post_process_pass,
 )
 from sglang.srt.utils.common import is_remote_url
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
@@ -163,10 +165,6 @@ def handle_load_format(server_args: Any):
     # (arg_groups/overrides.py: _gguf_quantization); load_format itself is
     # genuine config (runtime user updates write it) and stays imperative.
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        _gguf_quantization,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _gguf_quantization)
     if (cfg.load_format == "auto" or cfg.load_format == "gguf") and check_gguf_file(

@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -110,7 +111,7 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of, model_config_of
+    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
@@ -153,7 +154,6 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
     """TcPiecewise (torch.compile + piecewise) is incompatible with
     these configurations. Most are torch.compile / dynamo limitations.
     """
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
 
@@ -244,7 +244,6 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     memory-saver rejection in its own __init__; config-time rules can be
     added here as they're discovered.
     """
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import is_deepseek_v4
@@ -331,7 +330,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of, model_config_of
+    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -376,7 +375,7 @@ def apply_deepep_adjustments(server_args: Any):
         if bs is None:
             # 2048 = documented prefill default; max_bs unresolved here.
             max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
-            bs = generate_prefill_cuda_graph_batch_sizes(server_args, max_bs)
+            bs = generate_prefill_cuda_graph_batch_sizes(max_bs)
         aligned = sorted({((b + 7) // 8) * 8 for b in bs})
         if aligned != sorted(bs):
             logger.info(
@@ -403,7 +402,6 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     auto-disabled for this multimodal arch, and declarative model overrides
     materialize too late to steer cuda-graph resolution. Honors an explicit
     --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     if (
@@ -425,7 +423,6 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
 
 
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     if (
@@ -473,7 +470,7 @@ def validate_cuda_graph_config(server_args: Any):
             )
 
 
-def generate_prefill_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
+def generate_prefill_cuda_graph_batch_sizes(max_bs: int):
     """
     Generate the list of batch sizes for prefill CUDA graph capture
     based on max_bs. For tc_piecewise prefill, bs carries the

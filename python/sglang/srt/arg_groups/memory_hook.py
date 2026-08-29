@@ -9,8 +9,11 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
+    post_capture_kv_sizing_planned,
     resolved_view,
     resolving_view,
+    use_mla_backend,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -46,11 +49,6 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         generate_cpu_graph_batch_sizes,
         generate_decode_cuda_graph_batch_sizes,
         generate_prefill_cuda_graph_batch_sizes,
-    )
-    from sglang.srt.arg_groups.overrides import (
-        model_config_of,
-        post_capture_kv_sizing_planned,
-        use_mla_backend,
     )
 
     cfg = resolving_view(server_args)
@@ -206,7 +204,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
 
     if prefill_cuda_graph_config.bs is None:
         prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
-            server_args, prefill_cuda_graph_config.max_bs
+            prefill_cuda_graph_config.max_bs
         )
 
     if cuda_graph_config != cfg.cuda_graph_config:
@@ -278,7 +276,6 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
 
 
 def reserve_for_graph_mb(server_args: Any) -> float:
-    from sglang.srt.arg_groups.overrides import use_mla_backend
 
     cfg = resolving_view(server_args)
     decode_cuda_graph_config = cfg.cuda_graph_config.decode

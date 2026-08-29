@@ -148,7 +148,6 @@ class HiRadixCache(RadixCache):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
-                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -162,7 +161,6 @@ class HiRadixCache(RadixCache):
             attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
-                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,

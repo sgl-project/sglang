@@ -8,9 +8,14 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    _data_parallelism_defaults,
+    _dp_lm_head_validation,
+    _tp_lm_head_all_to_all_default,
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
+    run_post_process_pass,
     should_report_expert_balancedness,
 )
 from sglang.srt.connector import ConnectorType
@@ -22,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
-    from sglang.srt.arg_groups.overrides import model_config_of
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
@@ -162,10 +166,6 @@ def handle_data_parallelism(server_args: Any):
     )
 
     cfg = resolving_view(server_args)
-    from sglang.srt.arg_groups.overrides import (
-        _data_parallelism_defaults,
-        run_post_process_pass,
-    )
 
     run_post_process_pass(server_args, _data_parallelism_defaults)
 
@@ -221,7 +221,7 @@ def handle_data_parallelism(server_args: Any):
             clamped = {"max_bs": cfg.chunked_prefill_size}
             if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
                 clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(
-                    server_args, clamped["max_bs"]
+                    clamped["max_bs"]
                 )
             declare_resolution(
                 server_args,
@@ -233,10 +233,6 @@ def handle_data_parallelism(server_args: Any):
 
     # Resolve the phase-aware TP LM-head default before validating the
     # resulting DP/TP LM-head configuration.
-    from sglang.srt.arg_groups.overrides import (
-        _dp_lm_head_validation,
-        _tp_lm_head_all_to_all_default,
-    )
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
@@ -370,9 +366,7 @@ def handle_elastic_ep(server_args: Any):
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep",
-                mooncake_ib_device=validate_ib_devices(
-                    server_args, cfg.mooncake_ib_device
-                ),
+                mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
     if cfg.ep_join_mode is not None:
         assert (

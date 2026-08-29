@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_world_group
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
@@ -29,7 +30,6 @@ logger = logging.getLogger(__name__)
 def is_post_capture_kv_active(
     *, server_args: ServerArgs, is_draft_worker: bool
 ) -> bool:
-    from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 
     return (
         post_capture_kv_sizing_planned(server_args)
