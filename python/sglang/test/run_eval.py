@@ -275,9 +275,7 @@ def run_eval(args):
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
         # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
-        # caller's threshold has to be measured against it, not inherited from
-        # the simple-evals scorer this replaced -- that one permuted each
-        # question's four options and asked for chain-of-thought.
+        # caller's threshold has to be measured against it, not inherited.
         return _run_sgl_eval("gpqa", args)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
