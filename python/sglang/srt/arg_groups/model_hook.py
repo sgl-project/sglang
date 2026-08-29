@@ -786,7 +786,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 }
                 if (Phase.PREFILL, "bs") not in cuda_graph_config_locked:
                     sizing["bs"] = generate_prefill_cuda_graph_batch_sizes(
-                        server_args, sizing["max_bs"]
+                        sizing["max_bs"]
                     )
                 declare_resolution(
                     server_args,

@@ -104,7 +104,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_hardware_runtime_validation,
     )
 
-    handle_hardware_runtime_validation(server_args)
+    handle_hardware_runtime_validation()
     if cfg.model_path.lower() in ["none", "dummy"]:
         return
 

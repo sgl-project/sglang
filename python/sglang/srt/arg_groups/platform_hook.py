@@ -17,7 +17,7 @@ from sglang.srt.utils.common import is_cuda, is_hip, is_host_cpu_arm64, is_npu
 logger = logging.getLogger(__name__)
 
 
-def handle_hardware_runtime_validation(server_args: Any):
+def handle_hardware_runtime_validation():
     # This is intentionally independent of `server_args.device`: setting
     # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
     # the environment cannot honor that request. With the flag unset,
