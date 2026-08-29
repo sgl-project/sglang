@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1030,7 +1030,6 @@ class UnifiedRadixCacheSuite:
         )
         self._rid += 1
         req_to_token_pool.alloc([req])
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     def _apply_match_to_req(self, req, match):
@@ -1265,7 +1264,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.kv = ReqKvInfo(kv_allocated_len=kv_len, swa_evicted_seqlen=0)
+        req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
@@ -2200,7 +2199,6 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
@@ -2290,7 +2288,6 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)
@@ -2708,6 +2705,8 @@ class UnifiedRadixCacheSuite:
             prefix_len = f.matched_len
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         if prefix_indices is not None:
             # Spliceable mid-anchor consumption publishes value=cat(prefix,
             # fill) — the real device prefix is required (zeros would insert
@@ -3342,6 +3341,8 @@ class UnifiedRadixCacheSuite:
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         req.last_node = cons.root_node_handle()
         req.prefix_indices = torch.zeros(
             held.matched_len,
@@ -3561,6 +3562,8 @@ class UnifiedRadixCacheSuite:
         held = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         req.last_node = cons.root_node_handle()
         req.prefix_indices = torch.zeros(
             held.matched_len,
@@ -3763,6 +3766,8 @@ class UnifiedRadixCacheSuite:
         f = cons.buffer_pipeline.staged_prefetches[req_id]
         req = mock.Mock()
         req.rid = req_id
+        req.extra_key = None
+        req.cache_salt = None
         req.prefix_indices = torch.zeros(
             0,
             dtype=torch.int64,
@@ -5698,6 +5703,62 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
+    def test_hicache_swa_load_back_rejects_foreign_pinned_window(self):
+        """A second load-back must not claim nodes pinned by an in-flight one.
+
+        commit_load_back republishes Full device values before the DMA acks, so
+        a later anchor can claim just the still-host-only SWA window of a
+        pinned node and hit the commit pin assert. The spec build must degrade
+        to an empty spec instead (the caller recomputes).
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+        if self.cfg.sliding_window_size <= self.cfg.page_size:
+            # A window within one page never reaches the pinned ancestor.
+            self.skipTest("window must span past the leaf to reach the pin")
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        # commit_load_back pins its source nodes only under write-back; run the
+        # scenario in that mode so the foreign-pin path is reachable.
+        cache.is_write_back = True
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain collapsed below the two-node suffix being tested")
+        self._simulate_backup_tree(cache)
+
+        # Host-only suffix a -> b under a device-resident ancestor.
+        a, b = chain[-2], chain[-1]
+        for n in (a, b):
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.FULL, None)
+            cache.tree_core.set_component_device_value_raw(n, ComponentType.SWA, None)
+            if cache.tree_core.is_node_in_device_lru(n, ComponentType.SWA):
+                cache.tree_core.remove_node_from_device_lru(n, ComponentType.SWA)
+            cache.tree_core.insert_node_into_host_lru(n, ComponentType.SWA)
+
+        # Anchor `a`: a Full-only load whose SWA slice stays host-only.
+        kv_xfer, _comp_xfers = cache.tree_core.build_load_back_spec(a)
+        self.assertEqual(kv_xfer.nodes_to_load, [a])
+        device_indices = torch.arange(
+            int(kv_xfer.host_indices.numel()), dtype=torch.int64, device=cache.device
+        )
+        cache.tree_core.commit_load_back(a, device_indices, kv_xfer, {})
+        self.assertEqual(cache.tree_core.node_by_id(a).load_back_pending_id, a)
+
+        # Anchor `b` rejects its whole spec: its SWA window claims pinned `a`.
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(int(kv_xfer.host_indices.numel()), 0)
+        self.assertEqual(kv_xfer.nodes_to_load, [])
+        self.assertEqual(comp_xfers, {})
+
+        # After the ack unpins, the same spec builds fully.
+        cache.tree_core.finish_load_back(a)
+        self.assertIsNone(cache.tree_core.node_by_id(a).load_back_pending_id)
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(b)
+        self.assertEqual(kv_xfer.nodes_to_load, [b])
+        self.assertEqual(comp_xfers[ComponentType.SWA][0].nodes_to_load, [a, b])
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip
@@ -6539,7 +6600,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req_to_token_pool.alloc([req])
         req.output_ids = array("q")
         req.kv_committed_len = len(tokens)
-        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.kv.kv_allocated_len = len(tokens)
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
@@ -7570,7 +7631,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache._check_hybrid_prefetch_result.return_value = 8
         cache.cache_controller.prefetch_tokens_occupied = 100
         cache.prefetch_loaded_tokens_by_reqid = {}
-        cache.can_terminate_prefetch.return_value = True
+        cache._can_terminate_prefetch.return_value = True
         cache.pp_rank = 0
 
         order = mock.MagicMock()
@@ -7743,7 +7804,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         operation.hash_value = hashes
 
         with (
-            mock.patch.object(cache, "can_terminate_prefetch", return_value=True),
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
             # Isolate the drop-release branch under test from the hybrid-sync
             # step: treat the whole fetched prefix as usable so the insert runs.
             mock.patch.object(
@@ -7870,7 +7931,6 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)

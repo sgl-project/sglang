@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     send_tensors,
+    unpack_tensors,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     create_transfer_engine,
@@ -49,6 +50,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
@@ -64,6 +66,44 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
 logger = init_logger(__name__)
+
+
+def _advertised_pool_work_endpoint(server_args) -> str:
+    host = server_args.disagg_p2p_hostname or server_args.host or "127.0.0.1"
+    if host == "0.0.0.0":
+        host = server_args.disagg_p2p_hostname or "127.0.0.1"
+    return server_args.pool_work_endpoint.replace("0.0.0.0", host)
+
+
+def _expand_glm_distributed_outputs(req: Req) -> list[Req]:
+    """Split external-AR tokens into requests for sequential denoising."""
+    output_count = max(1, int(req.num_outputs_per_prompt or 1))
+    if output_count == 1:
+        return [req]
+
+    prior_token_ids = req.prior_token_id
+    if not isinstance(prior_token_ids, torch.Tensor) or (
+        prior_token_ids.shape[0] != output_count
+    ):
+        actual_count = (
+            prior_token_ids.shape[0]
+            if isinstance(prior_token_ids, torch.Tensor)
+            else type(prior_token_ids).__name__
+        )
+        raise RuntimeError(
+            "Cannot split GLM-Image AR output for distributed inference: "
+            f"expected {output_count} token rows, got {actual_count}."
+        )
+
+    usage_by_output = req.extra.get("usage_by_output")
+    output_reqs = expand_request_outputs(req)
+    for output_index, output_req in enumerate(output_reqs):
+        output_req.prior_token_id = prior_token_ids[output_index : output_index + 1]
+        output_req.extra.pop("usage_by_output", None)
+        if usage_by_output is not None and output_index < len(usage_by_output):
+            output_req.usage = usage_by_output[output_index]
+    return output_reqs
+
 
 # ---------------------------------------------------------------------------
 # Field extraction: split Req into tensors (transfer buffer) and scalars (JSON)
@@ -115,6 +155,9 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
         "teacache_params",
     }
 )
+
+# Receivers reconstruct base SamplingParams, so only base defaults can be omitted.
+_BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
 
 
 def _is_tensor_like(value) -> bool:
@@ -278,7 +321,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             value = getattr(sp, name, None)
             if value is None:
                 continue
-            if _is_default(value, f):
+            base_field = _BASE_SAMPLING_PARAM_FIELDS.get(name)
+            if base_field is not None and _is_default(value, base_field):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
@@ -458,6 +502,23 @@ class SchedulerDisaggMixin:
 
         sa = self.server_args
 
+        if self._is_glm_distributed_mode():
+            self._preallocated_slots = {}
+            register_msg = TransferRegisterMsg(
+                role=self._disagg_role.value,
+                work_endpoint=_advertised_pool_work_endpoint(sa),
+            )
+            self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
+            self._compute_ready_queue = queue.Queue(maxsize=4)
+            self._recv_prefetch_thread = threading.Thread(
+                target=self._recv_prefetch_loop,
+                daemon=True,
+                name="recv-prefetch-glm-distributed-denoiser",
+            )
+            self._recv_prefetch_thread.start()
+            logger.info("GLM distributed denoiser registered")
+            return
+
         # Pool size: configurable, default 256 MiB
         pool_size = getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
 
@@ -522,7 +583,7 @@ class SchedulerDisaggMixin:
             session_id=self._transfer_manager.session_id,
             pool_ptr=self._transfer_manager.pool_data_ptr,
             pool_size=self._transfer_manager.pool_size,
-            work_endpoint=sa.pool_work_endpoint,
+            work_endpoint=_advertised_pool_work_endpoint(sa),
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
@@ -622,6 +683,10 @@ class SchedulerDisaggMixin:
             try:
                 raw_frames = self._pool_work_pull.recv_multipart()
                 frames = [bytes(f) for f in raw_frames]
+
+                if not is_transfer_message(frames):
+                    self._compute_ready_queue.put(("relay_compute", frames))
+                    continue
 
                 msg = decode_transfer_msg(frames)
                 msg_type = msg.get("msg_type", "")
@@ -902,6 +967,18 @@ class SchedulerDisaggMixin:
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("skip",))
                     self._handle_transfer_msg(data)
+
+                elif msg_type == "relay_compute":
+                    local_device = (
+                        f"{current_platform.device_type}:{self.worker.local_rank}"
+                    )
+                    tensors, scalar_fields = unpack_tensors(data, device=local_device)
+                    request_id = scalar_fields.get("request_id", "unknown")
+                    req = self._build_disagg_req(scalar_fields, tensors)
+                    if is_multi_rank:
+                        self._broadcast_to_all_ranks(("compute",))
+                        self._broadcast_req_to_all_ranks(req)
+                    self._execute_glm_distributed_denoiser_request(req, request_id)
 
                 self._consecutive_error_count = 0
 
@@ -1298,11 +1375,16 @@ class SchedulerDisaggMixin:
         (:meth:`_disagg_non_rank0_event_loop`).
         """
         if self._disagg_role == RoleType.DENOISER:
-            # Initialize scheduler timesteps (same as rank 0)
-            _init_disagg_request_scheduler(self, req)
+            if not self._is_glm_distributed_mode():
+                _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
-                self.worker.execute_forward([req], return_req=True)
+                if self._is_glm_distributed_mode():
+                    req.save_output = False
+                    req.return_file_paths_only = False
+                    self.worker.execute_forward([req])
+                else:
+                    self.worker.execute_forward([req], return_req=True)
 
         elif self._disagg_role == RoleType.DECODER:
             req.save_output = False
@@ -1454,6 +1536,64 @@ class SchedulerDisaggMixin:
             "Transfer DENOISER: processed %s in %.2f s, staged for decoder",
             request_id,
             duration_s,
+        )
+
+    def _is_glm_distributed_mode(self: Scheduler) -> bool:
+        """Return whether this scheduler is a GLM distributed denoiser."""
+        return (
+            self._disagg_role == RoleType.DENOISER
+            and self.worker.pipeline.pipeline_name == "GlmImagePipeline"
+            and self.server_args.srt_encoder_url is not None
+        )
+
+    def _execute_glm_distributed_denoiser_request(
+        self: Scheduler, req: Req, request_id: str
+    ) -> None:
+        """Run local preparation, DiT, and VAE, then return decoded pixels."""
+        req.save_output = False
+        start_time = time.monotonic()
+        with self._disagg_trace_dispatch(req):
+            if (
+                self.server_args.pipeline_config.supports_sequential_multi_output_inference()
+                and max(1, int(req.num_outputs_per_prompt or 1)) > 1
+            ):
+                output_reqs = _expand_glm_distributed_outputs(req)
+                output_batches = list(
+                    self.worker.execute_forward_sequentially(output_reqs)
+                )
+                output_batch = self.worker._merge_expanded_output_batches(
+                    output_batches
+                )
+            else:
+                output_batch = self.worker.execute_forward([req])
+
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+        if output_batch.usage is not None:
+            scalar_fields["usage"] = output_batch.usage
+        if output_batch.metrics is not None:
+            scalar_fields["metrics"] = output_batch.metrics.to_dict()
+        if output_batch.metrics_list is not None:
+            scalar_fields["metrics_list"] = [
+                metrics.to_dict() if metrics is not None else None
+                for metrics in output_batch.metrics_list
+            ]
+        scalar_fields["peak_memory_mb"] = output_batch.peak_memory_mb
+        send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
+
+        if self._disagg_metrics:
+            if output_batch.error:
+                self._disagg_metrics.record_request_failed(request_id)
+            else:
+                self._disagg_metrics.record_request_complete(request_id)
+        logger.debug(
+            "GLM distributed denoiser: processed %s in %.2f s",
+            request_id,
+            time.monotonic() - start_time,
         )
 
     def _disagg_decoder_compute(self: Scheduler, req: Req, request_id: str) -> None:

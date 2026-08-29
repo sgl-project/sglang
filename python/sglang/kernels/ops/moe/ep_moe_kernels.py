@@ -911,9 +911,7 @@ def post_reorder_deepgemm_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    """`expert_id >= 0` includes the shared expert at num_experts (padding=-1); don't
-    switch to the cutlass `!= num_local_experts` gate. routed_scaling_factor is folded into the store.
-    """
+    """Accumulate valid permuted rows; routed_scaling_factor is folded into the store."""
     OutDtype = output_ptr.dtype.element_ty
 
     offset = BLOCK_SIZE * tl.program_id(1) + tl.arange(0, BLOCK_SIZE)
@@ -935,9 +933,8 @@ def post_reorder_deepgemm_triton_kernel(
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for idx in range(topk):
-            expert_id = tl.load(token_topk_ids_ptr + idx)
-            if expert_id >= 0:
-                dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
+            dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
+            if dst_idx >= 0:
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
@@ -1074,6 +1071,8 @@ def _fwd_kernel_ep_scatter_2(
     output_index,
     output_index_stride0,
     output_index_stride1,
+    expert_start,
+    num_experts,
     topk_num: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
@@ -1105,17 +1104,24 @@ def _fwd_kernel_ep_scatter_2(
 
         for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
             topk_index = topk_idx_int32.to(tl.int64)
-            expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
-            if expert_id >= 0:
+            global_expert_id = tl.load(
+                recv_topk + token_id * recv_topk_stride0 + topk_index
+            )
+            expert_id = global_expert_id - expert_start
+            output_index_ptr = (
+                output_index + token_id * output_index_stride0 + topk_index
+            )
+            valid = (expert_id >= 0) & (expert_id < num_experts)
+            # The post-permute path uses this index as the validity sentinel.
+            # Initialize non-local/padding lanes in this same kernel.
+            tl.store(output_index_ptr, -1)
+            if valid:
                 dest_token_index_int32 = tl.atomic_add(
                     expert_start_loc + expert_id, 1, sem=ATOMIC_ADD_SEM
                 )
                 dest_token_index = dest_token_index_int32.to(tl.int64)
 
-                tl.store(
-                    output_index + token_id * output_index_stride0 + topk_index,
-                    dest_token_index_int32,
-                )
+                tl.store(output_index_ptr, dest_token_index_int32)
                 output_tensor_ptr = (
                     output_tensor + dest_token_index * output_tensor_stride0
                 )
@@ -1148,6 +1154,7 @@ def ep_scatter(
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
     quant_block_size: int = 128,
+    expert_start: int = 0,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = quant_block_size  # block size of quantization
@@ -1208,6 +1215,8 @@ def ep_scatter(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        expert_start,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
@@ -1540,12 +1549,13 @@ def tma_align_input_scale(input_scale: torch.Tensor):
 
 @triton.jit
 def fused_moe_dispatch_index_triton_kernel(
-    topk_ids_ptr,  # flat (num_toks,) int32; -1 = padding (drives the `expert >= 0` gate)
+    topk_ids_ptr,  # flat (num_toks,) int32; global or already-local expert IDs
     src2dst_ptr,
     masked_m_ptr,
     m_max,
     num_toks,
     num_experts,
+    expert_start,
     BLOCK_SIZE: tl.constexpr,
     ZERO_INIT: tl.constexpr,
 ):
@@ -1563,19 +1573,23 @@ def fused_moe_dispatch_index_triton_kernel(
         tl.debug_barrier()
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < num_toks
-    expert = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
-    valid = mask & (expert >= 0)
+    global_expert = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+    expert = global_expert - expert_start
+    valid = mask & (expert >= 0) & (expert < num_experts)
     # Clamp masked lanes to bin 0 so the masked atomic's pointer stays in-bounds.
     expert_safe = tl.where(valid, expert, 0)
     offset = tl.atomic_add(masked_m_ptr + expert_safe, 1, mask=valid)
     dst = expert_safe * m_max + offset
-    tl.store(src2dst_ptr + offs, dst, mask=valid)
+    # post_reorder checks src2dst, so mark padding/non-local lanes -1 here to
+    # prevent uninitialized offsets from adding bogus expert contributions.
+    tl.store(src2dst_ptr + offs, tl.where(valid, dst, -1), mask=mask)
 
 
 def fused_moe_dispatch_index(
     topk_ids: torch.Tensor,
     num_local_experts: int,
     m_max: int,
+    expert_start: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_toks = topk_ids.numel()
     src2dst = torch.empty(num_toks, device=topk_ids.device, dtype=torch.int32)
@@ -1600,6 +1614,7 @@ def fused_moe_dispatch_index(
         m_max,
         num_toks,
         num_local_experts,
+        expert_start,
         BLOCK_SIZE=BLOCK_SIZE,
         ZERO_INIT=single_block,
     )
@@ -1635,9 +1650,8 @@ def fill_gateup_input_triton_kernel(
 
     vec = tl.arange(0, BLOCK_SIZE)
     for idx in range(topk):
-        expert_id = tl.load(topk_ids_ptr + idx)
-        if expert_id >= 0:
-            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+        dst_idx_int32 = tl.load(src2dst_ptr + idx)
+        if dst_idx_int32 >= 0:
             dst_idx = dst_idx_int32.to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
@@ -1679,6 +1693,7 @@ def moe_ep_deepgemm_preprocess(
     block_shape,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
     use_mxfp8: bool = False,
+    expert_start: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
@@ -1698,12 +1713,16 @@ def moe_ep_deepgemm_preprocess(
         # correctness is unconditional (m_cap >= max(masked_m) by
         # construction, and the final src2dst below is built with the same
         # capped stride).
-        masked_m_probe, _ = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+        masked_m_probe, _ = fused_moe_dispatch_index(
+            topk_ids, num_local_experts, m_max, expert_start=expert_start
+        )
         m_cap = (int(masked_m_probe.max().item()) + 255) // 256 * 256
         m_max = min(m_max, max(m_cap, 256))
     expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
 
-    masked_m, src2dst = fused_moe_dispatch_index(topk_ids, num_local_experts, m_max)
+    masked_m, src2dst = fused_moe_dispatch_index(
+        topk_ids, num_local_experts, m_max, expert_start=expert_start
+    )
 
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),

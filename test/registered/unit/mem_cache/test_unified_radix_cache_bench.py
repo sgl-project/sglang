@@ -240,7 +240,7 @@ def create_bench_cache(
     _rid = [0]
 
     def make_req():
-        from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+        from sglang.srt.managers.schedule_batch import Req
         from sglang.srt.sampling.sampling_params import SamplingParams
 
         req = Req(
@@ -251,8 +251,6 @@ def create_bench_cache(
         )
         _rid[0] += 1
         req_to_token_pool.alloc([req])
-        # fabricated reqs bypass alloc_for_extend, the normal creator of req.kv
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     return tree, allocator, req_to_token_pool, make_req
