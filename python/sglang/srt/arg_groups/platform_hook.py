@@ -17,6 +17,14 @@ from sglang.srt.utils.common import is_cuda, is_hip, is_host_cpu_arm64, is_npu
 logger = logging.getLogger(__name__)
 
 
+def handle_hardware_runtime_validation():
+    # This is intentionally independent of `server_args.device`: setting
+    # SGLANG_USE_MLX opts into the MLX backend and must fail immediately if
+    # the environment cannot honor that request. With the flag unset,
+    # use_mlx() remains lazy and does not import MLX.
+    use_mlx()
+
+
 def handle_npu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "npu":

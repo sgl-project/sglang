@@ -40,7 +40,7 @@ _OWNERS = ("server_args.py", "runtime_context.py", "arg_groups/")
 # startup default wherever it is written, and `benchmark/` ships too.
 _READS_SCANNED = _PACKAGE
 
-_DECLARERS = ("_declare", "declare_resolution", "declare_late_resolution")
+_DECLARERS = ("declare_resolution", "declare_late_resolution")
 
 
 def _declared_by_keyword():
@@ -190,10 +190,10 @@ def _declared_by_registry_and_passes():
 
 
 def _declared_by_late_resolution():
-    """Keywords of `self._late_resolution(...)`, the fourth declarer spelling.
+    """Keywords of `declare_late_resolution(record, ...)`, the late spelling.
 
-    It forwards `**fields` to `declare_late_resolution`, so the keywords sit at
-    its call sites and a scan for the declarer's own name finds none of them.
+    The fields sit at the call sites rather than in the declarer, so a scan
+    that only knew the declarer's own definition would find none of them.
     """
     # The record plus `arg_groups/`: a hook calls it on the record it was
     # handed, so scanning the record's file alone finds nothing.
@@ -203,8 +203,8 @@ def _declared_by_late_resolution():
         for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig"))):
             if (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_late_resolution"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_late_resolution"
             ):
                 fields |= {keyword.arg for keyword in node.keywords if keyword.arg}
     return fields
@@ -540,13 +540,20 @@ class TestNoChainReadsOfResolvedConfig(CustomTestCase):
             len(by_late),
             3,
             f"only {len(by_late)} fields are declared late; the "
-            "`_late_resolution` keyword scan broke",
+            "`declare_late_resolution` keyword scan broke",
         )
-        # The three mechanisms are not the same set: if any became a subset of
-        # the keyword scan, that scan would be doing all the work and a
-        # regression in the others would be invisible.
+        # The data channel is not the keyword scan's subset: if it became one,
+        # that scan would be doing all the work and a regression here would be
+        # invisible. The late channel *is* a subset, and deliberately so --
+        # `declare_late_resolution` is a keyword declarer like the others now
+        # that the record hosts no forwarding member, so its own floor above is
+        # what pins it.
         self.assertTrue(by_data - by_keyword, "the data channel adds nothing")
-        self.assertTrue(by_late - by_keyword, "late resolution adds nothing")
+        self.assertTrue(
+            by_late <= by_keyword,
+            "late resolution declares outside the keyword channel; it is the "
+            "same spelling, so the two cannot disagree",
+        )
 
     def test_nothing_reads_a_resolved_field_off_a_borrowed_record(self):
         found = _chain_reads(_resolution_written())

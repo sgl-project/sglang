@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang.srt.arg_groups.overrides import resolving_view
+
 
 def validate_experimental_sgl_marlin_server_args(
     server_args: Any, resolved_args: Any
 ) -> None:
     """Validate startup options before the experimental runner is constructed."""
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(server_args)
 
