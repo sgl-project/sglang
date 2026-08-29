@@ -1901,8 +1901,7 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
                     {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
                 )
-                with patch.object(ServerArgs, "use_mla_backend", return_value=False):
-                    handle_gpu_memory_settings(args, gpu_mem=None)
+                handle_gpu_memory_settings(args, gpu_mem=None)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
