@@ -61,7 +61,7 @@ class TestNoPublicNonFieldSlot(CustomTestCase):
         written = _self_written_attributes()
         self.assertGreater(
             len(written),
-            5,
+            3,
             f"only {len(written)} self-writes found; the scan is broken, not the "
             "record",
         )

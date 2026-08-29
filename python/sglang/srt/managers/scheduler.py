@@ -1300,7 +1300,6 @@ class Scheduler(
                     attn_tp_size=self.ps.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
                     device_group=self.tp_group.device_group,
-                    server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector
                         if self.metrics_reporter.enable_metrics
@@ -2820,7 +2819,7 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
-            buffer_mode = self.server_args.hicache_host_memory_mode == "buffer_only"
+            buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
@@ -3544,7 +3543,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             if (
                 self.enable_hicache_storage
-                and self.server_args.hicache_host_memory_mode == "buffer_only"
+                and get_memory().hicache_host_memory_mode == "buffer_only"
             ):
                 # Buffer mode: surface a staged prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
@@ -4452,7 +4451,7 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
-                    if self.server_args.hicache_host_memory_mode == "buffer_only":
+                    if get_memory().hicache_host_memory_mode == "buffer_only":
                         # Queued writes, staged prefetches, and in-flight
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
