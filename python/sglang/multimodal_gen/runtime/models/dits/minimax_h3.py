@@ -24,9 +24,7 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
-    can_use_fused_indexed_rmsnorm_scale_shift,
     can_use_fused_inplace_qknorm_rope,
-    fused_indexed_rmsnorm_scale_shift,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
@@ -331,17 +329,11 @@ def _modulate_rmsnorm_scale_shift(
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """RMSNorm + indexed AdaLN without materializing the normalized tensor."""
-    if (
-        not torch.compiler.is_compiling()
-        and dtype == _BF16_DTYPE
-        and can_use_fused_indexed_rmsnorm_scale_shift(
-            x, norm.weight, shift, scale, indices
-        )
-    ):
-        return fused_indexed_rmsnorm_scale_shift(
-            x, norm.weight, shift, scale, indices, float(norm.eps)
-        )
+    """RMSNorm + indexed AdaLN.
+
+    Keep ``nn.RMSNorm``; a fused RMSNorm+AdaLN kernel drifted 2-GPU
+    consistency GT for ~0.3% e2e, so it was removed.
+    """
     return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype)
 
 
