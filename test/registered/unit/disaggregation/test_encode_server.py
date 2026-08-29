@@ -23,6 +23,9 @@ from sglang.srt.disaggregation.encoder.server import (
     rid_to_receive_count,
     rid_to_receive_endpoint,
 )
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.multimodal_cache import (
     EmbeddingResult,
@@ -463,6 +466,19 @@ class TestEncoderDelivery(CustomTestCase):
 
         self.assertEqual(events, ["sync", "ready"])
 
+    def test_shared_mr_registration_failure_keeps_send_fallback_enabled(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.engine = unittest.mock.Mock()
+        encoder.engine.register.side_effect = RuntimeError("register failed")
+        embedding = torch.ones((2, 4))
+        mm_data = EmbeddingData(
+            "req", 1, 0, [[1, 1, 1]], Modality.IMAGE, embedding=embedding
+        )
+
+        encoder._register_shared_mr(mm_data, embedding)
+
+        self.assertIsNone(mm_data._mr_ptr)
+
     def test_stage_embedding_does_not_resurrect_missing_state(self):
         encoder = MMEncoder.__new__(MMEncoder)
         encoder.req_states = {}
@@ -744,6 +760,27 @@ class TestEncoderDelivery(CustomTestCase):
             self.assertNotIn("req", encoder.req_states)
 
         asyncio.run(run())
+
+
+class TestMooncakeRegistration(CustomTestCase):
+    def setUp(self):
+        self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
+        self.engine.engine = unittest.mock.Mock()
+
+    def test_register_raises_on_nonzero_status(self):
+        self.engine.engine.register_memory.return_value = -1
+
+        with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-1"):
+            self.engine.register(1234, 4096)
+
+    def test_deregister_preserves_backend_failure(self):
+        backend_error = OSError("backend failed")
+        self.engine.engine.unregister_memory.side_effect = backend_error
+
+        with self.assertRaisesRegex(RuntimeError, "deregistration failed") as ctx:
+            self.engine.deregister(1234)
+
+        self.assertIs(ctx.exception.__cause__, backend_error)
 
 
 if __name__ == "__main__":
