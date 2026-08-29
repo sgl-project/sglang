@@ -14,8 +14,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import UpdateExpertBackupReq, sock_recv, sock_send
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
@@ -34,16 +33,14 @@ class ExpertBackupClient:
     def __init__(
         self,
         *,
-        server_args: ServerArgs,
         model_config,
         moe_ep_size: int,
         moe_ep_rank: int,
         get_model: Callable[[], Any],
     ):
         context = zmq.Context(2)
-        self.server_args = server_args
-        self.engine_num = server_args.nnodes
-        self.engine_rank = server_args.node_rank
+        self.engine_num = get_parallel().nnodes
+        self.engine_rank = get_parallel().node_rank
         self.recv_list = [None] * self.engine_num
         self.ready_sockets = [None] * self.engine_num
         self._get_model = get_model
@@ -66,14 +63,14 @@ class ExpertBackupClient:
         for i in range(self.engine_num):
             self.recv_list[i] = context.socket(zmq.SUB)
             self.recv_list[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2 + 1}"
+                f"tcp://{all_ips[i * get_world_size() // get_parallel().nnodes]}:{PORT_BASE + i * 2 + 1}"
             )
             self.recv_list[i].setsockopt(zmq.SUBSCRIBE, b"")
 
             # Synchronization channel to notify the manager when this client is ready.
             self.ready_sockets[i] = context.socket(zmq.PUSH)
             self.ready_sockets[i].connect(
-                f"tcp://{all_ips[i * get_world_size() // server_args.nnodes]}:{PORT_BASE + i * 2}"
+                f"tcp://{all_ips[i * get_world_size() // get_parallel().nnodes]}:{PORT_BASE + i * 2}"
             )
             sock_send(self.ready_sockets[i], UpdateExpertBackupReq())
 

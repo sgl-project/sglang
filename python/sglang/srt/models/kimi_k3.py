@@ -780,7 +780,10 @@ class KimiK3MoE(nn.Module):
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+        from sglang.srt.layers.moe.mega_moe import (
+            _configure_mega_moe_deep_gemm_num_sms,
+            _get_mega_moe_symm_buffer,
+        )
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -833,15 +836,16 @@ class KimiK3MoE(nn.Module):
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="situ",
-            fast_math=True,
-        )
+        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="situ",
+                fast_math=True,
+            )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (

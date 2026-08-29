@@ -138,10 +138,12 @@ def init_torch_distributed(
         host=server_args.host, port=server_args.gated_launch_port
     )
 
+    # Draft workers reuse the target pool config and may exist on only one PP stage;
+    # including them in this WORLD reduction would deadlock on absent peers.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
+        distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
     tp_group = get_tp_group()

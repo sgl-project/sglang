@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    declare_late_resolution,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -23,7 +24,9 @@ def check_lora_server_args(server_args: Any):
     # Enable LoRA if any LoRA paths are provided for backward compatibility.
     if cfg.lora_paths:
         if cfg.enable_lora is None:
-            server_args._late_resolution("check_lora_server_args", enable_lora=True)
+            declare_late_resolution(
+                server_args, "check_lora_server_args", enable_lora=True
+            )
             logger.warning(
                 "--enable-lora is set to True because --lora-paths is provided."
             )
@@ -34,8 +37,8 @@ def check_lora_server_args(server_args: Any):
 
     if cfg.enable_lora:
         if cfg.enable_lora_overlap_loading is None:
-            server_args._late_resolution(
-                "check_lora_server_args", enable_lora_overlap_loading=False
+            declare_late_resolution(
+                server_args, "check_lora_server_args", enable_lora_overlap_loading=False
             )
 
         if cfg.enable_lora_overlap_loading:
@@ -90,11 +93,12 @@ def check_lora_server_args(server_args: Any):
                         "Expected a string or a dictionary."
                     )
                 parsed_lora_paths.append(lora_ref)
-            server_args._late_resolution(
-                "check_lora_server_args", lora_paths=parsed_lora_paths
+            declare_late_resolution(
+                server_args, "check_lora_server_args", lora_paths=parsed_lora_paths
             )
         elif isinstance(cfg.lora_paths, dict):
-            server_args._late_resolution(
+            declare_late_resolution(
+                server_args,
                 "check_lora_server_args",
                 lora_paths=[
                     LoRARef(
@@ -107,7 +111,9 @@ def check_lora_server_args(server_args: Any):
                 ],
             )
         elif cfg.lora_paths is None:
-            server_args._late_resolution("check_lora_server_args", lora_paths=[])
+            declare_late_resolution(
+                server_args, "check_lora_server_args", lora_paths=[]
+            )
         else:
             raise ValueError(
                 f"Invalid type for --lora-paths: {type(cfg.lora_paths)}. "
@@ -117,7 +123,8 @@ def check_lora_server_args(server_args: Any):
         # Normalize target modules to a set; keep {"all"} as a sentinel
         # that gets resolved model-awarely in lora_manager.init_lora_shapes().
         if cfg.lora_target_modules:
-            server_args._late_resolution(
+            declare_late_resolution(
+                server_args,
                 "check_lora_server_args",
                 lora_target_modules=set(cfg.lora_target_modules),
             )
