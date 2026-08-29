@@ -965,6 +965,10 @@ class Envs:
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    # Release cached-but-free allocator blocks once driver-side free memory drops
+    # below this. Covers every consumer that bypasses the caching allocator: HSA
+    # queues, Triton module loads, RCCL buffers. 0 disables.
+    SGLANG_DEVICE_HEADROOM_RECLAIM_GB = EnvFloat(0.0)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)

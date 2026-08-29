@@ -301,6 +301,7 @@ from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
     configure_logger,
+    device_headroom,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -3725,6 +3726,8 @@ class Scheduler(
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
+
+        device_headroom.reclaim_if_low()
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
