@@ -242,6 +242,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder._prepare_encode_context = AsyncMock(
                 return_value=self._encode_context()
             )
+            encoder._publish_preprocess_metadata = AsyncMock()
 
             class TPGroup:
                 world_size = 2
@@ -254,7 +255,7 @@ class TestEncoderDelivery(CustomTestCase):
             def all_gather(statuses, local_status, group):
                 self.assertIs(group, TPGroup.cpu_group)
                 statuses[0].copy_(local_status)
-                statuses[1].copy_(torch.tensor([400, 0, 0]))
+                statuses[1].copy_(torch.tensor([400, 1, 0, 0]))
 
             with (
                 patch(
@@ -284,6 +285,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder._prepare_encode_context = AsyncMock(
                 return_value=self._encode_context()
             )
+            encoder._publish_preprocess_metadata = AsyncMock()
 
             class TPGroup:
                 world_size = 2
@@ -293,7 +295,7 @@ class TestEncoderDelivery(CustomTestCase):
                 self.assertIs(group, TPGroup.cpu_group)
                 statuses[0].copy_(local_status)
                 statuses[1].copy_(local_status)
-                statuses[1][1] += 1
+                statuses[1][2] += 1
 
             with (
                 patch(
@@ -320,6 +322,9 @@ class TestEncoderDelivery(CustomTestCase):
     def test_remote_metadata_failure_stops_tp_peer_before_forward(self):
         async def run():
             encoder = MMEncoder.__new__(MMEncoder)
+            encoder._prepare_encode_context = AsyncMock(
+                return_value=self._encode_context()
+            )
             encoder._publish_preprocess_metadata = AsyncMock()
 
             class TPGroup:
@@ -333,7 +338,7 @@ class TestEncoderDelivery(CustomTestCase):
 
             def all_gather(statuses, local_status, group):
                 self.assertIs(group, TPGroup.cpu_group)
-                statuses[0].copy_(torch.tensor([500]))
+                statuses[0].copy_(torch.tensor([500, 2, 0, 0]))
                 statuses[1].copy_(local_status)
 
             with (
@@ -350,9 +355,10 @@ class TestEncoderDelivery(CustomTestCase):
                     InternalError,
                     "metadata publication failed on TP rank 0: registry down",
                 ):
-                    await encoder._publish_preprocess_metadata_on_all_ranks(
-                        self._encode_context(),
+                    await encoder._prepare_encode_context_on_all_ranks(
                         [{"req_id": "req"}],
+                        Modality.IMAGE,
+                        use_global_cache=False,
                     )
 
         asyncio.run(run())

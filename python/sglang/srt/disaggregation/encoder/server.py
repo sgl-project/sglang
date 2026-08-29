@@ -1075,9 +1075,10 @@ class MMEncoder:
         use_global_cache: bool,
         is_health_check: bool = False,
     ) -> EncodeContext:
-        """Make preprocessing failures and shared metadata consistent across TP."""
+        """Prepare one context consistently before TP ranks enter model forward."""
         ctx = None
         local_error = None
+        error_phase = 0
         try:
             ctx = await self._prepare_encode_context(
                 requests,
@@ -1087,24 +1088,33 @@ class MMEncoder:
             )
         except Exception as e:
             local_error = e
+            error_phase = 1
+
+        if local_error is None:
+            try:
+                assert ctx is not None
+                await self._publish_preprocess_metadata(ctx, requests)
+            except Exception as e:
+                local_error = e
+                error_phase = 2
 
         if local_error is None:
             assert ctx is not None
             layout_digest = _preprocess_layout_digest(ctx)
         else:
             layout_digest = (0, 0)
-        statuses = self._sync_tp_phase_status(
-            "Encoder preprocessing",
+        statuses = self._sync_tp_prepare_status(
             local_error,
-            metadata=layout_digest,
+            error_phase=error_phase,
+            layout_digest=layout_digest,
         )
 
-        expected_layout = tuple(statuses[0][1:].tolist())
+        expected_layout = tuple(statuses[0][2:].tolist())
         mismatch_rank = next(
             (
                 rank
                 for rank, rank_status in enumerate(statuses[1:], start=1)
-                if tuple(rank_status[1:].tolist()) != expected_layout
+                if tuple(rank_status[2:].tolist()) != expected_layout
             ),
             None,
         )
@@ -1117,14 +1127,14 @@ class MMEncoder:
         assert ctx is not None
         return ctx
 
-    def _sync_tp_phase_status(
+    def _sync_tp_prepare_status(
         self,
-        phase: str,
         local_error: Optional[Exception],
         *,
-        metadata: tuple[int, ...] = (),
+        error_phase: int,
+        layout_digest: tuple[int, int],
     ) -> List[torch.Tensor]:
-        """Raise the same error on every TP rank before the next collective."""
+        """Raise the same preparation error on every TP rank."""
         tp_group = get_tp_group()
         error_code = (
             int(
@@ -1135,7 +1145,9 @@ class MMEncoder:
             if local_error is not None
             else 0
         )
-        local_status = torch.tensor([error_code, *metadata], dtype=torch.int64)
+        local_status = torch.tensor(
+            [error_code, error_phase, *layout_digest], dtype=torch.int64
+        )
         statuses = [torch.empty_like(local_status) for _ in range(tp_group.world_size)]
         if tp_group.world_size > 1:
             torch.distributed.all_gather(
@@ -1147,7 +1159,11 @@ class MMEncoder:
             statuses[0].copy_(local_status)
 
         failures = [
-            (rank, int(rank_status[0].item()))
+            (
+                rank,
+                int(rank_status[0].item()),
+                int(rank_status[1].item()),
+            )
             for rank, rank_status in enumerate(statuses)
             if rank_status[0].item() != 0
         ]
@@ -1161,29 +1177,23 @@ class MMEncoder:
             if tp_group.world_size > 1
             else [str(local_error)]
         )
-        rank, failure_code = next(
+        rank, failure_code, failure_phase = next(
             (
-                (rank, rank_error_code)
-                for rank, rank_error_code in failures
+                (rank, rank_error_code, rank_error_phase)
+                for rank, rank_error_code, rank_error_phase in failures
                 if rank_error_code != HTTPStatus.BAD_REQUEST
             ),
             failures[0],
+        )
+        phase = (
+            "Encoder metadata publication"
+            if failure_phase == 2
+            else "Encoder preprocessing"
         )
         message = f"{phase} failed on TP rank {rank}: {errors[rank]}"
         if failure_code == HTTPStatus.BAD_REQUEST:
             raise BadRequestError(message)
         raise InternalError(message)
-
-    async def _publish_preprocess_metadata_on_all_ranks(
-        self, ctx: EncodeContext, requests: List[dict]
-    ) -> None:
-        """Prevent a rank-0 metadata error from stranding TP peers in forward."""
-        local_error = None
-        try:
-            await self._publish_preprocess_metadata(ctx, requests)
-        except Exception as e:
-            local_error = e
-        self._sync_tp_phase_status("Encoder metadata publication", local_error)
 
     def _broadcast_global_cache_mask(self, mask_tensor: torch.Tensor):
         if get_parallel().tp_size > 1:
@@ -1970,7 +1980,6 @@ class MMEncoder:
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            await self._publish_preprocess_metadata_on_all_ranks(ctx, requests)
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
             if self.profiler is not None:
