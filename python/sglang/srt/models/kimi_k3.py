@@ -26,6 +26,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import get_attn_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -45,7 +46,10 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
+    get_attention_dp_rank,
+    get_attention_dp_size,
     get_global_dp_buffer,
+    get_global_dp_buffer_len,
     get_local_dp_buffer,
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -140,7 +144,7 @@ _is_npu = is_npu()
 
 # ===== K3-DBG toggles (hard-coded; flip True/False as needed) =====
 K3_DBG_ENABLED = False  # master switch for all K3-DBG prints in this file
-K3_DBG_LAYER2  = False  # binary-search 4 control points (A/B/C/D) on layer 2
+K3_DBG_LAYER2  = True  # binary-search 4 control points (A/B/C/D) on layer 2
 K3_DBG_PREFILL_ONLY = False  # per-layer [KIMI-K3-DBG] prints: PREFILL only (skip DECODE)
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
@@ -160,6 +164,12 @@ else:
 _k3_dump_hidden_dir = os.getenv("SGLANG_K3_DUMP_HIDDEN_DIR") or os.getenv(
     "SGLANG_K3_DUMP_DIR", "/tmp/sglang-k3-hidden"
 )
+# KDA internals (qkv / beta / forget-gate / core / o_norm / o_proj). Same dir
+# and EXTEND-only / attn_tp0 write as the hidden dump. Default ON.
+# First N KDA layers only (0-index: 0,1,2,4,5,6 on the 93-layer K3).
+_k3_dump_kda = get_bool_env_var("SGLANG_K3_DUMP_KDA", "1")
+_k3_dump_kda_first_n = 6
+_k3_dump_kda_layer_ids: Optional[dict] = None
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -268,50 +278,241 @@ def _sp_local_rows(hidden_states: torch.Tensor) -> slice:
     return slice(lo, lo + hidden_states.shape[0])
 
 
-def _maybe_dump_k3_hidden(
-    layer_idx: int,
+def _dump_local_dp_token_count(forward_batch: ForwardBatch) -> int:
+    """This replica's token count, not the sum across DP ranks."""
+    gnt = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if not gnt:
+        return 0
+    try:
+        idx = get_attention_dp_rank() if is_dp_attention_enabled() else 0
+    except Exception:
+        idx = 0
+    if 0 <= idx < len(gnt):
+        return int(gnt[idx])
+    return 0
+
+
+def _dump_real_token_count(forward_batch: ForwardBatch, gathered_rows: int) -> int:
+    """Unpadded prefill token count. Do not trust extend_seq_lens_cpu==[1]
+    under DP: idle/decode conversion rewrites it to one dummy token per seq,
+    which previously saved [1, H] instead of the full prompt."""
+    seq = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seq_sum = int(sum(seq)) if seq else 0
+    if seq_sum > 1 or gathered_rows <= 1:
+        return min(seq_sum, gathered_rows) if seq_sum > 0 else gathered_rows
+
+    local_n = _dump_local_dp_token_count(forward_batch)
+    if local_n > 1:
+        return min(local_n, gathered_rows)
+
+    orig = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    if orig:
+        orig_sum = int(sum(int(x) for x in orig))
+        if orig_sum > 0:
+            return min(orig_sum, gathered_rows)
+
+    ext = getattr(forward_batch, "extend_num_tokens", None)
+    if ext is not None and int(ext) > 1:
+        return min(int(ext), gathered_rows)
+
+    return gathered_rows
+
+
+def _dump_gather_hidden(
     hidden_states: torch.Tensor,
     sp_sharded: bool,
     forward_batch: ForwardBatch,
-) -> None:
-    """Debug-only dump of complete, unpadded prefill hidden-state rows.
+) -> torch.Tensor:
+    """Token-axis hidden for dump. Only SP all-gather (attn_tp group).
 
-    When SP-sharded, every rank takes the debug all-gather first (so the
-    saved tensor is the full token axis). Only TP rank 0 then writes.
+    Do not DP-gather here. DeepEP never creates a 64-way TP HCCL comm;
+    dump's dp_gather_replicate would be the first, and idle DP replicas
+    skip EXTEND so they never join — HCCL then times out ranks 16–63.
+    A single-seq prefill already lives on one DP replica; local rows
+    (after SP AG) are the full prompt.
     """
+    del forward_batch
+    if sp_sharded:
+        return _sp_all_gather_rows(hidden_states)
+    return hidden_states
+
+
+def _dump_should_write(forward_batch: ForwardBatch, layer_idx: Optional[int]) -> bool:
+    if not _k3_dump_hidden:
+        return False
     if (
-        not _k3_dump_hidden
-        or (
-            _k3_dump_hidden_layers is not None
-            and layer_idx not in _k3_dump_hidden_layers
-        )
-        or not forward_batch.forward_mode.is_extend_without_speculative()
+        layer_idx is not None
+        and _k3_dump_hidden_layers is not None
+        and layer_idx not in _k3_dump_hidden_layers
     ):
+        return False
+    return bool(forward_batch.forward_mode.is_extend_without_speculative())
+
+
+def _dump_write_tensor(
+    filename: str,
+    tensor: torch.Tensor,
+    num_real_tokens: int,
+) -> None:
+    """Slice token dim 0, float32 CPU, atomic replace. attn_tp0 only."""
+    if get_attn_tensor_model_parallel_rank() != 0:
         return
-
-    # Every rank must enter this collective. Keep the gathered tensor separate
-    # so the model's hidden_states and sp_sharded state remain unchanged.
-    dump_hidden = (
-        _sp_all_gather_rows(hidden_states) if sp_sharded else hidden_states
-    )
-    if get_tensor_model_parallel_rank() != 0:
-        return
-
-    num_real_tokens = dump_hidden.shape[0]
-    if forward_batch.extend_seq_lens_cpu is not None:
-        num_real_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
-    num_real_tokens = min(num_real_tokens, dump_hidden.shape[0])
-    dump_tensor = dump_hidden[:num_real_tokens].detach().float().cpu()
-
-    os.makedirs(_k3_dump_hidden_dir, exist_ok=True)
-    pp_rank = get_pp_group().rank_in_group
-    filename = (
-        f"layer{layer_idx:03d}_pp{pp_rank:02d}_tokens{num_real_tokens}.pt"
-    )
+    dumped = tensor[:num_real_tokens].detach().float().contiguous().cpu()
     output_path = os.path.join(_k3_dump_hidden_dir, filename)
     temporary_path = f"{output_path}.tmp-{os.getpid()}"
-    torch.save(dump_tensor, temporary_path)
-    os.replace(temporary_path, output_path)
+    try:
+        os.makedirs(_k3_dump_hidden_dir, exist_ok=True)
+        torch.save(dumped, temporary_path)
+        os.replace(temporary_path, output_path)
+    except Exception as exc:
+        print(
+            f"[K3-DUMP] ERROR writing {output_path} "
+            f"(SGLANG_K3_DUMP_HIDDEN_DIR={_k3_dump_hidden_dir!r}): "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        try:
+            os.remove(temporary_path)
+        except OSError:
+            pass
+
+
+def _maybe_dump_k3_hidden(
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    attn_res,
+    sp_sharded: bool,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Prefill dump after each layer: hidden, residual, stream=h+res, attn_res bank.
+
+    PP wire is NOT this hidden: send folds hidden+=residual and ships
+    attn_res.block_residual in the residual slot. See _maybe_dump_k3_pp_wire.
+    """
+    if not _dump_should_write(forward_batch, layer_idx):
+        return
+
+    dump_hidden = _dump_gather_hidden(hidden_states, sp_sharded, forward_batch)
+    dump_residual = None
+    if residual is not None and residual.ndim >= 2:
+        dump_residual = _dump_gather_hidden(residual, sp_sharded, forward_batch)
+    dump_attnres = None
+    if attn_res is not None and getattr(attn_res, "num_valid_blocks", 0) > 0:
+        dump_attnres = _dump_gather_hidden(
+            attn_res.block_residual[:, : attn_res.num_valid_blocks, :],
+            sp_sharded,
+            forward_batch,
+        )
+
+    # Collectives done; only attn_tp0 writes.
+    if get_attn_tensor_model_parallel_rank() != 0:
+        return
+
+    num_real_tokens = _dump_real_token_count(forward_batch, dump_hidden.shape[0])
+    pp_rank = get_pp_group().rank_in_group
+    prefix = f"layer{layer_idx:03d}_pp{pp_rank:02d}_tokens{num_real_tokens}"
+    _dump_write_tensor(f"{prefix}.pt", dump_hidden, num_real_tokens)
+    if dump_residual is not None:
+        _dump_write_tensor(f"{prefix}_residual.pt", dump_residual, num_real_tokens)
+        if (
+            dump_residual.shape[0] == dump_hidden.shape[0]
+            and dump_residual.shape[-1] == dump_hidden.shape[-1]
+            and dump_residual.ndim == dump_hidden.ndim
+        ):
+            _dump_write_tensor(
+                f"{prefix}_stream.pt",
+                dump_hidden + dump_residual,
+                num_real_tokens,
+            )
+    if dump_attnres is not None:
+        _dump_write_tensor(f"{prefix}_attnres.pt", dump_attnres, num_real_tokens)
+
+    if layer_idx == 0:
+        print(
+            f"[K3-DUMP] wrote {prefix}.pt shape={[num_real_tokens, dump_hidden.shape[-1]]} "
+            f"has_residual={dump_residual is not None} "
+            f"attnres_blocks={getattr(attn_res, 'num_valid_blocks', 0)} "
+            f"seq_lens={getattr(forward_batch, 'extend_seq_lens_cpu', None)} "
+            f"gnt={getattr(forward_batch, 'global_num_tokens_cpu', None)}",
+            flush=True,
+        )
+
+
+def _kda_dump_ordinal(layer_idx: int, config) -> Optional[int]:
+    """0-based index among KDA layers, or None if this layer is not dumped."""
+    global _k3_dump_kda_layer_ids
+    if not _k3_dump_kda:
+        return None
+    if _k3_dump_kda_layer_ids is None:
+        ids = list(getattr(config, "linear_layer_ids", []) or [])[
+            :_k3_dump_kda_first_n
+        ]
+        _k3_dump_kda_layer_ids = {lid: i for i, lid in enumerate(ids)}
+        if get_attn_tensor_model_parallel_rank() == 0:
+            print(
+                f"[K3-KDA] dump first {_k3_dump_kda_first_n} KDA layers: "
+                f"{sorted(_k3_dump_kda_layer_ids)} dir={_k3_dump_hidden_dir!r}",
+                flush=True,
+            )
+    return _k3_dump_kda_layer_ids.get(layer_idx)
+
+
+def _kda_dump_should_write(layer_idx: int, config, forward_batch: ForwardBatch) -> bool:
+    if _kda_dump_ordinal(layer_idx, config) is None:
+        return False
+    return bool(forward_batch.forward_mode.is_extend_without_speculative())
+
+
+def _maybe_dump_k3_kda(
+    layer_idx: int,
+    tag: str,
+    tensor: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Write one KDA intermediate. No collectives. attn_tp0 only."""
+    if get_attn_tensor_model_parallel_rank() != 0:
+        return
+    dumped = tensor.detach()
+    # Prefill KDA unsqueezes a leading 1 (beta / forget-gate / core).
+    if dumped.ndim >= 2 and dumped.shape[0] == 1:
+        dumped = dumped.squeeze(0)
+    num_real_tokens = _dump_real_token_count(forward_batch, dumped.shape[0])
+    pp_rank = get_pp_group().rank_in_group
+    prefix = f"layer{layer_idx:03d}_pp{pp_rank:02d}_tokens{num_real_tokens}_{tag}"
+    _dump_write_tensor(f"{prefix}.pt", dumped, num_real_tokens)
+    sliced = dumped[:num_real_tokens].float()
+    print(
+        f"[K3-KDA] {prefix}.pt shape={list(sliced.shape)} "
+        f"mean_abs={sliced.abs().mean().item():.6g} "
+        f"max_abs={sliced.abs().max().item():.6g}",
+        flush=True,
+    )
+
+
+def _maybe_dump_k3_pp_wire(
+    tag: str,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> None:
+    """Dump the actual PPProxyTensors payload (send after fold, recv as-is)."""
+    if not _dump_should_write(forward_batch, layer_idx=None):
+        return
+    if get_attn_tensor_model_parallel_rank() != 0:
+        return
+    num_real_tokens = _dump_real_token_count(forward_batch, hidden_states.shape[0])
+    pp_rank = get_pp_group().rank_in_group
+    prefix = f"{tag}_pp{pp_rank:02d}_tokens{num_real_tokens}"
+    _dump_write_tensor(f"{prefix}_hidden.pt", hidden_states, num_real_tokens)
+    if residual is not None:
+        _dump_write_tensor(f"{prefix}_residual.pt", residual, num_real_tokens)
+    print(
+        f"[K3-DUMP] {tag} {prefix}_hidden.pt "
+        f"hidden={tuple(hidden_states.shape)} "
+        f"residual={None if residual is None else tuple(residual.shape)}",
+        flush=True,
+    )
 
 
 class KimiK3MLP(nn.Module):
@@ -1854,6 +2055,14 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        dump_kda = _kda_dump_should_write(
+            self.layer_idx, self.config, forward_batch
+        )
+        if dump_kda:
+            _maybe_dump_k3_kda(
+                self.layer_idx, "kdain", hidden_states, forward_batch
+            )
+
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 hidden_states
@@ -1871,6 +2080,12 @@ class KimiK3DeltaAttention(nn.Module):
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
+
+        if dump_kda:
+            _maybe_dump_k3_kda(self.layer_idx, "kdaqkv", mixed_qkv, forward_batch)
+            _maybe_dump_k3_kda(self.layer_idx, "kdabeta", beta, forward_batch)
+            _maybe_dump_k3_kda(self.layer_idx, "kdafg", forget_gate, forward_batch)
+            _maybe_dump_k3_kda(self.layer_idx, "kdag", g_proj_states, forward_batch)
 
         # Fused KDA handoff (attempt-and-verify): offer the output-norm gate
         # so covered decode and target-verify kernels can fold gated RMSNorm
@@ -1892,6 +2107,11 @@ class KimiK3DeltaAttention(nn.Module):
             b=beta,
         )
 
+        if dump_kda:
+            _maybe_dump_k3_kda(
+                self.layer_idx, "kdacore", core_attn_out, forward_batch
+            )
+
         if fused_onorm:
             self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
@@ -1899,11 +2119,19 @@ class KimiK3DeltaAttention(nn.Module):
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+        if dump_kda:
+            _maybe_dump_k3_kda(
+                self.layer_idx, "kdaonorm", core_attn_out, forward_batch
+            )
         if self.all_reduce_fusion:
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
-            return partial
-        return self.o_proj(core_attn_out)[0]
+            attn_out = partial
+        else:
+            attn_out = self.o_proj(core_attn_out)[0]
+        if dump_kda:
+            _maybe_dump_k3_kda(self.layer_idx, "kdaout", attn_out, forward_batch)
+        return attn_out
 
 
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
@@ -2410,6 +2638,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states, _, _ = self._finish_attn_reduce(
             hidden_states, allow_scatter=False
         )
+        # ? 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return hidden_states, residual, False
@@ -2704,6 +2933,7 @@ class KimiK3LinearModel(nn.Module):
             if TYPE_CHECKING:
                 assert isinstance(hidden_states, torch.Tensor)
                 assert isinstance(residual, torch.Tensor | None)
+            _maybe_dump_k3_pp_wire("pprecv", hidden_states, residual, forward_batch)
 
         # mlp-sync (DP attention OR MoE a2a/EP) pads extend batches to a
         # multiple of attn_tp_size; attention layers run on the real rows
@@ -2885,7 +3115,9 @@ class KimiK3LinearModel(nn.Module):
                     input_sharded=sp_sharded,
                     keep_sharded=sp_attn_res,
                 )
-            _maybe_dump_k3_hidden(i, hidden_states, sp_sharded, forward_batch)
+            _maybe_dump_k3_hidden(
+                i, hidden_states, residual, attn_res, sp_sharded, forward_batch
+            )
             if (
                 self.dspark_layers_to_capture is not None
                 and i in self.dspark_layers_to_capture
@@ -2920,6 +3152,7 @@ class KimiK3LinearModel(nn.Module):
                     # full stream head (bit-identical to the fused fold).
                     hidden_states = residual + hidden_states
                 residual = attn_res.block_residual  # raw bank across ranks
+            _maybe_dump_k3_pp_wire("ppsend", hidden_states, residual, forward_batch)
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
