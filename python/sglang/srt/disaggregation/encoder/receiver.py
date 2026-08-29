@@ -750,6 +750,34 @@ def extract_original_req_id(part_req_id: str) -> str:
     return part_req_id
 
 
+def _embedding_part_matches_request(
+    embedding_data: object, expected_req_id: str
+) -> bool:
+    """Normalize a matching part ID; reject stale data from a reused socket."""
+    if not isinstance(embedding_data, EmbeddingData):
+        logger.warning(
+            "Dropping non-embedding data for expected rid=%s", expected_req_id
+        )
+        return False
+    if not isinstance(embedding_data.req_id, str):
+        logger.warning(
+            "Dropping embedding data with a non-string req_id for expected rid=%s",
+            expected_req_id,
+        )
+        return False
+    original_req_id = extract_original_req_id(embedding_data.req_id)
+    if original_req_id != expected_req_id:
+        logger.warning(
+            "Dropping stale embedding data: expected rid=%s, got rid=%s "
+            "(likely from ZMQ port reuse)",
+            expected_req_id,
+            embedding_data.req_id,
+        )
+        return False
+    embedding_data.req_id = original_req_id
+    return True
+
+
 def _encoder_media_item(mm_item: dict):
     """Keep per-media options aligned while preserving the legacy URL shape."""
     item = {
@@ -878,14 +906,14 @@ class WaitingMMRequestBase(ABC):
 
         try:
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+            if not self._is_valid_embedding_part(recv_obj):
+                return
             if getattr(recv_obj, "error_msg", None) is not None:
                 logger.warning(
                     f"Received error signal from encoder for {self.rid}: "
                     f"{recv_obj.error_msg} {recv_obj.error_code = }"
                 )
                 self._fail_and_release(recv_obj.error_msg, recv_obj.error_code)
-                return
-            if not self._is_valid_embedding_part(recv_obj):
                 return
             # ZMQ materializes frame 1; RDMA already wrote the registered buffer.
             self._extract_embedding_from_buffer(recv_obj, parts)
@@ -928,15 +956,7 @@ class WaitingMMRequestBase(ABC):
 
     def _is_valid_embedding_part(self, recv_obj) -> bool:
         """Check for and drop stale or out-of-sync payloads; normalize the part req_id to the original rid."""
-        original_req_id = extract_original_req_id(recv_obj.req_id)
-        if original_req_id != self.recv_req.rid:
-            logger.warning(
-                f"Dropping stale embedding data: expected rid={self.recv_req.rid}, "
-                f"got rid={recv_obj.req_id} (likely from ZMQ port reuse)"
-            )
-            return False
-        recv_obj.req_id = original_req_id
-        return True
+        return _embedding_part_matches_request(recv_obj, self.recv_req.rid)
 
     @abstractmethod
     def _extract_embedding_from_buffer(self, recv_obj, parts) -> None:
@@ -1997,6 +2017,8 @@ class MMReceiverBase(ABC):
                 if not parts:
                     continue
                 recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+                if not _embedding_part_matches_request(recv_obj, req_id):
+                    continue
                 if getattr(recv_obj, "error_msg", None) is not None:
                     logger.warning(
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
@@ -2004,8 +2026,6 @@ class MMReceiverBase(ABC):
                     )
                     return None
                 logger.debug("recv_obj=%s", recv_obj)
-                # Normalize the part req_id to the original for aggregation.
-                recv_obj.req_id = extract_original_req_id(recv_obj.req_id)
                 if len(parts) < 2:
                     logger.error(
                         "zmq_to_tokenizer expected 2-part message, got %d parts",

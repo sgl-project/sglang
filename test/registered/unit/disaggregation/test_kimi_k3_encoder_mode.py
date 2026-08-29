@@ -26,6 +26,8 @@ from sglang.srt.disaggregation.encoder.receiver import (
     MMReceiverGrpc,
     MMReceiverHTTP,
     MultiModalEmbeddingData,
+    WaitingMMRequestStatus,
+    WaitingZmqRequest,
     _encoder_media_item,
     _select_mm_processor_prompt,
 )
@@ -841,6 +843,80 @@ def test_epd_scheduler_uses_token_ids_for_tokenized_mm_processors():
         )
         == "unexpanded prompt"
     )
+
+
+def test_epd_scheduler_ignores_foreign_error_part():
+    waiting = WaitingZmqRequest.__new__(WaitingZmqRequest)
+    waiting.rid = "current"
+    waiting.recv_req = SimpleNamespace(rid="current")
+    waiting.status = WaitingMMRequestStatus.PENDING
+    waiting._fail_and_release = Mock()
+    stale_error = EmbeddingData(
+        req_id="stale_local_part_0",
+        num_parts=1,
+        part_idx=0,
+        grid_dim=None,
+        modality=Modality.IMAGE,
+        error_msg="stale failure",
+        error_code=500,
+    )
+
+    waiting.consume_parts([pickle.dumps("not embedding data")])
+    waiting.consume_parts([pickle.dumps(stale_error)])
+
+    assert waiting.status == WaitingMMRequestStatus.PENDING
+    waiting._fail_and_release.assert_not_called()
+
+
+def test_epd_tokenizer_ignores_foreign_part_before_current_embedding():
+    class FakeSocket:
+        def __init__(self, messages):
+            self.messages = list(messages)
+            self.closed = False
+
+        async def recv_multipart(self, copy=False):
+            return self.messages.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    async def run_test():
+        stale_error = EmbeddingData(
+            req_id="stale_local_part_0",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+            error_msg="stale failure",
+            error_code=500,
+        )
+        embedding = torch.tensor([[1.0, 2.0]])
+        current = EmbeddingData(
+            req_id="current_local_part_0",
+            num_parts=1,
+            part_idx=0,
+            grid_dim=None,
+            modality=Modality.IMAGE,
+            embedding=embedding,
+        )
+        socket = FakeSocket(
+            [
+                [pickle.dumps(stale_error)],
+                [pickle.dumps(current.copy_without_embedding()), embedding.numpy()],
+            ]
+        )
+        receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+        receiver.model_type = None
+        processor = SimpleNamespace(
+            get_mm_data=lambda _prompt, embeddings, **_kwargs: embeddings
+        )
+
+        result = await receiver._recv_mm_data("current", socket, processor, "prompt")
+
+        torch.testing.assert_close(result[Modality.IMAGE], embedding)
+        assert socket.closed
+
+    asyncio.run(run_test())
 
 
 def test_epd_scheduler_routes_many_requests_over_one_receive_socket():
