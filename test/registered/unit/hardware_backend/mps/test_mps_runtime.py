@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.hardware_backend.mps import runtime
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_mps_ci
 
 register_mps_ci(est_time=1, suite="stage-a-unit-test-mps")
@@ -55,49 +56,35 @@ class TestMpsRuntime(unittest.TestCase):
         ):
             runtime.validate_mps_runtime()
 
-    def test_server_args_selects_runtime_gate_by_execution_path(self):
+    @staticmethod
+    def _resolve_with_gate(device, *, mlx, detected_mps=False):
+        """Drive the runtime gate the way a launch does, and report the call.
+
+        Uses a dummy model so the pipeline short-circuits before any download:
+        the gate under test runs ahead of that, which is the whole point of
+        where it sits.
+        """
         from sglang.srt import server_args
 
-        args = types.SimpleNamespace(device="mps")
         with (
-            mock.patch.object(server_args, "use_mlx", return_value=False),
+            mock.patch.object(server_args, "use_mlx", return_value=mlx),
+            override_platform(is_mps=detected_mps),
             mock.patch.object(server_args, "validate_mps_runtime") as validate,
         ):
-            server_args.ServerArgs._handle_hardware_runtime_validation(args)
-        validate.assert_called_once_with()
+            server_args.ServerArgs(model_path="dummy", device=device).resolve_once()
+        return validate
 
-        with (
-            mock.patch.object(server_args, "use_mlx", return_value=True),
-            mock.patch.object(server_args, "validate_mps_runtime") as validate,
-        ):
-            server_args.ServerArgs._handle_hardware_runtime_validation(args)
-        validate.assert_not_called()
+    def test_server_args_selects_runtime_gate_by_execution_path(self):
+        self._resolve_with_gate("mps", mlx=False).assert_called_once_with()
+        self._resolve_with_gate("mps", mlx=True).assert_not_called()
 
     def test_runtime_gate_follows_autodetected_platform_when_device_is_unset(self):
         """--device is normally omitted on macOS, so the gate must key off the
         detected platform rather than the raw (still None) device field."""
-        from sglang.srt import server_args
-
-        args = types.SimpleNamespace(device=None)
-        with (
-            mock.patch.object(server_args, "use_mlx", return_value=False),
-            mock.patch.object(
-                server_args.current_platform, "is_mps", return_value=True
-            ),
-            mock.patch.object(server_args, "validate_mps_runtime") as validate,
-        ):
-            server_args.ServerArgs._handle_hardware_runtime_validation(args)
-        validate.assert_called_once_with()
-
-        with (
-            mock.patch.object(server_args, "use_mlx", return_value=False),
-            mock.patch.object(
-                server_args.current_platform, "is_mps", return_value=False
-            ),
-            mock.patch.object(server_args, "validate_mps_runtime") as validate,
-        ):
-            server_args.ServerArgs._handle_hardware_runtime_validation(args)
-        validate.assert_not_called()
+        self._resolve_with_gate(
+            None, mlx=False, detected_mps=True
+        ).assert_called_once_with()
+        self._resolve_with_gate(None, mlx=False, detected_mps=False).assert_not_called()
 
     def test_checkpoint_derived_execution_modes_are_rejected(self):
         self.assertIsNone(
@@ -115,7 +102,9 @@ class TestMpsRuntime(unittest.TestCase):
             )
 
     def test_standard_path_rejects_unsupported_execution_modes(self):
-        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.arg_groups.validation_hook import (
+            validate_standard_mps_server_args,
+        )
 
         def make(**overrides):
             base = dict(
@@ -132,7 +121,7 @@ class TestMpsRuntime(unittest.TestCase):
             return types.SimpleNamespace(**base)
 
         # The supported baseline must pass untouched.
-        self.assertIsNone(ServerArgs._validate_standard_mps_server_args(make()))
+        self.assertIsNone(validate_standard_mps_server_args(make()))
 
         for overrides, expected in (
             ({"attention_backend": "fa3"}, "torch_native attention backend"),
@@ -144,7 +133,7 @@ class TestMpsRuntime(unittest.TestCase):
         ):
             with self.subTest(**overrides):
                 with self.assertRaisesRegex(ValueError, expected):
-                    ServerArgs._validate_standard_mps_server_args(make(**overrides))
+                    validate_standard_mps_server_args(make(**overrides))
 
 
 if __name__ == "__main__":
