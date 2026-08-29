@@ -30,7 +30,7 @@ def qsa_fast_topk(
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
-    if logits.is_cuda:
+    if logits.device.type == "cuda":
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
@@ -55,21 +55,32 @@ def qsa_fast_topk(
         )
         return _rerank_qsa_topk_candidates(logits, candidates, starts, topk)
 
-    # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
+    # Device-agnostic Torch path mirrors the CUDA operator's fixed-width,
+    # sequence-relative output without reading device scalars on the host.
     output = torch.full(
         (logits.shape[0], topk),
         -1,
         dtype=torch.int32,
         device=logits.device,
     )
+    select_width = min(topk, logits.shape[1])
+    if select_width == 0:
+        return output
+    columns = torch.arange(logits.shape[1], device=logits.device)
+    ranks = torch.arange(select_width, device=logits.device)
     for row in range(logits.shape[0]):
-        start = int(starts[row])
-        length = int(lengths[row])
-        width = min(length, topk)
-        if width:
-            output[row, :width] = torch.topk(
-                logits[row, start : start + length], width
-            ).indices.to(torch.int32)
+        start = starts[row]
+        length = lengths[row].clamp(min=0, max=logits.shape[1])
+        valid = (columns >= start) & (columns < start + length)
+        selected = torch.topk(
+            logits[row].masked_fill(~valid, -float("inf")), select_width
+        ).indices
+        relative = (selected - start).to(torch.int32)
+        output[row, :select_width] = torch.where(
+            ranks < valid.sum(),
+            relative,
+            torch.full_like(relative, -1),
+        )
     return output
 
 
@@ -271,7 +282,7 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
-    if block_indices.is_cuda:
+    if block_indices.device.type == "cuda":
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
         return triton_expand_qsa_block_indices(
@@ -299,8 +310,10 @@ def qsa_sparse_attention(
 ) -> torch.Tensor:
     """Torch reference for sparse GQA over physical token slots."""
 
-    if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
-        raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
+    if q.ndim != 3:
+        raise ValueError(f"q must be rank 3, got shape {tuple(q.shape)}")
+    k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
+    v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
     if token_slots.ndim != 2 or token_slots.shape[0] != q.shape[0]:
         raise ValueError(
             "token slots must be [query_tokens, selected_tokens], got "
@@ -315,6 +328,22 @@ def qsa_sparse_attention(
     )
 
 
+def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
+    """Expose flat physical slots from NHD or Ascend paged KV storage."""
+
+    if cache.ndim == 3:
+        return cache
+    if cache.ndim == 4:
+        # Ascend stores each layer as [pages, page_size, heads, dim], or as
+        # [slots, 1, heads, dim] with FIA. In both cases physical slot ids are
+        # the row-major flattening of the first two dimensions.
+        return cache.flatten(0, 1)
+    raise ValueError(
+        f"{name} must be [slots, heads, dim] or "
+        f"[pages, page_size, heads, dim], got shape {tuple(cache.shape)}"
+    )
+
+
 def qsa_sparse_attention_reference(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -325,18 +354,25 @@ def qsa_sparse_attention_reference(
     """Device-agnostic sparse GQA reference."""
 
     scale = softmax_scale or q.shape[-1] ** -0.5
+    if q.shape[0] == 0:
+        return torch.empty_like(q)
     outputs = []
     repeats = q.shape[1] // k_cache.shape[1]
     for row in range(q.shape[0]):
         valid = token_slots[row] >= 0
-        slots = token_slots[row, valid].long()
-        if slots.numel() == 0:
-            outputs.append(torch.zeros_like(q[row]))
-            continue
+        slots = token_slots[row].clamp_min(0).long()
         keys = k_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
         values = v_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
         scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) * scale
-        probabilities = torch.softmax(scores, dim=-1)
+        valid = valid.unsqueeze(0)
+        probabilities = torch.softmax(
+            scores.masked_fill(~valid, -float("inf")), dim=-1
+        )
+        # An all-padding row produces NaNs in softmax(-inf); masking the fixed
+        # width probabilities restores the reference contract of a zero row.
+        probabilities = torch.where(
+            valid, probabilities, torch.zeros_like(probabilities)
+        )
         outputs.append(
             torch.einsum("hk,khd->hd", probabilities, values.float()).to(q.dtype)
         )

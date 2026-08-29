@@ -121,14 +121,14 @@ class QSAIndexer(MultiPlatformOp):
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
         return (
-            tensor.is_cuda
+            tensor.device.type == "cuda"
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and self.index_head_dim in (64, 128, 256)
             and self.rotary_emb.rotary_dim % 2 == 0
             and not getattr(self.rotary_emb, "mrope_interleaved_glm", False)
             and len(getattr(self.rotary_emb, "mrope_section", None) or ()) in (0, 3)
             and getattr(self.rotary_emb, "cos_sin_cache", None) is not None
-            and self.rotary_emb.cos_sin_cache.is_cuda
+            and self.rotary_emb.cos_sin_cache.device.type == "cuda"
             and self.rotary_emb.cos_sin_cache.dtype == torch.float32
         )
 
@@ -523,7 +523,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_lengths,
             max_model_len,
         )
-        if logits.is_cuda and self.block_topk == 512:
+        if logits.device.type == "cuda" and self.block_topk == 512:
             # Decode rows start at zero, so lengths are the compressed lengths
             # themselves; calling the JIT kernel directly skips the zeros_like
             # fill + subtract of the generic path.
@@ -657,6 +657,19 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+        )
+
+    def forward_npu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        """Run the device-agnostic QSA orchestration with Torch NPU fallbacks."""
+
+        return self.forward_cuda(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 

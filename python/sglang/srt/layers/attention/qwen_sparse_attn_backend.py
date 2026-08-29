@@ -1056,7 +1056,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             supports_graph_metadata_kernels,
         )
 
-        return seq_lens.is_cuda and supports_graph_metadata_kernels(
+        return seq_lens.device.type == "cuda" and supports_graph_metadata_kernels(
             metadata.indexer_metadata.token_to_kv_pool, seq_lens.device
         )
 
@@ -1401,7 +1401,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, topk_indices
             )
             return self._pad_extend_output(output, num_output_rows)
-        if not q.is_cuda:
+        if q.device.type != "cuda":
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
@@ -1635,7 +1635,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        if not q.is_cuda:
+        if q.device.type != "cuda":
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)

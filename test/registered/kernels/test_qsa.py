@@ -1652,6 +1652,19 @@ def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
     assert decode_result.item() == 2
 
 
+def test_qsa_forward_npu_reuses_torch_fallback_orchestration():
+    indexer = _DispatchIndexer()
+    result = QSAIndexer.forward_npu(
+        indexer,
+        torch.zeros(1, 16),
+        torch.zeros(1, dtype=torch.int32),
+        SimpleNamespace(forward_mode=_ForwardMode(False)),
+        _DispatchMetadata(),
+    )
+    assert indexer.selected == "prefill"
+    assert result.item() == 1
+
+
 def test_qsa_fast_topk_returns_sequence_relative_indices():
     logits = torch.zeros(2, 1200, dtype=torch.float32)
     starts = torch.tensor([100, 600], dtype=torch.int32)
@@ -1669,6 +1682,15 @@ def test_qsa_fast_topk_returns_sequence_relative_indices():
     decode_indices = qsa_fast_topk(logits, decode_starts, decode_ends, topk=BLOCK_TOPK)
     assert 444 in decode_indices[0].tolist()
     assert 333 in decode_indices[1].tolist()
+
+    short = qsa_fast_topk(
+        torch.arange(12, dtype=torch.float32).unsqueeze(0),
+        torch.tensor([4], dtype=torch.int32),
+        torch.tensor([7], dtype=torch.int32),
+        topk=8,
+    )
+    assert set(short[0, :3].tolist()) == {0, 1, 2}
+    assert short[0, 3:].tolist() == [-1] * 5
 
 
 def test_qsa_reranks_wider_candidate_set():
@@ -1845,6 +1867,18 @@ def test_qsa_sparse_attention_matches_explicit_gqa():
             )
         )
     torch.testing.assert_close(actual, torch.stack(expected_rows), rtol=2e-2, atol=2e-2)
+
+    all_padding = qsa_sparse_attention(q[:1], k, v, slots.new_full((1, 8), -1))
+    torch.testing.assert_close(all_padding, torch.zeros_like(q[:1]))
+
+    paged = qsa_sparse_attention(
+        q, k.view(1, 7, 2, 16), v.view(1, 7, 2, 16), slots
+    )
+    fia = qsa_sparse_attention(
+        q, k.view(7, 1, 2, 16), v.view(7, 1, 2, 16), slots
+    )
+    torch.testing.assert_close(paged, actual)
+    torch.testing.assert_close(fia, actual)
 
 
 def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
