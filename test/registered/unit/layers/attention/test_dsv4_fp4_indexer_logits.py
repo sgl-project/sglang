@@ -76,6 +76,13 @@ def _fake_flydsl():
 
 
 class TestAITERFP4IndexerLogits(unittest.TestCase):
+    def test_decode_parallel_units_cap_graph_width_without_oversizing_eager(self):
+        get_parallel_units = aiter_fp4_indexer._get_aiter_fp4_decode_parallel_unit_num
+
+        self.assertEqual(get_parallel_units(32, 2048), 256)
+        self.assertEqual(get_parallel_units(32, 262144), 1024)
+        self.assertEqual(get_parallel_units(256, 8192), 1024)
+
     def _make_dispatch(self, *, mode, num_tokens, metadata_rows, batch_size):
         page_table = torch.arange(metadata_rows * 2, dtype=torch.int32).reshape(
             metadata_rows, 2
@@ -229,6 +236,35 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
         torch.testing.assert_close(args[4], expected_page_table)
         torch.testing.assert_close(args[6], case.c4_seq_lens[:2])
 
+    def test_decode_forwards_cached_logits_metadata(self):
+        case = self._make_dispatch(
+            mode=ForwardMode.DECODE,
+            num_tokens=2,
+            metadata_rows=2,
+            batch_size=2,
+        )
+        cached_metadata = object()
+        cached_positions = torch.tensor([7, 11], dtype=torch.int64)
+        case.backend.forward_metadata.aiter_fp4_logits_decode_metadata = cached_metadata
+        case.backend.forward_metadata.aiter_fp4_q_positions = cached_positions
+
+        with patch(
+            "sglang.srt.layers.attention.dsv4.indexer.aiter_fp4_paged_mqa_logits",
+            return_value=torch.empty((2, 128), dtype=torch.float32),
+        ) as logits:
+            case.backend.forward_c4_indexer(
+                x=torch.empty(2, 1),
+                q_lora=torch.empty(2, 1),
+                c4_indexer=case.c4_indexer,
+                forward_batch=case.forward_batch,
+            )
+
+        self.assertIs(logits.call_args.kwargs["decode_metadata"], cached_metadata)
+        self.assertIs(
+            case.backend._forward_prepare_normal.call_args.kwargs["positions"],
+            cached_positions,
+        )
+
     def test_extend_and_target_verify_use_exact_prefill_call(self):
         for mode in (ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY):
             with self.subTest(mode=mode):
@@ -340,7 +376,8 @@ class TestAITERFP4IndexerLogits(unittest.TestCase):
                         selected_kernel.call_args.args[-1], padded_width * 64
                     )
                     self.assertEqual(logits.shape, (num_tokens, page_table_width * 64))
-                    self.assertTrue(logits.is_contiguous())
+                    self.assertEqual(logits.stride(), (padded_width * 64, 1))
+                    self.assertEqual(logits.data_ptr(), padded_logits.data_ptr())
                     torch.testing.assert_close(
                         logits, padded_logits[:, : page_table_width * 64]
                     )

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import math
 import sys
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+from sglang.kernels.ops.attention.dsv4 import topk_transform_512
 from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
     aiter_fp4_paged_mqa_logits,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_rope_hadamard_fp4_quant,
     prepare_aiter_fp4_indexer_cos_sin,
+    prepare_aiter_fp4_paged_mqa_decode_metadata,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorDecodePlan
 from sglang.srt.utils import is_hip
@@ -67,6 +71,65 @@ pytestmark = pytest.mark.skipif(
     not _has_required_aiter_apis(),
     reason="requires HIP on exact gfx950 with AITER FP4 indexer APIs",
 )
+
+
+def test_post_load_refreshes_cached_norm_weight_in_place() -> None:
+    from sglang.srt.models import deepseek_v4
+
+    norm = SimpleNamespace(
+        weight=torch.nn.Parameter(torch.randn(128)),
+        _aiter_fp4_weight_bf16=None,
+    )
+    indexer_compressor = SimpleNamespace(ape_converted=True, norm=norm)
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            compress_ratio=4,
+            compressor=SimpleNamespace(ape_converted=True),
+            indexer=SimpleNamespace(compressor=indexer_compressor),
+        ),
+        refresh_mhc_norm_weight_cache=Mock(),
+    )
+    model = SimpleNamespace(
+        model=SimpleNamespace(start_layer=0, end_layer=1, layers=[layer])
+    )
+
+    with patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False):
+        deepseek_v4.DeepseekV4ForCausalLM.post_load_weights(model)
+        cached_weight = norm._aiter_fp4_weight_bf16
+        cached_pointer = cached_weight.data_ptr()
+        norm.weight.data.add_(1)
+        deepseek_v4.DeepseekV4ForCausalLM.post_load_weights(model)
+
+    assert norm._aiter_fp4_weight_bf16.data_ptr() == cached_pointer
+    torch.testing.assert_close(
+        norm._aiter_fp4_weight_bf16,
+        norm.weight.data.bfloat16(),
+    )
+
+
+def test_topk_accepts_strided_fp4_logits_view() -> None:
+    import sgl_kernel  # noqa: F401
+
+    device = torch.device("cuda")
+    scores_storage = torch.randn((2, 768), device=device, dtype=torch.float32)
+    scores = scores_storage[:, :576]
+    assert not scores.is_contiguous()
+    seq_lens = torch.tensor([576, 513], device=device, dtype=torch.int32)
+    page_table = torch.arange(18, device=device, dtype=torch.int32).reshape(2, 9)
+    strided_indices = torch.empty((2, 512), device=device, dtype=torch.int32)
+    contiguous_indices = torch.empty_like(strided_indices)
+
+    topk_transform_512(scores, seq_lens, page_table, strided_indices, 64)
+    topk_transform_512(
+        scores.contiguous(), seq_lens, page_table, contiguous_indices, 64
+    )
+
+    torch.testing.assert_close(
+        strided_indices.sort(dim=-1).values,
+        contiguous_indices.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
 
 
 def _unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
@@ -429,6 +492,10 @@ def test_dsv4_aiter_fp4_indexer_graph_capture_replay() -> None:
 
     decode_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(decode_graph):
+        decode_metadata = prepare_aiter_fp4_paged_mqa_decode_metadata(
+            page_table=decode_page_table,
+            c4_seq_lens=decode_c4_seq_lens,
+        )
         decode_q_fp4, decode_q_scale = aiter_q_indexer_rope_hadamard_fp4_quant(
             q, cos, sin, q_positions
         )
@@ -442,6 +509,7 @@ def test_dsv4_aiter_fp4_indexer_graph_capture_replay() -> None:
             c4_seq_lens=decode_c4_seq_lens,
             weight_scale=weight_scale,
             is_decode=True,
+            decode_metadata=decode_metadata,
         )
 
     prefill_graph = torch.cuda.CUDAGraph()

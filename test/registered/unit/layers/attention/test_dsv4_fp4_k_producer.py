@@ -85,7 +85,7 @@ class TestAITERFP4KCacheWriter(unittest.TestCase):
         self.payload = torch.empty((2, 1, 4, 64, 16), dtype=torch.float4_e2m1fn_x2)
         self.scale = torch.empty((2, 1, 4, 64), dtype=torch.uint8)
 
-    def _run_writer(self, plan, out_loc):
+    def _run_writer(self, plan, out_loc, write_metadata=None):
         num_rows = plan[1].shape[0]
         k = torch.randn(128, num_rows, dtype=torch.float32).T
         self.assertFalse(k.is_contiguous())
@@ -114,6 +114,7 @@ class TestAITERFP4KCacheWriter(unittest.TestCase):
                 out_loc=out_loc,
                 k_payload=self.payload,
                 k_scale=self.scale,
+                write_metadata=write_metadata,
             )
 
         call_args = fake_aiter.rmsnorm_rope_rotate_activation_fp4quant_kvcache.call_args
@@ -171,6 +172,20 @@ class TestAITERFP4KCacheWriter(unittest.TestCase):
 
         torch.testing.assert_close(positions, torch.tensor([4, 8, 0]))
         torch.testing.assert_close(slots, torch.tensor([303, 101, -1]))
+
+    def test_precomputed_metadata_is_forwarded(self):
+        plan = _decode_plan([4, 8])
+        expected_positions = torch.tensor([0, 4], dtype=torch.int64)
+        expected_slots = torch.tensor([11, 22], dtype=torch.int64)
+
+        positions, slots = self._run_writer(
+            plan,
+            torch.tensor([11, 22], dtype=torch.int32),
+            (expected_positions, expected_slots),
+        )
+
+        self.assertIs(positions, expected_positions)
+        self.assertIs(slots, expected_slots)
 
     def test_empty_prefill_is_a_no_op(self):
         fake_aiter = ModuleType("aiter")
@@ -335,7 +350,11 @@ class TestFP4KCompressorRouting(unittest.TestCase):
         payload = torch.empty((2, 1, 4, 64, 16), dtype=torch.float4_e2m1fn_x2)
         scale = torch.empty((2, 1, 4, 64), dtype=torch.uint8)
         out_loc = torch.tensor([3, 7], dtype=torch.int64)
-        norm = SimpleNamespace(weight=torch.randn(128), variance_epsilon=1e-6)
+        norm = SimpleNamespace(
+            weight=torch.randn(128),
+            variance_epsilon=1e-6,
+            _aiter_fp4_weight_bf16=torch.randn(128, dtype=torch.bfloat16),
+        )
         freqs_cis = torch.empty((128, 32), dtype=torch.complex64)
         cos = torch.empty((128, 32), dtype=torch.bfloat16)
         sin = torch.empty((128, 32), dtype=torch.bfloat16)
@@ -343,7 +362,9 @@ class TestFP4KCompressorRouting(unittest.TestCase):
         backend._get_paged_compress_metadata = Mock(return_value=plan)
 
         with (
-            patch.object(compressor_v2, "compress_forward", return_value=compressed),
+            patch.object(
+                compressor_v2, "compress_forward", return_value=compressed
+            ) as compress,
             patch.object(compressor_v2, "compress_norm_rope_store") as legacy_store,
             patch.object(
                 aiter_fp4_indexer, "aiter_k_indexer_fp4_cache_write"
@@ -370,9 +391,12 @@ class TestFP4KCompressorRouting(unittest.TestCase):
             )
 
         legacy_store.assert_not_called()
+        compress_out = compress.call_args.kwargs["out"]
+        self.assertEqual(compress_out.shape, (2, 128))
+        self.assertEqual(compress_out.dtype, torch.bfloat16)
         aiter_store.assert_called_once_with(
             k=compressed,
-            norm_weight=norm.weight,
+            norm_weight=norm._aiter_fp4_weight_bf16,
             norm_epsilon=norm.variance_epsilon,
             cos=cos,
             sin=sin,
@@ -381,6 +405,49 @@ class TestFP4KCompressorRouting(unittest.TestCase):
             k_payload=payload,
             k_scale=scale,
         )
+
+    def test_all_in_one_forwards_cached_aiter_write_metadata(self):
+        plan = _decode_plan([4, 8])
+        compressed = torch.randn((2, 128), dtype=torch.float32)
+        payload = torch.empty((2, 1, 4, 64, 16), dtype=torch.float4_e2m1fn_x2)
+        scale = torch.empty((2, 1, 4, 64), dtype=torch.uint8)
+        write_metadata = (
+            torch.tensor([0, 4], dtype=torch.int64),
+            torch.tensor([3, 7], dtype=torch.int64),
+        )
+        backend = CompressorBackendMixin.__new__(CompressorBackendMixin)
+        backend._get_paged_compress_metadata = Mock(return_value=plan)
+        backend.forward_metadata = SimpleNamespace(
+            aiter_fp4_k_write_metadata=write_metadata
+        )
+
+        with (
+            patch.object(compressor_v2, "compress_forward", return_value=compressed),
+            patch.object(
+                aiter_fp4_indexer, "aiter_k_indexer_fp4_cache_write"
+            ) as aiter_store,
+        ):
+            backend._forward_compress_all_in_one(
+                kv_score_buffer=torch.empty((2, 4, 512)),
+                kv_score_input=torch.empty((2, 256)),
+                ape=torch.empty((4, 128)),
+                head_dim=128,
+                norm=SimpleNamespace(weight=torch.randn(128), variance_epsilon=1e-6),
+                freqs_cis_cache=torch.empty((128, 32), dtype=torch.complex64),
+                kv_cache=payload,
+                kv_scale_cache=scale,
+                is_indexer=True,
+                rotate=True,
+                compress_ratio=4,
+                page_size=64,
+                out_loc=torch.tensor([3, 7]),
+                use_fp4_indexer=True,
+                use_aiter_fp4_indexer=True,
+                aiter_fp4_cos=torch.empty((128, 32), dtype=torch.bfloat16),
+                aiter_fp4_sin=torch.empty((128, 32), dtype=torch.bfloat16),
+            )
+
+        self.assertIs(aiter_store.call_args.kwargs["write_metadata"], write_metadata)
 
     def test_all_in_one_keeps_legacy_fp4_and_fp8_store(self):
         plan = _decode_plan([4, 8])

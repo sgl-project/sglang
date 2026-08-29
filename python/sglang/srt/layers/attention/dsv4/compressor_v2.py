@@ -185,6 +185,11 @@ class CompressorBackendMixin:
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
         # Step 1: compress_forward
+        compress_out = (
+            kv_score_input.new_empty((plan[1].shape[0], head_dim), dtype=torch.bfloat16)
+            if use_aiter_fp4_indexer
+            else None
+        )
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
@@ -192,6 +197,7 @@ class CompressorBackendMixin:
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
+            out=compress_out,
             is_online=is_online,
         )
 
@@ -200,9 +206,18 @@ class CompressorBackendMixin:
                 aiter_k_indexer_fp4_cache_write,
             )
 
+            norm_weight = getattr(norm, "_aiter_fp4_weight_bf16", None)
+            write_kwargs = {}
+            forward_metadata = getattr(self, "forward_metadata", None)
+            if forward_metadata is not None:
+                write_metadata = getattr(
+                    forward_metadata, "aiter_fp4_k_write_metadata", None
+                )
+                if write_metadata is not None:
+                    write_kwargs["write_metadata"] = write_metadata
             aiter_k_indexer_fp4_cache_write(
                 k=kv_compressed,
-                norm_weight=norm.weight,
+                norm_weight=norm.weight if norm_weight is None else norm_weight,
                 norm_epsilon=norm.variance_epsilon,
                 cos=aiter_fp4_cos,
                 sin=aiter_fp4_sin,
@@ -210,6 +225,7 @@ class CompressorBackendMixin:
                 out_loc=out_loc,
                 k_payload=kv_cache,
                 k_scale=kv_scale_cache,
+                **write_kwargs,
             )
             return
 

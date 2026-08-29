@@ -48,6 +48,9 @@ from sglang.srt.utils import ceil_align
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
+    from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
+        AiterFP4PagedMQADecodeMetadata,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -354,6 +357,13 @@ class DSV4Metadata:
 
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
+    aiter_fp4_k_write_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = field(
+        default=None, repr=False
+    )
+    aiter_fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
+    aiter_fp4_logits_decode_metadata: Optional[AiterFP4PagedMQADecodeMetadata] = field(
+        default=None, repr=False
+    )
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -452,6 +462,13 @@ class DeepseekV4HipRadixBackend(
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self.aiter_fp4_max_position = int(
+            getattr(
+                model_runner.model_config.hf_text_config,
+                "max_position_embeddings",
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
+            )
+        )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
@@ -860,6 +877,39 @@ class DeepseekV4HipRadixBackend(
                     torch.int32
                 )
             )
+
+        if (
+            self.enable_deepseek_v4_fp4_indexer
+            and isinstance(metadata, DSV4Metadata)
+            and metadata.c4_compress_metadata is not None
+        ):
+            from sglang.kernels.ops.attention.dsv4.aiter_fp4_indexer import (
+                prepare_aiter_fp4_paged_mqa_decode_metadata,
+                prepare_aiter_k_indexer_fp4_cache_write_metadata,
+            )
+
+            c4_out_loc = metadata.core_attn_metadata.c4_out_loc
+            assert c4_out_loc is not None
+            metadata.aiter_fp4_q_positions = metadata.core_attn_metadata.positions.to(
+                torch.int64
+            ).contiguous()
+            metadata.aiter_fp4_k_write_metadata = (
+                prepare_aiter_k_indexer_fp4_cache_write_metadata(
+                    plan=metadata.c4_compress_metadata,
+                    out_loc=c4_out_loc,
+                    max_position=self.aiter_fp4_max_position,
+                    device=self.device,
+                )
+            )
+            if forward_batch.forward_mode.is_decode():
+                indexer_metadata = metadata.indexer_metadata
+                assert indexer_metadata is not None
+                metadata.aiter_fp4_logits_decode_metadata = (
+                    prepare_aiter_fp4_paged_mqa_decode_metadata(
+                        page_table=indexer_metadata.page_table,
+                        c4_seq_lens=indexer_metadata.c4_seq_lens,
+                    )
+                )
 
     def init_forward_metadata_out_graph(
         self,

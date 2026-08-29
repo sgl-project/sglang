@@ -55,6 +55,8 @@ def topk_transform_512(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    if not scores.is_contiguous():
+        scores = scores.contiguous()
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
