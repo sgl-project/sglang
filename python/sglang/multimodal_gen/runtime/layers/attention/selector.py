@@ -130,6 +130,13 @@ def _record_component_attn_backend(backend_name: str, reason: str | None) -> boo
     return True
 
 
+def record_component_attn_backend(
+    backend: AttentionBackendEnum, reason: str | None = None
+) -> bool:
+    """Record a component backend selected outside layer construction."""
+    return _record_component_attn_backend(backend.name.lower(), reason)
+
+
 def _log_component_attn_backend_summary(
     context: ComponentAttnBackendContext | None,
 ) -> None:
