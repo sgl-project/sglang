@@ -597,9 +597,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self._cache_dit_requested() and not self._cache_dit_enabled:
             logger.debug("Deferring torch.compile until cache-dit is enabled")
             return
-        if (
-            batch is None
-            and getattr(self.server_args, "compile_trajectory_gate_manifest", None)
+        if batch is None and getattr(
+            self.server_args, "compile_trajectory_gate_manifest", None
         ):
             # A gate manifest is configured but there's no request yet to build
             # a workload signature from (e.g. this is the eager, construction-time
