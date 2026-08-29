@@ -228,7 +228,9 @@ class TestEncoderDelivery(CustomTestCase):
         encoder = MMEncoder.__new__(MMEncoder)
         encoder.rank = 0
         events = []
-        encoder._stage_embedding = lambda mm_data: events.append("ready")
+        state = ReqState("req", active_encodes=1)
+        state.embedding_ready = SimpleNamespace(set=lambda: events.append("ready"))
+        encoder.req_states = {"req": state}
         ctx = SimpleNamespace(
             req_id="req",
             modality=Modality.IMAGE,
