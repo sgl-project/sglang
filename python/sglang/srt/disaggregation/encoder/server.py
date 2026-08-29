@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import ctypes
+import hashlib
 import logging
 import os
 import pickle
@@ -247,6 +248,36 @@ class EncodeContext(msgspec.Struct):
     str_mm_hashes: Optional[List[str]]
     use_global_cache: bool
     is_health_check: bool
+
+
+def _preprocess_layout_digest(ctx: EncodeContext) -> tuple[int, int]:
+    """Hash metadata that must agree before TP ranks enter model forward."""
+
+    def normalize(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        if isinstance(value, np.ndarray):
+            return (
+                str(value.dtype),
+                tuple(value.shape),
+                tuple(value.reshape(-1).tolist()),
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(normalize(item) for item in value)
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    signature = (
+        tuple(ctx.items_per_req),
+        tuple(ctx.preprocess_result.token_counts),
+        normalize(ctx.preprocess_result.grid_thw),
+    )
+    digest = hashlib.blake2b(pickle.dumps(signature), digest_size=16).digest()
+    return (
+        int.from_bytes(digest[:8], byteorder="little", signed=True),
+        int.from_bytes(digest[8:], byteorder="little", signed=True),
+    )
 
 
 @dataclass
@@ -953,10 +984,14 @@ class MMEncoder:
             preprocess_result, items_per_req = (
                 await self.preprocessor.process_batch_mm_items(requests, modality)
             )
+        except MMError:
+            raise
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
+        except Exception as e:
+            raise InternalError(f"Failed to process mm items: {str(e)}")
 
         if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
             raise InternalError(
@@ -1032,6 +1067,124 @@ class MMEncoder:
             is_health_check=is_health_check,
         )
 
+    async def _prepare_encode_context_on_all_ranks(
+        self,
+        requests: List[dict],
+        modality: Modality,
+        *,
+        use_global_cache: bool,
+        is_health_check: bool = False,
+    ) -> EncodeContext:
+        """Make preprocessing failures and shared metadata consistent across TP."""
+        ctx = None
+        local_error = None
+        try:
+            ctx = await self._prepare_encode_context(
+                requests,
+                modality,
+                use_global_cache=use_global_cache,
+                is_health_check=is_health_check,
+            )
+        except Exception as e:
+            local_error = e
+
+        if local_error is None:
+            assert ctx is not None
+            layout_digest = _preprocess_layout_digest(ctx)
+        else:
+            layout_digest = (0, 0)
+        statuses = self._sync_tp_phase_status(
+            "Encoder preprocessing",
+            local_error,
+            metadata=layout_digest,
+        )
+
+        expected_layout = tuple(statuses[0][1:].tolist())
+        mismatch_rank = next(
+            (
+                rank
+                for rank, rank_status in enumerate(statuses[1:], start=1)
+                if tuple(rank_status[1:].tolist()) != expected_layout
+            ),
+            None,
+        )
+        if mismatch_rank is not None:
+            raise InternalError(
+                "Encoder preprocessing produced inconsistent layouts across TP "
+                f"ranks 0 and {mismatch_rank}"
+            )
+
+        assert ctx is not None
+        return ctx
+
+    def _sync_tp_phase_status(
+        self,
+        phase: str,
+        local_error: Optional[Exception],
+        *,
+        metadata: tuple[int, ...] = (),
+    ) -> List[torch.Tensor]:
+        """Raise the same error on every TP rank before the next collective."""
+        tp_group = get_tp_group()
+        error_code = (
+            int(
+                local_error.code
+                if isinstance(local_error, MMError)
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+            if local_error is not None
+            else 0
+        )
+        local_status = torch.tensor([error_code, *metadata], dtype=torch.int64)
+        statuses = [torch.empty_like(local_status) for _ in range(tp_group.world_size)]
+        if tp_group.world_size > 1:
+            torch.distributed.all_gather(
+                statuses,
+                local_status,
+                group=tp_group.cpu_group,
+            )
+        else:
+            statuses[0].copy_(local_status)
+
+        failures = [
+            (rank, int(rank_status[0].item()))
+            for rank, rank_status in enumerate(statuses)
+            if rank_status[0].item() != 0
+        ]
+        if not failures:
+            return statuses
+
+        errors = (
+            tp_group.all_gather_object(
+                str(local_error) if local_error is not None else None
+            )
+            if tp_group.world_size > 1
+            else [str(local_error)]
+        )
+        rank, failure_code = next(
+            (
+                (rank, rank_error_code)
+                for rank, rank_error_code in failures
+                if rank_error_code != HTTPStatus.BAD_REQUEST
+            ),
+            failures[0],
+        )
+        message = f"{phase} failed on TP rank {rank}: {errors[rank]}"
+        if failure_code == HTTPStatus.BAD_REQUEST:
+            raise BadRequestError(message)
+        raise InternalError(message)
+
+    async def _publish_preprocess_metadata_on_all_ranks(
+        self, ctx: EncodeContext, requests: List[dict]
+    ) -> None:
+        """Prevent a rank-0 metadata error from stranding TP peers in forward."""
+        local_error = None
+        try:
+            await self._publish_preprocess_metadata(ctx, requests)
+        except Exception as e:
+            local_error = e
+        self._sync_tp_phase_status("Encoder metadata publication", local_error)
+
     def _broadcast_global_cache_mask(self, mask_tensor: torch.Tensor):
         if get_parallel().tp_size > 1:
             torch.distributed.broadcast(
@@ -1045,7 +1198,19 @@ class MMEncoder:
         ctx: EncodeContext,
     ) -> Tuple[List[int], List[int]]:
         if self.rank == 0:
-            exist_mask = await self.mm_global_cache.batch_is_exist(ctx.str_mm_hashes)
+            try:
+                exist_mask = await self.mm_global_cache.batch_is_exist(
+                    ctx.str_mm_hashes
+                )
+            except Exception:
+                # global cache is optional; all ranks must take the same miss
+                # path when its control plane is unavailable
+                logger.exception(
+                    "Global multimodal cache lookup failed for req %s; "
+                    "falling back to ViT",
+                    ctx.req_id,
+                )
+                exist_mask = [False] * ctx.num_items
             mask_tensor = torch.tensor(
                 [1 if e else 0 for e in exist_mask], dtype=torch.int32
             )
@@ -1121,15 +1286,20 @@ class MMEncoder:
             return
 
         async def _background_insert():
-            await asyncio.to_thread(
-                self.mm_global_cache.wait_store_to_pool,
-                d2h_handles,
-            )
-            await asyncio.to_thread(
-                self.mm_global_cache.insert_batch,
-                hashes,
-                ctx.modality,
-            )
+            try:
+                await asyncio.to_thread(
+                    self.mm_global_cache.wait_store_to_pool,
+                    d2h_handles,
+                )
+                await asyncio.to_thread(
+                    self.mm_global_cache.insert_batch,
+                    hashes,
+                    ctx.modality,
+                )
+            except Exception:
+                logger.exception(
+                    "Global multimodal cache insert failed for req %s", ctx.req_id
+                )
 
         task = asyncio.create_task(_background_insert())
         self.background_tasks.add(task)
@@ -1794,13 +1964,13 @@ class MMEncoder:
         keep_on_gpu = self.use_mooncake and not is_health_check
         use_global_cache = self.mm_global_cache is not None and not is_health_check
         try:
-            ctx = await self._prepare_encode_context(
+            ctx = await self._prepare_encode_context_on_all_ranks(
                 requests,
                 modality,
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
             )
-            await self._publish_preprocess_metadata(ctx, requests)
+            await self._publish_preprocess_metadata_on_all_ranks(ctx, requests)
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
             if self.profiler is not None:

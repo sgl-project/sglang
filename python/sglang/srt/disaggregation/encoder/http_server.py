@@ -32,6 +32,7 @@ from sglang.srt.disaggregation.encoder.runtime import (
     execute_encode_pipeline,
     launch_dp_runtime,
     launch_local_runtime,
+    validate_encode_request,
 )
 from sglang.srt.disaggregation.encoder.server import (
     EncoderProfiler,
@@ -262,6 +263,15 @@ def _summarise_dp_broadcast(results: List[dict]) -> Response:
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
+    if err := validate_encode_request(request):
+        return ORJSONResponse(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content={
+                "status": "error",
+                "message": err,
+                "req_id": request.get("req_id"),
+            },
+        )
     req_id = request["req_id"]
     start_time = time.monotonic()
     time_stats_json = request.pop("time_stats_json", None)

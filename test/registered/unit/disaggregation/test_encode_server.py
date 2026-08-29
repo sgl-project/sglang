@@ -1,6 +1,7 @@
 import asyncio
 import pickle
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -11,6 +12,8 @@ from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
 from sglang.srt.disaggregation.encoder.server import (
+    BadRequestError,
+    EncodeContext,
     EncoderDelivery,
     InternalError,
     MMEncoder,
@@ -211,6 +214,374 @@ class TestEncoderDelivery(CustomTestCase):
             )
             await encoder._release_encode_ref(first_state)
             await encoder._release_encode_ref(second_state)
+
+        asyncio.run(run())
+
+    @staticmethod
+    def _encode_context():
+        return EncodeContext(
+            req_id="req",
+            modality=Modality.IMAGE,
+            preprocess_result=SimpleNamespace(
+                token_counts=[2],
+                grid_thw=torch.tensor([[1, 2, 4]]),
+            ),
+            get_feature_fn=None,
+            mm_feature=torch.zeros((8, 3)),
+            num_items=1,
+            items_per_req=[1],
+            aux_data={},
+            str_mm_hashes=None,
+            use_global_cache=False,
+            is_health_check=False,
+        )
+
+    def test_remote_preprocess_failure_stops_all_tp_ranks_before_forward(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder._prepare_encode_context = AsyncMock(
+                return_value=self._encode_context()
+            )
+
+            class TPGroup:
+                world_size = 2
+                cpu_group = object()
+
+                @staticmethod
+                def all_gather_object(local_error):
+                    return [local_error, "bad image"]
+
+            def all_gather(statuses, local_status, group):
+                self.assertIs(group, TPGroup.cpu_group)
+                statuses[0].copy_(local_status)
+                statuses[1].copy_(torch.tensor([400, 0, 0]))
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                    return_value=TPGroup(),
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
+                    side_effect=all_gather,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    BadRequestError,
+                    "failed on TP rank 1: bad image",
+                ):
+                    await encoder._prepare_encode_context_on_all_ranks(
+                        [{"req_id": "req"}],
+                        Modality.IMAGE,
+                        use_global_cache=False,
+                    )
+
+        asyncio.run(run())
+
+    def test_tp_preprocess_layout_mismatch_fails_before_forward(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder._prepare_encode_context = AsyncMock(
+                return_value=self._encode_context()
+            )
+
+            class TPGroup:
+                world_size = 2
+                cpu_group = object()
+
+            def all_gather(statuses, local_status, group):
+                self.assertIs(group, TPGroup.cpu_group)
+                statuses[0].copy_(local_status)
+                statuses[1].copy_(local_status)
+                statuses[1][1] += 1
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                    return_value=TPGroup(),
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
+                    side_effect=all_gather,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    InternalError,
+                    "inconsistent layouts across TP ranks 0 and 1",
+                ):
+                    await encoder._prepare_encode_context_on_all_ranks(
+                        [{"req_id": "req"}],
+                        Modality.IMAGE,
+                        use_global_cache=False,
+                    )
+
+        asyncio.run(run())
+
+    def test_remote_metadata_failure_stops_tp_peer_before_forward(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder._publish_preprocess_metadata = AsyncMock()
+
+            class TPGroup:
+                world_size = 2
+                cpu_group = object()
+
+                @staticmethod
+                def all_gather_object(local_error):
+                    self.assertIsNone(local_error)
+                    return ["registry down", None]
+
+            def all_gather(statuses, local_status, group):
+                self.assertIs(group, TPGroup.cpu_group)
+                statuses[0].copy_(torch.tensor([500]))
+                statuses[1].copy_(local_status)
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_tp_group",
+                    return_value=TPGroup(),
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
+                    side_effect=all_gather,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    InternalError,
+                    "metadata publication failed on TP rank 0: registry down",
+                ):
+                    await encoder._publish_preprocess_metadata_on_all_ranks(
+                        self._encode_context(),
+                        [{"req_id": "req"}],
+                    )
+
+        asyncio.run(run())
+
+    def test_unexpected_preprocess_failure_is_internal(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.preprocessor = SimpleNamespace(
+                process_batch_mm_items=AsyncMock(side_effect=RuntimeError("boom"))
+            )
+            with self.assertRaisesRegex(InternalError, "boom"):
+                await encoder._prepare_encode_context(
+                    [{"req_id": "req"}],
+                    Modality.IMAGE,
+                    use_global_cache=False,
+                )
+
+        asyncio.run(run())
+
+    def test_global_cache_lookup_failure_falls_back_to_all_misses(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.mm_global_cache = SimpleNamespace(
+                batch_is_exist=AsyncMock(side_effect=RuntimeError("store down"))
+            )
+            broadcast = unittest.mock.Mock()
+            encoder._broadcast_global_cache_mask = broadcast
+            ctx = SimpleNamespace(
+                req_id="req",
+                num_items=2,
+                str_mm_hashes=["hash-0", "hash-1"],
+            )
+
+            missing_indices, hit_indices = await encoder._lookup_global_cache(ctx)
+
+            self.assertEqual(missing_indices, [0, 1])
+            self.assertEqual(hit_indices, [])
+            torch.testing.assert_close(
+                broadcast.call_args.args[0], torch.zeros(2, dtype=torch.int32)
+            )
+
+        asyncio.run(run())
+
+    def test_global_cache_insert_failure_is_contained(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.background_tasks = set()
+            encoder.mm_global_cache = SimpleNamespace(
+                wait_store_to_pool=unittest.mock.Mock(
+                    side_effect=RuntimeError("store down")
+                ),
+                insert_batch=unittest.mock.Mock(),
+            )
+            ctx = SimpleNamespace(req_id="req", modality=Modality.IMAGE)
+
+            encoder._launch_global_cache_insert(ctx, ["hash"], [object()])
+            await asyncio.gather(*encoder.background_tasks)
+
+            encoder.mm_global_cache.insert_batch.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_grpc_rejects_invalid_request_before_tp_dispatch(self):
+        async def run():
+            import grpc
+            from smg_grpc_proto import sglang_encoder_pb2
+
+            from sglang.srt.disaggregation.encoder.grpc_server import (
+                SGLangEncoderServer,
+            )
+
+            context = SimpleNamespace(
+                set_code=unittest.mock.Mock(),
+                set_details=unittest.mock.Mock(),
+            )
+            server = SGLangEncoderServer(
+                encoder=SimpleNamespace(),
+                send_sockets=[object()],
+                server_args=SimpleNamespace(),
+            )
+            request = sglang_encoder_pb2.EncodeRequest(
+                mm_items=["image"],
+                req_id="invalid",
+                part_idx=0,
+            )
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.grpc_server.async_sock_send",
+                new_callable=AsyncMock,
+            ) as send:
+                await server.Encode(request, context)
+
+            send.assert_not_awaited()
+            context.set_code.assert_called_once_with(grpc.StatusCode.INVALID_ARGUMENT)
+            self.assertIn("num_parts", context.set_details.call_args.args[0])
+
+        asyncio.run(run())
+
+    def test_grpc_maps_processor_bad_request_to_invalid_argument(self):
+        async def run():
+            import grpc
+            from smg_grpc_proto import sglang_encoder_pb2
+
+            from sglang.srt.disaggregation.encoder.grpc_server import (
+                SGLangEncoderServer,
+            )
+
+            encoder = SimpleNamespace(
+                encode_dispatch_lock=asyncio.Lock(),
+                encode_request=AsyncMock(
+                    return_value=(
+                        0,
+                        0,
+                        0,
+                        "invalid image",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                ),
+                release_request=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                set_code=unittest.mock.Mock(),
+                set_details=unittest.mock.Mock(),
+            )
+            server = SGLangEncoderServer(
+                encoder=encoder,
+                send_sockets=[],
+                server_args=SimpleNamespace(),
+            )
+            request = sglang_encoder_pb2.EncodeRequest(
+                mm_items=["bad-image"],
+                req_id="bad-image",
+                num_parts=1,
+                part_idx=0,
+            )
+
+            await server.Encode(request, context)
+
+            context.set_code.assert_called_once_with(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details.assert_called_once_with("invalid image")
+            encoder.release_request.assert_awaited_once_with("bad-image")
+
+        asyncio.run(run())
+
+    def test_grpc_serializes_tp_dispatch_with_rank_zero_encode(self):
+        async def run():
+            from smg_grpc_proto import sglang_encoder_pb2
+
+            from sglang.srt.disaggregation.encoder.grpc_server import (
+                SGLangEncoderServer,
+            )
+            from sglang.srt.managers.io_struct import unwrap_from_pickle
+
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            events = []
+
+            class Encoder:
+                def __init__(self):
+                    self.encode_dispatch_lock = asyncio.Lock()
+
+                async def encode_request(self, request, _modality):
+                    req_id = request["req_id"]
+                    events.append(("encode-start", req_id))
+                    if req_id == "first":
+                        first_started.set()
+                        await release_first.wait()
+                    events.append(("encode-end", req_id))
+                    return 8, 1, 8, None, None
+
+            async def send(_socket, payload):
+                request = unwrap_from_pickle(payload)
+                events.append(("send", request["req_id"]))
+
+            server = SGLangEncoderServer(
+                encoder=Encoder(),
+                send_sockets=[object()],
+                server_args=SimpleNamespace(),
+            )
+            requests = [
+                sglang_encoder_pb2.EncodeRequest(
+                    mm_items=["image"],
+                    req_id=req_id,
+                    num_parts=1,
+                    part_idx=0,
+                )
+                for req_id in ("first", "second")
+            ]
+            contexts = [
+                SimpleNamespace(
+                    set_code=unittest.mock.Mock(),
+                    set_details=unittest.mock.Mock(),
+                )
+                for _ in requests
+            ]
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.grpc_server.async_sock_send",
+                    side_effect=send,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.grpc_server.get_disagg",
+                    return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+                ),
+            ):
+                first = asyncio.create_task(server.Encode(requests[0], contexts[0]))
+                await first_started.wait()
+                second = asyncio.create_task(server.Encode(requests[1], contexts[1]))
+                await asyncio.sleep(0)
+                self.assertEqual(
+                    events,
+                    [("send", "first"), ("encode-start", "first")],
+                )
+                release_first.set()
+                await asyncio.gather(first, second)
+
+            self.assertEqual(
+                events,
+                [
+                    ("send", "first"),
+                    ("encode-start", "first"),
+                    ("encode-end", "first"),
+                    ("send", "second"),
+                    ("encode-start", "second"),
+                    ("encode-end", "second"),
+                ],
+            )
 
         asyncio.run(run())
 

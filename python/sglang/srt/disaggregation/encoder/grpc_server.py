@@ -12,6 +12,7 @@ import logging
 import multiprocessing as mp
 import traceback
 from concurrent import futures
+from http import HTTPStatus
 from typing import List
 
 import grpc
@@ -21,6 +22,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
+from sglang.srt.disaggregation.encoder.runtime import validate_encode_request
 from sglang.srt.disaggregation.encoder.server import MMEncoder, launch_encoder
 from sglang.srt.managers.io_struct import async_sock_send, wrap_as_pickle
 from sglang.srt.managers.schedule_batch import Modality
@@ -98,21 +100,31 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "num_parts": request.num_parts,
                 "part_idx": request.part_idx,
             }
-            for socket in self.send_sockets:
-                await async_sock_send(socket, wrap_as_pickle(request_dict))
+            if err := validate_encode_request(request_dict):
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(err)
+                return sglang_encoder_pb2.EncodeResponse()
 
             # gRPC encode is image-only; the request follows the configured
-            # cache and transfer backend.
-            (
-                nbytes,
-                embedding_len,
-                embedding_dim,
-                error_msg,
-                error_code,
-            ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
+            # cache and transfer backend. Keep TP dispatch and rank-0 collective
+            # launch order identical when gRPC handlers run concurrently.
+            async with self.encoder.encode_dispatch_lock:
+                for socket in self.send_sockets:
+                    await async_sock_send(socket, wrap_as_pickle(request_dict))
+                (
+                    nbytes,
+                    embedding_len,
+                    embedding_dim,
+                    error_msg,
+                    error_code,
+                ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
             if error_msg is not None:
                 await self.encoder.release_request(request.req_id)
-                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_code(
+                    grpc.StatusCode.INVALID_ARGUMENT
+                    if error_code == HTTPStatus.BAD_REQUEST
+                    else grpc.StatusCode.INTERNAL
+                )
                 context.set_details(error_msg)
                 return sglang_encoder_pb2.EncodeResponse()
 
