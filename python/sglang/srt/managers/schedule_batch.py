@@ -1053,6 +1053,8 @@ class Req(ReqDllmMixin):
         self.skip_lock_node_ids: dict = {}
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+        # Whether UnifiedRadixCache deferred write-through during chunked prefill.
+        self.prefix_cache_chunked: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
