@@ -953,9 +953,7 @@ def build_kv_layer_ids(
     # Rank the draft's own ids by first appearance, so the band stays dense and
     # contiguous whatever the draft config numbers its layers.
     band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
-    return target_layer_ids + [
-        num_hidden_layers + band_index[lid] for lid in draft_ids
-    ]
+    return target_layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
