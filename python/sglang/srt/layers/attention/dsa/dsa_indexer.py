@@ -895,9 +895,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        # DeepGEMM SM100 paged MQA misaligns when batch_size exceeds num_sms:
-        # chunk per sm_count with per-chunk schedule metadata, else defer to the
-        # plain kernel. Injected into the shared helpers as the kernel fn.
+        # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
         def _chunked_fp8_paged_mqa_logits(
             q: torch.Tensor,
             kv_cache: torch.Tensor,

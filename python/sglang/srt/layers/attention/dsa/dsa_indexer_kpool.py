@@ -136,7 +136,8 @@ class IndexerKPool(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wk", prefix),
         )
-        # NOTE: weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenience
+        # Keep weights_proj in FP32 because its accumulation/scale path requires FP32;
+        # checkpoint BF16 weights are cast on load.
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
@@ -881,10 +882,9 @@ class IndexerKPool(MultiPlatformOp):
 
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
-        # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
+        # DeepGEMM paged-MQA requires 64-token pages.
         assert page_size == 64, "only support page size 64"
 
-        # NOTE(dark): this support extend/decode/decode+graph
         block_tables = metadata.get_page_table_64()
 
         kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
@@ -988,19 +988,13 @@ class IndexerKPool(MultiPlatformOp):
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
     ) -> Tuple[bool, int]:
-        """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
-        Return: (need_chunk, free_mem)
-        """
-        # Quick static check for normal batches
-        if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
+        if num_q * num_k < 8_000_000:
             return False, 0
 
         free_mem, total_mem = torch.cuda.mem_get_info(device)
-        bytes_per_elem = 4  # float32
+        bytes_per_elem = 4
         logits_bytes = num_q * num_k * bytes_per_elem
 
-        # Logits should not exceed 50% of free memory or 30% of total memory
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
 
@@ -1664,7 +1658,6 @@ class IndexerKPool(MultiPlatformOp):
                 return_indices=return_indices,
             )
 
-        # CUDA graph capture keeps the full topk path; the skip branch is extend-only.
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:

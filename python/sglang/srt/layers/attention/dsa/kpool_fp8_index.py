@@ -46,7 +46,6 @@ def _kpool_cache_k_offsets(
 
 
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
-    """Return the most pools an N-token write can close at any start offset."""
     return (num_draft_tokens + pool_size - 1) // pool_size
 
 
@@ -54,14 +53,8 @@ def build_pooled_page_table_64(
     page_table_64: torch.Tensor,
     pool_size: int,
 ) -> torch.Tensor:
-    """Pack one logical pool page into the first token page of each page group.
-
-    Uses advanced indexing (gather) rather than strided slicing so the result
-    is always a freshly allocated row-major tensor. Strided slicing produces
-    a view whose .contiguous() short-circuits for shape==(1, 1), leaving
-    stride(-1) == pool_size and breaking downstream kernels that require
-    stride(-1) == 1 (e.g. deep_gemm.fp8_paged_mqa_logits).
-    """
+    # Advanced indexing is required: a (1, 1) strided slice can remain non-unit-
+    # stride even after contiguous(), which DeepGEMM rejects.
     assert (
         BLOCK_SIZE_K % pool_size == 0
     ), f"pool_size ({pool_size}) must divide page_size ({BLOCK_SIZE_K})"
@@ -163,12 +156,8 @@ def kpool_build_ragged_layout(
     total_q: int,
     pool_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build one flat pooled-page table plus per-q row starts/ends.
-
-    DSA stores 64 pooled entries per physical page. A pooled page therefore
-    corresponds to every ``pool_size``-th 64-token page in the original real
-    page table.
-    """
+    # One packed-cache page represents 64 pools, so its source is every
+    # pool_size-th real token page.
     device = full_page_table.device
     n_rag = cu_pages_excl.shape[0]
     concat_page_table = torch.empty(
@@ -265,10 +254,8 @@ def _prep_update_kpool_write_plan_launch(
     num_draft_tokens: int,
     slots_per_page: int,
 ):
-    """Validate and build the (bs, args, constexpr kwargs) launch spec for the
-    write-plan kernel. Shared between the per-call wrapper below and the
-    prebound cuda-graph replay launcher. Mirrors the eager path exactly,
-    including pool_size < num_draft_tokens support (max_closed_pools)."""
+    # Eager and captured replay must share one launch spec, including
+    # N > pool_size where one write closes multiple pools.
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
     bs = write_start.shape[0]
 
@@ -385,9 +372,8 @@ def _update_kpool_write_plan_kernel(
         token_page_row = tl.minimum(
             tl.maximum(token_page_row, 0), real_page_table_cols - 1
         )
-        # Promote the row term to int64 before the pointer math (same as the
-        # fused metadata kernels): a row index times a context-scale stride
-        # wraps int32 well before the buffer does.
+        # Promote the row term before multiplication; 1M-context strides
+        # overflow int32 around row 2048.
         packed_page = tl.load(
             real_page_table_ptr
             + (b * N).to(tl.int64) * real_page_table_stride_0
@@ -405,7 +391,6 @@ def compute_pooled_write_locs(
     pool_ids: torch.Tensor,
     pool_size: int,
 ) -> torch.Tensor:
-    """Map logical pooled-K ids to packed physical index-cache locations."""
     assert page_table_64.ndim == 1
     pool_ids = pool_ids.to(torch.int64)
     pool_page_group = torch.div(pool_ids, BLOCK_SIZE_K, rounding_mode="floor")
@@ -429,7 +414,6 @@ def expand_pooled_groups_to_topk(
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Expand selected full-pool ids to a strict-width token topk tensor."""
     assert group_ids.ndim == 2
     assert group_valid.shape == group_ids.shape
     assert topk % pool_size == 0
@@ -471,7 +455,6 @@ def append_kpool_tail_to_topk(
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Append non-pooled tail tokens after selected expanded-history tokens."""
     assert topk_result.dtype == torch.int32
     assert seq_lens.ndim == 1
     assert pool_lens.ndim == 1
@@ -578,9 +561,8 @@ def _append_kpool_tail_to_topk_kernel(
     tail_value = tail_raw
     if HAS_PAGE_TABLE:
         safe_tail = tl.minimum(tl.maximum(tail_raw, 0), PAGE_TABLE_COLS - 1)
-        # int64 row term: the wide page table's row stride is context-scale
-        # (~2^20 on 1M-context models), so row * stride wraps int32 from
-        # row ~2048 — same promotion as the fused metadata kernels.
+        # Promote the row term before multiplication; 1M-context strides
+        # overflow int32 around row 2048.
         tail_value = tl.load(
             page_table_ptr
             + row.to(tl.int64) * page_table_stride_0
@@ -609,7 +591,6 @@ def topk_from_pooled_history_logits(
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select full-pool groups, expand to tokens, and optionally append tail."""
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
     assert logits.shape[0] == group_lengths.shape[0]
@@ -636,9 +617,8 @@ def topk_from_pooled_history_logits(
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
-    # The JIT fused path supports the dedicated 128..512 group-topk kernels on
-    # both CUDA and HIP. Keep the legacy HIP fallback only for the separate
-    # 2048-group AOT path, which is not covered by the JIT implementation.
+    # The JIT kernel covers group_topk <= 512 on CUDA/HIP; HIP 2048 still
+    # requires the legacy AOT fallback.
     if is_hip() and group_topk == 2048:
         return _topk_from_pooled_history_logits_unfused(
             logits=logits,

@@ -100,16 +100,10 @@ def nextn_mamba_commit_prologue(
     mamba_track_interval,
     HAS_TRACK: tl.constexpr,
 ):
-    # Chain-spec (topk == 1) commit prologue. accept_index[i, j] == i*draft + j
-    # for accepted slots, so the last-accepted tree step is accept_lens - 1 and
-    # the interval-crossing candidate step equals its own in-request index —
-    # no accept_index gathers are needed. One launch replaces the ~21-op eager
-    # sequence in commit_mamba_states_after_verify.
+    # In topk=1 chains, accepted node indices equal per-request step indices, so the eager accept_index gathers are identities.
     pid = tl.program_id(axis=0)
     al = tl.load(accept_lens_ptr + pid).to(tl.int64)
-    # Outputs are int32 (matching the eager path, whose gathers preserve the
-    # int32 accept_index dtype); the values are tree-step indices bounded by
-    # draft_token_num, so the narrowing cast is always exact.
+    # Eager accept_index gathers yield int32; draft-step bounds make this narrowing exact.
     tl.store(last_correct_ptr + pid, (al - 1).to(tl.int32))
     if HAS_TRACK:
         pre = tl.load(seq_lens_ptr + pid).to(tl.int64)
@@ -128,13 +122,7 @@ def nextn_mamba_commit_prologue_func(
     mamba_track_interval: int,
     has_track: bool,
 ):
-    """Fused topk==1 replacement for the eager commit prologue.
-
-    Returns (last_correct_step_indices, mamba_steps_to_track) with the same
-    dtypes/values as the eager reference path (int32, the dtype of
-    accept_index that the eager gathers preserve; track entries are -1 where
-    no interval crossing happened).
-    """
+    """Return int32 chain-step indices equivalent to the eager accept_index gathers."""
     bs = accept_lens.shape[0]
     last_correct = torch.empty(bs, dtype=torch.int32, device=accept_lens.device)
     steps_to_track = (

@@ -591,9 +591,7 @@ def eagle_prepare_for_verify(
             verify_forward_batch
         )
     )
-    # Pure full-attention backends can preload graph metadata on the plan
-    # stream.  Recurrent backends opt in only after their metadata path has
-    # been audited not to touch state still used by the preceding draft.
+    # Recurrent backends may defer graph metadata loading because it can mutate state still consumed by the draft.
     defer_graph_load = overlap_plan_stream and not getattr(
         target_worker.model_runner.attn_backend,
         "supports_overlap_plan_stream_graph_load",

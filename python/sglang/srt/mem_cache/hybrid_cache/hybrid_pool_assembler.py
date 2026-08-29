@@ -714,7 +714,6 @@ def build_hybrid_mamba_stack(
     mamba_allocator = params.req_to_token_pool.mamba_allocator
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    # Hybrid drafts wrap attention KV in HybridLinearKVPool; DSA drafts are bare pools.
     mtp_draft_device_pools = tuple(
         pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
         for pool in params.mtp_draft_device_pools

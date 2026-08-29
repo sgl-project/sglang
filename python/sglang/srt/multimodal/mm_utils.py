@@ -831,11 +831,7 @@ def run_dp_presharded_mrope_vision_model(
     global_grid_thw_list: list,
     gpu_sample_counts: list,
 ) -> torch.Tensor:
-    """Run a vision tower when video decode already sharded temporal units.
-
-    Rank-local inputs are contiguous pieces of the global video, so stripping
-    all-gather padding and concatenating rank order restores global order.
-    """
+    """Rank-local shards are contiguous, so rank-order concatenation restores global video order."""
     parallel = get_parallel()
     tp_size = parallel.attn_tp_size
     patches_per_unit = [math.prod(grid) for grid in global_grid_thw_list]

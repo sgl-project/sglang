@@ -192,7 +192,6 @@ class VideoDecoderWrapper:
         return None
 
     def close(self):
-        """Release decoder state, retained source bytes, and temporary files."""
         self._decoder = None
         self._source = None
         self._source_bytes = None

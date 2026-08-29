@@ -94,7 +94,6 @@ def set_mla_kv_buffer_kernel_norope(
     BLOCK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
-    """Variant of ``set_mla_kv_buffer_kernel`` for qk_rope_head_dim==0."""
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
 
@@ -148,11 +147,6 @@ def set_mla_kv_buffer_triton(
       BLOCK=128 dispatch) and the row-spanning block makes the boundary branch
       a one-shot per CTA. This is also the path for SM<90 and for shapes that
       violate the TMA 16-byte alignment.
-
-    A third path is taken when ``cache_k_rope`` is None or empty
-    (qk_rope_head_dim==0): the dedicated ``set_mla_kv_buffer_kernel_norope``
-    Triton kernel bypasses the rope branch entirely. The JIT TMA path assumes
-    both nope and rope are present, so it is skipped here.
 
     Speedup vs the legacy BLOCK=128 Triton kernel on GB300 (BF16, nope=512,
     rope=64): ~1.05x at bs=8, ~1.5x at bs=128, 3.5x at bs=512, **11.7x at
@@ -461,7 +455,6 @@ def get_mla_kv_buffer_kernel_norope(
     nope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
 ):
-    """Variant of ``get_mla_kv_buffer_kernel`` for qk_rope_head_dim==0."""
     pid_loc = tl.program_id(0)
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     loc_src_ptr = kv_buffer_ptr + loc * buffer_stride

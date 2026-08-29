@@ -1594,8 +1594,6 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
-            # Route DSATokenToKVPool in as the hybrid pool's full_kv_pool
-            # instead of a dense MLA pool.
             if is_deepseek_dsa(self.model_config.hf_config):
                 from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
 

@@ -1609,9 +1609,8 @@ class FlashAttentionBackend(AttentionBackend):
                 and self.fa_impl_ver == 4
                 and not any(forward_batch.extend_prefix_lens_cpu or [])
             ):
-                # FA4 has no absorbed MLA KV-cache kernel. In the MHA fallback,
-                # gather the rank-local projected K/V into global token order,
-                # then run each zigzag Q half against its causal K/V prefix.
+                # FA4 lacks absorbed MLA under CP, so projected K/V must be gathered
+                # globally before each zigzag Q half runs.
                 k_full = cp_all_gather_rerange_kv_cache(
                     k.contiguous(),
                     self.attn_cp_size,

@@ -272,9 +272,8 @@ class AttnTpContext:
         self.is_dsa = False
 
     def init_context(self, q_lora_rank, is_dsa, is_mhc=False):
-        # DSA + input_scattered requires hidden_states to be attn_tp-gathered
-        # before the attention call. Currently only MHC's prepare_attn does this
-        # pre-gather; hence is_mhc gates DSA's eligibility for input_scattered.
+        # Only MHC pre-gathers hidden states before DSA attention, so non-MHC DSA
+        # cannot use scattered inputs.
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_parallel().config.enable_attn_tp_input_scattered
@@ -463,9 +462,8 @@ def tp_reduce_scatter(
     residual: Optional[torch.Tensor],
     context: "CommunicateContext",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Reduce-scatter ``hidden_states`` over the full TP group and slice
-    ``residual`` to this rank. Module-level so variant communicators (e.g. MHC)
-    can reuse it without holding a ``LayerCommunicator`` instance."""
+    """Module-level so MHC communicators can reuse it without a
+    ``LayerCommunicator`` instance."""
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
     assert (

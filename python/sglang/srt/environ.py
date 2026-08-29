@@ -1387,11 +1387,7 @@ class Envs:
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )
-    # Ported optimization gates (all default-off).
-    # KPOOL_METADATA_FUSION covers the fused kpool metadata refresh for all
-    # three replay phases (verify / decode / draft-extend), including the
-    # multi-step draft metadata dedup (later step backends D2D-copy the
-    # derived metadata from step 0 instead of recomputing it).
+    # Later draft steps reuse step-0 metadata instead of recomputing it.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(False)
     # Capture the verify metadata refresh inside the CUDA graph; the
     # DG_OUT_OF_GRAPH sub-mode keeps DeepGEMM scheduling out of the graph.

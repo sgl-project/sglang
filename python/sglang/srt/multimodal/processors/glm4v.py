@@ -63,7 +63,6 @@ def _glm_item_config(item):
 
 
 def split_glm_video_items(mm_data):
-    """Extract per-video controls and return sources suitable for decoding."""
     if mm_data is None:
         return None, []
     items = mm_data if isinstance(mm_data, (list, tuple)) else [mm_data]
@@ -80,7 +79,6 @@ def split_glm_video_items(mm_data):
 
 
 def glm_budget_kwargs(processor, user_max_image_tokens=None, count=1, split=False):
-    """Resolve an optional per-item visual-token budget for a HF processor."""
     if processor is None:
         return None
     default_max = getattr(processor, "max_image_tokens", None)
@@ -102,7 +100,6 @@ def glm_budget_kwargs(processor, user_max_image_tokens=None, count=1, split=Fals
 
 
 def glm_max_image_tokens_from_configs(configs):
-    """Return the tightest max_image_tokens override across media items."""
     values = [
         int(config["max_image_tokens"])
         for config in configs or []
@@ -112,7 +109,6 @@ def glm_max_image_tokens_from_configs(configs):
 
 
 def glm_processor_video_config(processor):
-    """Read GLM video defaults exposed by the model's HF processor."""
     if processor is None:
         return {}
     config = {
@@ -127,12 +123,7 @@ def glm_processor_video_config(processor):
 
 
 def _glm_processor_resize_budget(processor):
-    """Resize geometry inputs mirroring the HF GLM video processor.
-
-    The budget comes from the processor's token limits, not `size`: on
-    Glm5NextVideoProcessor `size.longest_edge` is a sentinel (1) and the real
-    bound is `max_image_tokens * temporal_patch_size * (patch*merge)^2`.
-    """
+    """Use token limits because Glm5NextVideoProcessor.size.longest_edge is only a sentinel."""
     max_image_tokens = getattr(processor, "max_image_tokens", None)
     if not max_image_tokens:
         return None
@@ -153,7 +144,6 @@ def _glm_processor_resize_budget(processor):
 
 
 def _glm_effective_presize_budget(video_config, effective_max_image_tokens):
-    """Overlay the call-effective token budget onto a video's presize budget."""
     budget = video_config.get("_presize_budget") if video_config else None
     if not budget or effective_max_image_tokens is None:
         return video_config
@@ -166,7 +156,6 @@ def _glm_effective_presize_budget(video_config, effective_max_image_tokens):
 
 
 def _merge_glm_video_configs(default_config, item_configs):
-    """Merge server defaults with per-request overrides."""
     defaults = dict(default_config or {})
     return [{**defaults, **dict(config or {})} for config in item_configs]
 
@@ -179,12 +168,7 @@ def glm_sample_frame_indices(
     target_fps=None,
     max_frame_count=None,
 ):
-    """Sample GLM video frames deterministically and keep temporal pairs.
-
-    The algorithm mirrors the GLM/HF processor rather than treating target
-    timestamps as independent nearest-neighbour lookups.  That keeps the
-    no-override EPD path byte-for-byte aligned with ordinary preprocessing.
-    """
+    """Mirror HF's sequential sampler so EPD stays byte-identical, then preserve temporal pairs."""
     if total_frames <= 0:
         return []
     target_fps = GLM_VIDEO_DEFAULT_FPS if target_fps is None else float(target_fps)
@@ -238,7 +222,6 @@ def glm_sample_frame_indices(
 
 
 def _resize_frames_to_max_tokens(frames, max_tokens_per_frame):
-    """Downscale NHWC frames to the GLM per-frame post-merge token budget."""
     import torchvision.transforms.functional as TF
 
     if not isinstance(frames, torch.Tensor):
@@ -268,7 +251,6 @@ def _resize_frames_to_max_tokens(frames, max_tokens_per_frame):
 
 
 def preprocess_video_frames_sync(frame_list: List[dict]):
-    """Convert a client-provided GLM frame list to processor input."""
     total_num_frames = len(frame_list)
     if total_num_frames == 0:
         raise ValueError("GLM video frame list must not be empty")
@@ -341,14 +323,7 @@ def _pre_resize_frames_for_processor(
     max_pixels,
     resize_mode,
 ):
-    """Reproduce the HF GLM video processor's resize+pad output ahead of time.
-
-    The HF Glm5Next video processor converts the full stacked tensor to
-    float32 at native resolution before resizing; handing it an exact copy of
-    its own output makes its resize a no-op, keeping the final grid identical
-    while bounding the allocation. The resize runs in chunks because
-    torchvision materializes float32 intermediates.
-    """
+    """Pre-resize in chunks to avoid HF's native-resolution float32 intermediate while preserving its output grid."""
     import torchvision.transforms.functional as TF
 
     if not isinstance(frames, torch.Tensor):
@@ -392,12 +367,10 @@ def _pre_resize_frames_for_processor(
 
 
 def glm_decode_frames_at(vr, indices, video_config=None):
-    """Decode only an explicitly assigned frame subset for one encoder rank."""
     indices = list(indices)
     if not indices:
         return None
     video_config = video_config or {}
-    # VideoDecoderWrapper already uses parallel extraction where supported.
     if hasattr(vr, "get_frames_as_tensor"):
         frames = vr.get_frames_as_tensor(indices)
     else:
@@ -503,9 +476,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        # Normalize inline media dictionaries before loading. In particular, a
-        # bare base64 video must go through SGLang's decoder rather than being
-        # forwarded to the HF video loader as a path-like string.
+        # Bare base64 video must use SGLang's decoder because HF treats it as a path-like string.
         video_urls, video_configs = split_glm_video_items(request_obj.video_data)
         video_processor = getattr(self._processor, "video_processor", None)
         default_video_config = glm_processor_video_config(video_processor)
@@ -567,8 +538,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
 
         combine_kwargs = {}
         if video_metadata is not None:
-            # Frames were already sampled by SGLang. Preserve the original
-            # indices for timestamps and prevent a second HF sampling pass.
+            # Skip HF resampling because these frames already carry their original indices.
             combine_kwargs["video_metadata"] = video_metadata
             combine_kwargs["do_sample_frames"] = False
             processor_video_config = {

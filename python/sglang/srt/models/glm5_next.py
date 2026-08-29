@@ -378,15 +378,15 @@ class Glm5NextLinearAttention(nn.Module):
 
             self.fused_qkvbfg_a_proj = MergedColumnParallelRepeatedLinear(
                 self.hidden_size,
-                self.qkvb_sizes,  # column parallel: q, k, v, beta
-                self.fg_sizes,  # replicated: f_a, g_a
+                self.qkvb_sizes,
+                self.fg_sizes,
                 quant_config=quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
-                3 * projection_size // head_shard_size,  # qkv
-                self.num_heads // head_shard_size,  # beta
-                2 * self.head_dim,  # f_a, g_a (replicated)
+                3 * projection_size // head_shard_size,
+                self.num_heads // head_shard_size,
+                2 * self.head_dim,
             ]
             fused_dtype = (
                 getattr(config, "dtype", None)
@@ -472,9 +472,8 @@ class Glm5NextLinearAttention(nn.Module):
             tp_rank=head_shard_rank,
             tp_size=head_shard_size,
         )
-        # unsqueeze to fit conv1d weights shape into the linear weights shape.
-        # Can't do this in `weight_loader` since it already exists in
-        # `ColumnParallelLinear` and `set_weight_attrs` doesn't allow override.
+        # ColumnParallelLinear's loader cannot reshape conv1d weights, so add the
+        # singleton dimension after construction.
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
 
         self.A_log = nn.Parameter(
@@ -588,11 +587,9 @@ class Glm5NextLinearAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(
-            -1, (-1, self.head_dim)
-        )  # ... (h d) -> ... h d
+        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
+        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         output = self.o_proj(core_attn_out)[0]
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
@@ -724,10 +721,8 @@ class Glm5NextDecoderLayer(nn.Module):
             mix_hc = (2 + hc_mult) * hc_mult
             hc_dim = hc_mult * config.hidden_size
 
-            # mHC params live directly on the decoder layer so their names
-            # (hc_{attn,ffn}_{base,scale,fn}) match the ckpt verbatim and
-            # default_weight_loader hits them without any rename. The
-            # communicator reads them at runtime via MHCState(layer=self).
+            # Keep mHC params directly on the decoder layer so their names match
+            # the checkpoint verbatim.
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
             self.hc_attn_fn = nn.Parameter(
@@ -796,7 +791,6 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
     def hc_attn_pre(self, hidden_states, out_norm_weight, out_norm_eps):
-        """Attention-stage mHC pre: hidden_states ``[s, hc_mult*hidden]`` -> (layer_input [s,hidden], h_res [s,n*n], h_post [s,n], norm_fused)."""
         return self._hc_pre(
             self.hc_attn_fn,
             self.hc_attn_scale,
@@ -817,7 +811,6 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):
-        """mHC post-stage (parameter-free, scalar hc_mult only)."""
         assert self.config.mhc, "hc_post is only valid when config.mhc=True"
         return _hc_post_fn(
             x=hidden_states,
@@ -836,7 +829,6 @@ class Glm5NextDecoderLayer(nn.Module):
         out_norm_weight,
         out_norm_eps,
     ):
-        """Fuse attention mHC post with FFN mHC pre on AITER gfx95."""
         global _GLM_AITER_FUSED_MHC_LOGGED
 
         from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
@@ -899,21 +891,14 @@ class Glm5NextDecoderLayer(nn.Module):
     ):
         hidden_states_orig = hidden_states
 
-        # Attn-input prep, MHC attn_split, and (DSA-CP) scatter all happen inside
-        # the communicator; it also stores the AttentionInputs for fetch_qkv_latent.
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
         )
 
-        # MLA's CP attention consumes the scattered (round-robin/zigzag)
-        # layout while the cross-layer contract is plain (block-contiguous,
-        # see Glm5NextModel.forward). KDA handles its own CP gather/scatter
-        # inside Glm5NextLinearAttention, so only MLA layers need this wrap.
-        # NOTE: prepare_attn already stored an AttentionInputs referencing the
-        # plain hidden_states for fetch_qkv_latent(); rebind that ref to the
-        # scattered tensor so q/kv latent and positions stay token-aligned.
+        # MLA consumes scattered CP layout, so rebind cached AttentionInputs to the
+        # scattered tensor to keep Q/KV latents and positions token-aligned.
         mla_cp_wrap = not self.is_linear_attn and (
             dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
@@ -959,7 +944,6 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         )
 
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -1133,9 +1117,8 @@ class Glm5NextModel(nn.Module):
     def _prepare_aux_hidden_state(
         self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        # Under mHC the residual is folded into the widened hidden state, so the
-        # layer communicator hands back residual=None and hc_contract below does
-        # the merge. Only the plain residual-stream path has a tensor to add.
+        # mHC folds the residual into widened hidden state, so residual remains None
+        # until hc_contract merges it; only plain residual streams are added here.
         aux_hidden_state = (
             hidden_states if residual is None else hidden_states + residual
         )
@@ -1656,10 +1639,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # Fused path
             (".fused_qkvbfg_a_proj", ".q_proj", 0),
             (".fused_qkvbfg_a_proj", ".k_proj", 1),
             (".fused_qkvbfg_a_proj", ".v_proj", 2),
@@ -1668,11 +1649,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
             (".fused_fg_b_proj", ".f_b_proj", 0),
             (".fused_fg_b_proj", ".g_b_proj", 1),
-            # Unfused path: separate qkv_proj (when do_fuse_qkvbfg=False)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            # qkv conv fuse
             (".qkv_conv1d", ".q_conv1d", 0),
             (".qkv_conv1d", ".k_conv1d", 1),
             (".qkv_conv1d", ".v_conv1d", 2),

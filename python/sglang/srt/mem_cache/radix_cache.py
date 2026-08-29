@@ -183,11 +183,7 @@ class RadixKey:
         return self.match_at(other, offset=0, page_size=page_size)
 
     def match_at(self, other: RadixKey, offset: int, page_size: int = 1) -> int:
-        """Match this key against ``other`` starting at a logical offset.
-
-        This is the no-copy equivalent of ``self.match(other[offset:])`` and
-        preserves bigram boundary-token semantics and ``limit`` handling.
-        """
+        """Match without slicing while preserving bigram boundaries and limit semantics."""
         self._check_compatible(other)
         if self.is_bigram != other.is_bigram:
             raise ValueError("RadixKey operations require matching bigram modes")

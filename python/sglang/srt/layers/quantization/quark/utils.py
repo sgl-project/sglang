@@ -55,9 +55,8 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
-    # Some checkpoints serialize an already-fused module (for example a
-    # vision ``qkv`` projection) and list that fused name in ``exclude``.
-    # Honor the direct match before expanding model-level packed mappings.
+    # A serialized fused module may appear directly in ``exclude``, so match it
+    # before expanding the packed mapping.
     if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
         return True
 

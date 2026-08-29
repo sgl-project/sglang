@@ -213,16 +213,7 @@ def draft_kv_indices_used_len(
 
 
 def record_stream_each(tensors, stream):
-    """Call record_stream(stream) on each accelerator tensor in `tensors`,
-    skipping non-tensor / host entries. Tells the caching allocator that the
-    tensors are also used on `stream`, so memory is not recycled while
-    queued work is still in flight after Python refs drop.
-
-    Guarded by device type, not ``is_cuda``: the overlap plan stream runs on
-    every accelerator with a stream module (NPU/MUSA/XPU included, HIP
-    reports as cuda), and their caching allocators need the same
-    cross-stream lifetime hint.
-    """
+    """Protect accelerator tensors from allocator reuse while overlap-stream work is pending."""
     for t in tensors:
         if isinstance(t, torch.Tensor) and t.device.type in (
             "cuda",
@@ -1026,22 +1017,14 @@ def commit_mamba_states_after_verify(
         mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
         track_indices_to_pass = batch.mamba_track_indices
         if _is_cuda and not _is_hip and speculative_eagle_topk in (None, 1):
-            # Chain spec: accept_index[i, j] == i*draft + j on accepted slots,
-            # so both gathers below are identities (last step = accept_lens-1,
-            # candidate step = its own index). One fused launch replaces the
-            # ~21-op eager prologue.
+            # For topk=1, accepted node indices equal per-request step indices, so both eager gathers are identities.
             from sglang.kernels.ops.speculative.eagle import (
                 nextn_mamba_commit_prologue_func,
             )
 
             has_track = track_indices_to_pass is not None
             if has_track:
-                # Host-side sufficient no-crossing test: post-verify length is
-                # at most pre + draft_token_num (accept_lens includes the
-                # bonus and is capped at draft_token_num), so identical
-                # interval buckets for pre and pre+draft rule out any
-                # interval crossing this cycle — the whole track commit
-                # (two scatter launches + wrappers) can be skipped.
+                # If pre + max accepted tokens stays in the same interval, no tracking snapshot can be needed.
                 seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
                 interval = mamba_track_interval
                 if seq_lens_cpu is not None and seq_lens_cpu.numel() == bs:
@@ -1054,37 +1037,7 @@ def commit_mamba_states_after_verify(
                         has_track = False
                         track_indices_to_pass = None
                 elif interval > 0:
-                    # GPU-only seq_lens (a backend that sets
-                    # needs_cpu_seq_lens = False, e.g. KDA): no CPU
-                    # mirror, so bound the true pre-verify length with the
-                    # scheduler's host counter instead of reading it.
-                    # req.kv_committed_len only advances when a verify
-                    # result is resolved (batch_result_processor), so it is
-                    # a LOWER bound on the device seq_lens, lagging by at
-                    # most one in-flight verify in overlap mode — the same
-                    # lag the doubled alloc reserve absorbs (see
-                    # eagle_prepare_for_decode / get_alloc_reserve_per_decode).
-                    # A verify commits at most the draft size's tokens
-                    # (accept_lens includes the bonus), so with the matching
-                    # 2x safety margin:
-                    #   pre_verify_len in [lb, lb + 2 * max_draft]
-                    # and post-verify adds at most max_draft more.
-                    # max_draft must be the CONFIGURED maximum, not this
-                    # cycle's draft_token_num: with adaptive speculation the
-                    # in-flight verify the counter lags behind may have used
-                    # a larger draft than the current (downshifted) cycle,
-                    # and the alloc reserve this lag argument leans on is
-                    # sized by the configured value. Note the plain
-                    # speculative_num_draft_tokens field is NOT that maximum:
-                    # adaptive gear switches sync it to the current gear
-                    # (server_args.override in _restore_worker_state); the
-                    # max_ property is derived from the immutable candidate
-                    # config. floor(x / interval) is monotone, so if lb and
-                    # lb + 3 * max_draft share a bucket, every length
-                    # reachable this cycle does too — no crossing is
-                    # possible and the track commit can be skipped. Any
-                    # uncertainty (missing counter, req/row mismatch) keeps
-                    # the exact full path.
+                    # The host counter may lag one overlap cycle; skip only when the conservative 3x max-draft bound stays in one interval.
                     reqs = getattr(batch, "reqs", None)
                     if reqs is not None and len(reqs) == bs:
                         max_draft = (
@@ -1149,12 +1102,6 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
 def get_plan_stream(
     device: str,
 ) -> Tuple[Any, contextlib.AbstractContextManager]:
-    """Return (plan_stream, ctx) when SGLANG_ENABLE_OVERLAP_PLAN_STREAM is on.
-
-    With the flag off this returns (None, nullcontext()), so callers can
-    unconditionally enter the context and check ``plan_stream is None`` to
-    detect the single-stream fallback.
-    """
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)

@@ -121,19 +121,7 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
 
 
 def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
-    """Return whether a template associates tool results by call ID.
-
-    A template that reads ``tool_call_id`` can emit tool results in an order
-    other than the request's message order (for example, by iterating the
-    assistant's ``tool_calls`` and looking up each matching result). Media is
-    collected from the request in message order, so those templates need a
-    rendered-order recovery pass to keep media and placeholders aligned.
-
-    Inspecting the parsed template is deliberately model-agnostic: custom and
-    future templates get the same behavior without a model-name allowlist or a
-    runtime environment switch, while templates that simply stream messages in
-    request order pay no per-request recovery cost.
-    """
+    """Detect call-ID use so rendered media can be realigned without model-specific allowlists."""
     if not isinstance(chat_template, str):
         return False
 
@@ -154,7 +142,6 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     ):
         return True
 
-    # ``message.get('tool_call_id')`` is another common spelling.
     for call in jinja_ast.find_all(jinja2.nodes.Call):
         if (
             isinstance(call.node, jinja2.nodes.Getattr)
@@ -164,9 +151,6 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
         ):
             return True
 
-    # Templates can look up or sort result messages without a direct field
-    # access, e.g. ``messages | selectattr('tool_call_id', 'equalto', id)`` or
-    # ``messages | sort(attribute='tool_call_id')``.
     attribute_filters = {"groupby", "map", "rejectattr", "selectattr", "sort"}
     for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
         if filter_node.name not in attribute_filters:
@@ -274,9 +258,7 @@ def process_content_for_template_format(
                             {"type": "text", "text": chunk["text"]}
                         )
                 elif chunk_type == "tool_reference":
-                    # GLM-specific extension: pass through so the chat template
-                    # can match tool_reference.name against tools[*].function.name
-                    # and render the referenced tool schemas inline.
+                    # Preserve this extension because GLM templates resolve referenced tool schemas by function name.
                     processed_content_parts.append(chunk)
 
         new_msg = {

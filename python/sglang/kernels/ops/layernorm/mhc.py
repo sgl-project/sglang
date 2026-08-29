@@ -1672,22 +1672,11 @@ def mhc_fused_post_pre(
 
 
 def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
-    """[s, hidden_size] -> [s, n * hidden_size] by replication."""
     return x.repeat(1, n)
 
 
 def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
-    """[s, n * hidden_size] -> [s, hidden_size] by averaging."""
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
-
-
-# ---------------------------------------------------------------------------
-# Flat (2-D) MHC functional front-ends, matching the GLM reference contract so
-# the communicator pipeline (MHCState / MHCLayerCommunicator) can keep hidden
-# states as plain ``[tokens, n * hidden]`` 2-D tensors. The tilelang path reuses
-# this module's ``mhc_pre`` / ``mhc_post`` kernels; a pure-torch reference is
-# kept for fallback / numerics checks.
-# ---------------------------------------------------------------------------
 
 
 def _mhc_pre_torch(
@@ -1701,10 +1690,6 @@ def _mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-torch reference of mhc_pre.
-
-    residual: (s, n, h); returns (post=(s, n, 1), comb=(s, n, n), layer_input=(s, h)).
-    """
     import torch.nn.functional as F
 
     s, n, h = residual.shape
@@ -1712,7 +1697,7 @@ def _mhc_pre_torch(
 
     x_flat = residual.view(s, n * h).float()
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
-    mixes = F.linear(x_flat, fn) * rsqrt  # (s, mix_hc)
+    mixes = F.linear(x_flat, fn) * rsqrt
 
     pre_raw = mixes[:, :n]
     post_raw = mixes[:, n : 2 * n]
@@ -1741,7 +1726,6 @@ def _mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    """Pure-torch reference of mhc_post. x:(s,h) residual:(s,n,h) -> (s,n,h)."""
     out = post_layer_mix * x.unsqueeze(1) + (
         comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
     ).sum(dim=1)
@@ -1762,10 +1746,6 @@ def _mhc_pre_dispatch(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-    """Run mhc_pre using the env-selected backend.
-
-    Returns (post_mix=(s,n,1), comb_mix=(s,n,n), layer_input=(s,h), norm_fused).
-    """
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if _use_aiter_mhc():
         result = _try_aiter_mhc_pre(
@@ -1853,11 +1833,6 @@ def hc_pre(
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-    """MHC pre for one sublayer.
-
-    x: [s, n*hidden] bf16. Returns (layer_input [s,hidden], h_res [s,n*n] fp32,
-    h_post [s,n] fp32, norm_fused).
-    """
     s, total = x.shape
     hidden_size = total // hc_mult
     if x.numel() == 0:
@@ -1898,11 +1873,6 @@ def hc_post(
     h_res: torch.Tensor,
     hc_mult: int,
 ) -> torch.Tensor:
-    """MHC post for one sublayer.
-
-    x: [s, hidden], residual: [s, n*hidden], h_post: [s,n], h_res: [s,n*n].
-    Returns [s, n*hidden].
-    """
     s, hidden_size = x.shape
     if s == 0:
         return x.new_zeros((s, hc_mult * hidden_size))

@@ -11,14 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MHC (Manifold-Constrained Hyper-Connections) communicator for attention preparation.
-
-Adapted from the GLM reference: NSA naming -> DSA (``dsa_use_prefill_cp``,
-``ctx.is_dsa``). ``hc_expand`` / ``hc_contract`` live in ``layers/mhc.py``;
-the hc_mult-width local DP buffer is exposed via
-``get_local_dp_buffer_mhc(get_tp_group(), n)``.
-"""
-
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable, Optional
@@ -74,15 +66,8 @@ def tp_all_gather_hidden_states(hidden_states, forward_batch):
 
 @dataclass
 class MHCState:
-    """
-    Per-layer mHC runtime scratch.
-
-    The parameter-bearing pre/post stages live on the owning layer and
-    are injected here as callables (``hc_attn_pre`` / ``hc_ffn_pre`` /
-    ``hc_post``); this class only orchestrates the cross-stage scratch
-    (``h_res``, ``h_post``) and exposes the layer's ``hc_mult`` for the
-    few sites that need it as a raw scalar.
-    """
+    """Parameters belong to the owning layer; this state only holds scratch
+    shared across communication stages."""
 
     hc_mult: int
     hc_attn_pre: Callable
@@ -367,12 +352,8 @@ class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
             get_local_dp_buffer_mhc(get_tp_group(), 1),
             hidden_states,
         )
-        # Mirror CommunicateSummableTensorPairFn._scatter_hidden_states: when
-        # should_use_dp_reduce_scatterv() is true, the MoE skipped its
-        # post-experts all-reduce (should_skip_post_experts_all_reduce) on the
-        # promise that THIS scatter performs the combine. Without this branch,
-        # SUM_LEN rounds take the non-reducing dp_scatter and every DP rank's
-        # tokens keep only that rank's local-expert partial sums.
+        # MoE skips its post-expert all-reduce with reduce_scatterv, so this
+        # scatter must reduce while combining local-expert partial sums.
         if should_use_dp_reduce_scatterv():
             get_tp_group().reduce_scatterv(
                 global_hidden_states,
@@ -473,9 +454,8 @@ class MHCLayerCommunicator(LayerCommunicator):
         )
 
     def _post_init_communicate(self):
-        # MOE_FULL resolves to base *_moe methods that take no `mhc`, which
-        # this subclass passes unconditionally -> runtime TypeError. Not wired
-        # for MHC yet; fail loudly at construction instead.
+        # Base MOE_FULL callables do not accept ``mhc``, so reject this
+        # combination at construction.
         if self.layer_scatter_modes.mlp_mode == ScatterMode.MOE_FULL:
             raise NotImplementedError(
                 "MHCLayerCommunicator does not support MOE_FULL "
@@ -531,9 +511,8 @@ class MHCLayerCommunicator(LayerCommunicator):
             context=self._context,
         )
 
-        # Pre-gather to avoid duplicate all_gather in DSA; without a
-        # qkv_latent hook the attention impl reads mixed_qkv directly, so the
-        # full hidden_states must be materialized here.
+        # DSA and attention without a QKV hook consume full hidden states, so
+        # gather them before attention.
         ctx = get_attn_tp_context()
         dsa_pre_gather = ctx.input_scattered and ctx.is_dsa
         no_qkv_latent_pre_gather = ctx.input_scattered and self.qkv_latent_func is None
@@ -596,10 +575,8 @@ class MHCLayerCommunicator(LayerCommunicator):
             self._communicate_summable_tensor_pair_fn
             is MHCCommunicateSummableTensorPairFn._scatter_hidden_states
         ):
-            # Mirror LayerCommunicator.should_use_reduce_scatter (PR #24785):
-            # True on should_use_dp_reduce_scatterv() regardless of padding
-            # mode, else RowParallelLinear keeps all-reducing the dense MLP
-            # while the scatter above reduce-scatters on top of it.
+            # reduce_scatterv already combines expert outputs; returning False
+            # would make RowParallelLinear perform an extra all-reduce.
             if should_use_dp_reduce_scatterv():
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
