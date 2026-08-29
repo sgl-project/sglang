@@ -89,6 +89,11 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self.send_sockets = send_sockets
         self.server_args = server_args
 
+    async def _dispatch_encode(self, request_dict: dict):
+        for socket in self.send_sockets:
+            await async_sock_send(socket, wrap_as_pickle(request_dict))
+        return await self.encoder.encode_request(request_dict, Modality.IMAGE)
+
     async def Encode(
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
@@ -109,15 +114,28 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             # cache and transfer backend. Keep TP dispatch and rank-0 collective
             # launch order identical when gRPC handlers run concurrently.
             async with self.encoder.encode_dispatch_lock:
-                for socket in self.send_sockets:
-                    await async_sock_send(socket, wrap_as_pickle(request_dict))
+                encode_task = asyncio.create_task(self._dispatch_encode(request_dict))
+                try:
+                    result = await asyncio.shield(encode_task)
+                except asyncio.CancelledError:
+                    # Once TP dispatch starts, interrupting one rank can strand
+                    # its peers in a collective. Drain to a safe point before
+                    # releasing the lock and request state.
+                    try:
+                        await asyncio.shield(encode_task)
+                    except Exception:
+                        logger.exception(
+                            "Encoder request %s failed while draining cancellation",
+                            request.req_id,
+                        )
+                    raise
                 (
                     nbytes,
                     embedding_len,
                     embedding_dim,
                     error_msg,
                     error_code,
-                ) = await self.encoder.encode_request(request_dict, Modality.IMAGE)
+                ) = result
             if error_msg is not None:
                 await self.encoder.release_request(request.req_id)
                 context.set_code(

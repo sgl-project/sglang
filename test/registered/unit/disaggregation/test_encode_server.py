@@ -560,10 +560,12 @@ class TestEncoderDelivery(CustomTestCase):
             _, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
 
             encode_started = asyncio.Event()
+            finish_encode = asyncio.Event()
 
             async def encode_request(*_args):
                 encode_started.set()
-                await asyncio.Event().wait()
+                await finish_encode.wait()
+                return 8, 1, 8, None, None
 
             encoder = SimpleNamespace(
                 encode_dispatch_lock=asyncio.Lock(),
@@ -586,11 +588,22 @@ class TestEncoderDelivery(CustomTestCase):
                 set_details=unittest.mock.Mock(),
             )
 
-            task = asyncio.create_task(server.Encode(request, context))
-            await encode_started.wait()
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
+            with patch(
+                "sglang.srt.disaggregation.encoder.grpc_server.get_disagg",
+                return_value=SimpleNamespace(encoder_transfer_backend="mooncake"),
+            ):
+                task = asyncio.create_task(server.Encode(request, context))
+                await encode_started.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+
+                # Cancellation cannot interrupt an in-flight TP collective.
+                self.assertFalse(task.done())
+                encoder.release_request.assert_not_awaited()
+
+                finish_encode.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
 
             encoder.release_request.assert_awaited_once_with("cancelled-encode")
 
