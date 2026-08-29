@@ -2,12 +2,9 @@
 
 ``store_swa_into_unified`` writes one latent row per token. Under
 SGLANG_DSV4_UNIFIED_KV_FP8 that row is split over a packed fp8 nope pool and a
-bf16 rope pool, so the property these tests pin is that the ring row index --
-derived from state_slot/positions alone -- stays identical to the bf16 layout's
-and identical between the two pools.
-
-Needs a GPU for triton but only a few MB of it, so it runs fine next to a busy
-card.
+bf16 rope pool, so what these tests pin is that the ring row index -- derived
+from state_slot/positions alone -- stays identical to the bf16 layout's and
+identical between the two pools.
 """
 
 import unittest
