@@ -750,32 +750,39 @@ def extract_original_req_id(part_req_id: str) -> str:
     return part_req_id
 
 
-def _embedding_part_matches_request(
-    embedding_data: object, expected_req_id: str
-) -> bool:
-    """Normalize a matching part ID; reject stale data from a reused socket."""
+def _resolve_embedding_part_request_id(
+    embedding_data: object, expected_req_id: Optional[str] = None
+) -> Optional[str]:
+    """Validate and normalize an embedding part ID for safe routing."""
+    expected = (
+        f" for expected rid={expected_req_id}" if expected_req_id is not None else ""
+    )
     if not isinstance(embedding_data, EmbeddingData):
-        logger.warning(
-            "Dropping non-embedding data for expected rid=%s", expected_req_id
-        )
-        return False
+        logger.warning("Dropping non-embedding data%s", expected)
+        return None
     if not isinstance(embedding_data.req_id, str):
-        logger.warning(
-            "Dropping embedding data with a non-string req_id for expected rid=%s",
-            expected_req_id,
-        )
-        return False
+        logger.warning("Dropping embedding data with a non-string req_id%s", expected)
+        return None
     original_req_id = extract_original_req_id(embedding_data.req_id)
-    if original_req_id != expected_req_id:
+    if expected_req_id is not None and original_req_id != expected_req_id:
         logger.warning(
             "Dropping stale embedding data: expected rid=%s, got rid=%s "
             "(likely from ZMQ port reuse)",
             expected_req_id,
             embedding_data.req_id,
         )
-        return False
+        return None
     embedding_data.req_id = original_req_id
-    return True
+    return original_req_id
+
+
+def _embedding_part_matches_request(
+    embedding_data: object, expected_req_id: str
+) -> bool:
+    """Normalize a matching part ID; reject stale data from a reused socket."""
+    return (
+        _resolve_embedding_part_request_id(embedding_data, expected_req_id) is not None
+    )
 
 
 def _encoder_media_item(mm_item: dict):
@@ -2143,8 +2150,18 @@ class MMReceiverBase(ABC):
             except zmq.Again:
                 return
 
-            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            rid = extract_original_req_id(recv_obj.req_id)
+            try:
+                recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+            except Exception as error:
+                logger.warning(
+                    "Dropping malformed embedding data from the shared "
+                    "scheduler socket: %s",
+                    error,
+                )
+                continue
+            rid = _resolve_embedding_part_request_id(recv_obj)
+            if rid is None:
+                continue
             waiting_req = self.waiting_by_rid.get(rid)
             if waiting_req is None:
                 logger.warning(

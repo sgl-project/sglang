@@ -934,6 +934,8 @@ def test_epd_scheduler_routes_many_requests_over_one_receive_socket():
     sender = context.socket(zmq.PUSH)
     try:
         sender.connect(f"tcp://127.0.0.1:{port}")
+        sender.send_multipart([b"not a pickle"])
+        sender.send_multipart([pickle.dumps("not embedding data")])
         for i in range(32):
             mm_data = EmbeddingData(
                 req_id=f"rid-{i}_local_part_0",
