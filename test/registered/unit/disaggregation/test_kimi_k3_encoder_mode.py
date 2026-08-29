@@ -706,6 +706,109 @@ def test_kimi_k3_epd_aggregates_original_image_sizes_in_part_order():
     ]
 
 
+@pytest.mark.parametrize(
+    ("num_parts", "part_idx", "error"),
+    [
+        (0, 0, "num_parts must be a positive integer"),
+        (2, -1, "part_idx must be in"),
+        (2, 2, "part_idx must be in"),
+    ],
+)
+def test_epd_embedding_aggregation_rejects_invalid_part_metadata(
+    num_parts, part_idx, error
+):
+    part = EmbeddingData(
+        req_id="request",
+        num_parts=num_parts,
+        part_idx=part_idx,
+        grid_dim=torch.tensor([[1, 2, 2]]),
+        modality=Modality.IMAGE,
+        embedding=torch.ones(1, 2),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        MultiModalEmbeddingData.from_embedding_data(part)
+
+
+def test_epd_embedding_aggregation_rejects_duplicate_and_inconsistent_parts():
+    def make_part(num_parts, part_idx):
+        return EmbeddingData(
+            req_id="request",
+            num_parts=num_parts,
+            part_idx=part_idx,
+            grid_dim=torch.tensor([[1, 2, 2]]),
+            modality=Modality.IMAGE,
+            embedding=torch.ones(1, 2),
+        )
+
+    combined = MultiModalEmbeddingData.from_embedding_data(make_part(2, 0))
+    with pytest.raises(ValueError, match="duplicate embedding part 0"):
+        combined.add(make_part(2, 0))
+    with pytest.raises(ValueError, match="num_parts changed from 2 to 3"):
+        combined.add(make_part(3, 1))
+
+
+def test_epd_scheduler_contains_invalid_embedding_part_metadata():
+    waiting = WaitingZmqRequest.__new__(WaitingZmqRequest)
+    waiting.rid = "request"
+    waiting.recv_req = SimpleNamespace(rid="request")
+    waiting.status = WaitingMMRequestStatus.PENDING
+    waiting.recv_embedding_data = None
+    waiting.model_type = None
+    waiting._fail_and_release = Mock()
+    invalid = EmbeddingData(
+        req_id="request_local_part_2",
+        num_parts=2,
+        part_idx=2,
+        grid_dim=None,
+        modality=Modality.IMAGE,
+        embedding=torch.ones(1, 2),
+    )
+
+    waiting.consume_parts(
+        [pickle.dumps(invalid.copy_without_embedding()), invalid.embedding.numpy()]
+    )
+
+    waiting._fail_and_release.assert_called_once()
+
+
+def test_epd_tokenizer_contains_duplicate_embedding_part():
+    class FakeSocket:
+        def __init__(self, messages):
+            self.messages = messages
+            self.closed = False
+
+        async def recv_multipart(self, copy=False):
+            return self.messages.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    async def run_test():
+        embedding = torch.tensor([[1.0, 2.0]])
+        part = EmbeddingData(
+            req_id="request_local_part_0",
+            num_parts=2,
+            part_idx=0,
+            grid_dim=torch.tensor([[1, 2, 2]]),
+            modality=Modality.IMAGE,
+            embedding=embedding,
+        )
+        frame = [pickle.dumps(part.copy_without_embedding()), embedding.numpy()]
+        socket = FakeSocket([frame, frame])
+        receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+        receiver.model_type = None
+
+        result = await receiver._recv_mm_data(
+            "request", socket, SimpleNamespace(), "prompt"
+        )
+
+        assert result is None
+        assert socket.closed
+
+    asyncio.run(run_test())
+
+
 def test_kimi_k3_encoder_prefers_grid_thws_and_uses_temporal_pool_length():
     grid_thws = torch.tensor([[3, 8, 12]])
     stale_grid = torch.tensor([[1, 2, 2]])

@@ -628,6 +628,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         model_type: Optional[str] = None,
     ):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
+        _validate_embedding_part(embedding_data)
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
         for attr in video_meta_attrs_for(model_type):
@@ -695,13 +696,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
-        if self.req_id != embedding_data.req_id:
-            logger.warning(
-                f"Dropping embedding data with mismatched req_id: "
-                f"expected {self.req_id}, got {embedding_data.req_id}"
-            )
-            return False
-        assert not self.ready_list[embedding_data.part_idx]
+        _validate_embedding_part(embedding_data, current=self)
         pid = embedding_data.part_idx
         self.ready_list[pid] = True
         self.modality_list[pid] = embedding_data.modality
@@ -712,6 +707,45 @@ class MultiModalEmbeddingData(EmbeddingData):
             self._set_video_meta_for_part(pid, embedding_data)
         if embedding_data.modality == Modality.IMAGE:
             self._set_image_meta_for_part(pid, embedding_data)
+
+
+def _validate_embedding_part(
+    embedding_data: EmbeddingData,
+    current: Optional[MultiModalEmbeddingData] = None,
+) -> None:
+    """Reject malformed part metadata before indexing aggregation buffers."""
+    if not isinstance(embedding_data, EmbeddingData):
+        raise ValueError(f"expected EmbeddingData, got {type(embedding_data).__name__}")
+    if (
+        not isinstance(embedding_data.num_parts, int)
+        or isinstance(embedding_data.num_parts, bool)
+        or embedding_data.num_parts <= 0
+    ):
+        raise ValueError("num_parts must be a positive integer")
+    if (
+        not isinstance(embedding_data.part_idx, int)
+        or isinstance(embedding_data.part_idx, bool)
+        or embedding_data.part_idx < 0
+        or embedding_data.part_idx >= embedding_data.num_parts
+    ):
+        raise ValueError(
+            f"part_idx must be in [0, {embedding_data.num_parts}), "
+            f"got {embedding_data.part_idx}"
+        )
+    if current is None:
+        return
+    if current.req_id != embedding_data.req_id:
+        raise ValueError(
+            f"embedding req_id mismatch: expected {current.req_id}, "
+            f"got {embedding_data.req_id}"
+        )
+    if current.num_parts != embedding_data.num_parts:
+        raise ValueError(
+            f"num_parts changed from {current.num_parts} to "
+            f"{embedding_data.num_parts}"
+        )
+    if current.ready_list[embedding_data.part_idx]:
+        raise ValueError(f"duplicate embedding part {embedding_data.part_idx}")
 
 
 def _aggregate_embedding_part(current, recv_obj, model_type):
@@ -2056,6 +2090,11 @@ class MMReceiverBase(ABC):
                 recv_embedding,
                 **recv_embedding_data.get_mm_extra_meta(),
             )
+        except Exception:
+            logger.exception(
+                "Failed to receive encoder embeddings for req_id=%s", req_id
+            )
+            return None
         finally:
             recv_socket.close()
 
