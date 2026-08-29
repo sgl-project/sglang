@@ -1481,12 +1481,12 @@ class GroupCoordinator:
         if input_.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
             return self.broadcast(input_, src=src)
 
+        # PyNCCL is the faster path under capture, but not a precondition:
+        # a split attention-TP group is built without one, and the
+        # process-group broadcast captures and replays correctly.
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or not pynccl_comm.available:
-            raise RuntimeError(
-                f"CUDA graph broadcast on group {self.unique_name!r} requires "
-                "an available PyNCCL communicator."
-            )
+            return self.broadcast(input_, src=src)
         with pynccl_comm.change_state(enable=True):
             pynccl_comm.broadcast(input_, src=src)
         return input_
@@ -2372,7 +2372,6 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
-    use_attn_tp_pynccl: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2395,9 +2394,6 @@ def initialize_model_parallel(
             tensor-parallel group during decoding. Must be a divisor of
             tensor_model_parallel_size and is currently only supported on the
             AMD HIP platform.
-        use_attn_tp_pynccl: create a PyNCCL communicator for a split
-            attention tensor-parallel group. This is required by collectives
-            captured in CUDA graphs on that group.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2619,9 +2615,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=(
-                SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem or use_attn_tp_pynccl
-            ),
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
