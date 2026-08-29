@@ -22,6 +22,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
   NgramCorpusObj(
       int64_t capacity,
       int64_t max_trie_depth,
+      int64_t max_sam_match_depth,
       int64_t min_bfs_breadth,
       int64_t max_bfs_breadth,
       int64_t draft_token_num,
@@ -32,6 +33,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     param.enable = true;
     param.enable_router_mode = false;
     param.max_trie_depth = static_cast<size_t>(max_trie_depth);
+    param.max_sam_match_depth = static_cast<size_t>(max_sam_match_depth);
     param.min_bfs_breadth = static_cast<size_t>(min_bfs_breadth);
     param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
     param.draft_token_num = static_cast<size_t>(draft_token_num);
@@ -155,7 +157,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
-      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
+      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
