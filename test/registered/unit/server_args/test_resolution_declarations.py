@@ -376,6 +376,32 @@ class TestResolutionDeclarations(CustomTestCase):
             + "\n  ".join(differences),
         )
 
+    def test_the_whole_object_readback_carries_only_fields(self):
+        """`/server_info` and its gRPC and in-process twins report
+        `ServerArgs.resolved_dict()`.
+
+        The dump is exactly the field names, carrying the resolution result
+        for each. It holds none of the resolution bookkeeping (`_raw_input`, the
+        declaration stash, the finished flag) and no `ModelConfig` memo: none of
+        that is configuration, and all of it would cross IPC with the
+        readback.
+        """
+        server_args = self._resolve({"tp_size": 2})
+        dump = server_args.resolved_dict()
+        self.assertEqual(
+            sorted(dump),
+            sorted(field.name for field in dataclasses.fields(server_args)),
+            "the readback dump is no longer exactly the fields",
+        )
+        leaked = sorted(
+            name
+            for name in vars(server_args)
+            if name not in dump and not name.startswith("__")
+        )
+        self.assertNotEqual(
+            leaked, [], "nothing to leak any more -- this check is now vacuous"
+        )
+
     def test_every_published_leaf_is_what_resolution_decided(self):
         """One hop further than the check above: the leaf a reader reads.
 
@@ -396,9 +422,10 @@ class TestResolutionDeclarations(CustomTestCase):
         mapping = namespace_of(ServerArgs)
         self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
 
-        shadowed = _live_topology_leaves()
+        # The five sizes keep a live property shadowing the bare name; the
+        # comparison below reaches them anyway, through `get_parallel().config`.
         self.assertGreaterEqual(
-            shadowed
+            _live_topology_leaves()
             & {
                 "tp_size",
                 "pp_size",
@@ -407,8 +434,7 @@ class TestResolutionDeclarations(CustomTestCase):
                 "dcp_size",
             },
             {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
-            "a parallel size stopped being served from the live topology; if it "
-            "is a plain config leaf now, it belongs in the comparison below",
+            "a parallel size stopped being served from the live topology",
         )
 
         compared = 0
@@ -418,17 +444,16 @@ class TestResolutionDeclarations(CustomTestCase):
             server_args = self._resolve(shape)
             publish(server_args, role="scheduler")
             for field, path in mapping.items():
-                if field in shadowed:
-                    # Served from the process groups by design; `configured_*()`
-                    # is what answers with the configured value, and
-                    # test_launch_path_reads_configured_sizes pins that.
-                    continue
                 groups = path.split(".")
                 accessor = getattr(runtime_context, f"get_{groups[0]}", None)
                 if accessor is None:
                     unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
                     continue
                 node = accessor()
+                if groups[0] == "parallel":
+                    # Bare names there are the live topology; the published
+                    # leaves are one hop down, so the reader takes that hop.
+                    node = node.config
                 try:
                     for group in groups[1:]:
                         node = getattr(node, group)
@@ -739,7 +764,7 @@ class TestResolutionDeclarations(CustomTestCase):
         # Snapshot before publishing: the bag serves the very object the record
         # holds, so comparing them after the fact compares an object with
         # itself and passes however the projection behaves.
-        expected = copy.deepcopy(server_args.cuda_graph_config)
+        expected = copy.deepcopy(resolution_result(server_args, "cuda_graph_config"))
         publish(server_args, role="scheduler")
         published = get_exec().graph.cuda_graph_config
         resolved = expected

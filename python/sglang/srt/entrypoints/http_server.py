@@ -232,6 +232,8 @@ async def init_multi_tokenizer() -> ServerArgs:
         server_args.api_key is None
     ), "API key is not supported in multi-tokenizer mode"
 
+    publish(server_args, role="tokenizer")
+
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -488,6 +490,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_serving,
+    publish,
 )
 
 elastic_ep_router.route_class = ORJSONRoute
@@ -811,10 +814,9 @@ async def server_info():
 
     server_args = _global_state.tokenizer_manager.server_args
 
-    # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **dataclasses.asdict(server_args),
+            **server_args.resolved_dict(),
             **_global_state.scheduler_info,
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
@@ -2140,7 +2142,6 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
 
 
 async def _send_disaggregation_warmup_requests(
-    server_args: ServerArgs,
     url: str,
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
@@ -2177,7 +2178,7 @@ async def _send_disaggregation_warmup_requests(
         return await asyncio.gather(
             *(
                 send_request(session, dp_rank)
-                for dp_rank in range(get_parallel().dp_size)
+                for dp_rank in range(get_parallel().config.dp_size)
             )
         )
 
@@ -2236,9 +2237,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
+        json_data["input_ids"] = [
+            [10, 11, 12] for _ in range(get_parallel().config.dp_size)
+        ]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().config.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
@@ -2282,9 +2285,11 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
+        json_data["text"] = [
+            "The capital city of France is"
+        ] * get_parallel().config.dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if get_parallel().dp_size == 1:
+        if get_parallel().config.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2315,7 +2320,6 @@ def _execute_server_warmup(server_args: ServerArgs):
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
-                    server_args=server_args,
                     url=url,
                     headers=headers,
                     ssl_verify=ssl_verify,
@@ -2326,7 +2330,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    get_parallel().dp_size,
+                    get_parallel().config.dp_size,
                 )
                 logger.info("End of disaggregation warmup")
             else:

@@ -57,12 +57,13 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_device,
     get_disagg,
     get_exec,
     get_mm,
     get_model,
+    publish,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_media_url_security
@@ -448,7 +449,7 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
-        ensure_published(server_args, role="encoder")
+        assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(
@@ -2036,6 +2037,7 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    publish(server_args, role="encoder")
     try:
         asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))
     except KeyboardInterrupt:

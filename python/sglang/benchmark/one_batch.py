@@ -82,7 +82,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase, cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule, publish
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -538,17 +538,17 @@ def decode(input_token_ids, batch, model_runner):
 
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
-    if require_mlp_sync(model_runner.server_args):
+    if require_mlp_sync():
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().dp_size,
+            dp_size=get_parallel().config.dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
             attn_cp_size=model_runner.ps.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),
-            require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=set(),
         )
@@ -681,6 +681,8 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    publish(server_args, role="scheduler")
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -881,6 +883,9 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
+    # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise;
+    # a spawned child arrives with nothing published.
+    publish(server_args, role="scheduler")
     initialize_moe_config(server_args)
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
