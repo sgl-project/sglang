@@ -35,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_5_35B_A3B_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -43,7 +42,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
-
 
 # 模型路径可用环境变量覆盖，默认对齐本地手动脚本；CI 上按需注入。
 MODEL = QWEN3_5_35B_A3B_WEIGHTS_PATH
