@@ -552,6 +552,7 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
+    uses_own_vocab_modules = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -677,6 +678,39 @@ class DFlashDraftModel(nn.Module):
         if self.is_nemotron_35_draft:
             projected = projected[0]
         return self.hidden_norm(projected)
+
+    def project_target_hidden_partial(
+        self, target_hidden: torch.Tensor, feature_indices: list[int]
+    ) -> torch.Tensor:
+        if not feature_indices:
+            raise ValueError("feature_indices must be non-empty.")
+        feature_indices = [int(i) for i in feature_indices]
+        if (
+            min(feature_indices) < 0
+            or max(feature_indices) >= self.num_context_features
+        ):
+            raise ValueError(
+                "feature_indices out of range for DFLASH context projection: "
+                f"{feature_indices=} {self.num_context_features=}."
+            )
+        hidden_size = int(self.config.hidden_size)
+        expected = len(feature_indices) * hidden_size
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "DFLASH partial target_hidden feature dim mismatch. "
+                f"Expected shape [N, {expected}] for {feature_indices=}, "
+                f"but got shape={tuple(target_hidden.shape)}."
+            )
+
+        cols = []
+        for idx in feature_indices:
+            start = idx * hidden_size
+            cols.extend(range(start, start + hidden_size))
+        index = torch.tensor(cols, dtype=torch.long, device=self.fc.weight.device)
+        weight = self.fc.weight.index_select(1, index)
+        if target_hidden.dtype != weight.dtype:
+            target_hidden = target_hidden.to(weight.dtype)
+        return F.linear(target_hidden, weight)
 
     @torch.no_grad()
     def forward(
@@ -903,6 +937,35 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         if self.is_nemotron_35_draft:
             projected = projected[0]
         return self.hidden_norm(projected)
+
+    def project_target_hidden_partial(
+        self, target_hidden: torch.Tensor, feature_indices: list[int]
+    ) -> torch.Tensor:
+        if not feature_indices:
+            raise ValueError("feature_indices must be non-empty.")
+        feature_indices = [int(i) for i in feature_indices]
+        hidden_size = int(self.config.hidden_size)
+        expected = len(feature_indices) * hidden_size
+        if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "Laguna DFLASH partial target_hidden feature dim mismatch. "
+                f"Expected shape [N, {expected}] for {feature_indices=}, "
+                f"but got shape={tuple(target_hidden.shape)}."
+            )
+        slices = target_hidden.view(
+            target_hidden.shape[0], len(feature_indices), hidden_size
+        )
+        compute_dtype = self.fc.weight.dtype
+        if slices.dtype != compute_dtype:
+            slices = slices.to(compute_dtype)
+        normed = torch.empty_like(slices)
+        for out_idx, feature_idx in enumerate(feature_indices):
+            normed[:, out_idx, :] = self.aux_hidden_norms[feature_idx](
+                slices[:, out_idx, :]
+            )
+        return super().project_target_hidden_partial(
+            normed.reshape(target_hidden.shape[0], -1), feature_indices
+        )
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
