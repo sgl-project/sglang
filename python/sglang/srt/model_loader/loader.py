@@ -331,6 +331,28 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+def _validate_default_loader_extra_config(
+    *, extra_config: dict, load_format: LoadFormat
+) -> None:
+    allowed_keys = {"enable_multithread_load", "num_threads"}
+    if load_format == LoadFormat.FASTSAFETENSORS:
+        allowed_keys.add("enable_gds")
+        if "enable_gds" in extra_config and not isinstance(
+            extra_config["enable_gds"], bool
+        ):
+            raise ValueError(
+                "enable_gds in --model-loader-extra-config must be a boolean"
+            )
+
+    unexpected_keys = set(extra_config.keys()) - allowed_keys
+    if unexpected_keys:
+        raise ValueError(
+            f"Unexpected extra config keys for load format "
+            f"{load_format}: "
+            f"{unexpected_keys}"
+        )
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -382,24 +404,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        extra_config = load_config.model_loader_extra_config
-        allowed_keys = {"enable_multithread_load", "num_threads"}
-        if load_config.load_format == LoadFormat.FASTSAFETENSORS:
-            allowed_keys.add("enable_gds")
-            if "enable_gds" in extra_config and not isinstance(
-                extra_config["enable_gds"], bool
-            ):
-                raise ValueError(
-                    "enable_gds in --model-loader-extra-config must be a boolean"
-                )
-        unexpected_keys = set(extra_config.keys()) - allowed_keys
-
-        if unexpected_keys:
-            raise ValueError(
-                f"Unexpected extra config keys for load format "
-                f"{load_config.load_format}: "
-                f"{unexpected_keys}"
-            )
+        _validate_default_loader_extra_config(
+            extra_config=load_config.model_loader_extra_config,
+            load_format=load_config.load_format,
+        )
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -3225,21 +3233,28 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        # The ModelExpress backend keeps the native loader as its fallback path
-        # (used on the first replica and whenever no peer holds the weights), so
-        # it consumes model_loader_extra_config. The nccl and transfer_engine
-        # backends have no such path and still reject it.
-        if (
-            load_config.model_loader_extra_config
-            and load_config.remote_instance_weight_loader_backend
-            != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
-        ):
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format} with "
-                f"remote instance weight loader backend "
-                f"{load_config.remote_instance_weight_loader_backend}"
-            )
+        if load_config.model_loader_extra_config:
+            if (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            ):
+                # ModelExpress falls back to a DefaultModelLoader whenever no
+                # peer holds the weights, so it consumes this config; validate
+                # the keys here so a bad one fails on every rank instead of only
+                # on the ranks that end up taking the fallback.
+                _validate_default_loader_extra_config(
+                    extra_config=load_config.model_loader_extra_config,
+                    load_format=load_config.load_format,
+                )
+            else:
+                # nccl and transfer_engine replace the native loader outright,
+                # so nothing would ever read the config.
+                raise ValueError(
+                    f"Model loader extra config is not supported for "
+                    f"load format {load_config.load_format} with "
+                    f"remote instance weight loader backend "
+                    f"{load_config.remote_instance_weight_loader_backend}"
+                )
         self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
