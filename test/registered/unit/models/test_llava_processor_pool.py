@@ -43,12 +43,15 @@ def test_broken_pool_is_replaced_once_for_concurrent_failures():
     processor.cpu_executor = failed_executor
     processor._cpu_executor_lock = threading.Lock()
     processor._create_cpu_executor = Mock(return_value=replacement_executor)
+    shutdown_called = threading.Event()
+    failed_executor.shutdown.side_effect = lambda **_kwargs: shutdown_called.set()
 
     processor._replace_broken_cpu_executor(failed_executor)
     processor._replace_broken_cpu_executor(failed_executor)
 
     assert processor.cpu_executor is replacement_executor
     processor._create_cpu_executor.assert_called_once_with()
+    assert shutdown_called.wait(timeout=5)
     failed_executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
 
 
