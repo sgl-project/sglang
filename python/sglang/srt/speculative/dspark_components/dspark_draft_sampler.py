@@ -13,7 +13,7 @@ from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class DsparkDraftSampler:
         gamma,
         max_bs,
         device,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
@@ -147,19 +147,21 @@ class DsparkDraftSampler:
                     # and redraws.
                     noise = self.exp_noise[:bs].exponential_()
                     return self._tp_sync.sync(
+                        SpecTpSyncSite.DRAFT_SAMPLE,
                         SampleStepTokens.execute(
                             step_logits=step_logits,
                             temperatures=self.temperatures[:bs],
                             greedy_mask=self.greedy_mask[:bs],
                             exp_noise=noise,
-                        )
+                        ),
                     )
 
             else:
 
                 def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
                     return self._tp_sync.sync(
-                        greedy_step_sampler(step_logits, step_idx)
+                        SpecTpSyncSite.DRAFT_GREEDY,
+                        greedy_step_sampler(step_logits, step_idx),
                     )
 
             draft_tokens, corrected_logits = self.markov_head.sample_block(
@@ -222,7 +224,7 @@ def maybe_build_draft_sampler(
     max_bs: int,
     device,
     tp_rank: int,
-    tp_sync: DsparkTpSync,
+    tp_sync: SpecTpSync,
     available_memory_gb: float,
     confidence_fn=None,
     out=None,

@@ -40,8 +40,8 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
@@ -87,7 +87,7 @@ class TargetVerifyExecutor:
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -141,9 +141,16 @@ class TargetVerifyExecutor:
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
-        self._tp_sync.sync(correct_len)
-        self._tp_sync.sync(bonus)
-        self._tp_sync.sync(cap_trim_lens)
+        # accept_draft_tokens dispatches on is_all_greedy: the greedy kernel is
+        # deterministic, the sampling one draws rejection coins.
+        site = (
+            SpecTpSyncSite.VERIFY_GREEDY
+            if sampling_info is None or sampling_info.is_all_greedy
+            else SpecTpSyncSite.VERIFY_SAMPLE
+        )
+        self._tp_sync.sync(site, correct_len)
+        self._tp_sync.sync(site, bonus)
+        self._tp_sync.sync(site, cap_trim_lens)
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
@@ -494,7 +501,7 @@ class DsparkVerifyEpilogue:
         max_bs: int,
         verify_num_draft_tokens: int,
         device,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
     ) -> None:
         self.max_bs = int(max_bs)
@@ -646,9 +653,9 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=verify_lens,
         )
-        self._tp_sync.sync(correct_len)
-        self._tp_sync.sync(bonus)
-        self._tp_sync.sync(cap_trim_lens)
+        self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, correct_len)
+        self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, bonus)
+        self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, cap_trim_lens)
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,

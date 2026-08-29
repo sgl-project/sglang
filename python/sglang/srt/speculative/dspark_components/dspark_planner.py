@@ -35,13 +35,13 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     load_sts_calibration_from_path,
 )
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     RaggedVerifyMode,
     read_ragged_verify_mode,
     round_up_grid,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
@@ -79,7 +79,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -585,7 +585,7 @@ class DSparkVerifyPlanner:
             budget=budget,
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
-        self._tp_sync.sync(verify_lens)
+        self._tp_sync.sync(SpecTpSyncSite.PLAN, verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)

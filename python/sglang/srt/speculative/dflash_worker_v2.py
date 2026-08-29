@@ -62,6 +62,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
@@ -70,7 +71,7 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
 
@@ -302,7 +303,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
         self._logged_first_verify = False
-        self._tp_group = get_tp_group()
+        self._tp_sync = SpecTpSync(get_tp_group())
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -466,12 +467,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
-            # Group min: every rank must reach the same capture decision.
-            available_mem = get_available_gpu_memory(
-                self.device,
-                self.gpu_id,
-                distributed=self._tp_group.world_size > 1,
-                cpu_group=self._tp_group.cpu_group,
+            available_mem = self._tp_sync.available_memory_gb(
+                self.device, self.gpu_id, group=get_tp_group()
             )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
@@ -1648,8 +1645,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            self._tp_group.broadcast(accept_len, src=0)
-            self._tp_group.broadcast(bonus, src=0)
+            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
@@ -1661,14 +1658,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
-            self._tp_group.broadcast(accept_len, src=0)
-            self._tp_group.broadcast(bonus, src=0)
+            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.VERIFY_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
             target_predict = torch.argmax(next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
             )
-            self._tp_group.broadcast(target_predict, src=0)
+            self._tp_sync.sync(SpecTpSyncSite.VERIFY_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
                 try:
                     (
@@ -1768,7 +1765,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            self._tp_group.broadcast(next_token_ids, src=0)
+            self._tp_sync.sync(SpecTpSyncSite.TARGET, next_token_ids)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

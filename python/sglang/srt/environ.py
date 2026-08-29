@@ -1195,6 +1195,12 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Which speculative decisions rank 0 broadcasts to its TP group. Comma
+    # separated presets ("all", "rng", "off") or site names, each negatable with
+    # a leading "-": e.g. "all,-plan". See speculative/spec_tp_sync.py for what
+    # each site covers. Narrowing this under live traffic isolates which kind of
+    # divergence a deployment actually has.
+    SGLANG_SPEC_TP_SYNC = EnvStr("all")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

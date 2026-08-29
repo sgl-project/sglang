@@ -63,13 +63,13 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -77,7 +77,6 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
-    get_available_gpu_memory,
     is_cuda,
     is_cuda_alike,
     is_npu,
@@ -177,7 +176,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._mask_token_id = runtime_config.mask_token_id
 
         parallel = get_parallel()
-        self._tp_sync = DsparkTpSync(
+        self._tp_sync = SpecTpSync(
             parallel.attn_tp_group
             if server_args.enable_dp_attention
             else parallel.tp_group
@@ -388,13 +387,8 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
-        graph_group = self._draft_graph_group
-        # Group min: every rank must reach the same capture decisions below.
-        available_mem = get_available_gpu_memory(
-            self.device,
-            self.gpu_id,
-            distributed=graph_group.world_size > 1,
-            cpu_group=graph_group.cpu_group,
+        available_mem = self._tp_sync.available_memory_gb(
+            self.device, self.gpu_id, group=self._draft_graph_group
         )
         if is_cuda_alike() and capture_decode_cuda_graph:
             if available_mem < 1.0:
@@ -493,7 +487,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        self._tp_sync.sync(next_token_ids)
+        self._tp_sync.sync(SpecTpSyncSite.TARGET, next_token_ids)
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)

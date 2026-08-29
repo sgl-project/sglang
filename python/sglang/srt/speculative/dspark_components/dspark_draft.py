@@ -23,11 +23,11 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
@@ -135,7 +135,7 @@ def sample_draft_block(
     sampling_info,
     markov_head,
     device: torch.device,
-    tp_sync: DsparkTpSync,
+    tp_sync: SpecTpSync,
 ) -> DraftBlockResult:
     bs = base_logits.shape[0]
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
@@ -153,7 +153,9 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            return tp_sync.sync(torch.argmax(step_logits, dim=-1))
+            return tp_sync.sync(
+                SpecTpSyncSite.DRAFT_GREEDY, torch.argmax(step_logits, dim=-1)
+            )
 
     else:
 
@@ -164,12 +166,13 @@ def sample_draft_block(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
                 ).exponential_(1)
                 return tp_sync.sync(
+                    SpecTpSyncSite.DRAFT_SAMPLE,
                     SampleStepTokens.execute(
                         step_logits=step_logits,
                         temperatures=temperatures,
                         greedy_mask=greedy_mask,
                         exp_noise=exp_noise,
-                    )
+                    ),
                 )
             else:
                 probs = torch.softmax(
@@ -179,7 +182,8 @@ def sample_draft_block(
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return tp_sync.sync(
-                    torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+                    SpecTpSyncSite.DRAFT_SAMPLE,
+                    torch.where(greedy_mask, argmax_tokens, sampled_tokens),
                 )
 
     draft_tokens, corrected_logits = markov_head.sample_block(
@@ -205,7 +209,7 @@ class DraftBlockProposer:
         gamma: int,
         mask_token_id: int,
         draft_block_spec_info,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         dp_moe_sync: bool = False,
     ) -> None:
         self.draft_model = draft_model
