@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
@@ -14,6 +16,8 @@ from huggingface_hub.utils import validate_repo_id
 WeightSourceKind = Literal["local", "huggingface"]
 
 _WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt")
+_SAFETENSORS_INDEX_SUFFIX = ".safetensors.index.json"
+_WEIGHT_REFERENCE_SUFFIXES = _WEIGHT_SUFFIXES + (_SAFETENSORS_INDEX_SUFFIX,)
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,17 @@ class ResolvedWeight:
     selected_file: str
 
 
+@dataclass(frozen=True)
+class ResolvedWeightSet:
+    inventory: WeightInventory
+    selected_files: tuple[str, ...]
+    index_file: str | None = None
+
+
+class NoSafetensorsWeightsError(FileNotFoundError):
+    """The source has no safetensors payload to resolve as a weight set."""
+
+
 def is_explicit_weight_file_reference(source: str) -> bool:
     """Whether a component override names one weight file, not a component root."""
     expanded = os.path.expanduser(source)
@@ -63,6 +78,23 @@ def _merge_revision(url_revision: str | None, revision: str | None) -> str | Non
             f"revision {revision!r}"
         )
     return url_revision or revision
+
+
+def _local_index_inventory(index_path: Path) -> tuple[str, ...]:
+    """List only an exact local index and the shards it declares."""
+    with index_path.open(encoding="utf-8") as index_stream:
+        index = json.load(index_stream)
+    weight_map = index.get("weight_map") if isinstance(index, Mapping) else None
+    shard_names = weight_map.values() if isinstance(weight_map, Mapping) else ()
+    files = {index_path.name}
+    for shard_name in shard_names:
+        if not isinstance(shard_name, str):
+            continue
+        shard_name = _validate_relative_hub_path(shard_name, "index shard")
+        shard_path = index_path.parent / shard_name
+        if shard_path.is_file():
+            files.add(shard_path.relative_to(index_path.parent).as_posix())
+    return tuple(sorted(files))
 
 
 def _parse_huggingface_url(source: str, revision: str | None) -> WeightSource:
@@ -149,7 +181,7 @@ def parse_weight_source(
     tail = "/".join(parts[2:]) or None
     filename = (
         _validate_relative_hub_path(tail, "filename")
-        if tail is not None and tail.lower().endswith(_WEIGHT_SUFFIXES)
+        if tail is not None and tail.lower().endswith(_WEIGHT_REFERENCE_SUFFIXES)
         else None
     )
     subfolder = tail if filename is None else None
@@ -169,12 +201,11 @@ def _filter_inventory_files(
     files: tuple[str, ...], source: WeightSource
 ) -> tuple[str, ...]:
     if source.filename is not None:
-        selected = tuple(path for path in files if path == source.filename)
-        if not selected:
+        if source.filename not in files:
             raise FileNotFoundError(
                 f"Weight file {source.filename!r} was not found in {source.repo_id}"
             )
-        return selected
+        return (source.filename,)
     if source.subfolder is None:
         return files
     prefix = source.subfolder.rstrip("/") + "/"
@@ -245,7 +276,7 @@ def select_weight_file(
         path for path in inventory.files if path.lower().endswith(_WEIGHT_SUFFIXES)
     )
     if inventory.source.filename is not None:
-        return inventory.files[0]
+        return _select_named_file(candidates, inventory.source.filename)
     if weight_name is not None:
         return _select_named_file(candidates, weight_name)
     if len(candidates) == 1:
@@ -274,18 +305,210 @@ def resolve_weight(
     )
 
 
-def materialize_weight(resolved: ResolvedWeight) -> str:
-    """Return the selected local file, downloading one pinned Hub file if needed."""
-    source = resolved.inventory.source
+def _materialize_inventory_file(inventory: WeightInventory, filename: str) -> str:
+    source = inventory.source
     if source.kind == "local":
         assert source.local_path is not None
         if os.path.isfile(source.local_path):
-            return source.local_path
-        return os.path.join(source.local_path, resolved.selected_file)
+            local_path = Path(source.local_path)
+            if filename == local_path.name:
+                return source.local_path
+            return str(local_path.parent / filename)
+        return os.path.join(source.local_path, filename)
 
     assert source.repo_id is not None
     return hf_hub_download(
         repo_id=source.repo_id,
-        filename=resolved.selected_file,
-        revision=resolved.inventory.resolved_revision,
+        filename=filename,
+        revision=inventory.resolved_revision,
     )
+
+
+def _resolve_index_shard(
+    inventory: WeightInventory, index_file: str, shard_name: str
+) -> str:
+    shard_name = _validate_relative_hub_path(shard_name, "index shard")
+    if not shard_name.lower().endswith(".safetensors"):
+        raise ValueError(
+            f"Safetensors index {index_file!r} references a non-safetensors "
+            f"shard: {shard_name!r}"
+        )
+    index_parent = PurePosixPath(index_file).parent
+    candidates = (shard_name, (index_parent / shard_name).as_posix())
+    matches = tuple(
+        dict.fromkeys(path for path in candidates if path in inventory.files)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(
+            f"Safetensors index {index_file!r} references missing shard {shard_name!r}"
+        )
+    raise ValueError(
+        f"Safetensors index shard {shard_name!r} is ambiguous: {list(matches)}"
+    )
+
+
+def _read_safetensors_index(
+    inventory: WeightInventory, index_file: str
+) -> tuple[str, ...]:
+    with open(
+        _materialize_inventory_file(inventory, index_file), encoding="utf-8"
+    ) as index_stream:
+        index = json.load(index_stream)
+    weight_map = index.get("weight_map") if isinstance(index, Mapping) else None
+    if not isinstance(weight_map, Mapping) or not weight_map:
+        raise ValueError(
+            f"Safetensors index {index_file!r} must contain a non-empty weight_map"
+        )
+    shard_names = tuple(weight_map.values())
+    if not all(isinstance(name, str) for name in shard_names):
+        raise ValueError(
+            f"Safetensors index {index_file!r} contains a non-string shard name"
+        )
+    return tuple(
+        sorted(
+            {
+                _resolve_index_shard(inventory, index_file, shard_name)
+                for shard_name in shard_names
+            }
+        )
+    )
+
+
+def resolve_safetensors_weight_set(
+    source: str,
+    *,
+    revision: str | None = None,
+    weight_name: str | None = None,
+    select_unindexed_weight: Callable[[tuple[str, ...]], str | None] | None = None,
+) -> ResolvedWeightSet:
+    """Resolve one safetensors checkpoint, using its index as shard authority."""
+    parsed_source = parse_weight_source(source, revision=revision)
+    if (
+        parsed_source.kind == "local"
+        and parsed_source.local_path is not None
+        and os.path.isfile(parsed_source.local_path)
+        and parsed_source.local_path.lower().endswith(_SAFETENSORS_INDEX_SUFFIX)
+    ):
+        inventory = WeightInventory(
+            parsed_source,
+            None,
+            _local_index_inventory(Path(parsed_source.local_path)),
+        )
+    elif parsed_source.kind == "huggingface" and parsed_source.filename is not None:
+        parent = PurePosixPath(parsed_source.filename).parent
+        scoped_inventory = resolve_weight_inventory(
+            replace(
+                parsed_source,
+                filename=None,
+                subfolder=None if parent == PurePosixPath(".") else parent.as_posix(),
+            )
+        )
+        inventory = WeightInventory(
+            parsed_source,
+            scoped_inventory.resolved_revision,
+            scoped_inventory.files,
+        )
+    else:
+        inventory = resolve_weight_inventory(parsed_source)
+    weights = tuple(
+        path for path in inventory.files if path.lower().endswith(".safetensors")
+    )
+    indexes = tuple(
+        path
+        for path in inventory.files
+        if path.lower().endswith(_SAFETENSORS_INDEX_SUFFIX)
+    )
+    selected_name = inventory.source.filename or weight_name
+    if (
+        selected_name is None
+        and inventory.source.kind == "local"
+        and inventory.source.local_path is not None
+        and os.path.isfile(inventory.source.local_path)
+    ):
+        selected_name = Path(inventory.source.local_path).name
+    if selected_name is not None:
+        if not selected_name.lower().endswith(
+            (".safetensors", _SAFETENSORS_INDEX_SUFFIX)
+        ):
+            raise NoSafetensorsWeightsError(
+                f"Selected file is not safetensors: {selected_name!r}"
+            )
+        selected = _select_named_file(weights + indexes, selected_name)
+        if selected in weights:
+            return ResolvedWeightSet(inventory, (selected,))
+        return ResolvedWeightSet(
+            inventory,
+            _read_safetensors_index(inventory, selected),
+            index_file=selected,
+        )
+    if len(indexes) == 1:
+        return ResolvedWeightSet(
+            inventory,
+            _read_safetensors_index(inventory, indexes[0]),
+            index_file=indexes[0],
+        )
+    if len(indexes) > 1:
+        raise ValueError(
+            "Source contains multiple safetensors indexes; select one with an "
+            f"exact index name. Candidates: {list(indexes)}"
+        )
+    if len(weights) == 1:
+        return ResolvedWeightSet(inventory, weights)
+    if not weights:
+        raise NoSafetensorsWeightsError("Source contains no safetensors weights")
+    if select_unindexed_weight is not None:
+        selected = select_unindexed_weight(weights)
+        if selected is not None:
+            if selected not in weights:
+                raise ValueError(
+                    "Unindexed weight selector returned a file outside the source: "
+                    f"{selected!r}"
+                )
+            return ResolvedWeightSet(inventory, (selected,))
+    raise ValueError(
+        "Source contains multiple safetensors files without an index; they may "
+        "be independent variants. Select one exact file or provide a standard "
+        f"safetensors index. Candidates: {list(weights)}"
+    )
+
+
+def materialize_weight_set(resolved: ResolvedWeightSet) -> tuple[str, ...]:
+    """Materialize every selected file from one pinned checkpoint revision."""
+    return tuple(
+        _materialize_inventory_file(resolved.inventory, filename)
+        for filename in resolved.selected_files
+    )
+
+
+def materialize_weight_set_config(resolved: ResolvedWeightSet) -> str | None:
+    """Materialize adjacent runtime configuration from the pinned revision."""
+    source = resolved.inventory.source
+    if source.kind == "local" and source.local_path is not None:
+        local_path = Path(source.local_path)
+        if local_path.is_file():
+            config_path = local_path.with_name("config.json")
+            return str(config_path) if config_path.is_file() else None
+
+    anchor = resolved.index_file or resolved.selected_files[0]
+    config_file = PurePosixPath(anchor).with_name("config.json").as_posix()
+    if config_file not in resolved.inventory.files:
+        return None
+    config_parent = PurePosixPath(config_file).parent
+    metadata_files = tuple(
+        path
+        for path in resolved.inventory.files
+        if PurePosixPath(path).parent == config_parent
+        and PurePosixPath(path).name.startswith("quant_model_description")
+        and path.lower().endswith(".json")
+    )
+    config_path = _materialize_inventory_file(resolved.inventory, config_file)
+    for metadata_file in metadata_files:
+        _materialize_inventory_file(resolved.inventory, metadata_file)
+    return config_path
+
+
+def materialize_weight(resolved: ResolvedWeight) -> str:
+    """Return the selected local file, downloading one pinned Hub file if needed."""
+    return _materialize_inventory_file(resolved.inventory, resolved.selected_file)
