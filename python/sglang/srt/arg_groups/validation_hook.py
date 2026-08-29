@@ -9,6 +9,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
+    resolved_view,
     resolving_view,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -389,7 +390,7 @@ def validate_ib_devices(server_args: Any, device_str: Optional[str]) -> Optional
 
 
 def validate_experimental_sgl_marlin(server_args: Any):
-    view = server_args._resolved()
+    view = resolved_view(server_args)
     if view.moe_runner_backend != "experimental_sgl_marlin":
         return
 

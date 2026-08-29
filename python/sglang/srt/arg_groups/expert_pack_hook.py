@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 def handle_expert_pack(server_args: Any) -> None:
     """Normalize expert-pack settings and report all startup errors together."""
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     if cfg.load_format != "expert_pack":
         return
@@ -146,7 +148,7 @@ def handle_expert_pack(server_args: Any) -> None:
             )
         else:
             try:
-                hf_config = server_args.get_model_config().hf_config
+                hf_config = model_config_of(server_args).hf_config
             except Exception as exc:
                 errors.append(f"failed to load expert_pack model config: {exc}")
             else:

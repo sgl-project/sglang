@@ -37,7 +37,10 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import (
+    cutedsl_moe_max_num_tokens,
+    resolution_result,
+)
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
@@ -825,9 +828,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         defaults.update(kw)
         view = ResolvedView(
-            SimpleNamespace(
-                get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
-            )
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
@@ -845,21 +846,21 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self, _mock_is_hip):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
         the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
@@ -876,14 +877,14 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
         self, _mock_is_hip
     ):
@@ -892,7 +893,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -905,7 +906,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
     def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -917,7 +918,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
 
-    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
@@ -969,7 +970,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.prefill_attention_backend = prefill
         args.decode_attention_backend = decode
         args.page_size = page_size
-        # Short-circuit get_model_config(): the fa4 page_size branch only needs
+        # Short-circuit model_config_of(): the fa4 page_size branch only needs
         # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
@@ -978,7 +979,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         return args
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
-    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    @patch("sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False)
     def test_combined_attention_backend_fa4_forces_page_size_128(
         self, _mock_mla, _mock_sm100
     ):
@@ -993,7 +994,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
     @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
-    @patch("sglang.srt.server_args.ServerArgs.use_mla_backend", return_value=False)
+    @patch("sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_mla, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
         args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)
@@ -1678,7 +1679,7 @@ class TestAdaptiveSpecArgs(CustomTestCase):
             args.speculative_adaptive = True
             args.speculative_adaptive_config = f.name
             args.device = "cuda"
-            args.get_model_config = lambda: SimpleNamespace(
+            args._model_config = SimpleNamespace(
                 hf_config=SimpleNamespace(
                     architectures=["LlamaForCausalLM"],
                     get_text_config=lambda: SimpleNamespace(),
@@ -1870,7 +1871,9 @@ class TestCudaGraphDisaggregationRoles(CustomTestCase):
         )
         with (
             patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False
+            ),
         ):
             handle_cuda_graph_config(args)
         return args
@@ -1943,7 +1946,9 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
         )
         with (
             patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False
+            ),
         ):
             handle_cuda_graph_config(args)
         return args
@@ -2007,7 +2012,9 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
         )
         with (
             patch("sglang.srt.utils.is_cuda", return_value=True),
-            patch.object(ServerArgs, "use_mla_backend", return_value=False),
+            patch(
+                "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=False
+            ),
         ):
             handle_cuda_graph_config(args)
         return args
@@ -2096,7 +2103,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
         return server_args
 
     def test_prefill_dominates_in_default_config(self):
-        self.assertEqual(self._args().cutedsl_moe_max_num_tokens(), 16384)
+        self.assertEqual(cutedsl_moe_max_num_tokens(self._args()), 16384)
 
     def test_speculative_decoding_scales_decode_bound(self):
         # decode bound 512 * 8 dominates the small prefill/piecewise bounds
@@ -2106,7 +2113,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
             speculative_algorithm="EAGLE",
             speculative_num_draft_tokens=8,
         )
-        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 4096)
+        self.assertEqual(cutedsl_moe_max_num_tokens(args), 4096)
 
     def test_piecewise_bound_excluded_when_disabled(self):
         args = self._args(
@@ -2114,7 +2121,7 @@ class TestCutedslMoeMaxNumTokens(CustomTestCase):
             disable_piecewise_cuda_graph=True,
             cuda_graph_max_bs=64,
         )
-        self.assertEqual(args.cutedsl_moe_max_num_tokens(), 512)
+        self.assertEqual(cutedsl_moe_max_num_tokens(args), 512)
 
 
 class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
@@ -2466,10 +2473,9 @@ class TestDeepEPv2Args(CustomTestCase):
             dp_size=8,
             enable_dp_attention=True,
         )
-        with patch.object(
-            ServerArgs,
-            "max_speculative_num_draft_tokens",
-            new=property(lambda _self: 16),
+        with patch(
+            "sglang.srt.arg_groups.moe_hook.max_speculative_num_draft_tokens",
+            return_value=16,
         ):
             with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(128):
                 with self.assertRaisesRegex(ValueError, "tokens/request=16"):

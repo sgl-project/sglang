@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from sglang.srt.arg_groups.overrides import declare_resolution
+
 METADATA_FORMAT_VERSION = 3
 GGUF_SHARD_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
 DEEPSEEK_METADATA_FORMAT_VERSION = 4
@@ -215,7 +217,8 @@ def prepare_raw_kimi_server_args(
         model_path,
         tokenizer_dir=tokenizer_path,
     )
-    server_args._declare(
+    declare_resolution(
+        server_args,
         "prepare_raw_kimi_server_args",
         model_path=str(assets["model_dir"]),
         tokenizer_path=str(assets["model_dir"]),
@@ -538,7 +541,8 @@ def prepare_raw_deepseek_server_args(
     config_sha256 = _deepseek_digest(
         model_value.get("config_sha256"), "model.config_sha256"
     )
-    server_args._declare(
+    declare_resolution(
+        server_args,
         "prepare_raw_deepseek_server_args",
         model_path=str(model_config.parent),
         tokenizer_path=str(model_config.parent),

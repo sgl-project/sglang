@@ -30,7 +30,7 @@ _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 # Two quantities sharing one name.
 _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 
-# Declared after the first `get_model_config()`, so the cached configuration
+# Declared after the first `model_config_of()`, so the cached configuration
 # holds the earlier value. Nothing reads the stale copy today (its one consumer
 # is on the `is_draft_model` branch, built after resolution), and fixing it
 # means moving the build or the hook. Pinned so a second field in this position
@@ -109,7 +109,7 @@ def _registry_collection_is_after_the_build():
 
     Handler-local ordering only -- the caller still has to compare against the
     pipeline-wide first build, which sits in an *earlier* step: hoisting the
-    collection above this handler's own `get_model_config()` call does not move
+    collection above this handler's own `model_config_of()` call does not move
     it above the configuration another handler already cached.
     """
     handler = None
@@ -145,7 +145,7 @@ def _registry_collection_is_after_the_build():
             name = func.id
         else:
             continue
-        if name == "get_model_config" and build is None:
+        if name == "model_config_of" and build is None:
             build = node.lineno
         if name == "collect_model_override_declarations" and collect is None:
             collect = node.lineno
@@ -192,11 +192,12 @@ def _server_args_names(tree, path):
                 and value.args[0].id in names
             )
             # `resolved = self._resolved()` is the same view, spelled as the
-            # record's own member.
+            # resolution vocabulary.
             member = (
                 isinstance(value, ast.Call)
                 and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "_resolved"
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "resolved_view"
                 and isinstance(value.func.value, ast.Name)
                 and value.func.value.id in names
             )
@@ -267,7 +268,7 @@ def _late_resolution_fields():
                 if isinstance(node.func, ast.Attribute)
                 else getattr(node.func, "id", "")
             )
-            if called in ("_late_resolution", "declare_late_resolution"):
+            if called == "declare_late_resolution":
                 fields |= {kw.arg for kw in node.keywords if kw.arg}
     return fields
 
@@ -488,14 +489,14 @@ def _declaration_positions():
     wanted = _constructor_reads()
 
     def build_site():
-        """(step index, method name, line) of the first `get_model_config()`."""
+        """(step index, method name, line) of the first `model_config_of()`."""
         for index, step in enumerate(steps):
             for method in reached[step]:
                 for node in ast.walk(methods[method]):
                     if (
                         isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "get_model_config"
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "model_config_of"
                     ):
                         return index, step, method, node.lineno
         return None
@@ -532,8 +533,8 @@ def _declaration_positions():
                 same_body = index == build_index and method == build_method
                 rank = 0 if same_body and node.lineno < build_line_in_body else 1
                 if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "_declare"
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "declare_resolution"
                 ):
                     fields = {kw.arg for kw in node.keywords if kw.arg}
                 # A handler that calls an imported hook (the Kimi and DeepSeek
@@ -669,8 +670,8 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             for method in reached[step]
             if any(
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "get_model_config"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "model_config_of"
                 for node in ast.walk(methods[method])
             )
         )

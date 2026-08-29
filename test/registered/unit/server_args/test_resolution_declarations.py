@@ -24,7 +24,6 @@ import unittest
 import unittest.mock
 
 import sglang
-from sglang.srt import server_args as server_args_module
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -147,7 +146,7 @@ def _late_resolvers():
                     if isinstance(node.func, ast.Attribute)
                     else getattr(node.func, "id", None)
                 )
-                if called in ("declare_late_resolution", "_late_resolution"):
+                if called == "declare_late_resolution":
                     return True
                 if called and reaches(called, seen):
                     return True
@@ -887,7 +886,9 @@ class TestResolutionDeclarations(CustomTestCase):
         # The pipeline asks the platform other questions on the way through
         # (whether it is out of tree, whether it supports piecewise capture),
         # and which of those it reaches depends on the host.
-        class _Plugin(type(server_args_module.current_platform)):
+        from sglang.srt.platforms import current_platform
+
+        class _Plugin(type(current_platform)):
             device_name = "oot"
 
             def apply_server_args_defaults(self, server_args):

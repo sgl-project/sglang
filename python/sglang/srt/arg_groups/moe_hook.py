@@ -8,7 +8,10 @@ import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    cutedsl_moe_max_num_tokens,
     declare_resolution,
+    max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
     resolved_view,
     resolving_view,
 )
@@ -24,6 +27,8 @@ def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
     # the compatibility asserts and fusion writes stay below.
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.arg_groups.overrides import (
         _moe_runner_backend_quant_constraints,
@@ -50,7 +55,7 @@ def handle_moe_kernel_config(server_args: Any):
         # modelopt_mixed with non-NVFP4 MoE layers is rejected at load time.
         assert (
             view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
-            or server_args.get_model_config().nvfp4_moe_meta is not None
+            or model_config_of(server_args).nvfp4_moe_meta is not None
         ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
         assert view.ep_size in [
             1,
@@ -116,6 +121,8 @@ def handle_a2a_moe(server_args: Any):
     # the resolution pipeline (arg_groups/overrides.py:
     # _a2a_backend_overrides / _a2a_ep_size); the per-backend logs,
     # asserts, fusion/deepep_mode/env/cuda-graph writes stay below.
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     cfg = resolving_view(server_args)
     from sglang.srt.arg_groups.overrides import (
         _a2a_backend_overrides,
@@ -259,7 +266,7 @@ def handle_a2a_moe(server_args: Any):
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
         if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
             resolved_view(server_args).quantization == "modelopt_fp4"
-            or server_args.get_model_config().nvfp4_moe_meta is not None
+            or model_config_of(server_args).nvfp4_moe_meta is not None
         ):
             envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
             logger.warning(
@@ -291,7 +298,7 @@ def handle_a2a_moe(server_args: Any):
         # Skip validation if disaggregation mode is decode.
         if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
-                server_args._required_mori_dispatch_tokens_per_rank()
+                required_mori_dispatch_tokens_per_rank(server_args)
             ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
                 "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) "
                 "must be >= the per-rank MoRI dispatch tokens "
@@ -339,7 +346,7 @@ def handle_a2a_moe(server_args: Any):
         # Skip validation if disaggregation mode is decode
         if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
             assert (
-                server_args._required_pplx_dispatch_tokens_per_rank()
+                required_pplx_dispatch_tokens_per_rank(server_args)
             ) <= envs.SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), (
                 "SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 128) "
                 "must be >= the per-rank pplx dispatch tokens "
@@ -372,7 +379,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
     capacity = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
     if view.disaggregation_mode != "decode":
-        prefill_tokens = server_args.max_prefill_buffer_tokens() or (
+        prefill_tokens = max_prefill_buffer_tokens(server_args) or (
             view.max_prefill_tokens or 0
         )
         if prefill_tokens > capacity:
@@ -396,7 +403,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
         per_rank_pool_bs = max(1, view.max_running_requests // attn_dp_size)
         graph_bs = min(graph_bs, per_rank_pool_bs)
     tokens_per_req = (
-        server_args.max_speculative_num_draft_tokens or 1
+        max_speculative_num_draft_tokens(server_args) or 1
         if view.speculative_algorithm
         else 1
     )
@@ -413,6 +420,8 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
     """Allow DeepEP v2 only where its model workflow is validated."""
+    from sglang.srt.arg_groups.overrides import model_config_of
+
     if (
         parse_connector_type(resolved_view(server_args).model_path)
         == ConnectorType.INSTANCE
@@ -424,7 +433,7 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
         )
 
     architectures = (
-        getattr(server_args.get_model_config().hf_config, "architectures", None) or []
+        getattr(model_config_of(server_args).hf_config, "architectures", None) or []
     )
 
     architecture = architectures[0] if architectures else None
@@ -458,7 +467,7 @@ def validate_cutedsl_a2a_token_budget(server_args: Any):
         and cfg.disaggregation_mode != "decode"
     ):
         return
-    required_tokens = server_args.cutedsl_moe_max_num_tokens()
+    required_tokens = cutedsl_moe_max_num_tokens(server_args)
     max_dispatch_tokens_per_rank = (
         envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get() or 1024
     )
@@ -481,3 +490,18 @@ def validate_cutedsl_a2a_token_budget(server_args: Any):
             f"{required_per_rank}` or lower the relevant limit "
             f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
         )
+
+
+def required_mori_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Max tokens a single rank dispatches through MoRI in one forward."""
+    cfg = resolving_view(server_args)
+    return cfg.chunked_prefill_size
+
+
+def required_pplx_dispatch_tokens_per_rank(server_args: Any) -> int:
+    """Max tokens a single rank dispatches through pplx in one forward."""
+    cfg = resolving_view(server_args)
+    required = cfg.chunked_prefill_size
+    if cfg.cuda_graph_max_bs_decode is not None:
+        required = max(required, cfg.cuda_graph_max_bs_decode)
+    return required

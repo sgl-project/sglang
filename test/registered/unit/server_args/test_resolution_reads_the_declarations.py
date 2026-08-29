@@ -4,8 +4,8 @@
 nothing. The fields keep what the caller passed, so a resolver that reads a
 field another resolver may have decided reads the raw input -- silently, and
 only on the configurations where that other resolver fires. The whole pipeline
-therefore reads through `resolving_view` (or `ServerArgs._resolved()`, which is
-the same view spelled as the record's own member), and this pins that there is
+therefore reads through `resolving_view` (or `resolved_view`, which is
+the same view after resolution has finished), and this pins that there is
 nothing left reading a field directly.
 
 Subjects: every function in `arg_groups/` that takes a config, every
@@ -83,7 +83,6 @@ def _field_reads(fn, holders):
 
 _DECLARERS = frozenset(
     {
-        "_declare",
         "declare_resolution",
         "declare_late_resolution",
         "declare_direct_writes",
@@ -472,7 +471,7 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         members = _record_members()
         # The floor is here to catch the scan collapsing, not to pin the
         # class's size.
-        self.assertGreater(len(members), 40, f"only {len(members)} members were found")
+        self.assertGreater(len(members), 25, f"only {len(members)} members were found")
         offenders = []
         for name, fn in sorted(members.items()):
             holders = _holders(fn) | {"self"}
