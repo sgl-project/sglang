@@ -49,6 +49,18 @@ class DreamModel(Qwen2ForCausalLM):
                 if seq_lens is None:
                     raise RuntimeError("Dream requires per-request sequence lengths")
 
+                # Prefill BCG replays the transformer body at a padded token
+                # bucket, while Dream's ragged canvas metadata still describes
+                # only the real tokens.  The padding is appended after the
+                # live canvas, so remove it before splitting by request.
+                raw_num_tokens = sum(seq_lens)
+                if raw_num_tokens > hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "Dream sequence lengths exceed the hidden-state rows: "
+                        f"{raw_num_tokens} > {hidden_states.shape[0]}"
+                    )
+                hidden_states = hidden_states[:raw_num_tokens]
+
                 parts = hidden_states.split(seq_lens)
 
                 hidden_states = torch.cat(
