@@ -948,7 +948,8 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
 
         req = object.__new__(schedule_batch.Req)
         req.rid = "request-id"
-        req.multimodal_inputs = object()
+        req.multimodal_inputs = schedule_batch.MultimodalInputs(mm_items=[])
+        req.session = None
         req.grammar = object()
         req.origin_input_ids = [1, 2]
         req.return_logprob = True
