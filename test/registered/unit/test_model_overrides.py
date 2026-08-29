@@ -1236,6 +1236,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "operator's input",
         )
 
+    def test_a_pass_that_declares_nothing_runs_on_the_published_record(self):
+        """A validation slot has to survive a rebuild on the same record.
+
+        `Engine.shutdown()` leaves the launch published, and `Engine(server_args=sa)`
+        with the same instance calls `check_server_args()` again before
+        republishing. `_hisparse_validation` reaches the pass runner from there
+        and returns nothing, so refusing on identity alone would fail the
+        second launch.
+        """
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.runtime_context import publish, reset_context
+
+        sa = self._construct("LlamaForCausalLM", "llama")
+        self.addCleanup(reset_context)
+        publish(sa, role="scheduler")
+
+        def _declares_nothing(view):
+            return {}
+
+        run_post_process_pass(sa, _declares_nothing)  # must not raise
+
+        def _declares_something(view):
+            return {"attention_backend": "triton"}
+
+        with self.assertRaisesRegex(ValueError, r"on the published config"):
+            run_post_process_pass(sa, _declares_something)
+
     def test_attention_backend_user_choice_declares_nothing_extra(self):
         sa = self._construct("LlamaForCausalLM", "llama", attention_backend="triton")
         self.assertEqual(self._resolved(sa, "attention_backend"), "triton")

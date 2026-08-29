@@ -2,7 +2,7 @@
 // see _deployment.jsx header for the field contract.
 //
 // Sizing (drives the TP/nodes choices below):
-// ~760B total / ~40B active MoE. BF16 weights ≈ 1.5TB → TP16 on H200/B200
+// 770B total / 49B active MoE. BF16 weights ≈ 1.5TB → TP16 on H200/B200
 // (2x8 multi-node) or TP8 on B300 (single 8-GPU node) / GB300 (2x4 multi-node
 // — GB300 hosts carry 4 GPUs). MXFP8 ≈ 760GB → TP4 on B300/GB300 (288GB),
 // TP8 on B200; the MXFP8 kernel path requires SM100+, and H200 (SM90) was
@@ -12,10 +12,11 @@
 // left is ~25GB/rank ≈ 260K tokens — size `--context-length` to the pool
 // (the page's sizing table suggests 131072 there).
 //
-// Every cell carries `verificationStatus: "in-progress"`. When a recipe's
-// end-to-end verification lands, REPLACE that line with `verified: true` —
-// `verificationStatus` takes precedence over `verified` in the engine, so
-// merely adding `verified: true` would leave the badge amber.
+// Single-node recipes are `verified: true` (run end-to-end); the 2-node
+// BF16 recipes still carry `verificationStatus: "in-progress"` — when one
+// lands, REPLACE that line with `verified: true` (`verificationStatus`
+// takes precedence over `verified` in the engine, so merely adding
+// `verified: true` would leave the badge amber).
 
 export const config = {
   modelName: "Hy4-Preview",
@@ -173,37 +174,19 @@ sgl-eval run gsm8k \\
 
     // ----- Card 2: "MoE Parallelism" -----
     // 256 routed + 1 shared experts, top-8 sigmoid routing. The recipes run
-    // the MoE under pure TP (deep_gemm runner on B300/GB300 MXFP8, triton on
-    // B200); DeepEP/EP are experimentation overrides. No MegaMoE option —
-    // its fused path is not wired for Hy4's sigmoid-scored, bounded-SwiGLU
-    // experts.
+    // the MoE under pure TP (deep_gemm runner on MXFP8 — the validated
+    // HYV4 path); DeepEP is an experimentation override. No
+    // EP knob: the runtime rewrites EP to TP for a2a-spanning backends
+    // (DeepEP), so a free EP degree would advertise a topology that never
+    // runs. No MegaMoE option — its fused path is not wired for Hy4's
+    // sigmoid-scored, bounded-SwiGLU experts.
     moe: {
       backend: {
         options: [
           { id: null,     label: "Inherited" },
-          { id: "deepep", label: "DeepEP", flags: ["--moe-a2a-backend deepep"] },
+          { id: "deepep", label: "DeepEP (EP = TP)", flags: ["--moe-a2a-backend deepep"] },
         ],
       },
-      ep: { label: "EP", values: [
-        null,
-        4,
-        { value: 8,
-          disable: [
-            { when: { effTp: [4] },
-              reason: "EP=8 needs TP ≥ 8 (TP must be divisible by the EP degree) — raise TP in the Attention card first." },
-            { when: { hw: ["gb300"], nodes: ["single"] },
-              reason: "GB300 hosts carry 4 GPUs — EP=8 needs Multi-Nodes (2×4)." },
-          ] },
-        { value: 16,
-          disable: [
-            { when: { effTp: [4, 8] },
-              reason: "EP=16 needs TP=16 — raise TP in the Attention card first." },
-            { when: { nodes: ["single"] },
-              reason: "EP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
-            { when: { hw: ["gb300"] },
-              reason: "GB300 hosts carry 4 GPUs — 2 nodes provide only 8 ranks." },
-          ] },
-      ]},
     },
 
     // ----- Card 3: "Parsers" -----
@@ -316,7 +299,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -335,7 +318,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "mxfp8", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -355,7 +338,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -372,7 +355,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -422,18 +405,16 @@ sgl-eval run gsm8k \\
     },
 
     // ====================================================================
-    // B200 (192GB) × MXFP8 — TP8 single node (~95GB weights/rank). B200
-    // uses the triton MoE runner (the deep_gemm fused-expert path targets
-    // the 288GB SM103 parts).
+    // B200 (192GB) × MXFP8 — TP8 single node (~95GB weights/rank).
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend triton",
+        "--moe-runner-backend deep_gemm",
         "--fp8-gemm-backend deep_gemm",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -447,12 +428,12 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend triton",
+        "--moe-runner-backend deep_gemm",
         "--fp8-gemm-backend deep_gemm",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -502,7 +483,7 @@ sgl-eval run gsm8k \\
     // ====================================================================
     {
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "low-latency", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -521,7 +502,7 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "mxfp8", strategy: "high-throughput", nodes: "single" },
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

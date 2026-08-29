@@ -531,15 +531,17 @@ class KimiK3MoE(nn.Module):
                 "got a checkpoint with different constants"
             )
 
-        # EP a2a backends (megamoe / DeepEP / MoRI) move each row to its
-        # experts directly, so the MoE region can consume whatever rows this
-        # rank holds — an SP-MoE token shard (attn_tp > 1) or the DP-local
-        # batch (DP attention) — with every global token dispatched exactly
-        # once. No DP gather and no TP reduce is needed anywhere in the region.
+        # EP a2a backends (megamoe / DeepEP / Mooncake / Ascend-FuseEP / MoRI)
+        # move each row to its experts directly, so the MoE region can consume
+        # whatever rows this rank holds — an SP-MoE token shard (attn_tp > 1) or
+        # the DP-local batch (DP attention) — with every global token dispatched
+        # exactly once. No DP gather and no TP reduce is needed anywhere in the
+        # region.
         _a2a_backend = get_moe_a2a_backend()
         self._ep_a2a = (
             _a2a_backend.is_megamoe()
             or _a2a_backend.is_deepep()
+            or _a2a_backend.is_mooncake()
             or _a2a_backend.is_ascend_fuseep()
             or _a2a_backend.is_mori()
         )
@@ -778,7 +780,10 @@ class KimiK3MoE(nn.Module):
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+        from sglang.srt.layers.moe.mega_moe import (
+            _configure_mega_moe_deep_gemm_num_sms,
+            _get_mega_moe_symm_buffer,
+        )
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -831,15 +836,16 @@ class KimiK3MoE(nn.Module):
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="situ",
-            fast_math=True,
-        )
+        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="situ",
+                fast_math=True,
+            )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -2162,8 +2168,9 @@ class KimiK3DecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         )
-        # SP-MoE (EP a2a backend — megamoe, DeepEP or MoRI): o_proj defers its
-        # attention-TP reduction; this layer completes it as a reduce-scatter
+        # SP-MoE (EP a2a backend — megamoe, DeepEP, Mooncake, Ascend-FuseEP or
+        # MoRI): o_proj defers its attention-TP reduction; this layer completes
+        # it as a reduce-scatter
         # so the whole MoE region (agg2, norms, gate, latent projs, tp1
         # shared experts, EP a2a dispatch) runs on 1/attn_tp of the rows,
         # then all-gathers rows back after the MoE tail add. RS+AG moves the
@@ -2184,6 +2191,7 @@ class KimiK3DecoderLayer(nn.Module):
             (
                 _a2a_backend.is_megamoe()
                 or _a2a_backend.is_deepep()
+                or _a2a_backend.is_mooncake()
                 or _a2a_backend.is_ascend_fuseep()
                 or _a2a_backend.is_mori()
             )
