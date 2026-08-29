@@ -28,7 +28,13 @@ from sglang.srt.multimodal.mm_utils import (
     process_anyres_image,
 )
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import ImageData, get_image_bytes, load_image, logger
+from sglang.srt.utils import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+    logger,
+)
 from sglang.utils import get_exception_traceback
 
 
@@ -93,6 +99,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     pixel_values = pixel_values.astype(np.float16)
 
                 return pixel_values, image_hash, image.size
+        except CLIENT_MEDIA_EXCEPTIONS as error:
+            raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
             raise

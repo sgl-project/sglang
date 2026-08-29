@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
 
+from PIL import UnidentifiedImageError
+
 from sglang.srt.models.llava import AutoModel, LlavaForConditionalGeneration
 from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -90,18 +92,20 @@ class TestLlavaForConditionalGeneration(CustomTestCase):
 
 class TestLlavaImageProcessor(CustomTestCase):
     @patch("sglang.srt.multimodal.processors.llava.load_image")
-    def test_preprocess_preserves_media_error(self, mock_load_image):
-        media_error = ValueError("invalid image payload")
+    def test_preprocess_reports_invalid_media_as_client_error(self, mock_load_image):
+        media_error = UnidentifiedImageError("invalid image payload")
         mock_load_image.side_effect = media_error
 
-        with self.assertRaises(ValueError) as raised:
+        with self.assertRaisesRegex(
+            ValueError, "Error while processing image: invalid image payload"
+        ) as raised:
             LlavaImageProcessor._preprocess_image_task(
                 b"invalid",
                 image_hash=1,
                 processor=unittest.mock.Mock(),
             )
 
-        self.assertIs(raised.exception, media_error)
+        self.assertIs(raised.exception.__cause__, media_error)
 
 
 if __name__ == "__main__":
