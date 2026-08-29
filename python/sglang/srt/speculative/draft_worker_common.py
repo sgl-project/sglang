@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import attention_backends, get_spec
+from sglang.srt.runtime_context import attention_backends, get_device, get_spec
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -29,6 +29,13 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
+def _default_draft_attention_backend() -> str:
+    # A GPU default on a CPU run would fail at the first draft forward.
+    if get_device().device == "cpu":
+        return "intel_amx"
+    return "triton" if torch.version.hip else "flashinfer"
+
+
 def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
     """The draft's attention backend, from the published leaves.
 
@@ -40,9 +47,9 @@ def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:
-        return "triton" if torch.version.hip else "flashinfer"
+        return _default_draft_attention_backend()
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
-        fallback = "triton" if torch.version.hip else "flashinfer"
+        fallback = _default_draft_attention_backend()
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",

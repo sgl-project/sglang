@@ -56,6 +56,12 @@ class DFlashVerifyInput(SpecInput):
             self.num_tokens_per_req = int(self.draft_token_num)
         self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
+    @property
+    def tree_topk(self) -> int:
+        # DFLASH proposals are a linear chain, so backends that branch on tree
+        # width (e.g. intel_amx) can take their mask-free causal path.
+        return int(self.topk)
+
     def prepare_for_verify(
         self,
         batch: ScheduleBatch,

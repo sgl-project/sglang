@@ -62,6 +62,10 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         self._attn_logits_buffers: dict[tuple[int, int], torch.Tensor] = {}
 
+        # All-visible qlen masks for non-causal (ENCODER_ONLY) spec blocks,
+        # keyed by (batch_size, draft_token_num).
+        self._non_causal_masks: dict[tuple[int, int], torch.Tensor] = {}
+
         # speculative decoding params
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
@@ -109,7 +113,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             # exactly the kernel's built-in causal masking, and skipping the explicit
             # mask lets extend_attention_cpu take its faster mask-free path. EAGLE
             # has tree_topk == topk (> 1 for real trees); NGRAM has tree_topk == -1
-            # (irregular tree); both need the mask.
+            # (irregular tree); both need the mask. DFLASH is a chain (== 1).
             if spec_info.tree_topk != 1:
                 custom_mask = spec_info.custom_mask
                 if custom_mask is not None and custom_mask.numel() > 0:
@@ -215,6 +219,19 @@ class IntelAMXAttnBackend(AttentionBackend):
         # verify batches carry no extend_* fields; see _build_extend_metadata).
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
+        if (
+            tree_mask is None
+            and not layer.is_cross_attention
+            and layer.attn_type == AttentionType.ENCODER_ONLY
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            # The kernel's implicit mask is causal. A non-causal layer (DFLASH
+            # draft blocks) needs every query in the block to see every key in
+            # it, which an all-visible qlen mask expresses.
+            tree_mask = self._get_non_causal_qlen_mask(
+                forward_batch.batch_size, forward_batch.spec_info.draft_token_num
+            )
+
         _, max_extend_len = self.forward_metadata
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
@@ -308,6 +325,16 @@ class IntelAMXAttnBackend(AttentionBackend):
             sinks,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _get_non_causal_qlen_mask(self, bs: int, draft_token_num: int) -> torch.Tensor:
+        key = (int(bs), int(draft_token_num))
+        mask = self._non_causal_masks.get(key)
+        if mask is None:
+            mask = torch.ones(
+                key[0] * key[1] * key[1], dtype=torch.bool, device=self.device
+            )
+            self._non_causal_masks[key] = mask
+        return mask
 
     def _get_attn_logits_buffer(
         self, num_seqs: int, num_heads: int, v_head_dim: int
