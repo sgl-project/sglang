@@ -53,3 +53,9 @@ def test_scatter_row_count_mismatch_fails_loud():
     mask_heavy[2:6] = True
     with pytest.raises((RuntimeError, IndexError)):
         _scatter_mm_embedding(dest=dest, mask=mask_heavy, src=torch.ones(1, 4))
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
