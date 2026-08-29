@@ -1,6 +1,7 @@
 """CUDA graph-pool borrowing allocator and lifetime regression tests."""
 
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -11,7 +12,8 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils import pool
-from sglang.srt.speculative import eagle_utils
+from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -350,6 +352,115 @@ class TestGraphPoolBorrow(CustomTestCase):
             torch.cuda.empty_cache()
 
         del graph, y
+
+    def test_dflash_verify_output_buffers_predate_the_borrow_scope(self):
+        """The chain verify buffers outlive the step, so creating them inside
+        the borrow scope would let the next replay overwrite the accept
+        length instead of raising."""
+        events = []
+
+        @contextmanager
+        def recording_borrow(user):
+            events.append(f"borrow:{user}")
+            yield
+            events.append("release")
+
+        real_buffers = dflash_utils._get_or_create_chain_verify_buffers
+
+        def recording_buffers(**kwargs):
+            events.append("buffers")
+            return real_buffers(**kwargs)
+
+        def fake_sampling(**kwargs):
+            kwargs["predicts"].fill_(3)
+            kwargs["accept_index"].fill_(0)
+            kwargs["accept_token_num"].fill_(1)
+
+        sampling_info = SimpleNamespace(
+            temperatures=torch.ones((1, 1)),
+            top_ks=torch.ones(1, dtype=torch.int32),
+            top_ps=torch.ones(1),
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+        )
+        with (
+            patch.object(dflash_utils, "borrow_graph_pool", recording_borrow),
+            patch.object(
+                dflash_utils,
+                "_get_or_create_chain_verify_buffers",
+                recording_buffers,
+            ),
+            patch.object(dflash_utils, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True),
+            patch.object(
+                dflash_utils,
+                "tree_speculative_sampling_target_only",
+                fake_sampling,
+            ),
+        ):
+            correct_len, bonus = (
+                dflash_utils.compute_dflash_sampling_correct_drafts_and_bonus(
+                    candidates=torch.zeros((1, 2), dtype=torch.int64),
+                    next_token_logits=torch.randn((2, 8)),
+                    sampling_info=sampling_info,
+                    threshold_single=1.0,
+                    threshold_acc=1.0,
+                )
+            )
+
+        self.assertEqual(
+            events, ["buffers", "borrow:DFLASH verify probabilities", "release"]
+        )
+        self.assertTrue(torch.equal(correct_len, torch.ones_like(correct_len)))
+        self.assertTrue(torch.equal(bonus, torch.full_like(bonus, 3)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_dflash_prewarm_falls_back_when_the_rehearsal_exhausts_the_pool(self):
+        """A rehearsal too large for the pool must retire borrowing and
+        re-measure, rather than crash startup or leave KV sizing without the
+        headroom it now has to reserve."""
+        worker = object.__new__(DFlashWorkerV2)
+        worker.block_size = 4
+        worker.device = "cuda"
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                max_running_requests=2,
+                max_decode_logits_rows=lambda: 8,
+                sampling_prewarm_result=None,
+            ),
+            model_config=SimpleNamespace(vocab_size=32),
+        )
+        worker.model_runner = worker._target_worker.model_runner
+
+        calls = []
+
+        def rehearse(**kwargs):
+            calls.append(pool.graph_pool_borrow_enabled())
+            if len(calls) == 2:
+                raise torch.OutOfMemoryError("rehearsal too large")
+            return torch.zeros(2), torch.zeros(2)
+
+        with (
+            envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(True),
+            patch.object(pool, "get_global_graph_memory_pool", return_value=(1, 2)),
+            patch.object(
+                dflash_worker_v2,
+                "compute_dflash_sampling_correct_drafts_and_bonus",
+                rehearse,
+            ),
+        ):
+            self.assertTrue(pool.graph_pool_borrow_enabled())
+            result = worker.prewarm_sampling()
+            self.assertFalse(pool.graph_pool_borrow_enabled())
+
+        # Warm pass outside the pool, borrowed pass that OOMs, retry after the
+        # fallback retires borrowing.
+        self.assertEqual(calls, [False, True, False])
+        # 2 rows x 4 draft tokens x 32 vocab x 4 bytes.
+        self.assertEqual(result.sampling_input_bytes, 2 * 4 * 32 * 4)
+        self.assertGreaterEqual(
+            result.sampling_headroom_bytes, result.sampling_input_bytes
+        )
+        self.assertIs(worker.model_runner.sampling_prewarm_result, result)
 
 
 if __name__ == "__main__":
