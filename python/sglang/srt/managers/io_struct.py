@@ -61,7 +61,7 @@ from sglang.srt.managers.schedule_batch import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import MAX_STOP_STRINGS, SamplingParams
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import dec_hook, enc_hook, ext_hook
@@ -382,6 +382,7 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        self._validate_stop_string_counts()
         if self.data_parallel_rank is not None:
             import warnings
 
@@ -406,6 +407,25 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+
+    def _validate_stop_string_counts(self) -> None:
+        if self.sampling_params is None:
+            return
+
+        params_list = (
+            [self.sampling_params]
+            if isinstance(self.sampling_params, dict)
+            else self.sampling_params
+        )
+        for params in params_list:
+            if not isinstance(params, dict):
+                continue
+            stop = params.get("stop")
+            if isinstance(stop, list) and len(stop) > MAX_STOP_STRINGS:
+                raise ValueError(
+                    f"stop must contain at most {MAX_STOP_STRINGS} strings, "
+                    f"got {len(stop)}."
+                )
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""

@@ -38,6 +38,8 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+# Keep in sync with rust/sglang-server/src/message/sampling.rs.
+MAX_STOP_STRINGS = 32
 
 logger = logging.getLogger(__name__)
 
