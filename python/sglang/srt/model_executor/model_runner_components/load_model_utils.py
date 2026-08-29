@@ -26,6 +26,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_model,
     get_observability,
@@ -72,7 +73,6 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )
-        from sglang.srt.runtime_context import get_context
 
         # Device-driven, so every runner in the process resolves the same way;
         # the per-runner truth is model_config.dtype, this is the record.

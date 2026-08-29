@@ -486,7 +486,6 @@ def is_shared_experts_fusion_disabled() -> bool:
         )
     moe = get_flags().moe
     if moe.disable_shared_experts_fusion is None:
-        from sglang.srt.runtime_context import get_exec
 
         return get_exec().moe.disable_shared_experts_fusion
     return moe.disable_shared_experts_fusion
@@ -529,7 +528,6 @@ def install_shared_experts_fusion_decision(
     Inside ``draft_model_build_scope`` the answer also lands on the speculative
     leaf, so a flags dump afterwards shows both runners' decisions.
     """
-    from sglang.srt.runtime_context import get_exec
 
     disabled = get_exec().moe.disable_shared_experts_fusion
     if not disabled:

@@ -13,7 +13,11 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_resources,
+)
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -630,7 +634,6 @@ class FlashInferWorkspaceManager:
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
     """The per-group fusion workspace manager; the instances live on
     ``ctx.resources`` (one per comm group, created lazily)."""
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     name = (
@@ -1018,7 +1021,6 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    from sglang.srt.runtime_context import get_resources
 
     buffers = get_resources().buffers
     for name in (

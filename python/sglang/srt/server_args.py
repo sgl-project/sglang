@@ -69,6 +69,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import (
+    get_context,
+    publish,
+)
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -4417,7 +4421,6 @@ def _underscore_field_names() -> frozenset:
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""
-    from sglang.srt.runtime_context import publish
 
     publish(server_args, role="scheduler")
 
@@ -4425,7 +4428,6 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
 def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
     the process role differs."""
-    from sglang.srt.runtime_context import publish
 
     publish(server_args, role="tokenizer")
 
@@ -4433,7 +4435,6 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
 def get_global_server_args() -> ServerArgs:
     """Legacy accessor shim — prefer ``get_server_args()`` from
     ``sglang.srt.runtime_context`` in new code."""
-    from sglang.srt.runtime_context import get_context
 
     return get_context().server_args
 

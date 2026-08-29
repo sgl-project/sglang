@@ -46,6 +46,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
@@ -241,7 +242,6 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
     ``declare_late_resolution`` is -- post-publish changes go to the bags through
     ``get_context().override(...)``.
     """
-    from sglang.srt.runtime_context import get_context
 
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
@@ -331,7 +331,6 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     field write would desync them, which is what ``get_context().override`` is
     for.
     """
-    from sglang.srt.runtime_context import get_context
 
     try:
         published = get_context().server_args

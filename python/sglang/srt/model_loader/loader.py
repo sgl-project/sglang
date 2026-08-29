@@ -4388,7 +4388,6 @@ def get_model_loader(
         if load_config.weight_cache_socket:
             socket_path = load_config.weight_cache_socket
         else:
-            from sglang.srt.runtime_context import get_parallel
 
             ps = get_parallel()
             global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)

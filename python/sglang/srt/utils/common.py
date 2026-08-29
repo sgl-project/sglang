@@ -100,7 +100,10 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
+    get_model,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -3688,8 +3691,6 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
-    from sglang.srt.runtime_context import get_flags
-
     if get_flags().capture.disable_dispose_tensor:
         return
 
@@ -3723,7 +3724,6 @@ def require_mlp_tp_gather():
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_exec, get_parallel
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
@@ -3783,7 +3783,6 @@ def require_attn_tp_gather():
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().disable_attn_tp_gather:
         return False
@@ -3807,7 +3806,6 @@ def require_gathered_buffer():
 
 
 def require_mlp_sync():
-    from sglang.srt.runtime_context import get_parallel
 
     return get_parallel().enable_dp_attention or require_gathered_buffer()
 
@@ -4643,7 +4641,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     resolution's answers.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
