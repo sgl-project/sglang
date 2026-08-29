@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import sglang.kernels.ops.attention.fla.layernorm_gated as layernorm_gated_module
 from sglang.kernels.ops.attention.fla.layernorm_gated import (
     _layer_norm_fwd as layer_norm_fwd,
 )
@@ -390,6 +391,59 @@ def _layernorm_guard_misc_worker(
             out = layernorm_fn(x, w, b, z=None, eps=eps)
             ref = layer_norm_ref(x, w, b, z=None, eps=eps, is_rms_norm=False)
             torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+def test_npu_sigmoid_gate_fallback(monkeypatch, norm_before_gate: bool):
+    def fake_npu_layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=None,
+        out=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation="swish",
+    ):
+        assert z is None
+        assert activation == "swish"
+        assert group_size is None
+        assert is_rms_norm
+        y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + eps)
+        y = (y * weight.float()).to(x.dtype)
+        return y, None, None
+
+    monkeypatch.setattr(layernorm_gated_module, "_is_npu", True)
+    monkeypatch.setattr(
+        layernorm_gated_module, "_layer_norm_fwd", fake_npu_layer_norm_fwd
+    )
+
+    x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.float32)
+    z = torch.tensor([[-1.0, 0.0, 1.0, 2.0]], dtype=torch.float32)
+    weight = torch.tensor([0.5, 1.0, 1.5, 2.0], dtype=torch.float32)
+    eps = 1e-6
+
+    out = layernorm_gated_module.rms_norm_gated(
+        x=x,
+        weight=weight,
+        bias=None,
+        z=z,
+        eps=eps,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation="sigmoid",
+    )
+
+    norm_input = x if norm_before_gate else x * torch.sigmoid(z)
+    expected = norm_input * torch.rsqrt(
+        norm_input.square().mean(-1, keepdim=True) + eps
+    )
+    expected = expected * weight
+    if norm_before_gate:
+        expected = expected * torch.sigmoid(z)
+    torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":

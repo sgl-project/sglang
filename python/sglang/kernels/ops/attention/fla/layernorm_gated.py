@@ -313,7 +313,7 @@ def rms_norm_gated(
     is_rms_norm=False,
     activation: str = "swish",
 ):
-    """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+    """Apply layer norm/RMS norm and an optional activated gate."""
 
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -328,8 +328,26 @@ def rms_norm_gated(
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
+
+    npu_sigmoid_gate = None
     if _is_npu:
-        assert activation == "swish", "NPU only supports swish activation"
+        if activation == "sigmoid":
+            # The NPU fused kernel currently hardcodes swish when z is present.
+            # Keep the checkpoint's sigmoid semantics by running the fused norm
+            # without z and applying the gate with native NPU PyTorch ops.
+            if z is not None:
+                if norm_before_gate:
+                    npu_sigmoid_gate = z
+                else:
+                    x = (x.float() * torch.sigmoid(z.float())).to(x.dtype)
+                z = None
+            # Activation is unused when z is None, but pass the value supported
+            # by the current sgl-kernel-npu implementation.
+            activation = "swish"
+        else:
+            assert activation == "swish", (
+                f"NPU only supports swish and sigmoid activation, got {activation}"
+            )
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
@@ -341,6 +359,8 @@ def rms_norm_gated(
         is_rms_norm=is_rms_norm,
         activation=activation,
     )
+    if npu_sigmoid_gate is not None:
+        y = (y.float() * torch.sigmoid(npu_sigmoid_gate.float())).to(y.dtype)
     return y.reshape(x_shape_og)
 
 
