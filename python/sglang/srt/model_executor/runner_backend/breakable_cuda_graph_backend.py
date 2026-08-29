@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+    should_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
     DedupedCudaGraphMixin,
@@ -77,7 +78,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._use_symmetric_memory_graph_pool = (
-            cuda_graph_runner.model_runner.spec_algorithm.is_speculative()
+            should_use_dedicated_symmetric_memory_graph_pool(cuda_graph_runner)
         )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
@@ -154,6 +155,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     ),
                 ):
                     captured_fn()
+
+        if should_prime and post_warmup_hook is not None:
+            post_warmup_hook()
+            self._device_module.synchronize()
+            self._tp_group.barrier()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         size = shape_key.size

@@ -278,27 +278,7 @@ def defer_symmetric_memory_graph_registration(
 
 
 class SymmetricMemoryContext:
-    """
-    Context manager for using symmetric memory with pynccl.
-
-    To Utilize the symmetric memory feature in NCCL, the buffers need to be allocated
-    by `ncclMemAlloc` and registered by `ncclCommWindowRegister`. Due to this, we introduce
-    this context manager. All tensors created under this context will be correctly
-    allocated and registered with a custom allocator.
-
-    Key design:
-    - All groups share one eager MemPool and one graph-session MemPool.
-    - Eager warmup stays in the eager pool. Before each retained graph, a
-      disposable capture primes the separate graph pool, then any new segments
-      are registered outside capture.
-    - The retained capture uses those registered segments, keeping collective
-      buffer addresses stable for graph replay.
-    - At allocation time, ptrs are tracked but NOT registered with any comm.
-    - At context exit time, nccl_allocator_register_segments_with_comm is called
-      to register all tracked segments with the current comm. The C++ layer
-      tracks per-comm registration state using index-based tracking to avoid
-      re-registration of already-registered segments.
-    """
+    """Allocate symmetric buffers and register their segments with pynccl."""
 
     def __init__(
         self,
@@ -324,15 +304,24 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.suspend()
-        _cuda_releasePool(self._device_index, self._pool_id)
-        # Registration is deferred only for the disposable priming capture.
-        # Retained captures see the already registered graph-private segments.
-        self._register_segments_for_comm()
+        _cuda_endAllocateToPool(self._device_index, self._pool_id)
+        try:
+            self._register_segments_for_comm()
+        finally:
+            self._restore_graph_pool()
+            _cuda_releasePool(self._device_index, self._pool_id)
+
+            global _active_symmetric_memory_context
+            _active_symmetric_memory_context = None
 
     def suspend(self):
         _cuda_endAllocateToPool(self._device_index, self._pool_id)
+        self._restore_graph_pool()
 
+        global _active_symmetric_memory_context
+        _active_symmetric_memory_context = None
+
+    def _restore_graph_pool(self):
         if self.is_graph_capture:
             if after_2_8_0:
                 torch._C._cuda_beginAllocateCurrentThreadToPool(
@@ -340,9 +329,6 @@ class SymmetricMemoryContext:
                 )
             else:
                 torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
-
-        global _active_symmetric_memory_context
-        _active_symmetric_memory_context = None
 
     def resume(self):
         if self.is_graph_capture:
