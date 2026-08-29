@@ -364,6 +364,87 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             self.serving_embedding._validate_request(invalid_request),
         )
 
+    # ---------- x-request-id header passthrough ----------
+    def test_rid_from_header_single_value(self):
+        """A single x-request-id header value maps to a plain string rid."""
+        raw = Mock(spec=Request)
+        raw.headers = {"x-request-id": "single-rid"}
+        self.assertEqual(
+            self.serving_embedding.extract_rid_from_header(raw, None), "single-rid"
+        )
+
+    def test_rid_from_header_comma_separated_list(self):
+        """Comma-separated header values map to a stripped rid list."""
+        raw = Mock(spec=Request)
+        raw.headers = {"x-request-id": "a, b ,c"}
+        self.assertEqual(
+            self.serving_embedding.extract_rid_from_header(raw, None),
+            ["a", "b", "c"],
+        )
+
+    def test_rid_from_header_trailing_comma_ignored(self):
+        """An empty trailing segment is dropped, leaving the single rid."""
+        raw = Mock(spec=Request)
+        raw.headers = {"x-request-id": "abc,"}
+        self.assertEqual(
+            self.serving_embedding.extract_rid_from_header(raw, None), "abc"
+        )
+
+    def test_rid_from_header_falls_back_to_body(self):
+        """Missing or blank headers fall back to the body rid field."""
+        raw = Mock(spec=Request)
+        raw.headers = {}
+        self.assertEqual(
+            self.serving_embedding.extract_rid_from_header(raw, "body-rid"),
+            "body-rid",
+        )
+
+        raw.headers = {"x-request-id": ", "}
+        self.assertEqual(
+            self.serving_embedding.extract_rid_from_header(raw, "body-rid"),
+            "body-rid",
+        )
+
+        self.assertEqual(
+            self.serving_embedding.extract_rid_from_header(None, "body-rid"),
+            "body-rid",
+        )
+
+    def test_batch_rid_list_from_header_normalizes_per_item(self):
+        """A comma-separated header rid maps to each item of a batch."""
+        batch_req = EmbeddingRequest(
+            model="test-model",
+            input=["first", "second"],
+            encoding_format="float",
+        )
+        raw = Mock(spec=Request)
+        raw.headers = {"x-request-id": "batch_0, batch_1"}
+
+        adapted, _ = self.serving_embedding._convert_to_internal_request(
+            batch_req, raw
+        )
+        adapted.normalize_batch_and_arguments()
+
+        self.assertEqual(adapted.rid, ["batch_0", "batch_1"])
+        self.assertEqual(adapted[0].rid, "batch_0")
+        self.assertEqual(adapted[1].rid, "batch_1")
+
+    def test_batch_with_single_header_rid_is_rejected(self):
+        """One header rid for a batch is a ValueError (400), not an assertion crash."""
+        batch_req = EmbeddingRequest(
+            model="test-model",
+            input=["first", "second"],
+            encoding_format="float",
+        )
+        raw = Mock(spec=Request)
+        raw.headers = {"x-request-id": "batch"}
+
+        adapted, _ = self.serving_embedding._convert_to_internal_request(
+            batch_req, raw
+        )
+        with self.assertRaisesRegex(ValueError, "requires 2 rids"):
+            adapted.normalize_batch_and_arguments()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

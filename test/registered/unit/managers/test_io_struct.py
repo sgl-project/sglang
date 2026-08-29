@@ -1164,6 +1164,28 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "must match batch size"):
             req.normalize_batch_and_arguments()
 
+    def test_batch_requires_one_rid_per_item(self):
+        """A single rid cannot label a batch: each item is an independent request."""
+        req = EmbeddingReqInput(text=["first", "second"], rid="batch")
+        with self.assertRaisesRegex(ValueError, "requires 2 rids"):
+            req.normalize_batch_and_arguments()
+
+    def test_batch_rid_list_must_match_item_count(self):
+        """Exact rid lists are preserved per item; a wrong length is rejected."""
+        req = EmbeddingReqInput(text=["first", "second"], rid=["a", "b"])
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].rid, req[1].rid], ["a", "b"])
+
+        bad_req = EmbeddingReqInput(text=["first", "second"], rid=["a", "b", "c"])
+        with self.assertRaisesRegex(ValueError, "length mismatch"):
+            bad_req.normalize_batch_and_arguments()
+
+    def test_single_rid_string_stays_string(self):
+        """A single embedding request keeps its string rid untouched."""
+        req = EmbeddingReqInput(text="only one", rid="single")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid, "single")
+
 
 if __name__ == "__main__":
     unittest.main()

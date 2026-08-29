@@ -293,17 +293,22 @@ class OpenAIServingBase(ABC):
         return body_routed_dp_rank
 
     def extract_rid_from_header(
-        self, raw_request: Request, body_rid: Optional[str] = None
-    ) -> Optional[str]:
-        """Extract rid from HTTP header, with higher priority than rid in body.
+        self,
+        raw_request: Request,
+        body_rid: Optional[Union[List[str], str]] = None,
+    ) -> Optional[Union[List[str], str]]:
+        """Extract rid from the x-request-id header, taking precedence over the body rid.
 
-        Header name: x-request-id (case-insensitive in HTTP/1.1/2)
+        A single rid is returned as a string; "rid_0, rid_1" yields a list of two.
         """
         if raw_request is None:
             return body_rid
 
         header_value = raw_request.headers.get("x-request-id")
-        if header_value is not None:
-            return header_value
+        if header_value is None:
+            return body_rid
 
-        return body_rid
+        rids = [segment.strip() for segment in header_value.split(",") if segment.strip()]
+        if not rids:
+            return body_rid
+        return rids[0] if len(rids) == 1 else rids

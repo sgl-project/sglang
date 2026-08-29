@@ -1193,8 +1193,19 @@ class EmbeddingReqInput:
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                # A batch cannot be labeled by a single rid; require one per item.
+                raise ValueError(
+                    f"Batch of {self.batch_size} requests requires {self.batch_size} "
+                    f"rids, but got a single rid {self.rid!r}."
+                )
+            elif isinstance(self.rid, list):
+                if len(self.rid) != self.batch_size:
+                    raise ValueError(
+                        "The specified rids length mismatch with the batch_size for batch processing."
+                    )
             else:
-                assert isinstance(self.rid, list), "The rid should be a list."
+                raise ValueError("The rid should be a string or a list of strings.")
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
