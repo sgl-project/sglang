@@ -277,8 +277,8 @@ def test_preload_inventory_uses_selected_transformer_safetensors(tmp_path):
 
     with patch(
         "sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base."
-        "resolve_transformer_safetensors_to_load",
-        return_value=[str(mixed_path)],
+        "resolve_transformer_checkpoint_files",
+        return_value=SimpleNamespace(safetensors=(str(mixed_path),)),
     ):
         source = ComposedPipelineBase._component_weight_source(
             _spec("transformer", 0, "/model/transformer"), server_args

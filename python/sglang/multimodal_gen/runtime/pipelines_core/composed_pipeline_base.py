@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import names_gguf_checkpoint
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
-    resolve_transformer_safetensors_to_load,
+    resolve_transformer_checkpoint_files,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
@@ -453,9 +453,9 @@ class ComposedPipelineBase(ABC):
         ):
             component_server_args = copy.copy(server_args)
             component_server_args.transformer_weights_path = weights_path
-            selected_files = resolve_transformer_safetensors_to_load(
+            selected_files = resolve_transformer_checkpoint_files(
                 component_server_args, spec.component_model_path
-            )
+            ).safetensors
             checkpoint_bytes, parameter_count = infer_safetensors_weight_stats(
                 selected_files
             )
