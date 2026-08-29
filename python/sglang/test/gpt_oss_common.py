@@ -129,11 +129,14 @@ class BaseTestGptOss(CustomTestCase):
             num_examples=198,
             # use enough threads to allow parallelism
             num_threads=198,
+            # sgl-eval's gpqa defaults to 8; one pass per effort tier is what
+            # these thresholds are measured against.
+            repeat=1,
             # TODO 4k is still not enough, we need e.g. 64k token, but that is super slow
             # otherwise a lot of questions are not answered
             max_tokens=4096,
-            # simple-evals by default use 0.5 and is better than 0.0 temperature
-            # but here for reproducibility, we use 0.1
+            # Low but non-zero for reproducibility without pinning the model to
+            # a single greedy path.
             temperature=0.1,
             reasoning_effort=reasoning_effort,
         )

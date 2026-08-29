@@ -151,6 +151,10 @@ def _run_sgl_eval(eval_name, args) -> dict:
     # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
     if getattr(args, "seed", None) is not None:
         cmd += ["--seed", str(args.seed)]
+    # gpt-oss grades one score per effort tier, so dropping this collapses every
+    # tier onto the served model's default.
+    if getattr(args, "reasoning_effort", None) is not None:
+        cmd += ["--reasoning-effort", str(args.reasoning_effort)]
     if getattr(args, "repeat", None) is not None:
         cmd += ["--n-repeats", str(args.repeat)]
     # Bound generation length so long-reasoning models don't stall the eval.
@@ -285,12 +289,11 @@ def run_eval(args):
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
-        from sglang.test.simple_eval_gpqa import GPQAEval
-
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
-        )
-        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
+        # caller's threshold has to be measured against it, not inherited from
+        # the simple-evals scorer this replaced -- that one permuted each
+        # question's four options and asked for chain-of-thought.
+        return _run_sgl_eval("gpqa", args)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
