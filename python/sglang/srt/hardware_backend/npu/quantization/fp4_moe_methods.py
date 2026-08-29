@@ -295,7 +295,9 @@ def npu_fused_experts_w4a4_mxfp(
         hidden_states,
         group_index=expert_tokens,
         alpha=1,
-        limit=swiglu_limit
+        limit=swiglu_limit,
+        bias=0,
+        interleaved=False,
     )
     # _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
@@ -370,7 +372,9 @@ def npu_fused_experts_w4a4_mxfp_decode(
         hidden_states,
         group_index=expert_tokens,
         alpha=1,
-        limit=swiglu_limit
+        limit=swiglu_limit,
+        bias=0,
+        interleaved=False,
     )
     # _apply_swiglu_limit_npu(hidden_states, swiglu_limit)
     # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
@@ -487,6 +491,8 @@ def npu_apply_without_routing_weights_w4a4_mxfp(
         group_index=group_list,
         alpha=1,
         limit=layer.moe_runner_config.swiglu_limit
+        bias=0,
+        interleaved=False,
     )
     # _apply_swiglu_limit_npu(hidden_states, layer.moe_runner_config.swiglu_limit)
     # hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
