@@ -76,6 +76,7 @@ class PendingRequest:
 # vary per request and can't merge into one HF processor call.
 _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
 _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
+_DP_RELEASE_AFTER_ENCODE = "release_after_encode"
 
 
 def validate_encode_request(request: dict) -> Optional[str]:
@@ -416,6 +417,7 @@ class DPDispatcher:
         self,
         dp_size: int,
         dispatch_sockets: List,
+        release_sockets: List,
         result_socket,
         worker_processes: List[mp.Process],
         enable_metrics: bool = False,
@@ -423,6 +425,7 @@ class DPDispatcher:
     ):
         self.dp_size = dp_size
         self.dispatch_sockets = dispatch_sockets
+        self.release_sockets = release_sockets
         self.result_socket = result_socket
         self.worker_processes = worker_processes
         # Key = req_id for encode/broadcast, or a per-control-request key for
@@ -440,6 +443,9 @@ class DPDispatcher:
         self._pending_send_at: Dict[str, float] = {}
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
+        # Keep fire-and-forget release notifications alive after an HTTP
+        # handler is cancelled.
+        self._background_tasks: Set[asyncio.Task] = set()
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
@@ -488,6 +494,28 @@ class DPDispatcher:
         self.pending_futures[rank].pop(req_id, None)
         self.req_id_to_rank.pop(req_id, None)
         self._update_pending_gauge()
+
+    def _release_abandoned_encode(self, rank: int, req_id: str) -> None:
+        """Tell the owning worker to release an encode that lost its caller."""
+
+        async def notify_worker() -> None:
+            try:
+                await async_sock_send(
+                    self.release_sockets[rank],
+                    wrap_as_pickle(
+                        {"_dp_type": _DP_RELEASE_AFTER_ENCODE, "req_id": req_id}
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to retire abandoned encoder DP request %s on rank %s",
+                    req_id,
+                    rank,
+                )
+
+        task = asyncio.create_task(notify_worker())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     @staticmethod
     def _send_req_key(req_id: str, request: dict) -> str:
@@ -574,6 +602,7 @@ class DPDispatcher:
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
         self._update_pending_gauge()
+        dispatched = False
         logger.info(
             f"MM-Encoder DP dispatch: req_id={req_id}, "
             f"modality={request.get('modality', 'image')}, "
@@ -591,6 +620,7 @@ class DPDispatcher:
                     await async_sock_send(
                         self.dispatch_sockets[rank], wrap_as_pickle(request)
                     )
+                    dispatched = True
                 except BaseException:
                     self._drop_pending_and_mapping(rank, req_id)
                     self._mapping_condition.notify_all()
@@ -602,6 +632,8 @@ class DPDispatcher:
                 future, timeout=server_module.ENCODER_REQ_TIMEOUT
             )
         except asyncio.TimeoutError:
+            if dispatched:
+                self._release_abandoned_encode(rank, req_id)
             self._drop_pending_and_mapping(rank, req_id)
             return self._timeout_envelope(
                 req_id,
@@ -609,6 +641,8 @@ class DPDispatcher:
                 f"Encoder DP rank={rank} timed out after {server_module.ENCODER_REQ_TIMEOUT}s",
             )
         except BaseException:
+            if dispatched:
+                self._release_abandoned_encode(rank, req_id)
             self._drop_pending_and_mapping(rank, req_id)
             raise
 
@@ -1473,11 +1507,27 @@ async def _dp_worker_handle_request(
         )
 
 
+async def _retire_abandoned_encode(
+    enc: MMEncoder,
+    encode_task: Optional[asyncio.Task],
+    req_id: str,
+) -> None:
+    """Retire an abandoned request without interrupting its encode work."""
+    try:
+        if encode_task is not None and not encode_task.done():
+            await enc.abandon_request(req_id)
+        else:
+            await enc.release_request(req_id)
+    except Exception:
+        logger.exception("Failed to release abandoned encoder DP request %s", req_id)
+
+
 async def run_dp_worker(
     server_args: ServerArgs,
     dp_rank: int,
     gpu_id: int,
     dispatch_path: str,
+    release_path: str,
     result_path: str,
 ):
     logger.info(
@@ -1519,9 +1569,34 @@ async def run_dp_worker(
 
     ctx = zmq.asyncio.Context(2)
     recv_sock = get_zmq_socket(ctx, zmq.PULL, dispatch_path, False)
+    release_sock = get_zmq_socket(ctx, zmq.PULL, release_path, False)
     send_sock = get_zmq_socket(ctx, zmq.PUSH, result_path, False)
     send_lock = asyncio.Lock()
     inflight: Set[asyncio.Task] = set()
+    encode_tasks: Dict[str, asyncio.Task] = {}
+    release_tasks: Set[asyncio.Task] = set()
+
+    async def listen_for_releases() -> None:
+        # Cleanup must not wait behind the bounded encode queue: under a
+        # cancellation burst every normal worker slot may already be occupied.
+        while True:
+            try:
+                request = await async_sock_recv(release_sock)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(f"DP worker {dp_rank} release recv error", exc_info=True)
+                continue
+            if not isinstance(request, dict) or not request.get("req_id"):
+                logger.error(f"DP worker {dp_rank} received malformed release request")
+                continue
+            req_id = request["req_id"]
+            task = asyncio.create_task(
+                _retire_abandoned_encode(enc, encode_tasks.get(req_id), req_id)
+            )
+            release_tasks.add(task)
+            task.add_done_callback(release_tasks.discard)
+
     # Acquire-before-recv → back-pressure propagates to the dispatcher
     # PUSH buffer. Must be at least max_batch_size or batching degrades.
     max_inflight = envs.SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT.get()
@@ -1533,6 +1608,7 @@ async def run_dp_worker(
         )
     inflight_sem = asyncio.Semaphore(max_inflight)
     sched.start()
+    release_listener_task = asyncio.create_task(listen_for_releases())
     logger.info(f"DP worker {dp_rank} ready")
 
     try:
@@ -1567,12 +1643,30 @@ async def run_dp_worker(
                 spawned = True
                 inflight.add(task)
                 task.add_done_callback(inflight.discard)
+                if dp_type == "encode":
+                    req_id = request["req_id"]
+                    encode_tasks[req_id] = task
+
+                    def forget_encode_task(
+                        completed_task: asyncio.Task, request_id: str = req_id
+                    ) -> None:
+                        if encode_tasks.get(request_id) is completed_task:
+                            encode_tasks.pop(request_id, None)
+                        enc.clear_abandoned_request(request_id)
+
+                    task.add_done_callback(forget_encode_task)
             finally:
                 if not spawned:
                     inflight_sem.release()
     finally:
+        release_listener_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await release_listener_task
         for task in inflight:
             task.cancel()
+        for task in release_tasks:
+            task.cancel()
+        await asyncio.gather(*inflight, *release_tasks, return_exceptions=True)
         ctx.destroy(linger=0)
 
 
@@ -1581,13 +1675,21 @@ def launch_dp_worker(
     dp_rank: int,
     gpu_id: int,
     dispatch_path: str,
+    release_path: str,
     result_path: str,
 ):
     publish(server_args, role="encoder")
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
-            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+            run_dp_worker(
+                server_args,
+                dp_rank,
+                gpu_id,
+                dispatch_path,
+                release_path,
+                result_path,
+            )
         )
     except KeyboardInterrupt:
         logger.info(f"DP worker {dp_rank} exiting")
@@ -1704,6 +1806,12 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
         )
         for r in range(dp_size)
     ]
+    release_sockets: List[zmq.asyncio.Socket] = [
+        get_zmq_socket(
+            async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_release_{r}", True
+        )
+        for r in range(dp_size)
+    ]
 
     worker_processes: List[mp.Process] = []
 
@@ -1733,6 +1841,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
                     dp_rank,
                     gpu_id,
                     f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
+                    f"ipc:///tmp/{ipc_prefix}_dp_release_{dp_rank}",
                     result_path,
                 ),
                 daemon=False,
@@ -1746,6 +1855,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     return DPDispatcher(
         dp_size,
         dispatch_sockets,
+        release_sockets,
         result_socket,
         worker_processes,
         enable_metrics=get_observability().enable_metrics,

@@ -11,7 +11,12 @@ import torch
 from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
 from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
-from sglang.srt.disaggregation.encoder.runtime import execute_encode_pipeline
+from sglang.srt.disaggregation.encoder.runtime import (
+    _DP_RELEASE_AFTER_ENCODE,
+    DPDispatcher,
+    _retire_abandoned_encode,
+    execute_encode_pipeline,
+)
 from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
     EncodeContext,
@@ -245,6 +250,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = MMEncoder.__new__(MMEncoder)
             encoder.rank = 0
             encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
             encoder._embedding_dims = {Modality.IMAGE: 8}
             encoder._embedding_dtype = torch.float16
             encoder._element_size = 2
@@ -869,6 +875,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = MMEncoder.__new__(MMEncoder)
             encoder.rank = 0
             encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
             encoder.delivery = SimpleNamespace(release=AsyncMock())
 
             state = encoder._acquire_encode_ref("req")
@@ -905,6 +912,38 @@ class TestEncoderDelivery(CustomTestCase):
             encoder.delivery.release.assert_awaited_once_with(state)
             discard.assert_awaited_once_with("req")
             self.assertIsNone(state.embedding_data)
+            self.assertNotIn("req", encoder.req_states)
+
+        asyncio.run(run())
+
+    def test_abandon_before_encode_is_applied_when_state_is_created(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.rank = 0
+            encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
+            encoder.delivery = SimpleNamespace(release=AsyncMock())
+
+            await encoder.abandon_request("req")
+            self.assertIn("req", encoder.abandoned_req_ids)
+
+            state = encoder._acquire_encode_ref("req")
+            self.assertTrue(state.release_requested)
+            self.assertNotIn("req", encoder.abandoned_req_ids)
+            encoder._stage_embedding(
+                EmbeddingData(
+                    "req",
+                    1,
+                    0,
+                    None,
+                    Modality.IMAGE,
+                    embedding=torch.ones((1, 1)),
+                )
+            )
+            with patch.object(meta_registry, "discard", AsyncMock()):
+                await encoder._release_encode_ref(state)
+
+            encoder.delivery.release.assert_awaited_once_with(state)
             self.assertNotIn("req", encoder.req_states)
 
         asyncio.run(run())
@@ -1109,6 +1148,7 @@ class TestEncoderDelivery(CustomTestCase):
             encoder = MMEncoder.__new__(MMEncoder)
             encoder.rank = 0
             encoder.req_states = {}
+            encoder.abandoned_req_ids = set()
             state = encoder._acquire_encode_ref("req")
             state.embedding_data = EmbeddingData(
                 "req",
@@ -1205,6 +1245,157 @@ class TestEncoderDelivery(CustomTestCase):
             self.assertIs(embedding_seen_by_release[0], embedding)
             self.assertIsNone(state.embedding_data)
             self.assertNotIn("req", encoder.req_states)
+
+        asyncio.run(run())
+
+    def test_release_wakes_destination_waiter(self):
+        async def run():
+            req_id = "test-release-wakes-destination-waiter"
+            await meta_registry.discard(req_id)
+
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.req_states = {req_id: ReqState(req_id)}
+            encoder.send_timeout = 60
+            encoder.delivery = ZmqDelivery(encoder, cleanup_receive_state=True)
+
+            send_task = asyncio.create_task(encoder.send_with_url(req_id))
+            await asyncio.sleep(0)
+            self.assertFalse(send_task.done())
+
+            await asyncio.wait_for(encoder.release_request(req_id), timeout=1)
+            await asyncio.wait_for(send_task, timeout=1)
+
+            self.assertNotIn(req_id, encoder.req_states)
+            self.assertNotIn(req_id, rid_to_cond)
+            self.assertNotIn(req_id, rid_to_receive_endpoint)
+            self.assertNotIn(req_id, rid_to_receive_count)
+
+        asyncio.run(run())
+
+
+class TestEncoderDPAbandonedRequest(CustomTestCase):
+    @staticmethod
+    def _make_dispatcher():
+        return DPDispatcher(
+            dp_size=1,
+            dispatch_sockets=[object()],
+            release_sockets=[object()],
+            result_socket=object(),
+            worker_processes=[],
+        )
+
+    def test_dispatch_timeout_notifies_worker_to_release(self):
+        async def run():
+            dispatcher = self._make_dispatcher()
+            sent = []
+            release_sent = asyncio.Event()
+
+            async def send(socket, payload):
+                message = unwrap_from_pickle(payload)
+                sent.append((socket, message))
+                if message.get("_dp_type") == _DP_RELEASE_AFTER_ENCODE:
+                    release_sent.set()
+
+            request = {"req_id": "timed-out", "modality": "image"}
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                    side_effect=send,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.encoder.runtime.server_module.ENCODER_REQ_TIMEOUT",
+                    0.01,
+                ),
+            ):
+                result = await dispatcher.dispatch(request)
+                await asyncio.wait_for(release_sent.wait(), timeout=1)
+
+            self.assertEqual(result["_error_type"], "TimeoutError")
+            self.assertIs(sent[0][0], dispatcher.dispatch_sockets[0])
+            self.assertEqual(sent[0][1], request)
+            self.assertIs(sent[1][0], dispatcher.release_sockets[0])
+            self.assertEqual(
+                sent[1][1],
+                {
+                    "_dp_type": _DP_RELEASE_AFTER_ENCODE,
+                    "req_id": "timed-out",
+                },
+            )
+            self.assertEqual(dispatcher.pending_counts, [0])
+            self.assertNotIn("timed-out", dispatcher.req_id_to_rank)
+
+        asyncio.run(run())
+
+    def test_dispatch_cancellation_notifies_worker_to_release(self):
+        async def run():
+            dispatcher = self._make_dispatcher()
+            encode_sent = asyncio.Event()
+            release_sent = asyncio.Event()
+
+            async def send(_socket, payload):
+                message = unwrap_from_pickle(payload)
+                if message.get("_dp_type") == _DP_RELEASE_AFTER_ENCODE:
+                    release_sent.set()
+                else:
+                    encode_sent.set()
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.runtime.async_sock_send",
+                side_effect=send,
+            ):
+                task = asyncio.create_task(
+                    dispatcher.dispatch({"req_id": "cancelled", "modality": "image"})
+                )
+                await encode_sent.wait()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await asyncio.wait_for(release_sent.wait(), timeout=1)
+
+            self.assertEqual(dispatcher.pending_counts, [0])
+            self.assertNotIn("cancelled", dispatcher.req_id_to_rank)
+
+        asyncio.run(run())
+
+    def test_worker_marks_running_encode_abandoned(self):
+        async def run():
+            async def encode():
+                await asyncio.Event().wait()
+
+            encode_task = asyncio.create_task(encode())
+            encoder = SimpleNamespace(
+                abandon_request=AsyncMock(),
+                release_request=AsyncMock(),
+            )
+            await _retire_abandoned_encode(encoder, encode_task, "abandoned")
+
+            encoder.abandon_request.assert_awaited_once_with("abandoned")
+            encoder.release_request.assert_not_awaited()
+            encode_task.cancel()
+            await asyncio.gather(encode_task, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_worker_release_survives_encode_failure(self):
+        async def run():
+            async def encode():
+                raise RuntimeError("bad image")
+
+            encode_task = asyncio.create_task(encode())
+            await asyncio.sleep(0)
+            encoder = SimpleNamespace(
+                abandon_request=AsyncMock(),
+                release_request=AsyncMock(),
+            )
+            await _retire_abandoned_encode(
+                encoder,
+                encode_task,
+                "failed",
+            )
+
+            encoder.release_request.assert_awaited_once_with("failed")
+            encoder.abandon_request.assert_not_awaited()
+            await asyncio.gather(encode_task, return_exceptions=True)
 
         asyncio.run(run())
 
