@@ -306,7 +306,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bundle = build_draft_tp_worker(
             server_args=server_args,
             gpu_id=gpu_id,
-            ps=replace(ps, pp_rank=0),
+            ps=replace(ps, pp_rank=0, pp_size=1),
             nccl_port=nccl_port,
             target_model_config=target_worker.model_runner.model_config,
             algo_label="DFLASH",
@@ -1662,13 +1662,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
             logits_output, next_token_ids = (
