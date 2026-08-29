@@ -116,3 +116,17 @@ def test_success_consumes_acquire_authority_out_of_place():
     Scheduler._complete_req_pool_owner_acquisition(batch)
     assert batch.acquire_owner_mask.tolist() == [False]
     assert batch.acquire_owner_mask.data_ptr() != original.data_ptr()
+
+
+def test_rejected_candidate_releases_dflash_restore_pin_feature_safely():
+    released = []
+    req = SimpleNamespace(rid="rejected")
+    Scheduler._release_rejected_dflash_match(
+        SimpleNamespace(
+            release_dflash_draft_match_pin=lambda rid: released.append(rid)
+        ),
+        req,
+    )
+    assert released == ["rejected"]
+
+    Scheduler._release_rejected_dflash_match(SimpleNamespace(), req)

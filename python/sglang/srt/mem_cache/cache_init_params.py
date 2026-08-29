@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
     )
+    from sglang.srt.speculative.dflash_draft_content_allocator import (
+        DFlashDraftContentAllocator,
+    )
 
 
 @dataclasses.dataclass
@@ -55,3 +58,7 @@ class CacheInitParams:
     )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+
+    # Qwen DFlash compact radix content is bound to a fixed device subrange.
+    dflash_draft_content_allocator: Optional[DFlashDraftContentAllocator] = None
+    dflash_draft_window_size: Optional[int] = None

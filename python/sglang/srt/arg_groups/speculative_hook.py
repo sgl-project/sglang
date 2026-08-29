@@ -158,6 +158,27 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 "--speculative-draft-window-size"
             )
 
+    dflash_sidecar_tokens = int(
+        getattr(cfg, "speculative_dflash_radix_sidecar_tokens", 0) or 0
+    )
+    if dflash_sidecar_tokens < 0:
+        raise ValueError(
+            "--speculative-dflash-radix-sidecar-tokens must be nonnegative, "
+            f"got {dflash_sidecar_tokens}"
+        )
+    if dflash_sidecar_tokens > 0 and not getattr(
+        cfg, "speculative_dflash_compact_cache", False
+    ):
+        raise ValueError(
+            "--speculative-dflash-radix-sidecar-tokens requires "
+            "--speculative-dflash-compact-cache"
+        )
+    declare_resolution(
+        server_args,
+        "handle_speculative_decoding",
+        speculative_dflash_radix_sidecar_tokens=dflash_sidecar_tokens,
+    )
+
     algo = None
     if cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

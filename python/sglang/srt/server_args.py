@@ -2215,11 +2215,22 @@ class ServerArgs:
     speculative_dflash_compact_cache: A[
         bool,
         "Allocate a bounded physical draft KV cache for DFLASH. Requires "
-        "--speculative-draft-window-size, page size 1, and radix cache disabled. "
+        "--speculative-draft-window-size and page size 1. With the default "
+        "--speculative-dflash-radix-sidecar-tokens=0, radix cache must remain "
+        "disabled; a positive sidecar cap enables Prefill device radix. "
         "The committed visible suffix and verify scratch use disjoint rows, and "
         "the fixed allocation is deducted from target-KV capacity solving.",
         NS("spec"),
     ] = False
+    speculative_dflash_radix_sidecar_tokens: A[
+        int,
+        "Fixed device token cap for the Qwen DFLASH compact Prefill radix "
+        "sidecar. 0 preserves the compact-cache radix fail-closed behavior. "
+        "A positive value requires --speculative-dflash-compact-cache, is "
+        "page-aligned at startup, and is included exactly in the fixed draft "
+        "KV byte budget. Decode P/D workers resolve the cap to 0.",
+        NS("spec"),
+    ] = 0
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(

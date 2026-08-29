@@ -370,6 +370,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_draft_window = self.draft_window_size is not None
         self.use_compact_draft_cache = bool(get_spec().speculative_dflash_compact_cache)
+        spec_aux_config = getattr(target_worker.model_runner, "spec_aux_config", None)
+        self.dflash_radix_sidecar_tokens = int(
+            getattr(
+                spec_aux_config,
+                "dflash_radix_sidecar_tokens",
+                0,
+            )
+            or 0
+        )
         self.device = target_worker.device
         self._compact_physical_layout: Optional[CompactDFlashPhysicalLayout] = None
         self._compact_owner_generation: Optional[torch.Tensor] = None
@@ -382,7 +391,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "Compact DFlash cache requires page_size=1; larger pages "
                 "can expose two absolute positions that alias one modulo-ring row"
             )
-        if self.use_compact_draft_cache and not get_memory().disable_radix_cache:
+        if (
+            self.use_compact_draft_cache
+            and not get_memory().disable_radix_cache
+            and self.dflash_radix_sidecar_tokens <= 0
+        ):
             raise RuntimeError(
                 "Compact DFlash cache requires --disable-radix-cache; "
                 "owner-local draft rings do not preserve target prefix-cache state"
@@ -597,12 +610,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "Compact DFlash cache needs target pool config and request pool"
                 )
-            owner_count = int(req_to_token_pool.req_to_token.shape[0]) - 1
+            actual_owner_count = int(req_to_token_pool.req_to_token.shape[0]) - 1
+            owner_count = int(
+                getattr(
+                    self._target_worker.model_runner.spec_aux_config,
+                    "dflash_compact_owner_count",
+                    0,
+                )
+                or 0
+            )
+            if owner_count <= 0 or actual_owner_count > owner_count:
+                raise RuntimeError(
+                    "Compact DFlash request-owner geometry exceeds its frozen "
+                    f"budget: actual={actual_owner_count}, budgeted={owner_count}"
+                )
             self._compact_physical_layout = CompactDFlashPhysicalLayout.build(
                 owner_count=owner_count,
                 window_size=int(self.draft_window_size),
                 block_size=int(self.block_size),
                 page_size=int(self.page_size),
+                content_tokens=self.dflash_radix_sidecar_tokens,
             )
             self._compact_owner_generation = torch.zeros(
                 owner_count + 1, dtype=torch.int64, device="cpu"
@@ -633,11 +660,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             logger.info(
                 "Allocated bounded DFlash draft cache: owners=%d, owner_span=%d, "
-                "physical_rows=%d, bytes=%d",
+                "request_rows=%d, content_rows=%d, physical_rows=%d, bytes=%d, "
+                "target_kv_tokens=%d",
                 owner_count,
                 self._compact_physical_layout.owner_span,
+                self._compact_physical_layout.request_tokens,
+                self._compact_physical_layout.content_tokens,
                 self._compact_physical_layout.physical_tokens,
                 physical_bytes,
+                memory_pool_config.max_total_num_tokens,
             )
             return
 
@@ -1906,6 +1937,249 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=seq_lens)
 
+    def _restore_compact_radix_prefix(self, batch: ScheduleBatch) -> int:
+        layout = self._compact_physical_layout
+        if layout is None or layout.content_tokens <= 0:
+            return 0
+        tree_cache = batch.tree_cache
+        get_plan = getattr(tree_cache, "get_dflash_draft_match_plan", None)
+        release_pin = getattr(tree_cache, "release_dflash_draft_match_pin", None)
+        if get_plan is None or release_pin is None:
+            raise RuntimeError("Compact DFlash radix sidecar has no DRAFT component")
+
+        source_parts = []
+        destination_parts = []
+        restore_details = []
+        plans = []
+        failed = False
+        try:
+            acquire = batch.acquire_owner_mask.to(torch.bool).reshape(-1).cpu()
+            if acquire.numel() != len(batch.reqs):
+                raise RuntimeError(
+                    "Compact DFlash radix restore acquire-mask mismatch: "
+                    f"mask={acquire.numel()}, requests={len(batch.reqs)}"
+                )
+            for req in batch.reqs:
+                plans.append((req, get_plan(req.rid)))
+            for row, (req, plan) in enumerate(plans):
+                # A continuing chunk keeps the same generation-bound owner ring.
+                # Only a newly acquired owner needs radix content restored.
+                if not bool(acquire[row]):
+                    continue
+                prefix_len = int(batch.prefix_lens[row])
+                if plan is None:
+                    if prefix_len:
+                        raise RuntimeError(
+                            "Compact DFlash radix hit has no protected DRAFT source: "
+                            f"rid={req.rid!r}, prefix_len={prefix_len}"
+                        )
+                    continue
+                expected = min(int(self.draft_window_size), prefix_len)
+                if (
+                    int(plan.matched_tokens) != expected
+                    or int(plan.source_rows.numel()) != expected
+                ):
+                    raise RuntimeError(
+                        "Compact DFlash radix source coverage mismatch: "
+                        f"rid={req.rid!r}, expected={expected}, "
+                        f"matched={plan.matched_tokens}, rows={plan.source_rows.numel()}"
+                    )
+                layout.assert_content_locs(plan.source_rows)
+                positions = torch.arange(
+                    prefix_len - expected,
+                    prefix_len,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                owners = batch.req_pool_indices[row].expand(expected)
+                destination_parts.append(layout.committed_locs(owners, positions))
+                source_parts.append(plan.source_rows.to(self.device, non_blocking=True))
+                restore_details.append((req.rid, prefix_len, expected))
+
+            if not source_parts:
+                return 0
+            source_rows = torch.cat(source_parts)
+            destination_rows = torch.cat(destination_parts)
+            self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                destination_rows, source_rows
+            )
+            restored_tokens = int(source_rows.numel())
+            ps = self.__dict__.get("ps")
+            if ps is None or ps.tp_rank == 0:
+                logger.debug(
+                    "DFLASH_RADIX restored restored_tokens=%d details=%s",
+                    restored_tokens,
+                    restore_details,
+                )
+            return restored_tokens
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            release_error = None
+            known_pinned_rids = {req.rid for req, plan in plans if plan is not None}
+            # Plans are pinned by radix match, before this adapter reads them.
+            # Release every request even when validating the mask or retrieving
+            # the kth plan fails; release is an idempotent no-op without a pin.
+            for req in batch.reqs:
+                try:
+                    released = release_pin(req.rid)
+                    if released is False and req.rid in known_pinned_rids:
+                        raise RuntimeError(
+                            "Compact DFlash radix source pin disappeared before "
+                            f"restore cleanup: rid={req.rid!r}"
+                        )
+                except Exception as error:
+                    if release_error is None:
+                        release_error = error
+            if release_error is not None and not failed:
+                raise release_error
+
+    def _materialize_compact_prefill_with_sidecar(
+        self,
+        *,
+        batch: ScheduleBatch,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> bool:
+        layout = self._compact_physical_layout
+        if layout is None or layout.content_tokens <= 0:
+            return False
+        tree_cache = batch.tree_cache
+        alloc_content = getattr(tree_cache, "alloc_dflash_draft_content", None)
+        stage_publish = getattr(tree_cache, "stage_dflash_draft_publish", None)
+        discard_publish = getattr(tree_cache, "discard_dflash_draft_publish", None)
+        free_unstaged = getattr(tree_cache, "free_unstaged_dflash_draft_content", None)
+        if None in (alloc_content, stage_publish, discard_publish, free_unstaged):
+            raise RuntimeError("Compact DFlash radix sidecar cache API is incomplete")
+
+        hidden_parts = []
+        position_parts = []
+        projection_locs = []
+        owner_locs_for_copy = []
+        content_locs_for_copy = []
+        pending = []
+        owned_rows = []
+        staged_count = 0
+        try:
+            decoding_req_ids = {
+                id(req) for req in (getattr(batch, "decoding_reqs", None) or ())
+            }
+            owner_segments = {
+                row: (packed_start, packed_end, absolute_start)
+                for row, packed_start, packed_end, absolute_start in _compact_prefill_visible_segments(
+                    batch.prefix_lens,
+                    batch.extend_lens,
+                    int(self.draft_window_size),
+                )
+            }
+            for (
+                row,
+                part_start,
+                part_end,
+                absolute_start,
+            ) in _compact_prefill_visible_segments(
+                batch.prefix_lens,
+                batch.extend_lens,
+                layout.content_tokens,
+            ):
+                part_positions = positions[part_start:part_end]
+                req = batch.reqs[row]
+                owner = batch.req_pool_indices[row]
+                owner_start, owner_end, owner_absolute_start = owner_segments[row]
+                owner_positions = positions[owner_start:owner_end]
+                owner_locs = layout.committed_locs(
+                    owner.expand(owner_end - owner_start), owner_positions
+                )
+                # Decode rows in a mixed extend batch and requests that opt out
+                # of radix insertion still need their private owner ring updated,
+                # but must never allocate or publish DRAFT radix content.
+                if id(req) in decoding_req_ids or getattr(
+                    req, "skip_radix_cache_insert", False
+                ):
+                    hidden_parts.append(target_hidden[owner_start:owner_end])
+                    position_parts.append(owner_positions)
+                    projection_locs.append(owner_locs)
+                    continue
+
+                content_locs = alloc_content(part_end - part_start)
+                if content_locs is not None:
+                    # Track ownership immediately: range validation below may
+                    # fail before this allocation becomes a publish candidate.
+                    owned_rows.append(content_locs)
+                if content_locs is None:
+                    hidden_parts.append(target_hidden[owner_start:owner_end])
+                    position_parts.append(owner_positions)
+                    projection_locs.append(owner_locs)
+                    continue
+                layout.assert_content_locs(content_locs)
+
+                # Canonical content may cover more history than the request ring.
+                # Project it once, then copy only the intersection with the last W
+                # visible owner rows. If N < W, project the uncovered older owner
+                # rows directly instead of aliasing content through the modulo ring.
+                hidden_parts.append(target_hidden[part_start:part_end])
+                position_parts.append(part_positions)
+                projection_locs.append(content_locs)
+
+                overlap_absolute_start = max(absolute_start, owner_absolute_start)
+                content_offset = overlap_absolute_start - absolute_start
+                owner_offset = overlap_absolute_start - owner_absolute_start
+                overlap_len = part_end - part_start - content_offset
+                if overlap_len:
+                    content_locs_for_copy.append(
+                        content_locs[content_offset : content_offset + overlap_len]
+                    )
+                    owner_locs_for_copy.append(
+                        owner_locs[owner_offset : owner_offset + overlap_len]
+                    )
+                if owner_absolute_start < absolute_start:
+                    direct_len = absolute_start - owner_absolute_start
+                    hidden_parts.append(
+                        target_hidden[owner_start : owner_start + direct_len]
+                    )
+                    position_parts.append(owner_positions[:direct_len])
+                    projection_locs.append(owner_locs[:direct_len])
+                pending.append((req.rid, absolute_start, content_locs))
+
+            if hidden_parts:
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=torch.cat(hidden_parts),
+                    cache_loc=torch.cat(projection_locs),
+                    positions=torch.cat(position_parts),
+                )
+            if content_locs_for_copy:
+                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                    torch.cat(owner_locs_for_copy),
+                    torch.cat(content_locs_for_copy),
+                )
+            for rid, start_seqlen, rows in pending:
+                stage_publish(rid, start_seqlen, rows)
+                staged_count += 1
+            return True
+        except Exception as primary_error:
+            cleanup_errors = []
+            for rid, _, _ in pending[:staged_count]:
+                try:
+                    discarded = discard_publish(rid)
+                    if discarded is False:
+                        raise RuntimeError(
+                            "Compact DFlash staged publish disappeared during "
+                            f"rollback: rid={rid!r}"
+                        )
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for rows in owned_rows[staged_count:]:
+                try:
+                    free_unstaged(rows)
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                primary_error.add_note(
+                    "Compact DFlash sidecar rollback also failed: " f"{cleanup_error!r}"
+                )
+            raise
+
     def _make_next_draft_input_decode(
         self,
         *,
@@ -1932,17 +2206,37 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "compact DFlash requires request-pool generation metadata"
                 )
-            self._compact_physical_layout.bind_first_use_or_assert_generation(
-                (
-                    batch.req_pool_indices_cpu
-                    if batch.req_pool_indices_cpu is not None
-                    else batch.req_pool_indices
-                ),
-                self._compact_owner_generation,
-                self.model_runner.req_to_token_pool.req_generation,
-                batch.expected_req_generations_cpu,
-                batch.acquire_owner_mask,
-            )
+            try:
+                self._compact_physical_layout.bind_first_use_or_assert_generation(
+                    (
+                        batch.req_pool_indices_cpu
+                        if batch.req_pool_indices_cpu is not None
+                        else batch.req_pool_indices
+                    ),
+                    self._compact_owner_generation,
+                    self.model_runner.req_to_token_pool.req_generation,
+                    batch.expected_req_generations_cpu,
+                    batch.acquire_owner_mask,
+                )
+            except BaseException as primary_error:
+                if is_extend and self._compact_physical_layout.content_tokens > 0:
+                    release_pin = getattr(
+                        batch.tree_cache,
+                        "release_dflash_draft_match_pin",
+                        None,
+                    )
+                    if release_pin is not None:
+                        for req in batch.reqs:
+                            try:
+                                release_pin(req.rid)
+                            except Exception as cleanup_error:
+                                primary_error.add_note(
+                                    "Compact DFlash generation-bind rollback also "
+                                    f"failed: {cleanup_error!r}"
+                                )
+                raise
+            if is_extend:
+                self._restore_compact_radix_prefix(batch)
 
         if is_extend:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
@@ -1957,7 +2251,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.next_token_ids,
             )
             batch_output.new_seq_lens = batch.seq_lens
-            if on_publish is not None:
+            use_radix_sidecar = (
+                self._compact_physical_layout is not None
+                and self._compact_physical_layout.content_tokens > 0
+            )
+            if on_publish is not None and not use_radix_sidecar:
                 on_publish(batch_output.new_seq_lens)
 
             if logits_output.hidden_states is None:
@@ -1991,32 +2289,43 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             if self._compact_physical_layout is not None:
-                hidden_parts = []
-                position_parts = []
-                owner_parts = []
-                for row, part_start, part_end, _ in _compact_prefill_visible_segments(
-                    batch.prefix_lens,
-                    batch.extend_lens,
-                    int(self.draft_window_size),
-                ):
-                    owner = batch.req_pool_indices[row]
-                    hidden_parts.append(
-                        logits_output.hidden_states[part_start:part_end]
-                    )
-                    position_parts.append(positions[part_start:part_end])
-                    owner_parts.append(owner.expand(part_end - part_start))
-                if hidden_parts:
-                    compact_hidden = torch.cat(hidden_parts)
-                    compact_positions = torch.cat(position_parts)
-                    compact_owners = torch.cat(owner_parts)
-                    compact_locs = self._compact_physical_layout.committed_locs(
-                        compact_owners, compact_positions
-                    )
-                    self._append_target_hidden_to_draft_kv_by_loc(
-                        target_hidden=compact_hidden,
-                        cache_loc=compact_locs,
-                        positions=compact_positions,
-                    )
+                handled = self._materialize_compact_prefill_with_sidecar(
+                    batch=batch,
+                    target_hidden=logits_output.hidden_states,
+                    positions=positions,
+                )
+                if not handled:
+                    hidden_parts = []
+                    position_parts = []
+                    owner_parts = []
+                    for (
+                        row,
+                        part_start,
+                        part_end,
+                        _,
+                    ) in _compact_prefill_visible_segments(
+                        batch.prefix_lens,
+                        batch.extend_lens,
+                        int(self.draft_window_size),
+                    ):
+                        owner = batch.req_pool_indices[row]
+                        hidden_parts.append(
+                            logits_output.hidden_states[part_start:part_end]
+                        )
+                        position_parts.append(positions[part_start:part_end])
+                        owner_parts.append(owner.expand(part_end - part_start))
+                    if hidden_parts:
+                        compact_hidden = torch.cat(hidden_parts)
+                        compact_positions = torch.cat(position_parts)
+                        compact_owners = torch.cat(owner_parts)
+                        compact_locs = self._compact_physical_layout.committed_locs(
+                            compact_owners, compact_positions
+                        )
+                        self._append_target_hidden_to_draft_kv_by_loc(
+                            target_hidden=compact_hidden,
+                            cache_loc=compact_locs,
+                            positions=compact_positions,
+                        )
             else:
                 self._append_target_hidden_to_draft_kv_by_loc(
                     target_hidden=logits_output.hidden_states,
@@ -2026,6 +2335,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
+
+            if on_publish is not None and use_radix_sidecar:
+                on_publish(batch_output.new_seq_lens)
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 bonus_tokens=next_token_ids,

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.speculative.dflash_compact_physical_layout import (
     CompactDFlashPhysicalLayout,
 )
@@ -29,6 +30,21 @@ def _bare_worker(*, target_table: torch.Tensor, draft_table: torch.Tensor):
         req_to_token_pool=SimpleNamespace(req_to_token=draft_table)
     )
     worker._draft_block_end_buf = torch.empty(2, dtype=torch.int32)
+    return worker
+
+
+def _bare_sidecar_worker(layout, *, project=None, move=None):
+    worker_mod = _worker_module()
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = layout.window_size
+    worker.device = torch.device("cpu")
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(
+            move_kv_cache=move or (lambda destination, source: None)
+        )
+    )
+    worker._append_target_hidden_to_draft_kv_by_loc = project or (lambda **kwargs: None)
     return worker
 
 
@@ -187,6 +203,781 @@ def test_compact_verify_locs_and_prefix_valid_writer_keep_zero_and_full_lens():
     torch.testing.assert_close(pool.calls[0][0], committed_locs)
     torch.testing.assert_close(pool.calls[0][1], commit_lens)
     assert pool.written_locs == committed_locs[1].tolist()
+
+
+def test_compact_radix_restore_copies_content_to_owner_and_releases_pin():
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=8,
+    )
+    moves = []
+    released = []
+    source = torch.arange(layout.content_start, layout.content_start + 4)
+    plan = SimpleNamespace(source_rows=source, matched_tokens=4)
+    tree_cache = SimpleNamespace(
+        get_dflash_draft_match_plan=lambda rid: plan if rid == "warm" else None,
+        release_dflash_draft_match_pin=lambda rid: released.append(rid),
+    )
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = 4
+    worker.device = torch.device("cpu")
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(
+            move_kv_cache=lambda dst, src: moves.append((dst.clone(), src.clone()))
+        )
+    )
+    batch = SimpleNamespace(
+        tree_cache=tree_cache,
+        reqs=[SimpleNamespace(rid="warm")],
+        prefix_lens=[6],
+        req_pool_indices=torch.tensor([1]),
+        acquire_owner_mask=torch.tensor([True]),
+    )
+
+    restored = worker_mod.DFlashWorkerV2._restore_compact_radix_prefix(worker, batch)
+
+    assert restored == 4
+    assert released == ["warm"]
+    assert len(moves) == 1
+    torch.testing.assert_close(moves[0][1], source)
+    torch.testing.assert_close(
+        moves[0][0],
+        layout.committed_locs(torch.ones(4, dtype=torch.int64), torch.arange(2, 6)),
+    )
+
+
+@pytest.mark.parametrize("bad_source", [False, True])
+def test_compact_radix_restore_coverage_or_range_failure_releases_pin(bad_source):
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=4,
+    )
+    source = (
+        torch.arange(4)
+        if bad_source
+        else torch.arange(layout.content_start, layout.content_start + 3)
+    )
+    plan = SimpleNamespace(
+        source_rows=source,
+        matched_tokens=4 if bad_source else 3,
+    )
+    released = []
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = 4
+    worker.device = torch.device("cpu")
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(move_kv_cache=lambda dst, src: None)
+    )
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            get_dflash_draft_match_plan=lambda rid: plan,
+            release_dflash_draft_match_pin=lambda rid: released.append(rid),
+        ),
+        reqs=[SimpleNamespace(rid="bad")],
+        prefix_lens=[6],
+        req_pool_indices=torch.tensor([1]),
+        acquire_owner_mask=torch.tensor([True]),
+    )
+
+    message = "content loc OOB" if bad_source else "coverage mismatch"
+    with pytest.raises(RuntimeError, match=message):
+        worker_mod.DFlashWorkerV2._restore_compact_radix_prefix(worker, batch)
+    assert released == ["bad"]
+
+
+def test_compact_radix_restore_skips_continuing_owner_without_plan():
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=4,
+    )
+    moves = []
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = 4
+    worker.device = torch.device("cpu")
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(
+            move_kv_cache=lambda dst, src: moves.append((dst, src))
+        )
+    )
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            get_dflash_draft_match_plan=lambda rid: None,
+            release_dflash_draft_match_pin=lambda rid: None,
+        ),
+        reqs=[SimpleNamespace(rid="next-chunk")],
+        prefix_lens=[6],
+        req_pool_indices=torch.tensor([1]),
+        acquire_owner_mask=torch.tensor([False]),
+    )
+
+    assert worker_mod.DFlashWorkerV2._restore_compact_radix_prefix(worker, batch) == 0
+    assert not moves
+
+
+def test_compact_radix_restore_get_plan_failure_releases_every_batch_rid():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=3,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=6,
+    )
+    source = torch.arange(layout.content_start, layout.content_start + 2)
+    plan = SimpleNamespace(source_rows=source, matched_tokens=2)
+    get_calls = []
+    released = []
+
+    def get_plan(rid):
+        get_calls.append(rid)
+        if rid == "second":
+            raise ValueError("get-plan boom")
+        return plan
+
+    worker = _bare_sidecar_worker(layout)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            get_dflash_draft_match_plan=get_plan,
+            release_dflash_draft_match_pin=lambda rid: released.append(rid) or True,
+        ),
+        reqs=[
+            SimpleNamespace(rid="first"),
+            SimpleNamespace(rid="second"),
+            SimpleNamespace(rid="third"),
+        ],
+        prefix_lens=[2, 2, 2],
+        req_pool_indices=torch.tensor([1, 2, 3]),
+        acquire_owner_mask=torch.tensor([True, True, True]),
+    )
+
+    with pytest.raises(ValueError, match="get-plan boom"):
+        _worker_module().DFlashWorkerV2._restore_compact_radix_prefix(worker, batch)
+
+    assert get_calls == ["first", "second"]
+    assert released == ["first", "second", "third"]
+
+
+def test_compact_radix_restore_mask_failure_releases_every_batch_rid():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=2,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=4,
+    )
+    released = []
+    worker = _bare_sidecar_worker(layout)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            get_dflash_draft_match_plan=lambda rid: pytest.fail(
+                "mask validation must precede plan lookup"
+            ),
+            release_dflash_draft_match_pin=lambda rid: released.append(rid) or True,
+        ),
+        reqs=[SimpleNamespace(rid="first"), SimpleNamespace(rid="second")],
+        prefix_lens=[2, 2],
+        req_pool_indices=torch.tensor([1, 2]),
+        acquire_owner_mask=torch.tensor([True]),
+    )
+
+    with pytest.raises(RuntimeError, match="acquire-mask mismatch"):
+        _worker_module().DFlashWorkerV2._restore_compact_radix_prefix(worker, batch)
+
+    assert released == ["first", "second"]
+
+
+def test_compact_radix_restore_preserves_copy_error_and_attempts_all_releases():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=2,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=4,
+    )
+    source = torch.arange(layout.content_start, layout.content_start + 2)
+    plan = SimpleNamespace(source_rows=source, matched_tokens=2)
+    released = []
+
+    def release(rid):
+        released.append(rid)
+        if rid == "first":
+            raise RuntimeError("release boom")
+        return True
+
+    def move(destination, source):
+        raise ValueError("copy boom")
+
+    worker = _bare_sidecar_worker(layout, move=move)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            get_dflash_draft_match_plan=lambda rid: plan,
+            release_dflash_draft_match_pin=release,
+        ),
+        reqs=[SimpleNamespace(rid="first"), SimpleNamespace(rid="second")],
+        prefix_lens=[2, 2],
+        req_pool_indices=torch.tensor([1, 2]),
+        acquire_owner_mask=torch.tensor([True, True]),
+    )
+
+    with pytest.raises(ValueError, match="copy boom"):
+        _worker_module().DFlashWorkerV2._restore_compact_radix_prefix(worker, batch)
+
+    assert released == ["first", "second"]
+
+
+def test_compact_prefill_sidecar_projects_each_visible_token_once_and_falls_back():
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=2,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=4,
+    )
+    content_rows = torch.arange(layout.content_start, layout.content_end)
+    allocations = [content_rows, None]
+    staged = []
+    moves = []
+    projections = []
+    tree_cache = SimpleNamespace(
+        alloc_dflash_draft_content=lambda count: allocations.pop(0),
+        stage_dflash_draft_publish=lambda rid, start, rows: staged.append(
+            (rid, start, rows.clone())
+        ),
+        discard_dflash_draft_publish=lambda rid: None,
+        free_unstaged_dflash_draft_content=lambda rows: None,
+    )
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = 4
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(
+            move_kv_cache=lambda dst, src: moves.append((dst.clone(), src.clone()))
+        )
+    )
+    worker._append_target_hidden_to_draft_kv_by_loc = (
+        lambda **kwargs: projections.append(kwargs)
+    )
+    positions = torch.tensor([0, 1, 2, 3, 4, 5, 4, 5], dtype=torch.int64)
+    hidden = torch.arange(16, dtype=torch.float32).view(8, 2)
+    batch = SimpleNamespace(
+        tree_cache=tree_cache,
+        reqs=[SimpleNamespace(rid="published"), SimpleNamespace(rid="fallback")],
+        prefix_lens=[0, 4],
+        extend_lens=[6, 2],
+        req_pool_indices=torch.tensor([1, 2]),
+    )
+
+    handled = worker_mod.DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+        worker, batch=batch, target_hidden=hidden, positions=positions
+    )
+
+    assert handled
+    assert len(projections) == 1
+    torch.testing.assert_close(
+        projections[0]["target_hidden"], torch.cat((hidden[2:6], hidden[6:8]))
+    )
+    assert projections[0]["target_hidden"].shape[0] == 6
+    torch.testing.assert_close(projections[0]["cache_loc"][:4], content_rows)
+    fallback_locs = layout.committed_locs(torch.full((2,), 2), torch.tensor([4, 5]))
+    torch.testing.assert_close(projections[0]["cache_loc"][4:], fallback_locs)
+    assert len(moves) == 1
+    torch.testing.assert_close(moves[0][1], content_rows)
+    assert staged[0][0:2] == ("published", 2)
+    torch.testing.assert_close(staged[0][2], content_rows)
+
+
+def test_compact_prefill_sidecar_publishes_cap_history_but_copies_only_owner_window():
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=8,
+    )
+    content_rows = torch.arange(layout.content_start, layout.content_end)
+    staged = []
+    moves = []
+    projections = []
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = 4
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(
+            move_kv_cache=lambda dst, src: moves.append((dst.clone(), src.clone()))
+        )
+    )
+    worker._append_target_hidden_to_draft_kv_by_loc = (
+        lambda **kwargs: projections.append(kwargs)
+    )
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: content_rows,
+            stage_dflash_draft_publish=lambda rid, start, rows: staged.append(
+                (rid, start, rows.clone())
+            ),
+            discard_dflash_draft_publish=lambda rid: None,
+            free_unstaged_dflash_draft_content=lambda rows: None,
+        ),
+        reqs=[SimpleNamespace(rid="long-system")],
+        prefix_lens=[0],
+        extend_lens=[10],
+        req_pool_indices=torch.tensor([1]),
+    )
+    hidden = torch.arange(20, dtype=torch.float32).view(10, 2)
+    positions = torch.arange(10, dtype=torch.int64)
+
+    assert worker_mod.DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+        worker, batch=batch, target_hidden=hidden, positions=positions
+    )
+
+    assert len(projections) == 1
+    torch.testing.assert_close(projections[0]["target_hidden"], hidden[2:10])
+    torch.testing.assert_close(projections[0]["cache_loc"], content_rows)
+    assert staged[0][0:2] == ("long-system", 2)
+    torch.testing.assert_close(staged[0][2], content_rows)
+    assert len(moves) == 1
+    torch.testing.assert_close(moves[0][1], content_rows[4:8])
+    torch.testing.assert_close(
+        moves[0][0],
+        layout.committed_locs(torch.ones(4, dtype=torch.int64), torch.arange(6, 10)),
+    )
+
+
+def test_compact_prefill_sidecar_cap_below_window_projects_uncovered_owner_rows():
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=2,
+    )
+    content_rows = torch.arange(layout.content_start, layout.content_end)
+    moves = []
+    projections = []
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker._compact_physical_layout = layout
+    worker.draft_window_size = 4
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(
+            move_kv_cache=lambda dst, src: moves.append((dst.clone(), src.clone()))
+        )
+    )
+    worker._append_target_hidden_to_draft_kv_by_loc = (
+        lambda **kwargs: projections.append(kwargs)
+    )
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: content_rows,
+            stage_dflash_draft_publish=lambda rid, start, rows: None,
+            discard_dflash_draft_publish=lambda rid: None,
+            free_unstaged_dflash_draft_content=lambda rows: None,
+        ),
+        reqs=[SimpleNamespace(rid="small-cap")],
+        prefix_lens=[0],
+        extend_lens=[6],
+        req_pool_indices=torch.tensor([1]),
+    )
+    hidden = torch.arange(12, dtype=torch.float32).view(6, 2)
+    positions = torch.arange(6, dtype=torch.int64)
+
+    assert worker_mod.DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+        worker, batch=batch, target_hidden=hidden, positions=positions
+    )
+
+    assert len(projections) == 1
+    torch.testing.assert_close(
+        projections[0]["target_hidden"], torch.cat((hidden[4:6], hidden[2:4]))
+    )
+    torch.testing.assert_close(projections[0]["cache_loc"][:2], content_rows)
+    torch.testing.assert_close(
+        projections[0]["cache_loc"][2:],
+        layout.committed_locs(torch.ones(2, dtype=torch.int64), torch.arange(2, 4)),
+    )
+    torch.testing.assert_close(moves[0][1], content_rows)
+    torch.testing.assert_close(
+        moves[0][0],
+        layout.committed_locs(torch.ones(2, dtype=torch.int64), torch.arange(4, 6)),
+    )
+
+
+def test_compact_prefill_projection_failure_frees_every_unstaged_lease():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=2,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=4,
+    )
+    allocations = [
+        torch.arange(layout.content_start, layout.content_start + 2),
+        torch.arange(layout.content_start + 2, layout.content_end),
+    ]
+    allocated = [rows.clone() for rows in allocations]
+    freed = []
+    staged = []
+
+    def project(**kwargs):
+        raise ValueError("projection boom")
+
+    worker = _bare_sidecar_worker(layout, project=project)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: allocations.pop(0),
+            stage_dflash_draft_publish=lambda rid, start, rows: staged.append(rid),
+            discard_dflash_draft_publish=lambda rid: True,
+            free_unstaged_dflash_draft_content=lambda rows: freed.append(rows.clone()),
+        ),
+        reqs=[SimpleNamespace(rid="first"), SimpleNamespace(rid="second")],
+        decoding_reqs=None,
+        prefix_lens=[0, 0],
+        extend_lens=[2, 2],
+        req_pool_indices=torch.tensor([1, 2]),
+    )
+
+    with pytest.raises(ValueError, match="projection boom"):
+        _worker_module().DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+            worker,
+            batch=batch,
+            target_hidden=torch.arange(8, dtype=torch.float32).view(4, 2),
+            positions=torch.tensor([0, 1, 0, 1]),
+        )
+
+    assert not staged
+    assert len(freed) == 2
+    for actual, expected in zip(freed, allocated):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_compact_prefill_stage_failure_partitions_staged_and_unstaged_rows():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=3,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=6,
+    )
+    allocations = [
+        torch.arange(layout.content_start + offset, layout.content_start + offset + 2)
+        for offset in (0, 2, 4)
+    ]
+    expected = [rows.clone() for rows in allocations]
+    staged = []
+    discarded = []
+    freed = []
+
+    def stage(rid, start, rows):
+        if rid == "second":
+            raise ValueError("stage boom")
+        staged.append(rid)
+
+    worker = _bare_sidecar_worker(layout)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: allocations.pop(0),
+            stage_dflash_draft_publish=stage,
+            discard_dflash_draft_publish=lambda rid: discarded.append(rid) or True,
+            free_unstaged_dflash_draft_content=lambda rows: freed.append(rows.clone()),
+        ),
+        reqs=[
+            SimpleNamespace(rid="first"),
+            SimpleNamespace(rid="second"),
+            SimpleNamespace(rid="third"),
+        ],
+        decoding_reqs=None,
+        prefix_lens=[0, 0, 0],
+        extend_lens=[2, 2, 2],
+        req_pool_indices=torch.tensor([1, 2, 3]),
+    )
+
+    with pytest.raises(ValueError, match="stage boom"):
+        _worker_module().DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+            worker,
+            batch=batch,
+            target_hidden=torch.arange(12, dtype=torch.float32).view(6, 2),
+            positions=torch.tensor([0, 1, 0, 1, 0, 1]),
+        )
+
+    assert staged == ["first"]
+    assert discarded == ["first"]
+    assert len(freed) == 2
+    torch.testing.assert_close(freed[0], expected[1])
+    torch.testing.assert_close(freed[1], expected[2])
+
+
+def test_compact_prefill_rollback_is_best_effort_and_preserves_primary_error():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=3,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=6,
+    )
+    allocations = [
+        torch.arange(layout.content_start + offset, layout.content_start + offset + 2)
+        for offset in (0, 2, 4)
+    ]
+    cleanup_calls = []
+
+    def stage(rid, start, rows):
+        if rid == "second":
+            raise ValueError("primary stage boom")
+
+    def discard(rid):
+        cleanup_calls.append(("discard", rid))
+        raise RuntimeError("discard boom")
+
+    def free(rows):
+        cleanup_calls.append(("free", int(rows[0])))
+        if len([call for call in cleanup_calls if call[0] == "free"]) == 1:
+            raise RuntimeError("free boom")
+
+    worker = _bare_sidecar_worker(layout)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: allocations.pop(0),
+            stage_dflash_draft_publish=stage,
+            discard_dflash_draft_publish=discard,
+            free_unstaged_dflash_draft_content=free,
+        ),
+        reqs=[
+            SimpleNamespace(rid="first"),
+            SimpleNamespace(rid="second"),
+            SimpleNamespace(rid="third"),
+        ],
+        decoding_reqs=None,
+        prefix_lens=[0, 0, 0],
+        extend_lens=[2, 2, 2],
+        req_pool_indices=torch.tensor([1, 2, 3]),
+    )
+
+    with pytest.raises(ValueError, match="primary stage boom") as exc_info:
+        _worker_module().DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+            worker,
+            batch=batch,
+            target_hidden=torch.arange(12, dtype=torch.float32).view(6, 2),
+            positions=torch.tensor([0, 1, 0, 1, 0, 1]),
+        )
+
+    assert cleanup_calls == [
+        ("discard", "first"),
+        ("free", layout.content_start + 2),
+        ("free", layout.content_start + 4),
+    ]
+    assert len(exc_info.value.__notes__) == 2
+
+
+def test_compact_prefill_content_range_failure_frees_fresh_allocation():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=2,
+    )
+    invalid_rows = torch.arange(layout.content_start - 1, layout.content_start + 1)
+    freed = []
+    worker = _bare_sidecar_worker(layout)
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: invalid_rows,
+            stage_dflash_draft_publish=lambda rid, start, rows: None,
+            discard_dflash_draft_publish=lambda rid: True,
+            free_unstaged_dflash_draft_content=lambda rows: freed.append(rows.clone()),
+        ),
+        reqs=[SimpleNamespace(rid="bad-range")],
+        decoding_reqs=None,
+        prefix_lens=[0],
+        extend_lens=[2],
+        req_pool_indices=torch.tensor([1]),
+    )
+
+    with pytest.raises(RuntimeError, match="content loc OOB"):
+        _worker_module().DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+            worker,
+            batch=batch,
+            target_hidden=torch.arange(4, dtype=torch.float32).view(2, 2),
+            positions=torch.tensor([0, 1]),
+        )
+
+    assert len(freed) == 1
+    torch.testing.assert_close(freed[0], invalid_rows)
+
+
+def test_compact_prefill_mixed_decode_and_skip_rows_only_update_owner_ring():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=3,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=2,
+    )
+    content_rows = torch.arange(layout.content_start, layout.content_end)
+    allocations = []
+    staged = []
+    projections = []
+    prefill = SimpleNamespace(rid="prefill")
+    decode = SimpleNamespace(rid="decode")
+    skipped = SimpleNamespace(rid="skip", skip_radix_cache_insert=True)
+    worker = _bare_sidecar_worker(
+        layout, project=lambda **kwargs: projections.append(kwargs)
+    )
+    batch = SimpleNamespace(
+        tree_cache=SimpleNamespace(
+            alloc_dflash_draft_content=lambda count: allocations.append(count)
+            or content_rows,
+            stage_dflash_draft_publish=lambda rid, start, rows: staged.append(rid),
+            discard_dflash_draft_publish=lambda rid: True,
+            free_unstaged_dflash_draft_content=lambda rows: None,
+        ),
+        reqs=[prefill, decode, skipped],
+        decoding_reqs=[decode],
+        prefix_lens=[0, 4, 0],
+        extend_lens=[2, 1, 2],
+        req_pool_indices=torch.tensor([1, 2, 3]),
+    )
+    positions = torch.tensor([0, 1, 4, 0, 1])
+
+    assert _worker_module().DFlashWorkerV2._materialize_compact_prefill_with_sidecar(
+        worker,
+        batch=batch,
+        target_hidden=torch.arange(10, dtype=torch.float32).view(5, 2),
+        positions=positions,
+    )
+
+    assert allocations == [2]
+    assert staged == ["prefill"]
+    assert len(projections) == 1
+    expected_owner_locs = torch.cat(
+        (
+            layout.committed_locs(torch.tensor([2]), torch.tensor([4])),
+            layout.committed_locs(torch.tensor([3, 3]), torch.tensor([0, 1])),
+        )
+    )
+    torch.testing.assert_close(projections[0]["cache_loc"][:2], content_rows)
+    torch.testing.assert_close(projections[0]["cache_loc"][2:], expected_owner_locs)
+
+
+def test_compact_generation_bind_failure_releases_radix_pin():
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=1,
+        window_size=2,
+        block_size=2,
+        page_size=1,
+        content_tokens=2,
+    )
+    released = []
+    worker = _bare_sidecar_worker(layout)
+    worker._compact_owner_generation = torch.tensor([0, 4], dtype=torch.int64)
+    worker.model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(
+            req_generation=torch.tensor([0, 5], dtype=torch.int64)
+        )
+    )
+    batch = SimpleNamespace(
+        sampling_info=None,
+        forward_mode=SimpleNamespace(is_extend=lambda: True),
+        is_extend_in_batch=False,
+        expected_req_generations_cpu=torch.tensor([4]),
+        acquire_owner_mask=torch.tensor([True]),
+        req_pool_indices_cpu=torch.tensor([1]),
+        req_pool_indices=torch.tensor([1]),
+        tree_cache=SimpleNamespace(
+            release_dflash_draft_match_pin=lambda rid: released.append(rid) or True
+        ),
+        reqs=[SimpleNamespace(rid="stale")],
+    )
+
+    with pytest.raises(RuntimeError, match="generation mismatch"):
+        _worker_module().DFlashWorkerV2.forward_batch_generation(worker, batch)
+
+    assert released == ["stale"]
+
+
+def test_compact_pool_uses_frozen_owner_and_sidecar_geometry_for_exact_bytes():
+    worker_mod = _worker_module()
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=2,
+        window_size=4,
+        block_size=2,
+        page_size=1,
+        content_tokens=5,
+    )
+    cell_bytes = 32
+    allocated_bytes = (layout.physical_tokens + 1) * cell_bytes
+    calls = []
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker.use_compact_draft_cache = True
+    worker.draft_window_size = 4
+    worker.block_size = 2
+    worker.page_size = 1
+    worker.dflash_radix_sidecar_tokens = 5
+    worker._target_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            spec_aux_config=SimpleNamespace(
+                dflash_compact_owner_count=2,
+                dflash_draft_fixed_bytes=allocated_bytes,
+            )
+        )
+    )
+    worker._draft_worker = SimpleNamespace(
+        alloc_memory_pool=lambda **kwargs: calls.append(kwargs)
+    )
+    worker.draft_model_runner = SimpleNamespace(
+        token_to_kv_pool=SimpleNamespace(get_kv_size_bytes=lambda: allocated_bytes)
+    )
+    req_pool = SimpleNamespace(req_to_token=torch.empty((2, 16), dtype=torch.int64))
+
+    worker_mod.DFlashWorkerV2.alloc_memory_pool(
+        worker,
+        memory_pool_config=MemoryPoolConfig(max_total_num_tokens=999),
+        req_to_token_pool=req_pool,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["memory_pool_config"].max_total_num_tokens == layout.physical_tokens
+    assert worker._compact_physical_layout == layout
+    assert worker._compact_owner_generation.shape[0] == 3
+
+
+def test_compact_pool_rejects_actual_request_slots_above_frozen_owner_budget():
+    worker_mod = _worker_module()
+    worker = object.__new__(worker_mod.DFlashWorkerV2)
+    worker.use_compact_draft_cache = True
+    worker.draft_window_size = 4
+    worker.block_size = 2
+    worker.page_size = 1
+    worker.dflash_radix_sidecar_tokens = 0
+    worker._target_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            spec_aux_config=SimpleNamespace(dflash_compact_owner_count=1)
+        )
+    )
+    worker._draft_worker = SimpleNamespace(alloc_memory_pool=lambda **kwargs: None)
+    req_pool = SimpleNamespace(req_to_token=torch.empty((3, 16), dtype=torch.int64))
+
+    with pytest.raises(RuntimeError, match="exceeds its frozen budget"):
+        worker_mod.DFlashWorkerV2.alloc_memory_pool(
+            worker,
+            memory_pool_config=MemoryPoolConfig(max_total_num_tokens=999),
+            req_to_token_pool=req_pool,
+        )
 
 
 def test_compact_rebuild_returns_scratch_and_writes_physical_mapping(monkeypatch):

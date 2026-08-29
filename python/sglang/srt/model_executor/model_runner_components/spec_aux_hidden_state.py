@@ -48,6 +48,10 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_draft_cell_size_per_token: int | None = None
     # Fixed per-rank draft KV allocation, including the pool sentinel page.
     dflash_draft_fixed_bytes: int = 0
+    # Frozen request-owner geometry used to solve the compact fixed allocation.
+    dflash_compact_owner_count: int | None = None
+    # Internal, page-aligned DFlash radix content cap. Public API is not frozen.
+    dflash_radix_sidecar_tokens: int = 0
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -220,15 +224,36 @@ def _resolve_dflash_aux_hidden_state(
         )
         config.dflash_draft_cell_size_per_token = legacy_draft_cell_size
         if _compact_dflash_enabled():
+            sidecar_tokens = int(
+                getattr(get_spec(), "speculative_dflash_radix_sidecar_tokens", 0) or 0
+            )
+            if sidecar_tokens < 0:
+                raise RuntimeError(
+                    "Compact DFlash radix sidecar tokens must be nonnegative, "
+                    f"got {sidecar_tokens}"
+                )
+            # PR2 is Prefill-device-radix only. A P/D decode role keeps PR1's
+            # request ring and receives no content subrange.
+            if get_disagg().disaggregation_mode == "decode":
+                sidecar_tokens = 0
+            page_size = int(get_schedule().page_size)
+            if sidecar_tokens:
+                sidecar_tokens = (
+                    (sidecar_tokens + page_size - 1) // page_size
+                ) * page_size
+            compact_owner_count = _compact_dflash_owner_count(attn_dp_size=attn_dp_size)
+            config.dflash_compact_owner_count = compact_owner_count
+            config.dflash_radix_sidecar_tokens = sidecar_tokens
             config.dflash_draft_cell_size_per_token = _compact_dflash_linear_budget(
                 legacy_draft_cell_size
             )
             config.dflash_draft_fixed_bytes = _compact_dflash_fixed_bytes(
                 legacy_draft_cell_size,
-                owner_count=_compact_dflash_owner_count(attn_dp_size=attn_dp_size),
+                owner_count=compact_owner_count,
                 window_size=get_spec().speculative_draft_window_size,
                 block_size=get_spec().speculative_num_draft_tokens,
-                page_size=get_schedule().page_size,
+                page_size=page_size,
+                content_tokens=sidecar_tokens,
             )
 
 
@@ -276,6 +301,7 @@ def _compact_dflash_fixed_bytes(
     window_size: int | None,
     block_size: int | None,
     page_size: int,
+    content_tokens: int = 0,
 ) -> int:
     """Exact per-rank bytes allocated by the compact draft pool."""
     if not _compact_dflash_enabled():
@@ -306,6 +332,7 @@ def _compact_dflash_fixed_bytes(
         window_size=int(window_size),
         block_size=int(block_size),
         page_size=int(page_size),
+        content_tokens=int(content_tokens),
     )
     # TokenToKVPool allocates one sentinel page in addition to usable rows.
     return (layout.physical_tokens + int(page_size)) * int(legacy_bytes_per_token)

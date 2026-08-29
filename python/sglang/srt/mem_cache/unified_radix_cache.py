@@ -67,6 +67,9 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.components.dflash_draft_component import (
+    DFlashDraftComponent,
+)
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -112,6 +115,7 @@ _COMPONENT_POOL_LABEL = {
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
+    ComponentType.DRAFT: DFlashDraftComponent,
     ComponentType.SWA: SWAComponent,
 }
 
@@ -341,6 +345,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        for component in self._components_tuple:
+            component.reset_component_state()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -367,6 +373,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if ComponentType.DRAFT in self.tree_components:
+            raise ValueError(
+                "Qwen DFlash radix sidecar is device-only and cannot be combined "
+                "with HiCache"
+            )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
@@ -508,8 +519,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
-        for component in self._components_tuple:
-            result = component.finalize_match_result_in_cache(params, result)
+        try:
+            for component in self._components_tuple:
+                result = component.finalize_match_result_in_cache(params, result)
+        except Exception:
+            req = params.req
+            rid = getattr(req, "rid", None) if req is not None else None
+            if rid is not None:
+                self.release_dflash_draft_match_pin(rid)
+            raise
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
         return result
@@ -565,6 +583,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
             ComponentType.C128: 0,
+            ComponentType.DRAFT: params.draft_num_tokens,
         }
 
     def _component_available_size(self, component_type: ComponentType) -> int:
@@ -581,6 +600,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return self.token_to_kv_pool_allocator.swa_available_size()
         if component_type == ComponentType.MAMBA:
             return self.req_to_token_pool.mamba_allocator.schedulable_available_size()
+        if component_type == ComponentType.DRAFT:
+            return self.components[ComponentType.DRAFT].allocator.available_size()
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(
@@ -612,7 +633,51 @@ class UnifiedRadixCache(BasePrefixCache):
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
+            draft_num_tokens_evicted=tracker.get(ComponentType.DRAFT, 0),
         )
+
+    def get_dflash_draft_match_plan(self, rid: str):
+        component = self.components.get(ComponentType.DRAFT)
+        return None if component is None else component.get_match_plan(rid)
+
+    def release_dflash_draft_match_pin(self, rid: str) -> bool:
+        component = self.components.get(ComponentType.DRAFT)
+        return False if component is None else component.release_match_pin(rid)
+
+    def alloc_dflash_draft_content(self, num_tokens: int):
+        component = self.components.get(ComponentType.DRAFT)
+        if (
+            component is None
+            or num_tokens <= 0
+            or num_tokens > component.allocator.size
+        ):
+            return None
+        rows = component.allocator.alloc(num_tokens)
+        if rows is not None:
+            return rows
+        shortfall = num_tokens - component.allocator.available_size()
+        self.evict_for_alloc(EvictParams(draft_num_tokens=shortfall))
+        return component.allocator.alloc(num_tokens)
+
+    def stage_dflash_draft_publish(
+        self, rid: str, start_seqlen: int, rows: torch.Tensor
+    ) -> None:
+        component = self.components.get(ComponentType.DRAFT)
+        if component is None:
+            raise RuntimeError(
+                "DFlash draft content was staged without DRAFT component"
+            )
+        component.stage_pending_publish(rid, start_seqlen, rows)
+
+    def discard_dflash_draft_publish(self, rid: str) -> bool:
+        component = self.components.get(ComponentType.DRAFT)
+        return False if component is None else component.discard_pending_publish(rid)
+
+    def free_unstaged_dflash_draft_content(self, rows: torch.Tensor) -> None:
+        component = self.components.get(ComponentType.DRAFT)
+        if component is None:
+            raise RuntimeError("DFlash draft content has no owning component")
+        component.free_unstaged_content(rows)
 
     def _free_values(
         self,
@@ -840,39 +905,49 @@ class UnifiedRadixCache(BasePrefixCache):
                 priority=getattr(req, "priority", 0) or 0,
             )
 
-            # components prepare insert data + return effective cache_len
-            effective_cache_len = len(token_ids)
-            for comp in self._components_tuple:
-                cl = comp.prepare_for_caching_req(
-                    req=req,
-                    insert_params=insert_params,
-                    token_ids_len=len(token_ids),
-                    is_finished=True,
-                )
-                if cl is not None:
-                    effective_cache_len = min(effective_cache_len, cl)
+            try:
+                # components prepare insert data + return effective cache_len
+                effective_cache_len = len(token_ids)
+                for comp in self._components_tuple:
+                    cl = comp.prepare_for_caching_req(
+                        req=req,
+                        insert_params=insert_params,
+                        token_ids_len=len(token_ids),
+                        is_finished=True,
+                    )
+                    if cl is not None:
+                        effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed; the tail free is deferred and batched with
-            # the unaligned tail below so a shared boundary page is emitted once.
-            kv_indices_full = kv_indices
-            tail_free_start = None
-            if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.cache_protected_len)
-                token_ids = token_ids[:effective_cache_len]
-                kv_indices = kv_indices[:effective_cache_len]
+                # Truncate if needed; the tail free is deferred and batched with
+                # the unaligned tail below so a shared boundary page is emitted once.
+                kv_indices_full = kv_indices
+                tail_free_start = None
+                if effective_cache_len < len(token_ids):
+                    tail_free_start = max(effective_cache_len, req.cache_protected_len)
+                    token_ids = token_ids[:effective_cache_len]
+                    kv_indices = kv_indices[:effective_cache_len]
 
-            radix_key = RadixKey(
-                token_ids,
-                req.extra_key,
-                is_bigram=self.tree_core.is_eagle,
-                cache_salt=req.cache_salt,
-            ).page_aligned(self.page_size)
-            page_aligned_len = len(radix_key)
-            values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+                radix_key = RadixKey(
+                    token_ids,
+                    req.extra_key,
+                    is_bigram=self.tree_core.is_eagle,
+                    cache_salt=req.cache_salt,
+                ).page_aligned(self.page_size)
+                page_aligned_len = len(radix_key)
+                values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
-            insert_params.key = radix_key
-            insert_params.value = values
-            result = self.insert(insert_params)
+                insert_params.key = radix_key
+                insert_params.value = values
+                result = self.insert(insert_params)
+            except Exception:
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req,
+                        is_finished=True,
+                        insert_result=result,
+                        insert_params=insert_params,
+                    )
+                raise
 
             # Free unaligned tail (+ deferred truncation tail)
             segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
@@ -927,54 +1002,74 @@ class UnifiedRadixCache(BasePrefixCache):
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
-        effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
-            cl = comp.prepare_for_caching_req(
-                req=req,
-                insert_params=insert_params,
-                token_ids_len=len(token_ids),
-                is_finished=False,
-            )
-            if cl is not None:
-                effective_cache_len = min(effective_cache_len, cl)
-
-        radix_key = RadixKey(
-            token_ids[:effective_cache_len],
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
-        )
-
-        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            # The frontier lands a page below page_floor(pre_len + 1), which has to
-            # be where the insert stops, or the leaf it creates keeps less than a
-            # sliding window of live SWA and the match after the insert rejects it.
-            # The insert stops at page_floor(len(radix_key)), and a bigram key is
-            # one shorter than the tokens it spans, so measure the key.
+        result = None
+        try:
+            effective_cache_len = len(token_ids)
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+                cl = comp.prepare_for_caching_req(
+                    req=req,
+                    insert_params=insert_params,
+                    token_ids_len=len(token_ids),
+                    is_finished=False,
+                )
+                if cl is not None:
+                    effective_cache_len = min(effective_cache_len, cl)
 
-        if effective_cache_len <= 0:
-            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            radix_key = RadixKey(
+                token_ids[:effective_cache_len],
+                req.extra_key,
+                is_bigram=self.tree_core.is_eagle,
+                cache_salt=req.cache_salt,
+            )
+
+            if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+                # The frontier lands a page below page_floor(pre_len + 1), which has to
+                # be where the insert stops, or the leaf it creates keeps less than a
+                # sliding window of live SWA and the match after the insert rejects it.
+                # The insert stops at page_floor(len(radix_key)), and a bigram key is
+                # one shorter than the tokens it spans, so measure the key.
+                for comp in self._components_tuple:
+                    comp.free_out_of_window_slots(
+                        req, len(radix_key) - 1, insert_params
+                    )
+
+            if effective_cache_len <= 0:
+                req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+                for comp in self._components_tuple:
+                    comp.cleanup_after_caching_req(
+                        req, is_finished=False, insert_params=insert_params
+                    )
+                return
+
+            kv_indices = kv_indices_orig[:effective_cache_len]
+
+            radix_key = radix_key.page_aligned(self.page_size)
+            page_aligned_len = len(radix_key)
+            values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+
+            insert_params.key = radix_key
+            insert_params.value = values
+            result = self.insert(insert_params)
+        except Exception:
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=False, insert_params=insert_params
+                    req,
+                    is_finished=False,
+                    insert_result=result,
+                    insert_params=insert_params,
                 )
-            return
-
-        kv_indices = kv_indices_orig[:effective_cache_len]
-
-        radix_key = radix_key.page_aligned(self.page_size)
-        page_aligned_len = len(radix_key)
-        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-
-        insert_params.key = radix_key
-        insert_params.value = values
-        result = self.insert(insert_params)
+            raise
 
         # Match prefix. SWA insertion retains one extra window before the
         # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
+        match_result = self.match_prefix(
+            MatchPrefixParams(
+                key=radix_key,
+                req=req,
+                pin_dflash_restore=False,
+                require_dflash_draft=False,
+            )
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -2070,6 +2165,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
+        draft_component = self.components.get(ComponentType.DRAFT)
+        if draft_component is not None:
+            draft_component.release_request_state(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
         if (

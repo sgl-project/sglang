@@ -18,7 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import get_disagg, get_memory, get_serving, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -164,6 +164,8 @@ def _create_unified_radix_cache(
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
 
+    _attach_qwen_dflash_draft_component(ctx, params, tree_components)
+
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
             C128SidecarComponent,
@@ -194,6 +196,64 @@ def _create_unified_radix_cache(
             cache.cache_controller.layer_done_counter
         )
     return cache
+
+
+def _attach_qwen_dflash_draft_component(
+    ctx: TreeCacheBuildContext,
+    params: CacheInitParams,
+    tree_components: list,
+) -> None:
+    """Bind the fixed compact-DFlash content subrange to a Qwen target tree."""
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+    spec_aux_config = getattr(ctx.tp_worker.model_runner, "spec_aux_config", None)
+    content_tokens = getattr(spec_aux_config, "dflash_radix_sidecar_tokens", 0)
+    if not isinstance(content_tokens, int) or content_tokens <= 0:
+        return
+
+    model_type = getattr(ctx.model_config.hf_text_config, "model_type", None)
+    unsupported = []
+    if model_type != "qwen3_5_text":
+        unsupported.append(f"target model_type={model_type!r}")
+    if not ctx.is_hybrid_ssm or ctx.is_hybrid_swa:
+        unsupported.append("target tree is not FULL+MAMBA")
+    if ctx.disable_radix_cache:
+        unsupported.append("radix cache is disabled")
+    if ctx.enable_hierarchical_cache:
+        unsupported.append("HiCache is enabled")
+    if bool(getattr(ctx.server_args, "enable_unified_memory", False)):
+        unsupported.append("unified memory is enabled")
+    if unsupported:
+        raise ValueError(
+            "Qwen DFlash radix sidecar has unsupported configuration: "
+            + ", ".join(unsupported)
+        )
+
+    owner_count = getattr(spec_aux_config, "dflash_compact_owner_count", None)
+    window_size = get_spec().speculative_draft_window_size
+    block_size = get_spec().speculative_num_draft_tokens
+    from sglang.srt.speculative.dflash_compact_physical_layout import (
+        CompactDFlashPhysicalLayout,
+    )
+    from sglang.srt.speculative.dflash_draft_content_allocator import (
+        DFlashDraftContentAllocator,
+    )
+
+    layout = CompactDFlashPhysicalLayout.build(
+        owner_count=int(owner_count),
+        window_size=int(window_size),
+        block_size=int(block_size),
+        page_size=int(params.page_size),
+        content_tokens=content_tokens,
+    )
+    params.dflash_draft_content_allocator = DFlashDraftContentAllocator(
+        start=layout.content_start,
+        size=layout.content_tokens,
+        device=params.token_to_kv_pool_allocator.device,
+    )
+    params.dflash_draft_window_size = layout.window_size
+    # DRAFT finalization pins restore sources before Mamba COW can evict.
+    tree_components.insert(1, ComponentType.DRAFT)
 
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:

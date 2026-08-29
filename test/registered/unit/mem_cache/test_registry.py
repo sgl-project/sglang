@@ -5,17 +5,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
+    _attach_qwen_dflash_draft_component,
     create_tree_cache,
     default_radix_cache_factory,
     get_radix_cache_factory,
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -172,6 +176,80 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
     the class at its definition site to verify routing without depending
     on each cache's real constructor or runtime state.
     """
+
+    def test_qwen_dflash_sidecar_binds_exact_content_subrange(self):
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(device="cpu"),
+            page_size=1,
+        )
+        ctx = SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    spec_aux_config=SimpleNamespace(
+                        dflash_radix_sidecar_tokens=5,
+                        dflash_compact_owner_count=2,
+                    )
+                )
+            ),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(model_type="qwen3_5_text")
+            ),
+            server_args=SimpleNamespace(enable_unified_memory=False),
+            is_hybrid_ssm=True,
+            is_hybrid_swa=False,
+            disable_radix_cache=False,
+            enable_hierarchical_cache=False,
+        )
+        components = [ComponentType.FULL, ComponentType.MAMBA]
+        with patch(
+            "sglang.srt.mem_cache.registry.get_spec",
+            return_value=SimpleNamespace(
+                speculative_draft_window_size=4,
+                speculative_num_draft_tokens=2,
+            ),
+        ):
+            _attach_qwen_dflash_draft_component(ctx, params, components)
+
+        self.assertEqual(
+            components,
+            [ComponentType.FULL, ComponentType.DRAFT, ComponentType.MAMBA],
+        )
+        self.assertEqual(params.dflash_draft_window_size, 4)
+        allocator = params.dflash_draft_content_allocator
+        self.assertEqual(allocator.size, 5)
+        self.assertGreater(allocator.start, 0)
+
+    def test_qwen_dflash_sidecar_rejects_non_qwen_target(self):
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=SimpleNamespace(device="cpu"),
+            page_size=1,
+        )
+        ctx = SimpleNamespace(
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    spec_aux_config=SimpleNamespace(
+                        dflash_radix_sidecar_tokens=4,
+                        dflash_compact_owner_count=1,
+                    )
+                )
+            ),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(model_type="other")
+            ),
+            server_args=SimpleNamespace(enable_unified_memory=False),
+            is_hybrid_ssm=True,
+            is_hybrid_swa=False,
+            disable_radix_cache=False,
+            enable_hierarchical_cache=False,
+        )
+        with self.assertRaisesRegex(ValueError, "target model_type"):
+            _attach_qwen_dflash_draft_component(
+                ctx, params, [ComponentType.FULL, ComponentType.MAMBA]
+            )
 
     def test_chunk_cache_when_chunked_prefill_and_disable_radix(self):
         ctx = _make_ctx(

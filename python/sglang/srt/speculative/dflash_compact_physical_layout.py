@@ -29,6 +29,9 @@ class CompactDFlashPhysicalLayout:
     guard_rows: int
     page_size: int
     owner_span: int
+    request_tokens: int
+    content_start: int
+    content_tokens: int
     physical_tokens: int
 
     @classmethod
@@ -39,6 +42,7 @@ class CompactDFlashPhysicalLayout:
         window_size: int,
         block_size: int,
         page_size: int,
+        content_tokens: int = 0,
         scratch_blocks: int = 2,
         guard_blocks: int = 2,
     ) -> CompactDFlashPhysicalLayout:
@@ -64,6 +68,12 @@ class CompactDFlashPhysicalLayout:
         scratch_rows = _align_up(block_size * scratch_blocks, page_size)
         guard_rows = _align_up(block_size * guard_blocks, page_size)
         owner_span = _align_up(guard_rows + window_size + scratch_rows, page_size)
+        if int(content_tokens) < 0:
+            raise ValueError(
+                f"content_tokens must be nonnegative, got {content_tokens}"
+            )
+        request_tokens = int(owner_count) * owner_span
+        aligned_content_tokens = _align_up(int(content_tokens), int(page_size))
         return cls(
             owner_count=int(owner_count),
             window_size=int(window_size),
@@ -71,7 +81,10 @@ class CompactDFlashPhysicalLayout:
             guard_rows=guard_rows,
             page_size=int(page_size),
             owner_span=owner_span,
-            physical_tokens=int(owner_count) * owner_span,
+            request_tokens=request_tokens,
+            content_start=request_tokens,
+            content_tokens=aligned_content_tokens,
+            physical_tokens=request_tokens + aligned_content_tokens,
         )
 
     def _owner_bases(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
@@ -115,7 +128,7 @@ class CompactDFlashPhysicalLayout:
             + self.guard_rows
             + torch.remainder(positions, self.window_size)
         )
-        self.assert_in_bounds(locs)
+        self.assert_request_locs(locs)
         return locs
 
     def scratch_locs(self, req_pool_indices: torch.Tensor, width: int) -> torch.Tensor:
@@ -129,8 +142,28 @@ class CompactDFlashPhysicalLayout:
             0
         )
         locs = bases + self.guard_rows + self.window_size + offsets
-        self.assert_in_bounds(locs)
+        self.assert_request_locs(locs)
         return locs
+
+    @property
+    def content_end(self) -> int:
+        return self.content_start + self.content_tokens
+
+    def assert_request_locs(self, locs: torch.Tensor) -> None:
+        self._assert_in_range(
+            locs,
+            start=0,
+            end=self.request_tokens,
+            region_name="request",
+        )
+
+    def assert_content_locs(self, locs: torch.Tensor) -> None:
+        self._assert_in_range(
+            locs,
+            start=self.content_start,
+            end=self.content_end,
+            region_name="content",
+        )
 
     def bind_first_use_or_assert_generation(
         self,
@@ -180,18 +213,29 @@ class CompactDFlashPhysicalLayout:
         return reuse_count
 
     def assert_in_bounds(self, locs: torch.Tensor) -> None:
+        self._assert_in_range(
+            locs,
+            start=0,
+            end=self.physical_tokens,
+            region_name="physical",
+        )
+
+    @staticmethod
+    def _assert_in_range(
+        locs: torch.Tensor, *, start: int, end: int, region_name: str
+    ) -> None:
         if locs.numel() == 0:
             return
-        valid = (locs >= 0) & (locs < self.physical_tokens)
+        valid = (locs >= start) & (locs < end)
         if locs.is_cuda:
             torch._assert_async(
                 torch.all(valid),
-                "compact DFlash physical location is out of bounds",
+                f"compact DFlash {region_name} location is out of bounds",
             )
             return
         minimum, maximum = int(locs.min()), int(locs.max())
-        if minimum < 0 or maximum >= self.physical_tokens:
+        if minimum < start or maximum >= end:
             raise RuntimeError(
-                f"compact DFlash loc OOB: min={minimum}, max={maximum}, "
-                f"physical_tokens={self.physical_tokens}"
+                f"compact DFlash {region_name} loc OOB: min={minimum}, "
+                f"max={maximum}, valid=[{start},{end})"
             )

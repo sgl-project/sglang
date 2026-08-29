@@ -3586,6 +3586,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    self._release_rejected_dflash_match(self.tree_cache, req)
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
@@ -3866,6 +3867,13 @@ class Scheduler(
         acquire_owner_mask = getattr(batch, "acquire_owner_mask", None)
         if acquire_owner_mask is not None:
             batch.acquire_owner_mask = torch.zeros_like(acquire_owner_mask)
+
+    @staticmethod
+    def _release_rejected_dflash_match(tree_cache, req) -> None:
+        """Drop a short restore pin when admission rejects its candidate."""
+        release = getattr(tree_cache, "release_dflash_draft_match_pin", None)
+        if release is not None:
+            release(req.rid)
 
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(

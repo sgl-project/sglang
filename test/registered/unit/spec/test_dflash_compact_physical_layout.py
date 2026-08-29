@@ -13,17 +13,21 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
 from sglang.srt.speculative.dflash_compact_physical_layout import (
     CompactDFlashPhysicalLayout,
 )
+from sglang.srt.speculative.dflash_draft_content_allocator import (
+    DFlashDraftContentAllocator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _layout(*, owners=2, window=2048, block=8, page=1):
+def _layout(*, owners=2, window=2048, block=8, page=1, content=0):
     return CompactDFlashPhysicalLayout.build(
         owner_count=owners,
         window_size=window,
         block_size=block,
         page_size=page,
+        content_tokens=content,
     )
 
 
@@ -69,6 +73,63 @@ def test_fixed_bytes_include_one_sentinel_page(monkeypatch):
         )
         == (layout.physical_tokens + 1) * 10_240
     )
+
+
+def test_content_region_is_page_aligned_disjoint_and_budgeted(monkeypatch):
+    layout = _layout(owners=2, window=32, block=8, page=4, content=13)
+    assert layout.content_start == layout.request_tokens
+    assert layout.content_tokens == 16
+    assert layout.content_end == layout.physical_tokens
+
+    request_rows = torch.cat(
+        (
+            layout.committed_locs(torch.ones(32), torch.arange(32)),
+            layout.scratch_locs(torch.tensor([1]), 8).reshape(-1),
+        )
+    )
+    content_rows = torch.arange(layout.content_start, layout.content_end)
+    assert not bool(torch.isin(request_rows, content_rows).any())
+    layout.assert_content_locs(content_rows)
+    with pytest.raises(RuntimeError, match="content loc OOB"):
+        layout.assert_content_locs(request_rows[:1])
+
+    _enable_compact_budget(monkeypatch)
+    assert (
+        _compact_dflash_fixed_bytes(
+            32,
+            owner_count=2,
+            window_size=32,
+            block_size=8,
+            page_size=1,
+            content_tokens=13,
+        )
+        == (_layout(owners=2, window=32, block=8, content=13).physical_tokens + 1) * 32
+    )
+
+
+def test_content_allocator_exhaustion_free_double_free_and_clear():
+    allocator = DFlashDraftContentAllocator(start=100, size=5, device="cpu")
+    first = allocator.alloc(3)
+    second = allocator.alloc(2)
+    assert first.tolist() == [100, 101, 102]
+    assert second.tolist() == [103, 104]
+    assert allocator.available_size() == 0
+    assert allocator.alloc(1) is None
+    allocator.assert_allocated(torch.tensor([100, 104]))
+
+    allocator.free(torch.tensor([101, 103]))
+    assert allocator.available_size() == 2
+    with pytest.raises(RuntimeError, match="freed twice"):
+        allocator.free(torch.tensor([101]))
+    with pytest.raises(RuntimeError, match="outside allocator range"):
+        allocator.free(torch.tensor([99]))
+
+    reused = allocator.alloc(2)
+    assert reused.tolist() == [101, 103]
+    allocator.clear()
+    assert allocator.available_size() == 5
+    with pytest.raises(RuntimeError, match="unallocated row"):
+        allocator.assert_allocated(torch.tensor([100]))
 
 
 def test_fixed_budget_rejects_paged_modulo_aliasing(monkeypatch):

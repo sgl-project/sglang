@@ -10,6 +10,7 @@ class ComponentType(int, Enum):
     SWA = 1
     MAMBA = 2
     C128 = 3
+    DRAFT = 4
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()
@@ -25,6 +26,10 @@ class ComponentType(int, Enum):
     @property
     def is_mamba(self) -> bool:
         return self == ComponentType.MAMBA
+
+    @property
+    def is_draft(self) -> bool:
+        return self == ComponentType.DRAFT
 
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
