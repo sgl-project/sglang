@@ -1072,7 +1072,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dllm_algorithm="LowConfidence",
                 attention_backend=None,
                 cuda_graph_config=SimpleNamespace(
-                    decode=SimpleNamespace(backend=Backend.DISABLED)
+                    decode=SimpleNamespace(backend=Backend.DISABLED),
+                    prefill=SimpleNamespace(backend=Backend.DISABLED),
                 ),
             )
             defaults.update(kw)

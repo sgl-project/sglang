@@ -15,7 +15,14 @@ from sglang.srt.dllm.algorithm.dream import Dream, sample_tokens
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
+from sglang.srt.models.dream import DreamModel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 
@@ -150,6 +157,119 @@ class TestDreamAlgorithm(CustomTestCase):
             )
 
 
+class TestDreamCudaGraphPath(CustomTestCase):
+    def _dream_forward_with_hidden_states(self, hidden_states, seq_lens):
+        def model(*args, **kwargs):
+            del args, kwargs
+            return hidden_states
+
+        def logits_processor(input_ids, states, lm_head, forward_batch):
+            del input_ids, lm_head, forward_batch
+            return LogitsProcessorOutput(full_logits=states)
+
+        dream_model = SimpleNamespace(
+            capture_aux_hidden_states=False,
+            model=model,
+            logits_processor=logits_processor,
+            lm_head=None,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DLLM_EXTEND,
+            extend_seq_lens_cpu=seq_lens,
+        )
+        return DreamModel.forward(
+            dream_model,
+            torch.zeros(hidden_states.shape[0], dtype=torch.long),
+            torch.zeros(hidden_states.shape[0], dtype=torch.long),
+            forward_batch,
+        )
+
+    def test_dream_forward_trims_prefill_bcg_padding_before_split(self):
+        hidden_states = torch.arange(6, dtype=torch.float32).view(6, 1)
+
+        output = self._dream_forward_with_hidden_states(hidden_states, [3, 2])
+
+        # The graph bucket has 6 rows, while the live Dream canvas has 5.
+        self.assertEqual(output.full_logits.shape, (5, 1))
+        self.assertTrue(
+            torch.equal(
+                output.full_logits[:, 0],
+                torch.tensor([0.0, 0.0, 1.0, 3.0, 3.0]),
+            )
+        )
+
+    def test_dream_forward_rejects_lengths_larger_than_hidden_states(self):
+        with self.assertRaisesRegex(RuntimeError, "sequence lengths exceed"):
+            self._dream_forward_with_hidden_states(torch.zeros((4, 1)), [5])
+
+    def test_prefill_bcg_trims_full_logits_to_raw_tokens(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner.raw_bs = 1
+        runner.raw_num_tokens = 4
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False)
+        )
+        full_logits = torch.arange(12, dtype=torch.float32).view(6, 2)
+
+        output = runner._trim_logits_output(
+            LogitsProcessorOutput(full_logits=full_logits)
+        )
+
+        self.assertEqual(output.full_logits.shape, (4, 2))
+        self.assertTrue(torch.equal(output.full_logits, full_logits[:4]))
+
+    def _make_server_args_for_graph_test(self, disable_cuda_graph):
+        args = ServerArgs.__new__(ServerArgs)
+        args.dllm_algorithm = "Dream"
+        args.dllm_fdfo = True
+        args.tp_size = 1
+        args.pp_size = 1
+        args.disable_radix_cache = False
+        args.disable_cuda_graph = disable_cuda_graph
+        args.cuda_graph_config = SimpleNamespace(
+            decode=SimpleNamespace(
+                backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL
+            ),
+            prefill=SimpleNamespace(
+                backend=Backend.DISABLED if disable_cuda_graph else Backend.BREAKABLE
+            ),
+        )
+        args.enable_hierarchical_cache = False
+        args.enable_lmcache = False
+        args.enable_flexkv = False
+        args.enable_lora = False
+        args.disaggregation_mode = "null"
+        args.enable_mixed_chunk = False
+        args.get_model_config = MagicMock(
+            return_value=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["DreamModel"])
+            )
+        )
+        return args
+
+    @patch("sglang.srt.arg_groups.overrides.run_post_process_pass")
+    def test_server_guard_selects_dream_graph_backend(self, run_post_process_pass):
+        for disable_cuda_graph in (False, True):
+            with self.subTest(disable_cuda_graph=disable_cuda_graph):
+                args = self._make_server_args_for_graph_test(disable_cuda_graph)
+                with patch("sglang.srt.server_args.is_hip", return_value=False):
+                    args._handle_dllm_inference()
+
+                self.assertTrue(args.disable_radix_cache)
+                self.assertFalse(args.dllm_fdfo)
+                self.assertEqual(
+                    args.cuda_graph_config.decode.backend,
+                    Backend.DISABLED,
+                )
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend,
+                    Backend.DISABLED if disable_cuda_graph else Backend.BREAKABLE,
+                )
+                self.assertEqual(run_post_process_pass.call_count, 3)
+                run_post_process_pass.reset_mock()
+
+
 class _OneStepAlgorithm(DllmAlgorithm):
     def __init__(self):
         super().__init__(
@@ -251,41 +371,6 @@ class TestDreamConfig(CustomTestCase):
         self.assertEqual(config.mask_id, 156895)
         self.assertEqual(config.max_running_requests, 1)
         self.assertTrue(config.first_done_first_out_mode)
-
-    @patch("sglang.srt.arg_groups.overrides.run_post_process_pass")
-    def test_server_guard_disables_unsupported_dream_features(
-        self, run_post_process_pass
-    ):
-        args = ServerArgs.__new__(ServerArgs)
-        args.dllm_algorithm = "Dream"
-        args.dllm_fdfo = True
-        args.tp_size = 1
-        args.pp_size = 1
-        args.disable_radix_cache = False
-        args.disable_cuda_graph = False
-        args.cuda_graph_config = SimpleNamespace(
-            decode=SimpleNamespace(backend=object()),
-            prefill=SimpleNamespace(backend=object()),
-        )
-        args.enable_hierarchical_cache = False
-        args.enable_lmcache = False
-        args.enable_flexkv = False
-        args.enable_lora = False
-        args.disaggregation_mode = "null"
-        args.enable_mixed_chunk = False
-        args.get_model_config = MagicMock(
-            return_value=SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=["DreamModel"])
-            )
-        )
-
-        with patch("sglang.srt.server_args.is_hip", return_value=False):
-            args._handle_dllm_inference()
-
-        self.assertTrue(args.disable_radix_cache)
-        self.assertTrue(args.disable_cuda_graph)
-        self.assertFalse(args.dllm_fdfo)
-        self.assertEqual(run_post_process_pass.call_count, 3)
 
 
 class TestDreamSchedulerAdmission(CustomTestCase):
