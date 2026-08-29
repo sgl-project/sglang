@@ -42,14 +42,17 @@ class _CloneFailure:
 
 
 class _Handle:
-    def __init__(self):
+    def __init__(self, *, fail_unlink: bool = False):
         self.closed = False
         self.unlinked = False
+        self.fail_unlink = fail_unlink
 
     def close(self):
         self.closed = True
 
     def unlink(self):
+        if self.fail_unlink:
+            raise PermissionError("unlink denied")
         self.unlinked = True
 
 
@@ -187,6 +190,20 @@ class TestShmPointerFailureCleanup(unittest.TestCase):
             pointer.__setstate__(state)
             with self.assertRaisesRegex(RuntimeError, "FileNotFoundError"):
                 pointer.materialize()
+
+    def test_cleanup_error_does_not_escape_the_request_boundary(self):
+        pointer = object.__new__(ShmPointerMMData)
+        handle = _Handle(fail_unlink=True)
+        pointer.shm_name = "unused"
+        pointer._shm_handle = handle
+        pointer.tensor = torch.ones(1)
+        pointer._materialization_error = None
+
+        with self.assertLogs("sglang.utils", level="WARNING"):
+            result = pointer.materialize()
+
+        self.assertTrue(torch.equal(result, torch.ones(1)))
+        self.assertTrue(handle.closed)
 
 
 class TestShmRequestFailureConsensus(unittest.TestCase):

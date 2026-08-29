@@ -1314,7 +1314,7 @@ class ShmPointerMMData:
         self.tensor = None
         self._materialization_error = None
 
-        # Keep deserialization infallible so all TP ranks finish the broadcast
+        # keep deserialization infallible so all TP ranks finish the broadcast
         handle = None
         tensor = None
         try:
@@ -1325,7 +1325,13 @@ class ShmPointerMMData:
         except Exception as error:
             tensor = None
             if handle is not None:
-                handle.close()
+                try:
+                    handle.close()
+                except Exception:
+                    logger.warning(
+                        "Failed to close a malformed multimodal SHM handle",
+                        exc_info=True,
+                    )
             self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
@@ -1348,14 +1354,29 @@ class ShmPointerMMData:
             except FileNotFoundError:
                 return
             except OSError:
+                logger.warning(
+                    "Failed to reopen a multimodal SHM segment for cleanup",
+                    exc_info=True,
+                )
                 return
         try:
             try:
                 handle.unlink()
             except FileNotFoundError:
                 pass
+            except OSError:
+                logger.warning(
+                    "Failed to unlink a multimodal SHM segment",
+                    exc_info=True,
+                )
         finally:
-            handle.close()
+            try:
+                handle.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close a multimodal SHM handle",
+                    exc_info=True,
+                )
 
     def __del__(self):
         # Only close; never unlink. Unlinking is materialize()'s job.
