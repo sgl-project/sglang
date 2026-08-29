@@ -300,11 +300,8 @@ class DSparkVerifyPlanner:
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
         resolved = future_map.resolve_confidence_cpu(batch)
-        local_budget = self._budget_from_resolved(
+        draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
-        )
-        draft_input.verify_token_budget = self._tp_sync.broadcast_optional_int(
-            local_budget
         )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
             bs=batch.batch_size(),
@@ -372,20 +369,20 @@ class DSparkVerifyPlanner:
         prefix_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
     ) -> Optional[int]:
-        """Resolve one shared budget before any layout-dependent branch."""
+        """Per-step verify-token budget: under overlap it was precomputed into
+        the draft input by prepare_verify_budget; otherwise compute it now."""
         if not self.schedules_verify_budget or confidence is None:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
-        # Preserve per-rank planner state before selecting one shared decision.
-        local_budget = self.compute_budget_sync(
+        # No collective here: the budget is a pure function of the draft tokens
+        # (via confidence), req_generation, and the static sps table, all of
+        # which already agree across ranks.
+        draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
             req_pool_indices=req_pool_indices,
-        )
-        draft_input.verify_token_budget = self._tp_sync.broadcast_optional_int(
-            local_budget
         )
         return draft_input.verify_token_budget
 
