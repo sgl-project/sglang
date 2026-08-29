@@ -8,8 +8,9 @@
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
 // Every recipe on this page is single-node: BF16 and FP8 run TP4 on NVIDIA,
-// NVFP4 runs on one Blackwell GPU, and the AMD Quark MXFP4 path uses TP8+EP8.
-// Plain TP8 is not a valid substitute for that expert-parallel topology.
+// NVFP4 runs on one Blackwell GPU, and the validated AMD FP8 / Quark MXFP4
+// paths use TP8+EP8. Plain TP8 is not a valid substitute for that
+// expert-parallel topology on either AMD checkpoint.
 //
 // A hardware x quantization x strategy combination with no launch recipe has no
 // cell, and the engine greys it out.
@@ -34,7 +35,6 @@ export const config = {
   // operating points. Low latency adds the in-checkpoint MTP head where tested.
   strategies: [
     { id: "low-latency",     label: "Low Latency"     },
-    { id: "balanced",        label: "Balanced"        },
     { id: "high-throughput", label: "High Throughput" },
   ],
   nodesOptions: [
@@ -111,22 +111,21 @@ export const config = {
     ["mmmu_pro_pct", "MMMU-Pro", "%"],
   ],
 
-  // Launch images. AMD uses a content-addressed ROCm environment and mounts the
-  // exact #36601 source checkout because the qwen38flashnext ROCm tag predates
-  // the loader fix validated by the recipe below.
+  // Launch images. AMD uses the public image built from and validated at the
+  // exact #36601 source revision used by the recipes below.
   dockerImages: {
     h200:   "lmsysorg/sglang:qwen38flashnext",
     b200:   "lmsysorg/sglang:qwen38flashnext",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
-    mi350x: "lmsysorg/sglang@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72",
-    mi355x: "lmsysorg/sglang@sha256:6d68cd19206716cb3f1e31e2ad89cd0852d7ae614a792773c30a4277f8955c72",
+    mi350x: "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828",
+    mi355x: "aigmkt/qwen3.8-flash-next-gfx950-260827@sha256:51e4be1fde02780a5c39b37c464ebbceeffed5f6d307586f871611209a905828",
   },
 
-  dockerMounts: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
-    ? ["\"$(pwd):/workspace/sglang:ro\""] : [],
+  dockerGpuVendor: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
+    ? "amd" : "nvidia",
   dockerRunCommand: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
-    ? "env PYTHONPATH=/workspace/sglang/python:/sgl-workspace/sglang/python python3 -m sglang.launch_server"
+    ? "python3 -m sglang.launch_server"
     : "sglang serve",
   runModes: (sel) => ["mi350x", "mi355x"].includes(sel.hw)
     ? ["docker"] : ["python", "docker"],
@@ -139,9 +138,10 @@ export const config = {
 
     // ----- Card: "Attention Parallelism" -----
     // TP only. Every cell on the page is single-node TP (4 for BF16/FP8, 1 for
-    // NVFP4, 8 for AMD MXFP4) with no DP-attention anywhere, and the values stop at 8
-    // because that is the widest single host here. CP and DP-Attention are left
-    // out until there's a validated shape for them on this checkpoint.
+    // NVFP4, 8 for AMD FP8/MXFP4) with no DP-attention anywhere, and the values
+    // stop at 8 because that is the widest single host here. CP and
+    // DP-Attention are left out until there's a validated shape for them on
+    // this checkpoint.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [null, 1, 2, 4, 8] },
@@ -150,9 +150,10 @@ export const config = {
 
     // ----- Card: "MoE Parallelism" -----
     // EP degree only: the ultra-sparse MoE spreads its expert pool across ranks.
-    // NVIDIA BF16/FP8 high-throughput uses EP4, while AMD MXFP4 requires EP8 so
-    // each rank receives complete quantization groups. The AMD cells also pin
-    // AITER explicitly instead of relying on backend auto-selection.
+    // NVIDIA BF16/FP8 high-throughput uses EP4. The recommended eight-GPU AMD
+    // FP8/MXFP4 topology uses EP8 so each rank receives complete expert
+    // quantization groups. The AMD cells also pin AITER explicitly instead of
+    // relying on backend auto-selection.
     moe: {
       ep: { label: "EP", values: [null, 1, 2, 4, 8] },
     },
@@ -652,9 +653,38 @@ export const config = {
     },
 
     // ==== AMD CDNA4 (MI350X / MI355X) ====
-    // Quark MXFP4 was validated on eight MI350X GPUs with TP8+EP8, explicit
-    // AITER attention/MoE, page size 64, radix cache disabled, and full decode
-    // CUDA graphs. The two operating points differ only by EAGLE/MTP 3/1/4.
+    // FP8 and Quark MXFP4 were validated on eight MI350X GPUs with TP8+EP8,
+    // explicit AITER attention/MoE, page size 64, radix cache disabled, and
+    // full decode CUDA graphs. The FP8 evidence covers the EAGLE/MTP operating
+    // point; MXFP4 also has a controlled non-speculative throughput result.
+    {
+      match: { hw: "mi350x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision bcd9f01ddc9cff2316eb84281bebcd5b058bddce",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "mi350x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
       verified: true,
@@ -667,7 +697,6 @@ export const config = {
         "--attention-backend aiter",
         "--moe-runner-backend aiter",
         "--page-size 64",
-        "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
@@ -692,7 +721,35 @@ export const config = {
         "--attention-backend aiter",
         "--moe-runner-backend aiter",
         "--page-size 64",
-        "--kv-cache-dtype auto",
+        "--chunked-prefill-size 16384",
+        "--watchdog-timeout 1200",
+        "--mem-fraction-static 0.9",
+        "--disable-radix-cache",
+        "--max-running-requests 4",
+        "--cuda-graph-backend-decode full",
+        "--cuda-graph-max-bs-decode 4",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "This command matches the validated MI350X gfx950 path but has not been rerun on MI355X.",
+      env: ["SGLANG_USE_AITER=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision bcd9f01ddc9cff2316eb84281bebcd5b058bddce",
+        "--tp-size 8",
+        "--ep-size 8",
+        "--attention-backend aiter",
+        "--moe-runner-backend aiter",
+        "--page-size 64",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
@@ -722,7 +779,6 @@ export const config = {
         "--attention-backend aiter",
         "--moe-runner-backend aiter",
         "--page-size 64",
-        "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",
@@ -748,7 +804,6 @@ export const config = {
         "--attention-backend aiter",
         "--moe-runner-backend aiter",
         "--page-size 64",
-        "--kv-cache-dtype auto",
         "--chunked-prefill-size 16384",
         "--watchdog-timeout 1200",
         "--mem-fraction-static 0.9",

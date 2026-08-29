@@ -1545,15 +1545,28 @@ export const Playground = ({ config }) => {
         ],
       };
       const fabricFlags = HW_MULTINODE_DOCKER_FLAGS[sel.hw] || [];
+      const configuredDockerVendor = typeof config.dockerGpuVendor === "function"
+        ? config.dockerGpuVendor(sel)
+        : config.dockerGpuVendor;
+      const dockerVendor = configuredDockerVendor || "nvidia";
+      const gpuAccessLines = dockerVendor === "amd"
+        ? [
+            "docker run",
+            "  --device=/dev/kfd --device=/dev/dri",
+            "  --group-add video",
+            "  --cap-add=SYS_PTRACE --security-opt seccomp=unconfined",
+            "  --shm-size 32g",
+          ]
+        : [
+            "docker run --gpus all",
+            "  --shm-size 32g",
+          ];
       const dockerLines = [
-        "docker run --gpus all",
-        "  --shm-size 32g",
+        ...gpuAccessLines,
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
         ...(multinode ? fabricFlags.map((x) => "  " + x) : []),
         "  -v ~/.cache/huggingface:/root/.cache/huggingface",
-        ...(typeof config.dockerMounts === "function"
-          ? config.dockerMounts(sel)
-          : (config.dockerMounts || [])).map((mount) => `  -v ${mount}`),
+        ...(config.dockerMounts || []).map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
