@@ -102,9 +102,6 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
-    # Host-selected execution variant; this is a Python capture/eager scalar,
-    # not device metadata.
-    decode_seq_len_splits: int = 1
     # Decode/verify request order and read-only metadata shared by every
     # attention layer in one forward. Preparing these once avoids repeating
     # the same sort and page-table gathers in each layer.
@@ -424,7 +421,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _prepare_decode_seq_len_splits(self, metadata: TRTLLMMHAMetadata) -> None:
         """Build request ordering and sorted read metadata once per forward."""
         if (
-            metadata.decode_seq_len_splits == 1
+            self.decode_seq_len_splits == 1
             or metadata.is_ragged_verify
             or metadata.cache_seqlens_int32 is None
             or metadata.page_table is None
