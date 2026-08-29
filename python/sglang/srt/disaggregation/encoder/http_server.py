@@ -600,6 +600,10 @@ async def health_generate():
         drain_task = asyncio.create_task(
             _drain_health_encode(encoder, encode_task, req_id)
         )
+        # wait_for(shield(...)) leaves the drain running after a timeout. Keep
+        # a strong reference until it releases the TP dispatch lock.
+        encoder.background_tasks.add(drain_task)
+        drain_task.add_done_callback(encoder.background_tasks.discard)
         # The drain task now owns the lock and request state. A probe timeout or
         # client disconnect must not let a later request overtake its TP work.
         owns_dispatch_lock = False

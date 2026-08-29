@@ -17,6 +17,7 @@ class _FakeEncoder:
         self.embedding_to_send = {}
         self.encode_dispatch_lock = asyncio.Lock()
         self.encode_calls = []
+        self.background_tasks = set()
         self.released = []
         self.release_event = asyncio.Event()
 
@@ -107,12 +108,15 @@ def test_health_timeout_keeps_dispatch_order_until_encode_drains(monkeypatch):
         assert response.status_code == 503
         assert encode_started.is_set()
         assert encoder.encode_dispatch_lock.locked()
+        assert len(encoder.background_tasks) == 1
         assert encoder.released == []
 
         finish_encode.set()
         await asyncio.wait_for(encoder.release_event.wait(), timeout=1)
         await asyncio.wait_for(encoder.encode_dispatch_lock.acquire(), timeout=1)
         encoder.encode_dispatch_lock.release()
+        await asyncio.sleep(0)
+        assert encoder.background_tasks == set()
         assert len(encoder.released) == 1
 
     asyncio.run(run_test())
@@ -139,12 +143,15 @@ def test_cancelled_health_request_does_not_cancel_dispatched_encode(monkeypatch)
         with pytest.raises(asyncio.CancelledError):
             await task
         assert encoder.encode_dispatch_lock.locked()
+        assert len(encoder.background_tasks) == 1
         assert encoder.released == []
 
         finish_encode.set()
         await asyncio.wait_for(encoder.release_event.wait(), timeout=1)
         await asyncio.wait_for(encoder.encode_dispatch_lock.acquire(), timeout=1)
         encoder.encode_dispatch_lock.release()
+        await asyncio.sleep(0)
+        assert encoder.background_tasks == set()
         assert len(encoder.released) == 1
 
     asyncio.run(run_test())
