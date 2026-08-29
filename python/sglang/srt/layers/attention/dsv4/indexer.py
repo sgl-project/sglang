@@ -130,6 +130,87 @@ def fp8_paged_mqa_logits_torch(
     return scores
 
 
+_FP4_E2M1_MAG = None
+
+
+def _dequant_fp4_indexer(packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Dequant the DSv4 FP4 indexer format to bf16.
+
+    ``packed`` [..., 64] uint8 holds 128 E2M1 codes, 2 per byte (low nibble is
+    element 2b, high nibble 2b+1); ``sf`` [...] int32 holds four UE8M0 exponents
+    (one per 32-element group). Layout is fixed by _quantize_fp4_indexer_kernel
+    in kernels/ops/attention/dsv4/fp4_indexer.py -- keep in sync.
+    """
+    global _FP4_E2M1_MAG
+    if _FP4_E2M1_MAG is None or _FP4_E2M1_MAG.device != packed.device:
+        _FP4_E2M1_MAG = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            dtype=torch.float32,
+            device=packed.device,
+        )
+    p = packed.to(torch.int32)
+    codes = torch.stack([p & 0x0F, (p >> 4) & 0x0F], dim=-1).flatten(-2)
+    vals = _FP4_E2M1_MAG[codes & 0x07] * torch.where(
+        (codes & 0x08) != 0, -1.0, 1.0
+    )
+    s = sf.to(torch.int32)
+    exps = torch.stack([(s >> (g * 8)) & 0xFF for g in range(4)], dim=-1)
+    scale = (exps << 23).view(torch.float32).repeat_interleave(32, dim=-1)
+    return (vals * scale).to(torch.bfloat16)
+
+
+def fp4_paged_mqa_logits_torch(
+    q: tuple,
+    kvcache_raw: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = False,
+) -> torch.Tensor:
+    """FP4 indexer score for gfx950 (ROCm has no DeepGEMM fp4 kernel).
+
+    Correctness-mirror of fp8_paged_mqa_logits_torch with fp4 q/kv dequant.
+    ``kvcache_raw`` is the raw [pages, page_size*(64+4)] uint8 pool buffer,
+    blocked as [page_size*64 fp4 | page_size*4 scale] per _store_fp4_index_k_cache_kernel.
+    """
+    _ = (deep_gemm_metadata, clean_logits)
+    q_fp8 = q[0] if isinstance(q, tuple) else q  # fp8 q [B, 1, H, HEAD]
+    batch_size, _, num_heads, _ = q_fp8.shape
+    block_size = 64
+    head_dim = 128
+    pages = kvcache_raw.shape[0]
+    kv_flat = kvcache_raw.reshape(pages, -1)
+    kv_fp4 = kv_flat[:, : block_size * 64].reshape(pages, block_size, 64)
+    kv_sf = (
+        kv_flat[:, block_size * 64 :]
+        .reshape(pages, block_size, 4)
+        .contiguous()
+        .view(torch.int32)
+        .squeeze(-1)
+    )
+    kv_values = _dequant_fp4_indexer(kv_fp4, kv_sf)  # [pages, block, 128]
+
+    max_num_pages = page_table.shape[1]
+    pages_clamped = page_table.clamp(min=0)
+    kv_g = kv_values.reshape(pages, block_size * head_dim)[pages_clamped]
+    kv_g = kv_g.reshape(batch_size, max_num_pages * block_size, head_dim)
+
+    q_float = q_fp8[:, 0].to(torch.bfloat16)  # [B, H, 128]
+    scores = torch.bmm(kv_g, q_float.transpose(1, 2))
+    scores = F.relu(scores)
+    scores = scores * weight.unsqueeze(1)
+    scores = scores.sum(dim=2)
+
+    padded_seq_len = max_num_pages * block_size
+    positions = torch.arange(padded_seq_len, device=scores.device).unsqueeze(0)
+    scores = scores.masked_fill(~(positions < seq_lens.reshape(-1, 1)), 0.0)
+    if padded_seq_len < max_seq_len:
+        return F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
+    return scores[:, :max_seq_len]
+
+
 def _aiter_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kvcache_fp8: torch.Tensor,
@@ -693,9 +774,13 @@ class C4IndexerBackendMixin:
 
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
-            assert len(q_fp4.shape) == 3
-            assert len(q_sf.shape) == 2
-            q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
+            if q_sf is None:
+                # HIP: q kept fp8 (only KV is fp4); q_fp4 is the fp8 q [T, H, HEAD].
+                q = q_fp4.unsqueeze(1)
+            else:
+                assert len(q_fp4.shape) == 3
+                assert len(q_sf.shape) == 2
+                q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
         else:
             assert len(q_indexer.shape) == 3
             q = q_indexer.unsqueeze(1)
@@ -704,9 +789,18 @@ class C4IndexerBackendMixin:
         weights = weights.squeeze(2)
         if use_fp4_indexer:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            if is_hip():
+                # ROCm has no DeepGEMM fp4 kernel; use the fused Triton paged
+                # MQA-logits (fp4 dequant on the fly, no KV materialization).
+                from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                    fp4_paged_mqa_logits_triton as fn,
+                )
+            else:
+                if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                    raise RuntimeError(
+                        "DeepSeek V4 FP4 indexer requires DeepGEMM indexer."
+                    )
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
