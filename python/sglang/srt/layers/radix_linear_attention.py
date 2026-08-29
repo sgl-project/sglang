@@ -84,10 +84,8 @@ class RadixLinearAttention(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        if (
-            forward_batch.forward_mode.is_extend()
-            and get_tc_piecewise_forward_context() is not None
-        ):
+        is_extend = forward_batch.forward_mode.is_extend()
+        if is_extend and get_tc_piecewise_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
             output = torch.empty(
@@ -112,14 +110,102 @@ class RadixLinearAttention(nn.Module):
                     self.layer_id,
                 )
             return output
-        else:
-            return get_attn_backend().forward(
-                layer=self,
-                forward_batch=forward_batch,
+
+        # Target verify rebuilds query_start_loc from the physical padded input,
+        # unlike ordinary extend where it retains the logical sequence ends.
+        should_trim_padded_extend = (
+            is_extend and not forward_batch.forward_mode.is_target_verify()
+        )
+        real_num_tokens = (
+            getattr(forward_batch, "num_token_non_padded_cpu", None)
+            if should_trim_padded_extend
+            else None
+        )
+        if real_num_tokens is not None and real_num_tokens < mixed_qkv.shape[0]:
+            # DP synchronization may append physical rows beyond the logical varlen
+            # layout; compute its real prefix, then restore the downstream shape.
+            output = torch.empty(
+                (1, mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+            _linear_attention_with_output_impl(
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
+                output=output,
+                attention_layer=self,
+                forward_batch=forward_batch,
             )
+            return output
+
+        return get_attn_backend().forward(
+            layer=self,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+        )
+
+
+def _linear_attention_with_output_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    attention_layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Run linear attention on the real prefix and initialize physical padding."""
+    real_num_tokens = min(forward_batch.num_token_non_padded_cpu, mixed_qkv.shape[0])
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    logical_output = output[:, :real_num_tokens]
+    try:
+        ret = get_attn_backend().forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a[:real_num_tokens],
+            b=b[:real_num_tokens],
+            linear_attn_output=logical_output,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+    # FlashInfer GDN can write directly into the physical output's logical
+    # prefix. Other backends return their own tensor and keep the copy fallback.
+    if ret.data_ptr() != logical_output.data_ptr():
+        logical_output.copy_(ret)
+    # Physical padding participates in following residual, router, expert/MoE,
+    # and collective operations. Keep those inputs finite and deterministic.
+    output[:, real_num_tokens:].zero_()
+
+
+def _unified_linear_attention_with_output_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Eager implementation kept separate for backend-independent tests."""
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    _linear_attention_with_output_impl(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        attention_layer=attention_layer,
+        forward_batch=forward_batch,
+    )
+    return
 
 
 @register_custom_op(mutates_args=["output"])
@@ -131,31 +217,14 @@ def unified_linear_attention_with_output(
     output: torch.Tensor,
     layer_id: int,
 ) -> None:
-    """
-    Custom op wrapper for linear attention computation only.
-    """
-    context = get_tc_piecewise_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
-
-    original_out_cache_loc = forward_batch.out_cache_loc
-    # Keep the original ForwardBatch object and only narrow cache locations for
-    # this backend call so model/backend state is still written to the same batch.
-    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
-
-    ret = get_attn_backend().forward(
-        layer=attention_layer,
-        forward_batch=forward_batch,
-        mixed_qkv=mixed_qkv[:real_num_tokens],
-        a=a[:real_num_tokens],
-        b=b[:real_num_tokens],
+    """Custom op wrapper for linear attention computation only."""
+    _unified_linear_attention_with_output_impl(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        layer_id=layer_id,
     )
-    forward_batch.out_cache_loc = original_out_cache_loc
-
-    output[:, :real_num_tokens].copy_(ret)
-    return
 
 
 bcg_unified_linear_attention_with_output = eager_on_graph(True)(
