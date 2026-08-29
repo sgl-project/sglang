@@ -12,7 +12,7 @@ pull (2shot)  :func:`all_reduce_pull_res`   :func:`all_reduce_pull_norm`
 
 * **push** — 1shot multicast-push. Works on ANY contiguous bf16 tensor
   (input is read and written in place); reuses the CustomAllReduceV2 push
-  workspace, so the caller passes the workspace slab's multicast base.
+  plane, whose multicast base the plane itself carries.
   Best for small messages. Needs :func:`register_comm`.
 * **pull** — low-SM NVLS 2shot ON the input, which must be allocated from
   multicast-bound symmetric memory (the caller passes its multicast VA):
@@ -20,10 +20,8 @@ pull (2shot)  :func:`all_reduce_pull_res`   :func:`all_reduce_pull_norm`
   Launch geometry defaults to :data:`RES_TUNING` /
   :data:`NORM_TUNING` and can be overridden per call via ``num_blocks`` /
   ``unroll`` (``num_blocks`` must be uniform across ranks per call).
-  Barriers reuse the CustomAllReduceV2 pull semaphores (same reservation
-  protocol as the generic pull kernels, signaled via one multicast red), so
-  :func:`register_comm` additionally needs the semaphore region's multicast
-  VA (``CustomAllReduceV2.pull_sem_mc_ptr``).
+  Barriers reuse the CustomAllReduceV2 barrier plane (same reservation
+  protocol as the generic pull kernels, signaled via one multicast red).
 
 Epilogue contracts: the ``res`` residual must be identical on every rank (a
 fully reduced tensor such as the attn-res prefix sum) or absent; the
@@ -74,20 +72,15 @@ def _jit_module(world_size: int) -> Module:
 # Storage plane: the CustomAllReduceV2 Communicator
 
 
-class _CommEntry(NamedTuple):
-    obj: Communicator  # sgl.Communicator
-    pull_sem_mc_ptr: int
+_COMM_MAP: dict[int, Communicator] = {}
 
 
-_COMM_MAP: dict[int, _CommEntry] = {}
+def register_comm(comm: Communicator) -> None:
+    """Register the CustomAllReduceV2 communication planes.
 
-
-def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
-    """Register the CustomAllReduceV2 storage plane.
-
-    The push kernels only need ``comm``; the pull kernels additionally need
-    ``pull_sem_mc_ptr`` (``CustomAllReduceV2.pull_sem_mc_ptr``), the
-    multicast VA of the pull-semaphore region their barriers reuse.
+    The push kernels use the push plane, the pull kernels the barrier plane;
+    both carry their own multicast base, so nothing else has to be threaded
+    through here.
     """
     # world_size is the whole key, so at most one communicator per size can be
     # registered in a process. That matches how these ops are called -- the custom
@@ -97,12 +90,12 @@ def register_comm(comm: Communicator, *, pull_sem_mc_ptr: int = 0) -> None:
     # it instead of letting the overwrite happen; widening to per-group handles
     # means changing the custom-op signatures, which is a separate change.
     prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev.obj is comm, (
+    assert prev is None or prev is comm, (
         f"a different communicator is already registered for world_size="
         f"{comm.world_size}; these ops key only on world_size, so two groups of "
         f"the same size cannot coexist in one process"
     )
-    _COMM_MAP[comm.world_size] = _CommEntry(obj=comm, pull_sem_mc_ptr=pull_sem_mc_ptr)
+    _COMM_MAP[comm.world_size] = comm
 
 
 class PullTuning(NamedTuple):
@@ -164,10 +157,8 @@ def _push_res_op(
     world_size: int,
     x: torch.Tensor,
     residual: Optional[torch.Tensor],
-    ws_mc_base: int,
 ) -> None:
-    comm = _COMM_MAP[world_size].obj
-    _jit_module(world_size).push_res(comm, x.view(-1), residual, ws_mc_base)
+    _jit_module(world_size).push_res(_COMM_MAP[world_size], x.view(-1), residual)
 
 
 @register_custom_op(mutates_args=["x"])
@@ -177,11 +168,9 @@ def _push_norm_op(
     weight: torch.Tensor,
     eps: float,
     num_norm_rows: int,
-    ws_mc_base: int,
 ) -> None:
-    comm = _COMM_MAP[world_size].obj
     _jit_module(world_size).push_norm(
-        comm, x.view(-1), weight, eps, num_norm_rows, ws_mc_base
+        _COMM_MAP[world_size], x.view(-1), weight, eps, num_norm_rows
     )
 
 
@@ -194,18 +183,15 @@ def _finalize_push_norm_op(
     expert_weights: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    ws_mc_base: int,
 ) -> None:
-    comm = _COMM_MAP[world_size].obj
     _jit_module(world_size).finalize_push_norm(
-        comm,
+        _COMM_MAP[world_size],
         out.view(-1),
         gemm2_out,
         expanded_idx_to_permuted_idx,
         expert_weights,
         weight,
         eps,
-        ws_mc_base,
     )
 
 
@@ -218,13 +204,11 @@ def _pull_res_op(
     num_blocks: int,
     unroll: int,
 ) -> None:
-    entry = _COMM_MAP[world_size]
     _jit_module(world_size).pull_res(
-        entry.obj,
+        _COMM_MAP[world_size],
         x.view(-1),
         residual,
         input_mc_ptr,
-        entry.pull_sem_mc_ptr,
         num_blocks,
         unroll,
     )
@@ -241,15 +225,13 @@ def _pull_norm_op(
     num_blocks: int,
     unroll: int,
 ) -> None:
-    entry = _COMM_MAP[world_size]
     _jit_module(world_size).pull_norm(
-        entry.obj,
+        _COMM_MAP[world_size],
         x.view(-1),
         weight,
         eps,
         num_norm_rows,
         input_mc_ptr,
-        entry.pull_sem_mc_ptr,
         num_blocks,
         unroll,
     )
@@ -259,17 +241,14 @@ def all_reduce_push_res(
     world_size: int,
     x: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
-    *,
-    ws_mc_base: int,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x) [+ residual]`` via 1shot multicast push.
 
-    ``x`` may be any contiguous bf16 CUDA tensor whose byte size fits the
-    registered push workspace. ``ws_mc_base`` is the multicast VA of the v2
-    workspace slab base. Call :func:`register_comm` once beforehand.
+    ``x`` may be any contiguous bf16 CUDA tensor whose byte size fits a slot
+    of the registered push plane. Call :func:`register_comm` once beforehand.
     """
     residual_ = residual.view(-1) if residual is not None else None
-    _push_res_op(world_size, x, residual_, ws_mc_base)
+    _push_res_op(world_size, x, residual_)
     return x
 
 
@@ -280,11 +259,10 @@ def all_reduce_push_norm(
     eps: float,
     *,
     num_norm_rows: int,
-    ws_mc_base: int,
 ) -> torch.Tensor:
     """In-place allreduce via 1shot multicast push + RMSNorm over the first
     ``num_norm_rows`` rows of ``x`` viewed as [numel / 3584, 3584]."""
-    _push_norm_op(world_size, x, weight, eps, num_norm_rows, ws_mc_base)
+    _push_norm_op(world_size, x, weight, eps, num_norm_rows)
     return x
 
 
@@ -296,8 +274,6 @@ def finalize_all_reduce_push_norm(
     expert_weights: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    *,
-    ws_mc_base: int,
 ) -> torch.Tensor:
     """Deferred MoE finalize + 1shot push all-reduce + RMSNorm on EVERY row.
 
@@ -314,7 +290,6 @@ def finalize_all_reduce_push_norm(
         expert_weights,
         weight,
         eps,
-        ws_mc_base,
     )
     return out
 
@@ -331,8 +306,9 @@ def all_reduce_pull_res(
     """In-place ``x = allreduce(x) [+ residual]`` via low-SM NVLS 2shot.
 
     ``x`` MUST be allocated from multicast-bound symmetric memory and
-    ``input_mc_ptr`` must be its multicast VA. Call :func:`register_comm`
-    (with ``pull_sem_mc_ptr``) once beforehand.
+    ``input_mc_ptr`` must be its multicast VA (it varies per call, unlike the
+    barrier plane's own multicast base). Call :func:`register_comm` once
+    beforehand.
     """
     tuning = _resolve_tuning(
         RES_TUNING,

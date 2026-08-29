@@ -24,15 +24,20 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <cfloat>
-#include <cooperative_groups.h>
 #include <cstdint>
 #include <limits>
+
+#ifndef USE_ROCM
+#include <cooperative_groups.h>
+#endif
 
 namespace sglang {
 
 namespace device::topk {
 
+#ifndef USE_ROCM
 namespace cg = cooperative_groups;
+#endif
 
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
@@ -139,14 +144,27 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#else
+    uint32_t n = __shfl_up_sync(kFullMask, val, offset, kWarpThreads);
+#endif
     if (lane_id >= offset) val += n;
   }
   return val;
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+#ifdef USE_ROCM
+  // The ballot covers the whole hardware wave, which on wave64 holds two of
+  // these 32-lane logical warps, so a plain __popc would report the wave's
+  // lower half to both of them. Shift the caller's mask onto this warp's half
+  // and count all 64 bits. __lane_id() / kWarpSize is 0 on wave32.
+  const uint32_t half = __lane_id() / kWarpSize;
+  return __popcll(__ballot(pred) & (static_cast<uint64_t>(mask) << (kWarpSize * half)));
+#else
   return __popc(__ballot_sync(mask, pred));
+#endif
 }
 
 struct alignas(8) TieValue {
@@ -690,7 +708,12 @@ struct TopKStreaming : TopKRegister<2> {
 // ---------------------------------------------------------------------------
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
 // on one batch element via distributed shared memory (one cluster per element).
+//
+// CUDA only: thread-block clusters and distributed shared memory have no CDNA
+// equivalent.
 // ---------------------------------------------------------------------------
+
+#ifndef USE_ROCM
 
 template <uint32_t kClusterSize_>
 struct TopKCluster : TopKRadixBase<10> {
@@ -858,6 +881,8 @@ struct TopKCluster : TopKRadixBase<10> {
     }
   }
 };
+
+#endif  // !USE_ROCM
 
 }  // namespace device::topk
 
