@@ -137,6 +137,9 @@ class ComponentLoader(ABC):
     # Gates only --component-quantizations.<name>. Quantization declared by a
     # checkpoint is discovered and admitted by the component's normal loader.
     supports_online_quantization_override = False
+    # Gates only --component-direct-gpu-weight-loading.<name>. The checkpoint
+    # source stays component-specific because its streaming ABI is loader-owned.
+    supports_direct_gpu_weight_loading = False
 
     _loaders_registered = False
 
@@ -236,6 +239,13 @@ class ComponentLoader(ABC):
 
         """
         self._native_load_manages_placement = False
+        if (
+            server_args.should_direct_gpu_weight_load_component(component_name)
+            and not self.supports_direct_gpu_weight_loading
+        ):
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support direct GPU weight loading"
+            )
         component_quantization = server_args.component_quantizations.get(component_name)
         if (
             component_quantization is not None
