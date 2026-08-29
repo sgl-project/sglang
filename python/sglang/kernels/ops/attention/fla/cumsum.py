@@ -10,6 +10,9 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -68,17 +71,8 @@ def chunk_local_cumsum_scalar_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
-)
 @triton.jit(do_not_specialize=["T"])
-def chunk_local_cumsum_vector_kernel(
+def _chunk_local_cumsum_vector_kernel(
     s,
     o,
     scale,
@@ -156,6 +150,17 @@ def chunk_local_cumsum_vector_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+chunk_local_cumsum_vector_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
+        for BS in BS_LIST
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
+)(_chunk_local_cumsum_vector_kernel)
+
+
 def chunk_local_cumsum_scalar(
     g: torch.Tensor,
     chunk_size: int,
@@ -223,13 +228,24 @@ def chunk_local_cumsum_vector(
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
-    def grid(meta):
-        return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
+    if not _is_npu:
+        kernel = chunk_local_cumsum_vector_kernel
+
+        def grid(meta):
+            return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
+
+        static_config = {}
+    else:
+        # Ascend's autotuner benchmarks every CUDA-oriented candidate during
+        # the first request. Use the stable A3 configuration directly.
+        kernel = _chunk_local_cumsum_vector_kernel
+        grid = (triton.cdiv(S, 64), NT, B * H)
+        static_config = {"BS": 64, "num_warps": 4, "num_stages": 3}
 
     # keep cumulative normalizer in fp32
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
-    chunk_local_cumsum_vector_kernel[grid](
+    kernel[grid](
         s=g_org,
         o=g,
         scale=scale,
@@ -244,6 +260,7 @@ def chunk_local_cumsum_vector(
         REVERSE=reverse,
         HAS_SCALE=scale is not None,
         IS_VARLEN=cu_seqlens is not None,
+        **static_config,
     )
     return g
 
