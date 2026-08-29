@@ -100,10 +100,8 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
         disable_if_incompatible.assert_called_once()
 
-    def test_trtllm_mla_stays_on_breakable(self):
+    def _trtllm_mla_args(self):
         args = ServerArgs(model_path="dummy")
-        # trtllm_mla skips the tc_piecewise upgrade and keeps breakable, which
-        # now serves MLA by falling back to the flashinfer MLA impl for extend.
         args._model_config = SimpleNamespace(
             is_multimodal_piecewise_cuda_graph_supported=True,
             is_multimodal=False,
@@ -114,8 +112,17 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             prefill=PhaseConfig(backend=Backend.BREAKABLE)
         )
         args._cuda_graph_config_locked = set()
+        return args
 
+    def _resolve_with_varlen(self, args, has_varlen):
         with (
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook._trtllm_mla_has_varlen_absorbed",
+                return_value=has_varlen,
+            ),
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook.disable_tc_piecewise_cudagraph_if_incompatible"
+            ),
             patch.object(
                 args,
                 "_resolved_attention_backends",
@@ -124,9 +131,19 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             patch.object(args, "use_mla_backend", return_value=True),
         ):
             apply_cuda_graph_compatibility(args)
+        return resolution_result(args, "cuda_graph_config").prefill.backend
+
+    def test_trtllm_mla_takes_the_upgrade_when_varlen_absorbed_is_available(self):
+        args = self._trtllm_mla_args()
+        self.assertEqual(
+            self._resolve_with_varlen(args, has_varlen=True), Backend.TC_PIECEWISE
+        )
+
+    def test_trtllm_mla_keeps_the_exclusion_without_varlen_absorbed(self):
+        args = self._trtllm_mla_args()
 
         self.assertEqual(
-            resolution_result(args, "cuda_graph_config").prefill.backend,
+            self._resolve_with_varlen(args, has_varlen=False),
             Backend.BREAKABLE,
         )
 
