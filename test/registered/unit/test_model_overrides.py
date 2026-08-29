@@ -15,7 +15,6 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
-from sglang.srt.arg_groups import attention_hook
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.overrides import (
@@ -31,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_server_args,
+    override_platform,
     reset_context,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -427,11 +427,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
 
     def test_sparse_minicpm_defaults_to_sparse_attention_backend(self):
-        with patch.object(
-            overrides_module,
-            "is_blackwell_supported",
-            return_value=False,
-        ):
+        with override_platform(is_blackwell=False):
             for architecture in ("MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"):
                 with self.subTest(architecture=architecture):
                     self.assertEqual(
@@ -456,20 +452,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             has_lightning_layers=False,
         )
 
-        with patch.object(
-            overrides_module, "is_blackwell_supported", return_value=False
-        ):
+        with override_platform(is_blackwell=False):
             overrides = overrides_module._minicpm_sala_overrides(args, config)
 
         self.assertTrue(overrides["disable_radix_cache"])
         self.assertEqual(overrides["attention_backend"], "minicpm_flashattn")
 
     def test_sparse_minicpm_defaults_to_flashinfer_on_blackwell(self):
-        with patch.object(
-            overrides_module,
-            "is_blackwell_supported",
-            return_value=True,
-        ):
+        with override_platform(is_blackwell=True):
             self.assertEqual(
                 self._minicpm_overrides(
                     "MiniCPMSALAForCausalLM",
@@ -531,11 +521,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )["attention_backend"],
                 "flashinfer",
             )
-            with patch.object(
-                overrides_module,
-                "is_blackwell_supported",
-                return_value=True,
-            ):
+            with override_platform(is_blackwell=True):
                 self.assertEqual(
                     self._minicpm_overrides(
                         "MiniCPMSALAForCausalLM",
@@ -544,11 +530,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )["attention_backend"],
                     "fa4",
                 )
-            with patch.object(
-                overrides_module,
-                "is_blackwell_supported",
-                return_value=False,
-            ):
+            with override_platform(is_blackwell=False):
                 split_overrides = self._minicpm_overrides(
                     "MiniCPMSALAForCausalLM",
                     sparse_attention=True,
@@ -625,9 +607,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         """MiniMax-M2 NVFP4 auto must avoid the unsupported plain TRT-LLM path."""
         # Every module that asks: the attention handler validates what the
         # override family picks, and each holds its own import.
-        with patch.object(
-            overrides_module, "is_sm100_supported", return_value=True
-        ), patch.object(attention_hook, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True), override_platform(is_sm100=True):
             explicit = self._construct(
                 "MiniMaxM2ForCausalLM",
                 "llama",
@@ -666,8 +646,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         # Thor (SM110) and other architectures keep the existing auto behavior.
         with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=False),
-            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+            override_platform(is_sm100=False),
+            override_platform(is_sm120=False),
         ):
             non_sm10x = self._construct(
                 "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
@@ -688,7 +668,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return SimpleNamespace(**defaults)
 
         # Non-SM100: the MoE pin must not fire, so hf_config is never inspected.
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(
                 _mimo_v2_overrides(_args(speculative_algorithm="EAGLE"), None),
                 {"enable_multi_layer_eagle": True},
@@ -704,7 +684,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             with patch.object(
                 overrides_module, "get_quantization_config", return_value="fp8"
             ):
@@ -724,7 +704,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(_mimo_v2_overrides(_args(), None), {})
 
     def test_mimo_v2_family_is_registered(self):
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(
                 collect_model_override_declarations(
                     "MiMoV2FlashForCausalLM",
@@ -785,8 +765,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            override_platform(is_sm100=True),
+            override_platform(is_blackwell=True),
         ):
             self.assertEqual(
                 _nemotron_h_overrides(server_args, hf_config),
@@ -815,8 +795,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            override_platform(is_sm100=True),
+            override_platform(is_blackwell=True),
         ):
             self.assertEqual(
                 _nemotron_h_overrides(server_args, hf_config),
@@ -848,16 +828,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 server_args.speculative_algorithm = "EAGLE"
 
                 with (
-                    patch.object(
-                        overrides_module,
-                        "is_blackwell_supported",
-                        return_value=True,
-                    ),
-                    patch.object(
-                        overrides_module,
-                        "is_sm100_supported",
-                        return_value=is_sm100,
-                    ),
+                    override_platform(is_blackwell=True),
+                    override_platform(is_sm100=is_sm100),
                 ):
                     overrides = _nemotron_h_overrides(server_args, hf_config)
                     for key, value in expected.items():
@@ -871,12 +843,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 server_args, hf_config = self._nemotron_h_args(quantized_layers={})
                 server_args.speculative_algorithm = algorithm
                 with (
-                    patch.object(
-                        overrides_module, "is_blackwell_supported", return_value=True
-                    ),
-                    patch.object(
-                        overrides_module, "is_sm100_supported", return_value=True
-                    ),
+                    override_platform(is_blackwell=True),
+                    override_platform(is_sm100=True),
                 ):
                     overrides = _nemotron_h_overrides(server_args, hf_config)
                 self.assertEqual(overrides["attention_backend"], "trtllm_mha")
@@ -888,8 +856,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
         server_args.speculative_algorithm = "DFLASH"
         with (
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_blackwell=True),
+            override_platform(is_sm100=True),
         ):
             overrides = _nemotron_h_overrides(server_args, hf_config)
         self.assertEqual(overrides["attention_backend"], "trtllm_mha")
@@ -905,8 +873,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         server_args.speculative_draft_attention_backend = "flashinfer"
 
         with (
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_blackwell=True),
+            override_platform(is_sm100=True),
         ):
             overrides = _nemotron_h_overrides(server_args, hf_config)
 
@@ -923,8 +891,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         server_args.speculative_eagle_topk = 4
 
         with (
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_blackwell=True),
+            override_platform(is_sm100=True),
         ):
             overrides = _nemotron_h_overrides(server_args, hf_config)
 
@@ -939,8 +907,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
 
         with (
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            override_platform(is_blackwell=True),
+            override_platform(is_sm100=False),
         ):
             self.assertNotIn(
                 "attention_backend", _nemotron_h_overrides(server_args, hf_config)
@@ -952,8 +920,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
 
         with (
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_blackwell=True),
+            override_platform(is_sm100=True),
         ):
             self.assertEqual(
                 _nemotron_h_overrides(server_args, hf_config)["attention_backend"],
@@ -969,8 +937,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         server_args.speculative_draft_attention_backend = "fa3"
 
         with (
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_blackwell=True),
+            override_platform(is_sm100=True),
         ):
             overrides = _nemotron_h_overrides(server_args, hf_config)
         self.assertNotIn("attention_backend", overrides)
@@ -1477,7 +1445,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_sm100=True),
         ):
             self.assertEqual(
                 _deepseek_v4_overrides(_args(), hf),
@@ -1505,7 +1473,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # FlashInfer MXFP4 only supports the standard (non-A2A) dispatcher.
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_sm100=True),
         ):
             self.assertNotIn(
                 "moe_runner_backend",
@@ -1514,7 +1482,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # Runtime FP4-to-FP8 dequantization must retain the generic FP8 runner.
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
+            override_platform(is_sm100=True),
         ):
             self.assertNotIn(
                 "moe_runner_backend",
@@ -1539,9 +1507,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # Unsupported NVIDIA architectures keep the generic auto-resolution
         # path instead of selecting a FlashInfer kernel that cannot launch.
         with (
-            patch.object(overrides_module, "is_sm90_supported", return_value=False),
-            patch.object(overrides_module, "is_sm100_supported", return_value=False),
-            patch.object(overrides_module, "is_sm120_supported", return_value=False),
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=False),
+            override_platform(is_sm120=False),
         ):
             self.assertNotIn(
                 "moe_runner_backend",
@@ -1550,9 +1518,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # SM120 uses the same model hook; no later pass is needed.
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
-            patch.object(overrides_module, "is_sm90_supported", return_value=False),
-            patch.object(overrides_module, "is_sm100_supported", return_value=False),
-            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=False),
+            override_platform(is_sm120=True),
         ):
             self.assertEqual(
                 _deepseek_v4_overrides(_args(), hf)["moe_runner_backend"],
@@ -1605,8 +1573,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         hf = _hf()
         with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            override_platform(is_sm100=True),
+            override_platform(is_blackwell=True),
         ):
             # modelopt checkpoint: quant algo resolution + sm100 defaults
             self.assertEqual(
@@ -1625,7 +1593,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "modelopt_mixed",
             )
         with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            override_platform(is_sm100=False),
             patch.object(overrides_module, "is_cuda", return_value=True),
             patch.object(
                 overrides_module, "get_device_capability", return_value=(9, 0)
@@ -1651,8 +1619,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         hf_without_quant_cfg = _hf(include_quantization_config=False)
         with (
-            patch.object(overrides_module, "is_sm100_supported", return_value=True),
-            patch.object(overrides_module, "is_blackwell_supported", return_value=True),
+            override_platform(is_sm100=True),
+            override_platform(is_blackwell=True),
         ):
             for modelopt_quantization in ("modelopt_fp8", "modelopt_fp4"):
                 with self.subTest(modelopt_quantization=modelopt_quantization):
@@ -1811,8 +1779,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
-            patch.object(overrides_module, "is_sm90_supported", return_value=True),
-            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            override_platform(is_sm90=True),
+            override_platform(is_sm100=False),
         ):
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
@@ -1897,7 +1865,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             # decode-only cutedsl: prefill defaults to trtllm_mla
             self.assertEqual(
                 _cutedsl_prefill_backend_fill(_view()),
@@ -1921,7 +1889,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _cutedsl_prefill_backend_fill(_view(decode_attention_backend=None)),
                 {},
             )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             with self.assertRaises(ValueError):
                 _cutedsl_prefill_backend_fill(_view())
 
@@ -2234,9 +2202,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             args._model_config = SimpleNamespace(attention_arch=AttentionArch.MHA)
             return args
 
-        with patch.object(
-            overrides_module, "is_sm100_supported", return_value=True
-        ), patch.object(
+        with override_platform(is_sm100=True), patch.object(
             overrides_module,
             "get_default_attn_backend",
             lambda server_args, **_: server_args.default_backend_for_test,
@@ -2278,7 +2244,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {"attention_backend": "trtllm_mha", "page_size": 64},
             )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_5_hybrid_overrides(_args("fa3"), None), {})
 
     def test_qwen3vl_page_size(self):
@@ -2306,7 +2272,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="nvfp4_online")
@@ -2321,7 +2287,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
-        with patch.object(overrides_module, "is_sm120_supported", return_value=True):
+        with override_platform(is_sm120=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
                     _view(quantization="modelopt_fp4")
@@ -2366,7 +2332,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
-        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             # e4m3 + trtllm_mha + SM100: mode active
             self.assertTrue(m3_fp8_attn_gemm_enabled(_args()))
             # fa4 dense backend: mode inactive (no fp8-q GEMM path)
@@ -2380,7 +2346,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             # otherwise-active config
             with envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.override(True):
                 self.assertFalse(m3_fp8_attn_gemm_enabled(_args()))
-        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             # non-SM100: mode inactive
             self.assertFalse(m3_fp8_attn_gemm_enabled(_args()))
 
@@ -2400,9 +2366,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ns
 
         hf = SimpleNamespace()
-        with patch.object(overrides_module, "is_hip", return_value=False), patch.object(
-            overrides_module, "is_sm100_supported", return_value=True
-        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+        with patch.object(
+            overrides_module, "is_hip", return_value=False
+        ), override_platform(is_sm100=True), patch.object(
+            overrides_module, "get_quantization_config", return_value=None
+        ):
             # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
             # dense backend with the fp8-q GEMM path); page snaps to 128
             ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
@@ -2501,7 +2469,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
                 _fa4_page_constraint(
                     _view(
@@ -2565,7 +2533,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
                 _llama4_overrides(_args(), None), {"attention_backend": "trtllm_mha"}
             )
@@ -2599,9 +2567,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _lfm2_overrides(_args(), None), {"attention_backend": "flashinfer"}
             )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(_minicpm_v4_6_overrides(_args(), None), {})
-            with patch.object(overrides_module, "is_sm90_supported", return_value=True):
+            with override_platform(is_sm90=True):
                 self.assertEqual(
                     _llama4_overrides(_args(), None), {"attention_backend": "fa3"}
                 )
@@ -2609,11 +2577,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _gemma4_overrides(_args(), None), {"attention_backend": "triton"}
             )
         # Glm4Moe: unconditional tf32 declaration + (sm100) quant/moe absorption
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(
                 _glm4_moe_overrides(None, None), {"enable_tf32_matmul": True}
             )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             self.assertEqual(
                 _glm4_moe_overrides(
                     SimpleNamespace(
@@ -2654,7 +2622,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             with patch.object(
                 overrides_module, "get_quantization_config", return_value="fp8"
             ):
@@ -2670,7 +2638,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _deepseek_moe_quant_resolution(_view(arch="LlamaForCausalLM")), {}
             )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(_deepseek_moe_quant_resolution(_view()), {})
 
     def test_data_parallelism_and_a2a_passes(self):
@@ -2789,9 +2757,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch(
             "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
         ):
-            with patch.object(
-                overrides_module, "is_sm100_supported", return_value=True
-            ):
+            with override_platform(is_sm100=True):
                 self.assertEqual(
                     _deepseek_family_overrides(_args(), None),
                     {"attention_backend": "trtllm_mla"},
@@ -2802,15 +2768,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     ),
                     {},
                 )
-            with patch.object(
-                overrides_module, "is_sm100_supported", return_value=False
-            ):
+            with override_platform(is_sm100=False):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
 
     def test_qwen3_moe_family_quant_absorption(self):
         from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
 
-        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+        with override_platform(is_sm100=True):
             with patch.object(
                 overrides_module, "get_quantization_config", return_value="fp8"
             ):
@@ -2829,7 +2793,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         "moe_runner_backend": "flashinfer_trtllm",
                     },
                 )
-        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+        with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
     def test_step3p_declarations_at_callable_level(self):

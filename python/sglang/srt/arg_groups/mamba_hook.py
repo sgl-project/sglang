@@ -10,13 +10,13 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     supports_mamba_cache_extra_buffer,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
     is_musa,
     is_npu,
-    is_sm100_supported,
     is_xpu,
 )
 
@@ -48,7 +48,7 @@ def handle_mamba_backend(server_args: Any):
                 "supported on NVIDIA CUDA platforms. Disable "
                 "--enable-mamba-cache-stochastic-rounding on this platform."
             )
-        if cfg.mamba_backend == "triton" and not is_sm100_supported():
+        if cfg.mamba_backend == "triton" and not get_platform().is_sm100:
             raise ValueError(
                 "Stochastic rounding for the Mamba SSM cache with "
                 "--mamba-backend triton requires SM100 with CUDA >= 12.8 "

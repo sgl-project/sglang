@@ -34,15 +34,13 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_cuda,
     is_hip,
     is_mps,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
     is_xpu,
     parse_connector_type,
 )
@@ -336,7 +334,7 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
-        if is_sm120_supported():
+        if get_platform().is_sm120:
             # SM120 lacks tcgen05/TMEM: disable features that depend on
             # DeepGEMM or require >99KB SMEM (topk_v2).
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
@@ -715,7 +713,7 @@ def handle_model_capability_adjustments(server_args: Any):
         )
         if (
             is_cuda()
-            and (is_sm90_supported() or is_sm100_supported())
+            and (get_platform().is_sm90 or get_platform().is_sm100)
             and requested_prefill_backend in (None, "fa3", "fa4")
         ):
             # Hopper/Blackwell's default FA backend can consume raw K/V

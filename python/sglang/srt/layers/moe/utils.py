@@ -19,13 +19,13 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_model,
     get_parallel,
+    get_server_args,
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)

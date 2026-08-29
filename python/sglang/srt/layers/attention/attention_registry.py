@@ -19,6 +19,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
 )
 from sglang.srt.runtime_context import (
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
@@ -396,7 +397,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_sm120_supported,
             is_xpu,
         )
 
@@ -435,7 +435,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
-                if is_sm120_supported():
+                if get_platform().is_sm120:
                     allowed = {"triton", "trtllm_mha", "flashinfer"}
                 else:
                     allowed = {"triton", "trtllm_mha", "fa4"}

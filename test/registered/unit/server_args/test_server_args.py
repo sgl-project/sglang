@@ -73,7 +73,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
-from sglang.srt.runtime_context import get_context, get_serving
+from sglang.srt.runtime_context import get_context, get_serving, override_platform
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -645,7 +645,7 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             handle_mamba_backend(server_args)
 
     @patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=True)
-    @patch("sglang.srt.arg_groups.mamba_hook.is_sm100_supported", return_value=False)
+    @override_platform(is_sm100=False)
     def test_rejects_triton_without_sm100(self, _mock_sm100, _mock_is_cuda):
         server_args = ServerArgs(
             model_path="dummy",
@@ -971,14 +971,14 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         args.decode_attention_backend = decode
         args.page_size = page_size
         # Short-circuit model_config_of(): the fa4 page_size branch only needs
-        # use_mla_backend() (mocked) and is_sm100_supported() (mocked), not a
+        # use_mla_backend() (mocked) and override_platform(is_sm100=...), not a
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
         args._model_config = MagicMock()
         args._model_config.hf_config.dual_chunk_attention_config = None
         return args
 
-    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
+    @override_platform(is_sm100=True)
     def test_combined_attention_backend_fa4_forces_page_size_128(self, _mock_sm100):
         # `--attention-backend fa4` (combined): prefill/decode fields stay None.
         args = self._make_args(attention_backend="fa4")
@@ -990,7 +990,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
 
-    @patch("sglang.srt.arg_groups.overrides.is_sm100_supported", return_value=True)
+    @override_platform(is_sm100=True)
     def test_explicit_prefill_fa4_forces_page_size_128(self, _mock_sm100):
         # `--prefill-attention-backend fa4`: the previously-covered path.
         args = self._make_args(attention_backend=None, prefill="fa4", page_size=1)

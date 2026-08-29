@@ -48,6 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import (
     get_buffer,
     get_parallel,
+    get_platform,
     get_spec,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -55,7 +56,6 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -226,10 +226,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # TRTLLM-GEN:
         #   KV bf16: q_type = bf16, out_type=model_runner.dtype
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
-        self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
+        self.is_xqa_impl = get_platform().is_sm90 or get_platform().is_sm120
 
         # fmha_v2 prefill kernel supports SM90 and SM120
-        self.use_fmha_v2 = is_sm90_supported() or is_sm120_supported()
+        self.use_fmha_v2 = get_platform().is_sm90 or get_platform().is_sm120
 
         # trtllm-gen serves page_size >= 128 only through its dynamic
         # tokens-per-page kernels, which exist solely for GQA with equal QK/V

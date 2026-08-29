@@ -15,11 +15,9 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
-    is_blackwell_supported,
     is_cuda,
-    is_sm100_supported,
-    is_sm120_supported,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,7 +28,7 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
-    if not is_blackwell_supported():
+    if not get_platform().is_blackwell:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
@@ -51,7 +49,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
     if is_cuda():
         if cfg.kv_cache_dtype == "nvfp4" and not (
-            is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise RuntimeError(
                 "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "

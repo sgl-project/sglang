@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.kda_helion import HelionKDAKernel
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -160,10 +161,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
 
     def test_replayssm_accepts_helion_and_rejects_other_backends(self):
         with (
-            patch(
-                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
-                return_value=False,
-            ),
+            override_platform(is_sm100=False),
             patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
         ):
             helion_args = ServerArgs(
@@ -188,10 +186,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
             mamba_ssm_dtype="bfloat16",
         )
         with (
-            patch(
-                "sglang.srt.arg_groups.attention_hook.is_sm100_supported",
-                return_value=True,
-            ),
+            override_platform(is_sm100=True),
             patch("sglang.srt.arg_groups.attention_hook.is_cuda", return_value=False),
         ):
             handle_linear_attn_backend(args)

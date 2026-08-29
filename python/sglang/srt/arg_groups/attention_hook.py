@@ -32,13 +32,10 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     is_cuda,
     is_hip,
-    is_sm90_supported,
-    is_sm100_or_sm110_supported,
-    is_sm100_supported,
-    is_sm120_supported,
     parse_connector_type,
 )
 
@@ -136,7 +133,7 @@ def handle_attention_backend_compatibility(server_args: Any):
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     if "trtllm_mha" in (prefill_backend, decode_backend):
         if prefill_backend == "trtllm_mha" and not (
-            is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise ValueError(
                 "TRTLLM MHA backend for prefill requires Hopper (SM90), Blackwell (SM100), or SM120 GPUs. "
@@ -144,7 +141,7 @@ def handle_attention_backend_compatibility(server_args: Any):
             )
         if (
             prefill_backend == "trtllm_mha"
-            and is_sm120_supported()
+            and get_platform().is_sm120
             and (
                 cfg.kv_cache_dtype == "fp8_e4m3"
                 or (
@@ -158,14 +155,14 @@ def handle_attention_backend_compatibility(server_args: Any):
                 "fp8_e4m3 KV cache or skip-softmax."
             )
         if decode_backend == "trtllm_mha" and not (
-            is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise ValueError(
                 "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
             )
         if (
             prefill_backend == "trtllm_mha"
-            and not is_sm100_supported()
+            and not get_platform().is_sm100
             and (cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1)
         ):
             raise ValueError(
@@ -227,7 +224,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         cfg.linear_attn_decode_backend is None
         and cfg.linear_attn_backend != "helion"
-        and is_sm100_supported()
+        and get_platform().is_sm100
         and cfg.mamba_ssm_dtype == "bfloat16"
         # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
         # as a free int64, so it reads the page-major/unified envelope-strided
@@ -567,7 +564,7 @@ def handle_deterministic_inference(server_args: Any):
                 raise ValueError(
                     f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
                 )
-            if attention_backend == "fa4" and not is_sm100_or_sm110_supported():
+            if attention_backend == "fa4" and not get_platform().is_sm100_or_sm110:
                 raise ValueError(
                     "Deterministic inference with absorbed-MLA models on the fa4 "
                     "attention backend requires SM100/SM110: it runs "

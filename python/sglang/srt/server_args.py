@@ -71,6 +71,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
+    get_platform,
     publish,
 )
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
@@ -4383,12 +4384,11 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     bf16 q) without having to move off trtllm_mha.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.utils.common import is_sm100_supported
 
     return (
         args.kv_cache_dtype == "fp8_e4m3"
         and args.attention_backend == "trtllm_mha"
-        and is_sm100_supported()
+        and get_platform().is_sm100
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
 

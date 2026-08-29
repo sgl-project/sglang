@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -25,9 +26,6 @@ from sglang.srt.utils.common import (
     is_cuda,
     is_hip,
     is_mnnvl_fabric_device,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
 )
 from sglang.utils import is_in_ci
 
@@ -424,7 +422,7 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        is_sm100_supported() or is_sm120_supported()
+        get_platform().is_sm100 or get_platform().is_sm120
     ):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
@@ -440,7 +438,9 @@ def handle_environment_variables(server_args: Any):
         sm = get_device_sm()
         explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
         supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm90_supported() and explicit
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_platform().is_sm90
+            and explicit
         )
         if not supported and explicit:
             logger.warning(
