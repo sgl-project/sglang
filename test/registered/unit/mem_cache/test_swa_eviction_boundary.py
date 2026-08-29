@@ -104,6 +104,7 @@ def _make_req(req_pool_idx, token_ids, cache_protected_len, tree):
     """Mock Req with fields needed by _evict_swa and cache_finished_req."""
     req = SimpleNamespace(
         req_pool_idx=req_pool_idx,
+        is_holding_kv=True,
         origin_input_ids=token_ids,
         output_ids=[],
         cache_protected_len=cache_protected_len,
