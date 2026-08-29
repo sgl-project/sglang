@@ -17,6 +17,8 @@ class _FakeEncoder:
         self.embedding_to_send = {}
         self.encode_dispatch_lock = asyncio.Lock()
         self.encode_calls = []
+        self.released = []
+        self.release_event = asyncio.Event()
 
     def has_pending_embeddings(self):
         return bool(self.embedding_to_send)
@@ -28,8 +30,9 @@ class _FakeEncoder:
         self.encode_calls.append(kwargs)
         return 1, 1, 1, None, None
 
-    async def release_request(self, _req_id):
-        return None
+    async def release_request(self, req_id):
+        self.released.append(req_id)
+        self.release_event.set()
 
 
 def _install_tp_encoder(monkeypatch, encoder):
@@ -80,6 +83,88 @@ def test_health_encode_rechecks_busy_state_after_waiting(monkeypatch):
         assert response.status_code == 200
         assert broadcasts == []
         assert encoder.encode_calls == []
+
+    asyncio.run(run_test())
+
+
+def test_health_timeout_keeps_dispatch_order_until_encode_drains(monkeypatch):
+    async def run_test():
+        encoder = _FakeEncoder()
+        _install_tp_encoder(monkeypatch, encoder)
+        encode_started = asyncio.Event()
+        finish_encode = asyncio.Event()
+
+        async def encode(**kwargs):
+            encoder.encode_calls.append(kwargs)
+            encode_started.set()
+            await finish_encode.wait()
+            return 1, 1, 1, None, None
+
+        encoder.encode = encode
+        monkeypatch.setattr(http_server, "HEALTH_CHECK_TIMEOUT", 0.01)
+
+        response = await http_server.health_generate()
+        assert response.status_code == 503
+        assert encode_started.is_set()
+        assert encoder.encode_dispatch_lock.locked()
+        assert encoder.released == []
+
+        finish_encode.set()
+        await asyncio.wait_for(encoder.release_event.wait(), timeout=1)
+        await asyncio.wait_for(encoder.encode_dispatch_lock.acquire(), timeout=1)
+        encoder.encode_dispatch_lock.release()
+        assert len(encoder.released) == 1
+
+    asyncio.run(run_test())
+
+
+def test_cancelled_health_request_does_not_cancel_dispatched_encode(monkeypatch):
+    async def run_test():
+        encoder = _FakeEncoder()
+        _install_tp_encoder(monkeypatch, encoder)
+        encode_started = asyncio.Event()
+        finish_encode = asyncio.Event()
+
+        async def encode(**kwargs):
+            encoder.encode_calls.append(kwargs)
+            encode_started.set()
+            await finish_encode.wait()
+            return 1, 1, 1, None, None
+
+        encoder.encode = encode
+        task = asyncio.create_task(http_server.health_generate())
+        await asyncio.wait_for(encode_started.wait(), timeout=1)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert encoder.encode_dispatch_lock.locked()
+        assert encoder.released == []
+
+        finish_encode.set()
+        await asyncio.wait_for(encoder.release_event.wait(), timeout=1)
+        await asyncio.wait_for(encoder.encode_dispatch_lock.acquire(), timeout=1)
+        encoder.encode_dispatch_lock.release()
+        assert len(encoder.released) == 1
+
+    asyncio.run(run_test())
+
+
+def test_health_cleanup_failure_releases_dispatch_lock(monkeypatch):
+    async def run_test():
+        encoder = _FakeEncoder()
+        _install_tp_encoder(monkeypatch, encoder)
+
+        async def release_request(req_id):
+            encoder.released.append(req_id)
+            raise RuntimeError("cleanup failed")
+
+        encoder.release_request = release_request
+        response = await http_server.health_generate()
+
+        assert response.status_code == 503
+        assert not encoder.encode_dispatch_lock.locked()
+        assert len(encoder.released) == 1
 
     asyncio.run(run_test())
 

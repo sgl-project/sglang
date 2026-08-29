@@ -260,6 +260,27 @@ def _summarise_dp_broadcast(results: List[dict]) -> Response:
     )
 
 
+async def _drain_health_encode(
+    health_encoder: MMEncoder, encode_task: asyncio.Task, req_id: str
+):
+    """Finish a dispatched TP probe before releasing its state and lock."""
+    result = None
+    cleanup_failed = False
+    try:
+        result = await asyncio.shield(encode_task)
+    except Exception:
+        logger.exception("Encoder health check failed for req_id=%s", req_id)
+    finally:
+        try:
+            await asyncio.shield(health_encoder.release_request(req_id))
+        except Exception:
+            cleanup_failed = True
+            logger.exception("Encoder health cleanup failed for req_id=%s", req_id)
+        finally:
+            health_encoder.encode_dispatch_lock.release()
+    return None if cleanup_failed else result
+
+
 @app.post("/encode")
 async def handle_encode_request(request: dict):
     req_id = request["req_id"]
@@ -544,10 +565,10 @@ async def health_generate():
         # No processor available, fall back to liveness check only
         return Response(status_code=200)
 
+    # uuid keeps rids unique across workers; a bare time.time() can collide.
+    req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+    owns_dispatch_lock = False
     try:
-        # uuid keeps rids unique across workers; a bare time.time() can collide.
-        req_id = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
-
         dummy_request = {
             "mm_items": mm_items,
             "modality": modality.name,
@@ -560,25 +581,36 @@ async def health_generate():
         # request. Serialize its broadcast and rank-0 forward with every other
         # collective dispatch, then recheck whether traffic made the probe
         # unnecessary while it waited for the lock.
-        async with encoder.encode_dispatch_lock:
-            if encoder.has_pending_embeddings():
-                return Response(status_code=200)
-            for socket in send_sockets:
-                sock_send(socket, wrap_as_pickle(dummy_request))
+        await encoder.encode_dispatch_lock.acquire()
+        owns_dispatch_lock = True
+        if encoder.has_pending_embeddings():
+            return Response(status_code=200)
+        for socket in send_sockets:
+            sock_send(socket, wrap_as_pickle(dummy_request))
 
-            _, _, _, error_msg, _ = await asyncio.wait_for(
-                encoder.encode(
-                    mm_items=mm_items,
-                    modality=modality,
-                    req_id=req_id,
-                    num_parts=1,
-                    part_idx=0,
-                ),
-                timeout=HEALTH_CHECK_TIMEOUT,
+        encode_task = asyncio.create_task(
+            encoder.encode(
+                mm_items=mm_items,
+                modality=modality,
+                req_id=req_id,
+                num_parts=1,
+                part_idx=0,
             )
+        )
+        drain_task = asyncio.create_task(
+            _drain_health_encode(encoder, encode_task, req_id)
+        )
+        # The drain task now owns the lock and request state. A probe timeout or
+        # client disconnect must not let a later request overtake its TP work.
+        owns_dispatch_lock = False
+        result = await asyncio.wait_for(
+            asyncio.shield(drain_task),
+            timeout=HEALTH_CHECK_TIMEOUT,
+        )
 
-        # Clean up stored embedding
-        await encoder.release_request(req_id)
+        if result is None:
+            return Response(status_code=503)
+        _, _, _, error_msg, _ = result
 
         if error_msg:
             logger.error(f"Encoder health check failed: {error_msg}")
@@ -592,6 +624,9 @@ async def health_generate():
     except Exception as e:
         logger.error(f"Encoder health check failed: {e}")
         return Response(status_code=503)
+    finally:
+        if owns_dispatch_lock:
+            encoder.encode_dispatch_lock.release()
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
