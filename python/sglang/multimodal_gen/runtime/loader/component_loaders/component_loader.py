@@ -171,6 +171,11 @@ class ComponentLoader(ABC):
     ) -> dict[str, Any]:
         return {}
 
+    def supports_direct_gpu_weight_loading_for_component(
+        self, _component_name: str
+    ) -> bool:
+        return self.supports_direct_gpu_weight_loading
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
@@ -239,10 +244,9 @@ class ComponentLoader(ABC):
 
         """
         self._native_load_manages_placement = False
-        if (
-            server_args.should_direct_gpu_weight_load_component(component_name)
-            and not self.supports_direct_gpu_weight_loading
-        ):
+        if server_args.should_direct_gpu_weight_load_component(
+            component_name
+        ) and not self.supports_direct_gpu_weight_loading_for_component(component_name):
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} does not support direct GPU weight loading"
             )

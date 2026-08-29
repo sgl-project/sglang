@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.sound_tokenizer_load
 from sglang.multimodal_gen.runtime.loader.component_loaders.upsampler_loader import (
     UpsamplerLoader,
 )
+from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.loader.component_loaders.vocoder_loader import (
     VocoderLoader,
 )
@@ -61,6 +62,18 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             ComponentLoader().load(
                 "/model/vocoder", server_args, "vocoder", "diffusers"
             )
+
+    def test_direct_gpu_selector_is_rejected_by_unqualified_component(self):
+        server_args = SimpleNamespace(
+            component_quantizations={},
+            should_direct_gpu_weight_load_component=lambda component: component
+            == "audio_vae",
+        )
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "does not support direct GPU"
+        ):
+            VAELoader().load("/model/audio_vae", server_args, "audio_vae", "diffusers")
 
     def test_plain_loader_resolves_weights_separately_from_config(self):
         server_args = SimpleNamespace(

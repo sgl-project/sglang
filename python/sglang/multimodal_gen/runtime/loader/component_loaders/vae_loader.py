@@ -393,6 +393,11 @@ class VAELoader(ComponentLoader):
     expected_library = "diffusers"
     supports_direct_gpu_weight_loading = True
 
+    def supports_direct_gpu_weight_loading_for_component(
+        self, component_name: str
+    ) -> bool:
+        return component_name in ("vae", "video_vae")
+
     @staticmethod
     def resolve_model_weights_path(
         component_model_path: str,
