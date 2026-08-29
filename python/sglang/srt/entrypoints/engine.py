@@ -1681,7 +1681,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if "flashinfer" in cfg.get_attention_backends():
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.17",
+                "0.6.18",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
