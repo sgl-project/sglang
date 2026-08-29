@@ -277,7 +277,8 @@ impl ChatPreprocessor {
             uses_tool_call_structural_tag,
             request.parallel_tool_calls,
             request.choice_count,
-        );
+        )
+        .with_initial_reasoning(preparation.require_reasoning);
         Ok(LoweredChat {
             text_requests,
             response_processor,

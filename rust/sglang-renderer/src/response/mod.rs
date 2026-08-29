@@ -117,10 +117,17 @@ impl ChatResponseProcessor {
             parallel_tool_calls,
             choices: (0..choice_count)
                 .map(|_| ChoiceResponseProcessor {
-                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref()),
+                    reasoning: ReasoningStreamSplitter::new(reasoning_parser.as_deref(), false),
                 })
                 .collect(),
         }
+    }
+
+    pub(crate) fn with_initial_reasoning(mut self, initial_reasoning: bool) -> Self {
+        for choice in &mut self.choices {
+            choice.reasoning.initial_reasoning = initial_reasoning;
+        }
+        self
     }
 
     /// Interpret decoded output and emit semantic chat events.
@@ -242,10 +249,10 @@ impl ChatResponseProcessor {
             yield annotated_usage(prompt_tokens, completion_tokens);
         };
 
-        let suppress_qwen_post_tool_content = self
+        let suppress_post_tool_content = self
             .tool_parser
             .as_deref()
-            .is_some_and(|parser| dynamo_parser_name(parser) == "qwen25");
+            .is_some_and(|parser| matches!(dynamo_parser_name(parser), "qwen25" | "glm47"));
         let parsed: Pin<
             Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
         > = if let Some(parser) = self.tool_parser {
@@ -303,7 +310,7 @@ impl ChatResponseProcessor {
                             Some(ChatCompletionMessageContent::Text(text)) => Some(text),
                             _ => None,
                         };
-                        if suppress_qwen_post_tool_content && had_tool_calls {
+                        if suppress_post_tool_content && had_tool_calls {
                             content = None;
                         }
                         if choice.delta.role.is_some()
@@ -449,13 +456,15 @@ fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
 struct ReasoningStreamSplitter {
     name: Option<String>,
     parser: Option<ReasoningParserWrapper>,
+    initial_reasoning: bool,
 }
 
 impl ReasoningStreamSplitter {
-    fn new(name: Option<&str>) -> Self {
+    fn new(name: Option<&str>, initial_reasoning: bool) -> Self {
         Self {
             name: name.map(str::to_owned),
             parser: None,
+            initial_reasoning,
         }
     }
 
@@ -463,9 +472,12 @@ impl ReasoningStreamSplitter {
         let Some(name) = self.name.as_deref() else {
             return (String::new(), text.to_owned());
         };
-        let parser = self
-            .parser
-            .get_or_insert_with(|| build_reasoning_parser(name));
+        let initial_reasoning = self.initial_reasoning;
+        let parser = self.parser.get_or_insert_with(|| {
+            let mut parser = build_reasoning_parser(name);
+            parser.set_in_reasoning(initial_reasoning);
+            parser
+        });
         let token_ids = token_ids
             .iter()
             .filter_map(|&id| u32::try_from(id).ok())
@@ -576,6 +588,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_injected_reasoning_starts_without_opening_marker() {
+        let events = futures::executor::block_on(
+            ChatResponseProcessor::new(
+                None,
+                Some("glm45".into()),
+                None,
+                Some(ChatCompletionToolChoiceOption::Auto),
+                false,
+                true,
+                1,
+            )
+            .with_initial_reasoning(true)
+            .process_stream(stream::iter(vec![chunk(
+                0,
+                "reasoning</think>answer",
+                true,
+            )]))
+            .collect::<Vec<_>>(),
+        );
+
+        let reasoning = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    reasoning_content: Some(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        let content = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    content: Some(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(reasoning, "reasoning");
+        assert_eq!(content, "answer");
+    }
+
+    #[test]
     fn qwen_tool_calls_drop_post_call_special_tokens() {
         let events = futures::executor::block_on(
             processor(Some("qwen"), None, 1)
@@ -629,6 +686,37 @@ mod tests {
                 content: Some(text),
                 ..
             }) if text.contains("<|im_end|>")
+        )));
+    }
+
+    #[test]
+    fn glm_tool_calls_drop_post_call_special_tokens() {
+        let events = futures::executor::block_on(
+            processor(Some("glm45"), None, 1)
+                .process_stream(stream::iter(vec![
+                    chunk(
+                        0,
+                        "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
+                        false,
+                    ),
+                    chunk(0, "<|user|>", true),
+                ]))
+                .collect::<Vec<_>>(),
+        );
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Ok(ChatEvent::Delta {
+                content: Some(text),
+                ..
+            }) if text.contains("<|user|>")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(ChatEvent::Delta {
+                tool_calls: Some(calls),
+                ..
+            }) if calls.iter().any(|call| call.name.as_deref() == Some("get_weather"))
         )));
     }
 }

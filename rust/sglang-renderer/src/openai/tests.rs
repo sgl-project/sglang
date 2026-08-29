@@ -47,6 +47,7 @@ mod suite {
             "stop_regex": "END[0-9]",
             "ignore_eos": true,
             "skip_special_tokens": false,
+            "return_meta_info": true,
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
             "bootstrap_room": 42
@@ -67,6 +68,7 @@ mod suite {
         assert_eq!(request.sampling_overrides.min_tokens, Some(3));
         assert_eq!(request.sampling_overrides.ignore_eos, Some(true));
         assert_eq!(request.sampling_overrides.skip_special_tokens, Some(false));
+        assert_eq!(request.extensions.return_meta_info, Some(true));
 
         let (response_id, request) = lower_chat_request(&renderer_config(), request).unwrap();
 

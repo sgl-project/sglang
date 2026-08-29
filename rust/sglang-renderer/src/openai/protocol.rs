@@ -170,6 +170,8 @@ pub(crate) struct CompletionRequest {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct RequestExtensions {
     #[serde(default)]
+    pub return_meta_info: Option<bool>,
+    #[serde(default)]
     pub rid: Option<OneOrMany<String>>,
     #[serde(default)]
     pub cache_salt: Option<OneOrMany<String>>,
@@ -353,6 +355,10 @@ pub(crate) fn lower_chat_request(
     )?;
     // Accepted OpenAI metadata fields do not affect SGLang generation.
     let _ = (&request.store, &request.metadata, &request.user);
+    // This SGLang extension only requests scheduler diagnostics in the response.
+    // The renderer accepts it for client compatibility but has no scheduler-local
+    // diagnostics to attach when forwarding generation to an external engine.
+    let _ = request.extensions.return_meta_info;
     reject_unsupported_fields(&request.unsupported_fields)?;
     request.extensions.validate()?;
     validate_chat_request(config, &request)?;
