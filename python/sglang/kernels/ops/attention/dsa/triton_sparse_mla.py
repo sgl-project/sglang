@@ -77,9 +77,9 @@ def _no_async_copy():
 
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
-    from aiter.ops.triton.utils.device_info import get_num_sms
-
-    return get_num_sms()
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
 
 
 def _kv_splits_heuristic(
@@ -298,6 +298,14 @@ def _triton_sparse_mla_fwd_single(
     assert (
         num_groups <= 4
     ), f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
+    # The single-pass kernel indexes heads with an unmasked `tl.arange(0, H)`,
+    # which Triton requires to be a power of two. H < 16 is padded up to 16
+    # below; anything larger must already be a power of two.
+    assert H <= 16 or (H & (H - 1)) == 0, (
+        f"Triton sparse MLA prefill requires a power-of-two head count, got H={H}. "
+        "Use a tp_size that divides the model's head count to a power of two, or "
+        "pick another DSA prefill backend (--dsa-prefill-backend tilelang)."
+    )
     d_tail = q_rope.shape[-1]
     dim = kv.shape[-1]
     topk = indices.shape[-1]
@@ -371,6 +379,12 @@ def _prev_pow2(n: int) -> int:
     if n < 1:
         return 1
     return 1 << (n.bit_length() - 1)
+
+
+def _next_pow2(n: int) -> int:
+    if n < 1:
+        return 1
+    return 1 << (n - 1).bit_length()
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +759,7 @@ def _sparse_mla_reduce_kernel(
     D_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     ACTIVE_SPLITS: tl.constexpr,
+    ACTIVE_SPLITS_POW2: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -754,13 +769,21 @@ def _sparse_mla_reduce_kernel(
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    k_offs = tl.arange(0, ACTIVE_SPLITS)
+    # tl.arange needs a power-of-two extent, but ACTIVE_SPLITS is only a power
+    # of two when topk // BLOCK_K is. Iterate over the padded range and mask the
+    # tail: -3.4e38 drives exp2() to 0 without the NaN an -inf would produce.
+    k_offs = tl.arange(0, ACTIVE_SPLITS_POW2)
+    k_mask = k_offs < ACTIVE_SPLITS
     d_mask = d_offs < D_V
 
     H_padded = tl.cdiv(H, 16) * 16
 
     lse_base = t * KV_SPLITS * H_padded
-    lse_p = tl.load(lse_partial_ptr + lse_base + k_offs * H_padded + h)
+    lse_p = tl.load(
+        lse_partial_ptr + lse_base + k_offs * H_padded + h,
+        mask=k_mask,
+        other=-3.4e38,
+    )
 
     ap_base = t * KV_SPLITS * H_padded * D_V
     a_p = tl.load(
@@ -769,7 +792,7 @@ def _sparse_mla_reduce_kernel(
         + k_offs[:, None] * H_padded * D_V
         + h * D_V
         + d_offs[None, :],
-        mask=d_mask[None, :],
+        mask=k_mask[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -816,7 +839,7 @@ def _triton_sparse_mla_fwd_splitk(
     ), f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
     qk_scale = float(sm_scale) * _LOG2E
 
-    max_kv_splits = topk // BLOCK_K
+    max_kv_splits = max(1, topk // BLOCK_K)
     kv_splits = min(kv_splits, max_kv_splits)
 
     out = torch.empty(seq, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
@@ -895,6 +918,7 @@ def _triton_sparse_mla_fwd_splitk(
         D_V=d_v,
         KV_SPLITS=kv_splits,
         ACTIVE_SPLITS=active_splits,
+        ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
         num_warps=4,
@@ -928,10 +952,9 @@ def triton_sparse_mla_fwd(
     BLOCK_H = 16
     BLOCK_K = 64
     topk = indices.shape[-1]
-    max_kv_splits = topk // BLOCK_K
+    max_kv_splits = max(1, topk // BLOCK_K)
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
-    kv_work_per_cta = topk // BLOCK_K
     if base_ctas > num_cu:
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
     kv_splits = min(

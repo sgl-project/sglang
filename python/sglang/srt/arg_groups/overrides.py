@@ -1917,6 +1917,10 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        # The hisparse allow-list in hisparse_hook is platform- but not
+        # dtype-aware, so an explicitly requested backend still has to clear the
+        # shared backend/kv-cache-dtype rules before this arm returns early.
+        _check_dsa_backend_constraints(kv_cache_dtype, prefill, decode, hip=is_hip())
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."

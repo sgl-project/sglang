@@ -69,15 +69,21 @@ LOG2E = 1.4426950408889634
 
 @functools.lru_cache(maxsize=1)
 def _cu_count() -> int:
-    from aiter.ops.triton.utils.device_info import get_num_sms
-
-    return get_num_sms()
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
 
 
 def _prev_pow2(n: int) -> int:
     if n < 1:
         return 1
     return 1 << (n.bit_length() - 1)
+
+
+def _next_pow2(n: int) -> int:
+    if n < 1:
+        return 1
+    return 1 << (n - 1).bit_length()
 
 
 def _kv_splits_heuristic(
@@ -498,6 +504,7 @@ def _sparse_mla_decode_reduce_kernel(
     D_V: tl.constexpr,
     KV_SPLITS: tl.constexpr,
     ACTIVE_SPLITS: tl.constexpr,
+    ACTIVE_SPLITS_POW2: tl.constexpr,
     D_CHUNK: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -506,13 +513,21 @@ def _sparse_mla_decode_reduce_kernel(
     dc = tl.program_id(2)
 
     d_offs = dc * D_CHUNK + tl.arange(0, D_CHUNK)
-    k_offs = tl.arange(0, ACTIVE_SPLITS)
+    # tl.arange needs a power-of-two extent, but ACTIVE_SPLITS is only a power
+    # of two when topk // BLOCK_K is. Iterate over the padded range and mask the
+    # tail: -3.4e38 drives exp2() to 0 without the NaN an -inf would produce.
+    k_offs = tl.arange(0, ACTIVE_SPLITS_POW2)
+    k_mask = k_offs < ACTIVE_SPLITS
     d_mask = d_offs < D_V
 
     H_padded = tl.cdiv(H, 16) * 16
 
     lse_base = t * KV_SPLITS * H_padded
-    lse_p = tl.load(lse_partial_ptr + lse_base + k_offs * H_padded + h)
+    lse_p = tl.load(
+        lse_partial_ptr + lse_base + k_offs * H_padded + h,
+        mask=k_mask,
+        other=-3.4e38,
+    )
 
     ap_base = t * KV_SPLITS * H_padded * D_V
     a_p = tl.load(
@@ -521,7 +536,7 @@ def _sparse_mla_decode_reduce_kernel(
         + k_offs[:, None] * H_padded * D_V
         + h * D_V
         + d_offs[None, :],
-        mask=d_mask[None, :],
+        mask=k_mask[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -577,7 +592,7 @@ def triton_sparse_mla_decode_splitk(
     assert d_v % 128 == 0, f"d_v must be divisible by 128, got {d_v}"
     num_groups = d_v // 128
 
-    max_kv_splits = topk // BLOCK_K
+    max_kv_splits = max(1, topk // BLOCK_K)
     if kv_splits is None:
         kv_splits = min(
             _kv_splits_heuristic(
@@ -667,6 +682,7 @@ def triton_sparse_mla_decode_splitk(
         D_V=d_v,
         KV_SPLITS=kv_splits,
         ACTIVE_SPLITS=active_splits,
+        ACTIVE_SPLITS_POW2=_next_pow2(active_splits),
         D_CHUNK=D_CHUNK,
         BLOCK_K=BLOCK_K,
         num_warps=4,
