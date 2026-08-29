@@ -123,7 +123,7 @@ jobs:
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
 
   nightly-acc-16-npu-a3:
-    name: nightly-acc-16-npu-a3
+    name: nightly-acc-16-npu-a3-dsv
     if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
