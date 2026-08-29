@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -564,7 +565,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     draft modes).
     """
     cfg = resolving_view(server_args)
-    from sglang.srt.utils import is_hip
 
     supported_draft_backends = (
         "flashinfer",
@@ -575,7 +575,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "ascend",
     )
     # Use triton on ROCm (no FlashInfer), flashinfer on CUDA.
-    fallback_backend = "triton" if is_hip() else "flashinfer"
+    fallback_backend = "triton" if get_platform().is_hip else "flashinfer"
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:

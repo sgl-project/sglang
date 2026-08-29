@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -175,7 +176,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args.disable_radix_cache = False
         args.chunked_prefill_size = 2048
 
-        with (patch("sglang.srt.arg_groups.model_hook.is_cuda", return_value=True),):
+        with (override_platform(is_cuda=True),):
             handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "disable_radix_cache"))

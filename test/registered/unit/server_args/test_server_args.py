@@ -338,8 +338,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
     def _set_model_type(server_args, *, is_multimodal):
         server_args._model_config = SimpleNamespace(is_multimodal=is_multimodal)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_cuda_ipc_is_explicit_and_bounded(self):
         server_args = ServerArgs(
             model_path="dummy",
             mm_feature_transport="cuda_ipc",
@@ -360,8 +360,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         self.assertIn("base GPU 2", output)
         self.assertIn("4 tokenizer worker", output)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
         server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
 
         with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
@@ -388,8 +388,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
             handle_multimodal_feature_transport(server_args)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_explicit_cpu_overrides_legacy_environment(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_explicit_cpu_overrides_legacy_environment(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
 
         with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "1"}):
@@ -414,8 +414,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             )
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_default_transport_is_cpu_for_text_only_model(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_default_transport_is_cpu_for_text_only_model(self):
         server_args = ServerArgs(model_path="dummy")
         self._set_model_type(server_args, is_multimodal=False)
 
@@ -429,8 +429,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             )
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_default_transport_is_cpu_for_multimodal_model(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_default_transport_is_cpu_for_multimodal_model(self):
         server_args = ServerArgs(model_path="dummy")
         self._set_model_type(server_args, is_multimodal=True)
 
@@ -448,17 +448,13 @@ class TestMultimodalFeatureTransport(CustomTestCase):
     @patch(
         "sglang.srt.arg_groups.serving_hook.is_mnnvl_fabric_device", return_value=True
     )
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
+    @override_platform(is_cuda=True)
     @patch(
         "sglang.srt.model_loader.utils.supports_cuda_vmm_feature_transport",
         return_value=True,
     )
     def test_default_transport_is_cuda_vmm_for_supported_multinode_mnnvl(
-        self,
-        _mock_supports_cuda_vmm,
-        _mock_is_cuda,
-        _mock_is_mnnvl,
-        _mock_path_exists,
+        self, _mock_supports_cuda_vmm, _mock_is_cuda, _mock_is_mnnvl
     ):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
@@ -481,17 +477,13 @@ class TestMultimodalFeatureTransport(CustomTestCase):
     @patch(
         "sglang.srt.arg_groups.serving_hook.is_mnnvl_fabric_device", return_value=True
     )
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
+    @override_platform(is_cuda=True)
     @patch(
         "sglang.srt.model_loader.utils.supports_cuda_vmm_feature_transport",
         return_value=False,
     )
     def test_default_transport_is_cpu_for_unsupported_multinode_model(
-        self,
-        _mock_supports_cuda_vmm,
-        _mock_is_cuda,
-        _mock_is_mnnvl,
-        _mock_path_exists,
+        self, _mock_supports_cuda_vmm, _mock_is_cuda, _mock_is_mnnvl
     ):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
@@ -506,9 +498,9 @@ class TestMultimodalFeatureTransport(CustomTestCase):
     @patch(
         "sglang.srt.arg_groups.serving_hook.is_mnnvl_fabric_device", return_value=True
     )
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
+    @override_platform(is_cuda=True)
     def test_default_transport_is_cpu_without_imex_channel(
-        self, _mock_is_cuda, _mock_is_mnnvl, _mock_path_exists
+        self, _mock_is_cuda, _mock_is_mnnvl
     ):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
@@ -527,10 +519,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
     @patch(
         "sglang.srt.arg_groups.serving_hook.is_mnnvl_fabric_device", return_value=False
     )
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_default_transport_is_cpu_for_multinode_non_mnnvl(
-        self, _mock_is_cuda, _mock_is_mnnvl
-    ):
+    @override_platform(is_cuda=True)
+    def test_default_transport_is_cpu_for_multinode_non_mnnvl(self, _mock_is_cuda):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
 
@@ -543,8 +533,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             )
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_default_transport_is_cpu_for_language_only_model(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_default_transport_is_cpu_for_language_only_model(self):
         server_args = ServerArgs(model_path="dummy", language_only=True)
         self._set_model_type(server_args, is_multimodal=True)
 
@@ -557,15 +547,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             )
             self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=False)
-    def test_cuda_ipc_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+    @override_platform(is_cuda=False)
+    def test_cuda_ipc_rejects_non_nvidia_platforms(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
 
         with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
             handle_multimodal_feature_transport(server_args)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_cuda_ipc_rejects_multi_node(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_cuda_ipc_rejects_multi_node(self):
         server_args = ServerArgs(
             model_path="dummy", mm_feature_transport="cuda_ipc", nnodes=2
         )
@@ -573,8 +563,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "single node"):
             handle_multimodal_feature_transport(server_args)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_cuda_vmm_is_explicit_and_uses_shared_budget(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_cuda_vmm_is_explicit_and_uses_shared_budget(self):
         server_args = ServerArgs(
             model_path="dummy",
             mm_feature_transport="cuda_vmm",
@@ -600,15 +590,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         self.assertIn("2 tokenizer worker", output)
         self.assertIn("falls back to inline CPU", output)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=False)
-    def test_cuda_vmm_rejects_non_nvidia_platforms(self, _mock_is_cuda):
+    @override_platform(is_cuda=False)
+    def test_cuda_vmm_rejects_non_nvidia_platforms(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
 
         with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
             handle_multimodal_feature_transport(server_args)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_cuda_vmm_rejects_rust_server(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_cuda_vmm_rejects_rust_server(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_vmm")
 
         with (
@@ -617,8 +607,8 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         ):
             handle_multimodal_feature_transport(server_args)
 
-    @patch("sglang.srt.arg_groups.serving_hook.is_cuda", return_value=True)
-    def test_cuda_vmm_rejects_pipeline_parallelism(self, _mock_is_cuda):
+    @override_platform(is_cuda=True)
+    def test_cuda_vmm_rejects_pipeline_parallelism(self):
         server_args = ServerArgs(
             model_path="dummy", mm_feature_transport="cuda_vmm", pp_size=2
         )
@@ -638,8 +628,8 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype float16"):
             handle_mamba_backend(server_args)
 
-    @patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=False)
-    def test_rejects_non_cuda(self, _mock_is_cuda):
+    @override_platform(is_cuda=False)
+    def test_rejects_non_cuda(self):
         server_args = ServerArgs(
             model_path="dummy",
             mamba_ssm_dtype="float16",
@@ -649,9 +639,9 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "NVIDIA CUDA"):
             handle_mamba_backend(server_args)
 
-    @patch("sglang.srt.arg_groups.mamba_hook.is_cuda", return_value=True)
+    @override_platform(is_cuda=True)
     @override_platform(is_sm100=False)
-    def test_rejects_triton_without_sm100(self, _mock_is_cuda):
+    def test_rejects_triton_without_sm100(self):
         server_args = ServerArgs(
             model_path="dummy",
             mamba_ssm_dtype="float16",
@@ -837,8 +827,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch("sglang.srt.arg_groups.overrides.is_npu", return_value=False),
-            patch("sglang.srt.arg_groups.overrides.is_xpu", return_value=False),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             declared = _dsa_split_backend_resolution(view)
@@ -851,22 +841,22 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
-    def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self, _mock_is_hip):
+    @override_platform(is_hip=False)
+    def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
-    def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self, _mock_is_hip):
+    @override_platform(is_hip=False)
+    def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
-    def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self, _mock_is_hip):
+    @override_platform(is_hip=False)
+    def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
         the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
         start there at all. The device/arch narrowing happens later, in
@@ -882,24 +872,22 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
-    def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
+    @override_platform(is_hip=True)
+    def test_hisparse_defaults_to_tilelang_on_rocm(self):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
-    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
-        self, _mock_is_hip
-    ):
+    @override_platform(is_hip=True)
+    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(self):
         resolved = self._resolve("bfloat16", dsa_prefill_backend="tilelang")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "tilelang")
         self.assertEqual(resolved["dsa_decode_backend"], "tilelang")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
-    def test_hisparse_accepts_aiter_backend_on_rocm(self, _mock_is_hip):
+    @override_platform(is_hip=True)
+    def test_hisparse_accepts_aiter_backend_on_rocm(self):
         server_args = ServerArgs(
             model_path="dummy",
             enable_hisparse=True,
@@ -911,8 +899,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
         validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=True)
-    def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
+    @override_platform(is_hip=True)
+    def test_hisparse_rejects_cuda_backend_on_rocm(self):
         server_args = ServerArgs(
             model_path="dummy",
             enable_hisparse=True,
@@ -923,8 +911,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
-    def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
+    @override_platform(is_hip=False)
+    def test_hisparse_rejects_rocm_backend_on_cuda(self):
         server_args = ServerArgs(
             model_path="dummy",
             enable_hisparse=True,
@@ -1974,11 +1962,11 @@ class TestPrefillCudaGraphLoRACompatibility(CustomTestCase):
             prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
         )
         with (
-            patch("sglang.srt.arg_groups.cuda_graph_hook.is_hip", return_value=False),
-            patch("sglang.srt.arg_groups.cuda_graph_hook.is_npu", return_value=False),
+            override_platform(is_hip=False),
+            override_platform(is_npu=False),
             patch("sglang.srt.arg_groups.cuda_graph_hook.is_cpu", return_value=False),
             patch("sglang.srt.arg_groups.cuda_graph_hook.is_mps", return_value=False),
-            patch("sglang.srt.arg_groups.cuda_graph_hook.is_xpu", return_value=False),
+            override_platform(is_xpu=False),
         ):
             disable_tc_piecewise_cudagraph_if_incompatible(args)
 

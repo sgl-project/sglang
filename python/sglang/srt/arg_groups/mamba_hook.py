@@ -11,14 +11,6 @@ from sglang.srt.arg_groups.overrides import (
     supports_mamba_cache_extra_buffer,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    is_cuda,
-    is_flashinfer_available,
-    is_hip,
-    is_musa,
-    is_npu,
-    is_xpu,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +34,7 @@ def handle_mamba_backend(server_args: Any):
                 "Run with --mamba-ssm-dtype float16 or disable "
                 "--enable-mamba-cache-stochastic-rounding."
             )
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError(
                 "Stochastic rounding for the Mamba SSM cache is only "
                 "supported on NVIDIA CUDA platforms. Disable "
@@ -68,7 +60,7 @@ def handle_mamba_backend(server_args: Any):
                 " Stochastic rounding with --mamba-backend flashinfer "
                 "requires FlashInfer Mamba and --mamba-ssm-dtype float16."
             )
-        if is_flashinfer_available():
+        if get_platform().has_flashinfer:
             try:
                 import flashinfer.mamba  # noqa: F401
 
@@ -109,7 +101,11 @@ def validate_mamba_extra_buffer(view, model_arch: str, *, mamba_cache_chunk_size
         view, model_arch
     ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
     assert (
-        is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
+        get_platform().is_cuda
+        or get_platform().is_musa
+        or get_platform().is_npu
+        or get_platform().is_hip
+        or get_platform().is_xpu
     ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
         # The PD-disagg decode pool is not wired for lazy slots.

@@ -22,9 +22,6 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
-    get_device_sm,
-    is_cuda,
-    is_hip,
     is_mnnvl_fabric_device,
 )
 from sglang.utils import is_in_ci
@@ -407,7 +404,7 @@ def handle_environment_variables(server_args: Any):
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
     if cfg.debug_cuda_graph:
-        if not (is_cuda() or is_hip()):
+        if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(
                 "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                 "Disabling breakable CUDA graph."
@@ -432,10 +429,10 @@ def handle_environment_variables(server_args: Any):
     # it, mirroring the forward scale split: the ue8m0 path
     # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
     # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-    if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+    if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
-        sm = get_device_sm()
+        sm = get_platform().device_sm
         explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
         supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -788,7 +785,7 @@ def handle_multimodal_feature_transport(server_args: Any):
             )
         elif (
             model_config_of(server_args).is_multimodal
-            and is_cuda()
+            and get_platform().is_cuda
             and cfg.disaggregation_mode == "null"
         ):
             # A full GPU pool always degrades to CPU transport per tensor.
@@ -849,7 +846,7 @@ def handle_multimodal_feature_transport(server_args: Any):
         requested_transport = "cpu"
 
     if requested_transport == "cuda_vmm":
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_vmm requires NVIDIA CUDA.")
         if cfg.pp_size != 1:
             raise ValueError(
@@ -875,7 +872,7 @@ def handle_multimodal_feature_transport(server_args: Any):
         )
 
     if requested_transport == "cuda_ipc":
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_ipc requires NVIDIA CUDA.")
         if cfg.nnodes != 1:
             raise ValueError(

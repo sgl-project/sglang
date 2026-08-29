@@ -16,9 +16,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    is_cuda,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +44,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend
 
-    if is_cuda():
+    if get_platform().is_cuda:
         if cfg.kv_cache_dtype == "nvfp4" and not (
             get_platform().is_sm100 or get_platform().is_sm120
         ):

@@ -34,8 +34,6 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
-    is_cuda,
-    is_hip,
     parse_connector_type,
 )
 
@@ -270,7 +268,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
-        and is_cuda()
+        and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
         raise ValueError(
@@ -285,7 +283,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
-        and is_cuda()
+        and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
         raise ValueError(
@@ -301,7 +299,7 @@ def handle_linear_attn_backend(server_args: Any):
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (
         prefill == "flashinfer"
-        and is_cuda()
+        and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
         and cuda_major < 13
     ):
@@ -585,7 +583,7 @@ def handle_deterministic_inference(server_args: Any):
 
         # Check TP size
         if cfg.tp_size > 1:
-            if is_hip():
+            if get_platform().is_hip:
                 # AMD: use 1-stage all-reduce kernel which is inherently deterministic
                 # (each GPU reads all data from all GPUs, reduces locally in fixed order)
                 logger.info("AMD/ROCm: Using 1-stage all-reduce kernel (deterministic)")

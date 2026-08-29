@@ -8,6 +8,7 @@ import unittest
 
 from sglang.srt.runtime_context import (
     _PLATFORM_PROBES,
+    _PLATFORM_VALUES,
     get_platform,
     override_platform,
 )
@@ -20,8 +21,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestPlatformContext(CustomTestCase):
     def test_every_name_maps_to_a_real_probe(self):
-        """A typo in the table would answer with an AttributeError at runtime."""
-        for name, probe in _PLATFORM_PROBES.items():
+        """A typo in either table would answer with an AttributeError at runtime."""
+        for name, probe in {**_PLATFORM_PROBES, **_PLATFORM_VALUES}.items():
             self.assertTrue(
                 callable(getattr(_common, probe, None)),
                 f"{name} maps to {probe!r}, which is not callable in utils.common",
@@ -35,7 +36,7 @@ class TestPlatformContext(CustomTestCase):
 
     def test_the_probe_is_what_it_answers_with(self):
         platform = get_platform()
-        for name, probe in _PLATFORM_PROBES.items():
+        for name, probe in {**_PLATFORM_PROBES, **_PLATFORM_VALUES}.items():
             self.assertEqual(getattr(platform, name), getattr(_common, probe)())
 
     def test_an_override_is_scoped_and_restores(self):

@@ -1051,7 +1051,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_gpt_oss_xpu_dtype_validation_reads_pristine(self):
         from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
 
-        with patch.object(overrides_module, "is_xpu", return_value=True):
+        with override_platform(is_xpu=True):
             with self.assertRaises(NotImplementedError):
                 _gpt_oss_overrides(
                     SimpleNamespace(
@@ -1267,12 +1267,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         view = ResolvedView(
             SimpleNamespace(attention_backend="intel_amx", device="cpu")
         )
-        with patch.object(overrides_module, "cpu_has_amx_support", return_value=False):
+        with override_platform(has_amx=False):
             self.assertEqual(
                 _attention_backend_platform_fallbacks(view),
                 {"attention_backend": "torch_native"},
             )
-        with patch.object(overrides_module, "cpu_has_amx_support", return_value=True):
+        with override_platform(has_amx=True):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
 
         # dual-chunk config: mismatched explicit backend raises verbatim
@@ -1306,20 +1306,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
-        with patch.object(overrides_module, "is_hip", return_value=True):
+        with override_platform(is_hip=True):
             self.assertEqual(
                 _dllm_attention_backend(_view()), {"attention_backend": "triton"}
             )
             self.assertEqual(
                 _dllm_attention_backend(_view(attention_backend="aiter")), {}
             )
-        with patch.object(overrides_module, "is_hip", return_value=False):
-            with patch.object(overrides_module, "is_npu", return_value=True):
+        with override_platform(is_hip=False):
+            with override_platform(is_npu=True):
                 self.assertEqual(
                     _dllm_attention_backend(_view()),
                     {"attention_backend": "ascend"},
                 )
-            with patch.object(overrides_module, "is_npu", return_value=False):
+            with override_platform(is_npu=False):
                 # cuda graph disabled -> nothing to force
                 self.assertEqual(_dllm_attention_backend(_view()), {})
                 self.assertEqual(
@@ -1334,13 +1334,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _page_size_default(ResolvedView(SimpleNamespace(page_size=64))), {}
         )
         # default fill on non-HIP/non-MUSA platforms is 1
-        with patch.object(overrides_module, "is_hip", return_value=False):
-            with patch.object(overrides_module, "is_musa", return_value=False):
+        with override_platform(is_hip=False):
+            with override_platform(is_musa=False):
                 self.assertEqual(
                     _page_size_default(ResolvedView(SimpleNamespace(page_size=None))),
                     {"page_size": 1},
                 )
-            with patch.object(overrides_module, "is_musa", return_value=True):
+            with override_platform(is_musa=True):
                 self.assertEqual(
                     _page_size_default(ResolvedView(SimpleNamespace(page_size=None))),
                     {"page_size": 64},
@@ -1499,7 +1499,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "moe_runner_backend",
             _deepseek_v4_overrides(_args(device="npu"), hf),
         )
-        with patch.object(overrides_module, "is_hip", return_value=True):
+        with override_platform(is_hip=True):
             self.assertNotIn(
                 "moe_runner_backend",
                 _deepseek_v4_overrides(_args(), hf),
@@ -1594,10 +1594,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with (
             override_platform(is_sm100=False),
-            patch.object(overrides_module, "is_cuda", return_value=True),
-            patch.object(
-                overrides_module, "get_device_capability", return_value=(9, 0)
-            ),
+            override_platform(is_cuda=True),
+            override_platform(device_capability=(9, 0)),
         ):
             # SM80-SM90 fp4: marlin
             self.assertEqual(
@@ -1686,9 +1684,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch.object(overrides_module, "is_npu", return_value=False),
-            patch.object(overrides_module, "is_xpu", return_value=False),
-            patch.object(overrides_module, "is_hip", return_value=False),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
             patch("torch.cuda.get_device_capability", return_value=(9, 0)),
         ):
             # Hopper FP8 -> flashmla_kv both
@@ -1726,9 +1724,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch.object(overrides_module, "is_npu", return_value=False),
-            patch.object(overrides_module, "is_xpu", return_value=False),
-            patch.object(overrides_module, "is_hip", return_value=False),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
             patch("torch.cuda.get_device_capability", return_value=(12, 0)),
         ):
             self.assertEqual(
@@ -1740,9 +1738,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch.object(overrides_module, "is_npu", return_value=False),
-            patch.object(overrides_module, "is_xpu", return_value=False),
-            patch.object(overrides_module, "is_hip", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=True),
             patch("torch.cuda.get_device_capability", return_value=(9, 4)),
         ):
             # ROCm with both unset -> tilelang
@@ -1939,8 +1937,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
-            patch.object(overrides_module, "is_npu", return_value=False),
-            patch.object(overrides_module, "is_xpu", return_value=False),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
         ):
             with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
                 # Hopper: auto -> bfloat16
@@ -2020,7 +2018,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
-        with patch.object(overrides_module, "is_hip", return_value=True):
+        with override_platform(is_hip=True):
             with patch.object(
                 envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE, "get", return_value=False
             ):
@@ -2061,7 +2059,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 with self.assertRaises(ValueError):
                     _deepseek_spec_moe_resolution(_view(ep_size=1))
         # the arm is HIP-only
-        with patch.object(overrides_module, "is_hip", return_value=False):
+        with override_platform(is_hip=False):
             self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
 
     def test_mamba_radix_cache_resolution_pass(self):
@@ -2250,7 +2248,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_qwen3vl_page_size(self):
         from sglang.srt.arg_groups.overrides import _qwen3vl_overrides
 
-        with patch.object(overrides_module, "is_hip", return_value=True):
+        with override_platform(is_hip=True):
             with patch("sglang.srt.environ.envs.SGLANG_USE_AITER_UNIFIED_ATTN") as e:
                 e.get.return_value = True
                 self.assertEqual(
@@ -2366,11 +2364,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ns
 
         hf = SimpleNamespace()
-        with patch.object(
-            overrides_module, "is_hip", return_value=False
-        ), override_platform(is_sm100=True), patch.object(
-            overrides_module, "get_quantization_config", return_value=None
-        ):
+        with override_platform(is_hip=False), override_platform(
+            is_sm100=True
+        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
             # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
             # dense backend with the fp8-q GEMM path); page snaps to 128
             ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
@@ -2693,15 +2689,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch(
             "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
         ):
-            with patch.object(overrides_module, "is_npu", return_value=False):
-                with patch.object(overrides_module, "is_xpu", return_value=False):
-                    with patch.object(overrides_module, "is_hip", return_value=False):
+            with override_platform(is_npu=False):
+                with override_platform(is_xpu=False):
+                    with override_platform(is_hip=False):
                         self.assertEqual(
                             _deepseek_family_overrides(_args(), None),
                             {"attention_backend": "dsa", "page_size": 64},
                         )
                     # HIP without the preshuffle path: page 1
-                    with patch.object(overrides_module, "is_hip", return_value=True):
+                    with override_platform(is_hip=True):
                         with patch(
                             "sglang.srt.layers.attention.dsa.utils.aiter_can_use_preshuffle_paged_mqa",
                             return_value=False,
@@ -2714,9 +2710,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch(
             "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True
         ):
-            with patch.object(overrides_module, "is_npu", return_value=False):
-                with patch.object(overrides_module, "is_xpu", return_value=False):
-                    with patch.object(overrides_module, "is_hip", return_value=False):
+            with override_platform(is_npu=False):
+                with override_platform(is_xpu=False):
+                    with override_platform(is_hip=False):
                         result = _deepseek_family_overrides(
                             _args(
                                 enable_prefill_cp=True,

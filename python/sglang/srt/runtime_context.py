@@ -1767,6 +1767,12 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "has_flashinfer": "is_flashinfer_available",
 }
 
+# Not yes/no facts, same address.
+_PLATFORM_VALUES: Dict[str, str] = {
+    "device_sm": "get_device_sm",
+    "device_capability": "get_device_capability",
+}
+
 
 class PlatformContext:
     """The machine's own facts, with one place to override them.
@@ -1782,11 +1788,11 @@ class PlatformContext:
         object.__setattr__(self, "_overrides", {})
 
     def __getattr__(self, name: str) -> Any:
-        probe = _PLATFORM_PROBES.get(name)
+        probe = _PLATFORM_PROBES.get(name) or _PLATFORM_VALUES.get(name)
         if probe is None:
+            known = sorted(set(_PLATFORM_PROBES) | set(_PLATFORM_VALUES))
             raise AttributeError(
-                f"unknown platform fact {name!r}; known: "
-                f"{', '.join(sorted(_PLATFORM_PROBES))}"
+                f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
@@ -1803,7 +1809,7 @@ class PlatformContext:
         )
 
     def _install(self, **facts: Any) -> Dict[str, Any]:
-        unknown = set(facts) - set(_PLATFORM_PROBES)
+        unknown = set(facts) - set(_PLATFORM_PROBES) - set(_PLATFORM_VALUES)
         if unknown:
             raise ValueError(f"unknown platform fact(s): {sorted(unknown)}")
         overrides = object.__getattribute__(self, "_overrides")
