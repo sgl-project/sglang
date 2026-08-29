@@ -497,6 +497,9 @@ class MoeFlags(_FlagGroupBase):
     # speculative_moe_backend_context is active, so a draft gate's write also
     # lands on the speculative leaf.
     in_speculative_scope: bool = False
+    # Draft construction/execution uses a separate one-sided A2A workspace from
+    # the target model's concurrently live CUDA graphs.
+    speculative_context: bool = False
 
 
 @dataclasses.dataclass

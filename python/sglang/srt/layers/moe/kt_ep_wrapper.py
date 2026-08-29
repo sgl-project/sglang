@@ -76,14 +76,9 @@ def create_kt_config_from_server_args(
     if server_args.kt_weight_path is None:
         return None
 
-    # Try to get num_layers from model config
-    num_layers = None
-    try:
-        hf_config = server_args.get_hf_config()
-        num_layers = getattr(hf_config, "num_hidden_layers", None)
-    except Exception:
-        # If we can't get the config, num_layers will be None
-        pass
+    num_layers = getattr(
+        server_args.get_model_config().hf_config, "num_hidden_layers", None
+    )
 
     return KTConfig(
         layer_idx=layer_idx,

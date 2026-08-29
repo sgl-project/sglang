@@ -1660,12 +1660,25 @@ class UnifiedRadixCache(BasePrefixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[list[str]] = None,
         matched_prefix_tokens: Optional[list[int]] = None,
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
 
         buffer_mode = self.host_memory_mode == "buffer_only"
-        extra_key, cache_salt = self.tree_core.prefetch_anchor_info(last_host_node_id)
+        # Key the span by the request's namespace, not the anchor's (a root
+        # anchor has none): a span published under the wrong namespace gets
+        # re-owned by the request's own insert (double free).
+        anchor_extra_key, anchor_cache_salt = self.tree_core.prefetch_anchor_info(
+            last_host_node_id
+        )
+        assert (anchor_extra_key is None or anchor_extra_key == extra_key) and (
+            anchor_cache_salt is None or anchor_cache_salt == cache_salt
+        ), (
+            f"prefetch anchor namespace {(anchor_extra_key, anchor_cache_salt)} "
+            f"!= request namespace {(extra_key, cache_salt)}"
+        )
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=extra_key,
