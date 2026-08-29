@@ -37,7 +37,7 @@ def main() -> int:
     args = parse_args()
     if args.payload_samples < 0:
         raise ValueError("--payload-samples must be non-negative")
-    repo = Path(__file__).resolve().parents[2]
+    repo = Path(__file__).resolve().parent
     manifest = create_manifest(
         gguf_dir=args.gguf_dir,
         expert_pack=args.expert_pack,

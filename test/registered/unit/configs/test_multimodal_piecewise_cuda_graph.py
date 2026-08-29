@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
+from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
@@ -82,14 +84,15 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args._cuda_graph_config_locked = set()
 
         with (
-            patch.object(
-                ServerArgs, "_disable_tc_piecewise_cudagraph_if_incompatible"
+            patch(
+                "sglang.srt.arg_groups.cuda_graph_hook"
+                ".disable_tc_piecewise_cudagraph_if_incompatible"
             ) as disable_if_incompatible,
             patch.object(
                 args, "_resolved_attention_backends", return_value=("fa3", "fa3")
             ),
         ):
-            args._apply_cuda_graph_compatibility()
+            apply_cuda_graph_compatibility(args)
 
         self.assertEqual(
             resolution_result(args, "cuda_graph_config").prefill.backend,
@@ -120,7 +123,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             ),
             patch.object(args, "use_mla_backend", return_value=True),
         ):
-            args._apply_cuda_graph_compatibility()
+            apply_cuda_graph_compatibility(args)
 
         self.assertEqual(
             resolution_result(args, "cuda_graph_config").prefill.backend,
@@ -139,7 +142,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
             "_resolved_attention_backends",
             return_value=("trtllm_mla", "trtllm_mla"),
         ):
-            args._apply_cuda_graph_compatibility()
+            apply_cuda_graph_compatibility(args)
 
         self.assertEqual(
             resolution_result(args, "cuda_graph_config").prefill.backend,
@@ -184,9 +187,9 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         with (
             patch.object(args, "get_model_config", return_value=args._model_config),
-            patch("sglang.srt.server_args.is_cuda", return_value=True),
+            patch("sglang.srt.arg_groups.model_hook.is_cuda", return_value=True),
         ):
-            args._handle_model_capability_adjustments()
+            handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "disable_radix_cache"))
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), -1)
@@ -213,7 +216,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         )
 
         with patch.object(args, "get_model_config", return_value=args._model_config):
-            args._handle_model_capability_adjustments()
+            handle_model_capability_adjustments(args)
 
         self.assertTrue(resolution_result(args, "is_embedding"))
 
