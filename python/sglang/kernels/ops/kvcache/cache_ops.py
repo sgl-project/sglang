@@ -9,11 +9,14 @@ def concat_and_cast_mha_k_kernel(
     k_nope_ptr,
     k_rope_ptr,
     head_cnt: tl.constexpr,
-    k_stride0: tl.constexpr,
-    k_stride1: tl.constexpr,
-    nope_stride0: tl.constexpr,
-    nope_stride1: tl.constexpr,
-    rope_stride0: tl.constexpr,
+    # Strides stay runtime args: as constexpr each new caller shape is a fresh
+    # specialization that Triton compiles and device-loads on first use, which
+    # mid-serving means a cuModuleLoadData against whatever headroom is left.
+    k_stride0,
+    k_stride1,
+    nope_stride0,
+    nope_stride1,
+    rope_stride0,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
 ):
@@ -52,11 +55,11 @@ def concat_and_cast_mha_k_pad_kernel(
     k_nope_ptr,
     k_rope_ptr,
     head_cnt: tl.constexpr,
-    k_stride0: tl.constexpr,
-    k_stride1: tl.constexpr,
-    nope_stride0: tl.constexpr,
-    nope_stride1: tl.constexpr,
-    rope_stride0: tl.constexpr,
+    k_stride0,
+    k_stride1,
+    nope_stride0,
+    nope_stride1,
+    rope_stride0,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
@@ -66,7 +69,8 @@ def concat_and_cast_mha_k_pad_kernel(
     tl.arange needs a power-of-two extent, so walk HEAD_BLOCK == next_power_of_2(head_cnt)
     lanes and mask the tail.
     """
-    # int64 for the same reason as concat_and_cast_mha_k_kernel above.
+    # int64, and runtime strides, for the same reasons as
+    # concat_and_cast_mha_k_kernel above.
     pid_loc = tl.program_id(0).to(tl.int64)
     head_range = tl.arange(0, HEAD_BLOCK)
     head_mask = head_range < head_cnt
