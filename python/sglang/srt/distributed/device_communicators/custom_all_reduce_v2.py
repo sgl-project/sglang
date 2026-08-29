@@ -56,7 +56,9 @@ from sglang.srt.utils.cuda_vmm_utils import (
     is_vmm_pointer,
 )
 
+from .configs.custom_all_reduce_v2 import AllReduceConfig as TunedConfig
 from .configs.custom_all_reduce_v2 import (
+    Heuristic,
     get_all_reduce_config,
     get_supported_world_sizes,
 )
@@ -75,18 +77,31 @@ _SEMAPHORE_BYTES = 128
 _MAX_GRAPH_INPUTS = 131072
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
-# forced per-direction workspace sizes; highest priority, override both the
-# tuned config and explicit constructor sizes (None = not forced)
-_FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
-_FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
-def _ceil_align(nbytes: int, align: int) -> int:
-    return (nbytes + align - 1) // align * align
+def _forced_size(env_kb: Optional[int]) -> Optional[int]:
+    """Bytes behind a ``SGLANG_FORCE_*_SIZE_KB`` env var; ``None`` when unset."""
+    return None if env_kb is None else int(env_kb) * 1024
+
+
+# forced per-direction workspace sizes; highest priority, they override both
+# the tuned config and explicit constructor sizes
+_FORCE_PULL_SIZE = _forced_size(
+    envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
+)
+_FORCE_PUSH_SIZE = _forced_size(
+    envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
+)
 
 
 def _div_ceil(nbytes: int, div: int) -> int:
     return (nbytes + div - 1) // div
+
+
+def _align(nbytes: int) -> int:
+    """Round a workspace size up to ``_ALIGN_BYTES``, never down to zero."""
+    nbytes = max(nbytes, _ALIGN_BYTES)
+    return (nbytes + _ALIGN_BYTES - 1) // _ALIGN_BYTES * _ALIGN_BYTES
 
 
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
@@ -111,6 +126,141 @@ class AllReduceConfig(NamedTuple):
     algo: AllReduceAlgo
     use_graph: bool = False
     use_multicast: bool = False
+
+
+class _WorkspaceSizes(NamedTuple):
+    """Aligned byte capacities of one instance's symmetric-memory workspace.
+
+    ``pull`` and ``push`` are the per-direction message ceilings; either may
+    be ``0``. ``gather_slot`` is the shard slot ``2shot_push`` all-gathers
+    into, and ``two_shot_push`` the message ceiling that slot buys.
+    """
+
+    pull: int
+    push: int
+    gather_slot: int
+    two_shot_push: int
+
+    @property
+    def pull_enabled(self) -> bool:
+        return self.pull > 0
+
+    @property
+    def two_shot_push_enabled(self) -> bool:
+        return self.gather_slot > 0
+
+    @property
+    def shared_slot(self) -> int:
+        """Size of one of the ``2 * world_size`` shared push slots.
+
+        The two push algos share the plane, so a slot has to hold either
+        occupant: a whole ``1shot_push`` input, or a ``2shot_push`` shard.
+        """
+        return max(self.push, self.gather_slot)
+
+    @property
+    def max_message(self) -> int:
+        """Largest message any algorithm on this workspace can take."""
+        return max(self.pull, self.push)
+
+    @classmethod
+    def resolve(
+        cls,
+        tuned: TunedConfig,
+        world_size: int,
+        *,
+        max_size: int,
+        max_pull_size: Optional[int],
+        max_push_size: Optional[int],
+        max_two_shot_push_size: Optional[int],
+        pull_blocks_disabled: bool,
+    ) -> "_WorkspaceSizes":
+        """Resolve the constructor's optional caps into concrete capacities.
+
+        Precedence, highest first: the ``SGLANG_FORCE_*`` env vars, the
+        explicit constructor argument, then what the tuned config wants
+        clipped to ``max_size``.
+        """
+        if max_pull_size is None:
+            max_pull_size = min(tuned.max_pull_bytes, max_size)
+        if max_push_size is None:
+            max_push_size = min(tuned.max_push_bytes, max_size)
+        if max_two_shot_push_size is None:
+            max_two_shot_push_size = min(tuned.max_two_shot_push_bytes, max_size)
+        if _FORCE_PULL_SIZE is not None:
+            max_pull_size = _FORCE_PULL_SIZE
+        if _FORCE_PUSH_SIZE is not None:
+            max_push_size = _FORCE_PUSH_SIZE
+
+        # Zero on either pull knob opts out of the pull half entirely: no
+        # pull plane at all, and every pull algo disabled by clipping its
+        # threshold to 0. Push-only callers (the fused qk-norm instances)
+        # take this path rather than allocating a placeholder buffer just to
+        # satisfy a constructor.
+        pull_off = pull_blocks_disabled or max_pull_size <= 0
+        # 2shot_push stages its input through the pull buffer, so it goes
+        # down with the pull half; what it gathers is one reduced shard per
+        # rank, hence a slot of 1/world_size of the message.
+        gather_off = pull_off or max_two_shot_push_size <= 0
+        gather_slot = (
+            0 if gather_off else _align(_div_ceil(max_two_shot_push_size, world_size))
+        )
+        pull = 0 if pull_off else _align(max_pull_size)
+        return cls(
+            pull=pull,
+            push=_align(max_push_size),
+            gather_slot=gather_slot,
+            # rounding the shard up bought a bit of headroom; the pull
+            # buffer still has to hold the whole message
+            two_shot_push=min(gather_slot * world_size, pull),
+        )
+
+
+def _narrow_config(
+    tuned: TunedConfig,
+    sizes: _WorkspaceSizes,
+    *,
+    max_pull_blocks: Optional[int],
+    max_push_blocks: Optional[int],
+) -> TunedConfig:
+    """Narrow a tuned config to what this instance actually allocated.
+
+    Every algo's size threshold is clipped to its workspace capacity, and
+    the kernel grids to the caller's block limits.
+    """
+
+    def force_thresholds(heuristic: Heuristic) -> Heuristic:
+        # forced sizes bypass the tuned NCCL-crossover heuristics: lift
+        # each direction's ceiling to the forced workspace capacity (the
+        # clip() below only ever lowers thresholds)
+        if _FORCE_PULL_SIZE is not None:
+            heuristic = heuristic._replace(two_shot_pull_threshold=_FORCE_PULL_SIZE)
+        if _FORCE_PUSH_SIZE is not None:
+            heuristic = heuristic._replace(one_shot_push_threshold=_FORCE_PUSH_SIZE)
+        return heuristic
+
+    # a cap, and `0` is not one: it means "push-only instance", which leaves
+    # no pull plane to size in the first place
+    num_pull_blocks = tuned.num_pull_blocks
+    if max_pull_blocks:
+        num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
+    # not a cap but an override: callers size the push grid by occupancy,
+    # which may land either side of the tuned default
+    num_push_blocks = tuned.num_push_blocks
+    if max_push_blocks is not None:
+        num_push_blocks = max(max_push_blocks, 1)
+    return (
+        tuned._replace(
+            graph=force_thresholds(tuned.graph),
+            eager=force_thresholds(tuned.eager),
+        )
+        .clip(
+            max_push_bytes=sizes.push,
+            max_pull_bytes=sizes.pull,
+            max_two_shot_push_bytes=sizes.two_shot_push,
+        )
+        ._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
+    )
 
 
 class CustomAllReduceV2:
@@ -143,6 +293,8 @@ class CustomAllReduceV2:
                                  gather handle.
         :param max_pull_blocks: cap on the barrier plane's block count; ``0``
                                 builds a push-only instance.
+        :param max_push_blocks: exact push grid width, overriding the tuned
+                                one in either direction.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
@@ -162,69 +314,30 @@ class CustomAllReduceV2:
         # world size — so it picks both a different config and eager-only
         # dispatch below.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
-        base_config = get_all_reduce_config(self.world_size, multinode=is_multinode)
-        if max_pull_size is None:
-            max_pull_size = min(base_config.max_pull_bytes, max_size)
-        if max_push_size is None:
-            max_push_size = min(base_config.max_push_bytes, max_size)
-        if max_two_shot_push_size is None:
-            max_two_shot_push_size = min(base_config.max_two_shot_push_bytes, max_size)
-        if _FORCE_PULL_SIZE_KB is not None:
-            max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
-        if _FORCE_PUSH_SIZE_KB is not None:
-            max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
-
-        def force_thresholds(heuristic):
-            # forced sizes bypass the tuned NCCL-crossover heuristics: lift
-            # each direction's ceiling to the forced workspace capacity (the
-            # clip() below only ever lowers thresholds)
-            if _FORCE_PULL_SIZE_KB is not None:
-                heuristic = heuristic._replace(two_shot_pull_threshold=max_pull_size)
-            if _FORCE_PUSH_SIZE_KB is not None:
-                heuristic = heuristic._replace(one_shot_push_threshold=max_push_size)
-            return heuristic
-
-        base_config = base_config._replace(
-            graph=force_thresholds(base_config.graph),
-            eager=force_thresholds(base_config.eager),
+        tuned = get_all_reduce_config(self.world_size, multinode=is_multinode)
+        sizes = _WorkspaceSizes.resolve(
+            tuned,
+            self.world_size,
+            max_size=max_size,
+            max_pull_size=max_pull_size,
+            max_push_size=max_push_size,
+            max_two_shot_push_size=max_two_shot_push_size,
+            pull_blocks_disabled=max_pull_blocks == 0,
         )
-        # Zero on either pull knob opts out of the pull half entirely: no
-        # pull plane at all, and every pull algo disabled below by clipping
-        # its threshold to 0. Push-only callers (the fused qk-norm instances)
-        # take this path rather than allocating a placeholder buffer just to
-        # satisfy a constructor.
-        self.pull_enabled = max_pull_blocks != 0 and max_pull_size > 0
-        self.max_pull_size = (
-            _ceil_align(max(max_pull_size, _ALIGN_BYTES), _ALIGN_BYTES)
-            if self.pull_enabled
-            else 0
+        self.pull_enabled = sizes.pull_enabled
+        self.two_shot_push_enabled = sizes.two_shot_push_enabled
+        self.max_pull_size = sizes.pull
+        self.max_push_size = sizes.push
+        self.max_two_shot_push_size = sizes.two_shot_push
+        self.gather_slot_size = sizes.gather_slot
+        self.shared_slot_size = sizes.shared_slot
+        self.max_size = sizes.max_message
+        self.config = _narrow_config(
+            tuned,
+            sizes,
+            max_pull_blocks=max_pull_blocks,
+            max_push_blocks=max_push_blocks,
         )
-        self.max_push_size = _ceil_align(max(max_push_size, _ALIGN_BYTES), _ALIGN_BYTES)
-        num_pull_blocks = base_config.num_pull_blocks
-        num_push_blocks = base_config.num_push_blocks
-        if max_pull_blocks:
-            num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
-        if max_push_blocks is not None:
-            num_push_blocks = max(max_push_blocks, 1)
-        self.two_shot_push_enabled = self.pull_enabled and max_two_shot_push_size > 0
-        self.gather_slot_size = (
-            _ceil_align(
-                _div_ceil(max_two_shot_push_size, self.world_size),
-                _ALIGN_BYTES,
-            )
-            if self.two_shot_push_enabled
-            else 0
-        )
-        self.shared_slot_size = max(self.max_push_size, self.gather_slot_size)
-        self.max_two_shot_push_size = min(
-            self.gather_slot_size * self.world_size, self.max_pull_size
-        )
-        self.max_size = max(self.max_pull_size, self.max_push_size)
-        self.config = base_config.clip(
-            max_push_bytes=self.max_push_size,
-            max_pull_bytes=self.max_pull_size,
-            max_two_shot_push_bytes=self.max_two_shot_push_size,
-        )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
