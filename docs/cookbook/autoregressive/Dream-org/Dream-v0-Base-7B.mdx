@@ -1,0 +1,35 @@
+---
+title: Dream v0 Base 7B
+metatags:
+    description: "Deploy Dream v0 Base 7B with SGLang as a full-generation-canvas diffusion language model."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+Dream v0 Base 7B is a discrete diffusion language model served by SGLang with the `Dream` dLLM algorithm. Each request uses a complete prompt and generation canvas during denoising instead of a fixed block-diffusion step.
+
+## 2. SGLang Installation
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+The checkpoint ships model-specific code, so `--trust-remote-code` is required.
+
+## 3. Model Deployment
+
+```bash Command
+sglang serve \
+  --model-path Dream-org/Dream-v0-Base-7B \
+  --trust-remote-code \
+  --tp-size 1 \
+  --pp-size 1 \
+  --dllm-algorithm Dream \
+  --max-running-requests 4 \
+  --attention-backend flashinfer
+```
+
+Dream currently requires TP=1 and PP=1. Radix prefix caching, CUDA graphs, chunked prefill, and FDFO are disabled automatically for Dream.
+
+## 4. Model Invocation
+
+Dream exposes the standard SGLang OpenAI-compatible API. For request examples, see the [SGLang basic usage guide](../../../docs/basic_usage/send_request).

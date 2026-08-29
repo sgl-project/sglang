@@ -1368,6 +1368,12 @@
                     ]
                   },
                   {
+                    "group": "Dream-org",
+                    "pages": [
+                      "cookbook/autoregressive/Dream-org/Dream-v0-Base-7B"
+                    ]
+                  },
+                  {
                     "group": "InternLM",
                     "pages": [
                       "cookbook/autoregressive/InternLM/Intern-S2-Mobius",
