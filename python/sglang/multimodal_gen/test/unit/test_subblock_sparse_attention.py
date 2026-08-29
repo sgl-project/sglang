@@ -15,7 +15,7 @@ none of which an accuracy-only comparison at real sparsity would pin down.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -190,7 +190,7 @@ class TestSubBlockSparseBackend(unittest.TestCase):
         )
         self.assertEqual(metadata.current_timestep, 7)
 
-    def test_sm90_adapter_sorts_indices_and_uses_64x64_blocks(self):
+    def test_sm90_adapter_uses_presorted_indices_and_64x64_blocks(self):
         captured = {}
 
         class _FakeBlockSparseTensors:
@@ -202,7 +202,7 @@ class TestSubBlockSparseBackend(unittest.TestCase):
             captured.update(kwargs)
             return q, None
 
-        index = torch.tensor([[[[5, 1, 7, 3]]]], dtype=torch.int32)
+        index = torch.tensor([[[[1, 3, 5, 7]]]], dtype=torch.int32)
         q = torch.empty(1, 64, 1, HEAD_DIM, dtype=torch.bfloat16)
         with patch(
             "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn._load_sm90_block_sparse_attention",
@@ -229,8 +229,11 @@ class TestSubBlockGating(unittest.TestCase):
     """The schedule must decide sparsity from the layer and the step alone."""
 
     def _impl(self, prefix: str, **config) -> SubBlockSparseAttentionImpl:
-        with _patch_schedule(config), patch.object(
-            SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+        with (
+            _patch_schedule(config),
+            patch.object(
+                SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+            ),
         ):
             return SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,
@@ -254,8 +257,11 @@ class TestSubBlockGating(unittest.TestCase):
         self.assertFalse(self._impl("token_refiner.blocks.0.attn").layer_enabled)
 
     def test_head_dim_other_than_128_is_dense(self):
-        with _patch_schedule({}), patch.object(
-            SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+        with (
+            _patch_schedule({}),
+            patch.object(
+                SubBlockSparseAttentionImpl, "_build_dense_impl", return_value=None
+            ),
         ):
             impl = SubBlockSparseAttentionImpl(
                 num_heads=NUM_HEADS,
@@ -319,7 +325,7 @@ class TestSubBlockNumerics(unittest.TestCase):
         ref = _dense_reference(q, k, v, HEAD_DIM**-0.5)
         self.assertGreater(_cosine(out, ref), 0.999)
 
-    def test_unsorted_ragged_tail_oversubscribes_sms(self):
+    def test_presorted_ragged_tail_oversubscribes_sms(self):
         """Make tail-mask ordering observable across multiple SM waves."""
         if torch.cuda.get_device_capability() != (9, 0):
             self.skipTest("the reverse-consumption constraint is specific to SM90")
@@ -337,24 +343,21 @@ class TestSubBlockNumerics(unittest.TestCase):
         self.assertGreater(num_tiles, 2 * num_sms)
 
         # The SM90 consumer visits slots from high to low and applies the tail
-        # mask to the first block. Put the ragged block in the lowest slot, so
-        # removing the adapter's sort leaves its 27 padded rows unmasked. With
-        # zero Q/K and unit V that changes the output magnitude from 1 to
-        # (7 * 64 + 37) / (8 * 64), which an assert_close cannot overlook.
+        # mask to the first block, so the caller places the ragged block last.
         topk = 8
         tail_block = num_blocks - 1
-        unsorted_blocks = torch.tensor(
-            [tail_block, 0, 1, 2, 3, 4, 5, 6],
+        sorted_blocks = torch.tensor(
+            [0, 1, 2, 3, 4, 5, 6, tail_block],
             device=device,
             dtype=torch.int32,
         )
-        unsorted_index = (
-            unsorted_blocks.view(1, 1, 1, topk)
+        sorted_index = (
+            sorted_blocks.view(1, 1, 1, topk)
             .expand(1, NUM_HEADS, num_blocks, topk)
             .clone()
         )
         out = _run_subblock_sparse_attention(
-            q, k, v, unsorted_index, topk, HEAD_DIM**-0.5
+            q, k, v, sorted_index, topk, HEAD_DIM**-0.5
         )
 
         torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=2e-3)
@@ -378,14 +381,14 @@ class TestSubBlockNumerics(unittest.TestCase):
 
         num_blocks = (self.seq_len + 63) // 64
         topk = impl.router.route(q, k, sparsity=0.75, softmax_scale=HEAD_DIM**-0.5).topk
-        # A random permutation per row, not `randint`: sampling with replacement
-        # would leave the control holding duplicate blocks, so it would attend
-        # fewer distinct blocks than the router at the same budget, and the
-        # repeats would distort the softmax mass on top of that.
+        # Draw a random subset per row, not `randint`: sampling with replacement
+        # would attend fewer distinct blocks and distort the softmax mass. Sort
+        # the selected subset to honor the SM90 kernel's direct-call contract.
         random_index = (
             torch.rand(1, NUM_HEADS, num_blocks, num_blocks, device=device)
             .argsort(dim=-1)[..., :topk]
-            .to(torch.int32)
+            .sort(dim=-1)
+            .values.to(torch.int32)
         )
         random_out = _run_subblock_sparse_attention(
             q,
@@ -396,6 +399,97 @@ class TestSubBlockNumerics(unittest.TestCase):
             HEAD_DIM**-0.5,
         )
         self.assertLess(_cosine(random_out, ref), 0.9)
+
+    def _assert_kernel_backed_mixed_query_mask(self):
+        device = torch.device("cuda")
+        scale = HEAD_DIM**-0.5
+        generator = torch.Generator(device=device).manual_seed(7)
+        q = torch.randn(
+            1,
+            3 * 64,
+            NUM_HEADS,
+            HEAD_DIM,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        k = torch.randn(
+            1,
+            16 * 64,
+            NUM_HEADS,
+            HEAD_DIM,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        v = torch.randn(
+            k.shape,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+
+        topk = 8
+        sparse_blocks = torch.tensor(
+            [
+                [0, 2, 4, 6, 8, 10, 12, 14],
+                [1, 3, 5, 7, 9, 11, 13, 15],
+                [0, 1, 4, 5, 8, 9, 12, 13],
+            ],
+            device=device,
+            dtype=torch.int32,
+        )
+        routed_index = (
+            sparse_blocks.view(1, 1, 3, topk).expand(1, NUM_HEADS, 3, topk).clone()
+        )
+        plan = Mock(
+            index=routed_index,
+            topk=topk,
+            num_blocks=16,
+            density=0.5,
+        )
+        impl = self._impl(sparsity=0.5)
+        impl.router = Mock(route=Mock(return_value=plan))
+        sparse_query_block_mask = torch.tensor([True, False, True], device=device)
+
+        out = impl._sparse_attention(
+            q,
+            k,
+            v,
+            sparse_query_block_mask=sparse_query_block_mask,
+        )
+
+        reference = torch.empty_like(q)
+        all_blocks = torch.arange(16, device=device)
+        token_offsets = torch.arange(64, device=device)
+        for query_block in range(3):
+            selected_blocks = (
+                sparse_blocks[query_block].long()
+                if sparse_query_block_mask[query_block]
+                else all_blocks
+            )
+            selected_tokens = (
+                selected_blocks[:, None] * 64 + token_offsets[None, :]
+            ).reshape(-1)
+            query_slice = slice(query_block * 64, (query_block + 1) * 64)
+            reference[:, query_slice] = _dense_reference(
+                q[:, query_slice],
+                k.index_select(1, selected_tokens),
+                v.index_select(1, selected_tokens),
+                scale,
+            )
+
+        self.assertGreater(_cosine(out, reference), 0.999)
+
+    def test_sm90_kernel_backed_mixed_query_mask(self):
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("requires the SM90 SubBlock kernel")
+        self._assert_kernel_backed_mixed_query_mask()
+
+    def test_sm100_kernel_backed_mixed_query_mask(self):
+        if torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("requires the SM100 SubBlock kernel")
+        self._assert_kernel_backed_mixed_query_mask()
 
     def test_skipped_step_is_bitwise_dense(self):
         device = torch.device("cuda")

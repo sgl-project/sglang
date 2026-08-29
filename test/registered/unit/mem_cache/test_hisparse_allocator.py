@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -91,7 +92,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             rid="req-0",
             origin_input_ids=list(range(fill_len)),
             output_ids=[],
-            kv=None,
+            kv=ReqKvInfo(),
         )
 
         def set_extend_range(start, end):
