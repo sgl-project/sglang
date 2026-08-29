@@ -184,6 +184,16 @@ class TestAttentionBackendFallback(unittest.TestCase):
 
         self.assertIsNone(get_component_attn_backend_context())
 
+    def test_automatic_component_backend_may_skip_sglang_attention_layer(self):
+        with component_attn_backend_context_manager(
+            AttentionBackendEnum.TORCH_SDPA,
+            component_name="text_encoder",
+            require_component_backend_selection=False,
+        ):
+            pass
+
+        self.assertIsNone(get_component_attn_backend_context())
+
     def test_implicit_preference_falls_back_for_missing_capability(self):
         backend = self._resolve(
             AttentionBackendEnum.AITER,

@@ -372,6 +372,7 @@ def component_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum | None,
     component_name: str | None = None,
     allow_global_backend_fallback: bool = False,
+    require_component_backend_selection: bool = True,
 ) -> Generator[None, None, None]:
     if attn_backend is None and component_name is None:
         yield
@@ -393,11 +394,15 @@ def component_attn_backend_context_manager(
         completed = True
     finally:
         context = component_attn_backend_context.get()
-        unused_component_override = completed and (
-            context is not None
-            and context.backend is not None
-            and context.component_name is not None
-            and not context.selected_backends
+        unused_component_override = (
+            completed
+            and require_component_backend_selection
+            and (
+                context is not None
+                and context.backend is not None
+                and context.component_name is not None
+                and not context.selected_backends
+            )
         )
         if unused_component_override:
             unused_component_name = context.component_name

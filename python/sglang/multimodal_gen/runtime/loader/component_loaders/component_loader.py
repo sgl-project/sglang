@@ -197,6 +197,11 @@ class ComponentLoader(ABC):
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_component_backend_selection=(
+                not server_args.is_component_attention_backend_automatic(
+                    component_attn_name
+                )
+            ),
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -219,6 +224,11 @@ class ComponentLoader(ABC):
             attn_backend,
             component_name=component_attn_name,
             allow_global_backend_fallback=allow_global_backend_fallback,
+            require_component_backend_selection=(
+                not server_args.is_component_attention_backend_automatic(
+                    component_attn_name
+                )
+            ),
         ):
             component = self.load_native(
                 component_model_path,
@@ -711,6 +721,12 @@ class PipelineComponentLoader:
                 component_name=component_attn_name,
                 allow_global_backend_fallback=(
                     loader.allow_global_attention_backend_fallback
+                ),
+                require_component_backend_selection=(
+                    component_attn_backend is None
+                    or not server_args.is_component_attention_backend_automatic(
+                        component_attn_name
+                    )
                 ),
             ):
                 return loader.load(
