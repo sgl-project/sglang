@@ -21,8 +21,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.runtime_context import get_schedule
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_schedule,
+    get_serving,
+)
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -40,7 +43,6 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
-        server_args: ServerArgs,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -60,7 +62,6 @@ class DecodeKVCacheOffloadManager:
         self.decode_host_mem_pool = build_kv_host_pool(
             kv_pool=kv_cache,
             page_size=self.page_size,
-            server_args=server_args,
             use_mla=isinstance(kv_cache, MLATokenToKVPool),
         )
 
@@ -68,10 +69,10 @@ class DecodeKVCacheOffloadManager:
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
         hicache_storage_backend_extra_config = {}
-        if server_args.hicache_storage_backend_extra_config:
+        if get_memory().hicache_storage_backend_extra_config:
             try:
                 hicache_storage_backend_extra_config = json.loads(
-                    server_args.hicache_storage_backend_extra_config
+                    get_memory().hicache_storage_backend_extra_config
                 )
             except json.JSONDecodeError as e:
                 raise ValueError(
@@ -83,10 +84,10 @@ class DecodeKVCacheOffloadManager:
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
             tp_group=tp_group,
-            io_backend=server_args.hicache_io_backend,
+            io_backend=get_memory().hicache_io_backend,
             load_cache_event=threading.Event(),
-            storage_backend=server_args.hicache_storage_backend,
-            model_name=server_args.served_model_name,
+            storage_backend=get_memory().hicache_storage_backend,
+            model_name=get_serving().served_model_name,
             storage_backend_extra_config=hicache_storage_backend_extra_config,
         )
 
@@ -280,7 +281,7 @@ class DecodeKVCacheOffloadManager:
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
         self.req_to_token_pool.free(req)
-        req.kv = None
+        req.kv.mark_released()
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]

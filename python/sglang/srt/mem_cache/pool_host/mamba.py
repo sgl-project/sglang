@@ -5,13 +5,12 @@ import threading
 from typing import Optional
 
 import numpy as np
-import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.base import (
-    HICACHE_HOST_MEMORY_RESERVE_BYTES,
     HostKVCache,
+    host_memory_budget_bytes,
     sync_fixed_hicache_size,
     synchronized,
 )
@@ -96,9 +95,8 @@ class MambaPoolHost(HostKVCache):
                 device_pool.size,
             )
 
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -129,7 +127,7 @@ class MambaPoolHost(HostKVCache):
             for conv_state in device_pool.mamba_cache.conv
         ]
 
-        self.init_kv_buffer()
+        self.kv_buffer = self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
@@ -148,6 +146,9 @@ class MambaPoolHost(HostKVCache):
                 device=device,
                 pin_memory=pin_memory,
                 allocator=allocator,
+                registration_granularity_bytes=(
+                    int(np.prod(dims[1:])) * dtype.itemsize
+                ),
             )
 
         if self.layout in ["page_first", "page_first_direct"]:
@@ -201,6 +202,12 @@ class MambaPoolHost(HostKVCache):
                         allocator=self.allocator,
                     )
                 )
+        # destroy() unregisters via kv_buffer; without this list the pinned
+        # registrations leak past the buffers' mmap. 0-element buffers
+        # (conv-only models' temporal state) were never registered.
+        return [
+            buf for buf in (self.temporal_buffer, *self.conv_buffer) if buf.numel() > 0
+        ]
 
     def _init_write_back_staging_buffers(self):
         self.temporal_staging_buffer = None

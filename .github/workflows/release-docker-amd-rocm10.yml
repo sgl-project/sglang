@@ -1,0 +1,195 @@
+name: Release Docker Images Nightly ROCm 10 (AMD)
+on:
+  workflow_dispatch:
+    inputs:
+      job_select:
+        description: 'Select which release job to run'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - publish
+          - publish-gfx1250
+      gpu_arch:
+        description: 'Select which ROCm 10 GPU arch to build'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - gfx942-rocm1000
+          - gfx950-rocm1000
+  schedule:
+    - cron: '0 12 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm1000", "gfx950-rocm1000"]') }}
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set date
+        run: echo "DATE=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${VERSION}.dev${DATE}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: ${VERSION}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and push to rocm/sgl-dev
+        env:
+          BUILD_TYPE: ${{ matrix.build_type }}
+          GPU_ARCH: ${{ matrix.gpu_arch }}
+          PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          case "$GPU_ARCH" in
+            gfx942-rocm1000) rocm_tag="rocm10-mi30x" ;;
+            gfx950-rocm1000) rocm_tag="rocm10-mi35x" ;;
+            *)
+              echo "Unsupported GPU arch: $GPU_ARCH"
+              exit 1
+              ;;
+          esac
+
+          image_tag="v${VERSION}-${rocm_tag}-${DATE}"
+          echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
+            --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
+            --build-arg "GPU_ARCH=${GPU_ARCH}" \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t "rocm/sgl-dev:${image_tag}" \
+            --no-cache
+          docker push "rocm/sgl-dev:${image_tag}"
+
+      - name: Login to Docker Hub (lmsys)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push to lmsysorg/sglang-rocm
+        run: |
+          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
+
+  # gfx1250 (MI45x) is still being brought up on the amd_helios branch: main
+  # has no gfx1250 stage in docker/rocm.Dockerfile, so this job builds from
+  # that branch rather than from the ref the workflow was triggered on. It runs
+  # on the same schedule as the pair above but stays a separate job, because
+  # there is no MI450 runner pool consuming the image and a bring-up build
+  # failure must not gate the released gfx942/gfx950 images.
+  publish-gfx1250:
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250')
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    steps:
+      - name: Checkout amd_helios
+        uses: actions/checkout@v4
+        with:
+          ref: amd_helios
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set date
+        run: echo "DATE=$(date +%Y%m%d)" >> "$GITHUB_ENV"
+
+      - name: Get version and branch head
+        id: version
+        run: |
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          # The checkout above is amd_helios, so this is the branch head that
+          # both the build context and the cloned sglang source come from.
+          BRANCH_SHA=$(git rev-parse HEAD)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${VERSION}.dev${DATE}+g${COMMIT_HASH}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "branch_sha=${BRANCH_SHA}" >> "$GITHUB_OUTPUT"
+          echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building gfx1250 from amd_helios at ${BRANCH_SHA}"
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and push to rocm/sgl-dev
+        env:
+          BRANCH_SHA: ${{ steps.version.outputs.branch_sha }}
+          PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # `dev` marks this as built from a bring-up branch rather than from
+          # the ref the release ran on, so it never reads as a released tag.
+          image_tag="v${VERSION}-rocm10-mi45x-dev-${DATE}"
+          echo "Publishing rocm/sgl-dev:${image_tag}"
+
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg "SGL_BRANCH=${BRANCH_SHA}" \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GPU_ARCH=gfx1250-rocm1000 \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg ENABLE_NIXL=1 \
+            --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t "rocm/sgl-dev:${image_tag}" \
+            --no-cache
+          docker push "rocm/sgl-dev:${image_tag}"

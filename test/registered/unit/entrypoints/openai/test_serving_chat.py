@@ -11,6 +11,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import re
 import tempfile
 import unittest
 import uuid
@@ -21,25 +22,56 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ToolChoice,
+    ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
+from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+# Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
+_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
+
+
+def _spec_result(index):
+    return {
+        "text": f"choice-{index}",
+        "meta_info": {
+            "id": "chatcmpl-spec-test",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "finish_reason": {"type": "stop"},
+            "weight_version": "default",
+            "spec_accept_rate": 0.5,
+            "spec_accept_length": 2.0,
+            "spec_cap_length": index + 1.0,
+            "spec_block_accept_length": index + 0.5,
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 1,
+            "spec_correct_drafts_histogram": [0, 1],
+            "spec_cap_lens_histogram": [index, 1],
+        },
+        "index": index,
+    }
+
 
 _DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
 _DSV4_OFFICIAL_ENCODER = (
@@ -1569,6 +1601,191 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
+    def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
+        """A structural-tag parser owns the output format, so a missing tool
+        call must not be pushed through the json_schema array fallback."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        texts = {
+            "prose": "<|open|>response<|sep|>I'll check that.<|close|>response<|sep|>",
+            "empty": "",
+            "json_object": '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+        }
+        for choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            for label, text in texts.items():
+                with self.subTest(tool_choice=choice, payload=label):
+                    finish_reason = {"type": "stop", "matched": None}
+                    with self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                    ) as logs:
+                        tool_calls, remaining, finish_reason = (
+                            self.chat._process_tool_calls(
+                                text=text,
+                                tools=tools,
+                                finish_reason=finish_reason,
+                                tool_choice=choice,
+                            )
+                        )
+                    self.assertIsNone(tool_calls)
+                    self.assertEqual(remaining, text)
+                    self.assertEqual(finish_reason["type"], "stop")
+                    self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
+
+    def test_truncated_native_tool_call_logs_and_drops(self):
+        """A tools section cut off before its closing tag parses to zero calls
+        without raising; the sync path used to drop it with no log at all."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        truncated = TOOLS_OPEN + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        for choice in ("auto", "required"):
+            with self.subTest(tool_choice=choice):
+                finish_reason = {"type": "stop", "matched": None}
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                ) as logs:
+                    tool_calls, remaining, finish_reason = (
+                        self.chat._process_tool_calls(
+                            text=truncated,
+                            tools=tools,
+                            finish_reason=finish_reason,
+                            tool_choice=choice,
+                        )
+                    )
+                self.assertIsNone(tool_calls)
+                self.assertEqual(remaining, "")
+                self.assertEqual(finish_reason["type"], "stop")
+                self.assertIn("no complete call", "\n".join(logs.output))
+
+    def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
+        """Parsers without a structural tag keep the JSON array fallback, but a
+        non-array payload degrades instead of raising an opaque TypeError."""
+        self.chat.tool_call_parser = "glm45"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        cases = [
+            (
+                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]',
+                '{"city": "Paris"}',
+            ),
+            (
+                '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+                '{"city": "Paris"}',
+            ),
+            ('{"name": "get_weather"}', "{}"),
+        ]
+        for text, expected_args in cases:
+            with self.subTest(text=text):
+                tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                    text=text,
+                    tools=tools,
+                    finish_reason={"type": "stop", "matched": None},
+                    tool_choice="required",
+                )
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0].function.name, "get_weather")
+                self.assertEqual(tool_calls[0].function.arguments, expected_args)
+                self.assertEqual(finish_reason["type"], "tool_calls")
+
+        finish_reason = {"type": "stop", "matched": None}
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="ERROR"
+        ):
+            tool_calls, remaining, finish_reason = self.chat._process_tool_calls(
+                text='["get_weather"]',
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+        self.assertIsNone(tool_calls)
+        self.assertEqual(remaining, '["get_weather"]')
+        self.assertEqual(finish_reason["type"], "stop")
+
+    def test_required_tool_choice_rejects_conflicting_output_constraint(self):
+        """response_format and a forced tool call cannot both be honored: the
+        tool-call constraint was dropped with only a warning, so the model was
+        constrained to a shape that can never contain a tool call."""
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        constraint = ("structural_tag", None)
+        conflicting = [
+            {"type": "json_object"},
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "a", "schema": {"type": "object"}},
+            },
+        ]
+        for tool_choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            for response_format in conflicting:
+                with self.subTest(tool_choice=tool_choice, rf=response_format["type"]):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        response_format=response_format,
+                    )
+                    with self.assertRaises(ValueError) as ctx:
+                        request.to_sampling_params(
+                            stop=[],
+                            model_generation_config={},
+                            tool_call_constraint=constraint,
+                        )
+                    self.assertIn("cannot be combined", str(ctx.exception))
+
+    def test_auto_tool_choice_keeps_response_format_without_raising(self):
+        """ "auto" means the model need not call a tool, so dropping the
+        tool-call constraint still leaves a satisfiable request."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="auto",
+            response_format={"type": "json_object"},
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=("structural_tag", None),
+        )
+        self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 
@@ -1711,6 +1928,34 @@ class ServingChatTestCase(unittest.TestCase):
         tm.server_args.tool_call_parser = "kimi_k3"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
+
+    def test_custom_encoders_own_reasoning_history(self):
+        """Every custom encoding spec takes reasoning history natively.
+
+        The alternative splices a detector's markers into content, which an
+        encoder that frames its own channels turns into visible raw markers.
+        A new spec must not silently default to that path.
+        """
+        for spec in _ALL_CHAT_ENCODING_SPECS:
+            with self.subTest(chat_encoding_spec=spec):
+                self.chat.chat_encoding_spec = spec
+                self.assertTrue(self.chat.supports_native_reasoning_history())
+
+        # The HF chat-template path keeps the wrap-into-content behaviour.
+        self.chat.chat_encoding_spec = None
+        self.assertFalse(self.chat.supports_native_reasoning_history())
+
+    def test_all_chat_encoding_specs_are_enumerated(self):
+        """Guard the spec list this file asserts capabilities over."""
+        source = Path(chat_encoding.__file__).read_text()
+        returned = set(
+            re.findall(
+                r'^\s+return "(\w+)"$',
+                source[source.index("def resolve_chat_encoding_spec") :],
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
 
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
@@ -2265,13 +2510,13 @@ class ServingChatTestCase(unittest.TestCase):
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
         )
 
-    def test_non_streaming_cached_tokens_details_emits_sglext(self):
-        """Test that non-streaming chat responses emit cached token details in sglext."""
-
+    def test_non_streaming_extension_fields_emit_sglext_without_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             max_tokens=100,
+            return_meta_info=False,
+            return_routed_experts=True,
             return_cached_tokens_details=True,
         )
         ret = [
@@ -2288,6 +2533,7 @@ class ServingChatTestCase(unittest.TestCase):
                         "storage": 1,
                         "storage_backend": "file",
                     },
+                    "routed_experts": "cm91dGUtYQ==",
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
                 },
@@ -2297,6 +2543,7 @@ class ServingChatTestCase(unittest.TestCase):
         response = self.chat._build_chat_response(req, ret, 1234567890)
 
         self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.routed_experts, "cm91dGUtYQ==")
         self.assertEqual(
             response.sglext.cached_tokens_details.model_dump(exclude_none=True),
             {
@@ -2305,6 +2552,133 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage": 1,
                 "storage_backend": "file",
             },
+        )
+        self.assertIsNone(response.choices[0].meta_info)
+        dumped_response = response.model_dump()
+        self.assertIn("sglext", dumped_response)
+        self.assertNotIn("meta_info", dumped_response["choices"][0])
+
+    def test_non_streaming_meta_info_omits_response_level_routed_experts(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_meta_info=True,
+            return_routed_experts=True,
+        )
+        ret = [
+            {
+                "text": f"Response {index}",
+                "meta_info": {
+                    "id": "chatcmpl-meta-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": index,
+                    "routed_experts": routed_experts,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+            for index, routed_experts in enumerate(["cm91dGUtYQ==", "cm91dGUtYg=="])
+        ]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNone(
+            response.sglext,
+            "sglext is absent only when routed_experts is the sole extension",
+        )
+        self.assertEqual(
+            [choice.meta_info for choice in response.choices],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        dumped_response = response.model_dump()
+        self.assertNotIn("sglext", dumped_response)
+        self.assertEqual(
+            [choice["meta_info"] for choice in dumped_response["choices"]],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        serialized_response = json.dumps(dumped_response)
+        self.assertEqual(serialized_response.count('"routed_experts"'), 2)
+
+    def test_non_streaming_meta_info_preserves_cache_and_spec_in_sglext(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_meta_info=True,
+            return_routed_experts=True,
+            return_cached_tokens_details=True,
+            return_spec_tokens_details=True,
+        )
+        routed_experts = ["cm91dGUtYQ==", "cm91dGUtYg=="]
+        ret = [_spec_result(index) for index in range(2)]
+        for index, ret_item in enumerate(ret):
+            ret_item["meta_info"].update(
+                {
+                    "cached_tokens_details": {
+                        "device": 4 - index,
+                        "host": index,
+                    },
+                    "routed_experts": routed_experts[index],
+                }
+            )
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertIsNone(response.sglext.routed_experts)
+        self.assertEqual(
+            response.sglext.cached_tokens_details.model_dump(exclude_none=True),
+            {"device": 4, "host": 0},
+        )
+        self.assertEqual(
+            [item.spec_cap_length for item in response.sglext.spec_tokens_details],
+            [1.0, 2.0],
+        )
+        self.assertEqual(
+            [choice.meta_info for choice in response.choices],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        dumped_response = response.model_dump()
+        self.assertIn("sglext", dumped_response)
+        self.assertIn("spec_tokens_details", dumped_response["sglext"])
+        self.assertNotIn("routed_experts", dumped_response["sglext"])
+        self.assertEqual(
+            dumped_response["sglext"]["cached_tokens_details"],
+            {"device": 4, "host": 0},
+        )
+        serialized_response = json.dumps(dumped_response)
+        self.assertEqual(serialized_response.count('"routed_experts"'), 2)
+
+    def test_parallel_sampling_returns_spec_details_per_choice(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_spec_tokens_details=True,
+        )
+        ret = [_spec_result(index) for index in range(2)]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        details = response.sglext.spec_tokens_details
+        self.assertEqual([item.spec_cap_length for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item.spec_cap_lens_histogram for item in details],
+            [[0, 1], [1, 1]],
+        )
+
+        single_req = req.model_copy(update={"n": 1})
+        single_response = self.chat._build_chat_response(
+            single_req, ret[:1], 1234567890
+        )
+        self.assertEqual(
+            single_response.sglext.spec_tokens_details.spec_cap_length,
+            1.0,
         )
 
     def test_non_streaming_chat_response_returns_requested_token_ids_and_meta_info(
@@ -2420,6 +2794,31 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage": 1,
                 "storage_backend": "file",
             },
+        )
+
+    def test_streaming_parallel_sampling_orders_spec_details_by_choice(self):
+        async def mock_generate():
+            for index in (1, 0):
+                yield _spec_result(index)
+
+        self.tm.generate_request.return_value = mock_generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            stream=True,
+            return_spec_tokens_details=True,
+        )
+
+        parsed = self._parse_chunks(self._run_chat_stream(Mock(), req))
+        details = next(chunk["sglext"] for chunk in parsed if "sglext" in chunk)[
+            "spec_tokens_details"
+        ]
+        self.assertEqual([item["spec_cap_length"] for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item["spec_cap_lens_histogram"] for item in details],
+            [[0, 1], [1, 1]],
         )
 
     def _collect_continuous_usage(self, cached_tokens):
@@ -2836,6 +3235,29 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": True},
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_fallback_ling3_default_on(self):
+        """Ling3 public checkpoints default `thinking_option='on'` in the chat
+        template when `enable_thinking` is omitted, and the template detector
+        cannot infer that indirect assignment. The parser fallback must mirror
+        the template default: omitted kwargs enable reasoning, only an explicit
+        `enable_thinking=False` disables it. Regression: the detector shipped
+        with `explicit_enable_thinking`, which left `reasoning_content` null on
+        default requests while the model was in fact thinking."""
+        self._setup_fallback("ling3")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, True),  # no chat_template_kwargs → thinking (template default)
+            ({}, True),  # empty kwargs → thinking
+            ({"enable_thinking": True}, True),  # explicit on
+            ({"enable_thinking": False}, False),  # explicit off
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
 
     def test_fallback_no_detector_returns_false(self):
         self.chat.reasoning_parser = "qwen3"
