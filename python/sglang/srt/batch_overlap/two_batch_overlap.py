@@ -753,6 +753,7 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "local_prefill_cp_active",
             "return_logprob",
             "can_run_decode_cuda_graph",
             "can_run_dp_prefill_cuda_graph",

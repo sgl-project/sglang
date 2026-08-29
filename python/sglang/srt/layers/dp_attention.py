@@ -79,7 +79,6 @@ _is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
-
     # Padding tokens to max length and then gather tokens using `all_gather_into_tensor`
     MAX_LEN = auto()
     # Padding tokens to sum length and then gather tokens using `all_reduce`
@@ -392,6 +391,51 @@ def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
 
 
+def get_attention_tp_group() -> GroupCoordinator:
+    return get_attn_tp_group()
+
+
+def get_attention_tp_rank() -> int:
+    return get_attn_tensor_model_parallel_rank()
+
+
+def get_attention_tp_size() -> int:
+    return get_attn_tensor_model_parallel_world_size()
+
+
+def get_attention_cp_group() -> GroupCoordinator:
+    return get_attn_cp_group()
+
+
+def get_attention_cp_rank() -> int:
+    return get_parallel().attn_cp_rank
+
+
+def get_attention_cp_size() -> int:
+    return get_parallel().attn_cp_size
+
+
+def broadcast_tensor_within_attention_dp_group(
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Broadcast a generation decision from the local attention-DP leader.
+
+    Attention ranks form a two-dimensional ``(CP, attention-TP)`` grid.  The
+    scheduler leader for one DP replica is ``(cp=0, attn_tp=0)``.  Seed the
+    CP0 attention-TP row first, then broadcast down every CP column.  This is
+    the tensor equivalent of RequestReceiver's work-request broadcast and
+    makes every scheduler replica consume exactly the same generation state.
+
+    The attention-TP broadcast intentionally only runs on CP0: every other CP
+    row has a different process group and no authoritative value to seed it.
+    """
+    if get_attention_tp_size() > 1 and get_attention_cp_rank() == 0:
+        get_attention_tp_group().broadcast(tensor, src=0)
+    if get_attention_cp_size() > 1:
+        get_attention_cp_group().broadcast(tensor, src=0)
+    return tensor
+
+
 def get_attention_dp_rank() -> int:
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _ATTN_DP_RANK
@@ -512,9 +556,9 @@ def _dp_gather_via_all_reduce(
     if local_tokens.shape[0] > 0 and (
         is_partial or get_attn_tensor_model_parallel_rank() == 0
     ):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between global_tokens and local_tokens not allowed"
+        )
 
         memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
@@ -867,9 +911,9 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
+            "aliasing between local_tokens and global_tokens not allowed"
+        )
 
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 

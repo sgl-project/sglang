@@ -11,6 +11,9 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    broadcast_tensor_within_attention_dp_group,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -63,6 +66,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     idle_ragged_layout,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
+    AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
@@ -87,7 +91,6 @@ _is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -343,6 +346,40 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._draft_dp_context_enabled:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
+
+    def _sync_prefill_cp_tensor(self, tensor: Optional[torch.Tensor]):
+        """Keep dSparK generation state identical on replicated CP schedulers."""
+        if (
+            tensor is not None
+            and self.server_args.enable_dp_attention
+            and get_parallel().attn_cp_size > 1
+        ):
+            broadcast_tensor_within_attention_dp_group(tensor)
+        return tensor
+
+    def _sync_prefill_cp_accept(self, accept: AcceptOuts) -> AcceptOuts:
+        if not (
+            self.server_args.enable_dp_attention and get_parallel().attn_cp_size > 1
+        ):
+            return accept
+        values = (
+            accept.correct_len,
+            accept.bonus,
+            accept.cap_trim_lens,
+            accept.commit_lens,
+            accept.new_seq_lens,
+            accept.out_tokens,
+        )
+        # All fields are integral and tiny.  Coalescing them avoids six pairs
+        # of attention-TP/CP collectives in every speculative decode step.
+        packed = torch.cat([value.reshape(-1).to(torch.int64) for value in values])
+        broadcast_tensor_within_attention_dp_group(packed)
+        offset = 0
+        for value in values:
+            end = offset + value.numel()
+            value.copy_(packed[offset:end].view_as(value).to(value.dtype))
+            offset = end
+        return accept
 
     def alloc_memory_pool(
         self,
@@ -625,6 +662,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        self._sync_prefill_cp_tensor(draft_tokens)
 
         confidence = proposal.confidence
         if confidence is None:
@@ -634,6 +672,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 confidence_tap=proposal.confidence_tap,
             )
+        self._sync_prefill_cp_tensor(confidence)
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -733,6 +772,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        self._sync_prefill_cp_accept(accept)
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
@@ -740,7 +780,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept.out_tokens.reshape(-1),
                 chain_stride=self.verify_num_draft_tokens,
             )
-
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)

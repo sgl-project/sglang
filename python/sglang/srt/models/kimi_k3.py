@@ -76,6 +76,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -1919,6 +1920,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
+        self._use_npu_mla_cp_ring = True
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,
@@ -1931,6 +1933,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
+            mla_enable_prefill_cp=is_mla_prefill_cp_enabled(),
             skip_rope=True,
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
@@ -2377,7 +2380,20 @@ class KimiK3DecoderLayer(nn.Module):
         # output back; padded rows are discarded downstream.
         num_padded = hidden_states.shape[0]
         num_real = num_padded
-        if self._trim_padded_attn and forward_batch.forward_mode.is_extend():
+        cp_metadata = forward_batch.attn_cp_metadata
+        if cp_metadata is not None:
+            # CP-v2 pads every rank to a common physical row count for its
+            # collectives. KDA/MLA attention metadata, including causal-conv
+            # query_start_loc, covers only this rank's logical zigzag rows.
+            # Never feed the rank-local alignment tail into attention or its
+            # KV/state updates.
+            per_rank_tokens = (
+                cp_metadata.per_rank_logical_token or cp_metadata.per_rank_actual_token
+            )
+            num_real = min(
+                int(per_rank_tokens[get_parallel().attn_cp_rank]), num_padded
+            )
+        elif self._trim_padded_attn and forward_batch.forward_mode.is_extend():
             extend_lens = forward_batch.extend_seq_lens_cpu
             if extend_lens is not None:
                 num_real = min(int(sum(extend_lens)), num_padded)
@@ -3320,6 +3336,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
     @property
     def model(self):
         return self.language_model
+
+    @property
+    def logits_processor(self):
+        return self.language_model.logits_processor
+
+    @property
+    def capture_aux_hidden_states(self):
+        return self.language_model.capture_aux_hidden_states
+
+    @property
+    def pp_group(self):
+        return self.language_model.pp_group
+
+    def get_context_parallel_model(self):
+        """Return the text backbone used between CP shard and gather."""
+        return self.language_model.model
 
     def __setattr__(self, name, value):
         if name == "model":

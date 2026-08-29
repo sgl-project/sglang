@@ -45,6 +45,7 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
         "DeepseekV32ForCausalLM",
         "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
+        "KimiK3ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -136,23 +137,57 @@ def enable_cp_v2() -> bool:
     return bool(envs.SGLANG_ENABLE_CP_V2.get())
 
 
-def is_cp_v2_active(forward_batch) -> bool:
-    """Return whether the current forward batch is running through CP-v2."""
+def can_cp_v2_apply(forward_batch, num_tokens: Optional[int] = None) -> bool:
+    """Return whether the real local batch is structurally eligible for CP-v2.
+
+    ``num_tokens`` lets scheduler-side planning evaluate the padded token
+    count before ``forward_batch.input_ids`` is resized.  This deliberately
+    ignores ``local_prefill_cp_active``; :func:`is_cp_v2_active` consumes that
+    latched decision after DP-attention has fabricated any idle work.
+    """
     if not enable_cp_v2():
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+    if (
+        forward_mode is None
+        or not forward_mode.is_context_parallel_extend()
+        or getattr(forward_mode, "is_mixed", lambda: False)()
+    ):
         return False
 
     strategy = get_cp_strategy()
     if strategy is None:
         return False
 
-    input_ids = getattr(forward_batch, "input_ids", None)
-    if input_ids is None:
-        return False
+    if num_tokens is None:
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is None:
+            return False
+        num_tokens = len(input_ids)
 
-    return strategy.can_apply(len(input_ids), forward_batch)
+    return strategy.can_apply(int(num_tokens), forward_batch)
+
+
+def is_cp_v2_active(forward_batch, num_tokens: Optional[int] = None) -> bool:
+    """Return whether this forward must execute through CP-v2.
+
+    Kimi-K3 with DP-attention latches the decision from its real local batch.
+    Reusing it here prevents a fabricated idle batch or later DP padding from
+    changing the PCP path independently of the attention metadata.
+    """
+    latched = getattr(forward_batch, "local_prefill_cp_active", None)
+    if latched is not None:
+        if not latched or not enable_cp_v2() or get_cp_strategy() is None:
+            return False
+
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        return bool(
+            forward_mode is not None
+            and forward_mode.is_context_parallel_extend()
+            and not getattr(forward_mode, "is_mixed", lambda: False)()
+        )
+
+    return can_cp_v2_apply(forward_batch, num_tokens=num_tokens)
 
 
 def prepare_cp_forward(forward_batch) -> None:
@@ -323,6 +358,7 @@ __all__ = [
     "ZigzagCPStrategy",
     "ZigzagContextParallelMetadata",
     "CP_V2_DEFAULT_MODEL_CLASSES",
+    "can_cp_v2_apply",
     "enable_cp_v2",
     "get_cp_strategy",
     "is_cp_v2_active",

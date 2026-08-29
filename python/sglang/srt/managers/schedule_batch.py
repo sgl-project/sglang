@@ -2181,6 +2181,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
+    # Kimi-K3 PCP policy latched from this replica's real local batch. None
+    # preserves the standard per-forward CP policy.
+    local_prefill_cp_active: Optional[bool] = None
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -3438,6 +3441,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            local_prefill_cp_active=self.local_prefill_cp_active,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

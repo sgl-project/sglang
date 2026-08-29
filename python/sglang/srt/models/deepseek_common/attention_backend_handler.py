@@ -1,5 +1,8 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
+from sglang.srt.layers.utils.cp_utils import (
+    get_npu_mla_cp_ring_validation_error,
+    mla_use_prefill_cp,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -71,6 +74,16 @@ def handle_attention_ascend(attn, forward_batch):
     ):
         if hasattr(attn, "use_dsa") and attn.use_dsa:
             return AttnForwardMethod.DSA_NPU
+        elif getattr(attn, "_use_npu_mla_cp_ring", False) and mla_use_prefill_cp(
+            forward_batch, attn.mla_enable_prefill_cp
+        ):
+            reason = get_npu_mla_cp_ring_validation_error(forward_batch, attn)
+            if reason is not None:
+                raise ValueError(f"Kimi-K3 MLA CP ring is unavailable: {reason}")
+            # npu_ring_mla consumes expanded 128-dim K/V, so use the MHA
+            # preparation path while rotating compact latent KV between
+            # CP ranks inside the Ascend backend.
+            return AttnForwardMethod.MHA_NPU
         else:
             return AttnForwardMethod.MHA_NPU
     else:
