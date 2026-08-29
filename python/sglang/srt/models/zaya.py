@@ -1309,14 +1309,20 @@ class CCA(nn.Module):
                 f"per-request host loop (folded={self._decode_conv_folded})"
             )
 
+        # The host mirrors cost a device sync, so the backend defers building
+        # them until this fallback actually runs (a CPU-test mock hands them in
+        # pre-resolved on the metadata instead).
+        slot_ids_cpu, has_prefix_cpu = meta.slot_ids_cpu, meta.has_prefix_cpu
+        if slot_ids_cpu is None:
+            slot_ids_cpu, has_prefix_cpu = get_attn_backend().extend_host_mirrors()
         return cca_extend(
             qk,
             lag_now,
             self._conv_qk_run,
             conv_state,
             lag_state,
-            meta.slot_ids_cpu,
-            meta.has_prefix_cpu,
+            slot_ids_cpu,
+            has_prefix_cpu,
             extend_seq_lens_cpu,
             self.total_padding,
         )
