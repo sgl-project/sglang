@@ -1016,15 +1016,6 @@ class WaitingMMRequestBase(ABC):
         self.release_resources()
         self.close_recv_socket()
 
-    async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
-        """Validate gathered encoder responses; on the first error, FAIL the
-        request and release its resources. Returns True if all succeeded."""
-        msg = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
-        if msg is None:
-            return True
-        self._fail_and_release(msg)
-        return False
-
     def _is_valid_embedding_part(self, recv_obj) -> bool:
         """Check for and drop stale or out-of-sync payloads; normalize the part req_id to the original rid."""
         return _embedding_part_matches_request(recv_obj, self.recv_req.rid)
@@ -1389,6 +1380,8 @@ class WaitingRDMARequest(WaitingMMRequestBase):
         self._buffer_lock = threading.Lock()
         self._terminal = False
         self._receive_running = False
+        self._receive_error = None
+        self._receive_error_lock = threading.Lock()
 
     def send_encode_request(self):
         # Base-class hook. The tokenizer owns /encode, so this rank only pulls
@@ -1401,12 +1394,33 @@ class WaitingRDMARequest(WaitingMMRequestBase):
             asyncio.run(self._pull_meta_and_receive_embedding())
         except Exception as e:
             logger.error(f"RDMA receive failed for rid={self.rid}: {e}")
-            self._fail_and_release(str(e))
+            self._record_receive_error(str(e))
         finally:
             with self._buffer_lock:
                 self._receive_running = False
                 if self._terminal:
                     self._release_buffer_locked()
+
+    def _record_receive_error(self, error_msg, error_code=None) -> None:
+        """Pass a worker-thread failure to the scheduler thread."""
+        with self._receive_error_lock:
+            self._receive_error = (error_msg, error_code)
+
+    def _try_recv_mm_data(self):
+        with self._receive_error_lock:
+            receive_error, self._receive_error = self._receive_error, None
+        if receive_error is not None:
+            self._fail_and_release(*receive_error)
+            return
+        super()._try_recv_mm_data()
+
+    async def _check_encoder_responses(self, responses, endpoint: str) -> bool:
+        """Record network failures for the scheduler thread to consume."""
+        msg = await _extract_encoder_error(responses, endpoint, f"rid={self.rid}")
+        if msg is None:
+            return True
+        self._record_receive_error(msg)
+        return False
 
     async def _pull_meta_and_receive_embedding(self):
         """Pull per-part sizes, allocate the landing buffer, then drive /send.
@@ -1474,7 +1488,7 @@ class WaitingRDMARequest(WaitingMMRequestBase):
                     )
                     if alloc_result is None:
                         # Oversize or alloc timeout — fatal for this request.
-                        self._fail_and_release(
+                        self._record_receive_error(
                             f"EmbeddingPool could not allocate "
                             f"{total_bytes // (1024 * 1024)}MB (oversize or "
                             f"timeout). Raise SGLANG_EMBEDDING_POOL_SIZE_MB."
@@ -2422,6 +2436,7 @@ class MMReceiverBase(ABC):
             else:  # status_value == WaitingMMRequestStatus.PENDING
                 new_waiting.append(waiting_req)
                 continue
+            waiting_req.close_recv_socket()
             self.waiting_by_rid.pop(waiting_req.rid, None)
 
         self.waiting_list = new_waiting
