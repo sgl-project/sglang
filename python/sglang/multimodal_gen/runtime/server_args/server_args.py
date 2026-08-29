@@ -576,6 +576,7 @@ class ServerArgs(DisaggServerArgsMixin):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
         self._validate_pipeline()
+        self._validate_component_attention_backends()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
         if self.lora_alpha is not None and self.lora_alpha <= 0:
@@ -3232,6 +3233,14 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{type(self.pipeline_config).__name__} only supports monolithic "
                 f"deployment; disaggregation role {self.disagg_role.value!r} "
                 "is not supported"
+            )
+
+    def _validate_component_attention_backends(self) -> None:
+        if self.backend == Backend.DIFFUSERS and self.component_attention_backends:
+            raise ValueError(
+                "--component-attention-backends is supported only by native "
+                "SGLang pipelines; use --attention-backend for a diffusers "
+                "pipeline"
             )
 
     def _validate_offload(self):

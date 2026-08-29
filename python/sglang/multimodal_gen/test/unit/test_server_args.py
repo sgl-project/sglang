@@ -79,6 +79,7 @@ from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
+    Backend,
     ServerArgs,
 )
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
@@ -231,6 +232,18 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(backend.name, "TORCH_SDPA")
         self.assertEqual(matched_key, "text_encoder")
+
+    def test_diffusers_rejects_component_attention_backend_override(self):
+        with self.assertRaisesRegex(
+            ValueError, "supported only by native SGLang pipelines"
+        ):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "backend": Backend.DIFFUSERS,
+                    "component_attention_backends": {"text_encoder": "torch_sdpa"},
+                }
+            )
 
     def test_invalid_component_attention_backend_raises(self):
         with self.assertRaises(ValueError):
