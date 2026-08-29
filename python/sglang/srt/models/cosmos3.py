@@ -32,7 +32,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_model
 
 
 class Cosmos3ForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -98,13 +98,12 @@ class Cosmos3ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         # The vision encoder weights live in a separate ``vision_encoder/``
         # subfolder, so load them as a secondary weight source.
-        server_args = get_global_server_args()
         self.secondary_weights = []
         if not self.language_model_only:
             self.secondary_weights.append(
                 DefaultModelLoader.Source(
-                    model_or_path=server_args.model_path,
-                    revision=getattr(server_args, "revision", None),
+                    model_or_path=get_model().model_path,
+                    revision=get_model().revision,
                     prefix="",
                     allow_patterns_overrides=["vision_encoder/*.safetensors"],
                 )
