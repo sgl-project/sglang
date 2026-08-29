@@ -236,6 +236,19 @@ class TestEncoderDelivery(CustomTestCase):
             is_health_check=False,
         )
 
+    @staticmethod
+    def _load_grpc_server():
+        try:
+            import grpc
+            from smg_grpc_proto import sglang_encoder_pb2
+
+            from sglang.srt.disaggregation.encoder.grpc_server import (
+                SGLangEncoderServer,
+            )
+        except Exception as e:
+            raise unittest.SkipTest(f"gRPC test dependencies unavailable: {e}") from e
+        return grpc, sglang_encoder_pb2, SGLangEncoderServer
+
     def test_remote_preprocess_failure_stops_all_tp_ranks_before_forward(self):
         async def run():
             encoder = MMEncoder.__new__(MMEncoder)
@@ -424,12 +437,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_grpc_rejects_invalid_request_before_tp_dispatch(self):
         async def run():
-            import grpc
-            from smg_grpc_proto import sglang_encoder_pb2
-
-            from sglang.srt.disaggregation.encoder.grpc_server import (
-                SGLangEncoderServer,
-            )
+            grpc, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
 
             context = SimpleNamespace(
                 set_code=unittest.mock.Mock(),
@@ -460,12 +468,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_grpc_maps_processor_bad_request_to_invalid_argument(self):
         async def run():
-            import grpc
-            from smg_grpc_proto import sglang_encoder_pb2
-
-            from sglang.srt.disaggregation.encoder.grpc_server import (
-                SGLangEncoderServer,
-            )
+            grpc, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
 
             encoder = SimpleNamespace(
                 encode_dispatch_lock=asyncio.Lock(),
@@ -506,11 +509,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_grpc_serializes_tp_dispatch_with_rank_zero_encode(self):
         async def run():
-            from smg_grpc_proto import sglang_encoder_pb2
-
-            from sglang.srt.disaggregation.encoder.grpc_server import (
-                SGLangEncoderServer,
-            )
+            _, sglang_encoder_pb2, SGLangEncoderServer = self._load_grpc_server()
             from sglang.srt.managers.io_struct import unwrap_from_pickle
 
             first_started = asyncio.Event()
