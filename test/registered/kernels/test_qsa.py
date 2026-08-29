@@ -4,6 +4,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
@@ -26,9 +27,6 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_prefill,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-from sglang.srt.layers.attention.qsa.sm121_varlen import (
-    qsa_sm121_varlen_attention,
-)
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -109,13 +107,13 @@ def test_qsa_trtllm_sparse_decode_arch_gate(
         resolver.cache_clear()
 
 
-def test_qsa_sm121_resolves_triton_varlen_fallback(monkeypatch):
+def test_qsa_sm121_resolves_kda_varlen_kernel(monkeypatch):
     resolver = qsa_backend_module._resolve_flash_attn_varlen_func
     resolver.cache_clear()
     monkeypatch.setattr("sglang.srt.utils.is_sm121", lambda: True)
 
     try:
-        assert resolver() is qsa_sm121_varlen_attention
+        assert resolver() is qwen38_qsa_sm121_varlen
     finally:
         resolver.cache_clear()
 
@@ -136,16 +134,16 @@ def _qsa_packed_varlen_reference(q, k, v, cu_seqlens_k, scale):
 @pytest.mark.parametrize(
     ("lengths", "num_q_heads", "num_kv_heads", "head_dim"),
     [
-        ([1], 8, 1, 64),
-        ([17, 64, 65], 16, 2, 128),
-        ([511, 2048, 2051], 32, 4, 128),
-        ([7, 127], 8, 2, 192),
+        ([1], 12, 1, 256),
+        ([17, 64, 65], 24, 2, 256),
+        ([511, 2048, 2051], 12, 1, 256),
+        ([7, 127], 24, 2, 256),
     ],
 )
-def test_qsa_sm121_varlen_matches_torch_reference(
+def test_qsa_sm121_kda_varlen_matches_torch_reference(
     lengths, num_q_heads, num_kv_heads, head_dim
 ):
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
         return
     torch.manual_seed(2026)
     device = torch.device("cuda")
@@ -165,7 +163,7 @@ def test_qsa_sm121_varlen_matches_torch_reference(
     )
     scale = head_dim**-0.5
 
-    actual = qsa_sm121_varlen_attention(
+    actual = qwen38_qsa_sm121_varlen(
         q,
         k,
         v,
@@ -180,12 +178,12 @@ def test_qsa_sm121_varlen_matches_torch_reference(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-def test_qsa_sm121_varlen_cuda_graph_replays_dynamic_lengths():
-    if not torch.cuda.is_available():
+def test_qsa_sm121_kda_varlen_cuda_graph_replays_dynamic_lengths():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
         return
     torch.manual_seed(2027)
     device = torch.device("cuda")
-    batch, num_q_heads, num_kv_heads, head_dim = 3, 16, 2, 128
+    batch, num_q_heads, num_kv_heads, head_dim = 3, 12, 1, 256
     capacity = 3 * 2051
     q = torch.randn(batch, num_q_heads, head_dim, dtype=torch.bfloat16, device=device)
     k = torch.randn(
@@ -197,10 +195,12 @@ def test_qsa_sm121_varlen_cuda_graph_replays_dynamic_lengths():
     scale = head_dim**-0.5
 
     # Compile and validate the contract before capture.
-    qsa_sm121_varlen_attention(q, k, v, cu_q, cu_k, softmax_scale=scale)
+    qwen38_qsa_sm121_varlen(q, k, v, cu_q, cu_k, max_seqlen_k=2051, softmax_scale=scale)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = qsa_sm121_varlen_attention(q, k, v, cu_q, cu_k, softmax_scale=scale)
+        captured = qwen38_qsa_sm121_varlen(
+            q, k, v, cu_q, cu_k, max_seqlen_k=2051, softmax_scale=scale
+        )
 
     replay_lengths = torch.tensor([0, 64, 2115, 3139], dtype=torch.int32, device=device)
     cu_k.copy_(replay_lengths)
@@ -213,12 +213,12 @@ def test_qsa_sm121_varlen_cuda_graph_replays_dynamic_lengths():
 
 
 def test_qsa_sm121_compaction_and_attention_match_sparse_reference():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
         return
     torch.manual_seed(2028)
     device = torch.device("cuda")
     batch, topk = 3, FINAL_TOPK
-    num_q_heads, num_kv_heads, head_dim = 32, 4, 128
+    num_q_heads, num_kv_heads, head_dim = 24, 2, 256
     sequence_lengths = torch.tensor([17, 1050, 4096], dtype=torch.int32)
     valid_counts_cpu = [17, 911, topk]
     max_sequence_length = int(sequence_lengths.max())
@@ -276,8 +276,14 @@ def test_qsa_sm121_compaction_and_attention_match_sparse_reference():
     )
 
     scale = head_dim**-0.5
-    actual = qsa_sm121_varlen_attention(
-        q, packed_k, packed_v, cu_q, cu_k, softmax_scale=scale
+    actual = qwen38_qsa_sm121_varlen(
+        q,
+        packed_k,
+        packed_v,
+        cu_q,
+        cu_k,
+        max_seqlen_k=topk,
+        softmax_scale=scale,
     )
     expected = qsa_sparse_attention(q, k_cache, v_cache, slots, scale)
     assert valid_counts.tolist() == valid_counts_cpu

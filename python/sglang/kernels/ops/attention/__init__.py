@@ -67,7 +67,7 @@ register_kernel(
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description=(
-                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, " "q_rows in {1,3,4,12}"
+                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, " "1 <= q_rows <= 16"
             ),
         ),
         description=(
@@ -93,16 +93,29 @@ def can_use_kda_qwen38_qsa_sm121(
     return can_use_qwen38_qsa_sm121(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_k)
 
 
-def kda_qwen38_qsa_sm121(
+def qwen38_qsa_sm121_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    max_seqlen_k: int,
-    softmax_scale: float,
+    max_seqlen_q: int = 1,
+    max_seqlen_k: int = 0,
+    softmax_scale: float = 1.0,
+    causal: bool = True,
+    **_: object,
 ) -> torch.Tensor:
-    """Run the Codex/Kimi K3 KDA Qwen3.8 QSA kernel on SM121."""
+    """Run the only SM121 packed-QSA kernel for the low-concurrency contract."""
+    del causal
+    if max_seqlen_q != 1:
+        raise ValueError(f"QSA requires max_seqlen_q=1, got {max_seqlen_q}")
+    if not can_use_kda_qwen38_qsa_sm121(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_k
+    ):
+        raise ValueError(
+            "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
+            "TP1 24Q/2KV or TP2 12Q/1KV, bs<=16, and selected KV<=2055"
+        )
     return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
         q,
         k,
@@ -114,7 +127,7 @@ def kda_qwen38_qsa_sm121(
     )
 
 
-__all__ = ["can_use_kda_qwen38_qsa_sm121", "kda_qwen38_qsa_sm121"]
+__all__ = ["can_use_kda_qwen38_qsa_sm121", "qwen38_qsa_sm121_varlen"]
 
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated

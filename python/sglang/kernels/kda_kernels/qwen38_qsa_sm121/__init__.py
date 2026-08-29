@@ -13,8 +13,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_SUPPORTED_QUERY_ROWS = frozenset({1, 3, 4, 12})
 _SUPPORTED_HEAD_TOPOLOGIES = frozenset({(12, 1), (24, 2)})
+_MAX_BATCH = 16
 _MAX_SELECTED_KV = 2055
 _logged_fast_path = False
 
@@ -31,7 +31,7 @@ def can_use_qwen38_qsa_sm121(
     if not q.is_cuda or q.ndim != 3 or q.dtype != torch.bfloat16:
         return False
     batch, num_q_heads, head_dim = q.shape
-    if batch not in _SUPPORTED_QUERY_ROWS or batch > 16 or head_dim != 256:
+    if not (0 < batch <= _MAX_BATCH) or head_dim != 256:
         return False
     if k.ndim != 3 or v.shape != k.shape or k.dtype != q.dtype or v.dtype != q.dtype:
         return False

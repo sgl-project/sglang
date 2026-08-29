@@ -13,8 +13,7 @@ The kernel is specialized for the packed QSA decode tensors captured from
 - BF16 query, key, value, and output with head dimension 256
 - one packed query row per sequence and device-side `cu_seqlens`
 - 12 query heads per KV head: TP1 uses 24Q/2KV and TP2 uses 12Q/1KV
-- query-row counts in `{1, 3, 4, 12}`, all within the low-concurrency `bs <= 16`
-  envelope
+- all query-row counts in the low-concurrency `1 <= bs <= 16` envelope
 - `max_seqlen_k` capacity up to 2055 and captured logical selected-KV lengths
   up to 2051 rows per sequence
 
@@ -26,11 +25,11 @@ host-visible shape/topology policy selects the two measured schedules, while
 the live device `cu_seqlens_k` selects one, two, four, or eight active splits
 without a host synchronization.
 
-Production dispatch is opt-in through `SGLANG_ENABLE_KDA_QSA_SM121=1` and
-checks the exact captured contract. Unsupported calls stay on SGLang's generic
-SM121 Triton fallback. The KDA replay passed all 15 TP1/TP2 production tensors
-on two independent GB10 GPUs, and the final source passed 150,000 consecutive
-launches with all counters returning to zero.
+SM121 dispatch checks the exact Qwen3.8 contract and routes directly to this
+kernel; it is the only packed-QSA attention implementation added by this PR.
+The KDA replay passed all 15 TP1/TP2 production tensors on two independent GB10
+GPUs, and the final source passed 150,000 consecutive launches with all
+counters returning to zero.
 
 After adaptation into SGLang, the packaged kernel passed the same 15/15 replay
 with exactly one CUDA activity per row and a 2.0702x all-shape geomean over the
@@ -39,3 +38,8 @@ the full TP1 NVFP4 model with NEXTN, three-round low-concurrency serving A/B
 improved total token throughput by 4.45% at concurrency 1 and 4.00% at
 concurrency 4. A 50-example, five-shot GSM8K A/B with a 2048-token output limit
 scored 49/50 for both Triton and KDA, with the same single failed example.
+
+An additional synthetic GB10 sweep covers both TP topologies, every batch size
+from 1 through 16, and short plus saturated KV rows. All 64 cases passed; the
+maximum relative L2 against the original correct Triton implementation was
+0.002422, and speedup ranged from 1.41x to 5.09x.

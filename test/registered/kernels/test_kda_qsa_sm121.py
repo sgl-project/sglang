@@ -1,15 +1,10 @@
 import unittest
-from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.attention import (
     can_use_kda_qwen38_qsa_sm121,
-    kda_qwen38_qsa_sm121,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa.sm121_varlen import (
-    qsa_sm121_varlen_attention,
+    qwen38_qsa_sm121_varlen,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,15 +39,18 @@ def _make_inputs(num_q_heads, num_kv_heads, lengths, *, capacity=None):
     return q, k, v, cu_q, cu_k
 
 
-def _baseline(args, max_seqlen_k, scale):
-    with envs.SGLANG_ENABLE_KDA_QSA_SM121.override(False):
-        return qsa_sm121_varlen_attention(
-            *args,
-            max_seqlen_q=1,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=scale,
-            causal=True,
-        )
+def _reference(args, scale):
+    q, k, v, _, cu_k = args
+    queries_per_kv = q.shape[1] // k.shape[1]
+    rows = []
+    for row in range(q.shape[0]):
+        start = int(cu_k[row])
+        end = int(cu_k[row + 1])
+        keys = k[start:end].repeat_interleave(queries_per_kv, dim=1).float()
+        values = v[start:end].repeat_interleave(queries_per_kv, dim=1).float()
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
+        rows.append(torch.einsum("hk,khd->hd", scores.softmax(-1), values))
+    return torch.stack(rows).to(q.dtype)
 
 
 class TestKdaQwen38QsaSm121(CustomTestCase):
@@ -69,7 +67,7 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def assert_matches_baseline(self, actual, expected):
+    def assert_matches_reference(self, actual, expected):
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
         relative_l2 = (
             actual.float() - expected.float()
@@ -79,7 +77,7 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
         # the task's stricter relative-L2 <= 2e-3 acceptance gate.
         self.assertLessEqual(relative_l2.item(), 5e-3)
 
-    def test_real_tp1_tp2_shapes_match_triton(self):
+    def test_real_tp1_tp2_shapes_match_reference(self):
         scale = 256**-0.5
         for _, num_q_heads, num_kv_heads, lengths in _REAL_SHAPES:
             args = _make_inputs(num_q_heads, num_kv_heads, lengths)
@@ -87,36 +85,33 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
             self.assertTrue(
                 can_use_kda_qwen38_qsa_sm121(*args, max_seqlen_k=max_seqlen_k)
             )
-            expected = _baseline(args, max_seqlen_k, scale)
-            actual = kda_qwen38_qsa_sm121(*args, max_seqlen_k, scale)
-            self.assert_matches_baseline(actual, expected)
+            expected = _reference(args, scale)
+            actual = qwen38_qsa_sm121_varlen(
+                *args, max_seqlen_k=max_seqlen_k, softmax_scale=scale
+            )
+            self.assert_matches_reference(actual, expected)
 
-    def test_opt_in_dispatch_and_unsupported_fallback(self):
+    def test_all_low_concurrency_batches_and_contract_guard(self):
         scale = 256**-0.5
-        args = _make_inputs(12, 1, (64, 511, 861, 2051))
-        expected = kda_qwen38_qsa_sm121(*args, 2051, scale)
-        with patch(
-            "sglang.kernels.ops.attention.kda_qwen38_qsa_sm121",
-            wraps=kda_qwen38_qsa_sm121,
-        ) as candidate:
-            with envs.SGLANG_ENABLE_KDA_QSA_SM121.override(True):
-                actual = qsa_sm121_varlen_attention(
-                    *args, max_seqlen_k=2051, softmax_scale=scale
+        for num_q_heads, num_kv_heads in ((12, 1), (24, 2)):
+            for batch in range(1, 17):
+                lengths = tuple(17 + (row * 37) % 211 for row in range(batch))
+                args = _make_inputs(num_q_heads, num_kv_heads, lengths)
+                max_seqlen_k = max(lengths)
+                self.assertTrue(
+                    can_use_kda_qwen38_qsa_sm121(*args, max_seqlen_k=max_seqlen_k)
                 )
-        candidate.assert_called_once()
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                actual = qwen38_qsa_sm121_varlen(
+                    *args,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=scale,
+                )
+                self.assert_matches_reference(actual, _reference(args, scale))
 
-        unsupported = _make_inputs(12, 1, (64, 511))
-        expected_fallback = _baseline(unsupported, 511, scale)
-        with patch(
-            "sglang.kernels.ops.attention.kda_qwen38_qsa_sm121",
-            side_effect=AssertionError("unsupported shape reached KDA"),
-        ):
-            with envs.SGLANG_ENABLE_KDA_QSA_SM121.override(True):
-                actual_fallback = qsa_sm121_varlen_attention(
-                    *unsupported, max_seqlen_k=511, softmax_scale=scale
-                )
-        torch.testing.assert_close(actual_fallback, expected_fallback, rtol=0, atol=0)
+        unsupported = _make_inputs(12, 1, tuple(17 for _ in range(17)))
+        self.assertFalse(can_use_kda_qwen38_qsa_sm121(*unsupported, max_seqlen_k=17))
+        with self.assertRaisesRegex(ValueError, "unsupported SM121 QSA call"):
+            qwen38_qsa_sm121_varlen(*unsupported, max_seqlen_k=17, softmax_scale=scale)
 
     def test_cuda_graph_replays_live_cu_seqlens(self):
         scale = 256**-0.5
@@ -125,10 +120,12 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
         q, k, v, cu_q, cu_k = args
 
         # Allocate scratch and compile before capture.
-        kda_qwen38_qsa_sm121(*args, 2051, scale)
+        qwen38_qsa_sm121_varlen(*args, max_seqlen_k=2051, softmax_scale=scale)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = kda_qwen38_qsa_sm121(*args, 2051, scale)
+            captured = qwen38_qsa_sm121_varlen(
+                *args, max_seqlen_k=2051, softmax_scale=scale
+            )
 
         replay_lengths = (2051, 1307, 511, 64)
         cu_k.copy_(
@@ -143,19 +140,21 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
         v.normal_()
         graph.replay()
         torch.cuda.synchronize()
-        expected = _baseline(args, 2051, scale)
-        self.assert_matches_baseline(captured, expected)
+        expected = _reference(args, scale)
+        self.assert_matches_reference(captured, expected)
 
     def test_split_counters_reset_across_repeated_launches(self):
         from sglang.kernels.kda_kernels.qwen38_qsa_sm121.kernel import _get_scratch
 
         scale = 256**-0.5
         args = _make_inputs(12, 1, (2051, 2051, 2051, 2051))
-        expected = _baseline(args, 2051, scale)
+        expected = _reference(args, scale)
         for _ in range(100):
-            actual = kda_qwen38_qsa_sm121(*args, 2051, scale)
+            actual = qwen38_qsa_sm121_varlen(
+                *args, max_seqlen_k=2051, softmax_scale=scale
+            )
         torch.cuda.synchronize()
-        self.assert_matches_baseline(actual, expected)
+        self.assert_matches_reference(actual, expected)
         counters = _get_scratch(torch.device("cuda"))[-1]
         self.assertEqual(torch.count_nonzero(counters).item(), 0)
 
