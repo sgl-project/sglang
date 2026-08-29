@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
@@ -44,7 +48,6 @@ def set_default_server_args(args: "ServerArgs"):
     """
     Set default server arguments for NPU backend.
     """
-    from sglang.srt.arg_groups.overrides import resolving_view
 
     cfg = resolving_view(args)
 
@@ -148,7 +151,7 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        if args.use_mla_backend():
+        if use_mla_backend(args):
             declare_resolution(
                 args,
                 "set_default_server_args",

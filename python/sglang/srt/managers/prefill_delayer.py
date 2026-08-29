@@ -78,7 +78,6 @@ class PrefillDelayer:
         dp_size: int,
         attn_tp_size: int,
         cpu_group,
-        server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
@@ -91,14 +90,14 @@ class PrefillDelayer:
         self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
-        self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
+        self._queue_min_ratio = get_schedule().prefill_delayer_queue_min_ratio
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
-        self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
+        self._max_delay_ms = get_schedule().prefill_delayer_max_delay_ms
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
-        self._prefill_max_requests = server_args.prefill_max_requests
+        self._prefill_max_requests = get_schedule().prefill_max_requests
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
