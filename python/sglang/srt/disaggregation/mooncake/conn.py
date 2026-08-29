@@ -353,13 +353,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "slot_layer_ids": list(slot_layer_ids or []),
         }
 
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        self.engine.batch_register([ptr], [size])
+
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_buffers,
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self._register_staging_memory,
             self.kv_args,
             count,
             get_schedule().chunked_prefill_size,
@@ -372,7 +375,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self._register_staging_memory,
             self.kv_args,
         )
         self.kv_buffer_tensors = None
@@ -910,6 +913,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
+        pack_buffer=None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -942,10 +946,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
+        src_token_indices = plan.src_token_indices
+        dst_token_indices = plan.dst_token_indices
+        if pack_buffer is not None:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=src_kv_ptrs,
+                src_token_indices=src_token_indices,
+                token_item_lens=dcp_token_item_lens[: len(src_kv_ptrs)],
+            )
+            if packed is not None:
+                src_kv_ptrs, src_token_indices = packed
+
         layers_current_pp_stage = len(src_kv_ptrs)
         src_groups, dst_groups = group_concurrent_contiguous(
-            plan.src_token_indices,
-            plan.dst_token_indices,
+            src_token_indices,
+            dst_token_indices,
         )
 
         layers_params = [
@@ -1771,6 +1789,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dcp_token_item_lens
                             )
                             assert dcp_token_item_lens is not None
+                            pack_buffer = (
+                                self._dcp_pack_buffers[worker_index]
+                                if self._dcp_pack_buffers
+                                else None
+                            )
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1786,6 +1809,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
+                                pack_buffer=pack_buffer,
                             )
                         elif (
                             self.is_mla_backend
@@ -2073,6 +2097,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 * len(self.kv_args.kv_item_lens)
                             )
                         )
+                        self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
