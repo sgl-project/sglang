@@ -56,7 +56,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, max_speculative_num_draft_tokens
 from sglang.srt.utils import is_flashinfer_available, is_tokenspeed_mla_available
 
 if is_flashinfer_available():
@@ -145,9 +145,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 self.device,
                 self.num_q_heads,
                 self.kv_lora_rank,
-                max_q_len=(
-                    model_runner.server_args.max_speculative_num_draft_tokens or 1
-                ),
+                max_q_len=(max_speculative_num_draft_tokens() or 1),
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2

@@ -674,6 +674,13 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    # Let an external E2E driver establish a balanced DP batch before health traffic.
+    if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
+        "/health",
+        "/health_generate",
+    ):
+        return Response(status_code=200)
+
     if (
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
@@ -2438,6 +2445,7 @@ def _run_granian_server(
     port,
     log_level,
     http2_max_concurrent_streams,
+    http2_initial_connection_window_size,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2475,7 +2483,8 @@ def _run_granian_server(
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
         http2_settings=HTTP2Settings(
-            max_concurrent_streams=http2_max_concurrent_streams
+            initial_connection_window_size=http2_initial_connection_window_size,
+            max_concurrent_streams=http2_max_concurrent_streams,
         ),
         log_level=log_level,
         ssl_cert=ssl_certfile,
@@ -2610,6 +2619,9 @@ def _setup_and_run_http_server(
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
                     ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
+                    ),
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2699,6 +2711,9 @@ def _setup_and_run_http_server(
                     or get_observability().log_level,
                     http2_max_concurrent_streams=(
                         server_args.http2_max_concurrent_streams
+                    ),
+                    http2_initial_connection_window_size=(
+                        server_args.http2_initial_connection_window_size
                     ),
                     tokenizer_worker_num=server_args.tokenizer_worker_num,
                     ssl_certfile=server_args.ssl_certfile,

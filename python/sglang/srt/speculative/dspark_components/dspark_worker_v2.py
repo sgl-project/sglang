@@ -131,7 +131,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -219,7 +219,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
             device=self.device,
             tp_rank=self.ps.tp_rank,
-            server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
         if (
