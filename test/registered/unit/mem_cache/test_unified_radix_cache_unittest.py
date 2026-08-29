@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1030,7 +1030,6 @@ class UnifiedRadixCacheSuite:
         )
         self._rid += 1
         req_to_token_pool.alloc([req])
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
         return req
 
     def _apply_match_to_req(self, req, match):
@@ -1265,7 +1264,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv_committed_len = kv_len
-        req.kv = ReqKvInfo(kv_allocated_len=kv_len, swa_evicted_seqlen=0)
+        req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
@@ -2200,7 +2199,6 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
@@ -2290,7 +2288,6 @@ class UnifiedRadixCacheSuite:
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)
@@ -6603,7 +6600,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         req_to_token_pool.alloc([req])
         req.output_ids = array("q")
         req.kv_committed_len = len(tokens)
-        req.kv = ReqKvInfo(kv_allocated_len=len(tokens), swa_evicted_seqlen=0)
+        req.kv.kv_allocated_len = len(tokens)
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
@@ -7934,7 +7931,6 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         req.cache_protected_len = 0
         req.swa_uuid_for_lock = None
         req.extra_key = None
-        req.kv = ReqKvInfo(kv_allocated_len=0, swa_evicted_seqlen=0)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.cache_unfinished_req(req)
